@@ -149,6 +149,7 @@ def test_server_load_clock_excludes_warmup(
     clock = [1_000_000_000]
     output = io.StringIO()
     monkeypatch.setattr(utils.time, "monotonic_ns", lambda: clock[0])
+    monkeypatch.setattr(utils.current_platform, "is_hip", lambda: False)
     monkeypatch.setattr(utils.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(
         utils, "prepare_perf_log", lambda: (tmp_path, tmp_path / "perf.jsonl")

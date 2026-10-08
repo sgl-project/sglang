@@ -53,9 +53,7 @@ class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch):
         self._llada_image_conditioning_mask_active = False
-        text_lens = getattr(
-            forward_batch, "llada_image_conditioning_text_lens_cpu", None
-        )
+        text_lens = forward_batch.llada_image_conditioning_text_lens_cpu
         if text_lens is None:
             return super().init_forward_metadata(forward_batch)
 

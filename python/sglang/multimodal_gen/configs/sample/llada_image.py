@@ -30,6 +30,9 @@ class LLaDAImageSamplingParams(SamplingParams):
             raise ValueError(
                 "LLaDA-Image max_sequence_length must be between 1 and 3584"
             )
+        pipeline_config.validate_output_size(
+            self.width, self.height, editing=bool(self.image_path)
+        )
 
 
 @dataclass

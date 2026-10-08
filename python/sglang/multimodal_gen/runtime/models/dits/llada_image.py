@@ -19,13 +19,10 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.attention import AttentionMixin, AttentionModuleMixin, FeedForward
+from diffusers.models.attention import FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
-from diffusers.utils import BaseOutput
-from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
@@ -116,10 +113,6 @@ class LLaDAImageTimestepEmbedder(nn.Module):
         )
         arguments = timestep[:, None].float() * frequencies[None]
         embedding = torch.cat([torch.cos(arguments), torch.sin(arguments)], dim=-1)
-        if self.frequency_embedding_dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
         return self.mlp(embedding.to(dtype=hidden_dtype))
 
 
@@ -158,82 +151,7 @@ class LLaDAImageRopeEmbedder(nn.Module):
         return torch.cat(frequencies, dim=-1)
 
 
-class LLaDAImageAttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
-
-    def __call__(
-        self,
-        attn: "LLaDAImageAttention",
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        freqs_cis: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = qkv.split(
-            [attn.inner_dim, attn.inner_dim, attn.inner_dim], dim=-1
-        )
-        query = query.unflatten(-1, (attn.local_heads, attn.head_dim)).contiguous()
-        key = key.unflatten(-1, (attn.local_heads, attn.head_dim)).contiguous()
-        value = value.unflatten(-1, (attn.local_heads, attn.head_dim)).contiguous()
-
-        if freqs_cis is not None:
-            cos_sin_cache = torch.cat(
-                [freqs_cis.real.float(), freqs_cis.imag.float()], dim=-1
-            ).reshape(-1, attn.head_dim)
-            positions = torch.arange(
-                cos_sin_cache.shape[0], device=query.device, dtype=torch.long
-            )
-            if attn.norm_q is not None:
-                query, key = apply_qk_norm_with_optional_rope(
-                    q=query,
-                    k=key,
-                    q_norm=attn.norm_q,
-                    k_norm=attn.norm_k,
-                    head_dim=attn.head_dim,
-                    cos_sin_cache=cos_sin_cache.contiguous(),
-                    positions=positions,
-                    is_neox=False,
-                    allow_inplace=True,
-                )
-            else:
-                query, key = apply_flashinfer_rope_qk_inplace(
-                    query,
-                    key,
-                    cos_sin_cache.contiguous(),
-                    head_size=attn.head_dim,
-                    positions=positions,
-                    is_neox=False,
-                )
-        elif attn.norm_q is not None:
-            query, key = apply_qk_norm_with_optional_rope(
-                q=query,
-                k=key,
-                q_norm=attn.norm_q,
-                k_norm=attn.norm_k,
-                head_dim=attn.head_dim,
-                allow_inplace=True,
-            )
-
-        if attention_mask is not None and attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
-
-        hidden_states = attn.sgl_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states, _ = attn.to_out[0](hidden_states)
-        return hidden_states
-
-
-class LLaDAImageAttention(nn.Module, AttentionModuleMixin):
-    _default_processor_cls = LLaDAImageAttnProcessor
-    _available_processors: ClassVar[list[type]] = [LLaDAImageAttnProcessor]
-    _supports_qkv_fusion = False
-
+class LLaDAImageAttention(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -283,11 +201,9 @@ class LLaDAImageAttention(nn.Module, AttentionModuleMixin):
                     input_is_parallel=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
-                ),
-                nn.Dropout(0.0),
+                )
             ]
         )
-        self.set_processor(self._default_processor_cls())
 
     def forward(
         self,
@@ -295,12 +211,43 @@ class LLaDAImageAttention(nn.Module, AttentionModuleMixin):
         attention_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
     ) -> torch.Tensor:
-        return self.processor(
-            self,
-            hidden_states,
-            attention_mask,
-            freqs_cis,
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = (
+            tensor.unflatten(-1, (self.local_heads, self.head_dim)).contiguous()
+            for tensor in qkv.split([self.inner_dim] * 3, dim=-1)
         )
+        cos_sin_cache = torch.cat(
+            [freqs_cis.real.float(), freqs_cis.imag.float()], dim=-1
+        ).reshape(-1, self.head_dim)
+        positions = torch.arange(
+            cos_sin_cache.shape[0], device=query.device, dtype=torch.long
+        )
+        if self.norm_q is not None:
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache.contiguous(),
+                positions=positions,
+                is_neox=False,
+                allow_inplace=True,
+            )
+        else:
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query,
+                key,
+                cos_sin_cache.contiguous(),
+                head_size=self.head_dim,
+                positions=positions,
+                is_neox=False,
+            )
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, None, None, :]
+        hidden_states = self.sgl_attention(query, key, value, attn_mask=attention_mask)
+        hidden_states, _ = self.to_out[0](hidden_states.flatten(2, 3))
+        return hidden_states
 
 
 class LLaDAImageFeedForward(nn.Module):
@@ -337,6 +284,20 @@ class LLaDAImageFeedForward(nn.Module):
         return hidden_states
 
 
+def _padding_attention_mask(
+    lengths: list[int], device: torch.device
+) -> torch.Tensor | None:
+    max_length = max(lengths)
+    if all(length == max_length for length in lengths):
+        return None
+    attention_mask = torch.zeros(
+        (len(lengths), max_length), dtype=torch.bool, device=device
+    )
+    for batch_index, length in enumerate(lengths):
+        attention_mask[batch_index, :length] = True
+    return attention_mask
+
+
 def _select_per_token(
     noisy_value: torch.Tensor,
     clean_value: torch.Tensor,
@@ -351,7 +312,6 @@ def _select_per_token(
     )
 
 
-@maybe_allow_in_graph
 class LLaDAImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -396,48 +356,22 @@ class LLaDAImageTransformerBlock(nn.Module):
         adaln_clean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:
-            sequence_length = hidden_states.shape[1]
             if noise_mask is None:
-                scale_msa, gate_msa, scale_mlp, gate_mlp = (
+                modulation = (
                     self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
                 )
-                scale_msa = 1.0 + scale_msa
             else:
-                noisy_modulation = self.adaLN_modulation(adaln_noisy)
-                clean_modulation = self.adaLN_modulation(adaln_clean)
-                noisy_scale_msa, noisy_gate_msa, noisy_scale_mlp, noisy_gate_mlp = (
-                    noisy_modulation.chunk(4, dim=1)
-                )
-                clean_scale_msa, clean_gate_msa, clean_scale_mlp, clean_gate_mlp = (
-                    clean_modulation.chunk(4, dim=1)
-                )
-                scale_msa = _select_per_token(
-                    1.0 + noisy_scale_msa,
-                    1.0 + clean_scale_msa,
-                    noise_mask,
-                    sequence_length,
-                )
-                scale_mlp = _select_per_token(
-                    noisy_scale_mlp,
-                    clean_scale_mlp,
-                    noise_mask,
-                    sequence_length,
-                )
-                gate_msa = _select_per_token(
-                    noisy_gate_msa,
-                    clean_gate_msa,
-                    noise_mask,
-                    sequence_length,
-                )
-                gate_mlp = _select_per_token(
-                    noisy_gate_mlp,
-                    clean_gate_mlp,
-                    noise_mask,
-                    sequence_length,
-                )
+                modulation = [
+                    _select_per_token(noisy, clean, noise_mask, hidden_states.shape[1])
+                    for noisy, clean in zip(
+                        self.adaLN_modulation(adaln_noisy).chunk(4, dim=1),
+                        self.adaLN_modulation(adaln_clean).chunk(4, dim=1),
+                    )
+                ]
+            scale_msa, gate_msa, scale_mlp, gate_mlp = modulation
 
             attention_output = self.attention(
-                self.attention_norm1(hidden_states) * scale_msa,
+                self.attention_norm1(hidden_states) * (1.0 + scale_msa),
                 attention_mask,
                 freqs_cis,
             )
@@ -482,67 +416,20 @@ class LLaDAImageFinalLayer(nn.Module):
         adaln_clean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if noise_mask is None:
-            scale = 1.0 + self.adaLN_modulation(adaln_input)
-            scale = scale.unsqueeze(1)
+            scale = self.adaLN_modulation(adaln_input).unsqueeze(1)
         else:
-            sequence_length = hidden_states.shape[1]
-            noisy_scale = 1.0 + self.adaLN_modulation(adaln_noisy)
-            clean_scale = 1.0 + self.adaLN_modulation(adaln_clean)
             scale = _select_per_token(
-                noisy_scale, clean_scale, noise_mask, sequence_length
+                self.adaLN_modulation(adaln_noisy),
+                self.adaLN_modulation(adaln_clean),
+                noise_mask,
+                hidden_states.shape[1],
             )
-        hidden_states = self.norm_final(hidden_states) * scale
+        hidden_states = self.norm_final(hidden_states) * (1.0 + scale)
         return self.linear(hidden_states)
 
 
-class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
-    r"""
-    The denoising transformer used by LLaDAImage for text-to-image generation and single-image editing.
-
-    This component consumes caption features that have already passed through LLaDAImage's QueryFormer, connector, and
-    projector. For editing, it additionally consumes GLM/SigVQ features and source-image latents.
-
-    Args:
-        all_patch_size (`tuple[int, ...]`, defaults to `(1,)`):
-            Supported spatial patch sizes.
-        all_f_patch_size (`tuple[int, ...]`, defaults to `(1,)`):
-            Supported temporal patch sizes paired with `all_patch_size`.
-        in_channels (`int`, defaults to `128`):
-            Number of channels in the patchified Flux2 VAE latents.
-        dim (`int`, defaults to `3840`):
-            Transformer hidden dimension.
-        n_layers (`int`, defaults to `30`):
-            Number of main transformer blocks.
-        n_refiner_layers (`int`, defaults to `2`):
-            Number of noise, caption, and SigVQ refiner blocks.
-        n_heads (`int`, defaults to `30`):
-            Number of attention heads.
-        norm_eps (`float`, defaults to `1e-5`):
-            Epsilon used by RMS normalization layers.
-        qk_norm (`bool`, defaults to `True`):
-            Whether to apply RMS normalization to query and key tensors.
-        cap_feat_dim (`int`, defaults to `2560`):
-            Dimension of projected QueryFormer caption features.
-        semantic_feat_dim (`int`, defaults to `4096`):
-            Dimension of GLM/SigVQ semantic features.
-        rope_theta (`float`, defaults to `256.0`):
-            RoPE frequency base.
-        t_scale (`float`, defaults to `1000.0`):
-            Scale applied to diffusion timesteps.
-        axes_dims (`tuple[int, ...]`, defaults to `(32, 48, 48)`):
-            RoPE dimensions for sequence, height, and width axes.
-        axes_lens (`tuple[int, ...]`, defaults to `(32768, 1024, 1024)`):
-            Maximum RoPE positions for sequence, height, and width axes.
-    """
-
-    _no_split_modules: ClassVar[list[str]] = ["LLaDAImageTransformerBlock"]
-    _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageTransformerBlock"]
-    _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
-        "t_embedder",
-        "cap_embedder",
-        "semantic_embedder",
-        "sigvq_embedder",
-    ]
+class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
+    """Denoiser for text-to-image generation and single-image editing."""
 
     @register_to_config
     def __init__(
@@ -565,23 +452,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        if len(all_patch_size) != len(all_f_patch_size):
-            raise ValueError(
-                "`all_patch_size` and `all_f_patch_size` must have the same length."
-            )
-        if dim % n_heads != 0:
-            raise ValueError(
-                f"`dim` ({dim}) must be divisible by `n_heads` ({n_heads})."
-            )
-        if dim // n_heads != sum(axes_dims):
-            raise ValueError(
-                "The attention head dimension must equal the sum of `axes_dims`."
-            )
-
-        self.in_channels = in_channels
         self.out_channels = in_channels
-        self.all_patch_size = all_patch_size
-        self.all_f_patch_size = all_f_patch_size
         self.t_scale = t_scale
 
         self.all_x_embedder = nn.ModuleDict()
@@ -592,86 +463,40 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             self.all_x_embedder[patch_key] = nn.Linear(patch_dim, dim, bias=True)
             self.all_final_layer[patch_key] = LLaDAImageFinalLayer(dim, patch_dim)
 
-        self.noise_refiner = nn.ModuleList(
-            [
+        def blocks(name: str, count: int, modulation: bool) -> nn.ModuleList:
+            return nn.ModuleList(
                 LLaDAImageTransformerBlock(
                     dim,
                     n_heads,
                     norm_eps,
                     qk_norm,
-                    modulation=True,
+                    modulation=modulation,
                     quant_config=quant_config,
-                    prefix=f"noise_refiner.{layer_id}",
+                    prefix=f"{name}.{layer_id}",
                 )
-                for layer_id in range(n_refiner_layers)
-            ]
-        )
-        self.context_refiner = nn.ModuleList(
-            [
-                LLaDAImageTransformerBlock(
-                    dim,
-                    n_heads,
-                    norm_eps,
-                    qk_norm,
-                    modulation=False,
-                    quant_config=quant_config,
-                    prefix=f"context_refiner.{layer_id}",
-                )
-                for layer_id in range(n_refiner_layers)
-            ]
-        )
-        self.sigvq_refiner = nn.ModuleList(
-            [
-                LLaDAImageTransformerBlock(
-                    dim,
-                    n_heads,
-                    norm_eps,
-                    qk_norm,
-                    modulation=False,
-                    quant_config=quant_config,
-                    prefix=f"sigvq_refiner.{layer_id}",
-                )
-                for layer_id in range(n_refiner_layers)
-            ]
-        )
-        self.layers = nn.ModuleList(
-            [
-                LLaDAImageTransformerBlock(
-                    dim,
-                    n_heads,
-                    norm_eps,
-                    qk_norm,
-                    modulation=True,
-                    quant_config=quant_config,
-                    prefix=f"layers.{layer_id}",
-                )
-                for layer_id in range(n_layers)
-            ]
-        )
+                for layer_id in range(count)
+            )
+
+        def feature_embedder(feature_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                RMSNorm(feature_dim, eps=norm_eps, elementwise_affine=False),
+                nn.Linear(feature_dim, dim, bias=True),
+            )
+
+        self.noise_refiner = blocks("noise_refiner", n_refiner_layers, True)
+        self.context_refiner = blocks("context_refiner", n_refiner_layers, False)
+        self.sigvq_refiner = blocks("sigvq_refiner", n_refiner_layers, False)
+        self.layers = blocks("layers", n_layers, True)
 
         self.t_embedder = LLaDAImageTimestepEmbedder(min(dim, ADALN_EMBED_DIM))
-        self.cap_embedder = nn.Sequential(
-            RMSNorm(cap_feat_dim, eps=norm_eps, elementwise_affine=False),
-            nn.Linear(cap_feat_dim, dim, bias=True),
-        )
-        self.semantic_embedder = nn.Sequential(
-            RMSNorm(semantic_feat_dim, eps=norm_eps, elementwise_affine=False),
-            nn.Linear(semantic_feat_dim, dim, bias=True),
-        )
-        self.sigvq_embedder = nn.Sequential(
-            RMSNorm(semantic_feat_dim, eps=norm_eps, elementwise_affine=False),
-            nn.Linear(semantic_feat_dim, dim, bias=True),
-        )
-
-        nn.init.normal_(self.semantic_embedder[1].weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.semantic_embedder[1].bias)
-        nn.init.normal_(self.sigvq_embedder[1].weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.sigvq_embedder[1].bias)
+        self.cap_embedder = feature_embedder(cap_feat_dim)
+        # Checkpoint weights that neither generation nor editing reads.
+        self.semantic_embedder = feature_embedder(semantic_feat_dim)
+        self.sigvq_embedder = feature_embedder(semantic_feat_dim)
 
         self.x_pad_token = nn.Parameter(torch.zeros(1, dim))
         self.cap_pad_token = nn.Parameter(torch.zeros(1, dim))
         self.sigvq_pad_token = nn.Parameter(torch.zeros(1, dim))
-        nn.init.normal_(self.sigvq_pad_token, mean=0.0, std=0.02)
 
         self.rope_embedder = LLaDAImageRopeEmbedder(rope_theta, axes_dims, axes_lens)
 
@@ -724,40 +549,25 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         position_grid_size: tuple[int, int, int],
         position_start: tuple[int, int, int],
         noise_value: int | None = None,
-        sequence_multiple: int = SEQUENCE_MULTIPLE,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, list[int] | None]:
         original_length = len(features)
-        padding_length = (-original_length) % sequence_multiple
+        padding_length = (-original_length) % SEQUENCE_MULTIPLE
         padded_length = original_length + padding_length
-        device = features.device
-
         position_ids = self._create_coordinate_grid(
-            position_grid_size,
-            position_start,
-            device,
+            position_grid_size, position_start, features.device
         ).flatten(0, 2)
+        padding_mask = torch.zeros(
+            padded_length, dtype=torch.bool, device=features.device
+        )
         if padding_length > 0:
-            padding_position_ids = (
-                self._create_coordinate_grid(
-                    (1, 1, 1),
-                    (0, 0, 0),
-                    device,
-                )
-                .flatten(0, 2)
-                .repeat(padding_length, 1)
+            # Padding rows sit at position zero and repeat the last feature.
+            position_ids = torch.cat(
+                [position_ids, position_ids.new_zeros((padding_length, 3))], dim=0
             )
-            position_ids = torch.cat([position_ids, padding_position_ids], dim=0)
             features = torch.cat(
                 [features, features[-1:].repeat(padding_length, 1)], dim=0
             )
-            padding_mask = torch.cat(
-                [
-                    torch.zeros(original_length, dtype=torch.bool, device=device),
-                    torch.ones(padding_length, dtype=torch.bool, device=device),
-                ]
-            )
-        else:
-            padding_mask = torch.zeros(original_length, dtype=torch.bool, device=device)
+            padding_mask[original_length:] = True
 
         noise_mask = [noise_value] * padded_length if noise_value is not None else None
         return features, position_ids, padding_mask, padded_length, noise_mask
@@ -773,7 +583,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], torch.Tensor | None
     ]:
         sequence_lengths = [len(item) for item in features]
-        max_sequence_length = max(sequence_lengths)
         features = torch.cat(features, dim=0)
         inner_padding_mask = torch.cat(inner_padding_masks).unsqueeze(-1)
         features = torch.where(
@@ -787,16 +596,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         frequencies = pad_sequence(frequencies, batch_first=True, padding_value=0.0)[
             :, : features.shape[1]
         ]
-
-        attention_mask = None
-        if not all(length == max_sequence_length for length in sequence_lengths):
-            attention_mask = torch.zeros(
-                (len(sequence_lengths), max_sequence_length),
-                dtype=torch.bool,
-                device=features.device,
-            )
-            for batch_index, sequence_length in enumerate(sequence_lengths):
-                attention_mask[batch_index, :sequence_length] = True
+        attention_mask = _padding_attention_mask(sequence_lengths, features.device)
 
         noise_mask = None
         if noise_masks is not None:
@@ -820,7 +620,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         image_offsets: list[tuple[int, int]] | None = None,
     ) -> list[torch.Tensor]:
         outputs = []
-        sequence_multiple = SEQUENCE_MULTIPLE
         for batch_index, batch_hidden_states in enumerate(hidden_states):
             if image_offsets is None:
                 batch_sizes = [sizes[batch_index]]
@@ -838,7 +637,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     * (height // patch_size)
                     * (width // patch_size)
                 )
-                padding_length = (-original_length) % sequence_multiple
+                padding_length = (-original_length) % SEQUENCE_MULTIPLE
                 output = (
                     image_hidden_states[
                         current_offset : current_offset + original_length
@@ -862,69 +661,36 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
     def _prepare_t2i_sequences(
         self,
         x: list[torch.Tensor],
-        cap_feats: list[torch.Tensor] | None,
-        glm_features: list[torch.Tensor] | None,
+        cap_feats: list[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
-    ) -> tuple[
-        _LLaDAImageSequence,
-        _LLaDAImageSequence | None,
-        _LLaDAImageSequence | None,
-        list[tuple[int, int, int]],
-    ]:
+    ) -> tuple[_LLaDAImageSequence, _LLaDAImageSequence, list[tuple[int, int, int]]]:
         image_sequence = _LLaDAImageSequence([], [], [])
-        cap_sequence = (
-            _LLaDAImageSequence([], [], []) if cap_feats is not None else None
-        )
-        glm_sequence = (
-            _LLaDAImageSequence([], [], []) if glm_features is not None else None
-        )
+        cap_sequence = _LLaDAImageSequence([], [], [])
         image_sizes = []
 
-        for batch_index, latent in enumerate(x):
-            position_cursor = 1
-            if cap_sequence is not None:
-                padded_features, position_ids, padding_mask, sequence_length, _ = (
-                    self._pad_with_ids(
-                        cap_feats[batch_index],
-                        (len(cap_feats[batch_index]), 1, 1),
-                        (position_cursor, 0, 0),
-                    )
+        for latent, batch_cap_feats in zip(x, cap_feats):
+            padded_features, position_ids, padding_mask, cap_length, _ = (
+                self._pad_with_ids(
+                    batch_cap_feats, (len(batch_cap_feats), 1, 1), (1, 0, 0)
                 )
-                cap_sequence.features.append(padded_features)
-                cap_sequence.position_ids.append(position_ids)
-                cap_sequence.padding_masks.append(padding_mask)
-                position_cursor += sequence_length
-
-            if glm_sequence is not None:
-                padded_features, position_ids, padding_mask, sequence_length, _ = (
-                    self._pad_with_ids(
-                        glm_features[batch_index],
-                        (len(glm_features[batch_index]), 1, 1),
-                        (position_cursor, 0, 0),
-                    )
-                )
-                glm_sequence.features.append(padded_features)
-                glm_sequence.position_ids.append(position_ids)
-                glm_sequence.padding_masks.append(padding_mask)
-                position_cursor += sequence_length
+            )
+            cap_sequence.features.append(padded_features)
+            cap_sequence.position_ids.append(position_ids)
+            cap_sequence.padding_masks.append(padding_mask)
 
             patches, image_size, token_grid_size = self._patchify_image(
                 latent, patch_size, f_patch_size
             )
-            image_height_start = 0
             padded_features, position_ids, padding_mask, _, _ = self._pad_with_ids(
-                patches,
-                token_grid_size,
-                (position_cursor, image_height_start, 0),
-                sequence_multiple=SEQUENCE_MULTIPLE,
+                patches, token_grid_size, (1 + cap_length, 0, 0)
             )
             image_sequence.features.append(padded_features)
             image_sequence.position_ids.append(position_ids)
             image_sequence.padding_masks.append(padding_mask)
             image_sizes.append(image_size)
 
-        return image_sequence, cap_sequence, glm_sequence, image_sizes
+        return image_sequence, cap_sequence, image_sizes
 
     def _prepare_editing_sequences(
         self,
@@ -986,14 +752,9 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     image, patch_size, f_patch_size
                 )
                 image_token_counts.append(len(patches))
-                image_height_start = 0
                 padded_features, position_ids, padding_mask, _, noise_mask = (
                     self._pad_with_ids(
-                        patches,
-                        token_grid_size,
-                        (position_start, image_height_start, 0),
-                        noise_value,
-                        sequence_multiple=SEQUENCE_MULTIPLE,
+                        patches, token_grid_size, (position_start, 0, 0), noise_value
                     )
                 )
                 batch_image_features.append(padded_features)
@@ -1058,135 +819,69 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         frequency_groups: tuple[torch.Tensor, ...],
         length_groups: tuple[list[int], ...],
         noise_mask_groups: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        def merge(groups: tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+            return [
+                torch.cat(
+                    [
+                        group[batch_index, : lengths[batch_index]]
+                        for group, lengths in zip(groups, length_groups)
+                    ],
+                    dim=0,
+                )
+                for batch_index in range(feature_groups[0].shape[0])
+            ]
+
+        merged_features = merge(feature_groups)
+        attention_mask = _padding_attention_mask(
+            [len(features) for features in merged_features],
+            feature_groups[0].device,
+        )
+        noise_mask = None
+        if noise_mask_groups is not None:
+            noise_mask = pad_sequence(
+                merge(noise_mask_groups), batch_first=True, padding_value=0
+            )
+        return (
+            pad_sequence(merged_features, batch_first=True, padding_value=0.0),
+            pad_sequence(merge(frequency_groups), batch_first=True, padding_value=0.0),
+            attention_mask,
+            noise_mask,
+        )
+
+    def _embed_sequence(
+        self,
+        sequence: _LLaDAImageSequence,
+        embedder: nn.Module,
+        pad_token: torch.Tensor,
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor | None, list[int], torch.Tensor | None
     ]:
-        batch_size = feature_groups[0].shape[0]
-        merged_features = []
-        merged_frequencies = []
-        merged_noise_masks = [] if noise_mask_groups is not None else None
-
-        for batch_index in range(batch_size):
-            device = feature_groups[0].device
-            merged_features.append(
-                torch.cat(
-                    [
-                        features[batch_index, : lengths[batch_index]].to(device)
-                        for features, lengths in zip(feature_groups, length_groups)
-                    ],
-                    dim=0,
-                )
-            )
-            merged_frequencies.append(
-                torch.cat(
-                    [
-                        frequencies[batch_index, : lengths[batch_index]].to(device)
-                        for frequencies, lengths in zip(frequency_groups, length_groups)
-                    ],
-                    dim=0,
-                )
-            )
-            if merged_noise_masks is not None:
-                merged_noise_masks.append(
-                    torch.cat(
-                        [
-                            noise_masks[batch_index, : lengths[batch_index]].to(device)
-                            for noise_masks, lengths in zip(
-                                noise_mask_groups, length_groups
-                            )
-                        ],
-                        dim=0,
-                    )
-                )
-
-        merged_lengths = [len(features) for features in merged_features]
-        merged_features = pad_sequence(
-            merged_features, batch_first=True, padding_value=0.0
-        )
-        merged_frequencies = pad_sequence(
-            merged_frequencies, batch_first=True, padding_value=0.0
-        )
-
-        attention_mask = None
-        max_length = max(merged_lengths)
-        if not all(length == max_length for length in merged_lengths):
-            attention_mask = torch.zeros(
-                (batch_size, max_length),
-                dtype=torch.bool,
-                device=merged_features.device,
-            )
-            for batch_index, sequence_length in enumerate(merged_lengths):
-                attention_mask[batch_index, :sequence_length] = True
-
-        noise_mask = None
-        if merged_noise_masks is not None:
-            noise_mask = pad_sequence(
-                merged_noise_masks, batch_first=True, padding_value=0
-            )[:, : merged_features.shape[1]]
-
-        return (
-            merged_features,
-            merged_frequencies,
-            attention_mask,
-            merged_lengths,
-            noise_mask,
+        lengths = [len(features) for features in sequence.features]
+        features = embedder(torch.cat(sequence.features, dim=0))
+        frequencies = self.rope_embedder(torch.cat(sequence.position_ids, dim=0))
+        return self._batch_sequences(
+            list(features.split(lengths, dim=0)),
+            list(frequencies.split(lengths, dim=0)),
+            sequence.padding_masks,
+            pad_token,
+            sequence.noise_masks,
         )
 
     def forward(
         self,
         x: list[torch.Tensor],
         t: torch.Tensor,
-        cap_feats: list[torch.Tensor] | None,
+        cap_feats: list[torch.Tensor],
         glm_cap_feats: list[torch.Tensor] | None = None,
         source_latents: list[torch.Tensor] | None = None,
         patch_size: int = 1,
         f_patch_size: int = 1,
-        return_dict: bool = True,
-    ) -> Transformer2DModelOutput | tuple[list[torch.Tensor]]:
-        r"""
-        Args:
-            x (`list[torch.Tensor]`):
-                Target latents. Each tensor has shape `(channels, frames, height, width)`.
-            t (`torch.Tensor`):
-                Denoising timestep for each batch item.
-            cap_feats (`list[torch.Tensor]`, *optional*):
-                Projected QueryFormer features, each with shape `(sequence_length, cap_feat_dim)`.
-            glm_cap_feats (`list[torch.Tensor]`, *optional*):
-                GLM/SigVQ features, each with shape `(sequence_length, semantic_feat_dim)`.
-            source_latents (`list[torch.Tensor]`, *optional*):
-                Source-image latents for editing. When provided, `cap_feats` and `glm_cap_feats` are required.
-            patch_size (`int`, defaults to `1`):
-                Spatial patch size.
-            f_patch_size (`int`, defaults to `1`):
-                Temporal patch size.
-            return_dict (`bool`, defaults to `True`):
-                Whether to return a [`~models.modeling_outputs.Transformer2DModelOutput`].
-
-        Returns:
-            [`~models.modeling_outputs.Transformer2DModelOutput`] or `tuple`:
-                The denoised target latents.
-        """
+    ) -> list[torch.Tensor]:
         patch_key = f"{patch_size}-{f_patch_size}"
-        if patch_key not in self.all_x_embedder:
-            raise ValueError(
-                f"Unsupported patch sizes: patch_size={patch_size}, f_patch_size={f_patch_size}."
-            )
-        if source_latents is None and cap_feats is None and glm_cap_feats is None:
-            raise ValueError(
-                "Text-to-image inference requires `cap_feats` or `glm_cap_feats`."
-            )
-        if source_latents is not None and (cap_feats is None or glm_cap_feats is None):
-            raise ValueError(
-                "Editing requires `cap_feats`, `glm_cap_feats`, and `source_latents`."
-            )
-
         batch_size = len(x)
         is_editing = source_latents is not None
-        adaln_input = None
-        noisy_embedding = None
-        clean_embedding = None
         image_offsets = None
-
         if is_editing:
             if t.shape[0] == 1:
                 t = t.repeat(batch_size)
@@ -1194,8 +889,10 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             dual_embedding = self.t_embedder(
                 dual_timestep.abs() * self.t_scale, x[0].dtype
             )
-            noisy_embedding = dual_embedding[:batch_size]
-            clean_embedding = dual_embedding[batch_size:]
+            adaln = {
+                "adaln_noisy": dual_embedding[:batch_size],
+                "adaln_clean": dual_embedding[batch_size:],
+            }
             image_sequence, cap_sequence, sigvq_sequence, image_sizes, image_offsets = (
                 self._prepare_editing_sequences(
                     x,
@@ -1207,410 +904,126 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 )
             )
         else:
-            adaln_input = self.t_embedder(t * self.t_scale, x[0].dtype)
-            glm_features = (
-                [
-                    self.semantic_embedder(batch_features)
-                    for batch_features in glm_cap_feats
-                ]
-                if glm_cap_feats is not None
-                else None
-            )
-            image_sequence, cap_sequence, glm_sequence, image_sizes = (
-                self._prepare_t2i_sequences(
-                    x,
-                    cap_feats,
-                    glm_features,
-                    patch_size,
-                    f_patch_size,
-                )
+            adaln = {"adaln_input": self.t_embedder(t * self.t_scale, x[0].dtype)}
+            image_sequence, cap_sequence, image_sizes = self._prepare_t2i_sequences(
+                x, cap_feats, patch_size, f_patch_size
             )
 
-        image_lengths = [len(features) for features in image_sequence.features]
-        image_features = self.all_x_embedder[patch_key](
-            torch.cat(image_sequence.features, dim=0)
-        )
-        image_frequencies = list(
-            self.rope_embedder(torch.cat(image_sequence.position_ids, dim=0)).split(
-                [len(position_ids) for position_ids in image_sequence.position_ids],
-                dim=0,
+        image_features, image_frequencies, image_mask, image_lengths, image_noise = (
+            self._embed_sequence(
+                image_sequence, self.all_x_embedder[patch_key], self.x_pad_token
             )
         )
-        (
-            image_features,
-            image_frequencies,
-            image_attention_mask,
-            image_lengths,
-            image_noise_mask,
-        ) = self._batch_sequences(
-            list(image_features.split(image_lengths, dim=0)),
-            image_frequencies,
-            image_sequence.padding_masks,
-            self.x_pad_token,
-            image_sequence.noise_masks,
-        )
-
         for layer in self.noise_refiner:
-            if is_editing:
-                image_features = layer(
-                    image_features,
-                    image_attention_mask,
-                    image_frequencies,
-                    noise_mask=image_noise_mask,
-                    adaln_noisy=noisy_embedding,
-                    adaln_clean=clean_embedding,
-                )
-            else:
-                image_features = layer(
-                    image_features,
-                    image_attention_mask,
-                    image_frequencies,
-                    adaln_input,
-                )
+            image_features = layer(
+                image_features,
+                image_mask,
+                image_frequencies,
+                noise_mask=image_noise,
+                **adaln,
+            )
+
+        cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise = (
+            self._embed_sequence(cap_sequence, self.cap_embedder, self.cap_pad_token)
+        )
+        for layer in self.context_refiner:
+            cap_features = layer(cap_features, cap_mask, cap_frequencies)
 
         if is_editing:
-            cap_lengths = [len(features) for features in cap_sequence.features]
-            cap_features = self.cap_embedder(torch.cat(cap_sequence.features, dim=0))
-            cap_frequencies = list(
-                self.rope_embedder(torch.cat(cap_sequence.position_ids, dim=0)).split(
-                    [len(position_ids) for position_ids in cap_sequence.position_ids],
-                    dim=0,
-                )
-            )
-            (
-                cap_features,
-                cap_frequencies,
-                cap_attention_mask,
-                cap_lengths,
-                cap_noise_mask,
-            ) = self._batch_sequences(
-                list(cap_features.split(cap_lengths, dim=0)),
-                cap_frequencies,
-                cap_sequence.padding_masks,
-                self.cap_pad_token,
-                cap_sequence.noise_masks,
-            )
-
-            for layer in self.context_refiner:
-                cap_features = layer(
-                    cap_features,
-                    cap_attention_mask,
-                    cap_frequencies,
-                )
-
-            sigvq_lengths = [len(features) for features in sigvq_sequence.features]
-            sigvq_features = self.sigvq_embedder(
-                torch.cat(sigvq_sequence.features, dim=0)
-            )
-            sigvq_frequencies = list(
-                self.rope_embedder(torch.cat(sigvq_sequence.position_ids, dim=0)).split(
-                    [len(position_ids) for position_ids in sigvq_sequence.position_ids],
-                    dim=0,
-                )
-            )
             (
                 sigvq_features,
                 sigvq_frequencies,
-                sigvq_attention_mask,
+                sigvq_mask,
                 sigvq_lengths,
-                sigvq_noise_mask,
-            ) = self._batch_sequences(
-                list(sigvq_features.split(sigvq_lengths, dim=0)),
-                sigvq_frequencies,
-                sigvq_sequence.padding_masks,
-                self.sigvq_pad_token,
-                sigvq_sequence.noise_masks,
+                sigvq_noise,
+            ) = self._embed_sequence(
+                sigvq_sequence, self.sigvq_embedder, self.sigvq_pad_token
             )
-
             if any(sigvq_lengths):
                 for layer in self.sigvq_refiner:
                     sigvq_features = layer(
-                        sigvq_features,
-                        sigvq_attention_mask,
-                        sigvq_frequencies,
+                        sigvq_features, sigvq_mask, sigvq_frequencies
                     )
-
-            feature_groups = (cap_features, image_features, sigvq_features)
-            frequency_groups = (
-                cap_frequencies,
-                image_frequencies,
-                sigvq_frequencies,
-            )
-            length_groups = (cap_lengths, image_lengths, sigvq_lengths)
-            noise_mask_groups = (
-                cap_noise_mask,
-                image_noise_mask,
-                sigvq_noise_mask,
-            )
-
-            (
-                unified_features,
-                unified_frequencies,
-                unified_attention_mask,
-                _,
-                unified_noise_mask,
-            ) = self._merge_padded_sequences(
-                feature_groups,
-                frequency_groups,
-                length_groups,
-                noise_mask_groups,
+            unified_features, unified_frequencies, unified_mask, unified_noise = (
+                self._merge_padded_sequences(
+                    (cap_features, image_features, sigvq_features),
+                    (cap_frequencies, image_frequencies, sigvq_frequencies),
+                    (cap_lengths, image_lengths, sigvq_lengths),
+                    (cap_noise, image_noise, sigvq_noise),
+                )
             )
         else:
-            condition_feature_groups = []
-            condition_frequency_groups = []
-            condition_length_groups = []
-
-            if cap_sequence is not None:
-                cap_lengths = [len(features) for features in cap_sequence.features]
-                cap_features = self.cap_embedder(
-                    torch.cat(cap_sequence.features, dim=0)
+            unified_features, unified_frequencies, unified_mask, unified_noise = (
+                self._merge_padded_sequences(
+                    (image_features, cap_features),
+                    (image_frequencies, cap_frequencies),
+                    (image_lengths, cap_lengths),
                 )
-                cap_padding_mask = (
-                    torch.cat(cap_sequence.padding_masks)
-                    .unsqueeze(-1)
-                    .to(cap_features.device)
-                )
-                cap_features = torch.where(
-                    cap_padding_mask,
-                    self.cap_pad_token.to(
-                        device=cap_features.device, dtype=cap_features.dtype
-                    ),
-                    cap_features,
-                )
-                cap_features = pad_sequence(
-                    list(cap_features.split(cap_lengths, dim=0)),
-                    batch_first=True,
-                    padding_value=0.0,
-                )
-                cap_frequencies = list(
-                    self.rope_embedder(
-                        torch.cat(cap_sequence.position_ids, dim=0)
-                    ).split(
-                        [
-                            len(position_ids)
-                            for position_ids in cap_sequence.position_ids
-                        ],
-                        dim=0,
-                    )
-                )
-                cap_frequencies = pad_sequence(
-                    cap_frequencies, batch_first=True, padding_value=0.0
-                )
-                condition_feature_groups.append(cap_features)
-                condition_frequency_groups.append(cap_frequencies)
-                condition_length_groups.append(cap_lengths)
-
-            if glm_sequence is not None:
-                glm_lengths = [len(features) for features in glm_sequence.features]
-                glm_features = torch.cat(glm_sequence.features, dim=0)
-                glm_padding_mask = (
-                    torch.cat(glm_sequence.padding_masks)
-                    .unsqueeze(-1)
-                    .to(glm_features.device)
-                )
-                glm_features = torch.where(
-                    glm_padding_mask,
-                    self.cap_pad_token.to(
-                        device=glm_features.device, dtype=glm_features.dtype
-                    ),
-                    glm_features,
-                )
-                glm_features = pad_sequence(
-                    list(glm_features.split(glm_lengths, dim=0)),
-                    batch_first=True,
-                    padding_value=0.0,
-                )
-                glm_frequencies = list(
-                    self.rope_embedder(
-                        torch.cat(glm_sequence.position_ids, dim=0)
-                    ).split(
-                        [
-                            len(position_ids)
-                            for position_ids in glm_sequence.position_ids
-                        ],
-                        dim=0,
-                    )
-                )
-                glm_frequencies = pad_sequence(
-                    glm_frequencies, batch_first=True, padding_value=0.0
-                )
-                condition_feature_groups.append(glm_features)
-                condition_frequency_groups.append(glm_frequencies)
-                condition_length_groups.append(glm_lengths)
-
-            (
-                condition_features,
-                condition_frequencies,
-                condition_attention_mask,
-                condition_lengths,
-                _,
-            ) = self._merge_padded_sequences(
-                tuple(condition_feature_groups),
-                tuple(condition_frequency_groups),
-                tuple(condition_length_groups),
-            )
-
-            for layer in self.context_refiner:
-                condition_features = layer(
-                    condition_features,
-                    condition_attention_mask,
-                    condition_frequencies,
-                )
-
-            (
-                unified_features,
-                unified_frequencies,
-                unified_attention_mask,
-                _,
-                unified_noise_mask,
-            ) = self._merge_padded_sequences(
-                (image_features, condition_features),
-                (image_frequencies, condition_frequencies),
-                (image_lengths, condition_lengths),
             )
 
         for layer in self.layers:
-            if is_editing:
-                unified_features = layer(
-                    unified_features,
-                    unified_attention_mask,
-                    unified_frequencies,
-                    noise_mask=unified_noise_mask,
-                    adaln_noisy=noisy_embedding,
-                    adaln_clean=clean_embedding,
-                )
-            else:
-                unified_features = layer(
-                    unified_features,
-                    unified_attention_mask,
-                    unified_frequencies,
-                    adaln_input,
-                )
-
-        if is_editing:
-            unified_features = self.all_final_layer[patch_key](
+            unified_features = layer(
                 unified_features,
-                noise_mask=unified_noise_mask,
-                adaln_noisy=noisy_embedding,
-                adaln_clean=clean_embedding,
+                unified_mask,
+                unified_frequencies,
+                noise_mask=unified_noise,
+                **adaln,
             )
-        else:
-            unified_features = self.all_final_layer[patch_key](
-                unified_features,
-                adaln_input=adaln_input,
-            )
-
-        output = self._unpatchify(
+        unified_features = self.all_final_layer[patch_key](
+            unified_features, noise_mask=unified_noise, **adaln
+        )
+        return self._unpatchify(
             list(unified_features.unbind(dim=0)),
             image_sizes,
             patch_size,
             f_patch_size,
             image_offsets,
         )
-        if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
 
 
-@dataclass
-class LLaDAImageQueryFormerOutput(BaseOutput):
-    query_embeds: torch.Tensor
-
-
-class LLaDAImageQueryAttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
-
-    def __call__(
-        self,
-        attn: "LLaDAImageQueryAttention",
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        query = F.linear(
-            hidden_states,
-            attn.in_proj_weight[: attn.inner_dim],
-            attn.in_proj_bias[: attn.inner_dim],
-        )
-        key = F.linear(
-            encoder_hidden_states,
-            attn.in_proj_weight[attn.inner_dim : 2 * attn.inner_dim],
-            attn.in_proj_bias[attn.inner_dim : 2 * attn.inner_dim],
-        )
-        value = F.linear(
-            encoder_hidden_states,
-            attn.in_proj_weight[2 * attn.inner_dim :],
-            attn.in_proj_bias[2 * attn.inner_dim :],
-        )
-
-        query = query.unflatten(-1, (attn.heads, attn.head_dim))
-        key = key.unflatten(-1, (attn.heads, attn.head_dim))
-        value = value.unflatten(-1, (attn.heads, attn.head_dim))
-
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, None, None, :]
-
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=attn.dropout if attn.training else 0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        return attn.out_proj(hidden_states)
-
-
-class LLaDAImageQueryAttention(nn.Module, AttentionModuleMixin):
-    _default_processor_cls = LLaDAImageQueryAttnProcessor
-    _available_processors: ClassVar[list[type]] = [LLaDAImageQueryAttnProcessor]
-    _supports_qkv_fusion = False
-
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float):
+class LLaDAImageQueryAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int):
         super().__init__()
-        self.inner_dim = hidden_size
         self.heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.dropout = dropout
-
         self.in_proj_weight = nn.Parameter(torch.zeros(3 * hidden_size, hidden_size))
         self.in_proj_bias = nn.Parameter(torch.zeros(3 * hidden_size))
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.set_processor(self._default_processor_cls())
-
-        nn.init.xavier_uniform_(self.in_proj_weight)
-        nn.init.zeros_(self.in_proj_bias)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        return self.processor(
-            self, hidden_states, encoder_hidden_states, attention_mask
+        weights = self.in_proj_weight.chunk(3)
+        biases = self.in_proj_bias.chunk(3)
+        query, key, value = (
+            F.linear(inputs, weight, bias).unflatten(-1, (self.heads, self.head_dim))
+            for inputs, weight, bias in zip(
+                (hidden_states, encoder_hidden_states, encoder_hidden_states),
+                weights,
+                biases,
+            )
         )
+        hidden_states = dispatch_attention_fn(
+            query, key, value, attn_mask=attention_mask[:, None, None, :]
+        )
+        return self.out_proj(hidden_states.flatten(2, 3))
 
 
-@maybe_allow_in_graph
 class LLaDAImageQueryFormerBlock(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         intermediate_size: int,
-        dropout: float,
         norm_eps: float,
     ):
         super().__init__()
         self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
         self.norm_k = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
-        self.cross_attn = LLaDAImageQueryAttention(hidden_size, num_heads, dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.cross_attn = LLaDAImageQueryAttention(hidden_size, num_heads)
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
         self.mlp = nn.Module()
         self.mlp.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
@@ -1620,48 +1033,21 @@ class LLaDAImageQueryFormerBlock(nn.Module):
         self,
         query_embeds: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         query_embeds = self.norm_q(query_embeds)
         encoder_hidden_states = self.norm_k(encoder_hidden_states)
-        attention_output = self.cross_attn(
+        query_embeds = query_embeds + self.cross_attn(
             query_embeds, encoder_hidden_states, attention_mask
         )
-        query_embeds = query_embeds + self.dropout(attention_output)
         query_embeds = self.norm1(query_embeds)
-        mlp_output = self.mlp.fc2(
+        return query_embeds + self.mlp.fc2(
             F.gelu(self.mlp.fc1(query_embeds), approximate="tanh")
         )
-        return query_embeds + self.dropout(mlp_output)
 
 
-class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin, AttentionMixin):
-    r"""
-    QueryFormer used by LLaDA-Image to derive learnable image-generation queries from LLaDA token embeddings.
-
-    This model is independent from the LLaDA text encoder. It returns refined query embeddings. The pipeline appends
-    them to the text embeddings and invokes the text encoder backbone.
-
-    Args:
-        num_queries (`int`, defaults to `256`):
-            Number of learnable query tokens.
-        hidden_size (`int`, defaults to `2048`):
-            Query and LLaDA token embedding dimension.
-        num_hidden_layers (`int`, defaults to `1`):
-            Number of QueryFormer blocks.
-        num_attention_heads (`int`, defaults to `16`):
-            Number of cross-attention heads.
-        intermediate_size (`int`, defaults to `8192`):
-            Hidden dimension of the QueryFormer MLP.
-        dropout (`float`, defaults to `0.0`):
-            Dropout probability.
-        norm_eps (`float`, defaults to `1e-6`):
-            Epsilon used by parameter-free layer normalization.
-    """
-
-    _no_split_modules: ClassVar[list[str]] = ["LLaDAImageQueryFormerBlock"]
-    _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageQueryFormerBlock"]
-    _skip_layerwise_casting_patterns: ClassVar[list[str]] = ["norm"]
+class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin):
+    """Derives the image-generation query tokens from LLaDA token embeddings."""
 
     @register_to_config
     def __init__(
@@ -1675,154 +1061,73 @@ class LLaDAImageQueryFormerModel(ModelMixin, ConfigMixin, AttentionMixin):
         norm_eps: float = 1e-6,
     ):
         super().__init__()
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                f"`hidden_size` ({hidden_size}) must be divisible by `num_attention_heads` ({num_attention_heads})."
-            )
-
         self.meta_queries = nn.Parameter(torch.zeros(num_queries, hidden_size))
-        nn.init.normal_(self.meta_queries, std=1 / math.sqrt(hidden_size))
         self.query_blocks = nn.ModuleList(
-            [
-                LLaDAImageQueryFormerBlock(
-                    hidden_size,
-                    num_attention_heads,
-                    intermediate_size,
-                    dropout,
-                    norm_eps,
-                )
-                for _ in range(num_hidden_layers)
-            ]
+            LLaDAImageQueryFormerBlock(
+                hidden_size, num_attention_heads, intermediate_size, norm_eps
+            )
+            for _ in range(num_hidden_layers)
         )
 
     def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        return_dict: bool = True,
-    ) -> LLaDAImageQueryFormerOutput | tuple[torch.Tensor]:
-        r"""
-        Args:
-            inputs_embeds (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                LLaDA input token embeddings.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`):
-                Mask whose nonzero entries identify valid text tokens.
-            return_dict (`bool`, defaults to `True`):
-                Whether to return [`LLaDAImageQueryFormerOutput`] instead of a tuple.
-
-        Returns:
-            [`LLaDAImageQueryFormerOutput`] or `tuple`:
-                The refined query embeddings.
-        """
-        batch_size = inputs_embeds.shape[0]
-        query_embeds = self.meta_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        attention_mask = attention_mask.bool()
-
-        for query_block in self.query_blocks:
-            query_embeds = query_block(query_embeds, inputs_embeds, attention_mask)
-
-        if not return_dict:
-            return (query_embeds,)
-        return LLaDAImageQueryFormerOutput(query_embeds=query_embeds)
-
-
-@dataclass
-class LLaDAImageTextProjectionOutput(BaseOutput):
-    hidden_states: torch.Tensor
-
-
-class LLaDAImageTextProjectionAttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
-
-    def __call__(
-        self,
-        attn: "LLaDAImageTextProjectionAttention",
-        hidden_states: torch.Tensor,
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        query = attn.q_proj(hidden_states).unflatten(-1, (attn.heads, attn.head_dim))
-        key = attn.k_proj(hidden_states).unflatten(-1, (attn.heads, attn.head_dim))
-        value = attn.v_proj(hidden_states).unflatten(-1, (attn.heads, attn.head_dim))
-
-        query = attn.q_norm(query)
-        key = attn.k_norm(key)
-
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=attn.dropout if attn.training else 0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
+        query_embeds = self.meta_queries.unsqueeze(0).expand(
+            inputs_embeds.shape[0], -1, -1
         )
-        hidden_states = hidden_states.flatten(2, 3)
-        return attn.out_proj(hidden_states)
+        for query_block in self.query_blocks:
+            query_embeds = query_block(
+                query_embeds, inputs_embeds, attention_mask.bool()
+            )
+        return query_embeds
 
 
-class LLaDAImageTextProjectionAttention(nn.Module, AttentionModuleMixin):
-    _default_processor_cls = LLaDAImageTextProjectionAttnProcessor
-    _available_processors: ClassVar[list[type]] = [
-        LLaDAImageTextProjectionAttnProcessor
-    ]
-    _supports_qkv_fusion = False
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        attention_dropout: float,
-        norm_eps: float,
-    ):
+class LLaDAImageTextProjectionAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_attention_heads: int, norm_eps: float):
         super().__init__()
         self.heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
-        self.dropout = attention_dropout
-
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps, elementwise_affine=False)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps, elementwise_affine=False)
-        self.set_processor(self._default_processor_cls())
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.processor(self, hidden_states)
+        heads = (self.heads, self.head_dim)
+        query = self.q_norm(self.q_proj(hidden_states).unflatten(-1, heads))
+        key = self.k_norm(self.k_proj(hidden_states).unflatten(-1, heads))
+        value = self.v_proj(hidden_states).unflatten(-1, heads)
+        hidden_states = dispatch_attention_fn(query, key, value)
+        return self.out_proj(hidden_states.flatten(2, 3))
 
 
-class LLaDAImageTextProjectionMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+class LLaDAImageMLP(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, approximate: str):
         super().__init__()
+        self.approximate = approximate
         self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
         self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = F.gelu(hidden_states, approximate="tanh")
-        return self.fc2(hidden_states)
+        return self.fc2(F.gelu(self.fc1(hidden_states), approximate=self.approximate))
 
 
-@maybe_allow_in_graph
 class LLaDAImageTextProjectionBlock(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         num_attention_heads: int,
-        attention_dropout: float,
         norm_eps: float,
     ):
         super().__init__()
         self.self_attn = LLaDAImageTextProjectionAttention(
-            hidden_size,
-            num_attention_heads,
-            attention_dropout,
-            norm_eps,
+            hidden_size, num_attention_heads, norm_eps
         )
         self.layer_norm1 = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
-        self.mlp = LLaDAImageTextProjectionMLP(hidden_size, intermediate_size)
+        self.mlp = LLaDAImageMLP(hidden_size, intermediate_size, approximate="tanh")
         self.layer_norm2 = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1831,34 +1136,8 @@ class LLaDAImageTextProjectionBlock(nn.Module):
         return hidden_states
 
 
-class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin, AttentionMixin):
-    r"""
-    Connector and output projection used to map LLaDA hidden states to the LLaDA-Image denoiser context dimension.
-
-    Args:
-        hidden_size (`int`, defaults to `2048`):
-            Input and connector hidden dimension.
-        intermediate_size (`int`, defaults to `8960`):
-            Connector MLP hidden dimension.
-        num_hidden_layers (`int`, defaults to `6`):
-            Number of connector layers.
-        num_attention_heads (`int`, defaults to `32`):
-            Number of connector self-attention heads.
-        projection_dim (`int`, defaults to `2560`):
-            Output dimension expected by the denoising transformer.
-        attention_dropout (`float`, defaults to `0.0`):
-            Attention dropout probability.
-        norm_eps (`float`, defaults to `1e-6`):
-            Epsilon used by parameter-free RMS normalization.
-    """
-
-    _no_split_modules: ClassVar[list[str]] = ["LLaDAImageTextProjectionBlock"]
-    _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageTextProjectionBlock"]
-    _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
-        "layer_norm",
-        "q_norm",
-        "k_norm",
-    ]
+class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin):
+    """Maps LLaDA hidden states to the denoiser caption dimension."""
 
     @register_to_config
     def __init__(
@@ -1872,117 +1151,37 @@ class LLaDAImageTextProjectionModel(ModelMixin, ConfigMixin, AttentionMixin):
         norm_eps: float = 1e-6,
     ):
         super().__init__()
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                f"`hidden_size` ({hidden_size}) must be divisible by `num_attention_heads` ({num_attention_heads})."
-            )
-
         self.layers = nn.ModuleList(
-            [
-                LLaDAImageTextProjectionBlock(
-                    hidden_size,
-                    intermediate_size,
-                    num_attention_heads,
-                    attention_dropout,
-                    norm_eps,
-                )
-                for _ in range(num_hidden_layers)
-            ]
+            LLaDAImageTextProjectionBlock(
+                hidden_size, intermediate_size, num_attention_heads, norm_eps
+            )
+            for _ in range(num_hidden_layers)
         )
         self.projector = nn.Linear(hidden_size, projection_dim, bias=True)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        return_dict: bool = True,
-    ) -> LLaDAImageTextProjectionOutput | tuple[torch.Tensor]:
-        r"""
-        Args:
-            hidden_states (`torch.Tensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                Hidden states produced by the LLaDA text backbone.
-            return_dict (`bool`, defaults to `True`):
-                Whether to return [`LLaDAImageTextProjectionOutput`] instead of a tuple.
-
-        Returns:
-            [`LLaDAImageTextProjectionOutput`] or `tuple`:
-                Hidden states projected to the denoiser caption dimension.
-        """
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             hidden_states = layer(hidden_states)
-
-        hidden_states = self.projector(hidden_states)
-        if not return_dict:
-            return (hidden_states,)
-        return LLaDAImageTextProjectionOutput(hidden_states=hidden_states)
+        return self.projector(hidden_states)
 
 
-@dataclass
-class LLaDAImageSigVQOutput(BaseOutput):
-    semantic_features: torch.Tensor
-    token_ids: torch.Tensor
-
-
-class LLaDAImageSigVQAttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
-
-    def __call__(
-        self, attn: "LLaDAImageSigVQAttention", hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        query, key, value = attn.qkv(hidden_states).chunk(3, dim=-1)
-        query = query.unflatten(-1, (attn.heads, attn.head_dim))
-        key = key.unflatten(-1, (attn.heads, attn.head_dim))
-        value = value.unflatten(-1, (attn.heads, attn.head_dim))
-
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=attn.dropout if attn.training else 0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        return attn.proj(hidden_states)
-
-
-class LLaDAImageSigVQAttention(nn.Module, AttentionModuleMixin):
-    _default_processor_cls = LLaDAImageSigVQAttnProcessor
-    _available_processors: ClassVar[list[type]] = [LLaDAImageSigVQAttnProcessor]
-    _supports_qkv_fusion = False
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        attention_bias: bool,
-        attention_dropout: float,
-    ):
+class LLaDAImageSigVQAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_attention_heads: int, bias: bool):
         super().__init__()
         self.heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
-        self.dropout = attention_dropout
-        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=attention_bias)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
-        self.set_processor(self._default_processor_cls())
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=bias)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.processor(self, hidden_states)
+        query, key, value = (
+            tensor.unflatten(-1, (self.heads, self.head_dim))
+            for tensor in self.qkv(hidden_states).chunk(3, dim=-1)
+        )
+        hidden_states = dispatch_attention_fn(query, key, value)
+        return self.proj(hidden_states.flatten(2, 3))
 
 
-class LLaDAImageSigVQMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(hidden_states)))
-
-
-@maybe_allow_in_graph
 class LLaDAImageSigVQVisionBlock(nn.Module):
     def __init__(
         self,
@@ -1990,19 +1189,15 @@ class LLaDAImageSigVQVisionBlock(nn.Module):
         intermediate_size: int,
         num_attention_heads: int,
         attention_bias: bool,
-        attention_dropout: float,
         norm_eps: float,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, eps=norm_eps)
         self.norm2 = nn.LayerNorm(hidden_size, eps=norm_eps)
         self.attn = LLaDAImageSigVQAttention(
-            hidden_size,
-            num_attention_heads,
-            attention_bias,
-            attention_dropout,
+            hidden_size, num_attention_heads, attention_bias
         )
-        self.mlp = LLaDAImageSigVQMLP(hidden_size, intermediate_size)
+        self.mlp = LLaDAImageMLP(hidden_size, intermediate_size, approximate="none")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
@@ -2013,7 +1208,6 @@ class LLaDAImageSigVQVisionBlock(nn.Module):
 class LLaDAImageSigVQPatchEmbed(nn.Module):
     def __init__(self, in_channels: int, hidden_size: int, patch_size: int):
         super().__init__()
-        self.in_channels = in_channels
         self.patch_size = patch_size
         self.proj = nn.Conv2d(
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
@@ -2109,23 +1303,8 @@ class LLaDAImageSigVQQuantizer(nn.Module):
         return torch.argmin(distances, dim=1)
 
 
-class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
-    r"""
-    Minimal GLM SigVQ image encoder used by LLaDA-Image editing.
-
-    The model contains only the GLM vision encoder, VQ quantizer, and prior token projection used during inference.
-    Input images must already be RGB tensors normalized to `[-1, 1]`, have one common size, and be divisible by
-    `patch_size`.
-    """
-
-    _no_split_modules: ClassVar[list[str]] = ["LLaDAImageSigVQVisionBlock"]
-    _repeated_blocks: ClassVar[list[str]] = ["LLaDAImageSigVQVisionBlock"]
-    _skip_layerwise_casting_patterns: ClassVar[list[str]] = [
-        "patch_embed",
-        "position_embedding",
-        "norm",
-        "quantize",
-    ]
+class LLaDAImageSigVQModel(ModelMixin, ConfigMixin):
+    """GLM SigVQ image encoder, quantizer, and prior projection for editing."""
 
     @register_to_config
     def __init__(
@@ -2145,11 +1324,6 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
         semantic_embed_dim: int = 4096,
     ):
         super().__init__()
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                f"`hidden_size` ({hidden_size}) must be divisible by `num_attention_heads` ({num_attention_heads})."
-            )
-
         self.visual = nn.Module()
         self.visual.patch_embed = LLaDAImageSigVQPatchEmbed(
             in_channels, hidden_size, patch_size
@@ -2158,17 +1332,14 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
             image_size, patch_size, hidden_size
         )
         self.visual.blocks = nn.ModuleList(
-            [
-                LLaDAImageSigVQVisionBlock(
-                    hidden_size,
-                    intermediate_size,
-                    num_attention_heads,
-                    attention_bias,
-                    attention_dropout,
-                    norm_eps,
-                )
-                for _ in range(num_hidden_layers)
-            ]
+            LLaDAImageSigVQVisionBlock(
+                hidden_size,
+                intermediate_size,
+                num_attention_heads,
+                attention_bias,
+                norm_eps,
+            )
+            for _ in range(num_hidden_layers)
         )
 
         self.vqmodel = nn.Module()
@@ -2187,74 +1358,22 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin, AttentionMixin):
             activation_fn="linear-silu",
         )
 
-    def forward(
-        self,
-        pixel_values: torch.Tensor | None = None,
-        token_ids: torch.Tensor | None = None,
-        return_dict: bool = True,
-    ) -> LLaDAImageSigVQOutput | tuple[torch.Tensor, torch.Tensor]:
-        r"""
-        Args:
-            pixel_values (`torch.Tensor` of shape `(batch_size, 3, height, width)`, *optional*):
-                RGB images normalized to `[-1, 1]`. Mutually exclusive with `token_ids`.
-            token_ids (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Precomputed VQ codebook IDs. Mutually exclusive with `pixel_values`.
-            return_dict (`bool`, defaults to `True`):
-                Whether to return [`LLaDAImageSigVQOutput`] instead of a tuple.
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Map RGB images in [-1, 1] to projected semantic features."""
+        batch_size, _, height, width = pixel_values.shape
+        grid_height = height // self.config.patch_size
+        grid_width = width // self.config.patch_size
+        hidden_states = self.visual.patch_embed(pixel_values)
+        hidden_states = self.visual.embeddings(hidden_states, grid_height, grid_width)
+        for block in self.visual.blocks:
+            hidden_states = block(hidden_states)
 
-        Returns:
-            [`LLaDAImageSigVQOutput`] or `tuple`:
-                The projected semantic features and their discrete token IDs.
-        """
-        if (pixel_values is None) == (token_ids is None):
-            raise ValueError("Provide exactly one of `pixel_values` or `token_ids`.")
-
-        if pixel_values is not None:
-            if pixel_values.ndim != 4:
-                raise ValueError(
-                    f"`pixel_values` must have 4 dimensions, got shape {tuple(pixel_values.shape)}."
-                )
-            height, width = pixel_values.shape[-2:]
-            if (
-                height % self.config.patch_size != 0
-                or width % self.config.patch_size != 0
-            ):
-                raise ValueError(
-                    f"Image height and width must be divisible by {self.config.patch_size}, got {height}x{width}."
-                )
-
-            grid_height = height // self.config.patch_size
-            grid_width = width // self.config.patch_size
-            hidden_states = self.visual.patch_embed(pixel_values)
-            hidden_states = self.visual.embeddings(
-                hidden_states, grid_height, grid_width
-            )
-
-            for block in self.visual.blocks:
-                hidden_states = block(hidden_states)
-
-            hidden_states = hidden_states.transpose(1, 2).reshape(
-                pixel_values.shape[0],
-                self.config.hidden_size,
-                grid_height,
-                grid_width,
-            )
-            hidden_states = self.vqmodel.quant_conv(hidden_states)
-            token_ids = self.vqmodel.quantize(hidden_states).reshape(
-                pixel_values.shape[0], -1
-            )
-        elif token_ids.ndim != 2:
-            raise ValueError(
-                f"`token_ids` must have 2 dimensions, got shape {tuple(token_ids.shape)}."
-            )
-
-        semantic_features = self.prior_projector(self.prior_token_embedding(token_ids))
-
-        if not return_dict:
-            return semantic_features, token_ids
-        return LLaDAImageSigVQOutput(
-            semantic_features=semantic_features, token_ids=token_ids
+        hidden_states = hidden_states.transpose(1, 2).reshape(
+            batch_size, self.config.hidden_size, grid_height, grid_width
         )
+        hidden_states = self.vqmodel.quant_conv(hidden_states)
+        token_ids = self.vqmodel.quantize(hidden_states).reshape(batch_size, -1)
+        return self.prior_projector(self.prior_token_embedding(token_ids))
 
 
 class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
@@ -2288,64 +1407,24 @@ class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
         """Run model-specific post-load fixups (none are required)."""
         return
 
-    @staticmethod
-    def _as_feature_list(
-        features: torch.Tensor | list[torch.Tensor],
-        attention_mask: torch.Tensor | list[torch.Tensor] | None = None,
-    ) -> list[torch.Tensor]:
-        if isinstance(features, list):
-            return features
-        if features.ndim == 2:
-            return [features]
-        if features.ndim != 3:
-            raise ValueError(
-                "LLaDA-Image condition features must have two or three dimensions"
-            )
-        if attention_mask is None:
-            return list(features.unbind(dim=0))
-        if isinstance(attention_mask, list):
-            attention_mask = torch.stack(attention_mask)
-        return [sample[mask.bool()] for sample, mask in zip(features, attention_mask)]
-
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | list[torch.Tensor],
+        encoder_hidden_states: list[torch.Tensor],
         timestep: torch.Tensor,
-        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
-        encoder_attention_mask: torch.Tensor | list[torch.Tensor] | None = None,
+        encoder_hidden_states_image: list[torch.Tensor] | None = None,
         source_latents: list[torch.Tensor] | None = None,
-        guidance=None,
         **kwargs,
     ) -> torch.Tensor:
-        del guidance, kwargs
-        if hidden_states.ndim != 4:
-            raise ValueError(
-                "LLaDA-Image latents must have shape [batch, channels, height, width]"
-            )
-
+        del kwargs
         model_dtype = next(self.parameters()).dtype
-        latent_list = [latent.unsqueeze(1).to(model_dtype) for latent in hidden_states]
-        cap_feats = self._as_feature_list(encoder_hidden_states, encoder_attention_mask)
-        glm_cap_feats = (
-            None
-            if encoder_hidden_states_image is None
-            or (
-                isinstance(encoder_hidden_states_image, list)
-                and not encoder_hidden_states_image
-            )
-            else self._as_feature_list(encoder_hidden_states_image)
-        )
-        output = (
-            super()
-            .forward(
-                x=latent_list,
-                t=(timestep / 1000.0).to(model_dtype),
-                cap_feats=cap_feats,
-                glm_cap_feats=glm_cap_feats,
-                source_latents=source_latents,
-            )
-            .sample
+        output = super().forward(
+            x=[latent.unsqueeze(1).to(model_dtype) for latent in hidden_states],
+            t=(timestep / 1000.0).to(model_dtype),
+            cap_feats=encoder_hidden_states,
+            # Text-to-image passes no SigVQ features.
+            glm_cap_feats=encoder_hidden_states_image or None,
+            source_latents=source_latents,
         )
         return -torch.stack(output, dim=0).squeeze(2).float()
 

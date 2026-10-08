@@ -7,6 +7,9 @@ from sglang.multimodal_gen.configs.models.dits.llada_image import (
     LLaDAImageArchConfig,
     editing_rope_rows,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
+    LLaDAImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.llada_image import (
     LLaDAImageSamplingParams,
     LLaDAImageTurboSamplingParams,
@@ -50,6 +53,16 @@ class TestLLaDAImageConfig(unittest.TestCase):
 
         self.assertLessEqual(rows(1904), limit)
         self.assertGreater(rows(1920), limit)
+
+    def test_unservable_editing_sizes_are_rejected_at_validation(self):
+        """Edits off the SigVQ grid or past the RoPE table fail before any GPU work."""
+        config = LLaDAImagePipelineConfig()
+        config.validate_output_size(1008, 1008, editing=False)
+        config.validate_output_size(1024, 1024, editing=True)
+        with self.assertRaisesRegex(ValueError, "divisible by 32"):
+            config.validate_output_size(1008, 1008, editing=True)
+        with self.assertRaisesRegex(ValueError, "sequence positions"):
+            config.validate_output_size(2048, 2048, editing=True)
 
 
 if __name__ == "__main__":

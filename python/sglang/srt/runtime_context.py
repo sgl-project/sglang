@@ -629,8 +629,6 @@ class Resources(_FlagGroupBase):
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
     buffers: dict = msgspec.field(default_factory=dict)
-    # The weight data parallel manager belongs to the model using it.
-    dwdp_manager: Any = None
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
@@ -1640,12 +1638,16 @@ def get_buffer(name: str, factory: Any) -> Any:
     return _CONTEXT.get_buffer(name, factory)
 
 
+_GLOBAL_DWDP_MANAGER: Any = None
+
+
 def get_global_dwdp_manager() -> Any:
-    return _CONTEXT.resources.dwdp_manager
+    return _GLOBAL_DWDP_MANAGER
 
 
 def set_global_dwdp_manager(manager: Any) -> None:
-    _CONTEXT.resources.dwdp_manager = manager
+    global _GLOBAL_DWDP_MANAGER
+    _GLOBAL_DWDP_MANAGER = manager
 
 
 def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:

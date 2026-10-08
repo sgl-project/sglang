@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 from array import array
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -29,21 +27,10 @@ def _resolve_llada_image_component_path(
     server_args: ServerArgs,
     component_name: str,
 ) -> str:
-    override_path = (getattr(server_args, "component_paths", {}) or {}).get(
-        component_name
-    )
+    override_path = server_args.component_paths.get(component_name)
     if override_path is not None:
         return prepare_diffusers_component_path_for_loading(override_path)
     return str(Path(model_root) / component_name)
-
-
-def ensure_conditioning_mask_active(attn_backend) -> None:
-    """Fail closed if the conditioning block mask did not reach the backend."""
-    if not attn_backend.conditioning_mask_active:
-        raise RuntimeError(
-            "LLaDA-Image conditioning ran without its block attention mask "
-            "because the forward batch lost the conditioning text lengths"
-        )
 
 
 def format_llada_image_prompt(prompt: str | None) -> str:
@@ -99,8 +86,6 @@ class LLaDAImageTextEncoderRunner:
         )
         device = get_local_torch_device()
         gpu_id = device.index
-        if gpu_id is None:
-            gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
         nccl_port = server_args.nccl_port or 29500
         srt_args = SRTServerArgs(
             model_path=text_encoder_path,
@@ -117,9 +102,6 @@ class LLaDAImageTextEncoderRunner:
             max_prefill_tokens=8192,
             max_total_tokens=8192,
             max_running_requests=2,
-            mem_fraction_static=(
-                server_args.pipeline_config.text_encoder_mem_fraction_static
-            ),
         )
         self.runtime_context = create_context(
             srt_args,
@@ -175,20 +157,14 @@ class LLaDAImageTextEncoderRunner:
         input_ids: torch.Tensor,
         sequence_lengths: list[int],
         text_lengths: list[int],
-        component_context=None,
+        component_context,
     ) -> torch.Tensor:
-        model = self.model_runner.model
-        embeddings = model.get_input_embeddings()
+        embeddings = self.model_runner.model.get_input_embeddings()
         inputs = []
         offset = 0
-        context = (
-            nullcontext(self.queryformer)
-            if component_context is None
-            else component_context(
-                component_name="queryformer", module=self.queryformer
-            )
-        )
-        with context as queryformer:
+        with component_context(
+            component_name="queryformer", module=self.queryformer
+        ) as queryformer:
             assert queryformer is not None
             queryformer_dtype = queryformer.dtype
             for sequence_length, text_length in zip(
@@ -202,13 +178,7 @@ class LLaDAImageTextEncoderRunner:
                 query_embeds = queryformer(
                     text_embeds.unsqueeze(0).to(dtype=queryformer_dtype),
                     text_mask,
-                ).query_embeds
-                query_count = sequence_length - text_length
-                if query_embeds.shape[1] != query_count:
-                    raise RuntimeError(
-                        f"QueryFormer returned {query_embeds.shape[1]} queries, "
-                        f"expected {query_count}"
-                    )
+                )
                 inputs.append(
                     torch.cat(
                         [text_embeds, query_embeds.squeeze(0).to(text_embeds.dtype)],
@@ -216,16 +186,10 @@ class LLaDAImageTextEncoderRunner:
                     )
                 )
                 offset += sequence_length
-        if offset != input_ids.numel():
-            raise ValueError(
-                f"Conditioning spans {offset} tokens, got {input_ids.numel()}"
-            )
         return torch.cat(inputs, dim=0)
 
     @torch.no_grad()
-    def encode(
-        self, prompts: list[str], max_sequence_length: int, component_context=None
-    ):
+    def encode(self, prompts: list[str], max_sequence_length: int, component_context):
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_parallel_state
         import sglang.srt.distributed.parallel_state as srt_parallel_state
         from sglang.srt.runtime_context import use_context
@@ -245,7 +209,7 @@ class LLaDAImageTextEncoderRunner:
                 srt_parallel_state._ATTN_TP = saved_attn_tp
 
     def _encode_impl(
-        self, prompts: list[str], max_sequence_length: int, component_context=None
+        self, prompts: list[str], max_sequence_length: int, component_context
     ):
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
         from sglang.srt.managers.schedule_batch import Req as SRTReq
@@ -349,23 +313,18 @@ class LLaDAImageTextEncoderRunner:
             )
             forward_batch.llada_image_conditioning_text_lens_cpu = text_lengths
             model_output = self.model_runner.forward(forward_batch=forward_batch)
-            ensure_conditioning_mask_active(self.model_runner.attn_backend)
-            hidden_states = model_output.logits_output.hidden_states
-            if not isinstance(hidden_states, torch.Tensor):
-                raise TypeError(
-                    "SGLang did not return full LLaDA-Image conditioning states"
+            if not self.model_runner.attn_backend.conditioning_mask_active:
+                raise RuntimeError(
+                    "LLaDA-Image conditioning ran without its block attention mask "
+                    "because the forward batch lost the conditioning text lengths"
                 )
+            hidden_states = model_output.logits_output.hidden_states
 
             projected = []
             offset = 0
-            context = (
-                nullcontext(self.text_projection)
-                if component_context is None
-                else component_context(
-                    component_name="text_projection", module=self.text_projection
-                )
-            )
-            with context as text_projection:
+            with component_context(
+                component_name="text_projection", module=self.text_projection
+            ) as text_projection:
                 assert text_projection is not None
                 projection_dtype = text_projection.dtype
                 for sequence_length in sequence_lengths:
@@ -373,17 +332,17 @@ class LLaDAImageTextEncoderRunner:
                         hidden_states[offset : offset + sequence_length]
                         .unsqueeze(0)
                         .to(dtype=projection_dtype)
-                    ).hidden_states
+                    )
                     projected.append(output.squeeze(0))
                     offset += sequence_length
             return projected
         finally:
             for req in reqs:
-                if req.kv is not None:
+                if not req.kv.is_kv_released:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
-                elif req.req_pool_idx is not None:
-                    # KV alloc failed after the slot grab. Freeing the bare
-                    # slot avoids the release_kv_cache lifecycle assert.
+                elif req.kv.holds_kv:
+                    # KV alloc failed after the row grab. Freeing the bare row
+                    # avoids the release_kv_cache lifecycle assert.
                     self.req_to_token_pool.free(req)
 
 

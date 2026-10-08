@@ -6,12 +6,23 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.models.dits.llada_image import LLaDAImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.llada_image import (
+    LLaDAImageDitConfig,
+    editing_rope_rows,
+)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.flux import _unpatchify_latents
+
+
+def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
+    variance = vae.bn.running_var.view(1, -1, 1, 1)
+    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
+    return mean, std
 
 
 @dataclass
@@ -20,7 +31,6 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     should_use_guidance: bool = False
 
     dit_config: LLaDAImageDitConfig = field(default_factory=LLaDAImageDitConfig)
-    dit_precision: str = "bf16"
     vae_config: Flux2VAEConfig = field(default_factory=Flux2VAEConfig)
     vae_precision: str = "bf16"
     vae_tiling: bool = False
@@ -32,7 +42,8 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     postprocess_text_funcs: tuple = ()
 
     latent_scale_factor: int = 16
-    text_encoder_mem_fraction_static: float | None = None
+    # Editing feeds the source to SigVQ at half size, and its patch is 16 pixels.
+    editing_size_multiple: int = 32
     # The embedded text worker admits 8192 prefill tokens shared by the two
     # CFG sequences and each sequence appends 256 query tokens.
     max_request_text_tokens: int = 3584
@@ -46,11 +57,9 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         del num_frames
-        if batch.height % self.latent_scale_factor != 0:
-            raise ValueError("LLaDA-Image height must be divisible by 16")
-        if batch.width % self.latent_scale_factor != 0:
-            raise ValueError("LLaDA-Image width must be divisible by 16")
-        self._validate_spatial_rope_bounds(batch.width, batch.height)
+        self.validate_output_size(
+            batch.width, batch.height, editing=batch.condition_image is not None
+        )
         return (
             batch_size,
             self.dit_config.num_channels_latents,
@@ -106,6 +115,31 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_disaggregation(self) -> bool:
         return False
 
+    def validate_output_size(self, width: int, height: int, editing: bool) -> None:
+        multiple = self.editing_size_multiple if editing else self.latent_scale_factor
+        if width % multiple != 0 or height % multiple != 0:
+            task = "editing" if editing else "generation"
+            raise ValueError(
+                f"LLaDA-Image {task} width and height must be divisible by "
+                f"{multiple}, got {width}x{height}"
+            )
+        self._validate_spatial_rope_bounds(width, height)
+        if editing:
+            # Lower bound without the prompt, the DiT checks the exact length.
+            image_tokens = (width // self.latent_scale_factor) * (
+                height // self.latent_scale_factor
+            )
+            sigvq_tokens = (width // self.editing_size_multiple) * (
+                height // self.editing_size_multiple
+            )
+            rows = editing_rope_rows(0, [image_tokens, image_tokens], sigvq_tokens)
+            limit = self.dit_config.arch_config.axes_lens[0]
+            if rows > limit:
+                raise ValueError(
+                    f"LLaDA-Image editing at {width}x{height} needs at least {rows} "
+                    f"sequence positions, above the model limit of {limit}"
+                )
+
     def _validate_spatial_rope_bounds(self, width: int, height: int) -> None:
         # The served DiT uses patch size 1.
         axes_lens = self.dit_config.arch_config.axes_lens
@@ -118,84 +152,39 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             )
 
     @staticmethod
-    def _prepare_condition_list(values, name: str, expected_size: int, device, dtype):
-        if values is None:
-            return None
-        if len(values) != expected_size:
-            raise ValueError(
-                f"LLaDA-Image {name} has {len(values)} entries, "
-                f"expected {expected_size}"
-            )
-        return [value.to(device=device, dtype=dtype) for value in values]
+    def _cond_kwargs(batch, device, dtype, negative: bool) -> dict:
+        def to_device(values):
+            if values is None:
+                return None
+            return [value.to(device=device, dtype=dtype) for value in values]
 
-    def _prepare_source_latents(self, batch, device, dtype):
-        source_latents = self._prepare_condition_list(
-            batch.source_latents,
-            "source_latents",
-            batch.batch_size,
-            device,
-            dtype,
-        )
-        return source_latents
+        image_embeds = batch.image_embeds
+        if image_embeds:
+            image_embeds = to_device(image_embeds)
+            if negative:
+                # The unconditional edit keeps the source latents without SigVQ.
+                empty = image_embeds[0].new_zeros((0, image_embeds[0].shape[-1]))
+                image_embeds = [empty] * batch.batch_size
+        return {
+            "encoder_hidden_states_image": image_embeds,
+            "source_latents": to_device(batch.source_latents),
+        }
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        del rotary_emb
-        image_embeds = batch.image_embeds
-        if image_embeds:
-            image_embeds = self._prepare_condition_list(
-                image_embeds,
-                "image_embeds",
-                batch.batch_size,
-                device,
-                dtype,
-            )
-        source_latents = self._prepare_source_latents(batch, device, dtype)
-        return {
-            "encoder_hidden_states_image": image_embeds,
-            "source_latents": source_latents,
-        }
+        return self._cond_kwargs(batch, device, dtype, negative=False)
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        del rotary_emb
-        image_embeds = batch.image_embeds
-        if image_embeds:
-            image_embeds = self._prepare_condition_list(
-                image_embeds,
-                "image_embeds",
-                batch.batch_size,
-                device,
-                dtype,
-            )
-            empty_image_embed = image_embeds[0].new_zeros(
-                (0, image_embeds[0].shape[-1])
-            )
-            image_embeds = [empty_image_embed] * batch.batch_size
-        source_latents = self._prepare_source_latents(batch, device, dtype)
-        return {
-            "encoder_hidden_states_image": image_embeds,
-            "source_latents": source_latents,
-        }
+        return self._cond_kwargs(batch, device, dtype, negative=True)
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         del device, dtype, vae
         return 1.0, None
 
     def preprocess_decoding(self, latents, server_args=None, vae=None):
-        del server_args
-        if vae is None or not hasattr(vae, "bn"):
-            raise ValueError("LLaDA-Image decoding requires the Flux2 VAE BN state")
         vae_parameter = next(vae.parameters())
         latents = latents.to(device=vae_parameter.device, dtype=vae_parameter.dtype)
-        vae_config = getattr(vae.config, "arch_config", vae.config)
-        latent_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents)
-        latent_std = torch.sqrt(
-            vae.bn.running_var.view(1, -1, 1, 1) + vae_config.batch_norm_eps
-        ).to(latents)
-        latents = latents * latent_std + latent_mean
-        batch_size, channels, height, width = latents.shape
-        latents = latents.reshape(batch_size, channels // 4, 2, 2, height, width)
-        latents = latents.permute(0, 1, 4, 2, 5, 3)
-        return latents.reshape(batch_size, channels // 4, height * 2, width * 2)
+        mean, std = flux2_vae_bn_stats(vae, latents)
+        return _unpatchify_latents(latents * std + mean)
 
     def post_denoising_loop(self, latents, batch):
         del batch
