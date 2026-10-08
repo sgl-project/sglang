@@ -768,9 +768,10 @@ class PrefillAdder:
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+        mamba state, plus the node slot a host hit loads into. Charged only on the
+        SHARED Mamba pool (`_mamba_slot_cost > 0`) and only when the req has no
+        state yet (`mamba_pool_idx is None`, mirroring `HybridReqToTokenPool.alloc`);
+        0 keeps baseline / SWA / non-Mamba unchanged.
 
         Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
         radix COW headroom or locked-but-evictable bytes — that residual is
@@ -778,7 +779,7 @@ class PrefillAdder:
         over-admission crashes under pressure, make this more conservative (e.g.
         also account for missing tracking buffers)."""
         if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return self._mamba_slot_cost
+            return (1 + req.mamba_host_hit_length) * self._mamba_slot_cost
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -842,10 +843,10 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
+        # Each new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1291,6 +1292,13 @@ class PrefillAdder:
         # this returns 0, so the debit sites below reuse the value.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
         total_tokens += mamba_gap_reserve
+        # budget_state only checks one slot is left; a host hit needs two.
+        if (
+            mamba_gap_reserve
+            and self.rem_mamba_slots is not None
+            and mamba_gap_reserve // self._mamba_slot_cost > self.rem_mamba_slots
+        ):
+            return AddReqResult.NO_TOKEN
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
