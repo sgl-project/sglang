@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsWNA16,
@@ -121,6 +122,11 @@ SELECTION_CASES = [
     ("moe", "nvfp4a16", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": False, "group_size": 16}),
     ("moe", "nvfp4", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": True}),
     ("moe", "nvfp4", SM100, CompressedTensorsW4A4Nvfp4MoE, {}),
+    # No native MXFP4 linear kernel exists, so both variants are weight-only on
+    # every capability.
+    ("linear", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": False}),
+    ("linear", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
+    ("linear", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
     # Neighbours of the fp4 predicates. The int4 type check keeps fp4 out of
     # WNA16; a weight-only MoE config has no input_activations, which the w8a8
     # predicates used to dereference.
@@ -149,7 +155,7 @@ class TestFp4SchemeSelection(CustomTestCase):
         """warning_once is lru_cache-wrapped; clear it to stay order-independent."""
         logging.Logger.warning_once.cache_clear()
         self.addCleanup(logging.Logger.warning_once.cache_clear)
-        for w4a4, a16 in (("nvfp4", "nvfp4a16"),):
+        for w4a4, a16 in (("nvfp4", "nvfp4a16"), ("mxfp4", "mxfp4a16")):
             with self.subTest(variant=w4a4):
                 with self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured:
                     _get_scheme("linear", _make_config(w4a4), SM90)
@@ -165,14 +171,6 @@ class TestFp4SchemeSelection(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "NVFP4"):
             _get_scheme("linear", config, SM90)
-
-    def test_mxfp4_linear_reports_no_compatible_scheme(self):
-        """No MXFP4 linear kernel yet; the error must not name Sparse24."""
-        for variant in ("mxfp4a16", "mxfp4"):
-            with self.subTest(variant=variant):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    _get_scheme("linear", _make_config(variant), SM90)
-                self.assertNotIn("Sparse24", str(ctx.exception))
 
 
 def _noop_loader(*args, **kwargs):
@@ -210,6 +208,8 @@ def _moe_layer(scheme, is_gated=True):
 # (name, scheme class, group size, scale dtype, has a weight global scale)
 LINEAR_FORMATS = [
     ("nvfp4", CompressedTensorsW4A16Fp4, 16, torch.float8_e4m3fn, True),
+    # E8M0 scales arrive as raw uint8 exponent bytes; no outer global scale.
+    ("mxfp4", CompressedTensorsW4A16Mxfp4, 32, torch.uint8, False),
 ]
 MOE_FORMATS = [
     ("nvfp4", CompressedTensorsW4A16Nvfp4MoE, 16, torch.float8_e4m3fn, True),
@@ -241,6 +241,9 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         )
         layer = _linear_layer(CompressedTensorsW4A16Fp4(has_input_global_scale=True))
         self.assertEqual(layer.input_global_scale.shape, (1,))
+        # MXFP4 folds its outer scale into the E8M0 group scales.
+        layer = _linear_layer(CompressedTensorsW4A16Mxfp4(has_input_activations=True))
+        self.assertFalse(hasattr(layer, "input_global_scale"))
 
     def test_mismatched_fused_global_scales_are_rejected(self):
         """Both kernels take one global scale per layer, so fused projections
