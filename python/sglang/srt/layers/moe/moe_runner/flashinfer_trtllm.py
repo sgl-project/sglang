@@ -605,9 +605,9 @@ def trtllm_nvfp4_hidden_alignment(
     """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
 
     The per-token (dynamic activation scale) non-gated variant ships far fewer
-    tile configs than the static one: at Nemotron's hidden size 2688 the
-    heuristic default fails with "No valid config found", while a 512-aligned
-    hidden size has a usable tactic set. Every other variant runs unpadded.
+    tile configs than the static one. At Nemotron's hidden size 2688 it runs
+    but produces garbage (GSM8K ~0.02 on FlashInfer 0.7.0.post1), while a
+    512-aligned hidden size is correct. Every other variant runs unpadded.
     """
     if use_per_token_activation and not is_gated:
         return 512

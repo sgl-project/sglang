@@ -339,17 +339,12 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
 class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
-    """Non-gated RELU^2 experts; hidden 2688 is padded to 3072 for per-token.
+    """Non-gated RELU^2 experts with per-token NVFP4 activations."""
 
-    Few-shot completion GSM8K is a weak signal for this model (BF16 scores ~0.5),
-    so the threshold only separates working output from the garbage (~0.02)
-    an unpadded per-token RELU^2 MoE produces.
-    """
-
-    model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm"
-    gsm8k_threshold = 0.30
+    gsm8k_threshold = 0.95
 
 
 if __name__ == "__main__":

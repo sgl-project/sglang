@@ -332,7 +332,9 @@ class TestG1ScaleC(CustomTestCase):
         self.assertEqual(g1_scale_c.dtype, torch.float32)
 
 
-def _fp4_moe_weights(num_experts: int, hidden: int, inter: int, is_gated: bool):
+def _generate_fp4_moe_weights(
+    num_experts: int, hidden: int, inter: int, is_gated: bool
+):
     """Packed FP4 weights + E4M3 block scales in checkpoint layout, no zeros."""
     gate_up = (2 if is_gated else 1) * inter
 
@@ -368,7 +370,7 @@ class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):
 
 class TestAlignFp4MoeWeights(CustomTestCase):
     def test_aligned_shapes_are_returned_untouched(self):
-        weights = _fp4_moe_weights(4, 3072, 1920, is_gated=False)
+        weights = _generate_fp4_moe_weights(4, 3072, 1920, is_gated=False)
 
         out = _align_fp4_moe_weights(
             *weights, is_gated=False, intermediate_alignment=128, hidden_alignment=512
@@ -381,7 +383,7 @@ class TestAlignFp4MoeWeights(CustomTestCase):
     def test_nemotron_pads_intermediate_and_hidden_with_zero_fill(self):
         num_experts, hidden, inter = 4, 2688, 1856
         padded_hidden, padded_inter = 3072, 1920
-        w13, w13_scale, w2, w2_scale = _fp4_moe_weights(
+        w13, w13_scale, w2, w2_scale = _generate_fp4_moe_weights(
             num_experts, hidden, inter, is_gated=False
         )
 
@@ -422,7 +424,7 @@ class TestAlignFp4MoeWeights(CustomTestCase):
 
     def test_gated_pads_only_intermediate_by_default(self):
         num_experts, hidden, inter = 2, 2688, 1000
-        w13, w13_scale, w2, w2_scale = _fp4_moe_weights(
+        w13, w13_scale, w2, w2_scale = _generate_fp4_moe_weights(
             num_experts, hidden, inter, is_gated=True
         )
 
