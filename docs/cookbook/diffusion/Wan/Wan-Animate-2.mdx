@@ -103,6 +103,10 @@ branch, rather than recomputed at every timestep. These projected tensors are
 released after the clip and never reused across requests. Decoded output is
 copied to CPU and clip-local intermediates are released; only the decoded
 overlap frames needed by the next clip remain on the GPU.
+Geometry caches retain at most four RoPE tables and two attention masks, rather
+than accumulating GPU tensors for every request size. Evicted entries are
+recomputed without changing the results; frequently alternating among more
+geometries can add setup work.
 
 Measured on one H200, with a 576×1024 budget, 8 steps, CFG 3, seed 42,
 `clip_len=37`, text-encoder CPU offload, and MP4 plus raw-frame output, the initial

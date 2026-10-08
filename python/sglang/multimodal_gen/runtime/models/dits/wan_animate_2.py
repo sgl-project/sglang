@@ -6,6 +6,7 @@
 # K/V, forward_gen attends over [gen tokens, then that reference-video K/V]). No extra parameters.
 # Names kept from the reference implementation: the forward_ref / forward_gen methods and the
 # kv_cache_mode values "ref" / "gen"; there "ref" means the reference video (the motion source), not the reference image.
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -70,9 +71,13 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         # Prompt embeddings are padded/truncated to this many tokens.
         self.max_text_len = config.text_len
 
-        self._block_masks: dict[tuple[int, int, int, str], BlockMask] = {}
+        self._block_masks: OrderedDict[tuple[int, int, int, str], BlockMask] = (
+            OrderedDict()
+        )
         # RoPE tables keyed by the (f, h, w) position ranges and device; see _rope_tables.
-        self._rope_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._rope_cache: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = (
+            OrderedDict()
+        )
 
     def _make_block(
         self,
@@ -123,7 +128,11 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         The table is cached per ranges."""
         key = (f_range, h_range, w_range, str(self._device))
         if key in self._rope_cache:
+            self._rope_cache.move_to_end(key)
             return self._rope_cache[key]
+        # Bound retained GPU tables; evict before allocating the next geometry.
+        if len(self._rope_cache) >= 4:
+            self._rope_cache.popitem(last=False)
         f_start, f_len, f_stride = f_range
         f_idx = torch.arange(f_len, device=self._device) * f_stride + f_start
         h_idx = torch.arange(h_range[1], device=self._device) + h_range[0]
@@ -167,7 +176,10 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
             str(self._device),
         )
         if key in self._block_masks:
+            self._block_masks.move_to_end(key)
             return self._block_masks[key]
+        if len(self._block_masks) >= 2:
+            self._block_masks.popitem(last=False)
 
         # _compile=True keeps the block-sparse layout consistent with the compiled
         # flex_attention; built once per key, so the compile cost is paid once.

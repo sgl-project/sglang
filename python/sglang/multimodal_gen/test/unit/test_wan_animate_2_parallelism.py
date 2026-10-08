@@ -6,6 +6,8 @@ Single-process and CPU only, in the style of ``test_sp_shard.py`` / ``test_usp_r
 shape helpers are called directly. The parallelism rejections live in ``test_wan_animate_2_config.py``.
 """
 
+from collections import OrderedDict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -75,7 +77,7 @@ def test_block_mask_head_agnostic_and_masks_correctly():
         captured.update(mask_fn=mask_fn, B=B, H=H, Q_LEN=Q_LEN, KV_LEN=KV_LEN)
         return "SENTINEL_BLOCK_MASK"
 
-    stub = SimpleNamespace(_block_masks={}, _device=torch.device("cpu"))
+    stub = SimpleNamespace(_block_masks=OrderedDict(), _device=torch.device("cpu"))
     layout = _SHORT_CLIP_LAYOUT
     with patch(f"{_DIT}.create_block_mask", side_effect=fake_create_block_mask) as cbm:
         first = WanAnimate2Transformer3DModel._get_block_mask_from_layout(stub, layout)
@@ -110,6 +112,55 @@ def test_block_mask_head_agnostic_and_masks_correctly():
     # Frame 3 attends keys 136..139; 140 is past the 12 reference-video tokens (pad).
     assert valid(13, 136) and valid(13, 139)
     assert not valid(13, 140)
+
+
+@pytest.mark.parametrize("cache_kind", ["rope", "mask"])
+def test_geometry_cache_bounds_and_rebuilds(cache_kind):
+    cache = OrderedDict()
+    stub = SimpleNamespace(_device=torch.device("cpu"))
+    if cache_kind == "rope":
+        limit = 4
+        stub._rope_cache = cache
+        stub.rotary_emb = SimpleNamespace(
+            forward_uncached=lambda positions: (positions.cos(), positions.sin())
+        )
+
+        def lookup(size):
+            return WanAnimate2Transformer3DModel._rope_tables(
+                stub, (0, size, 1), (0, 2), (0, 2)
+            )
+
+        context = nullcontext()
+    else:
+        limit = 2
+        stub._block_masks = cache
+
+        def lookup(size):
+            layout = _InContextLayout((size, 2, 2), (size - 1, 2, 2), (size, 2, 2))
+            return WanAnimate2Transformer3DModel._get_block_mask_from_layout(
+                stub, layout
+            )
+
+        context = patch(
+            f"{_DIT}.create_block_mask",
+            side_effect=lambda fn, **kwargs: torch.tensor(
+                [_mask_probe(fn)(0, i) for i in range(32)]
+            ),
+        )
+    with context:
+        first = lookup(2)
+        oldest_key = next(iter(cache))
+        for size in range(3, limit + 2):
+            lookup(size)
+        assert lookup(2) is first
+        lookup(limit + 2)
+        assert oldest_key in cache
+        for size in range(limit + 3, 2 * limit + 3):
+            lookup(size)
+            assert len(cache) == limit
+        assert oldest_key not in cache
+        rebuilt = lookup(2)
+        torch.testing.assert_close(rebuilt, first, rtol=0, atol=0)
 
 
 def test_attention_pads_tokens_into_the_slots_the_block_mask_admits():
