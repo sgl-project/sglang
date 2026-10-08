@@ -387,10 +387,7 @@ class SWAComponent(TreeComponent):
         )
 
     def resync_window_full_to_swa_mapping(
-        self,
-        node_id: int,
-        prefix_len: int | None = None,
-        req_full_locs: torch.Tensor | None = None,
+        self, node_id: int, prefix_len: int | None = None
     ) -> None:
         """Re-point the allocator's global full -> swa table for the reused window.
 
@@ -460,21 +457,6 @@ class SWAComponent(TreeComponent):
                 flush=True,
             )
         alloc.set_full_to_swa_mapping(full, swa)
-        # The attention's read-side page table indexes the allocator-global LUT by
-        # the REQUEST's own full locs (`req_to_token[req, p]`), not by the tree
-        # node's BASE.value. On a hit those can diverge once the pool has recycled
-        # slots, so re-point through the request's indexing as well: otherwise the
-        # page-sampled window table keeps reading the stale mapping even though the
-        # node-indexed write above succeeded (`[SWAKV] win` stays wrong).
-        if req_full_locs is not None and req_full_locs.numel() >= swa.numel():
-            req_full = req_full_locs[-swa.numel() :].to(torch.int64)
-            if os.environ.get("DSV4_DUMP_META"):
-                print(
-                    f"[SWAGATE] resync-req n={req_full.numel()} "
-                    f"full={req_full.tolist()[:2]}..{req_full.tolist()[-2:]}",
-                    flush=True,
-                )
-            alloc.set_full_to_swa_mapping(req_full, swa)
 
     def tree_owned_swa_floor(self, node_id: int, hi_pos: int) -> int | None:
         """Earliest position on this request's path whose SWA the tree still owns."""
