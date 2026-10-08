@@ -194,6 +194,7 @@ def _state_passing_fwd(
     out_dtype=None,
     is_cont_batched=False,
     chunk_offsets=None,
+    sm120_tiles=False,
 ):
     batch, nchunks, nheads, dim = states.shape
     if chunk_size is None:
@@ -277,5 +278,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
             IS_CONT_BATCHED=is_cont_batched,
+            BLOCK_SIZE=256 if sm120_tiles else 16,
         )
     return out, final_states

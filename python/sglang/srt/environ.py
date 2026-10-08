@@ -1125,6 +1125,7 @@ class Envs:
     SGLANG_SM120_LOSSLESS_BF16_HEAD_M4 = EnvBool(False)
     SGLANG_SM120_LOSSLESS_BF16_INPROJ = EnvBool(False)
     SGLANG_SM120_MAMBA_STATIC_VERIFY = EnvBool(False)
+    SGLANG_SM120_MAMBA_PREFILL_TILES = EnvBool(False)
     SGLANG_SM120_LOSSLESS_BF16_MOE = EnvBool(False)
     SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
@@ -1428,6 +1429,7 @@ class Envs:
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
+    SGLANG_FLASHINFER_DRAFT_COMPACT_PLAN = EnvBool(False)
     SGLANG_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
