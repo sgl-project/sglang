@@ -76,7 +76,6 @@ configure_environment() {
         if ! "$UV_VENV/bin/python3" -c "import sys; assert sys.version_info[:2] == tuple(map(int, '${CI_PYTHON_VER}'.split('.')))" 2>/dev/null; then
             rm -rf "$UV_VENV"
             # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
-            # uv reads UV_PYTHON_INSTALL_MIRROR for runners without direct github.com access.
             uv python install "$CI_PYTHON_VER" --python-preference only-managed
             uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
         fi

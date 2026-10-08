@@ -168,9 +168,8 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 60
     name: Build Rust Ext
-    # No crate sets abi3, so each interpreter the stages run (SGLANG_CI_PYTHON in
-    # ci_install_dependency.sh) needs its own module set, and each its own target
-    # dir, since PyO3's fingerprint tracks the interpreter.
+    # No crate sets abi3: each interpreter the stages run (SGLANG_CI_PYTHON in
+    # ci_install_dependency.sh) needs its own leg, as PyO3 fingerprints the interpreter.
     strategy:
       fail-fast: false
       matrix:
