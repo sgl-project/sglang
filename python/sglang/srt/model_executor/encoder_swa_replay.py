@@ -154,6 +154,7 @@ def _build_replay_batch(*, batch, runner, rows):
     replay.has_grammar = False
     replay.multimodal_inputs = [None] * len(reqs)
     replay.engram_history = _engram_history(reqs=reqs, starts=starts, runner=runner)
+    _set_execution_counts(batch=replay, scheduled=batch)
     return replay
 
 
@@ -215,12 +216,7 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
-    if batch.global_num_tokens is not None:
-        # The MLP-sync gather counted the scheduled rows. Logprob and draft counts
-        # keep that meaning: the fold shifts extend and logprob starts alike.
-        folded.global_num_tokens = _folded_global_num_tokens(
-            batch.global_num_tokens, scheduled=batch.extend_num_tokens, folded=fold_off
-        )
+    _set_execution_counts(batch=folded, scheduled=batch)
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -243,11 +239,24 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     )
 
 
-def _folded_global_num_tokens(global_num_tokens, *, scheduled, folded):
+def _set_execution_counts(*, batch, scheduled) -> None:
+    """MLP-sync counts of a batch copied from `scheduled` with different rows."""
+    if scheduled.global_num_tokens is None:
+        return
     # The flag rejects attention DP, so the gather holds only this rank's count.
-    if len(global_num_tokens) != 1 or global_num_tokens[0] != scheduled:
+    if (
+        len(scheduled.global_num_tokens) != 1
+        or scheduled.global_num_tokens[0] != scheduled.extend_num_tokens
+    ):
         raise ValueError(
-            "encoder SWA replay fold expects one MLP-sync count equal to the "
-            f"scheduled extend ({scheduled}), got {global_num_tokens}"
+            "encoder SWA replay expects one MLP-sync count equal to the scheduled "
+            f"extend ({scheduled.extend_num_tokens}), got {scheduled.global_num_tokens}"
         )
-    return [folded]
+    batch.global_num_tokens = [batch.extend_num_tokens]
+    # The scheduler's formula; the draft counts stay with the scheduled batch.
+    batch.global_num_tokens_for_logprob = [
+        sum(
+            max(n - start, 1)
+            for n, start in zip(batch.extend_lens, batch.extend_logprob_start_lens)
+        )
+    ]
