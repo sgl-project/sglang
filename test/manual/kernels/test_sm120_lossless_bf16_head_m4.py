@@ -8,6 +8,7 @@ import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors import safe_open
@@ -54,6 +55,8 @@ class TestLosslessBf16HeadM4(CustomTestCase):
         with (
             envs.SGLANG_SM120_LOSSLESS_BF16_HEAD.override(True),
             envs.SGLANG_SM120_LOSSLESS_BF16_HEAD_M4.override(True),
+            patch.object(uq, "_BF16_GEMM_BACKEND", uq.Bf16GemmBackend.GEMV),
+            patch("torch.matmul", side_effect=AssertionError("M4 head used fallback")),
         ):
             head.quant_method.process_weights_after_loading(head)
             self.assertTrue(
