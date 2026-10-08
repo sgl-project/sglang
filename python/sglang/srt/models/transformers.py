@@ -1098,6 +1098,8 @@ class TransformersBase(nn.Module):
             skip_substrs=self.skip_substrs,
             ignore_unexpected_prefixes=self.ignore_unexpected_prefixes,
             ignore_unexpected_suffixes=self.ignore_unexpected_suffixes,
+            # Checkpoint keys HF itself drops on load, e.g. an MTP head unused for serving.
+            ignore_unexpected_patterns=self.model._keys_to_ignore_on_load_unexpected,
         )
         return loader.load_weights(weights, mapper=self.weight_mapper)
 
