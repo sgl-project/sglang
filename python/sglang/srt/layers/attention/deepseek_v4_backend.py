@@ -19,6 +19,14 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    amax_topk_blocks,
+    candidate_row_lens,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_table import (
+    build_sparse_indexer_schedule,
+    sort_candidate_blocks,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -29,6 +37,13 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    gather_fp4_index_k_cache_masked,
+)
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
+    sparse_logits,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -37,6 +52,14 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+    topk_prefill_candidates,
+)
+from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_paged_torch,
+    topk_transform_ragged_v2,
+    topk_transform_sparse,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -86,6 +109,10 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+    get_index_k_cache,
+    quantize_index_q,
 )
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -271,26 +298,25 @@ def _dense_fp4_mqa_logits(
     )
 
 
-def _prefill_graph_dense_k_layout(
-    req_to_token: torch.Tensor,
-    pool,
-    layer_id: int,
-    ratio: int,
+def _prefill_graph_dense_k_offsets(
     width: int,
     local_req_ids: torch.Tensor,
     req_ids: torch.Tensor,
-    req_lens: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Pack up to eight replayed requests into capture-stable contiguous FP4 K."""
+) -> torch.Tensor:
     req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
-    ks = req_ord.to(torch.int32) * width
-    logical_k = torch.arange(width, device=req_to_token.device)
-    valid_k = logical_k[None, :] < (req_lens[:, None] // ratio)
-    logical_pos = (logical_k[None, :] * ratio).expand_as(valid_k)
-    logical_pos = logical_pos.masked_fill(~valid_k, 0)
-    k_slots = req_to_token[req_ids[:, None], logical_pos].to(torch.int64) // ratio
-    k_slots = k_slots.masked_fill(~valid_k, 0).clamp_min_(0).flatten()
-    return ks, k_slots, pool.get_low_ratio_index_k_fp4(layer_id, k_slots)
+    return req_ord * width
+
+
+@dataclass
+class _CapturedCandidateMask(CandidateMetadata):
+    block_mask: torch.Tensor
+
+
+@dataclass
+class _CapturedSparseTable(CandidateMetadata):
+    blocks: torch.Tensor
+    schedule: torch.Tensor
+    valid_lens: torch.Tensor
 
 
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
@@ -1038,6 +1064,7 @@ class DSV4Metadata:
     low_ratio_dense_req_indices: Optional[torch.Tensor] = None
     low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
     prefill_graph_dense_indexer: bool = False
+    low_ratio_dense_k_offsets: Dict[int, torch.Tensor] = field(default_factory=dict)
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1640,7 +1667,9 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        supported = bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        supported = (
+            bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        )
         return supported and (
             get_parallel().attn_cp_size == 1 or _prefill_graph_max_seq_len() is not None
         )
@@ -3356,12 +3385,7 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Inside the window every block is a candidate: the full top-k applies.
-            width = metadata.max_compressed_seq_len
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
+        width = metadata.max_compressed_seq_len
         inputs = CapturedPrefillInputs(
             indexer=indexer,
             layer_id=layer.layer_id,
@@ -3371,7 +3395,212 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        self.full_topk_indexer.topk_prefill_captured(inputs)
+        dense = (
+            self.forward_metadata.prefill_graph_dense_indexer
+            and projected_q.shape[0]
+            >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+            * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+        )
+        two_level = (
+            width > indexer.candidate_topk_blocks * indexer.candidate_block_size
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+        )
+        if not dense and not two_level:
+            self.full_topk_indexer.topk_prefill_captured(inputs)
+            return
+        if two_level:
+            assert indexer.candidate_block_size == 8
+
+        q_fp4, q_sf = quantize_index_q(projected_q)
+        rows, heads = q_fp4.shape[:2]
+        weights = projected_w.float()
+        lens = metadata.compressed_seq_lens
+        page_table = metadata.page_table
+        page_size = metadata.compressed_page_size
+        out_page = inputs.out_page_indices
+        out_raw = inputs.out_raw_indices
+        topk = min(indexer.index_topk, width)
+        published = self.forward_metadata.candidate_metadata
+        local_req_ids = None
+        ks = None
+        if dense:
+            req_ids = self.forward_metadata.low_ratio_dense_req_indices
+            req_lens = self.forward_metadata.low_ratio_dense_seq_lens
+            local_req_ids = self.forward_metadata.low_ratio_local_req_indices
+            assert req_ids is not None and req_lens is not None
+            assert local_req_ids is not None and local_req_ids.shape[0] == rows
+            ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
+            if ks is None:
+                ks = _prefill_graph_dense_k_offsets(width, local_req_ids, req_ids)
+                self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
+
+        sparse_consumer = (
+            dense
+            and two_level
+            and indexer.uses_candidates
+            and not indexer.is_candidate_source
+        )
+        if sparse_consumer:
+            assert isinstance(published, _CapturedSparseTable)
+        elif two_level and indexer.uses_candidates:
+            assert isinstance(published, _CapturedCandidateMask)
+
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=layer.layer_id,
+            page_size=page_size,
+        )
+        if dense and not sparse_consumer:
+            k_fp4 = gather_fp4_index_k_cache_masked(
+                self.token_to_kv_pool.get_index_k_with_scale_buffer(layer.layer_id),
+                self.req_to_token,
+                req_ids,
+                req_lens,
+                width=width,
+                compress_ratio=ratio,
+                page_size=page_size,
+            )
+
+        block_masks = []
+        for chunk, plan in [(slice(0, rows), None)] if dense else metadata.row_chunks():
+            chunk_lens = lens[chunk]
+            if sparse_consumer:
+                scores = sparse_logits(
+                    q_fp4[chunk].view(-1, 1, heads, 64),
+                    q_sf[chunk].view(-1, 1, heads),
+                    k_cache,
+                    weights[chunk].to(torch.bfloat16),
+                    published.schedule,
+                    published.blocks.shape[1],
+                )
+            elif dense:
+                scores = _dense_fp4_mqa_logits(
+                    (q_fp4[chunk], q_sf[chunk]),
+                    k_fp4,
+                    weights[chunk],
+                    ks[chunk],
+                    ks[chunk] + chunk_lens,
+                    width,
+                )
+            else:
+                scores = deep_gemm_fp4_paged_mqa_logits(
+                    (
+                        q_fp4[chunk].view(-1, 1, heads, 64),
+                        q_sf[chunk].view(-1, 1, heads),
+                    ),
+                    k_cache,
+                    weights[chunk],
+                    chunk_lens,
+                    page_table[chunk],
+                    plan,
+                    width,
+                )
+
+            if two_level and indexer.is_candidate_source:
+                nblocks, valid_lens = candidate_row_lens(
+                    chunk_lens, indexer.candidate_topk_blocks
+                )
+                blocks = amax_topk_blocks(
+                    scores, chunk_lens, nblocks, indexer.candidate_topk_blocks
+                )
+                if dense:
+                    sort_candidate_blocks(
+                        blocks, chunk_lens, page_table[chunk], page_size
+                    )
+                    schedule = build_sparse_indexer_schedule(
+                        blocks,
+                        chunk_lens,
+                        page_table[chunk],
+                        page_size,
+                        q_fp4.dtype,
+                        local_req_ids[chunk].to(torch.int32).contiguous(),
+                    )
+                    self.forward_metadata.candidate_metadata = _CapturedSparseTable(
+                        blocks, schedule, valid_lens
+                    )
+                else:
+                    ncols = (width + 7) // 8
+                    mask = torch.zeros(
+                        (scores.shape[0], ncols + 1),
+                        dtype=torch.bool,
+                        device=scores.device,
+                    )
+                    mask.scatter_(
+                        1, blocks.to(torch.int64).masked_fill(blocks < 0, ncols), True
+                    )
+                    block_masks.append(mask[:, :ncols])
+
+            if sparse_consumer:
+                selected = torch.empty(
+                    (scores.shape[0], topk), dtype=torch.int32, device=scores.device
+                )
+                topk_transform_sparse(
+                    scores,
+                    published.valid_lens[chunk],
+                    published.blocks[chunk],
+                    selected,
+                )
+            elif two_level and indexer.uses_candidates:
+                selected = torch.empty(
+                    (scores.shape[0], topk), dtype=torch.int32, device=scores.device
+                )
+                topk_prefill_candidates(
+                    scores,
+                    chunk_lens,
+                    published.block_mask[chunk],
+                    indexer.candidate_block_size,
+                    ks[chunk] if dense else torch.zeros_like(chunk_lens),
+                    selected,
+                )
+                if dense:
+                    selected = torch.where(
+                        selected >= 0, selected - ks[chunk, None], selected
+                    )
+            elif dense:
+                selected = torch.empty(
+                    (scores.shape[0], topk), dtype=torch.int32, device=scores.device
+                )
+                topk_transform_ragged_v2(
+                    scores, chunk_lens, out_offsets=ks[chunk], out_indices=selected
+                )
+                selected = torch.where(
+                    selected >= 0, selected - ks[chunk, None], selected
+                )
+            else:
+                topk_transform_paged_torch(
+                    scores,
+                    chunk_lens,
+                    page_table[chunk],
+                    out_page[chunk, :topk],
+                    page_size,
+                    out_raw[chunk, :topk],
+                )
+                continue
+
+            valid = selected >= 0
+            sentinel = torch.iinfo(torch.int32).max
+            selected = selected.masked_fill(~valid, sentinel).sort(dim=-1).values
+            valid = selected != sentinel
+            idx = selected.clamp_max(width - 1).to(torch.int64)
+            if dense:
+                slots = (
+                    self.req_to_token[local_req_ids[chunk, None], idx * ratio].to(
+                        torch.int64
+                    )
+                    // ratio
+                )
+            else:
+                slots = (
+                    page_table[chunk].gather(-1, idx // page_size) * page_size
+                    + idx % page_size
+                )
+            out_page[chunk, :topk] = torch.where(valid, slots, -1).to(torch.int32)
+            out_raw[chunk, :topk] = torch.where(valid, selected, -1).to(torch.int32)
+
+        if block_masks:
+            self.forward_metadata.candidate_metadata = _CapturedCandidateMask(
+                torch.cat(block_masks, dim=0)
+            )
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio
