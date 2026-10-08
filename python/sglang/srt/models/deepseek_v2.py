@@ -3030,7 +3030,7 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if not get_parallel().dcp_enabled:
+        if not (self.use_dsa and get_parallel().dcp_enabled):
             return self._forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )

@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
 )
-from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -389,12 +389,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self.draft_runner.kv_index_translator.bind_and_verify_backends(
-            [
-                self.draft_extend_attn_backend,
-                *getattr(self.draft_attn_backend, "attn_backends", ()),
-            ]
-        )
+        if get_parallel().dcp_enabled and is_deepseek_dsa(
+            self.draft_runner.model_config.hf_config
+        ):
+            # A DSA draft shards under DCP; its swapped-in backends need the translator.
+            self.draft_runner.kv_index_translator.bind_and_verify_backends(
+                [
+                    self.draft_extend_attn_backend,
+                    *getattr(self.draft_attn_backend, "attn_backends", ()),
+                ]
+            )
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
 

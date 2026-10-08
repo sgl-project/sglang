@@ -156,7 +156,8 @@ class DeepseekModelNextN(nn.Module):
             exit_stack.enter_context(
                 envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
             )
-        exit_stack.enter_context(dcp_forward_scope(forward_batch))
+        if self.decoder.self_attn.use_dsa:
+            exit_stack.enter_context(dcp_forward_scope(forward_batch))
 
         try:
             zero_allocator = BumpAllocator(
