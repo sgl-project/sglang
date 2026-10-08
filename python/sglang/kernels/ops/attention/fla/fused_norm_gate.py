@@ -346,7 +346,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
         ):
             g_strided = (g.shape[-2], g.stride(-3), g.stride(-2))
         else:
-            g = g.reshape(-1, g.shape[-1])
+            g = g.reshape(-1, g.shape[-1]).contiguous()
         if residual is not None:
             assert residual.shape == x_shape_og
             residual = residual.reshape(-1, residual.shape[-1])
