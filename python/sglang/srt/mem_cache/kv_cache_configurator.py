@@ -80,6 +80,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
 from sglang.srt.runtime_context import (
     attention_backends,
     get_context,
@@ -135,6 +136,12 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 
 _is_npu = is_npu()
+
+_KV_POOL_BASE_FOR_KIND: dict[str, type] = {
+    "mha": MHATokenToKVPool,
+    "mla": MLATokenToKVPool,
+    "dsa": DSATokenToKVPool,
+}
 
 
 def _pd_prefill_skips_mamba_spec_state() -> bool:
@@ -504,6 +511,10 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
+            reject_out_of_tree_path(
+                current_platform,
+                subsystem="the unified memory pool (--enable-unified-memory)",
+            )
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
             # Order matters: an Inkling-class model is BOTH mambaish and
             # hybrid-SWA, and the mamba pair would store every SWA layer's KV at
@@ -1236,16 +1247,31 @@ class KVCacheConfigurator:
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
-        enable_page_major = get_memory().enable_page_major_kv_layout
-        if self.is_draft_worker and get_memory().enable_unified_memory:
-            # Page-major is a target-pool layout choice; the draft backend
-            # reads the plain per-layer contiguous layout.
-            enable_page_major = False
-        mha_pool_class = (
-            PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
+        enable_page_major = self._page_major_enabled()
+        mha_pool_class = self._resolve_kv_pool_class(
+            kind="mha",
+            default=(
+                PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
+            ),
         )
+        mla_pool_class = self._resolve_kv_pool_class(
+            kind="mla", default=MLATokenToKVPool
+        )
+        dsa_pool_class = self._resolve_kv_pool_class(
+            kind="dsa", default=DSATokenToKVPool
+        )
+        if (
+            is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            or self.kv_cache_dtype_str == "mxfp8"
+        ):
+            reject_out_of_tree_path(
+                current_platform, subsystem="the block-scaled (fp4 / mxfp8) KV pool"
+            )
 
         if is_dsv4_model:
+            reject_out_of_tree_path(
+                current_platform, subsystem="the DeepSeek-V4 KV pool"
+            )
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -1258,20 +1284,6 @@ class KVCacheConfigurator:
                 c128_state_dtype=sizes.c128_state_dtype,
                 req_to_token_pool=req_to_token_pool,
             )
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_dsa_model:
-                token_to_kv_pool = self._build_oot_dsa_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
-                )
-            elif self.use_mla_backend:
-                token_to_kv_pool = self._build_oot_mla_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
-                    is_dsa_model=is_dsa_model,
-                )
-            else:
-                token_to_kv_pool = self._build_oot_mha_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
-                )
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
@@ -1298,11 +1310,14 @@ class KVCacheConfigurator:
                 full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 is_dsa_model=is_dsa_model,
+                mla_pool_class=mla_pool_class,
+                dsa_pool_class=dsa_pool_class,
             )
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
                 max_running_requests=req_to_token_pool.req_to_token.shape[0],
+                dsa_pool_class=dsa_pool_class,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -1313,6 +1328,7 @@ class KVCacheConfigurator:
             else:
                 token_to_kv_pool = self._build_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
+                    mla_pool_class=mla_pool_class,
                 )
         else:
             if self.is_hybrid_swa:
@@ -1322,6 +1338,9 @@ class KVCacheConfigurator:
                     mha_pool_class=mha_pool_class,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
+                reject_out_of_tree_path(
+                    current_platform, subsystem="the MiniMax sparse-index KV pool"
+                )
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
@@ -1330,6 +1349,8 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
+                    mla_pool_class=mla_pool_class,
+                    dsa_pool_class=dsa_pool_class,
                 )
             else:
                 quant_method = self._build_mha_quant_method(
@@ -1443,63 +1464,25 @@ class KVCacheConfigurator:
             )
         return token_to_kv_pool
 
-    def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        PoolCls = current_platform.get_dsa_kv_pool_cls()
-        token_to_kv_pool = PoolCls(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            kv_lora_rank=self.model_config.kv_lora_rank,
-            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            kv_cache_dim=calculate_mla_kv_cache_dim(
-                model_config=self.model_config,
-                kv_cache_dtype=self.kv_cache_dtype,
-            ),
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
-        )
-        return token_to_kv_pool
+    def _page_major_enabled(self) -> bool:
+        enable_page_major = get_memory().enable_page_major_kv_layout
+        if self.is_draft_worker and get_memory().enable_unified_memory:
+            # Page-major is a target-pool layout choice; the draft backend
+            # reads the plain per-layer contiguous layout.
+            enable_page_major = False
+        return enable_page_major
 
-    def _build_oot_mla_kv_pool(
-        self, *, max_total_num_tokens: int, is_dsa_model: bool
-    ) -> KVCache:
-        PoolCls = current_platform.get_mla_kv_pool_cls()
-        token_to_kv_pool = PoolCls(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            kv_lora_rank=self.model_config.kv_lora_rank,
-            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-        )
-        return token_to_kv_pool
-
-    def _build_oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        PoolCls = current_platform.get_mha_kv_pool_cls()
-        token_to_kv_pool = PoolCls(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-        )
-        return token_to_kv_pool
+    def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
+        pool_cls = current_platform.get_kv_pool_cls(kind=kind)
+        if pool_cls is None:
+            return default
+        base = _KV_POOL_BASE_FOR_KIND[kind]
+        if not (isinstance(pool_cls, type) and issubclass(pool_cls, base)):
+            raise TypeError(
+                f"{type(current_platform).__name__}.get_kv_pool_cls(kind={kind!r}) "
+                f"returned {pool_cls!r}; expected a subclass of {base.__name__}"
+            )
+        return pool_cls
 
     def _build_ascend_swa_kv_pool(
         self,
@@ -1653,7 +1636,11 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(
-        self, *, max_total_num_tokens: int, max_running_requests: int
+        self,
+        *,
+        max_total_num_tokens: int,
+        max_running_requests: int,
+        dsa_pool_class: type,
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -1663,6 +1650,9 @@ class KVCacheConfigurator:
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
         if get_memory().enable_hisparse and not self.is_draft_worker:
+            reject_out_of_tree_path(
+                current_platform, subsystem="the HiSparse DSA KV pool"
+            )
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1670,6 +1660,9 @@ class KVCacheConfigurator:
                 parse_hisparse_config().host_to_device_ratio
             )
         elif dsa_cp_layer_shard_rank is not None:
+            reject_out_of_tree_path(
+                current_platform, subsystem="the CP layer-split DSA KV pool"
+            )
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
                 LayerSplitDSATokenToKVPool,
@@ -1679,7 +1672,7 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
-            PoolCls = DSATokenToKVPool
+            PoolCls = dsa_pool_class
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1719,6 +1712,8 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: int,
         swa_max_total_num_tokens: int,
         is_dsa_model: bool,
+        mla_pool_class: type,
+        dsa_pool_class: type,
     ) -> KVCache:
         """Build a hybrid MLA pool with independent full/SWA cache geometries.
 
@@ -1726,7 +1721,7 @@ class KVCacheConfigurator:
         layers use MLA storage. The returned ``SWAKVPool`` exposes the common
         MLA and optional DSA-index interfaces independent of model type.
         """
-        full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
+        full_pool_class = dsa_pool_class if is_dsa_model else mla_pool_class
         common = {
             "page_size": get_schedule().page_size,
             "device": self.device,
@@ -1757,7 +1752,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             full_kv_pool_class=full_pool_class,
-            swa_kv_pool_class=MLATokenToKVPool,
+            swa_kv_pool_class=mla_pool_class,
             full_kv_pool_kwargs=full_pool_kwargs,
             swa_kv_pool_kwargs={
                 **common,
@@ -1781,8 +1776,10 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MLATokenToKVPool(
+    def _build_mla_kv_pool(
+        self, *, max_total_num_tokens: int, mla_pool_class: type
+    ) -> KVCache:
+        token_to_kv_pool = mla_pool_class(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1899,6 +1896,8 @@ class KVCacheConfigurator:
         max_total_num_tokens: int,
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
+        mla_pool_class: type,
+        dsa_pool_class: type,
     ) -> KVCache:
         full_attention_layer_ids = (
             [0]
@@ -1945,12 +1944,10 @@ class KVCacheConfigurator:
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
-        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
-        # buffers) for the full-attention layers, same as the SWA branch.
-        full_pool_class = (
-            MHATokenToKVPoolMXFP8
-            if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
-            else mha_pool_class
+        full_pool_class = self._hybrid_full_attention_pool_class(
+            mha_pool_class=mha_pool_class,
+            mla_pool_class=mla_pool_class,
+            dsa_pool_class=dsa_pool_class,
         )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
@@ -2002,6 +1999,34 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _hybrid_full_attention_pool_class(
+        self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
+    ) -> type:
+        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            return dsa_pool_class
+        if _is_npu:
+            if self.use_mla_backend:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                return NPUMLATokenToKVPool
+            assert not is_float4_e2m1fn_x2(self.kv_cache_dtype), (
+                "FP4 is not supported on NPU yet."
+            )
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMHATokenToKVPool,
+            )
+
+            return NPUMHATokenToKVPool
+        if self.use_mla_backend:
+            return mla_pool_class
+        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
+        # buffers) for the full-attention layers, same as the SWA branch.
+        if self.kv_cache_dtype_str == "mxfp8":
+            return MHATokenToKVPoolMXFP8
+        return mha_pool_class
+
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
@@ -2050,17 +2075,7 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
-                AllocatorCls = current_platform.get_paged_allocator_cls()
-                token_to_kv_pool_allocator = AllocatorCls(
-                    sizes.max_total_num_tokens,
-                    page_size=get_schedule().page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=token_to_kv_pool,
-                    need_sort=need_sort,
-                )
-            elif _is_npu and (
+            if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
@@ -2163,7 +2178,11 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        paged_allocator_cls = (
+                            current_platform.get_paged_allocator_cls()
+                            or PagedTokenToKVPoolAllocator
+                        )
+                        token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,
