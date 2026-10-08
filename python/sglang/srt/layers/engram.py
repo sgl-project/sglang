@@ -54,6 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.utils.memfd import memfd_create
 
 logger = logging.getLogger(__name__)
 
@@ -649,7 +650,7 @@ class _HostTable:
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
         if self.group.rank_in_group == 0:
-            fd = os.memfd_create(name, 0)
+            fd = memfd_create(name, 0)
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
         pid, owner_fd = self.group.broadcast_object(owner, src=0)

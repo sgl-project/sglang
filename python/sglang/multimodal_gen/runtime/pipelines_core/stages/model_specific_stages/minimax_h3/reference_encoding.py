@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _cached_latent_mean_std,
     minimax_h3_scoped_encode_rng,
 )
+from sglang.srt.utils.memfd import MFD_CLOEXEC, memfd_create
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
@@ -447,10 +448,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     output_fd = -1
     if sys.platform.startswith("linux"):
         try:
-            output_fd = os.memfd_create(
-                "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
-            )
+            output_fd = memfd_create("sglang-h3-reference-video", MFD_CLOEXEC)
         except OSError:
             output_fd = -1
 
@@ -532,9 +530,8 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     if is_leader:
         try:
             try:
-                leader_fd = os.memfd_create(
-                    "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
+                leader_fd = memfd_create(
+                    "sglang-h3-reference-video-shared", MFD_CLOEXEC
                 )
             except OSError:
                 # Anonymous file descriptors can be disabled by a container's

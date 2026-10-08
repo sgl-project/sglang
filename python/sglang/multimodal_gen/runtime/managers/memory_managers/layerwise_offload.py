@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.memfd import memfd_create
 
 logger = init_logger(__name__)
 
@@ -438,10 +439,8 @@ def _shared_storage(nbytes: int) -> Optional[torch.UntypedStorage]:
     them: the host-anon figures (and the forced-host-view budget that
     subtracts them) keep meaning "pageable copies".
     """
-    if not hasattr(os, "memfd_create"):
-        return None
     try:
-        fd = os.memfd_create("sglang-pinned-store", 0)
+        fd = memfd_create("sglang-pinned-store", 0)
     except OSError:
         return None
     try:

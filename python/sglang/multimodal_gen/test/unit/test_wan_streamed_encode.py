@@ -5,7 +5,6 @@ The frame hand-off itself is covered in
 python/sglang/multimodal_gen/test/unit/test_wan_vae_on_frames.py.
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,10 +94,7 @@ def _video_request(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and hasattr(os, "memfd_create"),
-    "needs CUDA and memfd",
-)
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class TestStreamedEncode(CustomTestCase):
     @torch.no_grad()
     def test_streamed_mp4_matches_the_one_shot_save(self):
