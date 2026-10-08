@@ -639,21 +639,6 @@ VAE_IMAGE_SIZE = 1024 * 1024
 class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2I
 
-    def _get_condition_image_sizes(self, batch) -> list[tuple[int, int]]:
-        image = batch.condition_image
-        if not isinstance(image, list):
-            image = [image]
-
-        condition_image_sizes = []
-        for img in image:
-            image_width, image_height = img.size
-            edit_width, edit_height, _ = _calculate_dimensions(
-                VAE_IMAGE_SIZE, image_width / image_height
-            )
-            condition_image_sizes.append((edit_width, edit_height))
-
-        return condition_image_sizes
-
     def prepare_image_processor_kwargs(self, batch, neg=False) -> dict:
         prompt = batch.prompt if not neg else batch.negative_prompt
         if not prompt:
