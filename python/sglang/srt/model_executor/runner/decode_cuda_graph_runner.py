@@ -189,6 +189,8 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+        kv_loc_plan=forward_batch.kv_loc_plan,
+        kv_loc_cols=forward_batch.kv_loc_cols,
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,
@@ -1005,7 +1007,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
-            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -1043,6 +1044,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
@@ -1117,9 +1119,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
         self._profiler = None
-
-        # No pool-side pin to clear: the captured full-physical write loc rides the
-        # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1271,9 +1270,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            # Full-physical write loc lives in the attention metadata (the backend's
-            # `out_cache_loc_full_physical` -> KVWriteLoc.full_loc), so the runner
-            # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
                 shape_key = self._make_graph_key(
