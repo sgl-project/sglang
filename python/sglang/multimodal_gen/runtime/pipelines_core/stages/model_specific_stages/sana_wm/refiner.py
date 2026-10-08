@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -240,7 +241,7 @@ def _forward_diffusers_video_only(
     )
 
     for block in transformer.transformer_blocks:
-        hidden_states = _forward_diffusers_video_block(
+        hidden_states = _forward_refiner_video_block(
             block=block,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
@@ -248,6 +249,7 @@ def _forward_diffusers_video_only(
             video_rotary_emb=video_rotary_emb,
             encoder_attention_mask=encoder_attention_mask,
             n_context_tokens=n_context_tokens,
+            self_attention=_streaming_diffusers_self_attention,
         )
 
     scale_shift_values = (
@@ -259,7 +261,7 @@ def _forward_diffusers_video_only(
     return transformer.proj_out(hidden_states)
 
 
-def _forward_diffusers_video_block(
+def _forward_refiner_video_block(
     *,
     block: nn.Module,
     hidden_states: torch.Tensor,
@@ -268,6 +270,7 @@ def _forward_diffusers_video_block(
     video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
     encoder_attention_mask: torch.Tensor | None,
     n_context_tokens: int,
+    self_attention: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     batch_size = hidden_states.size(0)
 
@@ -281,7 +284,7 @@ def _forward_diffusers_video_block(
     )
     norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
 
-    attn_hidden_states = _streaming_diffusers_self_attention(
+    attn_hidden_states = self_attention(
         attn=block.attn1,
         hidden_states=norm_hidden_states,
         query_rotary_emb=video_rotary_emb,
