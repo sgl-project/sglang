@@ -138,13 +138,34 @@ class TestGLM53FlashB200DFlash2(
 
 class TestGLM53FlashB200ContextParallel(
     GSM8KMixin,
-    _GLM53FlashB200Base,
+    CustomTestCase,
 ):
     gsm8k_score_threshold = 0.93
     gsm8k_num_examples = 500
     gsm8k_num_shots = 20
     server_args = [
-        *TestGLM53FlashB200LowLatency.server_args,
+        "--tp-size",
+        "4",
+        "--dsa-prefill-backend",
+        "trtllm",
+        "--dsa-decode-backend",
+        "trtllm",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--moe-runner-backend",
+        "flashinfer_trtllm",
+        "--reasoning-parser",
+        "auto",
+        "--tool-call-parser",
+        "auto",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "6",
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",
@@ -157,6 +178,24 @@ class TestGLM53FlashB200ContextParallel(
         "--moe-dense-tp-size",
         "4",
     ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model("zai-org/GLM-5.3-Flash")
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = None
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=3600,
+            other_args=cls.server_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if process := getattr(cls, "process", None):
+            terminate_and_kill_process_tree(process)
+            _wait_for_gpu_idle_in_ci(timeout=120)
 
     def test_gsm8k(self):
         super().test_gsm8k()
