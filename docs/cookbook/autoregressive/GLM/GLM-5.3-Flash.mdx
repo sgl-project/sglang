@@ -29,7 +29,7 @@ Choose your hardware, then choose the operating point that matches your workload
 
 Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
-The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration used a host tier, and the merged source has not been remeasured. Do not treat the CUDA benchmark rows as MI355X measurements.
+The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration adds the host tier described in [Extend the cache hierarchy](#extend-the-cache-hierarchy). Do not treat the CUDA benchmark rows as MI355X measurements.
 
 **Breakable Cuda Graph** defaults to **Off**. On NVIDIA, select **On** to add `--cuda-graph-backend-prefill breakable` to the generated command. This requires a build that includes [PR #38522](https://github.com/sgl-project/sglang/pull/38522); the option is disabled on MI355X.
 
@@ -125,6 +125,8 @@ On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 
 ### Extend the cache hierarchy
 
 Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill reusable cache entries into host memory. Select **+ L3** only after configuring Mooncake on every serving node; the generated command exposes the required configuration path. These options remain selectable but are marked **Not Verified** until the resulting command is validated on the chosen hardware.
+
+For agentic MXFP4 serving on MI355X, select **Low Latency** with **L1 + L2**. The host tier uses `--hicache-size 180` (about 190 GB of host memory per rank once the KDA state and DSA indexer pools are included, 750 GB per node) and requires a build that includes [PR #42178](https://github.com/sgl-project/sglang/pull/42178). With less free host memory, keep HiCache off; the server does not start when the host tier does not fit.
 
 ### Multimodal memory
 
