@@ -103,6 +103,23 @@ class TestEmbeddingEncodingFormat(unittest.IsolatedAsyncioTestCase, CustomTestCa
                     text="a", encoding_format=fmt
                 ).normalize_batch_and_arguments()
 
+    def test_media_only_batches_preserve_encoding_format(self):
+        """Audio/video-only requests retain their encoding format when split."""
+        for media_field in ("audio_data", "video_data"):
+            for fmt in (None, "float", "TENSOR"):
+                with self.subTest(media_field=media_field, fmt=fmt):
+                    req = EmbeddingReqInput(
+                        **{media_field: [["first"], ["second"]]},
+                        encoding_format=fmt,
+                    )
+                    req.normalize_batch_and_arguments()
+                    self.assertFalse(req.is_single)
+                    self.assertEqual(req.batch_size, 2)
+                    expected = fmt.lower() if fmt is not None else None
+                    for i in range(2):
+                        self.assertEqual(req[i].encoding_format, expected)
+                        req[i].normalize_batch_and_arguments()
+
     def test_default_and_mixed_dense_batches(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             values = torch.arange(12, dtype=dtype).reshape(3, 4).requires_grad_()
