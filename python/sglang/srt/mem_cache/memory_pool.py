@@ -4290,8 +4290,8 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "tail_extra_slots", 0)
 
     @property
-    def slots_per_page(self) -> int:
-        return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
+    def index_page_size(self) -> int:
+        return getattr(self.full_kv_pool, "index_page_size", self.page_size)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -5153,7 +5153,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert self.page_size % index_kpool == 0, (
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
-        self.slots_per_page = self.page_size // index_kpool
+        self.index_page_size = self.page_size // index_kpool
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
