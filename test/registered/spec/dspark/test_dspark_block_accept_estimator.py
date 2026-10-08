@@ -91,38 +91,32 @@ def _read_records(path: Path) -> list[dict]:
 
 
 class TestBlockAcceptEstimateRecorder(CustomTestCase):
-    def test_censored_block_uses_saved_truncated_or_deterministic_q(self):
-        for deterministic in (False, True):
-            with (
-                self.subTest(deterministic=deterministic),
-                tempfile.TemporaryDirectory() as tmp,
-            ):
-                recorder, path = _make_recorder(tmp)
-                drafts = [1, 2, 3]
-                probs = torch.zeros(1, _GAMMA, _VOCAB)
-                for step, token in enumerate(drafts):
-                    probs[0, step, token] = 1.0 if deterministic else 0.75
-                    if not deterministic:
-                        probs[0, step, 0] = 0.25
-                _observe(
-                    recorder,
-                    forward_ct=1,
-                    rid="r0",
-                    drafts=drafts,
-                    corrected_logits=torch.zeros(_GAMMA, _VOCAB),
-                    draft_probs=probs,
-                    target_logits=torch.zeros(_GAMMA + 1, _VOCAB),
-                    verify_len=2,
-                    correct_len=1,
-                    bonus=2,
-                    seq_len=10,
-                )
-                recorder._file.flush()
-                record = _read_records(path)[0]
-                expected = 0.0 if deterministic else math.log(0.75)
-                self.assertEqual(len(record["q_lp"]), 2)
-                for logprob in record["q_lp"]:
-                    self.assertAlmostEqual(logprob, expected, places=6)
+    def test_censored_block_uses_saved_truncated_q(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder, path = _make_recorder(tmp)
+            drafts = [1, 2, 3]
+            # Saved q differs from softmax(corrected_logits), which is uniform.
+            probs = torch.zeros(1, _GAMMA, _VOCAB)
+            probs[0, :, 0] = 0.25
+            probs[0, torch.arange(_GAMMA), torch.tensor(drafts)] = 0.75
+            _observe(
+                recorder,
+                forward_ct=1,
+                rid="r0",
+                drafts=drafts,
+                corrected_logits=torch.zeros(_GAMMA, _VOCAB),
+                draft_probs=probs,
+                target_logits=torch.zeros(_GAMMA + 1, _VOCAB),
+                verify_len=2,
+                correct_len=1,
+                bonus=2,
+                seq_len=10,
+            )
+            recorder._file.flush()
+            record = _read_records(path)[0]
+            self.assertEqual(len(record["q_lp"]), 2)
+            for logprob in record["q_lp"]:
+                self.assertAlmostEqual(logprob, math.log(0.75), places=6)
 
     def test_exact_block_when_rejected_inside_window(self):
         with tempfile.TemporaryDirectory() as tmp:

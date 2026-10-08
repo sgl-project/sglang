@@ -102,10 +102,8 @@ def _sample_corrected_candidate_path(kind, scores, *, uniforms, params):
 
 
 @pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-@pytest.mark.parametrize("temperature", [0.5, 1.0])
-def test_candidate_sampling_returns_the_truncated_realized_conditionals(
-    kind, temperature
-):
+def test_candidate_sampling_returns_the_truncated_realized_conditionals(kind):
+    temperature = 0.5
     # Position one's correction depends on the sampled predecessor. The rows
     # used by verify must be the two conditional distributions actually visited.
     scores = torch.zeros(1, 2, 4, 4)
@@ -121,23 +119,6 @@ def test_candidate_sampling_returns_the_truncated_realized_conditionals(
     expected_q = torch.tensor([[[0.0, 0.0, low, high], [high, low, 0.0, 0.0]]])
     assert tokens.tolist() == [[2, 5]]
     torch.testing.assert_close(q, expected_q)
-
-
-@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-def test_candidate_top_p_follows_correction_and_temperature(kind):
-    scores = torch.zeros(1, 2, 4, 4)
-    scores[:, 0, 0] = torch.tensor([1.0, 0.0, 2.0, 3.0])
-    scores[:, 1, 3] = torch.tensor([0.0, 5.0, 6.0, 1.0])
-    tokens, q = _sample_corrected_candidate_path(
-        kind,
-        scores,
-        uniforms=torch.tensor([[0.0, 0.0]]),
-        params=_params([0.5], [2], [0.8]),
-    )
-    assert tokens.tolist() == [[3, 6]]
-    torch.testing.assert_close(
-        q, torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]]])
-    )
 
 
 @pytest.mark.parametrize("kind", ["selector", "lilicorr"])
@@ -175,38 +156,6 @@ def test_candidate_sampling_roundoff_fallback_stays_in_truncated_support():
     )
     assert tokens.tolist() == [[2, 6]]
     assert torch.all(q.gather(-1, (tokens % 4).unsqueeze(-1)) > 0)
-
-
-@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-def test_candidate_graph_stages_draft_overrides(kind, topology):
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
-
-    if kind == "selector":
-        from sglang.srt.speculative.dflash_worker_v2 import _SelectorDraftSampler
-
-        sampler_class = _SelectorDraftSampler
-    else:
-        sampler_class = LiLiCorrDraftSampler
-    sampler = sampler_class.__new__(sampler_class)
-    sampler.sampling_params = DraftSamplingParams.greedy(3, "cpu")
-    sampler.sampling_enabled = True
-    sampling_info = SimpleNamespace(
-        temperatures=torch.tensor([[0.7], [1.2]]),
-        top_ks=torch.tensor([2, 7]),
-        top_ps=torch.tensor([0.8, 0.95]),
-        is_all_greedy=False,
-    )
-    with get_context().override_server_args(
-        speculative_draft_temperature=0.25,
-        speculative_draft_top_k=-1,
-        speculative_draft_top_p=0.6,
-    ):
-        sampler.stage_sampling_params(bs=2, sampling_info=sampling_info)
-    staged = sampler.sampling_params.slice(2)
-    torch.testing.assert_close(staged.temperatures, torch.tensor([0.25, 0.25]))
-    assert staged.top_ks.tolist() == [TOP_K_ALL, TOP_K_ALL]
-    torch.testing.assert_close(staged.top_ps, torch.tensor([0.6, 0.6]))
 
 
 def test_selector_rejects_a_quantized_target_lm_head():

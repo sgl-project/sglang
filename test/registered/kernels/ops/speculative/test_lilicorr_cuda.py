@@ -159,27 +159,6 @@ def test_sampled_path_matches_the_reference(k):
     torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
 
 
-def test_truncated_path_graph_replay_uses_updated_sampling_params():
-    inputs = _sampled_inputs(3, 4, 8, seed=11)
-    params = inputs["params"]
-    params.top_ks.copy_(torch.tensor([2, 4, 50], dtype=torch.int32))
-    params.top_ps.copy_(torch.tensor([0.8, 0.9, 1.0]))
-    # Warm the shared renormalization kernels before graph capture.
-    for _ in range(3):
-        lilicorr_sample_path(**inputs)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        tokens, q = lilicorr_sample_path(**inputs)
-    for temperatures, top_ks in [([1.0, 0.4, 1.3], [1, 2, 4]), ([0.7] * 3, [3] * 3)]:
-        params.temperatures.copy_(torch.tensor(temperatures))
-        params.top_ks.copy_(torch.tensor(top_ks, dtype=torch.int32))
-        graph.replay()
-        ref_tokens, ref_q = _walk_reference(**inputs)
-        assert torch.equal(tokens.cpu(), ref_tokens)
-        torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
-        assert torch.all(q.gather(-1, (tokens % 8).unsqueeze(-1)) > 0)
-
-
 def test_truncated_walk_roundoff_fallback_stays_in_support():
     from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 

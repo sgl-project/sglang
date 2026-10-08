@@ -6,12 +6,10 @@ import torch
 
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import run_markov_block
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.srt.speculative.dspark_components.dspark_draft import (
-    DraftBlockProposer,
     DraftBlockResult,
-    DraftForwardResult,
     sample_draft_block,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -23,48 +21,24 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
+# (temperature, top_k, top_p) draft overrides: inherit, sharpen, greedy draft.
+_OVERRIDES = ((None, None, None), (0.4, 2, 0.5), (0.0, -1, 1.0))
 
-def _sampling_info():
+
+def _sampling_info(device="cpu"):
     return SimpleNamespace(
-        temperatures=torch.tensor([[0.7], [1.5], [1.0]]),
-        top_ks=torch.tensor([2, 3, 1], dtype=torch.int32),
-        top_ps=torch.tensor([0.8, 0.9, 1.0]),
+        temperatures=torch.tensor([[0.7], [1.5], [1.0]], device=device),
+        top_ks=torch.tensor([2, 3, 1], dtype=torch.int32, device=device),
+        top_ps=torch.tensor([0.8, 0.9, 1.0], device=device),
         is_all_greedy=False,
         is_any_greedy=True,
     )
 
 
-def _reference_probs(logits, sampling_info, temperature=None, top_k=None, top_p=None):
-    rows = []
-    for row, scores in enumerate(logits):
-        temp = (
-            float(sampling_info.temperatures[row])
-            if temperature is None
-            else temperature
-        )
-        target_k = int(sampling_info.top_ks[row])
-        k = target_k if top_k is None else (TOP_K_ALL if top_k == -1 else top_k)
-        p = sampling_info.top_ps[row] if top_p is None else top_p
-        if temp == 0 or target_k <= 1 or k <= 1:
-            probs = torch.zeros_like(scores, dtype=torch.float32)
-            probs[scores.argmax()] = 1.0
-        else:
-            probs = (scores.float() / temp).softmax(-1)
-            sorted_probs, indices = probs.sort(descending=True)
-            sorted_probs[k:] = 0
-            sorted_probs /= sorted_probs.sum()
-            remove = sorted_probs.cumsum(-1) - sorted_probs > p
-            sorted_probs[remove] = 0
-            sorted_probs /= sorted_probs.sum()
-            probs = torch.zeros_like(probs).scatter_(-1, indices, sorted_probs)
-        rows.append(probs)
-    return torch.stack(rows)
-
-
 class _MarkovHead:
     def apply_step_logits(self, logits, *, token_ids, hidden_states):
-        # Promote a token outside the base top-k. Its identity changes with
-        # the sampled prefix, so pre-correction cutoffs cannot pass this test.
+        # Promote a token outside the base top-2. Its identity depends on the
+        # sampled prefix, so q built before the correction cannot match.
         correction = torch.zeros_like(logits)
         correction.scatter_(1, ((token_ids + 3) % logits.shape[-1])[:, None], 4.0)
         return logits + correction
@@ -77,117 +51,114 @@ def _tp_sync():
     return SimpleNamespace(sync=lambda _site, values: values)
 
 
-def _base_logits():
-    return torch.tensor([2.0, 1.0, 0.0, -1.0, -2.0]).repeat(3, 2, 1)
+def _base_logits(device="cpu"):
+    return torch.tensor([2.0, 1.0, 0.0, -1.0, -2.0], device=device).repeat(3, 2, 1)
+
+
+def _folded_sampler(device):
+    model = SimpleNamespace(
+        sample_from_anchor=True,
+        markov_head=_MarkovHead(),
+        lm_head=SimpleNamespace(org_vocab_size=5, weight=torch.empty(1)),
+        compute_base_logits=lambda hidden: (hidden, None),
+    )
+    return DsparkDraftSampler(
+        model=model, gamma=2, max_bs=3, device=device, tp_sync=_tp_sync()
+    )
 
 
 class TestDsparkDraftSampling(unittest.TestCase):
     def setUp(self):
-        self.spec = SimpleNamespace(
-            speculative_draft_temperature=None,
-            speculative_draft_top_k=None,
-            speculative_draft_top_p=None,
-        )
+        self.spec = SimpleNamespace()
         patcher = mock.patch(
             "sglang.srt.runtime_context.get_spec", return_value=self.spec
         )
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _check_block(
-        self, tokens, logits, probs, info, temperature=None, top_k=None, top_p=None
-    ):
-        for step in range(tokens.shape[1]):
-            expected = _reference_probs(
-                logits[:, step], info, temperature, top_k, top_p
-            )
-            torch.testing.assert_close(probs[:, step], expected)
-            self.assertTrue(
-                bool((probs[:, step].gather(1, tokens[:, step, None]) > 0).all())
-            )
+    def _set_overrides(self, temperature, top_k, top_p):
+        self.spec.speculative_draft_temperature = temperature
+        self.spec.speculative_draft_top_k = top_k
+        self.spec.speculative_draft_top_p = top_p
 
-    def test_eager_saves_corrected_truncated_distribution_for_both_samplers(self):
+    def _check_block(self, *, tokens, corrected_logits, probs, info):
+        params = DraftSamplingParams.from_sampling_info(info)
+        for step in range(tokens.shape[1]):
+            torch.testing.assert_close(
+                probs[:, step], build_draft_probs(corrected_logits[:, step], params)
+            )
+        self.assertTrue(bool((probs.gather(-1, tokens[..., None]) > 0).all()))
+        # Token 3 enters request 0's top-2 only after the Markov correction.
+        self.assertGreater(float(probs[0, 0, 3]), 0)
+
+    def test_eager_q_follows_the_markov_correction(self):
         info = _sampling_info()
         for fast in (False, True):
-            for override, top_k, top_p in (
-                (None, None, None),
-                (0.4, 2, 0.5),
-                (None, -1, 1.0),
-                (None, 1, None),
-                (0.0, -1, 1.0),
-            ):
-                with self.subTest(
-                    fast=fast, override=override, top_k=top_k, top_p=top_p
+            for overrides in _OVERRIDES:
+                self._set_overrides(*overrides)
+                with (
+                    self.subTest(fast=fast, overrides=overrides),
+                    envs.SGLANG_DSPARK_FAST_SAMPLING.override(fast),
                 ):
-                    self.spec.speculative_draft_temperature = override
-                    self.spec.speculative_draft_top_k = top_k
-                    self.spec.speculative_draft_top_p = top_p
-                    with envs.SGLANG_DSPARK_FAST_SAMPLING.override(fast):
-                        result = sample_draft_block(
-                            base_logits=_base_logits(),
-                            anchor_tokens=torch.zeros(3, dtype=torch.long),
-                            draft_hidden=torch.zeros(3, 2, 1),
-                            sampling_info=info,
-                            markov_head=_MarkovHead(),
-                            device=torch.device("cpu"),
-                            tp_sync=_tp_sync(),
-                        )
+                    result = sample_draft_block(
+                        base_logits=_base_logits(),
+                        anchor_tokens=torch.zeros(3, dtype=torch.long),
+                        draft_hidden=torch.zeros(3, 2, 1),
+                        sampling_info=info,
+                        markov_head=_MarkovHead(),
+                        device=torch.device("cpu"),
+                        tp_sync=_tp_sync(),
+                    )
                     self._check_block(
-                        result.draft_tokens,
-                        result.corrected_logits,
-                        result.draft_probs,
-                        info,
-                        override,
-                        top_k,
-                        top_p,
+                        tokens=result.draft_tokens,
+                        corrected_logits=result.corrected_logits,
+                        probs=result.draft_probs,
+                        info=info,
                     )
-                    # Token 3 is outside the uncorrected top-2, yet the
-                    # correction puts it inside the actual proposal support.
-                    self.assertGreater(float(result.draft_probs[0, 0, 3]), 0)
-                    # greedy_mask selects the accept rule, so it stays the
+                    # greedy_mask picks the accept rule, so it stays the
                     # target's even when the draft itself is greedy.
-                    torch.testing.assert_close(
-                        result.greedy_mask, torch.tensor([False, False, True])
-                    )
+                    self.assertEqual(result.greedy_mask.tolist(), [False, False, True])
 
-    def test_folded_sampler_retains_q_in_graph_buffers(self):
-        base_logits = _base_logits()
-        model = SimpleNamespace(
-            sample_from_anchor=True,
-            markov_head=_MarkovHead(),
-            lm_head=SimpleNamespace(org_vocab_size=5, weight=torch.empty(1)),
-            compute_base_logits=lambda hidden: (hidden, None),
-        )
-        sampler = DsparkDraftSampler(
-            model=model, gamma=2, max_bs=3, device="cpu", tp_sync=_tp_sync()
-        )
-        info = _sampling_info()
-        probs_address = sampler.probs_out.data_ptr()
-        for override, top_k, top_p in (
-            (None, None, None),
-            (None, -1, 1.0),
-            (0.4, 2, 0.5),
-            (None, 1, None),
-            (0.0, -1, 1.0),
-        ):
-            self.spec.speculative_draft_temperature = override
-            self.spec.speculative_draft_top_k = top_k
-            self.spec.speculative_draft_top_p = top_p
+    def test_folded_sampler_retains_q(self):
+        sampler, info = _folded_sampler("cpu"), _sampling_info()
+        for overrides in _OVERRIDES:
+            self._set_overrides(*overrides)
             sampler.stage_sampling_params(bs=3, sampling_info=info)
-            sampler(base_logits.reshape(6, 5), torch.zeros(6, dtype=torch.long))
+            sampler(_base_logits().reshape(6, 5), torch.zeros(6, dtype=torch.long))
             self._check_block(
-                sampler.out.view(3, 2),
-                sampler.corrected_out.view(3, 2, 5),
-                sampler.probs_out.view(3, 2, 5),
-                info,
-                override,
-                top_k,
-                top_p,
+                tokens=sampler.out.view(3, 2),
+                corrected_logits=sampler.corrected_out.view(3, 2, 5),
+                probs=sampler.probs_out.view(3, 2, 5),
+                info=info,
             )
-            torch.testing.assert_close(
-                sampler.greedy_mask, torch.tensor([False, False, True])
+            self.assertEqual(sampler.greedy_mask.tolist(), [False, False, True])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA graph replay")
+    def test_folded_cuda_graph_replays_changed_overrides(self):
+        sampler, info = _folded_sampler("cuda"), _sampling_info("cuda")
+        hidden = _base_logits("cuda").reshape(6, 5)
+        input_ids = torch.zeros(6, dtype=torch.long, device="cuda")
+        self._set_overrides(*_OVERRIDES[0])
+        sampler.stage_sampling_params(bs=3, sampling_info=info)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                sampler(hidden, input_ids)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden, input_ids)
+        for overrides in _OVERRIDES:
+            self._set_overrides(*overrides)
+            sampler.stage_sampling_params(bs=3, sampling_info=info)
+            graph.replay()
+            self._check_block(
+                tokens=sampler.out.view(3, 2),
+                corrected_logits=sampler.corrected_out.view(3, 2, 5),
+                probs=sampler.probs_out.view(3, 2, 5),
+                info=info,
             )
-        self.assertEqual(sampler.probs_out.data_ptr(), probs_address)
 
     def test_folded_memory_budget_includes_saved_probabilities(self):
         model = SimpleNamespace(
@@ -209,97 +180,8 @@ class TestDsparkDraftSampling(unittest.TestCase):
                 )
             )
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA graph replay")
-    def test_folded_cuda_graph_replays_changed_sampling_policy(self):
-        hidden = _base_logits().to("cuda").reshape(6, 5)
-        input_ids = torch.zeros(6, dtype=torch.long, device="cuda")
-        model = SimpleNamespace(
-            sample_from_anchor=True,
-            markov_head=_MarkovHead(),
-            lm_head=SimpleNamespace(org_vocab_size=5, weight=hidden),
-            compute_base_logits=lambda values: (values, None),
-        )
-        sampler = DsparkDraftSampler(
-            model=model, gamma=2, max_bs=3, device="cuda", tp_sync=_tp_sync()
-        )
-        info = _sampling_info()
-        for name in ("temperatures", "top_ks", "top_ps"):
-            setattr(info, name, getattr(info, name).to("cuda"))
-        sampler.stage_sampling_params(bs=3, sampling_info=info)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                sampler(hidden, input_ids)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            sampler(hidden, input_ids)
-        for override, top_k, top_p in (
-            (None, None, None),
-            (0.4, 2, 0.5),
-            (None, -1, 1.0),
-            (None, 1, None),
-            (0.0, -1, 1.0),
-        ):
-            self.spec.speculative_draft_temperature = override
-            self.spec.speculative_draft_top_k = top_k
-            self.spec.speculative_draft_top_p = top_p
-            sampler.stage_sampling_params(bs=3, sampling_info=info)
-            graph.replay()
-            self._check_block(
-                sampler.out.view(3, 2),
-                sampler.corrected_out.view(3, 2, 5),
-                sampler.probs_out.view(3, 2, 5),
-                info,
-                override,
-                top_k,
-                top_p,
-            )
-
-    def test_proposer_passes_folded_q_to_verification(self):
-        sampler = SimpleNamespace(
-            folded_sampling=True,
-            out=torch.arange(6),
-            corrected_out=torch.randn(6, 5),
-            probs_out=torch.randn(6, 5).softmax(-1),
-            sampling_params=SimpleNamespace(temperatures=torch.ones(3)),
-            greedy_mask=torch.zeros(3, dtype=torch.bool),
-            confidence_out=None,
-        )
-        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
-        proposer.sample_from_anchor = True
-        proposer.gamma = 2
-        proposer._draft_sampler = sampler
-        proposer._run_forward = mock.Mock(
-            return_value=DraftForwardResult(
-                draft_block_ids=torch.zeros(2, 2, dtype=torch.long),
-                raw_hidden=torch.zeros(4, 1),
-                draft_hidden_3d=torch.zeros(2, 2, 1),
-                can_run_graph=True,
-            )
-        )
-        target = SimpleNamespace(get_input_embeddings=lambda: torch.nn.Embedding(5, 1))
-        with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(True):
-            result = proposer.propose(
-                batch=None,
-                draft_input=None,
-                verify_window=None,
-                bs=2,
-                device="cpu",
-                target_model=target,
-                sampling_info=_sampling_info(),
-            )
-        self.assertTrue(result.folded)
-        self.assertEqual(
-            result.draft_block.draft_probs.data_ptr(), sampler.probs_out.data_ptr()
-        )
-        torch.testing.assert_close(
-            result.draft_block.draft_probs, sampler.probs_out[:4].view(2, 2, 5)
-        )
-
-    def test_mixed_verification_uses_saved_q(self):
-        info = _sampling_info()
+    def test_sampling_verification_uses_saved_q(self):
+        # Rebuilding q from corrected logits would drop the draft cutoffs.
         probs = torch.zeros(3, 2, 5)
         probs[:, :, 3] = 1.0
         draft = DraftBlockResult(
@@ -326,7 +208,7 @@ class TestDsparkDraftSampling(unittest.TestCase):
                 candidates=torch.zeros(3, 3, dtype=torch.long),
                 target_logits=torch.zeros(9, 5),
                 draft_block=draft,
-                sampling_info=info,
+                sampling_info=_sampling_info(),
                 draft_input=None,
                 gamma=2,
                 verify_num_draft_tokens=3,

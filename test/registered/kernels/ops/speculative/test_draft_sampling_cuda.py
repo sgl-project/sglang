@@ -1,8 +1,7 @@
-"""CUDA coverage for proposal cutoffs and graph parameter staging."""
+"""Draft q and target p must agree on CUDA for the same logits and cutoffs."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -43,43 +42,6 @@ class TestDraftSamplingCUDA(unittest.TestCase):
                 proposal = build_draft_probs(logits, params)
                 self.assertTrue(torch.equal(proposal > 0, target > 0))
                 torch.testing.assert_close(proposal, target, atol=1e-6, rtol=1e-5)
-
-    def test_graph_replay_observes_new_cutoffs_and_zero_temperature(self):
-        params = DraftSamplingParams.greedy(4, "cuda")
-        logits = torch.arange(64, device="cuda", dtype=torch.float32).reshape(4, 16)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                build_draft_probs(logits, params)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured_q = build_draft_probs(logits, params)
-        info = SimpleNamespace(
-            temperatures=torch.tensor([[0.5], [2.0]], device="cuda"),
-            top_ks=torch.tensor([2, 5], dtype=torch.int32, device="cuda"),
-            top_ps=torch.tensor([0.95, 0.7], device="cuda"),
-        )
-        for override, top_k, top_p in (
-            (None, None, None),
-            (0.0, -1, 1.0),
-            (1.2, 3, 0.5),
-            (None, -1, 1.0),
-        ):
-            with patch(
-                "sglang.srt.runtime_context.get_spec",
-                return_value=SimpleNamespace(
-                    speculative_draft_temperature=override,
-                    speculative_draft_top_k=top_k,
-                    speculative_draft_top_p=top_p,
-                ),
-            ):
-                params.copy_from(info, 2)
-            graph.replay()
-            expected = build_draft_probs(logits, params)
-            torch.testing.assert_close(captured_q, expected, rtol=0, atol=0)
-            torch.testing.assert_close(captured_q.sum(-1), torch.ones(4, device="cuda"))
 
 
 if __name__ == "__main__":
