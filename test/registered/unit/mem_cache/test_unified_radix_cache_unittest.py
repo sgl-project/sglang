@@ -4413,6 +4413,56 @@ class UnifiedRadixCacheSuite:
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
+    def test_buffer_only_abort_defers_query_beliefs_until_hit_drain(self):
+        self._skip_unsupported_hicache_test()
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("requires a FULL-only query")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        tokens = self._make_seq(1, 4)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        self._buffer_backup_and_wait(cache, leaf)
+        controller = cache.cache_controller
+        controller._stop_storage_threads()
+        cache.storage_existence_cache.clear()
+
+        # Drive the real query and queue publication separately so cancellation
+        # observes a worker-local verdict before the scheduler consumes it.
+        request = CacheRequestHandle("abort-before-query-publication", 0)
+        cache.prefetch_from_storage(
+            request, cache.root_node_handle(), array("q", tokens)
+        )
+        operation = controller.prefetch_queue.get_nowait()
+        hashes, hit_tokens = controller._storage_hit_query(operation)
+        self.assertEqual(hit_tokens, len(tokens))
+        self.assertEqual(operation.query_pool_hit_pages[PoolName.KV], 4)
+        self.assertEqual(operation.storage_hit_count, 0)
+
+        cache.finish(request, CacheRequestOutcome.ABORT)
+        self.assertNotIn(request, cache.ongoing_prefetch)
+        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+        self.assertFalse(beliefs.contains_all(hashes))
+        cache.request_buffer_backup(leaf)
+        self.assertEqual(
+            [intent.pool for intent in cache.buffer_pipeline.pending_write_queue],
+            [PoolName.KV],
+        )
+
+        operation.storage_hit_count = controller._sync_prefetch_hit_query(
+            operation, hit_tokens
+        )
+        operation.hash_value = hashes
+        controller.prefetch_hit_queue.put(operation)
+        cache.check_hicache_events()
+        self.assertTrue(beliefs.contains_all(hashes))
+        self.assertFalse(cache.buffer_backup_pending(leaf))
+        self.assertFalse(cache.buffer_pipeline.ongoing_write_through)
+
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
         nothing device-side, unmatchable, stable readiness, counters fed) ->

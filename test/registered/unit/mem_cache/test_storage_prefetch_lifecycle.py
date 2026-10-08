@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -152,13 +153,10 @@ def _hit_drain_fixture():
 
 def _terminated_query(cache, rid, hit_tokens):
     handle = CacheRequestHandle(rid, 0)
-    operation = SimpleNamespace(
-        request_id=rid,
-        handle=handle,
-        storage_hit_count=hit_tokens,
-        stats_requested_tokens=8,
-        is_terminated=lambda: True,
-    )
+    operation = PrefetchOperation(handle, list(range(8)))
+    operation.storage_hit_count = hit_tokens
+    operation.stats_requested_tokens = 8
+    operation.mark_terminate()
     cache.ongoing_prefetch[handle] = _OngoingPrefetch(
         0, RadixKey(array("q", range(8))), None, operation, None, {}
     )
