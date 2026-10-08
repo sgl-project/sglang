@@ -898,6 +898,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def max_shared_logits_buffer_rows(self) -> int:
