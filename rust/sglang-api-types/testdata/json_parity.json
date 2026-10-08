@@ -1,0 +1,373 @@
+{
+  "_": "Cross-language JSON parity fixtures for sglang.api.v1. Each case: decoding `input` and re-encoding yields `canonical` byte for byte, and `canonical` re-encodes to itself. Checked by rust/sglang-api-types/tests/json_parity.rs and test/registered/unit/api/v1/test_parity.py.",
+  "cases": [
+    {
+      "type": "GenerateRequest",
+      "name": "single text prompt with a sampling object; stream absent",
+      "input": {
+        "text": "hi",
+        "sampling_params": {
+          "temperature": 0.5,
+          "max_new_tokens": 8
+        }
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"sampling_params\":{\"max_new_tokens\":8,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "batch form: per-item sampling, broadcast flag, nullable PD columns",
+      "input": {
+        "text": [
+          "a",
+          "b"
+        ],
+        "stream": true,
+        "sampling_params": [
+          {
+            "top_p": 0.9
+          },
+          {
+            "temperature": 0.5
+          }
+        ],
+        "return_logprob": true,
+        "bootstrap_host": [
+          null,
+          "h"
+        ],
+        "bootstrap_port": [
+          8998,
+          null
+        ]
+      },
+      "canonical": "{\"text\":[\"a\",\"b\"],\"stream\":true,\"sampling_params\":[{\"max_new_tokens\":128,\"temperature\":1.0,\"top_p\":0.9,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false},{\"max_new_tokens\":128,\"temperature\":0.5,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}],\"return_logprob\":true,\"bootstrap_host\":[null,\"h\"],\"bootstrap_port\":[8998,null]}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "token prompt with every logprob knob; stream null resets to false",
+      "input": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "rid": "r-1",
+        "stream": null,
+        "return_logprob": true,
+        "logprob_start_len": 0,
+        "top_logprobs_num": 2,
+        "token_ids_logprob": [
+          5,
+          6
+        ],
+        "return_text_in_logprobs": true,
+        "return_hidden_states": true,
+        "routed_dp_rank": 1
+      },
+      "canonical": "{\"rid\":\"r-1\",\"input_ids\":[1,2,3],\"stream\":false,\"return_logprob\":true,\"logprob_start_len\":0,\"top_logprobs_num\":2,\"token_ids_logprob\":[5,6],\"return_hidden_states\":true,\"return_text_in_logprobs\":true,\"routed_dp_rank\":1}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "media containers: nested, ref object, bare source; unknown keys ignored",
+      "input": {
+        "text": "see",
+        "image_data": [
+          [
+            "a",
+            null
+          ],
+          null,
+          []
+        ],
+        "video_data": {
+          "url": "v",
+          "fps": 2.0,
+          "use_audio": true
+        },
+        "audio_data": "data:audio/wav;base64,AA==",
+        "mm_hashes": [
+          "h1",
+          "h2"
+        ],
+        "priority": 3,
+        "session_id": "ignored"
+      },
+      "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"
+    },
+    {
+      "type": "SamplingParams",
+      "name": "empty object: every schema default is emitted",
+      "input": {},
+      "canonical": "{\"max_new_tokens\":128,\"temperature\":1.0,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}"
+    },
+    {
+      "type": "SamplingParams",
+      "name": "explicit null resets a default; lists, maps and raw custom_params round-trip",
+      "input": {
+        "temperature": null,
+        "stop": [
+          "a",
+          "b"
+        ],
+        "stop_token_ids": [
+          1,
+          2
+        ],
+        "logit_bias": {
+          "7": -1.5
+        },
+        "custom_params": {
+          "k": [
+            1,
+            "x",
+            null
+          ]
+        },
+        "json_schema": "{}",
+        "beam_width": 2
+      },
+      "canonical": "{\"max_new_tokens\":128,\"stop\":[\"a\",\"b\"],\"stop_token_ids\":[1,2],\"temperature\":1.0,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":1,\"json_schema\":\"{}\",\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false,\"logit_bias\":{\"7\":-1.5},\"custom_params\":{\"k\":[1,\"x\",null]},\"beam_width\":2}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "plain frame: finish_reason null pre-terminal, output_ids present",
+      "input": {
+        "text": "ok",
+        "meta_info": {
+          "id": "client-rid",
+          "prompt_tokens": 5,
+          "completion_tokens": 2,
+          "finish_reason": null
+        },
+        "output_ids": [
+          7,
+          8
+        ]
+      },
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"client-rid\",\"prompt_tokens\":5,\"completion_tokens\":2,\"finish_reason\":null},\"output_ids\":[7,8]}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "terminal batch frame with every logprob family, null rows, hidden states, e2e_latency, index",
+      "input": {
+        "text": "ok",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 1,
+          "finish_reason": {
+            "type": "stop",
+            "matched": [
+              1,
+              2
+            ]
+          },
+          "output_token_logprobs": [
+            [
+              -0.5,
+              5,
+              "x"
+            ],
+            [
+              null,
+              6,
+              null
+            ]
+          ],
+          "input_token_logprobs": [],
+          "output_top_logprobs": [
+            null,
+            [
+              [
+                -0.25,
+                6,
+                null
+              ]
+            ]
+          ],
+          "input_top_logprobs": [
+            [
+              [
+                -0.125,
+                1,
+                "<s>"
+              ]
+            ]
+          ],
+          "output_token_ids_logprobs": [
+            [
+              [
+                -0.5,
+                9,
+                null
+              ]
+            ]
+          ],
+          "input_token_ids_logprobs": [
+            null
+          ],
+          "hidden_states": [
+            [
+              0.5,
+              0.25
+            ],
+            []
+          ],
+          "e2e_latency": 0.01
+        },
+        "output_ids": [
+          5
+        ],
+        "index": 0
+      },
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01},\"output_ids\":[5],\"index\":0}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "finish length",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 9,
+          "finish_reason": {
+            "type": "length",
+            "length": 9
+          }
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9}}}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "finish abort emits its null keys",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 0,
+          "finish_reason": {
+            "type": "abort",
+            "message": "over the limit",
+            "status_code": 400,
+            "err_type": null
+          }
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"abort\",\"message\":\"over the limit\",\"status_code\":400,\"err_type\":null}}}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "unknown finish type passes through unchanged",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 0,
+          "finish_reason": {
+            "detail": 3,
+            "type": "novel"
+          }
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"detail\":3,\"type\":\"novel\"}}}"
+    },
+    {
+      "type": "GenerateStreamError",
+      "name": "in-stream error item with batch index",
+      "input": {
+        "error": {
+          "message": "bad sampling",
+          "code": 400
+        },
+        "index": 1
+      },
+      "canonical": "{\"error\":{\"message\":\"bad sampling\",\"code\":400},\"index\":1}"
+    },
+    {
+      "type": "GetModelInfoResponse",
+      "name": "absent optionals are emitted as null",
+      "input": {
+        "model_path": "/m",
+        "served_model_name": "m",
+        "tokenizer_path": "/t",
+        "is_generation": true,
+        "weight_version": "v1"
+      },
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"is_generation\":true,\"preferred_sampling_params\":null,\"weight_version\":\"v1\",\"load_format\":null,\"reasoning_parser\":null,\"tool_call_parser\":null}"
+    },
+    {
+      "type": "GetServerInfoResponse",
+      "name": "internal_states is a list of raw JSON documents",
+      "input": {
+        "model_path": "/m",
+        "served_model_name": "m",
+        "tokenizer_path": "/t",
+        "max_context_length": 4096,
+        "max_total_num_tokens": 8192,
+        "version": "0.5.0",
+        "internal_states": [
+          {
+            "last_gen_throughput": 1.5,
+            "memory_usage": {
+              "weight": 2.0
+            }
+          }
+        ]
+      },
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"max_context_length\":4096,\"max_total_num_tokens\":8192,\"version\":\"0.5.0\",\"internal_states\":[{\"last_gen_throughput\":1.5,\"memory_usage\":{\"weight\":2.0}}]}"
+    },
+    {
+      "type": "SamplingParams",
+      "name": "null_is_none: an explicit max_new_tokens null (unbounded) survives the round trip as null",
+      "input": {
+        "max_new_tokens": null,
+        "n": 2
+      },
+      "canonical": "{\"max_new_tokens\":null,\"temperature\":1.0,\"top_p\":1.0,\"top_k\":1073741824,\"min_p\":0.0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0,\"min_new_tokens\":0,\"n\":2,\"ignore_eos\":false,\"skip_special_tokens\":true,\"spaces_between_special_tokens\":true,\"no_stop_trim\":false}"
+    },
+    {
+      "type": "GetModelInfoResponse",
+      "name": "preferred_sampling_params is the launch object itself (raw JSON)",
+      "input": {
+        "model_path": "/m",
+        "served_model_name": "m",
+        "tokenizer_path": "/t",
+        "is_generation": true,
+        "preferred_sampling_params": {
+          "temperature": 0.5,
+          "max_new_tokens": 64
+        },
+        "weight_version": "v1"
+      },
+      "canonical": "{\"model_path\":\"/m\",\"served_model_name\":\"m\",\"tokenizer_path\":\"/t\",\"is_generation\":true,\"preferred_sampling_params\":{\"temperature\":0.5,\"max_new_tokens\":64},\"weight_version\":\"v1\",\"load_format\":null,\"reasoning_parser\":null,\"tool_call_parser\":null}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "unknown finish type passes through with its key order",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 0,
+          "finish_reason": {
+            "type": "novel",
+            "detail": 3,
+            "again": [
+              1,
+              {
+                "z": 1,
+                "a": 2
+              }
+            ]
+          }
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]}}}"
+    }
+  ]
+}

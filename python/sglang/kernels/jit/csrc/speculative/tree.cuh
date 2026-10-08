@@ -48,7 +48,7 @@ inline void build_tree_kernel_efficient(
   TensorMatcher({batch_size, parent_width})
       .with_strides({parent_list.size(1) == 0 ? -1 : parent_list.size(1), 1})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(parent_list);
   CHECK_HOST(depth == 1 || parent_width.unwrap() == topk * (depth - 1) + 1);
   TensorMatcher({batch_size, draft_token_num - 1})
@@ -138,7 +138,7 @@ inline void verify_tree_greedy(
   SymbolicDevice device;
   TensorMatcher({batch_size, draft_tokens})
       .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(candidates)
       .verify(retrive_index)
       .verify(retrive_next_token)
@@ -183,7 +183,7 @@ inline void reconstruct_indices_from_tree_mask(
   // Bytes, not element type -- same reasoning as build_tree_kernel_efficient:
   // the kernel casts straight to bool* and callers are free to spell a 1-byte
   // mask as bool or uint8.
-  TensorMatcher({-1}).with_device<kDLCUDA>(device).verify(tree_mask);
+  TensorMatcher({-1}).with_device<kDLGPU>(device).verify(tree_mask);
   CHECK_HOST(tree_mask.dtype().bits == 8);
   CHECK_HOST(tree_mask.numel() >= batch_size * draft_token_num * draft_token_num);
   TensorMatcher({batch_size}).with_dtype<int64_t>().with_device(device).verify(verified_seq_len);

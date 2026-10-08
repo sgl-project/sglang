@@ -166,7 +166,9 @@ def _weak_ref_if_tensor(x):
     if torch.is_tensor(x):
         if x.numel() == 0 or x.device.type == "cpu":
             return x
-        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+        from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
+            weak_ref_tensors,
+        )
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):

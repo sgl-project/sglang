@@ -127,6 +127,26 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             compress_ratio=128,
         ),
         DSV4AttentionCase(
+            name="dsv4_c2_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            # Odd lengths: the ratio-2 causal count (pos + 1) // 2 rounds down.
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=2,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(65,),
+            compress_ratio=2,
+        ),
+        DSV4AttentionCase(
             name="dsv4_c128_decode",
             backend="dsv4",
             forward_mode=ForwardMode.DECODE,
@@ -533,6 +553,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 backend.model_runner = SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
+                backend.token_to_kv_pool = SimpleNamespace(request_window=None)
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -577,6 +598,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.model_runner = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH
         )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -794,7 +816,8 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = None
         backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc],
+            request_window=None,
         )
         return backend
 

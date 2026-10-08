@@ -32,6 +32,7 @@ from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
@@ -277,7 +278,6 @@ class TestDSAIndexer(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "flashmla_sparse"
         server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
@@ -1235,7 +1235,7 @@ class TestDSAIndexer(CustomTestCase):
             with self.subTest(topk_backend=topk_backend.value):
                 backend = object.__new__(DeepseekSparseAttnBackend)
                 backend.device = self.device
-                backend.real_page_size = 64
+                backend.physical_page_size = 64
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True
@@ -1243,6 +1243,9 @@ class TestDSAIndexer(CustomTestCase):
                 backend.dsa_index_topk = 2048
                 backend.dsa_index_kpool = 1
                 backend.dsa_decode_impl = "fa3"
+                backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=False
+                )
                 backend.req_to_token = torch.empty(
                     2, 4096, dtype=torch.int32, device=self.device
                 )

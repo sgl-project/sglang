@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -25,6 +25,59 @@ class TestRegisterToBootstrap(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+
+    def test_sender_dp_rank_registration(self):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        for force_query in (False, True):
+            for dp_rank in (0, 1):
+                with self.subTest(force_query=force_query, dp_rank=dp_rank):
+                    mgr = MagicMock(
+                        is_dummy_cp_rank=False,
+                        attn_dp_rank=dp_rank,
+                        deferred_bootstrap=None,
+                    )
+                    sender = MagicMock(spec=CommonKVSender)
+                    sender._register_prefill_dp_rank = (
+                        CommonKVSender._register_prefill_dp_rank.__get__(sender)
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.common.conn.requests.post"
+                        ) as mock_post,
+                        get_context().override_server_args(
+                            dp_size=4, load_balance_method="follow_bootstrap_room"
+                        ),
+                        envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(
+                            force_query
+                        ),
+                    ):
+                        mock_post.return_value.status_code = 200
+                        CommonKVSender.__init__(
+                            sender,
+                            mgr=mgr,
+                            bootstrap_addr="127.0.0.1:8765",
+                            bootstrap_room=4,
+                        )
+
+                    self.assertEqual(
+                        mock_post.call_args_list,
+                        [
+                            call(
+                                "http://127.0.0.1:8765/register_dp_rank",
+                                json={"bootstrap_room": 4, "dp_rank": dp_rank},
+                                timeout=5,
+                            )
+                        ]
+                        if force_query
+                        else [],
+                    )
+                    conflict = not force_query and dp_rank != 0
+                    self.assertEqual(mgr.record_failure.call_count, int(conflict))
+                    mgr.update_status.assert_called_with(
+                        4, KVPoll.Failed if conflict else KVPoll.Bootstrapping
+                    )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -201,10 +254,10 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertIn("10.0.0.1", url_used)
 
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    @patch("sglang.srt.disaggregation.common.conn.get_world_group")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
-        self, mock_world_group, mock_put
+        self, mock_put
     ):
+        mock_world_group = MagicMock()
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
@@ -228,9 +281,12 @@ class TestRegisterToBootstrap(CustomTestCase):
                 for dp_rank, tp_rank, host, rank_port, _ in schedulers
             ]
 
-        mock_world_group.return_value.all_gather_object.side_effect = gather_topology
+        mock_world_group.all_gather_object.side_effect = gather_topology
 
-        with envs.SGLANG_RUST_SERVER.override(True):
+        with (
+            get_parallel().override(world_group=mock_world_group),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
             for dp_rank, tp_rank, local_ip, _, rust_http_port in schedulers:
                 manager = self._make_manager()
                 manager.attn_dp_size = 2
@@ -275,7 +331,7 @@ class TestRegisterToBootstrap(CustomTestCase):
                     gather_call.args[0]["attn_dp_rank"],
                     gather_call.args[0]["attn_tp_rank"],
                 )
-                for gather_call in mock_world_group.return_value.all_gather_object.call_args_list
+                for gather_call in mock_world_group.all_gather_object.call_args_list
             ],
             [(dp, tp) for dp, tp, _, _, _ in schedulers],
         )
