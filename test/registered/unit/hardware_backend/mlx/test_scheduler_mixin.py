@@ -4,6 +4,7 @@ Covers:
   - Every MLX launch advances forward_ct and stamps forward_iter/launch_ts.
   - The profiler predicate runs before the async forward is enqueued, matching
     Scheduler.run_batch() so step-bounded profiling stops on the right step.
+  - A retract-mode pause processes the in-flight MLX job before retracting.
 
 Skips on non-Apple-Silicon platforms and when ``mlx`` is missing (importing
 scheduler_mixin requires ``mlx.core``).
@@ -325,6 +326,178 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         self.assertEqual(scheduler.ingest_requests.call_count, 1)
         scheduler.get_next_batch_to_run.assert_not_called()
         synchronize.assert_called_once_with()
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestRetractPauseDrainsInflightJob(unittest.TestCase):
+    """``pause_generation(mode="retract")`` must process the in-flight MLX job first.
+
+    The MLX overlap loop leaves a launched job queued in ``result_queue`` at
+    the top of each iteration.  A retract-mode pause that does not drain it
+    retracts the job's requests and frees their KV, and on resume the loop
+    processes the stale job for requests that are back in the waiting queue.
+    """
+
+    def _make_scheduler(self, *, ingest_steps, events):
+        from collections import deque
+
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = MagicMock()
+        scheduler.forward_ct = 0
+        scheduler._sched_idled = False
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler.enable_overlap = False
+        scheduler.enable_overlap_mlx = True
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.chunked_req = None
+        scheduler.decode_offload_manager = None
+        scheduler.last_batch = None
+        scheduler.waiting_queue = []
+        scheduler.result_queue = deque()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        for name in (
+            "_prepare_mlx_launch",
+            "_finalize_mlx_pending_job",
+            "_drain_mlx_pending_jobs",
+        ):
+            getattr(scheduler, name).side_effect = getattr(
+                SchedulerMlxOverlapMixin, name
+            ).__get__(scheduler)
+        scheduler.pause_generation.side_effect = Scheduler.pause_generation.__get__(
+            scheduler
+        )
+
+        req = MagicMock()
+        req.rid = "r1"
+        req.finished.return_value = False
+        batch = MagicMock()
+        batch.reqs = [req]
+        batch.return_logprob = False
+        batch.forward_mode.is_extend.return_value = False
+        batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
+        scheduler.running_batch = batch
+
+        def get_next_batch_to_run(running_batch, last_batch):
+            plan = MagicMock()
+            plan.running_batch = running_batch
+            plan.batch_to_run = running_batch if running_batch.reqs else None
+            return plan
+
+        scheduler.get_next_batch_to_run.side_effect = get_next_batch_to_run
+        # A decode launch without a chainable handle: one job in flight.
+        scheduler.tp_worker.async_forward_batch_generation_mlx.side_effect = lambda b: (
+            events.append(("launch", [r.rid for r in b.reqs])),
+            MlxLaunch(
+                lazy_tokens=None,
+                prefills=[],
+                extends=[],
+                decode=None,
+                mode="decode",
+            ),
+        )[1]
+        result = MagicMock()
+        result.next_token_ids = None
+        scheduler.tp_worker.finalize_mlx_result.return_value = result
+        scheduler.process_batch_result.side_effect = lambda b, _r: events.append(
+            ("process", [r.rid for r in b.reqs])
+        )
+
+        steps = iter(ingest_steps)
+
+        def ingest_requests():
+            step = next(steps, None)
+            if step is None:
+                raise _StopLoop()
+            step(scheduler)
+
+        scheduler.ingest_requests.side_effect = ingest_requests
+        return scheduler
+
+    def _run_loop(self, scheduler, events):
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        def fake_retract_all(reqs, **_kwargs):
+            events.append(("retract", [r.rid for r in reqs]))
+
+        with (
+            patch("sglang.srt.managers.scheduler.retract_all", fake_retract_all),
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
+            ),
+            self.assertRaises(_StopLoop),
+        ):
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+
+    def _pause(self, mode):
+        from sglang.srt.managers.io_struct import PauseGenerationReqInput
+
+        return lambda s: s.pause_generation(PauseGenerationReqInput(mode=mode))
+
+    @staticmethod
+    def _resume(scheduler):
+        scheduler._engine_paused = False
+
+    def test_retract_pause_processes_inflight_job_before_retract(self):
+        # Iteration 1 launches a decode job.  Iteration 2 pauses with retract
+        # while that job is in flight.  Iteration 3 resumes; the retracted
+        # request is no longer running, so the loop idles.
+        events = []
+        queue_after_pause = []
+        pause = self._pause("retract")
+        scheduler = self._make_scheduler(
+            ingest_steps=[
+                lambda s: None,
+                lambda s: (pause(s), queue_after_pause.append(len(s.result_queue))),
+                self._resume,
+            ],
+            events=events,
+        )
+
+        self._run_loop(scheduler, events)
+
+        self.assertEqual(
+            events,
+            [("launch", ["r1"]), ("process", ["r1"]), ("retract", ["r1"])],
+        )
+        self.assertEqual(queue_after_pause, [0])
+        self.assertEqual(len(scheduler.result_queue), 0)
+
+    def test_retract_after_in_place_pause_drains_job_left_queued(self):
+        # An in_place pause leaves the in-flight job queued and unprocessed;
+        # a retract pause that follows must still process it first.
+        events = []
+        queued_after_in_place = []
+        in_place = self._pause("in_place")
+        scheduler = self._make_scheduler(
+            ingest_steps=[
+                lambda s: None,
+                lambda s: (
+                    in_place(s),
+                    queued_after_in_place.append(len(s.result_queue)),
+                ),
+                self._pause("retract"),
+                self._resume,
+            ],
+            events=events,
+        )
+
+        self._run_loop(scheduler, events)
+
+        self.assertEqual(queued_after_in_place, [1])
+        self.assertEqual(
+            events,
+            [("launch", ["r1"]), ("process", ["r1"]), ("retract", ["r1"])],
+        )
+        self.assertEqual(len(scheduler.result_queue), 0)
 
 
 if __name__ == "__main__":
