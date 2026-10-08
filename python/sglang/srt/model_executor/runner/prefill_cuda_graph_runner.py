@@ -1681,6 +1681,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
+            if forward_batch.lora_ids is not None:
+                self.model_runner.lora_manager.reset_routing_cache()
             # Record LoRA kernels even when capture uses base-model requests.
             with (
                 model_capture_mode()

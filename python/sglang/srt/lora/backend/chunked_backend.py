@@ -218,7 +218,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             torch.cumsum(seg_lens, dim=0, out=indptr[1:])
         return indptr
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
