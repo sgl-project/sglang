@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
 class IndexPageEncoding(Enum):
-    # A page stores 128 fp8 keys per row followed by one fp32 scale per row.
+    # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
     DSA_FP8 = "dsa_fp8"
 
 
@@ -50,6 +50,10 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     page_size: int
     buffers: EncodedPageBuffers
     compress_ratio: int
+
+    @property
+    def layer_count(self) -> int:
+        return len(self.buffers.buffers)
 
     @property
     def page_bytes(self) -> int:
@@ -99,14 +103,11 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     shared_layer_to_owner: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if isinstance(self.buffer_info, IndexKeyBufferInfo):
-            buffers = self.buffer_info.buffers.buffers
-        else:
-            buffers = self.buffer_info.buffers
-        if not self.layer_ids or len(self.layer_ids) != len(buffers):
+        layer_count = self.buffer_info.layer_count
+        if not self.layer_ids or len(self.layer_ids) != layer_count:
             raise ValueError(
                 f"{self.pool_name}: {len(self.layer_ids)} model layers must match "
-                f"{len(buffers)} buffers"
+                f"{layer_count} buffers"
             )
         if len(set(self.layer_ids)) != len(self.layer_ids) or min(self.layer_ids) < 0:
             raise ValueError(f"{self.pool_name}: invalid model layers {self.layer_ids}")

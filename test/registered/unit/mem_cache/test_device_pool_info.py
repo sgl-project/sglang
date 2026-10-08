@@ -65,6 +65,33 @@ class TestDevicePoolInfo(CustomTestCase):
             )
         )
 
+    def test_model_layers_match_physical_layers_for_each_buffer_format(self):
+        for info in _pool_infos():
+            with self.subTest(pool=info.pool_name):
+                with self.assertRaisesRegex(ValueError, "model layers must match"):
+                    DevicePoolInfo(
+                        pool_name=info.pool_name,
+                        indices_from_pool=info.indices_from_pool,
+                        layer_ids=info.layer_ids[:-1],
+                        buffer_info=info.buffer_info,
+                    )
+
+    def test_packed_mla_rejects_strided_rows_before_linker_construction(self):
+        from msgspec.structs import replace
+
+        target = _pool_infos()[0]
+        strided = tuple(buffer[::2] for buffer in target.buffer_info.buffers)
+        target = replace(
+            target, buffer_info=replace(target.buffer_info, buffers=strided)
+        )
+        with self.assertRaisesRegex(ValueError, "matching packed rows"):
+            bind_packed_pool_buffers(
+                target=target,
+                drafts=(),
+                model_to_transfer_layer={20: 0, 21: 1, 22: 2},
+                target_layer_num=3,
+            )
+
     def test_dcp_index_host_keeps_legacy_page_geometry(self):
         from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerHostPoolBuilder
 

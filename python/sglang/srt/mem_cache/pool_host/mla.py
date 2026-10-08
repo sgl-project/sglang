@@ -122,20 +122,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pool_label=pool_label,
         )
         self._initialize_transfer_views()
-        if self.mtp_draft_device_pools:
-            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-            self.packed_device_data_ptrs = torch.cat(
-                [pool.data_ptrs for pool in device_pools]
-            )
-            self.packed_device_kv_buffers = [
-                buffer for pool in device_pools for buffer in pool.kv_buffer
-            ]
-        self._init_device_row_stride(
-            buf
-            for pool in (self.device_pool, *self.mtp_draft_device_pools)
-            for buf in getattr(pool, "kv_buffer", None) or ()
-        )
-        self._init_write_back_staging_buffers()
 
     @property
     def _transfer_device(self) -> torch.device:
@@ -183,14 +169,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pool_label=pool_label,
         )
         self._initialize_transfer_views()
-        self.packed_device_kv_buffers = list(buffer_info.buffers)
-        self.packed_device_data_ptrs = torch.tensor(
-            [buffer.data_ptr() for buffer in buffer_info.buffers],
-            dtype=torch.uint64,
-            device=self._transfer_device,
-        )
-        self._init_device_row_stride(buffer_info.buffers)
-        self._init_write_back_staging_buffers()
         return self
 
     def _initialize_transfer_views(self) -> None:
@@ -216,6 +194,29 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self._transfer_device,
             host_memory_registered=self.pin_memory,
         )
+
+        if self._buffer_info is not None:
+            buffers = self._buffer_info.buffers
+            self.packed_device_kv_buffers = list(buffers)
+            self.packed_device_data_ptrs = torch.tensor(
+                [buffer.data_ptr() for buffer in buffers],
+                dtype=torch.uint64,
+                device=self._transfer_device,
+            )
+        else:
+            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+            buffers = [
+                buffer
+                for pool in device_pools
+                for buffer in getattr(pool, "kv_buffer", None) or ()
+            ]
+            if self.mtp_draft_device_pools:
+                self.packed_device_kv_buffers = buffers
+                self.packed_device_data_ptrs = torch.cat(
+                    [pool.data_ptrs for pool in device_pools]
+                )
+        self._init_device_row_stride(buffers)
+        self._init_write_back_staging_buffers()
 
     def _layer_transfer_buffer(
         self, device_pool, device_layer_id: int, host_layer_id: int

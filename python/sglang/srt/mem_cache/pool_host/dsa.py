@@ -254,13 +254,14 @@ class DSAIndexerPoolHost(HostKVCache):
 
         # uint8 storage, so element counts below are byte counts
         self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
+        self._initialize_host_buffers()
+
+    def _initialize_host_buffers(self):
+        if self.indexer_page_stride_size % self.page_size:
+            raise ValueError("DSA index page bytes must split into whole token bytes")
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = storage_info.bytes_per_token_per_layer * self.layer_num
-
-        self._allocate()
-
-    def _allocate(self):
+        self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
         self.can_use_write_back_jit = False
         if self._is_dummy:
@@ -345,12 +346,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.page_num = num_host_pages
         self.size = num_host_pages * self.page_size
         self.indexer_page_stride_size = buffers[0].shape[1]
-        self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        if self.indexer_page_stride_size % self.page_size:
-            raise ValueError("DSA index page bytes must split into whole token bytes")
-        self.size_per_token = self.indexer_layout_dim // self.page_size
-        self._allocate()
+        self._initialize_host_buffers()
         return self
 
     def destroy(self):

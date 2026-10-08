@@ -26,6 +26,7 @@ def bind_packed_pool_buffers(
     if target.shared_layer_to_owner:
         raise ValueError("this transfer binding does not support shared owner layers")
     info = target.buffer_info
+    info.validate()
     buffers = list(
         info.buffers.buffers if isinstance(info, IndexKeyBufferInfo) else info.buffers
     )
@@ -46,9 +47,8 @@ def bind_packed_pool_buffers(
             or draft_info.compress_ratio != info.compress_ratio
         ):
             raise ValueError(f"{target.pool_name}: packed draft page format differs")
+        draft_info.validate()
         if isinstance(info, IndexKeyBufferInfo):
-            info.validate()
-            draft_info.validate()
             if draft_info.buffers.encoding != info.buffers.encoding:
                 raise ValueError(f"{target.pool_name}: packed draft encoding differs")
             draft_buffers = draft_info.buffers.buffers
@@ -70,7 +70,6 @@ def bind_packed_pool_buffers(
                 buffers=tuple(buffers), encoding=info.buffers.encoding
             ),
         )
-        packed.validate()
     else:
         packed = MLABufferInfo(
             page_size=info.page_size,
