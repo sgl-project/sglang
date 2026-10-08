@@ -339,3 +339,20 @@ class SanaWMRealtimeConfig(SanaWMPipelineConfig):
             keep_resident_components=("dit",),
             auto_enable_cfg_parallel=False,
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SanaWMSamplingParams,
+        pipeline_config_cls=SanaWMPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
+        ],
+        model_detectors=[
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
+        ],
+    )

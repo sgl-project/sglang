@@ -3,7 +3,7 @@
 
 //! Concurrent-mutation stress test for `HashTree`.
 //!
-//! The inline tests in `policies::kv_events::tree` are all
+//! The inline tests in `state::kv_events::tree` are all
 //! single-threaded.  Under production load, multiple worker subscribers
 //! drive `insert` / `remove` / `clear_worker` against the same tree from
 //! tokio worker threads while the chat handler simultaneously calls
@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use sgl_router::policies::kv_events::{HashTree, KvWorkerId};
+use sgl_router::state::kv_events::{HashTree, KvWorkerId};
 
 fn worker(i: usize) -> KvWorkerId {
     KvWorkerId {

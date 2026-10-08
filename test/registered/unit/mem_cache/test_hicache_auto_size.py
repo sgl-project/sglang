@@ -26,12 +26,21 @@ class TestHiCacheAutoSize(CustomTestCase):
         target = Mock(
             spec=SWAKVPool,
             size=128,
-            full_kv_pool=Mock(size=128, get_kv_size_bytes=Mock(return_value=4096)),
-            swa_kv_pool=Mock(size=32, get_kv_size_bytes=Mock(return_value=1024)),
+            full_kv_pool=Mock(
+                size=128,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=4096),
+            ),
+            swa_kv_pool=Mock(
+                size=32,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=1024),
+            ),
         )
         draft_mha = Mock(
             spec=MHATokenToKVPool,
             size=16,
+            host_capacity_bytes=None,
             get_kv_size_bytes=Mock(return_value=(128, 128)),
         )
         params = CacheInitParams(
@@ -52,6 +61,34 @@ class TestHiCacheAutoSize(CustomTestCase):
                     sizing._estimate_hicache_bytes(params, plan),
                     4096 + 1024 + expected_sidecar_bytes,
                 )
+
+    def test_unified_views_are_sized_from_host_capacity(self):
+        """Unified sub-pools answer get_kv_size_bytes with zero (UnifiedKVPool
+        logs the shared buffer once) and publish host_capacity_bytes instead,
+        the weight the explicit host-size split already uses. An estimate taken
+        from get_kv_size_bytes is zero device bytes, and the default ratio then
+        divides by it."""
+        target = Mock(
+            spec=SWAKVPool,
+            size=128,
+            full_kv_pool=Mock(
+                size=128,
+                host_capacity_bytes=4096,
+                get_kv_size_bytes=Mock(return_value=(0, 0)),
+            ),
+            swa_kv_pool=Mock(
+                size=32,
+                host_capacity_bytes=1024,
+                get_kv_size_bytes=Mock(return_value=(0, 0)),
+            ),
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=2,
+        )
+        self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the

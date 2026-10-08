@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import abstractmethod
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Hashable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -152,6 +152,21 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,
         )
+        # Size host pools in tokens; sub-pool `size` counts physical rows.
+        kvcache.full_kv_pool.host_capacity_tokens = self._size_full
+        kvcache.swa_kv_pool.host_capacity_tokens = self._size_swa
+        for name, pool in (
+            ("full", kvcache.full_kv_pool),
+            ("swa", kvcache.swa_kv_pool),
+        ):
+            pool.host_capacity_bytes = (
+                pool.host_capacity_tokens * unified_buffer.spec(name).entry_bytes()
+            )
+        # Full-attention transfers use virtual IDs. SWA transfers already use
+        # physical IDs from translate_loc_from_full_to_swa.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc
+        )
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
@@ -272,12 +287,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """SWA-layer read path: virtual TOKEN ids -> swa kernel-facing ids."""
-        return self.swa_attn_allocator.translate_kv_loc_for_kernel(kv_indices, out=out)
-
-    @property
-    def kernel_page_multiplier(self) -> int:
-        return self.full_attn_allocator.kernel_page_multiplier
+        """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices, out=out)
 
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
@@ -295,7 +306,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         """Virtual TOKEN ids -> full-sub-pool PHYSICAL token ids for the PD
         transfer engine.
 
-        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        The transfer registers page ENVELOPES and addresses them by PHYSICAL id (see
         `UnifiedMHATokenToKVPool.get_contiguous_buf_infos`). Without this
         override the base identity would put VIRTUAL ids on the wire, which
         address real bytes and so corrupt silently rather than fail.
@@ -305,14 +316,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
-
-        The SWA counterpart of the above. `translate_loc_from_full_to_swa`
-        cannot serve here: it returns KERNEL-FACING ids (the physical page
-        scaled by the sub-pool's per-page block count), which index the
-        per-layer views, whereas the SWA state component is registered as whole
-        page envelopes and addressed by physical page.
-        """
+        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids, for the PD
+        transfer engine: the same translate as `translate_loc_from_full_to_swa`,
+        on int64 ids."""
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def _move_gate_targets(self):
@@ -329,31 +335,55 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
-    def translate_kv_loc_for_kernel(
-        self,
-        loc: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> kernel-facing ids."""
-        return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
+    def bind_swa_for_loaded_rows(
+        self, full_token_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Bind SWA pages to resident or newly loaded full-attention virtual IDs.
 
-    def translate_write_loc_for_kernel(
+        Bind before translating: unbound pages translate to the padding sink.
+        Return physical IDs, or None if capacity cannot be reclaimed.
+        """
+        ids = full_token_ids.to(torch.int64)
+        if ids.numel() == 0:
+            return ids
+        ps = self.page_size
+        pages = torch.unique(ids // ps)
+        # Tombstones (-1) and the padding sink (0) both need a physical binding.
+        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
+        need = int(unbound.numel()) * ps
+        if need:
+            if need > self.swa_available_size():
+                return None
+            if (
+                need > self.swa_attn_allocator.available_size()
+                and not _relieve_for_alloc(self.swa_attn_allocator, need)
+            ):
+                return None
+            self.swa_attn_allocator.alloc_with_virtual(unbound)
+        return self.translate_loc_from_full_to_swa(ids)
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+    def translate_write_loc(
         self,
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """Widened virtual WRITE loc -> kernel-facing id. DCP is rejected for this
+        """Widened virtual WRITE loc -> physical id. DCP is rejected for this
         composite at argument validation, so it coincides with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(
+        return self.full_attn_allocator.translate_write_loc(
             loc, out=out, out_width=out_width
         )
-
-    @property
-    def swa_kernel_page_multiplier(self) -> int:
-        return self.swa_attn_allocator.kernel_page_multiplier
 
     @property
     def swa_v2p_page_table(self) -> torch.Tensor:
@@ -472,11 +502,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         The static composite allocates the two sides independently and records
         a full->swa index mapping. That is not representable here: the two
         sides SHARE one virtual id space (a virtual page names a full-physical
-        page and, if bound, a swa-physical one), which is why
-        `set_full_to_swa_mapping` is a no-op on this allocator and
-        `translate_loc_from_full_to_swa` derives the swa id from the virtual id
-        instead of a table. Running the static body would call `alloc_extend`
-        on the swa sub-allocator, which asserts it is not the id owner.
+        page and, if bound, a swa-physical one). Load-back installs that binding
+        through `set_full_to_swa_mapping`, and `translate_loc_from_full_to_swa`
+        resolves the SWA kernel-facing id from the shared virtual id. Running the
+        static body would call `alloc_extend` on the swa sub-allocator, which
+        asserts it is not the id owner.
 
         The tail is expressed by binding swa for the TAIL's virtual pages only.
         A new page left unbound has no swa-physical page, which reads as the
@@ -648,9 +678,12 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """No-op stub for HiCache load-back: in shared mode the swa v2p IS the
-        mapping, and HiCache for shared SWA is out of scope."""
-        return
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
@@ -767,6 +800,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 
     @abstractmethod
     def _ask_float_for_room(self, need_tokens: int) -> None: ...
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
 
 
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
@@ -999,7 +1036,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
     def _compaction_allowed(self) -> bool:
         return all(
-            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            not allocator.moves_blocked()
             for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
         )
 
@@ -1162,7 +1199,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     ) -> bool | None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
         reclaim_plan = self.reclaim_plan(
@@ -1175,7 +1212,10 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             return
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
-            tree_cache.evict_for_alloc(
+            # The shared-byte plan returns cumulative eviction quotas.
+            # Per-component capacity targets can count the same shared bytes
+            # independently and stop before the joint allocation fits.
+            tree_cache.evict(
                 EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim)
             )
         # A zero-reclaim plan can still depend on compaction before allocation.
@@ -1202,6 +1242,57 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
             ):
                 return 0
             return fa.flush_opportunistic() + sa.flush_opportunistic()
+
+    def resize(self, config) -> None:
+        """Synchronize allocator capacity after the shared pool is finalized."""
+        if not self.unified_buffer.post_capture_active:
+            raise RuntimeError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires post-capture backing"
+            )
+        final_pool_bytes = config.unified_memory_pool_bytes
+        if final_pool_bytes is None:
+            raise ValueError(
+                "UnifiedSWATokenToKVPoolAllocator.resize requires "
+                "config.unified_memory_pool_bytes"
+            )
+        if int(final_pool_bytes) != self.unified_buffer.total_bytes:
+            raise RuntimeError(
+                "UnifiedKVPool.finalize_backing must run before allocator.resize: "
+                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
+                f"{self.unified_buffer.total_bytes} bytes"
+            )
+        for allocator in (self.full_attn_allocator, self.swa_attn_allocator):
+            if allocator.allocated_count() != 0 or allocator._pending_reuse:
+                raise RuntimeError(
+                    f"cannot resize non-empty unified allocator "
+                    f"{allocator.sub_pool_name!r}"
+                )
+        self.full_attn_allocator._set_capacity(self.unified_buffer.max_slots("full"))
+        self.swa_attn_allocator._set_capacity(
+            self.unified_buffer.max_slots("swa"),
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
+        )
+        self._empty_shared_gap_bytes = self.full_attn_allocator._current_gap_bytes()
+        self._size_full = self.full_attn_allocator.available_size()
+        self._size_swa = min(
+            self.swa_attn_allocator.available_size(),
+            len(self.full_attn_allocator.free_virtual_ids) * self.page_size,
+        )
+        self._full_max_total_num_tokens = self._size_full
+        self._swa_max_total_num_tokens = self._size_swa
+        self._kvcache.size = self.full_attn_allocator.max_slots - 1
+        self._kvcache.size_swa = self.swa_attn_allocator.max_slots - 1
+        for allocator, pool, host_capacity in (
+            (self.full_attn_allocator, self._kvcache.full_kv_pool, self._size_full),
+            (self.swa_attn_allocator, self._kvcache.swa_kv_pool, self._size_swa),
+        ):
+            pool._num_pages = allocator.num_pages
+            pool.size = allocator.num_pages * self.page_size - self.page_size
+            pool.host_capacity_tokens = host_capacity
+            pool.host_capacity_bytes = (
+                host_capacity
+                * self.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
+            )
 
 
 class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
