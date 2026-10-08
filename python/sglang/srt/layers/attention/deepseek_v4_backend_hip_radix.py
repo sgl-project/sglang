@@ -1693,6 +1693,7 @@ class DeepseekV4HipRadixBackend(
                             self, forward_batch, ratio
                         )
                     },
+                    max_context_len=self.max_context_len,
                     num_requests=forward_batch.batch_size,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
@@ -1746,6 +1747,7 @@ class DeepseekV4HipRadixBackend(
                         if metadata.late_layer_tail is not None
                         else _as_int_list(forward_batch.extend_seq_lens_cpu)
                     ),
+                    max_context_len=self.max_context_len,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )

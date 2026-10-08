@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4KWriteMetadata,
     FP4RowgroupDecodeWorkspace,
     _decode_cta_count,
@@ -55,6 +56,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     read_fp4_index_k_split,
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
+    rowgroup_table_columns,
     store_fp4_index_k_cache_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
@@ -1016,6 +1018,60 @@ def test_rowgroup_prefill_workspace_scores_ragged_requests() -> None:
         torch.testing.assert_close(
             got[row, :end], ref[row, :end], rtol=1e-5, atol=1e-6, msg=f"row {row}"
         )
+
+
+def test_rowgroup_table_columns_fix_the_compiled_width() -> None:
+    """Workspaces built with rowgroup_table_columns share one block-table width whatever
+    the context, so the row-group kernel compiles one variant for it, and score exactly
+    as tables at their own width; the logits width stays each step's own."""
+    torch.manual_seed(14)
+    columns = rowgroup_table_columns(1 << 20, 1, LOW_RATIO_PAGE_TABLE_BUCKET)
+    widths = set()
+    for ctx in (300, 5000, 9000):
+        case = _build_logits_case(1, ctx, ctx_lens=[ctx], shuffle_pages=True)
+        case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+        rows = 3
+        row_ends = torch.arange(ctx - rows + 1, ctx + 1, dtype=torch.int32).to(
+            get_device()
+        )
+        page_table = case["page_table"].expand(rows, -1).contiguous()
+        q_fp4 = case["q_fp4"].view(torch.uint8).expand(rows, -1, -1).contiguous()
+        common = dict(
+            q_fp4=q_fp4.view(case["q_fp4"].dtype),
+            q_scale=case["q_scale"].expand(rows, -1, -1, -1, -1).contiguous(),
+            weights=case["weights"].expand(rows, -1).contiguous(),
+            k_payload=case["payload8"],
+            k_scale=case["scale8"],
+            weight_scale=case["weight_scale"],
+            query_start_loc=torch.tensor(
+                [0, rows], dtype=torch.int32, device=get_device()
+            ),
+            row_ends=row_ends,
+            max_query_len=rows,
+            page8=True,
+            pages_per_block=8,
+            is_decode=False,
+        )
+        fixed = prepare_fp4_rowgroup_prefill_workspace(
+            page_table, [rows], LOW_RATIO_PAGE_TABLE_BUCKET, table_columns=columns
+        )
+        own = prepare_fp4_rowgroup_prefill_workspace(
+            page_table, [rows], LOW_RATIO_PAGE_TABLE_BUCKET
+        )
+        assert fixed.request_page_table.shape[1] == columns
+        assert fixed.max_seq_len == own.max_seq_len
+        widths.add(fixed.request_page_table.stride(0))
+        got = rowgroup_paged_mqa_logits(
+            block_tables=fixed.request_page_table,
+            max_seq_len=fixed.max_seq_len,
+            **common,
+        ).clone()
+        ref = rowgroup_paged_mqa_logits(
+            block_tables=own.request_page_table, max_seq_len=own.max_seq_len, **common
+        )
+        for row, end in enumerate(row_ends.tolist()):
+            assert torch.equal(got[row, :end], ref[row, :end]), f"{ctx=} row {row}"
+    assert widths == {columns}
 
 
 def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:

@@ -178,17 +178,32 @@ def _guarded_pages(logical_width: int, page_table_bucket: int = 4) -> int:
     )
 
 
+def rowgroup_table_columns(
+    max_context_len: int, ratio: int, page_table_bucket: int = 4
+) -> int:
+    """Block-table columns of every row-group launch at ``ratio``: one width for the
+    server's life. AITER compiles the row-group kernel per block-table width and stride,
+    and its bounded compile cache unloads an evicted variant that a captured CUDA graph
+    still launches; widths that track the context would also compile on the request path."""
+    compressed_len = -(-max_context_len // ratio)
+    pages = -(-compressed_len // _KV_BLOCK_SIZE)
+    return _guarded_pages(pages, page_table_bucket) + 4
+
+
 def _guard_page_table(
     page_table: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     page_table_bucket: int = 4,
+    columns: Optional[int] = None,
 ):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         pad_page_table,
     )
 
-    return pad_page_table(page_table, out=out, page_table_bucket=page_table_bucket)
+    return pad_page_table(
+        page_table, out=out, page_table_bucket=page_table_bucket, columns=columns
+    )
 
 
 def logits_rows_per_chunk(page_table: torch.Tensor, page_table_bucket: int = 4) -> int:
@@ -271,13 +286,15 @@ def prepare_fp4_rowgroup_decode_workspace(
     page_table: torch.Tensor,
     rows_per_request: int,
     page_table_bucket: int = 4,
+    table_columns: Optional[int] = None,
 ) -> FP4RowgroupDecodeWorkspace:
     """The decode workspace of the row-group logits kernel: the padded page table and the
     rows' sequences, no schedule. ``rows_per_request`` consecutive rows belong to one
     request (one page-table row, non-decreasing bounds); they score as one sequence once
-    there are enough requests, else every row is its own. Capture-safe."""
+    there are enough requests, else every row is its own. The table has at least
+    ``table_columns`` columns (``rowgroup_table_columns``). Capture-safe."""
     guarded, max_seq_len = _guard_page_table(
-        page_table, page_table_bucket=page_table_bucket
+        page_table, page_table_bucket=page_table_bucket, columns=table_columns
     )
     rows = guarded.shape[0]
     grouped = (
@@ -306,15 +323,18 @@ def prepare_fp4_rowgroup_prefill_workspace(
     page_table: torch.Tensor,
     extend_lens: List[int],
     page_table_bucket: int = 4,
+    table_columns: Optional[int] = None,
 ) -> FP4RowgroupPrefillWorkspace:
     """The row-group prefill workspace of a step whose requests own extend_lens consecutive
-    page-table rows each."""
+    page-table rows each, the request table at least ``table_columns`` columns
+    (``rowgroup_table_columns``)."""
     num_rows = page_table.shape[0]
     starts = itertools.accumulate([0, *extend_lens[:-1]])
     first_rows = [min(s, num_rows - 1) for s in starts]
     request_page_table, max_seq_len = _guard_page_table(
         page_table.index_select(0, _pinned_int32(first_rows, page_table.device)),
         page_table_bucket=page_table_bucket,
+        columns=table_columns,
     )
     return FP4RowgroupPrefillWorkspace(request_page_table, max_seq_len, {})
 
@@ -513,10 +533,11 @@ def aiter_fp4_paged_mqa_logits(
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
     page_table_bucket: int = 4,
     page8: bool = False,
+    rowgroup_table_columns: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel. A page8 pool
     is read by the row-group kernel only: without a row-group decode workspace every row
-    scores as its own sequence."""
+    scores as its own sequence, on a table of ``rowgroup_table_columns`` columns."""
     from aiter.ops.flydsl import (
         flydsl_pa_mqa_logits_fp4,
         flydsl_pa_mqa_logits_fp4_prefill,
@@ -536,7 +557,10 @@ def aiter_fp4_paged_mqa_logits(
     )
     if page8 and rowgroup_ws is None:
         rowgroup_ws = prepare_fp4_rowgroup_decode_workspace(
-            page_table, 1, page_table_bucket=page_table_bucket
+            page_table,
+            1,
+            page_table_bucket=page_table_bucket,
+            table_columns=rowgroup_table_columns,
         )
     if rowgroup_ws is not None:
         return _rowgroup_decode_logits(

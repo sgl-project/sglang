@@ -46,6 +46,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_rowgroup_prefill_workspace,
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
+    rowgroup_table_columns,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
@@ -157,13 +158,15 @@ def _indexer_inputs(layer, x, q_lora, pos):
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     *,
+    max_context_len: int,
     num_requests: Optional[int] = None,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]]:
     """Capture-safe: everything the schedule kernel touches is pinned in the workspace.
     With the row-group kernel there is no schedule; a request's rows (``num_requests``
     requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
-    score as one sequence. A page8 pool is read by the row-group kernel only."""
+    score as one sequence, on a table as wide as ``max_context_len`` needs. A page8 pool
+    is read by the row-group kernel only."""
     rowgroup = envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get()
     workspaces = {}
     for ratio, meta in metadata_by_ratio.items():
@@ -182,6 +185,9 @@ def build_low_ratio_decode_workspaces(
             meta.page_table,
             rows_per_request,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            table_columns=rowgroup_table_columns(
+                max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
         )
     return workspaces
 
@@ -191,11 +197,13 @@ def refresh_low_ratio_prefill_workspaces(
     previous: Optional[Dict[int, FP4PrefillWorkspace]],
     *,
     extend_lens: Optional[List[int]],
+    max_context_len: int,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
     """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
-    scores on the row-group kernel, which takes no schedule (without extend_lens, the
-    indexer builds its workspace itself)."""
+    scores on the row-group kernel, which takes no schedule, on a table as wide as
+    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
+    itself)."""
     previous = previous or {}
     workspaces = {}
     for ratio, meta in metadata_by_ratio.items():
@@ -205,6 +213,9 @@ def refresh_low_ratio_prefill_workspaces(
                     meta.page_table,
                     extend_lens,
                     page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+                    table_columns=rowgroup_table_columns(
+                        max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                    ),
                 )
             continue
         workspaces[ratio] = prepare_fp4_prefill_workspace(
@@ -389,6 +400,9 @@ def low_ratio_index_topk_hip_decode(
         is_decode=True,
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
         page8=page8,
+        rowgroup_table_columns=rowgroup_table_columns(
+            backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+        ),
     )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
@@ -537,6 +551,9 @@ def low_ratio_index_topk_hip_extend(
             indexer_metadata.page_table,
             extend_lens_cpu,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            table_columns=rowgroup_table_columns(
+                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
         )
 
     def score_rows(
