@@ -1,16 +1,22 @@
 """Pure-language V4.1 CP input, padding and DSpark state regressions."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DeepseekV4AttnBackend,
+    LateLayerTail,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
     is_cp_active,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,6 +30,162 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
+    def test_tail_moe_count_is_prepared_per_batch_without_lazy_device_copy(self):
+        for rank in range(4):
+            with (
+                self.subTest(rank=rank),
+                cp_context(4, rank, (5, 9)) as (
+                    strategy,
+                    batch,
+                ),
+            ):
+                batch.batch_size = 2
+                full_metadata = batch.attn_cp_metadata
+                full_count = strategy.moe_num_token_non_padded(batch)
+                for rows in ([3, 4, 11, 12, 13], [0, 1, 2, 3]):
+                    with patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                        return_value=NS(attn_cp_rank=rank, attn_cp_size=4),
+                    ):
+                        layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout(
+                            None,
+                            batch,
+                            torch.tensor(rows),
+                            torch.tensor([2, len(rows) - 2]),
+                        )
+                    tail_metadata = layout["cp_metadata"]
+                    count = tail_metadata.moe_local_token_count
+                    self.assertIsNotNone(count)
+                    self.assertEqual(count.shape, torch.Size([]))
+                    self.assertEqual(count.dtype, torch.int32)
+                    self.assertEqual(count.item(), sum(row % 4 == rank for row in rows))
+                    self.assertNotEqual(count.data_ptr(), full_count.data_ptr())
+                    batch.attn_cp_metadata = tail_metadata
+                    try:
+                        with patch(
+                            "sglang.srt.layers.cp.interleave.torch.tensor",
+                            side_effect=AssertionError("lazy tail count copy"),
+                        ):
+                            self.assertIs(
+                                strategy.moe_num_token_non_padded(batch), count
+                            )
+                            self.assertIs(
+                                strategy.moe_num_token_non_padded(batch), count
+                            )
+                    finally:
+                        batch.attn_cp_metadata = full_metadata
+                    self.assertEqual(full_count.item(), len(batch.input_ids[rank::4]))
+
+    def test_compact_tail_eager_gather_and_exception_restore_full_cp_layout(self):
+        global_rows = torch.tensor([3, 4, 11, 12, 13])
+        full = torch.arange(42, dtype=torch.float32).reshape(14, 3)
+        for rank in range(4):
+            for fail in (False, True):
+                with (
+                    self.subTest(rank=rank, fail=fail),
+                    cp_context(4, rank, (5, 9)) as (strategy, cp_batch),
+                ):
+                    batch = ForwardBatch(
+                        forward_mode=cp_batch.forward_mode,
+                        batch_size=2,
+                        input_ids=cp_batch.input_ids,
+                        req_pool_indices=torch.tensor([0, 1]),
+                        seq_lens=torch.tensor([12, 22]),
+                        out_cache_loc=torch.arange(14),
+                        seq_lens_sum=34,
+                        positions=cp_batch.positions,
+                        extend_seq_lens=torch.tensor([5, 9]),
+                        extend_seq_lens_cpu=[5, 9],
+                        extend_prefix_lens_cpu=[7, 13],
+                        extend_logprob_start_lens_cpu=[5, 9],
+                        attn_cp_metadata=cp_batch.attn_cp_metadata,
+                    )
+                    full_metadata = batch.attn_cp_metadata
+                    with patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                        return_value=NS(attn_cp_rank=rank, attn_cp_size=4),
+                    ):
+                        layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout(
+                            None, batch, global_rows, torch.tensor([2, 3])
+                        )
+                    tail = LateLayerTail(
+                        token_indices=layout["local_token_indices"],
+                        positions=layout["local_positions"],
+                        extend_seq_lens=torch.tensor([2, 3]),
+                        extend_seq_lens_cpu=[2, 3],
+                        swa_out_cache_loc=torch.zeros(2, dtype=torch.int64),
+                        cp_metadata=layout["cp_metadata"],
+                        pad_rows=layout["pad_rows"],
+                        global_token_indices=global_rows,
+                    )
+                    compact = tail.rows(strategy.shard_hidden_states(full, batch))
+                    model = NS(
+                        get_input_embeddings=lambda: lambda ids: full,
+                        model=Mock(
+                            return_value=((compact, compact.clone()), [compact.clone()])
+                        ),
+                        capture_aux_hidden_states=True,
+                        pp_group=NS(is_last_rank=True),
+                        lm_head=object(),
+                        logits_processor=Mock(return_value=NS()),
+                    )
+                    model.model.late_layer_start = 21
+                    peers = []
+                    for peer in range(4):
+                        peer_rows = full[global_rows[global_rows % 4 == peer]]
+                        padded = full.new_zeros((2, 3))
+                        padded[: len(peer_rows)] = peer_rows
+                        peers.append(padded)
+
+                    def gather(out, local):
+                        self.assertIs(batch.attn_cp_metadata, tail.cp_metadata)
+                        torch.testing.assert_close(local, peers[rank])
+                        if fail:
+                            raise RuntimeError("collective failed")
+                        out.copy_(torch.cat(peers))
+
+                    with (
+                        patch(RUNNER + ".torch.cuda.current_stream", return_value=None),
+                        patch(
+                            "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+                            side_effect=lambda *a, **k: nullcontext(),
+                        ),
+                        patch(
+                            "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+                            return_value=False,
+                        ),
+                        patch(
+                            "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+                            side_effect=gather,
+                        ),
+                    ):
+                        runner = NS(
+                            model_runner=NS(
+                                model=model,
+                                attn_backend=NS(
+                                    tail_forward_metadata=NS(late_layer_tail=tail)
+                                ),
+                            )
+                        )
+                        if fail:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "collective failed"
+                            ):
+                                EagerRunner._execute_extend_cp(runner, batch, {})
+                        else:
+                            output = EagerRunner._execute_extend_cp(runner, batch, {})
+                            args = model.logits_processor.call_args.args
+                            torch.testing.assert_close(
+                                args[0], batch.input_ids[global_rows]
+                            )
+                            torch.testing.assert_close(args[1], full[global_rows])
+                            torch.testing.assert_close(args[4][0], full[global_rows])
+                            self.assertEqual(args[3].extend_seq_lens_cpu, [2, 3])
+                            torch.testing.assert_close(
+                                output.hidden_states_token_indices, global_rows
+                            )
+                    self.assertIs(batch.attn_cp_metadata, full_metadata)
+
     def test_interleave_roundtrip_mixed_lengths_prefix_and_padding(self):
         for size in (2, 4):
             for length in (4, 5, 9, 127, 128, 129):
@@ -177,6 +339,7 @@ class TestDSV41TextCP(CustomTestCase):
                     lm_head=object(),
                     logits_processor=Mock(return_value="ok"),
                 )
+                model.model.late_layer_start = None
                 with (
                     simulated_collective(strategy, batch, full),
                     patch(RUNNER + ".torch.cuda.current_stream", return_value=None),
