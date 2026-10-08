@@ -38,6 +38,9 @@ class ComfyUIModelAdapter:
 
     model_types: tuple[str, ...] = ()
     pipeline_class_name: str = ""
+    # extra_req fields the worker caches per cond. Dropped on a cache hit and
+    # hashed into the cond key, so the two lists cannot drift apart.
+    cached_extra_keys: tuple[str, ...] = ("image_latent",)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -71,7 +74,8 @@ class ComfyUIModelAdapter:
         packed.prompt_embeds = []
         packed.prompt_seq_lens = None
         packed.pooled_embeds = None
-        packed.extra_req.pop("image_latent", None)
+        for key in self.cached_extra_keys:
+            packed.extra_req.pop(key, None)
 
 
 def get_adapter_class(model_type: str) -> type[ComfyUIModelAdapter]:
