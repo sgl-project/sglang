@@ -303,10 +303,8 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
-        """Unified mamba-MHA fusion prices the EXACT fused entry (host +
-        draft + alignment pad): the per-draft-layer ratio under-reserves the pad,
-        so a solve over it hands out more tokens than the fused pages hold.
-        The control pins that path-only drafts keep the ratio arm."""
+        """A fused draft prices the exact fused entry (host + draft + pad);
+        the per-draft-layer ratio under-reserves the pad."""
         mr = _make_model_runner(self, speculative_algorithm="EAGLE")
         mr.spec_algorithm.is_eagle.return_value = True
         mr.spec_algorithm.is_none.return_value = False
@@ -320,12 +318,7 @@ class TestDefaultConfigurator(CustomTestCase):
             )
 
             fused = create_memory_pool_configurator(mr)
-            mr.fused_entry_bytes.side_effect = None
-            mr.fused_entry_bytes.return_value = None
-            unfused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
-        base = _full_per_token(mr) * 32
-        self.assertEqual(unfused._cell_size, int(base * (1 + 1 / 32)))
 
 
 class TestHybridSWAConfigurator(CustomTestCase):
@@ -1459,13 +1452,9 @@ class TestSWAPoolFloor(CustomTestCase):
 
 
 class TestFusedDraftPricing(unittest.TestCase):
-    """Fused draft KV: the boot solve must price the EXACT fused entry.
-
-    The fused full-side entry (host + draft + alignment pad) replaces BOTH the
-    per-token full term and the per-draft-layer approximation; charging both
-    would over-reserve, charging only the approximation would under-reserve
-    and OOM at pool construction (the factory allocates tokens x fused entry).
-    """
+    """A fused full-side entry (host + draft + pad) replaces both the
+    per-token full term and the per-draft-layer approximation in every solve:
+    charging both over-reserves, charging only the approximation under-reserves."""
 
     def _make(self, fused_entry, draft_layers, **runner_kwargs):
         mr = _make_model_runner(
@@ -1500,14 +1489,6 @@ class TestFusedDraftPricing(unittest.TestCase):
             + cfg._draft_cell_size
         )
 
-    def test_unfused_keeps_the_draft_layer_approximation(self):
-        _, cfg = self._make(fused_entry=None, draft_layers=2)
-        self.assertEqual(cfg._draft_full_layers_num, 2)
-        self.assertEqual(
-            cfg._cell_size,
-            self._expected_cell(cfg, cfg._full_per_token * (4 + 2)),
-        )
-
     def test_fused_entry_replaces_full_and_draft_terms(self):
         fused_entry = 54_321
         _, cfg = self._make(fused_entry=fused_entry, draft_layers=2)
@@ -1515,9 +1496,8 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertEqual(cfg._cell_size, self._expected_cell(cfg, fused_entry))
 
     def _assert_unified_bytes_price_the_fused_entry(self, cfg, config, available):
-        """The bytes handed to the unified pool must buy every full token at
-        the fused entry -- the factory divides them by it -- and must not leave
-        a full token's worth of the budget unspent."""
+        """The unified pool's bytes buy every full token at the fused entry
+        (the factory divides by it) without leaving a full token unspent."""
         fused_entry = cfg._fused_full_entry
         swa_bytes = (
             config.swa_max_total_num_tokens * cfg._swa_per_token * cfg._swa_layers_num

@@ -15,17 +15,12 @@
 
 A whole-sequence verify reads `[committed prefix | drafts]` back out of the
 pool, so under the unified pool the translated page table a verify kernel
-reads has to cover `seq_lens + num_draft_tokens` columns per row. A table
-filled only to `seq_lens` leaves the draft tail stale: invisible at
-page_size 256, where the un-widened `ceil(seq/ps)` pages still cover a few
-draft tokens, and at page_size 1 observed as accept length collapsing
-(6.20 -> 1.37) or wrong tokens (gsm8k 0.905 -> 0.730).
+reads has to cover `seq_lens + num_draft_tokens` columns per row; a table
+filled only to `seq_lens` silently leaves the draft tail stale.
 
-These tests build a verify's own plan through a translating KV-index
-translator over a non-identity virtual->physical page map, drive fa3's two
-verify builds -- the eager one and the captured one a cuda-graph replay runs --
-from it, and check the page table the kernel reads: every row translated, and
-filled through the draft tail.
+These tests drive fa3's eager and captured verify builds from a verify plan
+over a non-identity virtual->physical page map, and check the page table the
+kernel reads: every row translated, and filled through the draft tail.
 
     python -m pytest test/registered/unit/layers/attention/test_verify_widening_is_wired.py -v
 """

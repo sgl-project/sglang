@@ -11,17 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`generate_draft_decode_kv_indices` over either kind of read table.
+"""`generate_draft_decode_kv_indices` over the unified pool's read tables.
 
-The multi-step draft-decode kernel gathers each step's kv_indices from a read
-table. On a static pool that is `req_to_token` itself (token-granular, and the
-emitted ids must stay byte-identical to the historical raw copy); on the
-unified pool it is the iteration plan's page table, whose entries are already
-physical pages, and the kernel rebuilds token ids as `entry * ps + pos % ps`.
-With no table shared that iteration it reads the virtual rows and maps them
-through the page table in its own gather. Pinned here: over a physical page
-table, and over virtual rows with the page table, the kernel emits exactly the
-ids `translate_kv_loc` would give the raw virtual ones, and the same kv_indptr.
+Over the plan's physical page table (token ids rebuilt as
+`entry * ps + pos % ps`), and over virtual rows translated in the kernel's own
+gather, the kernel must emit exactly the translated virtual ids and the same
+kv_indptr. The static `req_to_token` path is covered by
+test_spec_kv_indices_grid.py.
 
     python -m pytest test/registered/kernels/ops/speculative/test_draft_decode_kv_indices_read_table.py -v
 """
@@ -33,7 +29,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _SENTINEL = -7
 
@@ -124,29 +120,6 @@ class TestDraftDecodeKVIndicesReadTable(CustomTestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA required")
         self._check(page_size=2)
-
-    def test_token_table_is_a_raw_copy(self):
-        """The static-pool compilation stays byte-identical to the historical
-        kernel: the emitted indices ARE the req_to_token values."""
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA required")
-        torch.manual_seed(11)
-        num_seqs, max_context = 2, 32
-        req_to_token = torch.randint(
-            0, 1 << 20, (num_seqs, max_context), dtype=torch.int64, device="cuda"
-        )
-        seq_lens = torch.tensor([4, 7], dtype=torch.int64, device="cuda")
-        raw, _ = _run_kernel(
-            table=req_to_token,
-            entry_page_size=1,
-            seq_lens=seq_lens,
-            positions=seq_lens,
-            num_steps=2,
-            topk=1,
-            page_size=1,
-        )
-        written = raw != _SENTINEL
-        self.assertTrue(bool(torch.isin(raw[written], req_to_token.flatten()).all()))
 
 
 if __name__ == "__main__":

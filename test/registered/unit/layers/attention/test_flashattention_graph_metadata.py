@@ -89,10 +89,8 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
 
 
 class TestSpecReadSeqLenDelta(CustomTestCase):
-    """The mode -> seq_len_delta map IS the widening the whole-sequence spec
-    reads apply to cache_seqlens; a drift silently truncates the verify or
-    draft tail of the translated read table (the metadata builders widen
-    cache_seqlens while the source fill stays prefix-only)."""
+    """How far past seq_lens each spec mode's translated read table reaches;
+    too short silently leaves the verify or draft tail stale."""
 
     def _backend(self, *, topk=1, num_steps=3, step_id=1, num_draft=4):
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
@@ -127,11 +125,8 @@ class TestSpecReadSeqLenDelta(CustomTestCase):
 
 
 class TestDraftExtendInGraph(CustomTestCase):
-    """The draft-extend cuda-graph runners record
-    `init_forward_metadata_in_graph` unconditionally. Under translation fa3
-    rebuilds the draft-extend tables out of graph on every replay, so the
-    in-graph gather -- raw req_to_token, i.e. virtual ids -- must not be
-    recorded, or each replay overwrites the translated tables."""
+    """A translating fa3 must not record the in-graph draft-extend gather: it
+    reads raw (virtual) req_to_token ids over the tables rebuilt out of graph."""
 
     def _run(self, *, translating):
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
@@ -140,10 +135,8 @@ class TestDraftExtendInGraph(CustomTestCase):
         fb = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
         b.init_forward_metadata_in_graph(fb)
 
-    def test_translating_backend_records_nothing(self):
+    def test_only_a_static_backend_builds_in_graph(self):
         self._run(translating=True)
-
-    def test_static_backend_still_builds_in_graph(self):
         with self.assertRaises(KeyError):
             self._run(translating=False)
 

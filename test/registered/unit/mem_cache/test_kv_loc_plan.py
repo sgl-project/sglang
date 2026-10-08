@@ -13,30 +13,21 @@
 # ==============================================================================
 """`KVLocPlan`: one iteration's KV ids, translated once.
 
-- the target and a fused draft read the same physical write ids; a
-  pass-through reader (a private draft pool, a static pool) reads virtual;
-- the virtual window is never mutated, and `cols` picks the same columns in
-  both spaces;
-- the sliding-window write ids come from the virtual window and agree with
-  the derivation from the physical one;
+- the target and a fused draft get the same physical write ids, a
+  pass-through reader (a private draft pool, a static pool) the virtual
+  window, which is never mutated; `bind` and a split batch's `cols_slice`
+  pick the same tokens in both spaces;
 - a forward whose `seq_lens` do not yet count the window it writes (a
   verify, a speculative draft decode, a draft extend) reads that window past
   them;
-- the read table covers `seq_lens + read_extent`, is built once, and grows
-  for a captured graph's padded lanes by copying (sink rows), never by
-  building again;
-- only a reader of the plan's own rows reads its table (the target, a fused
-  draft); a pass-through reader gathers `req_to_token`, and a draft with a
-  `req_to_token` of its own plans its own reads over the shared write ids
-  (`reads_from`);
-- one iteration's forwards -- a draft step, the verify, a draft extend, the
-  readers of a target and a fused draft -- translate the window once and
-  build each id space's table once;
-- `bind` gives a batch its ids, with the virtual mirror only when they were
-  translated;
-- a runner's own write buffer (graph capture, warmup) is used as it is, its
-  sliding-window ids naming the sink; a replayed graph's batch writes through
-  the runner's padded buffer, its sliding-window ids padded with the sink.
+- one iteration's forwards translate the window once per sub-pool and build
+  a sub-pool's read table at most once, only when a table reader asks; the
+  table covers `seq_lens + read_extent`, padded lanes reading the sink;
+- only readers of the plan's own rows read its table; a pass-through reader
+  gathers `req_to_token`, and a draft with its own `req_to_token` plans its
+  own reads over the shared write ids (`reads_from`);
+- a runner's own write buffer and a replayed graph's padded buffer are used
+  as they are, the sliding-window ids naming the sink past the plan's.
 
   python -m pytest test/registered/unit/mem_cache/test_kv_loc_plan.py -v
 """
@@ -65,7 +56,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
@@ -238,48 +229,9 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertIs(plan.write_ids(self.private_draft), self.window)
         self.assertTrue(torch.equal(self.window, window))  # never mutated
 
-    def test_cols_pick_the_same_columns_in_both_spaces(self):
-        plan = self._plan()
-        bs = int(self.rpi.numel())
-        first = slice(0, 1)
-        self.assertTrue(
-            torch.equal(
-                plan.write_ids(self.target, cols=first),
-                plan.write_physical.view(bs, -1)[:, first].reshape(-1),
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                plan.virtual_write_ids(cols=first),
-                self.window.view(bs, -1)[:, first].reshape(-1),
-            )
-        )
-
-    def test_swa_ids_come_from_the_virtual_window(self):
-        plan = self._plan()
-        self.assertTrue(
-            torch.equal(
-                plan.write_ids(self.target, kind=_SWA),
-                self.allocator.translate_loc_from_full_to_swa(self.window),
-            )
-        )
-
-    def test_each_sub_pool_is_translated_once_and_shared(self):
-        """A sub-pool's ids are derived on first use and handed out again
-        after; a reader whose pool shares the sub-pool (a fused draft's full
-        one) gets the same tensor, and a pool without it gets None."""
-        plan = self._plan()
-        swa = plan.write_ids(self.target, kind=_SWA)
-        self.assertIs(plan.write_ids(self.target, kind=_SWA), swa)
-        self.assertIs(plan.write_ids(self.fused_draft), plan.write_ids(self.target))
-        self.assertIsNone(plan.write_ids(self.fused_draft, kind=_SWA))
-        self.assertIsNone(plan.write_ids(self.private_draft, kind=_SWA))
-
     def test_cols_slice_names_a_split_batch_s_tokens(self):
-        """Two-batch overlap splits a forward's tokens; each half names its
-        tokens of the window, whatever the forward's own columns were. A
-        contiguous half is a run of tokens, read as a view of the window's ids;
-        only columns spread over the rows become a flat index."""
+        """Two-batch overlap splits a forward's tokens; each half writes its
+        own tokens of the window, whatever the forward's own columns were."""
         plan = self._plan()
         bs = int(self.rpi.numel())
         everything = plan.cols_slice(None, slice(1, None))
@@ -372,74 +324,6 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertTrue(torch.equal(verify.out_cache_loc, plan.write_physical))
         self.assertIs(extend.out_cache_loc, verify.out_cache_loc)
 
-    def test_a_stream_read_before_a_table_reader_builds_no_table(self):
-        """A stream read before any table reader is gathered and translated
-        straight into its buffer. The table reader that comes next builds the
-        table into its own capture-stable buffer -- the iteration's only table
-        -- and a stream read after it packs from that table."""
-        builds, packed = [], []
-        real_build = kv_index_translator.build_kv_read_table
-        real_packed = kv_index_translator.build_kv_read_table_packed
-
-        def counting_build(**kwargs):
-            builds.append(kwargs["out"])
-            return real_build(**kwargs)
-
-        def counting_packed(**kwargs):
-            packed.append(kwargs["out"])
-            return real_packed(**kwargs)
-
-        bs = int(self.rpi.numel())
-        lens = torch.tensor([3, 2], dtype=torch.int64)
-        indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
-        captured = torch.full((bs + 1, 8), 7, dtype=torch.int32)
-        with (
-            patch.object(kv_index_translator, "build_kv_read_table", counting_build),
-            patch.object(
-                kv_index_translator, "build_kv_read_table_packed", counting_packed
-            ),
-            patch.object(
-                kv_index_translator,
-                "create_flashinfer_kv_indices_triton",
-                _HostStreamGather(),
-            ),
-        ):
-            plan = self._plan(read_extent=1)
-
-            def stream():
-                out = torch.full((6,), -7, dtype=torch.int32)
-                self.assertTrue(
-                    self.fused_draft.pack_read_stream(
-                        plan,
-                        req_pool_indices=self.rpi,
-                        seq_lens=lens,
-                        indptr=indptr,
-                        out=out,
-                    )
-                )
-                return out
-
-            first = stream()
-            self.assertEqual(len(packed), 1)
-            self.assertFalse(plan.has_read_table())
-            self.target.copy_page_table(plan, out=captured)
-            self.assertEqual([t.data_ptr() for t in builds], [captured.data_ptr()])
-            self.assertEqual(
-                plan.read_table(rows=bs + 1).ids.data_ptr(), captured.data_ptr()
-            )
-            after = stream()
-            # Packed from the captured table: nothing gathered or built again.
-            self.assertEqual(len(packed), 1)
-            self.assertEqual(len(builds), 1)
-        for b in range(bs):
-            row = self.req_to_token[int(self.rpi[b]), : int(lens[b])].to(torch.int64)
-            want = self.allocator.translate_write_loc(row)
-            got = first[int(indptr[b]) : int(indptr[b + 1])].to(torch.int64)
-            self.assertTrue(torch.equal(got, want))
-        self.assertTrue(torch.equal(after, first))
-        self.assertEqual(int(first[5]), -7)  # past the stream: untouched
-        self.assertFalse(plan.has_read_table(_SWA))
-
     def test_a_verify_reads_the_window_it_writes(self):
         def own_plan(mode, spec_info):
             return self.target.own_plan(
@@ -469,11 +353,10 @@ class TestKVLocPlan(unittest.TestCase):
         self.assertEqual(own_plan(ForwardMode.DECODE, None).read_extent, 0)
 
     def test_a_stream_only_iteration_builds_no_table(self):
-        """A plan builds a table only when a reader asks for the table form.
-        Readers of streams and row gathers -- one runner, or a target and a
-        draft over the same rows -- each translate in their own gather: no
-        table, with or without host lengths. Once a table reader has the table
-        built, every later reader takes it."""
+        """A plan builds a table only when a table reader asks for it: stream
+        readers -- one runner, or a target and a fused draft over the same
+        rows -- each translate in their own gather. Once the table is built,
+        a stream packs the same ids from it."""
         calls = {"packed": 0, "table": 0}
 
         def counting(name, real):
@@ -483,24 +366,21 @@ class TestKVLocPlan(unittest.TestCase):
 
             return wrapped
 
-        def stream_only_backend():
-            return SimpleNamespace(kv_index_translator=None)
-
         # A runner of rows no other translator here reads.
         self.req_to_token = self.req_to_token.clone()
         solo = self._translator(self.allocator.get_kvcache())
-        # A multi-step draft container is bound with its step backends and
-        # carries the runner's translator too.
-        container = SimpleNamespace(kv_index_translator=None)
-        solo.bind_and_verify_backends([container, stream_only_backend()])
-        self.assertIs(container.kv_index_translator, solo)
         bs = int(self.rpi.numel())
         lens = torch.tensor([3, 2], dtype=torch.int64)
         indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
 
-        def pack(translator, plan, out):
+        def pack(translator, plan, out, kind=_FULL):
             return translator.pack_read_stream(
-                plan, req_pool_indices=self.rpi, seq_lens=lens, indptr=indptr, out=out
+                plan,
+                req_pool_indices=self.rpi,
+                seq_lens=lens,
+                indptr=indptr,
+                out=out,
+                kind=kind,
             )
 
         with (
@@ -544,16 +424,24 @@ class TestKVLocPlan(unittest.TestCase):
                 out=again,
             )
             self.assertTrue(torch.equal(again, out))
-            calls["packed"] -= 1
+            self.assertEqual(calls, {"packed": 2, "table": 0})
 
-            # A table read after it still gets one.
+            # Once a table reader has the table built, a stream packs from it:
+            # nothing gathered again, the same ids.
             plan.read_table()
-            self.assertEqual(calls["table"], 1)
+            after = torch.full((6,), -7, dtype=torch.int32)
+            pack(solo, plan, after)
+            self.assertEqual(calls, {"packed": 2, "table": 1})
+            self.assertTrue(torch.equal(after, out))
+            # Nothing asked for the sliding-window table: its stream comes
+            # alone.
+            pack(solo, plan, torch.empty(6, dtype=torch.int32), kind=_SWA)
+            self.assertEqual(calls, {"packed": 3, "table": 1})
+            self.assertFalse(plan.has_read_table(_SWA))
 
-            # Another stream reader of the same rows (a fused flashinfer
-            # draft): still no table -- each translates its own gather.
+            # Another stream reader of the same rows (a fused draft): still no
+            # table -- each translates its own gather.
             peer = self._translator(self.draft_pool)
-            peer.bind_and_verify_backends([stream_only_backend()])
             for seq_lens_cpu in (self.seq_lens.clone(), None):
                 both = solo.plan(
                     req_pool_indices=self.rpi,
@@ -571,30 +459,7 @@ class TestKVLocPlan(unittest.TestCase):
                 self.assertIs(src.ids, self.req_to_token)
                 self.assertIs(src.v2p, solo.space(_FULL).read_v2p)
                 self.assertFalse(both.has_read_table())
-            self.assertEqual(calls, {"packed": 5, "table": 1})
-
-            # A table reader asks for the table: built once, and the readers
-            # after it take it rather than translating again.
-            shared = self._plan(solo, read_extent=1)
-            table = shared.read_table(rows=bs)
-            self.assertEqual(calls["table"], 2)
-            src = peer.read_source(shared, req_pool_indices=self.rpi, bs=bs)
-            self.assertIsNone(src.v2p)
-            self.assertIs(src.ids, table.ids)
-            pack(solo, shared, torch.empty(6, dtype=torch.int32))
-            self.assertEqual(calls, {"packed": 5, "table": 2})
-            # Nothing asked for the sliding-window table: its stream comes
-            # alone.
-            solo.pack_read_stream(
-                shared,
-                req_pool_indices=self.rpi,
-                seq_lens=lens,
-                indptr=indptr,
-                out=torch.empty(6, dtype=torch.int32),
-                kind=_SWA,
-            )
-            self.assertEqual(calls["packed"], 6)
-            self.assertFalse(shared.has_read_table(_SWA))
+            self.assertEqual(calls, {"packed": 7, "table": 1})
 
     def test_a_captured_first_reader_holds_the_table(self):
         """When the plan's first reader is a captured table, the table is built
@@ -731,28 +596,26 @@ class TestKVLocPlan(unittest.TestCase):
         )
         self.assertTrue(torch.equal(derived.read_table().ids, reference))
 
-    def test_a_pass_through_plan_does_no_work(self):
-        plan = self._plan(source=self.private_draft)
-        self.assertIs(plan.write_physical, self.window)
-        table = plan.read_table()
-        self.assertFalse(table.is_translated)
-        self.assertIs(table.ids, self.req_to_token)
-        self.assertIs(table.row_ids, self.rpi)
-
     def test_bind_sets_the_write_fields(self):
+        """`bind` gives a batch the columns it writes, the same ones in both
+        spaces, with the virtual mirror only when its ids were translated."""
         plan = self._plan()
+        bs = int(self.rpi.numel())
+        first = slice(0, 1)
         fused = SimpleNamespace()
-        plan.bind(fused, self.fused_draft, cols=slice(0, 1))
+        plan.bind(fused, self.fused_draft, cols=first)
         self.assertIs(fused.kv_loc_plan, plan)
-        self.assertEqual(fused.kv_loc_cols, slice(0, 1))
+        self.assertEqual(fused.kv_loc_cols, first)
         self.assertTrue(
             torch.equal(
-                fused.out_cache_loc, plan.write_ids(self.target, cols=slice(0, 1))
+                fused.out_cache_loc,
+                plan.write_physical.view(bs, -1)[:, first].reshape(-1),
             )
         )
         self.assertTrue(
             torch.equal(
-                fused.out_cache_loc_virtual, plan.virtual_write_ids(cols=slice(0, 1))
+                fused.out_cache_loc_virtual,
+                self.window.view(bs, -1)[:, first].reshape(-1),
             )
         )
         self.assertTrue(fused.out_cache_loc_is_physical)

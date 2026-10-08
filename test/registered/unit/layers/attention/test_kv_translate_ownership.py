@@ -2,9 +2,9 @@
 
 Ownership is exactly one place: the iteration's `KVLocPlan`, built through
 `KVIndexTranslator`, translates the WRITE window and the READ table once, and
-backends read the result. Virtual and physical ids
-share a value range, so a backend that forgets a translate -- or does one
-twice -- reads the wrong rows and nothing crashes.
+backends read the result. Virtual and physical ids share a value range, so a
+backend that forgets a translate -- or does one twice -- reads the wrong rows
+and nothing crashes.
 
 Deliberately out of scope: the allocator-internal implementations
 (`allocator/unified_*`, `unified_memory_pool`), which ARE the mechanism the

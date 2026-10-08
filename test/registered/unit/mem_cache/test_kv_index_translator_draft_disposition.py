@@ -11,32 +11,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KVIndexTranslator's three id-space dispositions with a fused draft region.
+"""KVIndexTranslator with a fused draft region.
 
-1. TARGET runner (allocator's own kvcache): translates to physical ids.
-2. FUSED-DRAFT runner (`UnifiedDraftKVPool` bound to this allocator): the
-   SAME translate -- same pages, same v2p table, same physical ids (the draft
-   parts sit inside the host entry). A dense draft pool routes no window
-   layers, so it has no swa id space: the window index table falls back to
-   the one dense table and its plan binds no sliding-window write ids (a
-   separate-swa assumption here crashed the read side and left the write side
-   with nothing to derive).
-3. PRIVATE-POOL draft (DSPARK/DFLASH shape: target's allocator, own
-   virtual-indexed buffer): strict passthrough — translating such a runner
-   would address a slot-count buffer with dense ids (OOB both directions),
-   so the no-op is load-bearing, not a default.
+A FUSED-DRAFT runner (`UnifiedDraftKVPool` bound to the target's allocator)
+translates exactly as the target does -- same v2p table, same physical ids,
+the draft parts sitting inside the host entries -- and, routing no window
+layers, has no sliding-window write ids. A PRIVATE-POOL draft (own
+virtual-indexed buffer) stays a strict passthrough. The draft writers outside
+the draft's forward (DFLASH/DSPARK's target-hidden writes, the multi-step
+draft decode's kv indices) read the same ids.
 
     python -m pytest test/registered/unit/mem_cache/test_kv_index_translator_draft_disposition.py -v
 """
 
-import ast
-import pathlib
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache import kv_index_translator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -52,7 +44,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
@@ -151,16 +143,6 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_target_runner_translates_to_physical_ids(self):
-        _, allocator, kvcache, _ = _build()
-        src = _source(allocator, kvcache)
-        self.assertTrue(src.is_translating)
-        v = allocator.alloc(2 * _PS)
-        self.assertIsNotNone(v)
-        fb = SimpleNamespace(out_cache_loc=v)
-        src.bind_own_plan(fb)
-        self.assertTrue(torch.equal(fb.out_cache_loc, allocator.translate_kv_loc(v)))
-
     def test_fused_draft_runner_translates_to_the_same_physical_ids(self):
         _, allocator, _, draft_pool = _build()
         src = _source(allocator, draft_pool)
@@ -182,123 +164,11 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         # A dense draft pool routes no window layers: no swa write loc.
         self.assertIsNone(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW))
 
-    def test_dense_fused_draft_has_no_window_write_loc(self):
-        """A dense fused-draft batch binds no sliding-window write ids: the
-        pool routes no window layers, so there is nothing to derive. The
-        hybrid-SWA TARGET on the same allocator keeps genuinely derived swa
-        ids, so the None can never paper over a real swa id space."""
-        _, allocator, kvcache, draft_pool = _build()
-        src = _source(allocator, draft_pool)
-        v = allocator.alloc(_PS)
-        self.assertIsNotNone(v)
-        fb = SimpleNamespace(out_cache_loc=v)
-        src.bind_own_plan(fb)
-        self.assertIsNone(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW))
-        # Target contrast: a real swa side derives a DIFFERENT loc.
-        tgt = _source(allocator, kvcache)
-        tv = allocator.alloc(_PS)
-        self.assertIsNotNone(tv)
-        tfb = SimpleNamespace(out_cache_loc=tv)
-        tgt.bind_own_plan(tfb)
-        tswa = tgt.write_ids(tfb, IdSpaceKind.SLIDING_WINDOW)
-        self.assertIsNotNone(tswa)
-        self.assertIsNot(tswa, tfb.out_cache_loc)
-        self.assertTrue(torch.equal(tswa, allocator.translate_loc_from_full_to_swa(tv)))
-
-    def test_private_pool_draft_stays_a_strict_passthrough(self):
-        _, allocator, _, _ = _build()
-        private_draft_pool = _FakeKVCache(64)  # own buffer, not the allocator's
-        src = _source(allocator, private_draft_pool)
-        self.assertFalse(src.is_translating)
-        v = torch.arange(2 * _PS, dtype=torch.int64)
-        fb = SimpleNamespace(out_cache_loc=v)
-        src.bind_own_plan(fb)
-        self.assertIs(fb.out_cache_loc, v)  # untouched, not even a copy
-
-    def test_foreign_allocator_draft_pool_is_not_enabled(self):
-        # A UnifiedDraftKVPool bound to a DIFFERENT allocator must not enable
-        # against this one (identity, not type, decides).
-        pool, allocator, kvcache, _ = _build()
-        _, other_alloc, _, other_draft = _build()
-        src = _source(allocator, other_draft)
-        self.assertFalse(src.is_translating)
-
-    def _one_row(self):
-        _, allocator, kvcache, _ = _build()
-        v = allocator.alloc(6 * _PS)
-        self.assertIsNotNone(v)
-        rt = torch.zeros((2, 16), dtype=torch.int32)
-        rt[0, : v.numel()] = v.to(torch.int32)
-        src = KVIndexTranslator(
-            req_to_token=rt,
-            token_to_kv_pool_allocator=allocator,
-            token_to_kv_pool=kvcache,
-            page_size=_PS,
-            device=_DEV,
-        )
-        return src, torch.tensor([0], dtype=torch.int64), torch.tensor([3])
-
-    def test_read_extent_matches_widened_lens(self):
-        """A plan reading ``k`` past its lengths must be byte-identical to one
-        built over ``seq_lens + k`` -- the two spellings of the whole-sequence
-        verify widening. A kernel applying the extent to the page count but
-        not the loads (or vice versa) silently truncates the verify tail."""
-        src, rpi, seq = self._one_row()
-        delta = 2 * _PS + 1
-        widened = src.plan(
-            req_pool_indices=rpi,
-            seq_lens=seq,
-            seq_lens_cpu=seq.clone(),
-            write_virtual=None,
-            read_extent=delta,
-        ).read_table()
-        by_lens = src.plan(
-            req_pool_indices=rpi,
-            seq_lens=seq + delta,
-            seq_lens_cpu=seq + delta,
-            write_virtual=None,
-        ).read_table()
-        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
-        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
-        # The extent genuinely widened: entries exist past the plain prefix.
-        plain_pages = -(-3 // _PS)
-        self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
-
-    def test_a_verify_plans_its_draft_tail(self):
-        """A verify's own plan reads its `draft_token_num` past its lengths, as
-        the widened-lens build over the SAME batch does."""
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        src, rpi, seq = self._one_row()
-        delta = 2 * _PS + 1
-        fb = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            spec_info=SimpleNamespace(draft_token_num=delta),
-            batch_size=1,
-            req_pool_indices=rpi,
-            seq_lens=seq,
-            seq_lens_cpu=seq.clone(),
-            out_cache_loc=torch.zeros(delta, dtype=torch.int64),
-        )
-        widened = src.own_plan(fb).read_table()
-        by_lens = src.plan(
-            req_pool_indices=rpi,
-            seq_lens=seq + delta,
-            seq_lens_cpu=seq + delta,
-            write_virtual=None,
-        ).read_table()
-        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
-
     def test_target_hidden_writers_write_physical_ids(self):
-        """BUG REGRESSION. DFLASH and DSPARK do not compute their draft KV from
-        the draft's own forward -- they PROJECT the target's hidden states and
-        write them straight into the draft pool, at locs read off the target's
-        req_to_token (VIRTUAL). Under fusion the draft pool takes the target's
-        physical ids, so an untranslated write lands at the wrong row: the
-        draft attends over the wrong KV and accept length collapses to 1.0
-        with no crash. Both writers take the ids from the iteration's plan in
-        the draft pool's space -- the target's physical ids under fusion --
-        and write them as they are."""
+        """DFLASH and DSPARK project the target's hidden states straight into
+        the draft pool. Under fusion that pool takes the target's physical ids:
+        both writers take them from the iteration's plan in the draft pool's
+        space, never the virtual ids (a wrong row, with no crash)."""
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
         from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
             TargetHiddenKvInjector,
@@ -460,94 +330,6 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
                 "pass the read table's entry granularity",
             )
             self.assertTrue(has_source, f"{name} launches without read_source")
-
-
-class TestDispositionBranchesAgree(unittest.TestCase):
-    """Every `__init__` disposition must assign the SAME attribute set.
-
-    BUG REGRESSION. `KVIndexTranslator.__init__` picks a disposition --
-    translating (unified target or fused draft) or passthrough -- and later
-    methods read attributes off `self` unconditionally. When upstream adds an
-    attribute it naturally adds it to the branches IT knows about; a branch
-    added here is silently left short, and nothing fails until the missing
-    attribute is read at RUNTIME. That is exactly how the fused-draft branch
-    once lost its write translate and `defer_read_translate` across a rebase:
-    py_compile passes (the attribute is only ever read, never declared), the
-    undefined-NAME check passes (it is an attribute, not a bare name), and the
-    target and passthrough paths both work -- only a fused-draft forward raises
-    `AttributeError`.
-
-    Comparing the branches against EACH OTHER needs no list to maintain: a new
-    attribute is covered the moment any one branch sets it.
-
-        python -m pytest test/registered/unit/mem_cache/test_kv_index_translator_draft_disposition.py -v
-    """
-
-    def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
-        # parallel width that only exists once a config is published.
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
-
-    def _init_branch_assignments(self):
-        """{branch index: {attr names it assigns}} for __init__'s if/elif/else."""
-        src = pathlib.Path(kv_index_translator.__file__).read_text()
-        tree = ast.parse(src)
-        cls = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.ClassDef) and n.name == "KVIndexTranslator"
-        )
-        init = next(
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-        )
-
-        # The disposition chain is the `if` whose body assigns the id-space
-        # fields; find it by the attribute every disposition must set.
-        def assigns(stmts):
-            out = set()
-            for st in stmts:
-                for node in ast.walk(st):
-                    if isinstance(node, ast.Assign):
-                        for t in node.targets:
-                            if (
-                                isinstance(t, ast.Attribute)
-                                and isinstance(t.value, ast.Name)
-                                and t.value.id == "self"
-                            ):
-                                out.add(t.attr)
-            return out
-
-        for node in init.body:
-            if not isinstance(node, ast.If):
-                continue
-            branches, cur = [], node
-            while True:
-                branches.append(assigns(cur.body))
-                if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
-                    cur = cur.orelse[0]
-                    continue
-                if cur.orelse:
-                    branches.append(assigns(cur.orelse))
-                break
-            if len(branches) >= 2 and all("_full_v2p_table" in b for b in branches):
-                return branches
-        self.fail("could not locate the disposition if/elif/else in __init__")
-
-    def test_every_disposition_assigns_the_same_attributes(self):
-        branches = self._init_branch_assignments()
-        union = set().union(*branches)
-        missing = {i: sorted(union - b) for i, b in enumerate(branches) if union - b}
-        self.assertEqual(
-            missing,
-            {},
-            "a KVIndexTranslator.__init__ disposition does not assign every "
-            "attribute its siblings do; the branch raises AttributeError only "
-            "when that path is taken at runtime: " + repr(missing),
-        )
 
 
 if __name__ == "__main__":

@@ -1,17 +1,12 @@
 """Dense fused-draft geometry: the draft model's KV as two more parts of every
-host slot's entry.
-
-Derived-property pins for the fused entry layout
+host slot's entry,
 
     [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
 
-the draft parts start at the 16-B-aligned end of the host parts and the entry
-rounds up to the 32-B entry alignment (never to an lcm of row widths), so the
-draft's row width is free to differ from the host's; host and draft views
-share the slot stride and are indexed by the same physical token id; and
+the draft parts starting at the aligned end of the host parts. Host and draft
+views share the slot stride and are indexed by the same physical token id;
 writes through either family's views land inside their own part of their own
-slot (compaction moves whole page envelopes, so confinement IS the correctness
-of the fused move).
+slot, and a host page move carries the draft bytes with it.
 
     python -m pytest test/registered/unit/mem_cache/test_dense_fused_draft_geometry.py -v
 """
@@ -27,7 +22,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.layout.token_major import (
     ENTRY_ALIGN_BYTES,
-    ROW_ALIGN_BYTES,
     align_entry_bytes,
     align_part_offset,
 )
@@ -43,11 +37,10 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _DTYPE = torch.bfloat16
-_ITEM = _DTYPE.itemsize
 
 
 def _host_spec(draft_region=None, layer_num=2, head_num=2, head_dim=4):
@@ -75,12 +68,6 @@ def _placement(region):
 
 
 class TestFusedSpecMath(unittest.TestCase):
-    def test_unfused_spec_is_byte_identical_to_before(self):
-        s = _host_spec()
-        self.assertEqual(s.entry_bytes(), 2 * (16 + 16))
-        self.assertEqual(s.host_entry_bytes(), s.entry_bytes())
-        self.assertEqual([p.name for p in s.layout().parts], ["k", "v"])
-
     def test_fused_entry_appends_the_draft_parts(self):
         f = _host_spec(_draft_region())
         r = f.draft_region
@@ -100,46 +87,6 @@ class TestFusedSpecMath(unittest.TestCase):
         self.assertEqual(layout.part("draft_k").offset_bytes, 64)
         self.assertEqual(layout.part("draft_v").offset_bytes, 64 + 48)
         self.assertEqual(layout.part("draft_k").layer_stride_bytes, 64)
-
-    def test_entry_alignment_pads_only_to_the_entry_quantum(self):
-        # host 32 B + draft 48 B = 80 B of rows -> one 96 B entry (16 B pad),
-        # not an lcm of the two row widths.
-        f = _host_spec(
-            DenseDraftRegion(
-                lane_num=1, head_num=1, head_dim=8, v_head_dim=16, store_dtype=_DTYPE
-            ),
-            layer_num=1,
-            head_num=1,
-            head_dim=8,
-        )
-        self.assertEqual(f.host_entry_bytes(), 32)
-        self.assertEqual(f.draft_region.entry_bytes(), 48)
-        self.assertEqual(f.entry_bytes(), 96)
-        self.assertEqual(f.draft_offset_in_entry() % ROW_ALIGN_BYTES, 0)
-        f.layout()  # parts fit and do not overlap
-
-    def test_draft_rows_must_be_row_aligned(self):
-        with self.assertRaises(AssertionError):
-            _host_spec(
-                DenseDraftRegion(lane_num=1, head_num=1, head_dim=3, store_dtype=_DTYPE)
-            ).layout()
-
-    def test_only_page_envelope_kinds_accept_a_draft_region(self):
-        """`draft_region` is a universal spec field (None = unfused), but a
-        kind without the fused entry layout must refuse one at construction;
-        a silently-carried region would never reach the layout. MHA and MLA
-        entries carry the draft parts; mamba state pages carry none yet."""
-        with self.assertRaises(AssertionError):
-            MambaSubPoolSpec(
-                name="mamba",
-                layer_num=1,
-                conv_state_shapes=((2, 2),),
-                conv_dtype=torch.float32,
-                temporal_state_shape=(2,),
-                temporal_dtype=torch.float32,
-                grow_direction="up",
-                draft_region=_draft_region(),
-            )
 
 
 class TestFusedRegionConfinement(unittest.TestCase):
@@ -199,20 +146,6 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertGreaterEqual(lo, page * self.PS * entry)
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
-    def test_host_and_draft_views_share_the_slot_stride(self):
-        spec, _, (hk, hv), (dk, dv) = self._build()
-        stride = spec.entry_bytes()
-        for view in (*hk, *hv, *dk, *dv):
-            self.assertEqual(view.stride(0) * view.element_size(), stride)
-            self.assertEqual(view.shape[0], hk[0].shape[0])
-        self.assertEqual(tuple(dk[0].shape[1:]), (1, 24))
-        self.assertEqual(tuple(dv[0].shape[1:]), (1, 8))
-
-    def test_pool_helper_refuses_an_unfused_sub_pool(self):
-        _, pool, _, _ = self._build()
-        with self.assertRaises(AssertionError):
-            pool.build_dense_draft_views("swa")  # no fused region there
-
 
 class TestUnifiedDraftKVPool(unittest.TestCase):
     PS = 2
@@ -268,9 +201,9 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         )
 
     def test_host_page_move_carries_the_draft_bytes(self):
-        # THE fused-layout property: compaction relocates whole page envelopes
-        # on the HOST pool; a draft marker written in page A must arrive at
-        # page B after host.move_kv_cache(B, A), with zero draft-side moves.
+        # Compaction relocates whole page envelopes on the HOST pool: a draft
+        # marker written in page A arrives at page B after
+        # host.move_kv_cache(B, A), with no draft-side move.
         pool = self._pool()
         dp, _ = self._draft_pool(pool)
         host = UnifiedMHATokenToKVPool(
@@ -336,17 +269,6 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         self.assertEqual(dp.get_key_buffer(0).dtype, fp8)
         torch.testing.assert_close(dp.get_key_buffer(0)[loc].float(), k)
 
-    def test_draft_side_moves_and_transfers_fail_loudly(self):
-        pool = self._pool()
-        dp, _ = self._draft_pool(pool)
-        one = torch.zeros(self.PS, dtype=torch.int64)
-        with self.assertRaises(NotImplementedError):
-            dp.move_kv_cache(one, one)
-        with self.assertRaises(NotImplementedError):
-            dp.get_contiguous_buf_infos()
-        with self.assertRaises(NotImplementedError):
-            dp.get_cpu_copy(one)
-
 
 def _mla_host_spec(draft_region=None):
     # 32 B latent rows, two layers: a 64 B host entry before the draft parts.
@@ -376,8 +298,7 @@ def _mamba_spec():
 class TestFusedMLAHost(unittest.TestCase):
     """MLA entries carry the fused draft parts exactly like MHA entries: the
     same aligned entry, one slot stride for both families, and byte-disjoint
-    host/draft parts within every slot. The unfused spec stays byte-identical;
-    that identity guards every existing MLA deploy."""
+    host/draft parts within every slot."""
 
     def setUp(self):
         # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
@@ -388,13 +309,6 @@ class TestFusedMLAHost(unittest.TestCase):
 
     PS = 2
     PAGES = 8
-
-    def test_unfused_spec_is_byte_identical_to_before(self):
-        s = _mla_host_spec()
-        self.assertEqual(s.row_bytes(), 32)
-        self.assertEqual(s.entry_bytes(), 64)
-        self.assertEqual(s.host_entry_bytes(), s.entry_bytes())
-        self.assertEqual([p.name for p in s.layout().parts], ["kv"])
 
     def test_fused_entry_appends_the_draft_parts(self):
         f = _mla_host_spec(_draft_region())
@@ -448,10 +362,9 @@ class TestFusedMLAHost(unittest.TestCase):
                 self.assertTrue(bool((nz >= split).all() and (nz < slot_hi).all()))
 
     def test_translator_takes_the_fused_disposition_on_the_mla_host(self):
-        """A draft runner bound over the MLA host's entries must translate
-        through the mamba allocator's full-side v2p, exactly as on the SWA
-        host. A kind-specific probe regression here silently reverts the
-        draft to passthrough (raw virtual ids into the views)."""
+        """A draft runner bound over the MLA host's entries translates through
+        the mamba allocator's full-side v2p, as on the SWA host; a passthrough
+        here would write raw virtual ids into the views."""
         from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )

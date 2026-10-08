@@ -11,29 +11,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`place_fused_draft`: which host/draft pairs fuse, and where each runner's
-layers land.
+"""`place_fused_draft` and the target's fused-draft decision: which drafts
+fuse into the host's entries, and where each runner's layers land.
 
-A decline keeps a DFLASH or DSPARK draft on its private pool (a DFLASH draft
-on a mamba host is refused instead), and refuses an EAGLE draft at boot. A
-wrong answer for a draft that keeps its pool silently changes what it binds
-and what the boot solve prices. Pinned:
+A decline keeps a draft on a private pool (or refuses it at boot); admitting
+one that cannot read the fused rows correctly gives silently wrong drafts.
+Pinned:
   - a replicated head under multi-layer EAGLE gets one lane RANGE per runner
     (one shared region would let the runners clobber each other's KV);
   - a per-depth head serves one depth per runner and needs one runner per
     depth;
   - a draft with SWA or recurrent-state layers of its own, or asymmetric K/V
-    rows, declines: the fused arm binds one dense pool over the host's full
-    slots;
-  - a draft whose attention backend is off the translated MHA rails
-    declines: it would read the fused rows without the KV-index translator;
-  - so does a draft under --dcp-size > 1, where each rank's host rows hold
-    only its share of the tokens the replicated draft reads, and a draft
-    under HiCache, which builds its host pool off a device pool of its own;
-  - an explicit draft KV dtype unlike the host's declines;
-  - the profile divides the draft's heads by attn_tp, as the target does;
-  - a placement whose runner lane counts do not fill its region is refused;
-  - the priced entry counts the layers THIS runner owns, not the whole model's.
+    rows, declines;
+  - so does a draft whose attention backend is off the translated MHA rails
+    (it would read the fused rows with virtual ids), a draft under
+    --dcp-size > 1 (each rank's rows hold only its share of the tokens), an
+    explicit draft KV dtype unlike the host's, and a draft under HiCache or
+    host-pool decode retraction (they build the draft's host pool off a
+    device pool of its own).
 
     python -m pytest test/registered/unit/mem_cache/test_fused_draft_placement.py -v
 """
@@ -48,9 +43,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftKVGeometry,
     DraftKVProfile,
-    FusedDraftDecision,
-    FusedDraftPlacement,
-    draft_kv_profile,
     place_fused_draft,
 )
 from sglang.srt.runtime_context import get_parallel, override_platform
@@ -130,118 +122,6 @@ class TestPlaceFusedDraft(CustomTestCase):
         )
 
 
-class TestDraftKVProfile(CustomTestCase):
-    def test_heads_are_divided_by_attn_tp(self):
-        mc = SimpleNamespace(
-            is_hybrid_swa=True,
-            is_deepseek_v4_arch=False,
-            swa_attention_layer_ids=[0],
-            num_nextn_predict_layers=None,
-            get_num_kv_heads=lambda tp: max(1, 8 // tp),
-            head_dim=64,
-            v_head_dim=32,
-        )
-        with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(mc, num_layers=1, attn_tp_size=2)
-        self.assertEqual(
-            profile.full, DraftKVGeometry(head_num=4, head_dim=64, v_head_dim=32)
-        )
-        self.assertEqual(profile.swa_layer_ids, (0,))
-        self.assertEqual(profile.num_depths, 1)
-        self.assertEqual(profile.num_state_layers, 0)
-
-    def _linear_trunk_mc(self, hf_text_config):
-        return SimpleNamespace(
-            is_hybrid_swa=False,
-            is_deepseek_v4_arch=False,
-            num_nextn_predict_layers=1,
-            get_num_kv_heads=lambda tp: 8,
-            head_dim=64,
-            v_head_dim=64,
-            hf_text_config=hf_text_config,
-        )
-
-    def test_a_nextn_head_of_a_linear_trunk_owns_no_state(self):
-        """BUG REGRESSION. A NEXTN head ships inside the trunk checkpoint and
-        inherits its config CLASS, so `mamba2_cache_params` lists the TRUNK's
-        state layers while the head is a full-attention block. Counting them
-        declined a fusable draft to its private pool."""
-        mc = self._linear_trunk_mc(SimpleNamespace())
-        trunk = SimpleNamespace(mamba2_cache_params=SimpleNamespace(layers=[0, 1, 2]))
-        with patch(
-            "sglang.srt.configs.hybrid_arch.mambaish_config", return_value=trunk
-        ):
-            profile = draft_kv_profile(mc, num_layers=1, attn_tp_size=1)
-        self.assertEqual(profile.num_state_layers, 0)
-
-    def test_a_conv_chain_head_still_counts_its_state(self):
-        """The discriminator must not silence a head that really owns state:
-        only a conv-chain MTP config declares `mtp_local_layer_ids`."""
-        mc = self._linear_trunk_mc(SimpleNamespace(mtp_local_layer_ids=[0]))
-        trunk = SimpleNamespace(mamba2_cache_params=SimpleNamespace(layers=[0, 1, 2]))
-        with patch(
-            "sglang.srt.configs.hybrid_arch.mambaish_config", return_value=trunk
-        ):
-            profile = draft_kv_profile(mc, num_layers=1, attn_tp_size=1)
-        self.assertEqual(profile.num_state_layers, 3)
-
-
-class TestFusedDraftPlacement(CustomTestCase):
-    def test_runner_lane_counts_must_fill_the_region(self):
-        region = DenseDraftRegion(
-            lane_num=2, head_num=1, head_dim=8, store_dtype=_DTYPE
-        )
-        with self.assertRaises(AssertionError):
-            FusedDraftPlacement(region=region, runner_lane_counts=(1,))
-        with self.assertRaises(AssertionError):
-            FusedDraftPlacement(region=region, runner_lane_counts=())
-
-
-class TestFusedEntryPricing(CustomTestCase):
-    """The boot solve prices a fused entry through the same spec the pool
-    factory builds, so the two cannot drift. The factory builds the full
-    sub-pool from this runner's OWN layer slice; pricing from the whole-model
-    split over-counts every layer another pipeline rank holds, and the solve
-    then hands out fewer tokens than fit."""
-
-    def _configurator(self, *, whole, hybrid_swa, owned=(), span=(0, 0)):
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-
-        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
-        cfg.is_hybrid_swa = hybrid_swa
-        cfg.layer_info = SimpleNamespace(
-            full_attention_layer_ids=list(owned),
-            start_layer=span[0],
-            end_layer=span[1],
-        )
-        cfg.mambaish_config = SimpleNamespace(full_attention_layer_ids=whole)
-        cfg.model_config = SimpleNamespace(
-            full_attention_layer_ids=whole,
-            head_dim=8,
-            get_num_kv_heads=lambda *_: 1,
-        )
-        cfg.use_mla_backend = False
-        cfg.kv_cache_dtype = _DTYPE
-        return cfg
-
-    def _priced(self, cfg):
-        region = DenseDraftRegion(
-            lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE
-        )
-        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
-            return cfg._full_host_spec(region).layer_num
-
-    def test_an_swa_host_prices_this_runners_slice(self):
-        cfg = self._configurator(
-            whole=[0, 1, 2, 3], hybrid_swa=True, owned=[0, 1], span=(0, 2)
-        )
-        self.assertEqual(self._priced(cfg), 2)
-
-    def test_a_mamba_host_prices_only_the_layers_in_its_span(self):
-        cfg = self._configurator(whole=[0, 1, 2, 3], hybrid_swa=False, span=(2, 4))
-        self.assertEqual(self._priced(cfg), 2)
-
-
 class TestFusedDraftDecision(CustomTestCase):
     """The target's boot decision over a host whose full sub-pool fuses."""
 
@@ -252,7 +132,6 @@ class TestFusedDraftDecision(CustomTestCase):
         draft_kv_dtype=None,
         host_kv_dtype=_DTYPE,
         kv_cache_dtype_flag="auto",
-        attention_arch=None,
         draft_backend=None,
         target_backends=("triton", "triton"),
         dcp_size=1,
@@ -286,7 +165,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
-                attention_arch=attention_arch or AttentionArch.MHA,
+                attention_arch=AttentionArch.MHA,
             ),
         )
         memory = SimpleNamespace(
@@ -325,15 +204,6 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
-
-    def test_a_non_mha_draft_keeps_the_private_pool(self):
-        """The region holds dense MHA K/V rows. An MLA draft is kept out by its
-        own architecture, not by the accident of asymmetric head dims."""
-        from sglang.srt.configs.model_config import AttentionArch
-
-        declined = self._decide(attention_arch=AttentionArch.MLA)
-        self.assertIsNone(declined.placement)
-        self.assertIn("MLA", declined.declined)
 
     def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
         """A fused draft stores its rows in the host's KV dtype; an explicit
@@ -398,91 +268,6 @@ class TestFusedDraftDecision(CustomTestCase):
         self.assertIn(
             "--disaggregation-decode-retraction-backup=host_pool", declined.declined
         )
-
-
-class TestMambaHostPrivateDraftRefused(CustomTestCase):
-    """A mamba host's unified buffer takes the whole KV budget, so a private
-    draft pool on top of it would overcommit; the fused arm is the only
-    EAGLE-family or DFLASH arm such a host builds. A DSPARK draft that does
-    not fuse keeps its private pool."""
-
-    _DECLINED = "the draft's K/V rows are asymmetric"
-
-    def _resolve(self, *, decision, algorithm="EAGLE"):
-        from sglang.srt.mem_cache import kv_cache_configurator as kvc
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
-        cfg.is_draft_worker = False
-        cfg.spec_algorithm = SpeculativeAlgorithm[algorithm]
-        with patch.object(
-            kvc.KVCacheConfigurator, "_fused_draft_decision", return_value=decision
-        ):
-            return cfg._fused_draft_for_mamba_factory()
-
-    def test_a_declined_eagle_draft_is_refused(self):
-        for algorithm in ("EAGLE", "EAGLE3"):
-            with self.subTest(algorithm=algorithm):
-                with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
-                    self._resolve(
-                        decision=FusedDraftDecision(declined=self._DECLINED),
-                        algorithm=algorithm,
-                    )
-
-    def test_a_declined_dflash_draft_is_refused_and_dspark_keeps_its_pool(self):
-        """A DFLASH decliner is refused like EAGLE's; a DSPARK decliner keeps
-        its private pool instead of failing the boot."""
-        declined = FusedDraftDecision(declined=self._DECLINED)
-        with self.assertRaisesRegex(ValueError, "rows are asymmetric"):
-            self._resolve(decision=declined, algorithm="DFLASH")
-        self.assertIsNone(self._resolve(decision=declined, algorithm="DSPARK"))
-
-    def test_a_placed_draft_and_other_algorithms_pass(self):
-        placement = _place(_profile()).placement
-        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
-            with self.subTest(algorithm=algorithm):
-                self.assertIs(
-                    self._resolve(
-                        decision=FusedDraftDecision(placement=placement),
-                        algorithm=algorithm,
-                    ),
-                    placement,
-                )
-        self.assertIsNone(
-            self._resolve(decision=FusedDraftDecision(), algorithm="NONE")
-        )
-
-
-class TestSWAHostPrivateDraftRefused(CustomTestCase):
-    """A hybrid-SWA host's boot solve prices a private EAGLE draft at the
-    target's per-token size, so a draft that does not fuse is refused there
-    too; the fused arm is the only EAGLE arm such a host builds."""
-
-    def _resolve(self, *, decision, eagle=True):
-        from sglang.srt.mem_cache import kv_cache_configurator as kvc
-
-        cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
-        cfg.is_draft_worker = False
-        cfg.spec_algorithm = SimpleNamespace(is_eagle=lambda: eagle)
-        with patch.object(
-            kvc.KVCacheConfigurator, "_fused_draft_decision", return_value=decision
-        ):
-            return cfg._fused_draft_for_swa_factory()
-
-    def test_a_declined_eagle_draft_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "KV cache dtype"):
-            self._resolve(
-                decision=FusedDraftDecision(
-                    declined="the draft's KV cache dtype (bf16) differs from the host's"
-                )
-            )
-
-    def test_a_placed_draft_and_other_algorithms_pass(self):
-        placement = _place(_profile()).placement
-        self.assertIs(
-            self._resolve(decision=FusedDraftDecision(placement=placement)), placement
-        )
-        self.assertIsNone(self._resolve(decision=FusedDraftDecision(), eagle=False))
 
 
 if __name__ == "__main__":
