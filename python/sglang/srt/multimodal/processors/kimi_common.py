@@ -5,6 +5,7 @@ Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Union
 
 import numpy as np
@@ -30,6 +31,20 @@ _KIMI_IMAGE_IDENTITY_TAG = b"sglang-kimi-image-identity-v1"
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
 
 
+@dataclass(frozen=True)
+class KimiLoadedImage:
+    """Decoded image and the digest of the exact input bytes read by its loader."""
+
+    image: Any
+    content_digest: str
+
+
+def unwrap_kimi_images(images):
+    return [
+        image.image if isinstance(image, KimiLoadedImage) else image for image in images
+    ]
+
+
 def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> bytes:
     """Full SHA-256 image identity: content and preprocessing config, then grid."""
     digest = parse_content_hash(content_config_digest)
@@ -45,8 +60,12 @@ def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> 
 def _item_grid_thw(item: MultimodalDataItem) -> List[int]:
     grid = item.model_specific_data.get("image_grid_thw")
     if grid is None:
+        grid = item.model_specific_data.get("grid_thws")
+    if grid is None:
         raise ValueError("Kimi image item is missing image_grid_thw")
     values = torch.as_tensor(grid).reshape(-1).tolist()
+    if len(values) == 2:
+        values.insert(0, 1)
     if len(values) != 3:
         raise ValueError(f"Kimi image item needs one [t, h, w] grid, got {values}")
     return values
@@ -62,6 +81,27 @@ class KimiGridMMDataMixin:
 
     # Opt-in: processors whose image spans use full identities and wide pads.
     uses_wide_image_identity = False
+
+    @classmethod
+    def _load_single_item(cls, data, modality, *args, **kwargs):
+        if (
+            not cls.uses_wide_image_identity
+            or modality != Modality.IMAGE
+            or cls._is_preprocessed_input(data)
+            or envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+        ):
+            return super()._load_single_item(data, modality, *args, **kwargs)
+        # hash the bytes already on the host, before nvJPEG creates a GPU tensor
+        snapshot = snapshot_media(data)
+        image = super()._load_single_item(snapshot.data, modality, *args, **kwargs)
+        return KimiLoadedImage(image, snapshot.content_digest)
+
+    def process_mm_data(self, input_text, images=None, **kwargs):
+        return super().process_mm_data(
+            input_text,
+            images=unwrap_kimi_images(images) if images else images,
+            **kwargs,
+        )
 
     @staticmethod
     def reject_caller_image_identity(image_data, request_obj) -> None:
@@ -86,7 +126,9 @@ class KimiGridMMDataMixin:
 
     def kimi_content_config_digest(self, media: Any) -> str:
         return build_artifact_key(
-            snapshot_media(media).content_digest,
+            media.content_digest
+            if isinstance(media, KimiLoadedImage)
+            else snapshot_media(media).content_digest,
             modality="image",
             processor_fingerprint=self._kimi_config_fingerprint(),
         )
@@ -140,6 +182,7 @@ class KimiGridMMDataMixin:
 
         """
         assert images is not None
+        images = unwrap_kimi_images(images)
         media_tokens_calculator = (
             self._processor.media_processor.media_tokens_calculator
         )
@@ -235,7 +278,7 @@ class KimiGridMMDataMixin:
         image_embeddings = embeddings[Modality.IMAGE]
         mm_items = []
         consumed = 0
-        for start, end in offsets:
+        for (start, end), grid in zip(offsets, img_grid_thw):
             num_tokens = end - start + 1
             embedding_slice = image_embeddings[consumed : consumed + num_tokens]
             consumed += num_tokens
@@ -244,8 +287,12 @@ class KimiGridMMDataMixin:
                     modality=Modality.IMAGE,
                     offsets=[(start, end)],
                     precomputed_embeddings=embedding_slice,
+                    model_specific_data={"image_grid_thw": grid},
                 )
             )
+
+        if self.uses_wide_image_identity:
+            self.assign_kimi_image_identities(mm_items, None)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,

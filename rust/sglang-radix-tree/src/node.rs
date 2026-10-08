@@ -816,7 +816,7 @@ pub trait ChildKeyType:
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self>;
 
     /// The atom's token ids as u32 storage-hash words.
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32>;
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64>;
 
     /// The raw token ids spanned by `atoms`; the unigram view borrows, bigram
     /// atoms (overlapping by one) materialize.
@@ -894,9 +894,9 @@ pub trait ChildKeyType:
     }
 }
 
-/// A token id as a u32 storage-hash word; token ids beyond u32 are rejected.
-fn hash_word(token_id: i64) -> u32 {
-    u32::try_from(token_id).expect("token id does not fit in uint32")
+/// Wide multimodal sentinels use the same non-negative int64 domain as tree keys.
+fn hash_word(token_id: i64) -> u64 {
+    u64::try_from(token_id).expect("token id must be a non-negative int64")
 }
 
 impl ChildKeyType for Vec<i64> {
@@ -907,7 +907,7 @@ impl ChildKeyType for Vec<i64> {
         token_ids
     }
 
-    fn hash_words(atom: &i64) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &i64) -> impl Iterator<Item = u64> {
         std::iter::once(hash_word(*atom))
     }
 
@@ -925,7 +925,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
         Cow::Owned(token_ids.windows(2).map(|w| (w[0], w[1])).collect())
     }
 
-    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u64> {
         [hash_word(atom.0), hash_word(atom.1)].into_iter()
     }
 
@@ -946,7 +946,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
 pub(crate) const DIGEST_LEN: usize = 32;
 pub(crate) type HashDigest = [u8; DIGEST_LEN];
 
-/// SHA256(prior_digest || page atom words as little-endian u32 bytes).
+/// Preserve u32 page hashes; wide pages use a 0xff tag and little-endian u64 words.
 pub(crate) fn hash_page<K: ChildKeyType>(
     page: &[K::Atom],
     prior: Option<&HashDigest>,
@@ -955,9 +955,21 @@ pub(crate) fn hash_page<K: ChildKeyType>(
     if let Some(prior) = prior {
         hasher.update(prior);
     }
+    let wide = page
+        .iter()
+        .flat_map(K::hash_words)
+        .any(|word| word > u32::MAX as u64);
+    if wide {
+        // match hash_binding.cpp; the tag makes the encoding length odd
+        hasher.update([0xff]);
+    }
     for atom in page {
         for word in K::hash_words(atom) {
-            hasher.update(word.to_le_bytes());
+            if wide {
+                hasher.update(word.to_le_bytes());
+            } else {
+                hasher.update((word as u32).to_le_bytes());
+            }
         }
     }
     hasher.finalize().into()

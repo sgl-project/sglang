@@ -33,6 +33,7 @@ from sglang.srt.models.kimi_k25 import (
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
+    build_processor_fingerprint,
     resolve_multimodal_item_hash,
     snapshot_media,
 )
@@ -69,12 +70,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
-from sglang.srt.runtime_context import (
-    get_context,
-    get_parallel,
-    publish,
-    reset_context,
-)
+from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -639,6 +635,27 @@ def _k3_preprocess_config(
         image_std=(0.5, 0.5, 0.5),
         transparent_bg_config=None,
     )
+
+
+def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
+    fingerprints = []
+    for mean in ([0.5, 0.5, 0.5], [0.1, 0.1, 0.1]):
+        wrapper = KimiGPUProcessorWrapper(
+            _HFProcessor(),
+            "<|media_pad|>",
+            42,
+            14,
+            2,
+            16384,
+            512,
+            None,
+            mean,
+            [0.5, 0.5, 0.5],
+        )
+        fingerprints.append(
+            build_processor_fingerprint(wrapper, SimpleNamespace(to_dict=lambda: {}))
+        )
+    assert fingerprints[0] != fingerprints[1]
 
 
 @pytest.mark.parametrize(

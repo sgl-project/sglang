@@ -55,7 +55,11 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.utils import (
+    get_hash_str,
+    get_storage_hash_str,
+    hash_str_to_int64,
+)
 from sglang.srt.runtime_context import get_context
 
 
@@ -1102,10 +1106,18 @@ def test_hash_boundary_rejects_malformed_prior_hash(prior_hash):
         mem_cache.get_hash_str(array("q", [1, 2]), prior_hash, 2)
 
 
-@pytest.mark.parametrize("token_id", [-1, 1 << 32])
-def test_hash_boundary_rejects_token_ids_outside_uint32(token_id):
-    with pytest.raises(ValueError, match="does not fit in uint32"):
-        mem_cache.get_hash_str(array("q", [token_id]), None, 1)
+def test_hash_boundary_rejects_negative_token_ids():
+    with pytest.raises(ValueError, match="non-negative int64"):
+        mem_cache.get_hash_str(array("q", [-1]), None, 1)
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_hash_boundary_preserves_wide_multimodal_tokens(is_bigram):
+    raw = array("q", [1, 2, (1 << 62) + 123, 4, 5])
+    key = RadixKey(raw, is_bigram=is_bigram)
+    assert mem_cache.get_hash_str(raw, None, 2, is_bigram) == get_hash_str(
+        key, page_size=2
+    )
 
 
 def test_hash_boundary_rejects_zero_page_size():

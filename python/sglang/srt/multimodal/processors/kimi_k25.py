@@ -10,19 +10,12 @@ from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
-from sglang.srt.multimodal.processors.kimi_cache_config import (
-    validate_kimi_wide_pad_config,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -390,6 +383,20 @@ class KimiGPUProcessorWrapper:
         self.tokenizer = hf_processor.tokenizer
         self.media_processor = hf_processor.media_processor
 
+    def preprocess_fingerprint_payload(self):
+        return {
+            "patch_size": self._patch_size,
+            "merge_kernel_size": self._merge_kernel_size,
+            "in_patch_limit": self._in_patch_limit,
+            "patch_limit_on_one_side": self._patch_limit_on_one_side,
+            "fixed_output_tokens": self._fixed_output_tokens,
+            "image_mean": self._image_mean,
+            "image_std": self._image_std,
+            "hf_media_config": self.media_processor.media_proc_cfg,
+            "force_cpu": _FORCE_CPU_IMAGE_PREPROCESSING,
+            "cuda_available": torch.cuda.is_available(),
+        }
+
     def __call__(self, text=None, images=None, **kwargs):
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
@@ -527,7 +534,6 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     uses_wide_image_identity = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        validate_kimi_wide_pad_config(server_args)
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             # TODO: could we convert in MultimodalSpecialTokens?

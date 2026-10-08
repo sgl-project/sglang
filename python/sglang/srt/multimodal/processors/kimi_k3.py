@@ -32,9 +32,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
 )
-from sglang.srt.multimodal.kimi_k3_image_processing import (
-    to_chw_uint8,
-)
+from sglang.srt.multimodal.kimi_k3_image_processing import to_chw_uint8
 from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
@@ -47,15 +45,12 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
-from sglang.srt.multimodal.processors.kimi_cache_config import (
-    validate_kimi_wide_pad_config,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
+    KimiLoadedImage,
     kimi_image_identity,
+    unwrap_kimi_images,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -391,7 +386,6 @@ class KimiK3ImageProcessor(
     uses_wide_image_identity = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        validate_kimi_wide_pad_config(server_args)
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
             image_token_id=hf_config.media_placeholder_token_id,
@@ -415,6 +409,7 @@ class KimiK3ImageProcessor(
         """
         when raw_bytes <= processed_bytes, preprocess first would introduce larger payload, so deferring gpu preprocessing would benefit
         """
+        images = unwrap_kimi_images(images or [])
         if (
             not images
             or self.mm_feature_transport != "cpu"
@@ -461,13 +456,14 @@ class KimiK3ImageProcessor(
         return raw_bytes <= processed_bytes
 
     def _build_deferred_output(self, base_output):
+        images = unwrap_kimi_images(base_output.images)
         (
             input_ids,
             resize_configs,
             deferred_preprocessing,
         ) = self._processor.prepare_deferred(
             base_output.input_text,
-            base_output.images,
+            images,
             base_output.input_ids,
         )
         offsets = self.get_mm_items_offset(
@@ -477,9 +473,7 @@ class KimiK3ImageProcessor(
             raise ValueError("Expected one Kimi-K3 image span for each image")
 
         items = []
-        for image, resize_config, offset in zip(
-            base_output.images, resize_configs, offsets
-        ):
+        for image, resize_config, offset in zip(images, resize_configs, offsets):
             grid_thw = _grid_thw_from_resize_config(
                 resize_config, self._processor.preprocess_config.patch_size
             )
@@ -720,7 +714,14 @@ class KimiK3ImageProcessor(
 
     def kimi_content_config_digest(self, media) -> str:
         self._kimi_config_fingerprint()
-        return self._artifact_key(snapshot_media(media).content_digest, media)
+        digest = (
+            media.content_digest
+            if isinstance(media, KimiLoadedImage)
+            else snapshot_media(media).content_digest
+        )
+        return self._artifact_key(
+            digest, media.image if isinstance(media, KimiLoadedImage) else media
+        )
 
     async def process_mm_data_async(
         self,

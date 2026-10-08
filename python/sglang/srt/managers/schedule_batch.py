@@ -465,7 +465,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def padding_sequence(self, length: int) -> List[int]:
         values = self.padding_values()
-        return [values[i % len(values)] for i in range(length)]
+        repeats, remainder = divmod(length, len(values))
+        return list(values) * repeats + list(values[:remainder])
 
     @staticmethod
     def is_empty_list(l):

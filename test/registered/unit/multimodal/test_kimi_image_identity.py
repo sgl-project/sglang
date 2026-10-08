@@ -3,6 +3,7 @@
 import json
 import unittest
 from array import array
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,16 +12,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
-from sglang.srt.managers import scheduler as scheduler_module
-from sglang.srt.managers.io_struct import (
-    AttachHiCacheStorageReqInput,
-    GenerateReqInput,
-)
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-)
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
@@ -28,12 +22,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalInputs,
 )
-from sglang.srt.multimodal.processors.kimi_cache_config import (
-    uses_kimi_wide_image_pads,
-    validate_kimi_wide_pad_config,
-)
+from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
+    KimiLoadedImage,
     kimi_image_identity,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,17 +59,55 @@ def _image_item(grid, feature=None, fmt=MultimodalInputFormat.NORMAL):
     return item
 
 
-def _server_args(**overrides):
-    args = dict(
-        kv_events_config=None,
-        hicache_storage_backend=None,
-        disaggregation_mode="null",
-    )
-    args.update(overrides)
-    return SimpleNamespace(**args)
+class _LoadingProcessor(KimiGridMMDataMixin, BaseMultimodalProcessor):
+    uses_wide_image_identity = True
 
 
 class TestKimiImageIdentity(CustomTestCase):
+    def test_loader_hashes_the_same_snapshot_it_decodes(self):
+        encoded = BytesIO()
+        _image(0).save(encoded, format="JPEG")
+        payload = encoded.getvalue()
+        loaded = _LoadingProcessor._load_single_item(payload, Modality.IMAGE)
+        self.assertIsInstance(loaded, KimiLoadedImage)
+        self.assertEqual(loaded.content_digest, snapshot_media(payload).content_digest)
+        item = _image_item([1, 4, 4])
+        with patch(
+            "sglang.srt.multimodal.processors.kimi_common.snapshot_media",
+            side_effect=AssertionError("decoded images must not be copied for hashing"),
+        ):
+            _IdentityOnly({}).assign_kimi_image_identities([item], [loaded])
+        self.assertIsNotNone(item.identity)
+
+    def test_hf_grid_alias_has_the_same_identity(self):
+        processor = _IdentityOnly({})
+        canonical = _image_item([1, 4, 4])
+        alias = _image_item([1, 4, 4])
+        alias.model_specific_data["grid_thws"] = alias.model_specific_data.pop(
+            "image_grid_thw"
+        )
+        processor.assign_kimi_image_identities([canonical, alias], [_image(0)] * 2)
+        self.assertEqual(canonical.identity, alias.identity)
+
+    def test_epd_embeddings_receive_content_and_grid_identity(self):
+        processor = _IdentityOnly({})
+        processor.uses_wide_image_identity = True
+        processor.hf_config = SimpleNamespace(
+            vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+        )
+        identities = []
+        for grid, value in (([1, 4, 4], 1), ([1, 2, 8], 1), ([1, 4, 4], 2)):
+            output = processor._build_kimi_mm_data_from_grids(
+                [9],
+                {Modality.IMAGE: torch.full((4, 2), value)},
+                image_token_id=9,
+                img_grid_thw=[grid],
+            )
+            item = output.mm_items[0]
+            self.assertIsNotNone(item.identity)
+            identities.append(item.identity)
+        self.assertEqual(len(set(identities)), 3)
+
     def test_same_pixels_different_grid_gives_different_key(self):
         processor = _IdentityOnly({"in_patch_limit": 16384})
         image = _image(0)
@@ -212,76 +243,6 @@ class TestKimiCallerIdentityRejection(CustomTestCase):
         KimiGridMMDataMixin.reject_caller_image_identity(
             ["image", {"format": "processor_output"}], request
         )
-
-
-class TestKimiWidePadConfig(CustomTestCase):
-    def test_refuses_narrow_token_id_consumers(self):
-        cases = (
-            _server_args(kv_events_config="{}"),
-            _server_args(hicache_storage_backend="file"),
-            _server_args(disaggregation_mode="prefill"),
-            _server_args(disaggregation_mode="decode"),
-        )
-        for server_args in cases:
-            with self.subTest(server_args=server_args):
-                with self.assertRaises(ValueError):
-                    validate_kimi_wide_pad_config(server_args)
-        with self.assertRaises(ValueError):
-            validate_kimi_wide_pad_config(
-                _server_args(), hicache_storage_backend="file"
-            )
-
-    def test_allows_default_and_skip_hash(self):
-        validate_kimi_wide_pad_config(_server_args())
-        with envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(True):
-            validate_kimi_wide_pad_config(_server_args(kv_events_config="{}"))
-
-    def test_architecture_gate(self):
-        self.assertTrue(
-            uses_kimi_wide_image_pads(
-                ["KimiK3ForConditionalGeneration"], ModelImpl.SGLANG
-            )
-        )
-        self.assertTrue(
-            uses_kimi_wide_image_pads(
-                ["KimiK25ForConditionalGeneration"], ModelImpl.SGLANG
-            )
-        )
-        self.assertFalse(
-            uses_kimi_wide_image_pads(
-                ["KimiK3ForConditionalGeneration"], ModelImpl.TRANSFORMERS
-            )
-        )
-        self.assertFalse(uses_kimi_wide_image_pads(["LlamaForCausalLM"], "sglang"))
-        self.assertFalse(uses_kimi_wide_image_pads(None, ModelImpl.SGLANG))
-
-    def test_runtime_storage_attach_is_refused(self):
-        attached = []
-        fake = SimpleNamespace(
-            enable_hierarchical_cache=True,
-            is_fully_idle=lambda: True,
-            tree_cache=SimpleNamespace(
-                attach_storage_backend=lambda **kwargs: attached.append(kwargs)
-            ),
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    architectures=["KimiK3ForConditionalGeneration"]
-                )
-            ),
-            server_args=_server_args(),
-        )
-        request = AttachHiCacheStorageReqInput(hicache_storage_backend="file")
-        with patch.object(
-            scheduler_module,
-            "get_resolved_model_impl",
-            return_value=ModelImpl.SGLANG,
-        ):
-            result = scheduler_module.Scheduler.attach_hicache_storage_wrapped(
-                fake, request
-            )
-        self.assertFalse(result.success)
-        self.assertIn("int64", result.message)
-        self.assertEqual(attached, [])
 
 
 if __name__ == "__main__":

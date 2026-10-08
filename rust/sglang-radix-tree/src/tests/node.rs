@@ -880,13 +880,15 @@ fn empty_key_yields_no_pages() {
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
-fn oversized_token_id_is_rejected() {
-    get_hash_str::<Vec<i64>>(&[1 << 33], None, 2);
+fn wide_token_ids_keep_their_high_bits() {
+    assert_ne!(
+        get_hash_str::<Vec<i64>>(&[1 << 33], None, 2),
+        get_hash_str::<Vec<i64>>(&[0], None, 2)
+    );
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
+#[should_panic(expected = "token id must be a non-negative int64")]
 fn negative_token_id_is_rejected() {
     get_hash_str::<Vec<i64>>(&[-1], None, 2);
 }
