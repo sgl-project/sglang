@@ -48,10 +48,11 @@ dynamo-renderer = "5.1.2"
 minijinja = "2.24"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
+http = "1.5.0"
 itertools = "0.14"
-# POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
-libc = "0.2"
-# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm_result`) moves
+# POSIX shm (`shm_open` family) for the MM feature fan-out (`utils::shm`).
+rustix = { version = "1", features = ["fs", "mm", "shm"] }
+# Same major as the workspace pyo3: the zero-copy drain (`recv_requests`) moves
 # Rust vectors into numpy arrays.
 numpy = "0.29.0"
 # Pinned EXACTLY: this crate's accepted grammar defines the
@@ -64,6 +65,9 @@ rmpv = { version = "1", features = ["with-serde"] }
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.

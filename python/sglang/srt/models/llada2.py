@@ -31,16 +31,19 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -49,7 +52,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -71,14 +73,14 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
     is_non_idle_and_non_empty,
     is_npu,
-    make_layers,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -105,11 +107,11 @@ class LLaDA2MoeMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: Optional[bool] = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
@@ -117,8 +119,7 @@ class LLaDA2MoeMLP(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -127,8 +128,7 @@ class LLaDA2MoeMLP(nn.Module):
             reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
         if config.hidden_act != "silu":
@@ -140,7 +140,7 @@ class LLaDA2MoeMLP(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if (self.tp_size == 1) and hidden_states.shape[0] == 0:
+        if self.is_replicated and hidden_states.shape[0] == 0:
             return hidden_states
 
         gate_up, _ = self.gate_up_proj(hidden_states)
@@ -257,6 +257,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=self.layer_id,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
@@ -292,17 +293,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    else {}
-                ),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                else "tp",
             )
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().tp_size
-
             self.deepep_dispatcher = DeepEPDispatcher(
                 group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
@@ -381,7 +377,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
     def forward_deepep(
@@ -429,8 +424,6 @@ class LLaDA2MoeAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_kv_heads = config.num_key_value_heads
-        self.dp_size = get_parallel().attn_dp_size
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -463,8 +456,7 @@ class LLaDA2MoeAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=add_prefix("query_key_value", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         if self.use_qk_norm:
@@ -478,8 +470,7 @@ class LLaDA2MoeAttention(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("dense", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         if hasattr(config, "partial_rotary_factor"):
@@ -595,7 +586,6 @@ class LLaDA2MoeBlock(nn.Module):
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.dp_size = get_parallel().attn_dp_size
         self.attention = LLaDA2MoeAttention(
             config,
             layer_id,
@@ -605,20 +595,9 @@ class LLaDA2MoeBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
-        is_previous_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id - 1)
         is_next_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id + 1)
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
@@ -629,26 +608,27 @@ class LLaDA2MoeBlock(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = LLaDA2MoeMLP(
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
             )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def _is_layer_sparse(self, config: PretrainedConfig, layer_id: int) -> bool:
@@ -661,12 +641,9 @@ class LLaDA2MoeBlock(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states=hidden_states, forward_batch=forward_batch
         )
 
         hidden_states = self.attention(
@@ -675,27 +652,16 @@ class LLaDA2MoeBlock(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(hidden_states, forward_batch)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-        )
-
-        return hidden_states, residual
+        return hidden_states
 
 
 class LLaDA2MoeModel(nn.Module):
@@ -724,7 +690,7 @@ class LLaDA2MoeModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LLaDA2MoeBlock(
                 layer_id=idx,
@@ -733,8 +699,6 @@ class LLaDA2MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -755,34 +719,26 @@ class LLaDA2MoeModel(nn.Module):
                 hidden_states = self.word_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                )
+                hidden_states = layer(positions, hidden_states, forward_batch)
+
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
             return hidden_states
 
 

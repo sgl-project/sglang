@@ -17,11 +17,12 @@ use dynamo_renderer::{
 };
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value as JsonValue;
+use sglang_processor::{OneOrMany as ProcessorOneOrMany, dynamo_tool_parser_name};
 
-use crate::ChatResponseProcessor;
 use crate::{
-    ChatFormatter, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
-    RendererError, SamplingParams, TextRequest,
+    ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    RendererConfig, RendererError, SamplingParams, TextRequest,
 };
 
 use super::{GenerateRequestIdentity, TextRequestGroup};
@@ -75,9 +76,9 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
     where
         D: Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = JsonValue::deserialize(deserializer)?;
         match value {
-            serde_json::Value::String(value) => {
+            JsonValue::String(value) => {
                 let effort = match value.as_str() {
                     "none" => Some(Self::None),
                     "minimal" => Some(Self::Minimal),
@@ -96,13 +97,13 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
                 })?;
                 numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
             }
-            serde_json::Value::Number(value) => {
+            JsonValue::Number(value) => {
                 let numeric = value.as_f64().ok_or_else(|| {
                     serde::de::Error::custom("reasoning_effort must be a finite number")
                 })?;
                 numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
             }
-            serde_json::Value::Bool(_) => Err(serde::de::Error::custom(
+            JsonValue::Bool(_) => Err(serde::de::Error::custom(
                 "reasoning_effort must not be a boolean",
             )),
             _ => Err(serde::de::Error::custom(
@@ -136,7 +137,7 @@ pub struct ChatRequest {
     pub response_format: Option<ResponseFormat>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub continue_final_message: bool,
-    pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
+    pub chat_template_args: Option<HashMap<String, JsonValue>>,
     pub sampling_params: SamplingParams,
     pub choice_count: usize,
     pub stream: bool,
@@ -183,7 +184,7 @@ impl OAIChatLikeRequest for ChatRequest {
         !self.continue_final_message
     }
 
-    fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
+    fn chat_template_args(&self) -> Option<&HashMap<String, JsonValue>> {
         self.chat_template_args.as_ref()
     }
 }
@@ -206,7 +207,7 @@ pub struct ChatPreprocessor {
     formatter_error: Option<String>,
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
-    default_chat_template_kwargs: HashMap<String, serde_json::Value>,
+    default_chat_template_kwargs: HashMap<String, JsonValue>,
 }
 
 impl ChatPreprocessor {
@@ -359,7 +360,12 @@ impl ChatPreprocessor {
             )
         })?;
         let mut request = request.clone();
-        let final_message = prepare_continuation(&mut request);
+        // DeepSeek-V4 continues the final turn as SGLang's encoder path does,
+        // null and parts content included.
+        let final_message = match formatter {
+            ChatFormatter::DeepSeekV4(_) => None,
+            _ => prepare_continuation(&mut request),
+        };
         let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);
         template_args.insert(
             "add_generation_prompt".into(),
@@ -455,10 +461,10 @@ fn validate_chat(request: &ChatRequest) -> Result<(), RendererError> {
     Ok(())
 }
 
-fn contains_media(value: &serde_json::Value) -> bool {
+fn contains_media(value: &JsonValue) -> bool {
     match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
+        JsonValue::Array(values) => values.iter().any(contains_media),
+        JsonValue::Object(object) => {
             object.keys().any(|key| {
                 matches!(
                     key.as_str(),
@@ -475,8 +481,8 @@ fn merge_template_stops(sampling: &mut SamplingParams, formatter: Option<&ChatFo
         return;
     };
     let mut stops = match template_stops {
-        OneOrMany::One(stop) => vec![stop],
-        OneOrMany::Many(stops) => stops,
+        ProcessorOneOrMany::One(stop) => vec![stop],
+        ProcessorOneOrMany::Many(stops) => stops,
     };
     if let Some(request_stops) = sampling.stop.take() {
         match request_stops {
@@ -508,15 +514,6 @@ fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
             strict: tool.function.strict,
         })
         .collect()
-}
-
-pub(crate) fn dynamo_parser_name(parser: &str) -> &str {
-    match parser {
-        "llama3" => "llama3_json",
-        "qwen" => "qwen25",
-        "glm" | "glm45" => "glm47",
-        other => other,
-    }
 }
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
@@ -554,7 +551,7 @@ fn apply_tool_constraint(
     let Some(parser) = parser else {
         return Ok(());
     };
-    let parser = dynamo_parser_name(parser);
+    let parser = dynamo_tool_parser_name(parser);
     let config = get_tool_parser_map()
         .get(parser)
         .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
@@ -688,8 +685,7 @@ mod tests {
         chat_preprocessor_with(
             Some("llama3"),
             None,
-            crate::preprocessing::template::load_chat_formatter(None, None, Some("chatml"))
-                .unwrap(),
+            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap(),
         )
     }
 
@@ -754,7 +750,7 @@ mod tests {
         )
         .unwrap();
 
-        let schema: serde_json::Value =
+        let schema: JsonValue =
             serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
         assert_eq!(schema["minItems"], 1);
         assert_eq!(schema["maxItems"], 1);
@@ -813,9 +809,10 @@ mod tests {
 
     #[test]
     fn qwen_required_tools_forward_effective_template_thinking() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
-            "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
-        );
+        let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+            "chat_template": "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
+        }))
+        .unwrap();
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
 
         let enabled = preprocessor
@@ -827,7 +824,7 @@ mod tests {
         disabled_request.reasoning_effort = Some(ReasoningEffort::Max);
         disabled_request.chat_template_args = Some(HashMap::from([(
             "enable_thinking".into(),
-            serde_json::Value::Bool(false),
+            JsonValue::Bool(false),
         )]));
         let disabled = preprocessor.preprocess(disabled_request).unwrap();
         assert!(!disabled.text_requests[0].options.require_reasoning);
@@ -835,14 +832,13 @@ mod tests {
 
     #[test]
     fn thinking_policy_uses_the_effective_tool_template() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter_from_config(
-            serde_json::json!({
-                "chat_template": [
-                    {"default": "{{ enable_thinking | default(false) }}"},
-                    {"tool_use": "{{ enable_thinking | default(true) }}"}
-                ]
-            }),
-        );
+        let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+            "chat_template": [
+                {"default": "{{ enable_thinking | default(false) }}"},
+                {"tool_use": "{{ enable_thinking | default(true) }}"}
+            ]
+        }))
+        .unwrap();
         let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
 
         let mut no_tools = chat_request(None);
@@ -880,26 +876,53 @@ mod tests {
     }
 
     #[test]
-    fn always_on_channel_template_requires_reasoning() {
-        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
-            "<|start|>assistant<|channel|>analysis<|message|>",
-        );
-        let preprocessor = chat_preprocessor_with(None, Some("gpt-oss"), formatter);
-        let mut request = chat_request(None);
-        request.tools = None;
-        request.response_format = Some(
-            serde_json::from_value(serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "schema": {"type": "object"}
-                }
-            }))
-            .unwrap(),
-        );
-
-        let lowered = preprocessor.preprocess(request).unwrap();
-
-        assert!(lowered.text_requests[0].options.require_reasoning);
+    fn deepseek_v4_continues_the_final_turn_as_sglang_does() {
+        let formatter = ChatFormatter::DeepSeekV4(sglang_processor::DeepSeekV4Profile::Official);
+        let preprocessor = chat_preprocessor_with(None, None, formatter);
+        // SGLang flattens parts, blanks null, drops the continuation's leading BOS
+        // and tokenizes the continuation on its own.
+        let user = serde_json::json!({"role": "user", "content": "Hi"});
+        let after_user = "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>";
+        let parts =
+            serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+        for (first, content, prompt, continuation) in [
+            (&user, parts, after_user, "a b"),
+            (&user, JsonValue::Null, after_user, ""),
+            (
+                &user,
+                serde_json::json!("<｜begin▁of▁sentence｜>abc"),
+                after_user,
+                "abc",
+            ),
+            (
+                &serde_json::json!({"role": "system", "content": "a"}),
+                serde_json::json!("b"),
+                "<｜begin▁of▁sentence｜>a",
+                "b",
+            ),
+        ] {
+            let mut request = chat_request(None);
+            request.tools = None;
+            request.continue_final_message = true;
+            // Pinned so SGLANG_DEFAULT_THINKING and SGLANG_DSV4_REASONING_EFFORT don't apply.
+            request.chat_template_args = serde_json::from_value(
+                serde_json::json!({"thinking": false, "reasoning_effort": "low"}),
+            )
+            .unwrap();
+            request.messages = serde_json::from_value(serde_json::json!([
+                first,
+                {"role": "assistant", "content": content}
+            ]))
+            .unwrap();
+            let rendered = preprocessor.lower_to_text(request).unwrap().prompt;
+            assert_eq!(rendered.as_str(), format!("{prompt}{continuation}"));
+            let segments = rendered
+                .segments()
+                .map(|segments| segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>());
+            assert_eq!(
+                segments,
+                (!continuation.is_empty()).then(|| vec![prompt, continuation])
+            );
+        }
     }
 }
