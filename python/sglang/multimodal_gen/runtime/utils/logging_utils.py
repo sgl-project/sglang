@@ -587,17 +587,6 @@ def get_log_level() -> int:
     return root.level
 
 
-def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
-    original_levels = {}
-
-    for logger_name in loggers_to_suppress:
-        logger = logging.getLogger(logger_name)
-        original_levels[logger_name] = logger.level
-        logger.setLevel(level)
-
-    return original_levels
-
-
 def globally_suppress_loggers():
     # globally suppress some obsessive loggers
     target_names = [

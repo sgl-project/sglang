@@ -79,13 +79,6 @@ PLACEMENT_STATUS_ROLLED_BACK = "rolled_back"
 PLACEMENT_STATUS_ROLLBACK_FAILED = "rollback_failed"
 
 
-def describe_error(error: BaseException) -> str:
-    """Never-empty error text (str(AssertionError()) is "" and would be
-    dropped by any truthiness filter)."""
-    text = str(error)
-    return f"{type(error).__name__}: {text}" if text else type(error).__name__
-
-
 class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     """Per-rank memory measurement of one server warmup forward."""
 
