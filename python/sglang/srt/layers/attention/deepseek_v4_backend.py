@@ -1552,6 +1552,12 @@ class DeepseekV4AttnBackend(
             tail_len=SWA_WINDOW,
             device=device,
         )
+        if self.encoder_row_floor is not None:
+            # Folded hits: a tail row never reads below its request's replay start.
+            swa_replay_start = torch.maximum(
+                swa_replay_start,
+                self.encoder_row_floor[token_indices].to(swa_replay_start.dtype),
+            )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
@@ -3999,7 +4005,7 @@ class DeepseekV4AttnBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
-            elif self.encoder_row_floor is not None:
+            elif swa_replay_start is None and self.encoder_row_floor is not None:
                 # Folded replay: hits floor every row at their replay start.
                 assert self.encoder_row_floor.shape[0] == raw_positions.shape[0]
                 swa_replay_start = self.encoder_row_floor
