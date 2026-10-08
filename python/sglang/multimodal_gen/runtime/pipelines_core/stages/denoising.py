@@ -56,7 +56,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows_kernel_fusions,
+    quality_allows,
     resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.task_type import get_request_task_type
@@ -177,70 +177,95 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 logger = init_logger(__name__)
 
+# Request-gated DiT fusions and the lowest quality level that may mount each
+# one. A fusion belongs to "lossless" when it keeps the reference math and the
+# precision of every operand and accumulator, changing only where or in which
+# order the rounding happens; one that lowers a precision or quantizes belongs
+# to "high". No entry is tier "exact": the default must keep running the same
+# kernels it runs today, so a by-construction bit-exact fast path has to come
+# with a BitExactFusionGate before it can move there.
 _QUALITY_FUSION_HANDLERS: tuple[
-    tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
+    tuple[str, str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
     (
+        # quantizes FC2's input before the reference BF16 intermediate exists
+        "high",
         "FLUX.2 NVFP4 FC1+SwiGLU+quant",
         mount_flux2_nvfp4_swiglu_quant,
         unmount_flux2_nvfp4_swiglu_quant,
     ),
     (
+        "lossless",
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,
         unmount_fused_linear_gelu,
     ),
     (
+        "lossless",
         "Wan NVFP4 fused bias+GELU",
         mount_nvfp4_bias_gelu,
         unmount_nvfp4_bias_gelu,
     ),
     (
+        "lossless",
         "Qwen-Image fused added-QKV",
         mount_qwen_image_added_qkv,
         unmount_qwen_image_added_qkv,
     ),
     (
+        "lossless",
         "fused LN+modulate (affine folding)",
         mount_fused_ln_modulate,
         unmount_fused_ln_modulate,
     ),
     (
+        "lossless",
         "LTX-2 Hopper QKNorm+split-RoPE",
         mount_ltx2_qknorm_split_rope,
         unmount_ltx2_qknorm_split_rope,
     ),
     (
+        "lossless",
         "LTX-2 fused RMSNorm+modulate",
         mount_ltx2_rms_norm_modulate,
         unmount_ltx2_rms_norm_modulate,
     ),
     (
+        # Ideogram's reference keeps the norm statistics in fp32; the
+        # BF16-native kernel rounds them, which lowers accumulation precision
+        "high",
         "fused gate RMSNorm (BF16-native Triton)",
         mount_fused_gate_rmsnorm,
         unmount_fused_gate_rmsnorm,
     ),
     (
+        "lossless",
         "HunyuanVideo strided QK RMSNorm",
         mount_hunyuan_qknorm,
         unmount_hunyuan_qknorm,
     ),
     (
+        "lossless",
         "LingBot Video fused RMSNorm",
         mount_lingbot_video_rmsnorm,
         unmount_lingbot_video_rmsnorm,
     ),
     (
+        "lossless",
         "LingBot Video per-token gated residual",
         mount_lingbot_video_gated_residual,
         unmount_lingbot_video_gated_residual,
     ),
     (
+        "lossless",
         "Helios per-token gated residual",
         mount_helios_gated_residual,
         unmount_helios_gated_residual,
     ),
     (
+        # the first attention GEMM takes BF16 inputs where the reference
+        # promotes them to FP32
+        "high",
         "SANA-Video BF16-input linear attention",
         mount_sana_video_linear_attention,
         unmount_sana_video_linear_attention,
@@ -359,11 +384,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides: dict[str, Any] = {}
         # Overrides key the mounted hooks were built from; None when unmounted.
         self._cache_dit_active_key: tuple | None = None
-        # Whether request-scoped extra-high-or-higher fusions are mounted.
-        self._quality_fusions_mounted = False
+        # The quality level whose request-scoped fusions are mounted.
+        self._mounted_quality = "exact"
         self._torch_compile_registry = CompiledModuleRegistry()
-        # Breakable CUDA graph runners, one per transformer module (lazy).
-        self._bcg_runners: dict[int, Any] = {}
+        # Breakable CUDA graph runners, lazily created per (module, quality
+        # level); see _maybe_get_bcg_runner for why the level is in the key.
+        self._bcg_runners: dict[tuple[int, str], Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -611,8 +637,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
+        self._reset_dit_cache_states(batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
+
+    def _reset_dit_cache_states(self, batch: Req) -> None:
+        """Start every DiT's TeaCache and Spectrum state fresh for this request.
+
+        The DiTs reset themselves at denoising step 0, which a boundary expert
+        (Wan2.2 ``transformer_2``) never sees, so its state would otherwise carry
+        over from the previous request.
+        """
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
+                transformer.reset_teacache_state()
+            if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
+                transformer.reset_spectrum_state(batch.spectrum_params)
 
     def _maybe_override_attention_backend(
         self, batch: Req, *, force_fa_for_self_attention: bool = False
@@ -763,40 +803,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
         """Mount/unmount request-gated kernel fusions for this batch.
 
-        These fusions are numerically equivalent only at half-precision
-        rounding level (not bit-exact), so they are mounted for both
-        ``quality="extra-high"`` and ``quality="high"``. The ``"lossless"``
-        default runs the reference path bit-for-bit. ``quality`` participates
-        in the dynamic-batch signature, making this transition safe at the
-        batch boundary. Mounting is all-or-nothing per transformer and fusion
+        Each fusion declares the lowest quality level that may mount it (see
+        ``_QUALITY_FUSION_HANDLERS``), so a request mounts the fusions of its
+        own tier and of every stricter one; ``"exact"`` mounts none of them
+        and runs the reference path bit-for-bit. ``quality`` participates in
+        the dynamic-batch signature, making this transition safe at the batch
+        boundary. Mounting is all-or-nothing per transformer and fusion
         family; models without marked sites are no-ops.
+
+        Under breakable CUDA graphs the mounted set is baked into whatever was
+        captured, which is why the runner is keyed by level as well as module
+        (see :meth:`_maybe_get_bcg_runner`): changing level here cannot
+        silently replay another level's kernels.
         """
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        want = quality_allows_kernel_fusions(quality)
-        if want == self._quality_fusions_mounted:
+        if quality == self._mounted_quality:
             return
         mounted_fusions: set[str] = set()
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            for description, mount, unmount in _QUALITY_FUSION_HANDLERS:
-                if want:
+            for tier, description, mount, unmount in _QUALITY_FUSION_HANDLERS:
+                if quality_allows(quality, tier):
                     if mount(transformer):
                         mounted_fusions.add(description)
                 else:
                     unmount(transformer)
 
-        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
-            for transformer in filter(None, [self.transformer, self.transformer_2]):
-                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
-                    unmount(transformer)
-            descriptions = ", ".join(sorted(mounted_fusions))
-            raise ValueError(
-                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
-                f"this model because its request-scoped DiT fusions "
-                f"({descriptions}) do not match the lossless warmup graphs. "
-                "Disable breakable CUDA graphs or use quality='lossless'."
-            )
-
-        self._quality_fusions_mounted = want
+        self._mounted_quality = quality
         for description in sorted(mounted_fusions):
             logger.debug("Mounted %s for quality=%s", description, quality)
 
@@ -1035,8 +1067,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
+        has_separate_cfg = (
+            requested
+            and batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
         desired_key = (
-            cache_dit_overrides_key(self._cache_dit_request_overrides)
+            (
+                cache_dit_overrides_key(self._cache_dit_request_overrides),
+                has_separate_cfg,
+            )
             if requested
             else None
         )
@@ -1063,11 +1103,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     steps_computation_policy=scm_policy,
                 )
             else:
-                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
                     primary_num_steps,
-                    scm_preset=scm_preset,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_policy=scm_policy,
                 )
             return
 
@@ -1156,7 +1196,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
-                has_separate_cfg=batch.do_classifier_free_guidance,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -2581,19 +2621,38 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return None
         if not isinstance(current_model, nn.Module):
             return None
-        key = id(current_model)
+        # A captured graph bakes in whichever fusions were mounted when it was
+        # recorded, and the capture signature only covers the tensors -- so a
+        # runner is per (module, quality level). Warmup runs at the default
+        # level and captures its graphs there; a request at another level
+        # finds an empty runner and the eager fallback runs the fusion set it
+        # actually asked for. Sharing one runner would replay the warmup
+        # level's kernels under a different level's name.
+        key = (id(current_model), self._mounted_quality)
         runner = self._bcg_runners.get(key)
         if runner is None:
             from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
                 DiffusionBreakableCudaGraphRunner,
             )
 
+            # Another level already has a runner, so this one arrived after
+            # warmup and will never hold a captured graph.
+            served_another_level = any(
+                model_id == id(current_model) for model_id, _ in self._bcg_runners
+            )
             # DenoisingStage can switch between transformer and transformer_2;
             # each module owns separate graph state and static input buffers.
             runner = DiffusionBreakableCudaGraphRunner(
                 current_model, get_local_torch_device()
             )
             self._bcg_runners[key] = runner
+            if served_another_level:
+                logger.info_once(
+                    "quality=%s has no captured breakable CUDA graphs (warmup "
+                    "captures the server's default level), so its requests run "
+                    "eager.",
+                    self._mounted_quality,
+                )
         return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
