@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import requests
@@ -71,10 +72,82 @@ class TestNpuReturnOutputIds(CustomTestCase):
 
         # The returned output ids must decode back to the generated content.
         generated_text = data["choices"][0]["message"]["content"]
-        decoded = self.tokenizer.decode(output_ids[0])
-        self.assertTrue(decoded)
-        self.assertIn(generated_text.strip(), decoded.strip())
+        decoded = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        self.assertEqual(decoded.strip(), generated_text.strip())
+
+    def test_chat_completion_stream_returns_output_ids_in_sglext(self):
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "The capital of France is"}],
+                "temperature": 0,
+                "max_tokens": 16,
+                "stream": True,
+            },
+            stream=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        output_ids = None
+        generated_text = ""
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8")
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if payload == "[DONE]":
+                continue
+            chunk = json.loads(payload)
+            sglext = chunk.get("sglext")
+            if sglext and sglext.get("output_ids") is not None:
+                output_ids = sglext["output_ids"]
+            for choice in chunk.get("choices", []):
+                content = choice.get("delta", {}).get("content")
+                if content:
+                    generated_text += content
+
+        self.assertIsNotNone(
+            output_ids, "streaming response missing sglext.output_ids"
+        )
+        self.assertIsInstance(output_ids, list)
+        self.assertEqual(len(output_ids), 1)  # n == 1
+        self.assertIsInstance(output_ids[0], list)
+        self.assertGreater(len(output_ids[0]), 0)
+        self.assertTrue(all(isinstance(i, int) for i in output_ids[0]))
+        decoded = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        self.assertEqual(decoded.strip(), generated_text.strip())
+
+    def test_chat_completion_returns_output_ids_n_greater_than_one(self):
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "The capital of France is"}],
+                "temperature": 0.8,
+                "max_tokens": 16,
+                "n": 2,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+
+        self.assertIn("sglext", data, "sglext extension missing in response")
+        output_ids = data["sglext"]["output_ids"]
+        self.assertIsInstance(output_ids, list)
+        self.assertEqual(len(output_ids), 2)  # n == 2
+        self.assertEqual(len(data["choices"]), 2)
+
+        for ids, choice in zip(output_ids, data["choices"]):
+            self.assertIsInstance(ids, list)
+            self.assertGreater(len(ids), 0)
+            self.assertTrue(all(isinstance(i, int) for i in ids))
+            decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+            self.assertEqual(decoded.strip(), choice["message"]["content"].strip())
 
 
 if __name__ == "__main__":
     unittest.main()
+    
