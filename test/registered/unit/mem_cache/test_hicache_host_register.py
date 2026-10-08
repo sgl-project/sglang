@@ -201,6 +201,117 @@ class TestHiCacheHostRegister(unittest.TestCase):
             )
         allocate.assert_not_called()
 
+    def test_layer_first_kv_registration_keeps_coalesced_layers_intact(self):
+        mib = 1024**2
+        for pool_cls in (
+            MLATokenToKVPoolHost,
+            MHATokenToKVPoolHost,
+            MHATokenToKOnlyPoolHost,
+        ):
+            with self.subTest(pool=pool_cls.__name__):
+                pool = pool_cls.__new__(pool_cls)
+                pool.layout = "layer_first"
+                pool.size = 150 * mib
+                pool.layer_num = 5
+                pool.kv_cache_dim = pool.head_dim = pool.head_num = 1
+                pool.dtype = torch.float16
+                pool.token_stride_size = 2
+                pool.device_pool = SimpleNamespace(device="cpu")
+                pool.device = "cpu"
+                pool.pin_memory = True
+                pool.allocator = object()
+                cudart = _FakeCudart()
+                base = 0x10000000
+                buffers = []
+
+                def allocate(dims, *, registration_granularity_bytes, **kwargs):
+                    # No large allocation: exercise the real registration helper.
+                    elements = 1
+                    for dim in dims:
+                        elements *= dim
+                    buffer = _FakeBuffer(base, elements * pool.dtype.itemsize)
+                    _cuda_host_register(buffer, registration_granularity_bytes)
+                    buffers.append(buffer)
+                    return buffer
+
+                with (
+                    envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.override(1),
+                    mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+                    mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": allocate}),
+                ):
+                    pool.init_kv_buffer()
+                    _cuda_host_unregister(buffers[0])
+
+                layer_bytes = 300 * mib
+                expected_total = layer_bytes * pool.layer_num
+                if pool_cls is MHATokenToKVPoolHost:
+                    expected_total *= 2  # Both K and V are in the allocation.
+                self.assertEqual(
+                    sum(size for _, size, _ in cudart.registrations), expected_total
+                )
+                self.assertGreater(len(cudart.registrations), 1)
+                for ptr, size, _ in cudart.registrations:
+                    self.assertEqual((ptr - base) % layer_bytes, 0)
+                    self.assertEqual(size % layer_bytes, 0)
+                    self.assertLessEqual(size, 1024**3)
+                self.assertEqual(
+                    cudart.unregistrations,
+                    [ptr for ptr, _, _ in reversed(cudart.registrations)],
+                )
+
+    def test_dsa_layer_first_registration_uses_whole_indexer_layer(self):
+        host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host.device_pool = SimpleNamespace(
+            device="cpu", index_k_with_scale_buffer=[torch.empty(1)] * 2
+        )
+        host.mtp_draft_device_pools = ()
+        host._live_target_layers = [0, 1]
+        host.layer_num = 2
+        host.layout = "layer_first"
+        host.indexer_page_num = 3
+        host.indexer_page_stride_size = 8
+        host.indexer_dtype = torch.uint8
+        host.device = "cpu"
+        host.pin_memory = False
+        host.allocator = object()
+        alloc = mock.Mock(return_value=torch.empty(2, 3, 8, dtype=torch.uint8))
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}):
+            host.init_kv_buffer()
+        self.assertEqual(alloc.call_args.kwargs["registration_granularity_bytes"], 24)
+
+    def test_cuda_error_type_is_preserved_for_diagnostics_and_rollback(self):
+        class ErrorCode:
+            def __init__(self, value):
+                self.value = value
+
+            def __int__(self):
+                return self.value
+
+        class TypedCudart(_FakeCudart):
+            def cudaHostRegister(self, *args):
+                return ErrorCode(super().cudaHostRegister(*args))
+
+            def cudaHostUnregister(self, ptr):
+                super().cudaHostUnregister(ptr)
+                return ErrorCode(2)
+
+            def cudaGetErrorString(self, rc):
+                if not isinstance(rc, ErrorCode):
+                    raise TypeError("cudaGetErrorString requires cudaError_t")
+                return "typed CUDA error"
+
+        cudart = TypedCudart(fail_on_registration=2)
+        buffer = _FakeBuffer(0x10000000, 2 * 1024**3)
+        with (
+            envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.override(1),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rc=1, typed CUDA error"):
+                _cuda_host_register(buffer, 1024**3)
+            # Failed rollback retains the range so teardown can retry it.
+            _cuda_host_unregister(buffer)
+        self.assertEqual(cudart.unregistrations, [buffer.data_ptr()] * 2)
+
     def test_dsa_page_layouts_with_draft_use_page_registration_granularity(self):
         target_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
         draft_buffer = torch.empty(1, dtype=torch.uint8)
