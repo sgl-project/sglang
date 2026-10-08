@@ -2357,9 +2357,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
-    # Forward-pass metrics
-    fpm_start_time: float = 0.0
-
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
@@ -3829,7 +3826,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
             dp_balance_stats=self.dp_balance_stats,
             prefill_stats=self.prefill_stats,
-            fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
