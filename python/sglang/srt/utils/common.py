@@ -2045,6 +2045,30 @@ def is_jpeg_with_cuda(
     return False
 
 
+_JPEG_DECODE_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=None)
+def _jpeg_decode_stream(device_index: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device_index)
+
+
+def _decode_jpeg_cuda(image_bytes: bytes) -> torch.Tensor:
+    from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
+    caller = torch.cuda.current_stream()
+    decode_stream = _jpeg_decode_stream(caller.device.index)
+    encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+    # Workaround for pytorch/vision#9699: nvJPEG writes the output on its own stream,
+    # so allocate it on a separate, idle stream; drop once torchvision orders the write.
+    with _JPEG_DECODE_LOCK, torch.cuda.stream(decode_stream):
+        decode_stream.synchronize()
+        image_tensor = decode_jpeg(encoded_image, device="cuda")
+    caller.wait_stream(decode_stream)
+    image_tensor.record_stream(caller)
+    return image_tensor
+
+
 @lru_cache(maxsize=16)
 def _warn_fancy_jpeg_fallback(error: str) -> None:
     logger.warning(
@@ -2074,11 +2098,7 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
-
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
-            return image_tensor
+            return _decode_jpeg_cuda(image_bytes)
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")

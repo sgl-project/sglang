@@ -13,6 +13,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_cuda,
 )
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -22,7 +23,7 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -181,6 +182,36 @@ class TestLoadImage(CustomTestCase):
                         image_bytes=image_bytes,
                         gpu_image_decode=False,
                     )
+
+    @unittest.skipUnless(is_cuda(), "requires the CUDA nvJPEG path")
+    def test_gpu_decode_keeps_queued_reads_of_freed_memory(self):
+        """GPU JPEG decode must not overwrite a freed block whose read is still queued."""
+        from torchvision.io import encode_jpeg
+
+        size = 2048
+        white = torch.full((3, size, size), 255, dtype=torch.uint8)
+        jpeg = bytes(encode_jpeg(white, quality=95).numpy())
+        warmup = _load_image(image_bytes=jpeg, gpu_image_decode=True)
+        self.assertIsInstance(warmup, torch.Tensor)
+        del warmup
+        torch.cuda.synchronize()
+
+        # Same byte size as the decoded uint8 image, so the freed block fits its output.
+        observed = torch.empty(3 * size * size // 4, device="cuda")
+        source = torch.full_like(observed, 0.25)
+        torch.cuda._sleep(500_000_000)
+        observed.copy_(source)
+        copy_done = torch.cuda.Event()
+        copy_done.record()
+        del source
+
+        decoded = _load_image(image_bytes=jpeg, gpu_image_decode=True)
+        self.assertFalse(copy_done.query(), "the copy must still be queued")
+        torch.cuda.synchronize()
+
+        self.assertIsInstance(decoded, torch.Tensor)
+        self.assertEqual(int((observed != 0.25).sum()), 0)
+        self.assertTrue(bool((decoded == 255).all()))
 
 
 class _FakePynvml:
