@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Run only inside an existing GPU allocation; this script never requests one.
+# Uses the visible GPUs; this script never requests or allocates GPUs.
 set -euo pipefail
 
 usage() {
@@ -116,7 +116,7 @@ if [[ "$dry_run" == true ]]; then
 else
     visible_gpus=$("$NATIVE_PYTHON" -c 'import torch; print(torch.cuda.device_count())')
     if ((visible_gpus < 1)); then
-        printf 'No visible GPUs; run inside an existing allocation or use --dry-run\n' >&2
+        printf 'No visible GPUs; run on a GPU host or use --dry-run\n' >&2
         exit 2
     fi
     gpu_limit=$visible_gpus

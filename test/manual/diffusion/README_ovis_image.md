@@ -1,9 +1,8 @@
 # Ovis-Image manual validation
 
 These commands compare native SGLang against an independent, pinned Diffusers
-oracle. Run GPU commands only in a GPU allocation that already exists. For this
-development task, the main session owns the `overflow` allocation and queues
-every GPU case serially. The scripts do not call `sbatch`, `srun`, or request GPUs.
+oracle. The scripts use the GPUs visible to the process and run every GPU case
+serially; they do not request or allocate GPUs themselves.
 
 The default profile is **1024 × 1024, 50 steps, CFG 5, seed 42**, with an empty
 negative prompt, text length 256, BF16, and a CPU random generator. `--quick`
@@ -194,8 +193,7 @@ baseline. `vae-spatial` also compares against a preceding `vae-tiled` case.
 # Command construction only: does not import Torch, use a GPU, or create results.
 bash test/manual/diffusion/run_ovis_image_matrix.sh --dry-run --quick --max-gpus 4
 
-# Queue this command through the main session's existing overflow allocation.
-# No new allocation is requested by this script.
+# Runs every selected case serially on the visible GPUs.
 bash test/manual/diffusion/run_ovis_image_matrix.sh --quick --max-gpus 4
 
 # Complete default-profile single-card oracle; omit --quick for 1024/50.
@@ -247,24 +245,3 @@ communication and repeated row-projection computation for the original
 conditioning tolerances. FP32 split-K accumulation alone did not meet those
 tolerances on the full 28-layer encoder. Report actual latency and peak memory
 rather than assuming that TP accelerates the text encoder.
-
-## Record actual results
-
-Populate this table only from completed runs. Keep failures and unavailable
-cases visible. The matrix's `pass` status means that execution/comparison
-completed; acceptance still requires inspecting numerical errors and images.
-Do not treat approximate-cache on/off outputs as an exact-equality oracle, and
-do not infer a quality or performance baseline from a four-step smoke image.
-
-| Validation | Profile / hardware / native SHA | Evidence | Actual result |
-| --- | --- | --- | --- |
-| Component numerical oracles | To fill | Log and tolerances | Pending |
-| Full default-profile native vs pinned reference | To fill | Conditioning/prediction/trajectory/image errors, PSNR/SSIM, images | Pending |
-| Offload matrix | To fill | Resolved residency, tensors, peak memory | Pending |
-| TP2 / Ulysses2 / Ring2 / CFG2 | To fill | Actual encoder groups, conditioning errors and per-case comparison | Pending |
-| TP2 × SP2 | To fill | Four-GPU tiny and full-model logs | Pending |
-| Tiled / spatial VAE | To fill | Decode mode, outputs, memory, reference comparison | Pending |
-| Repeated HTTP requests | To fill | Server lifecycle log and same-seed comparisons | Pending |
-
-No GPU results, throughput baseline, or measured quality threshold are claimed
-by this document. The main session fills actual evidence after queued runs.
