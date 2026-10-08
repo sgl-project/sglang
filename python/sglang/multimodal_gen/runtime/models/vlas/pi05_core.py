@@ -90,6 +90,14 @@ def layernorm_forward(
     return layernorm(x)
 
 
+def linear_compute_dtype(module: nn.Module) -> torch.dtype:
+    return (
+        torch.bfloat16
+        if module.weight.dtype == torch.float8_e4m3fn
+        else module.weight.dtype
+    )
+
+
 def linear_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     output = module(x)
     return output[0] if isinstance(output, tuple) else output
@@ -1305,7 +1313,7 @@ class Pi05CoreModel(nn.Module):
             scaling=self._time_embedding_scaling,
         )
         action_emb = self.action_in_proj(
-            noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+            noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj))
         )
         time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
         time_emb = self.time_mlp_in(time_emb)
@@ -1499,5 +1507,5 @@ class Pi05CoreModel(nn.Module):
             )
         suffix_out = outputs_embeds[1][:, -x_t.shape[1] :]
         return self.action_out_proj(
-            suffix_out.to(dtype=self.action_out_proj.weight.dtype)
+            suffix_out.to(dtype=linear_compute_dtype(self.action_out_proj))
         ).to(dtype=torch.float32)

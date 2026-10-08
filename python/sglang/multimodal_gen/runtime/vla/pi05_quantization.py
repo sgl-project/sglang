@@ -8,17 +8,62 @@ import re
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+
 _COMPONENT_PREFIXES = {
     "paligemma": "paligemma_with_expert.paligemma.model.language_model.layers.",
     "action_expert": "paligemma_with_expert.gemma_expert.model.layers.",
+    "vision": "paligemma_with_expert.paligemma.model.vision_tower.",
+    "projector": "paligemma_with_expert.paligemma.model.multi_modal_projector.",
+    "action_heads": "action_",
 }
 _PROJECTION = re.compile(
     r"\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:gate_up_proj|down_proj))$"
 )
 
+_VISION_PROJECTION = re.compile(
+    r"(?:vision_model\.)?encoder\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|proj)|mlp\.fc[12])$"
+)
+DEFAULT_COMPONENTS = list(_COMPONENT_PREFIXES)
+
+
+def _selected(name: str, component: str) -> bool:
+    prefix = _COMPONENT_PREFIXES[component]
+    if not name.startswith(prefix):
+        return False
+    suffix = name[len(prefix) :]
+    if component == "vision":
+        return bool(_VISION_PROJECTION.fullmatch(suffix))
+    if component == "projector":
+        return suffix == "linear"
+    if component == "action_heads":
+        return suffix in ("in_proj", "out_proj")
+    return bool(_PROJECTION.fullmatch(suffix))
+
+
+def _tuple_output(module, inputs, output):
+    # Shared SigLIP linears return (output, bias), unlike nn.Linear.
+    return output, None
+
+
+class Pi05Fp8Linear(ReplicatedLinear):
+    """Preserve each caller's tensor/tuple interface and high-precision output."""
+
+    def __init__(self, *args, tensor_output: bool, output_dtype: torch.dtype, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tensor_output = tensor_output
+        self.output_dtype = output_dtype
+        self.in_features = self.input_size
+        self.out_features = self.output_size
+
+    def forward(self, x):
+        output, bias = super().forward(x.to(torch.bfloat16))
+        output = output.to(self.output_dtype)
+        return output if self.tensor_output else (output, bias)
+
 
 def projection_names(model: nn.Module, components: list[str]) -> list[str]:
-    """Select only transformer projections, including already fused QKV/gate-up."""
+    """Select executed Linears; exclude Conv2d, time MLP and AdaRMS dense."""
     if not components or len(set(components)) != len(components):
         raise ValueError("FP8 components must be nonempty and unique")
     if set(components) - _COMPONENT_PREFIXES.keys():
@@ -26,11 +71,7 @@ def projection_names(model: nn.Module, components: list[str]) -> list[str]:
     return [
         name
         for name, _ in model.named_modules()
-        if any(
-            name.startswith(_COMPONENT_PREFIXES[component])
-            and _PROJECTION.fullmatch(name[len(_COMPONENT_PREFIXES[component]) :])
-            for component in components
-        )
+        if any(_selected(name, component) for component in components)
     ]
 
 
@@ -62,7 +103,6 @@ def replace_projections(
     original fused forward already splits the result into Q/K/V or gate/up.
     Call after the core's BF16/FP32 precision policy, before loading weights.
     """
-    from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
     from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
         ModelOptFp8Config,
     )
@@ -75,13 +115,15 @@ def replace_projections(
         module = model.get_submodule(name)
         output_size, input_size = module.weight.shape
         if quantized:
-            replacement = ReplicatedLinear(
+            replacement = Pi05Fp8Linear(
                 input_size,
                 output_size,
                 bias=module.bias is not None,
                 params_dtype=torch.bfloat16,
                 quant_config=ModelOptFp8Config(),
                 prefix=name,
+                tensor_output=isinstance(module, nn.Linear),
+                output_dtype=module.weight.dtype,
             ).to(device=module.weight.device)
         else:
             replacement = nn.Linear(
@@ -95,6 +137,8 @@ def replace_projections(
                 replacement.weight.copy_(module.weight)
                 if module.bias is not None:
                     replacement.bias.copy_(module.bias)
+            if not isinstance(module, nn.Linear):
+                replacement.register_forward_hook(_tuple_output)
         parent_name, _, child_name = name.rpartition(".")
         setattr(model.get_submodule(parent_name), child_name, replacement)
     return names

@@ -24,7 +24,10 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from sglang.multimodal_gen.runtime.vla.pi05_quantization import replace_projections
+from sglang.multimodal_gen.runtime.vla.pi05_quantization import (
+    DEFAULT_COMPONENTS,
+    replace_projections,
+)
 
 
 def load_observations(path: str, config, device: torch.device) -> list[dict]:
@@ -211,8 +214,8 @@ def main() -> None:
     parser.add_argument(
         "--components",
         nargs="+",
-        choices=["paligemma", "action_expert"],
-        default=["paligemma", "action_expert"],
+        choices=DEFAULT_COMPONENTS,
+        default=DEFAULT_COMPONENTS,
     )
     parser.add_argument("--num-steps", type=int)
     parser.add_argument("--seed", type=int, default=0)

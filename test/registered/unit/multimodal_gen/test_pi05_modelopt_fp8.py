@@ -10,11 +10,13 @@ import torch
 from torch import nn
 from transformers import GemmaConfig
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     PiGemmaMLP,
     linear_forward,
 )
 from sglang.multimodal_gen.runtime.vla.pi05_quantization import (
+    DEFAULT_COMPONENTS,
     finalize_fp8_weights,
     projection_names,
     replace_projections,
@@ -78,6 +80,56 @@ class TestPi05ModelOptFp8(CustomTestCase):
         self.assertEqual(model.action_out_proj.weight.dtype, torch.float32)
         with self.assertRaisesRegex(ValueError, "Invalid per-tensor"):
             finalize_fp8_weights(model, names)
+
+    def test_extended_coverage_preserves_bias_interfaces_and_exclusions(self):
+        # A missed component would silently export an incomplete FP8 checkpoint;
+        # tuple-returning vision projections must still feed their existing callers.
+        model = tiny_model()
+        paligemma = model.paligemma_with_expert
+        paligemma.paligemma = nn.Module()
+        paligemma.paligemma.model = nn.Module()
+        prefix = paligemma.paligemma.model
+        prefix.language_model = nn.Module()
+        prefix.language_model.layers = nn.ModuleList([])
+        prefix.vision_tower = nn.Module()
+        prefix.vision_tower.encoder = nn.Module()
+        vision_layer = nn.Module()
+        vision_layer.mlp = nn.Module()
+        vision_layer.mlp.fc1 = layer = ReplicatedLinear(
+            32, 64, bias=True, params_dtype=torch.bfloat16
+        )
+        prefix.vision_tower.encoder.layers = nn.ModuleList([vision_layer])
+        prefix.vision_tower.patch_embedding = nn.Conv2d(3, 32, 2)
+        prefix.multi_modal_projector = nn.Module()
+        prefix.multi_modal_projector.linear = nn.Linear(64, 32).bfloat16()
+        model.action_in_proj = nn.Linear(32, 32).float()
+        model.time_mlp_in = nn.Linear(32, 32).float()
+        expert_layer = paligemma.gemma_expert.model.layers[0]
+        expert_layer.input_layernorm.dense = nn.Linear(32, 96).float()
+        components = [c for c in DEFAULT_COMPONENTS if c != "paligemma"]
+        x = torch.randn(1, 3, 32, dtype=torch.bfloat16)
+        with torch.no_grad():
+            layer.weight.uniform_(-0.1, 0.1)
+            layer.bias.uniform_(-0.1, 0.1)
+        before, _ = layer(x)
+        bias = layer.bias.detach().clone()
+        names = replace_projections(model, components, quantized=False)
+        after, unused_bias = vision_layer.mlp.fc1(x)
+        torch.testing.assert_close(after, before, atol=0, rtol=0)
+        self.assertIsNone(unused_bias)
+        torch.testing.assert_close(vision_layer.mlp.fc1.bias, bias)
+        self.assertEqual(len(names), 6)
+        replace_projections(model, components, quantized=True)
+        self.assertEqual(model.action_in_proj.out_features, 32)
+        self.assertEqual(model.action_out_proj.output_dtype, torch.float32)
+        self.assertEqual(
+            prefix.multi_modal_projector.linear.weight.dtype, torch.float8_e4m3fn
+        )
+        self.assertEqual(model.time_mlp_in.weight.dtype, torch.float32)
+        self.assertEqual(expert_layer.input_layernorm.dense.weight.dtype, torch.float32)
+        self.assertEqual(
+            prefix.vision_tower.patch_embedding.weight.dtype, torch.float32
+        )
 
     def test_export_uses_modelopt_amax_and_preserves_unquantized_weights(self):
         model = tiny_model()

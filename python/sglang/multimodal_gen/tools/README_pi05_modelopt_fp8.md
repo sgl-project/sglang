@@ -4,13 +4,24 @@ The tool calibrates the native Pi0.5 fused projections with NVIDIA ModelOpt and
 exports a checkpoint consumed by SGLang's native FP8 Linear backend. It does not
 export ONNX or require TensorRT.
 
-Supported targets are PaliGemma and action-expert QKV, output, gate/up and down
-projections. Each fused projection has one E4M3 weight scale and one static input
-scale. SigLIP, multimodal projector, embeddings, norms/AdaRMS, action heads and
-time heads retain the checkpoint's BF16/FP32 precision policy. Attention and KV
-cache precision remain unchanged. The first version requires a single SM89+
-NVIDIA CUDA GPU and resident BF16 inference; TP/SP and component offload are
-rejected. CUDA graphs remain available after FP8 weight loading is complete.
+The default Linear coverage matches the tutorial's pure-FP8 path with its default
+performance options: PaliGemma and action-expert QKV, output, gate/up and down
+projections, SigLIP encoder QKV/output and MLP fc1/fc2, the multimodal projector,
+and action input/output heads. Each fused projection has one E4M3 weight scale
+and one static input scale. Conv2d, embeddings, norms/AdaRMS dense and time MLP
+remain unquantized, matching the tutorial's exclusions. There is no executed
+language-model output head in this policy.
+
+FP8 GEMMs compute with BF16 activations and biases. Action heads retain FP32
+outputs for the denoising integration, but their weights and inputs are now FP8;
+this does not retain their former FP32 GEMM precision. Tensor/tuple interfaces
+and feature dimensions are preserved for native SigLIP and action callers.
+Attention and KV cache precision remain unchanged. This covers the tutorial's
+Linear quantization, not its optional attention MatMul or NVFP4 quantization.
+The first version requires a single SM89+ NVIDIA CUDA GPU and resident BF16
+inference; TP/SP and component offload are rejected. CUDA graphs remain available
+after FP8 weight loading is complete. Previously exported two-component
+checkpoints remain supported without enabling additional components.
 
 ## Explicit synthetic calibration
 
@@ -25,7 +36,6 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.tools.quantize_pi05_model
   --model-path /path/to/pi05_bf16 \
   --dummy-calibration \
   --seed 123 \
-  --components paligemma action_expert \
   --output-dir /path/to/pi05_fp8_dummy
 ```
 
@@ -78,11 +88,12 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.tools.quantize_pi05_model
   --model-path /path/to/pi05_bf16 \
   --calibration-data calibration.pt \
   --validation-data validation.pt \
-  --components paligemma action_expert \
   --output-dir /path/to/pi05_fp8
 ```
 
-Use `--components paligemma` or `--components action_expert` to isolate sensitivity.
+The default components are `paligemma action_expert vision projector action_heads`.
+Use `--components paligemma action_expert` to reproduce the earlier restricted
+coverage, or select any subset to isolate sensitivity.
 The output directory must not exist. The default denoising step count comes from
 the checkpoint; `--num-steps` overrides it and is recorded in the exported config.
 

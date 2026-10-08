@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from torch import nn
-from transformers import GemmaConfig
+from transformers import GemmaConfig, SiglipVisionConfig
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -29,6 +29,9 @@ from sglang.multimodal_gen.tools.quantize_pi05_modelopt_fp8 import (
     export_state,
     make_quantization_config,
 )
+from sglang.srt.models.siglip import SiglipEncoderLayer
+from sglang.srt.runtime_context import publish, restore_context, snapshot_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,6 +56,30 @@ def tiny_core():
     with global_force_attn_backend_context_manager(AttentionBackendEnum.TORCH_SDPA):
         layer = PiGemmaDecoderLayer(config, 0).to(torch.bfloat16)
     expert.model.layers = nn.ModuleList([layer])
+    core.paligemma_with_expert.paligemma = nn.Module()
+    prefix = core.paligemma_with_expert.paligemma
+    prefix.model = nn.Module()
+    prefix.model.vision_tower = nn.Module()
+    prefix.model.vision_tower.encoder = nn.Module()
+    vision_config = SiglipVisionConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+    )
+    prefix.model.vision_tower.encoder.layers = nn.ModuleList(
+        [
+            SiglipEncoderLayer(
+                vision_config,
+                qkv_backend="sdpa",
+                flatten_batch=False,
+                use_data_parallel=True,
+            ).to(torch.bfloat16)
+        ]
+    )
+    prefix.model.multi_modal_projector = nn.Module()
+    prefix.model.multi_modal_projector.linear = nn.Linear(64, 64).bfloat16()
+    core.action_in_proj = nn.Linear(64, 64).float()
+    core.action_out_proj = nn.Linear(64, 32).float()
     with torch.no_grad():
         for parameter in core.parameters():
             parameter.uniform_(-0.1, 0.1)
@@ -60,12 +87,22 @@ def tiny_core():
 
 
 class TestPi05ModelOptFp8CUDA(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.saved_context = snapshot_context()
+        publish(ServerArgs(model_path="dummy", tp_size=1), role="diffusion_gpu_worker")
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_context(cls.saved_context)
+
     def test_calibrated_checkpoint_loader_and_mutable_graph_input(self):
         import modelopt.torch.quantization as mtq
 
         torch.manual_seed(123)
         core = tiny_core()
-        names = replace_projections(core, ["action_expert"], quantized=False)
+        components = ["action_expert", "vision", "projector", "action_heads"]
+        names = replace_projections(core, components, quantized=False)
         x = torch.randn(1, 10, 64, device="cuda", dtype=torch.bfloat16)
         cos = torch.ones(1, 10, 16, device="cuda", dtype=torch.bfloat16)
         sin = torch.zeros_like(cos)
@@ -73,9 +110,14 @@ class TestPi05ModelOptFp8CUDA(CustomTestCase):
         def run(model):
             layer = model.paligemma_with_expert.gemma_expert.model.layers[0]
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                return layer(x, position_embeddings=(cos, sin))
+                prefix = model.paligemma_with_expert.paligemma.model
+                hidden = model.action_in_proj(x.float()).bfloat16()
+                hidden = prefix.vision_tower.encoder.layers[0](hidden, None, None)
+                hidden = prefix.multi_modal_projector.linear(hidden)
+                hidden = layer(hidden, position_embeddings=(cos, sin))
+                return model.action_out_proj(hidden.float())
 
-        self.assertEqual(len(names), 4)
+        self.assertEqual(len(names), 11)
         baseline = run(core)
         config = make_quantization_config(names)
         with torch.no_grad():
@@ -97,7 +139,7 @@ class TestPi05ModelOptFp8CUDA(CustomTestCase):
             policy.manifest = Pi05CheckpointManifest(directory, [str(path)])
             policy._fp8_projection_names = replace_projections(
                 policy.core_model,
-                ["action_expert"],
+                components,
                 quantized=True,
             )
             policy._to_empty_preserve_buffers(
@@ -118,15 +160,24 @@ class TestPi05ModelOptFp8CUDA(CustomTestCase):
                     atol=0,
                     rtol=0,
                 )
+                if loaded.bias is not None:
+                    torch.testing.assert_close(
+                        loaded.bias.cpu(),
+                        exported[f"{name}.bias"].bfloat16(),
+                        atol=0,
+                        rtol=0,
+                    )
             finalize_fp8_weights(policy.core_model, names)
         actual = run(policy.core_model)
-        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertEqual(actual.dtype, torch.float32)
         self.assertTrue(actual.isfinite().all())
         # Fake quant dequantizes to BF16 before GEMM; native FP8 GEMM
-        # avoids that intermediate rounding. Check the accumulated error,
+        # avoids that intermediate rounding. FP32 action-head fake GEMMs also
+        # differ from native BF16 compute. Check the accumulated error,
         # and independently verify the loaded weight/scale contract exactly.
-        torch.testing.assert_close(actual, fake, atol=0.01, rtol=0.05)
-        torch.testing.assert_close(actual, baseline, atol=0.02, rtol=0.15)
+        torch.testing.assert_close(actual, fake, atol=0.02, rtol=0.05)
+        self.assertLess((actual - baseline).abs().mean().item(), 0.01)
+        torch.testing.assert_close(actual, baseline, atol=0.03, rtol=0.15)
         for _ in range(3):
             run(policy.core_model)
         graph = torch.cuda.CUDAGraph()
