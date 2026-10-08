@@ -1,4 +1,4 @@
-export const Qwen35Deployment = () => {
+export const Qwen35Deployment = ({ DynamoCommands, dynamoRecipes }) => {
   // Qwen3.5 Configuration Generator
   //
   // MoE models (Gated Delta Networks + sparse MoE, hybrid architecture):
@@ -38,6 +38,14 @@ export const Qwen35Deployment = () => {
   };
 
   const options = {
+    deployment: {
+      name: 'deployment',
+      title: 'Deployment',
+      items: [
+        { id: 'aggregated', label: 'Aggregated', default: true },
+        { id: 'dynamo', label: 'Dynamo PD (GB200 NVFP4-V2)', default: false }
+      ]
+    },
     model: {
       name: 'model',
       title: 'Model Variant',
@@ -62,7 +70,7 @@ export const Qwen35Deployment = () => {
           { id: 'h200',   label: 'H200',   default: false,     disabled: isNvfp4 },
           { id: 'b200',   label: 'B200',   default: false,     disabled: false },
           { id: 'b300',   label: 'B300',   default: isNvfp4,   disabled: false },
-          { id: 'gb200',  label: 'GB200',  default: false,     disabled: isNvfp4 },
+          { id: 'gb200',  label: 'GB200',  default: false,     disabled: isNvfp4 && values.deployment !== 'dynamo' },
           { id: 'gb300',  label: 'GB300',  default: false,     disabled: isNvfp4 },
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
@@ -318,6 +326,14 @@ export const Qwen35Deployment = () => {
       }
 
       const next = { ...prev, [optionName]: value };
+      if (optionName === 'deployment' && value === 'dynamo') {
+        next.model = '397b';
+        next.hardware = 'gb200';
+        next.quantization = 'fp4';
+      }
+      if (optionName === 'deployment' && value === 'aggregated' && prev.deployment === 'dynamo') {
+        next.quantization = 'fp8';
+      }
       if (optionName === 'hardware' && value === 'arc_b' && !['35b', '9b', '4b'].includes(next.model)) {
         next.model = '35b';
       }
@@ -653,6 +669,7 @@ export const Qwen35Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (values.deployment === 'dynamo' && !['deployment', 'model', 'hardware', 'quantization'].includes(key)) return null;
         if (typeof option.condition === 'function' && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
@@ -665,12 +682,13 @@ export const Qwen35Deployment = () => {
                   values.hardware === 'arc_b' &&
                   option.name === 'model' &&
                   !['35b', '9b', '4b'].includes(item.id);
-                const isDisabled = !!item.disabled || isArcBModelLocked;
+                const isDynamoLocked = values.deployment === 'dynamo' && key !== 'deployment';
+                const isDisabled = !!item.disabled || isArcBModelLocked || isDynamoLocked;
                 return (
                   <label
                     key={item.id}
-                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
-                    title={item.disabledReason || ''}
+                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}), ...(isDynamoLocked && isChecked ? { opacity: 0.85 } : {}) }}
+                    title={isDynamoLocked ? 'This recipe uses Qwen3.5-397B NVFP4-V2 on GB200' : item.disabledReason || ''}
                   >
                     <input
                       type="radio"
@@ -690,10 +708,12 @@ export const Qwen35Deployment = () => {
           </div>
         );
       })}
-      <div style={cardStyle}>
+      {values.deployment === 'dynamo' ? (
+        <DynamoCommands recipes={dynamoRecipes} isDark={isDark} />
+      ) : <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
-      </div>
+      </div>}
     </div>
   );
 };
