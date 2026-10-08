@@ -49,7 +49,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/zai-org/glm-5.2.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <Warning>
   All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.2.
@@ -66,6 +66,19 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
+
+<AgentX data={agentx} />
 
 ## 1. Model Introduction
 
@@ -273,104 +286,3 @@ When deploying with PD Disaggregation, the prefill node can choose to enable [La
 --cp-strategy interleave \
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
-
-### 3.6 Agentic Long-Context with HiCache DRAM Offload (NVFP4, MTP)
-
-**B300 (TP8):**
-```bash Command
-python3 -m sglang.launch_server \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 8 \
-  --ep-size 1 \
-  --quantization modelopt_fp4 \
-  --kv-cache-dtype fp8_e4m3 \
-  --bf16-gemm-backend cutedsl \
-  --max-prefill-tokens 8192 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.85 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --enable-hierarchical-cache \
-  --hicache-size 270 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct \
-  --hicache-mem-layout page_first_direct
-```
-
-**B200 (TP8):** same command, with `--mem-fraction-static 0.83` and `--hicache-size 169`. Lower concurrency (c1/c4/c8) uses `--hicache-ratio 0.75` instead.
-
-**GB300 (TP4, single node):** one 4-GPU GB300 node serves the whole model. All three commands offload KV cache to host DRAM with `--hicache-size 135` (GB of host memory per rank, 540 GB per node). GLM-5.2 is a DSA model, so on Blackwell SGLang already defaults to an FP8 E4M3 KV cache and TRT-LLM DSA attention; the commands do not need to set them.
-
-Low-latency (TP4, MTP 5-1-6, up to 16 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --quantization modelopt_fp4 \
-  --fp4-gemm-backend flashinfer_trtllm \
-  --max-running-requests 16 \
-  --cuda-graph-max-bs-decode 16 \
-  --chunked-prefill-size 8192 \
-  --max-prefill-tokens 8192 \
-  --mem-fraction-static 0.8 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 5 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 6 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
-
-Balanced (DP attention, MTP 2-1-3, up to 256 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --attn-dp-size 4 \
-  --quantization modelopt_fp4 \
-  --max-running-requests 256 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.92 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 2 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 3 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
-
-High-throughput (DP attention, no MTP, up to 512 concurrent requests):
-```bash Command
-sglang serve \
-  --model-path nvidia/GLM-5.2-NVFP4 \
-  --trust-remote-code \
-  --tp 4 \
-  --attn-dp-size 4 \
-  --quantization modelopt_fp4 \
-  --max-running-requests 512 \
-  --chunked-prefill-size 8192 \
-  --mem-fraction-static 0.92 \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45 \
-  --enable-hierarchical-cache \
-  --hicache-size 135 \
-  --hicache-write-policy write_back \
-  --hicache-io-backend direct
-```
-
-With `--attn-dp-size 4`, `--chunked-prefill-size` is a global budget divided across the attention DP ranks, so the balanced and high-throughput commands prefill 2048 tokens per rank per chunk.

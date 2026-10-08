@@ -38,13 +38,17 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
 
-# Pixel frames per encode segment after the first (which has one more: the causal first frame).
+# pixel frames per segment after the extra causal first frame
 _SEGMENT_FRAMES = 16
-# Inputs above this many elements are convolved in temporal chunks: at 4x SR decode tiles
-# (~1536x832) the full-resolution 256-channel convs of the last decoder level see ~5.6e9
-# elements per segment, beyond 32-bit indexing, and chunking also keeps the transient conv
-# workspace to a fraction of the activation.
+# temporal chunks bound workspace and avoid int32 indexing overflow at 4x decode
 _MAX_CONV_NUMEL = 2 * 10**9
+
+
+def _segment_sizes(frames: int, stride: int) -> list[int]:
+    """The first causal segment has one extra frame; the final segment may be short."""
+    return [min(frames, stride + 1)] + [
+        min(stride, frames - start) for start in range(stride + 1, frames, stride)
+    ]
 
 
 class _SegmentCache:
@@ -56,17 +60,12 @@ class _SegmentCache:
 
 
 def _silu(x: torch.Tensor) -> torch.Tensor:
-    # The output norms use this form and the resblocks use F.silu; the two are not bitwise
-    # equal in bf16, so this distinction (inherited from the Diffusers / FastVideo ports) is
-    # deliberate, not a simplification opportunity.
+    # output norms require this form; F.silu in resblocks rounds differently in bf16
     return x * torch.sigmoid(x)
 
 
 class _K6RMSNorm(WanRMS_norm):
-    """``WanRMS_norm`` with an explicit float32 upcast around the normalize, matching the
-    Diffusers reference's ``Kandinsky6SRRMSNorm`` (which upcasts unconditionally, not only for
-    fp16/bf16/fp8 inputs): at bf16/fp16 activations, normalizing without upcasting measurably
-    drifts from the reference over many resnet blocks."""
+    """Wan RMS norm with the reference's unconditional fp32 reduction."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         normed = F.normalize(x.float(), dim=1).to(x.dtype)
@@ -89,10 +88,7 @@ class _ChunkedConv3d(nn.Conv3d):
                 f"padding {self.padding}"
             )
         if self.stride[0] != 1:
-            # A strided conv can't reuse the stride-1 path's "prefix each chunk with the
-            # previous chunk's tail" trick below (a strided conv's output doesn't align with
-            # input chunk boundaries), so slide one kernel-width window at a time instead, only
-            # raising if even a single window would overflow.
+            # strided outputs may cross chunk boundaries: use one kernel window per output
             stride = self.stride[0]
             window_numel = x.shape[0] * x.shape[1] * k * x.shape[3] * x.shape[4]
             if window_numel >= _MAX_CONV_NUMEL:
@@ -100,8 +96,6 @@ class _ChunkedConv3d(nn.Conv3d):
                     f"frames are too big for Conv3d even one stride-{stride} window at a time "
                     f"({window_numel} elements per window)"
                 )
-            # Bare super() doesn't resolve inside a list comprehension's own implicit scope,
-            # hence the loop.
             window_outputs = []
             for i in range(0, frames - k + 1, stride):
                 window_outputs.append(super().forward(x[:, :, i : i + k]))
@@ -229,21 +223,14 @@ class _ResnetBlock3D(nn.Module):
         if in_channels != out_channels:
             self.nin_shortcut = _ChunkedConv3d(in_channels, out_channels, kernel_size=1)
 
-    def _norm(
-        self,
-        norm: nn.Module,
-        h: torch.Tensor,
-        zq: torch.Tensor | None,
-        cache: _SegmentCache,
-    ) -> torch.Tensor:
-        return norm(h) if zq is None else norm(h, zq, cache)
-
     def forward(
         self, x: torch.Tensor, cache: _SegmentCache, zq: torch.Tensor | None = None
     ) -> torch.Tensor:
-        h = F.silu(self._norm(self.norm1, x, zq, cache), inplace=True)
+        h = self.norm1(x) if zq is None else self.norm1(x, zq, cache)
+        h = F.silu(h, inplace=True)
         h = self.conv1(h, cache)
-        h = F.silu(self._norm(self.norm2, h, zq, cache), inplace=True)
+        h = self.norm2(h) if zq is None else self.norm2(h, zq, cache)
+        h = F.silu(h, inplace=True)
         h = self.conv2(h, cache)
         if hasattr(self, "nin_shortcut"):
             x = self.nin_shortcut(x)
@@ -375,8 +362,6 @@ class _PXSUpsample(nn.Module):
                 x = x[:, :, 1:]
             x = self.temporal_conv(x, cache) + x
         frames, height, width = x.shape[-3:]
-        # Chunked along channels: see _chunked_interpolate_nearest's docstring for the overflow
-        # this guards against (the old vendored code did not chunk this specific call).
         x = _chunked_interpolate_nearest(x, (frames, height * 2, width * 2))
         x.add_(self.spatial_conv(x))
         return self.linear(x)
@@ -402,7 +387,6 @@ class _Encoder3D(nn.Module):
         temporal_compress_start_level: int,
     ) -> None:
         super().__init__()
-        self.num_res_blocks = num_res_blocks
         time_levels = range(
             temporal_compress_start_level,
             temporal_compress_start_level + int(math.log2(temporal_compress_times)),
@@ -494,10 +478,7 @@ class _Decoder3D(nn.Module):
         return self.conv_out(_silu(self.norm_out(h, z, cache)), cache)
 
 
-# The structural knobs every Encoder3D / Decoder3D constructor kwarg comes from; everything
-# else in a checkpoint's encoder_config / decoder_config (``checkpoint_list``, ``resolution``,
-# the placeholder ``"None"`` channel field, ...) is ignored, the same way the old vendored
-# module silently dropped unknown keys via its own ``**ignore_kwargs`` / unused params.
+# constructor fields; resolution and training-only metadata do not affect the architecture
 _ARCH_KEYS = (
     "ch",
     "ch_mult",
@@ -508,12 +489,7 @@ _ARCH_KEYS = (
 
 
 def _arch_kwargs(conf: dict[str, Any], extra: str, which: str) -> dict[str, Any]:
-    # norm_type is the one legacy knob this port still checks: unlike padding_mode /
-    # downsample_version / fix_pxs / double_z (which the new Encoder3D / Decoder3D no longer
-    # branch on at all -- they always run the "zeros" / v2-pixel-unshuffle / fixed-stride /
-    # double-z behavior those knobs used to select), a group_norm checkpoint would silently
-    # get rms_norm layers instead of a clear error, which is the one mismatch worth failing
-    # loudly on here.
+    # never silently substitute RMSNorm for an unsupported group-norm checkpoint
     norm_type = conf.get("norm_type", "rms_norm")
     if norm_type != "rms_norm":
         raise ValueError(
@@ -596,12 +572,7 @@ class Kandinsky6SRVAE(nn.Module, LayerwiseOffloadableModuleMixin):
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
         """``[B, C, T, H, W]`` normalized pixels -> ``(raw latent mean, pixel-frame segment sizes)``."""
-        split_list = [_SEGMENT_FRAMES + 1]
-        remaining = x.size(2) - split_list[0]
-        while remaining > 0:
-            split_list.append(_SEGMENT_FRAMES)
-            remaining -= _SEGMENT_FRAMES
-        split_list[-1] += remaining
+        split_list = _segment_sizes(x.size(2), _SEGMENT_FRAMES)
         cache = _SegmentCache()
         latents = []
         for segment in torch.split(x, split_list, dim=2):
@@ -634,15 +605,9 @@ class Kandinsky6SRVAE(nn.Module, LayerwiseOffloadableModuleMixin):
         return DecoderOutput(sample=self._decode(z))
 
     def _decode(self, z: torch.Tensor) -> torch.Tensor:
-        segment = _SEGMENT_FRAMES // self.temporal_compression
-        num_frames = z.size(2)
-        if num_frames == 1:
-            split_list = [1]
-        else:
-            split_list = [segment] * ((num_frames - 1) // segment)
-            if (num_frames - 1) % segment:
-                split_list.append((num_frames - 1) % segment)
-            split_list[0] += 1
+        split_list = _segment_sizes(
+            z.size(2), _SEGMENT_FRAMES // self.temporal_compression
+        )
         cache = _SegmentCache()
         samples = []
         for chunk in torch.split(z, split_list, dim=2):

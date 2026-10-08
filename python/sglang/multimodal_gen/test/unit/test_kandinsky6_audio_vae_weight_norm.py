@@ -15,6 +15,7 @@ reference).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.kandinsky6_audio import (
@@ -78,12 +79,16 @@ def test_audio_vae_weights_are_not_renormalized_after_checkpoint_load():
     vae = Kandinsky6AudioVAE(config)
     assert vae.vae._weights_normalized is True
 
-    # `load_state_dict(vae.state_dict())` mirrors VAELoader's real call
-    # (`vae.load_state_dict(loaded, strict=strict_load)`) with the module's
-    # own current weights standing in for "a checkpoint's own weights" --
-    # exactly what happens when a real checkpoint's stored tensors are
-    # loaded: no code path scales or otherwise disturbs them afterward.
-    vae.load_state_dict(vae.state_dict())
+    checkpoint = dict(vae.state_dict())
+    checkpoint["vae.data_mean"] = torch.full((1, 80, 1), -2.5)
+    checkpoint["vae.data_std"] = torch.full((1, 80, 1), 1.25)
+    vae.load_state_dict(checkpoint, strict=True)
+    torch.testing.assert_close(vae.vae.data_mean, checkpoint["vae.data_mean"])
+    torch.testing.assert_close(vae.vae.data_std, checkpoint["vae.data_std"])
+    for key in ("vae.data_mean", "vae.data_std"):
+        incomplete = {name: value for name, value in checkpoint.items() if name != key}
+        with pytest.raises(RuntimeError, match=key):
+            vae.load_state_dict(incomplete, strict=True)
 
     latents = torch.randn(1, vae.vae.embed_dim, 4)
     mel_a = vae.decode(latents.clone())
