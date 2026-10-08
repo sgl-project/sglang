@@ -1,4 +1,4 @@
-"""Cache compatible FlashInfer 0.7.0 MXFP8 host dispatch.
+"""Cache compatible FlashInfer 0.7.0+ MXFP8 host dispatch.
 
 Keep FlashInfer's output allocation, autotuner and kernel invocation intact.
 Only reuse the stateless CuTe runner and validation of identical metadata.
@@ -6,6 +6,8 @@ Only reuse the stateless CuTe runner and validation of identical metadata.
 
 from functools import lru_cache
 from inspect import Parameter, signature
+
+from packaging.version import InvalidVersion, Version
 
 try:
     from flashinfer import __version__ as flashinfer_version
@@ -19,7 +21,12 @@ _cached_runner_factories = set()
 
 def maybe_cache_mxfp8_dispatch(raw_mm):
     """Keep unsupported FlashInfer versions and APIs on the original path."""
-    if flashinfer_version.split("+", 1)[0] != "0.7.0" or gemm_base is None:
+    if gemm_base is None:
+        return raw_mm
+    try:
+        if Version(flashinfer_version) < Version("0.7.0"):
+            return raw_mm
+    except InvalidVersion:
         return raw_mm
     try:
         if not callable(gemm_base._cute_dsl_gemm_mxfp8_runner):

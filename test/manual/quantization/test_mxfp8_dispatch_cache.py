@@ -88,7 +88,17 @@ class DispatchCacheTest(unittest.TestCase):
         self.assertEqual(self.checks, [False, False])
 
     def test_supported_flashinfer_api_enables_cache(self):
-        for version in ("0.7.0", "0.7.0+cu130"):
+        for version in (
+            "0.7.0",
+            "0.7.0+cu130",
+            "0.7.0.post1",
+            "0.7.0.post1+cu130",
+            "0.7.1",
+            "0.7.01",
+            "0.8.0",
+            "0.10.0",
+            "1.0.0",
+        ):
             with (
                 self.subTest(version=version),
                 patch.multiple(
@@ -120,7 +130,7 @@ class DispatchCacheTest(unittest.TestCase):
         self.assertEqual(self.checks, [False, True])
 
     def test_unsupported_version_does_not_modify_runner(self):
-        for version in ("0.6.18", "0.7.1", "0.7.0rc1", "0.7.01", "0.7.0.post1"):
+        for version in ("0.6.18", "0.7.0rc1", "0.7.0.dev1", "", "unknown"):
             with self.subTest(version=version):
                 factory = lambda: None
                 module = SimpleNamespace(_cute_dsl_gemm_mxfp8_runner=factory)
