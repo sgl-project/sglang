@@ -4160,6 +4160,7 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            # late_dp_counts is only not None on hip
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = _enter_late_layer_dp(forward_batch, late_dp_counts)
                 # Gathered over the full extend; no late layer is hash-routed.
@@ -4219,6 +4220,7 @@ class DeepseekV4Model(nn.Module):
                     seam_open=tail is None,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        # saved_dp is only not None on hip
         if saved_dp is not None:
             _exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
