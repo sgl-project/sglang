@@ -4,16 +4,7 @@ import enum
 import functools
 import logging
 from dataclasses import dataclass, field
-from typing import (
-    TYPE_CHECKING,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeVar, Union
 
 import msgspec
 import torch
@@ -52,11 +43,8 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
-    topk_prefill_candidates,
-)
+from sglang.kernels.ops.attention.dsv4.prefill_candidates import topk_prefill_candidates
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_torch,
     topk_transform_ragged_v2,
     topk_transform_sparse,
 )
@@ -83,11 +71,11 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
-    _rope_fq4,
-    token_req_indices,
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4, token_req_indices
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    topk_transform_paged_from_metadata,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -114,18 +102,12 @@ from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     get_index_k_cache,
     quantize_index_q,
 )
-from sglang.srt.layers.attention.verify_mask import (
-    VerifyMask,
-    maybe_create_verify_mask,
-)
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
 )
-from sglang.srt.layers.cp.utils import (
-    cp_materialize_global_token_order,
-    is_cp_active,
-)
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order, is_cp_active
 from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     set_local_dp_buffer_len,
@@ -133,12 +115,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_platform,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -304,7 +281,7 @@ def _prefill_graph_dense_k_offsets(
     req_ids: torch.Tensor,
 ) -> torch.Tensor:
     req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
-    return req_ord * width
+    return (req_ord * width).to(torch.int32)
 
 
 @dataclass
@@ -1659,7 +1636,7 @@ class DeepseekV4AttnBackend(
             compressed_page_size=index_page_size,
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
-            use_topk_v2=False,
+            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
@@ -3395,12 +3372,7 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        dense = (
-            self.forward_metadata.prefill_graph_dense_indexer
-            and projected_q.shape[0]
-            >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
-            * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
-        )
+        dense = self.forward_metadata.prefill_graph_dense_indexer
         two_level = (
             width > indexer.candidate_topk_blocks * indexer.candidate_block_size
             and (indexer.is_candidate_source or indexer.uses_candidates)
@@ -3462,7 +3434,8 @@ class DeepseekV4AttnBackend(
             )
 
         block_masks = []
-        for chunk, plan in [(slice(0, rows), None)] if dense else metadata.row_chunks():
+        chunks = [(slice(0, rows), None)] if dense else metadata.row_chunks()
+        for chunk_idx, (chunk, plan) in enumerate(chunks):
             chunk_lens = lens[chunk]
             if sparse_consumer:
                 scores = sparse_logits(
@@ -3567,13 +3540,17 @@ class DeepseekV4AttnBackend(
                     selected >= 0, selected - ks[chunk, None], selected
                 )
             else:
-                topk_transform_paged_torch(
+                topk_transform_paged_from_metadata(
                     scores,
-                    chunk_lens,
-                    page_table[chunk],
-                    out_page[chunk, :topk],
-                    page_size,
-                    out_raw[chunk, :topk],
+                    metadata,
+                    out_page[:, :topk],
+                    out_raw[:, :topk],
+                    rows=chunk,
+                    topk_metadata=(
+                        metadata.topk_plan_for_chunk(chunk_idx, chunk)
+                        if metadata.use_topk_v2
+                        else None
+                    ),
                 )
                 continue
 

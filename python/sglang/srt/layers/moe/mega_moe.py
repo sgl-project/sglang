@@ -97,14 +97,14 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
-    scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    # MegaMoE schedules two 128-column CTAs per cluster. L1 has 2 *
+    # intermediate columns (gate + up), while L2 has hidden columns.
+    # Scale rows are not TMA-aligned in the current DeepGEMM layout; applying
+    # the old 16-byte scale-row restriction rejects valid DSV4.1 shapes.
+    if hidden % 256 != 0 or intermediate % 128 != 0:
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            "moe_intermediate_size to be multiples of 256 and 128 respectively; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -520,9 +520,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         build_flydsl_mega_moe_weights(experts)
         return
 
-    from deep_gemm import (
-        transform_sf_into_required_layout,
-    )
+    from deep_gemm import transform_sf_into_required_layout
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
