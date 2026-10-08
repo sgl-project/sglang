@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
@@ -1339,6 +1340,8 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("nonexistent", str(ctx.exception))
 
     def test_custom_tool_constraints_are_forwarded(self):
+        """Tool strict and disable_parallel_tool_use must reach the Chat request for
+        every tool choice rather than be dropped."""
         for choice in ("auto", "any", "tool", "none"):
             for enabled in (False, True):
                 with self.subTest(choice=choice, enabled=enabled):
@@ -1361,6 +1364,59 @@ class TestAnthropicServing(unittest.TestCase):
                     )
                     self.assertEqual(converted.tools[0].function.strict, enabled)
                     self.assertEqual(converted.parallel_tool_calls, not enabled)
+
+    def test_rejected_requests_are_client_errors(self):
+        """A request the shared Chat pipeline rejects with ValueError, such as an
+        unsupported tool control, must get 400 on every Messages route, as on Chat;
+        other failures stay 500."""
+
+        class _RejectingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self, error):
+                super().__init__()
+                self.tokenizer_manager.model_config = SimpleNamespace(
+                    is_multimodal=False
+                )
+                self.error = error
+
+            def _validate_request(self, chat_request):
+                return None
+
+            def _convert_to_internal_request(self, chat_request, raw_request):
+                raise self.error
+
+            def _process_messages(self, chat_request, is_multimodal):
+                raise self.error
+
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        count_request = AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hello"}]
+        )
+        for error, status, error_type in (
+            (ValueError("unsupported tool control"), 400, "invalid_request_error"),
+            (RuntimeError("internal failure"), 500, "api_error"),
+        ):
+            serving = AnthropicServing(_RejectingOpenAI(error))
+            routes = {
+                "messages": serving._handle_non_streaming(
+                    chat_request, self._anthropic_request(stream=False), object()
+                ),
+                "stream": serving._handle_streaming(
+                    chat_request, self._anthropic_request(), object()
+                ),
+                "count_tokens": serving.handle_count_tokens(count_request, object()),
+            }
+            for route, handled in routes.items():
+                with self.subTest(error=type(error).__name__, route=route):
+                    response = asyncio.run(handled)
+                    payload = json.loads(response.body)
+                    self.assertEqual(
+                        (response.status_code, payload["error"]["type"]),
+                        (status, error_type),
+                    )
 
     def test_convert_response_non_streaming_empty_content_keeps_block(self):
         """Empty-string completion must still produce a content list of len 1."""
