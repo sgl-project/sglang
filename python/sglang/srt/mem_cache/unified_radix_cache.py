@@ -600,8 +600,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.supports_fast_match_prefix()
 
     def touch_prefix(self, key: RadixKey) -> None:
-        # The walk and its actions only; no session shortcut, cache-level finalizers
-        # or linker.
+        # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
         if self.disable:
             return
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))

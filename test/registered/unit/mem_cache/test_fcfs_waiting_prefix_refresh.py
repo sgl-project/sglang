@@ -28,9 +28,6 @@ NEWER_PREFIX = [5, 6, 7, 8]
 
 
 class TestFcfsWaitingPrefixRefresh(CustomTestCase):
-    """Under FCFS with LRU eviction, the prefixes of waiting requests are evicted
-    in reverse admission order, after prefixes no waiting request needs."""
-
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
@@ -77,7 +74,6 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
                 )
             )
             time.sleep(0.005)
-        # The head waits on the older prefix, the second request on the newer one.
         queue = [
             Req(rid, "", array("q", tokens + [9]), SamplingParams())
             for rid, tokens in ((1, OLDER_PREFIX), (2, NEWER_PREFIX))

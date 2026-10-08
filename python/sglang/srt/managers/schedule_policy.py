@@ -130,11 +130,9 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
-# Per-round prefix work on the waiting queue stops at this depth: LPM/HRRN fall
-# back to FCFS above it, and the waiting-prefix refresh covers only this many.
+# Arbitrary; bounds per-round prefix work on the waiting queue.
 WAITING_QUEUE_PREFIX_MATCH_MAX = 128
-# A refresh only has to keep waiting prefixes newer than idle ones, so it need not
-# run every round; bounds the per-second walk cost under a long queue.
+# Arbitrary; bounds the walk cost of touching waiting prefixes.
 WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
 
 
@@ -279,9 +277,8 @@ class SchedulePolicy:
         self._touch_waiting_prefixes(policy, waiting_queue)
 
     def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
-        # Under LRU a waiting prefix ages and is evicted before idle ones; refresh in
-        # admission order, head last. Cache-aware policies refresh as they match, and
-        # other eviction strategies do not rank by recency (MRU would invert it).
+        # Head last, so LRU evicts in reverse admission order; cache-aware policies
+        # already touch while matching, and other eviction strategies ignore recency.
         if (
             isinstance(policy, CacheAwarePolicy)
             or not waiting_queue

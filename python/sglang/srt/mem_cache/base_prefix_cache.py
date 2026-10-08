@@ -439,14 +439,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def touch_prefix(self, key: RadixKey) -> None:
-        """Touch the cached prefix of ``key`` so LRU eviction sees it as recent.
-
-        The scheduler calls this periodically for waiting requests. It walks the
-        tree only: with a host tier it also touches host-backed nodes, but it never
-        allocates, loads, or enqueues lookups on a storage backend or external
-        connector, as ``match_prefix`` may. Caches without such a walk leave this a
-        no-op.
-        """
+        """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
+        never allocates, loads, or queries external tiers."""
 
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
