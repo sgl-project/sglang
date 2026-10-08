@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import _model_forward_tbo_merge_key
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import deepseek_v4
@@ -84,9 +85,7 @@ class TestDeepseekV4TboGather(unittest.TestCase):
                 parallel = SimpleNamespace(
                     attn_tp_size=tp_size, attn_tp_rank=0, tp_group=group
                 )
-                batch = SimpleNamespace(
-                    _tbo_tp_sizes=[8 // tp_size] * (2 * tp_size)
-                )
+                batch = SimpleNamespace(_tbo_tp_sizes=[8 // tp_size] * (2 * tp_size))
                 with (
                     patch.object(moe_transport, "get_parallel", return_value=parallel),
                     patch.object(
@@ -109,9 +108,7 @@ class TestDeepseekV4TboGather(unittest.TestCase):
                         layer.mlp, local, batch, 0, False
                     )
                 if tp_size == 1:
-                    dp_gather.assert_called_once_with(
-                        global_hidden, local, batch
-                    )
+                    dp_gather.assert_called_once_with(global_hidden, local, batch)
                     group.all_gatherv.assert_not_called()
                 else:
                     dp_gather.assert_not_called()
@@ -120,9 +117,22 @@ class TestDeepseekV4TboGather(unittest.TestCase):
                     torch.testing.assert_close(args[0], local[:2])
                     self.assertEqual(kwargs["sizes"], [2] * 8)
                     self.assertIs(kwargs["output"], global_hidden)
-                self.assertIs(
-                    keepalive, local if tp_size == 1 else args[0]
-                )
+                self.assertIs(keepalive, local if tp_size == 1 else args[0])
+
+
+class TestDeepseekV4TboMerge(unittest.TestCase):
+    def test_mhc_outputs_merge_with_padding_and_no_residual(self):
+        chunks = (torch.arange(6).reshape(3, 2), torch.arange(6, 10).reshape(2, 2))
+        outputs = [
+            dict(
+                hidden_states=chunk,
+                residual=None,
+                forward_batch=SimpleNamespace(tbo_parent_token_range=token_range),
+            )
+            for chunk, token_range in zip(chunks, ((0, 2), (2, 3)))
+        ]
+        hidden = _model_forward_tbo_merge_key(*outputs, "hidden_states", original_len=3)
+        torch.testing.assert_close(hidden, torch.cat((chunks[0][:2], chunks[1][:1])))
 
 
 if __name__ == "__main__":

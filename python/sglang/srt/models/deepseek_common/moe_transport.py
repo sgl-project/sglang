@@ -295,7 +295,9 @@ def _tbo_gather_moe_input(moe, local, batch, sub, do_shared_local):
     local_shard = (
         local
         if parallel.attn_tp_size == 1
-        else local.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank].contiguous()
+        else local.tensor_split(parallel.attn_tp_size)[
+            parallel.attn_tp_rank
+        ].contiguous()
     )
     tp_sizes = batch._tbo_tp_sizes
     assert local_shard.shape[0] == tp_sizes[parallel.tp_group.rank_in_group]
