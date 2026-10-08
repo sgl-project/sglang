@@ -300,9 +300,6 @@ class UniPCMultistepScheduler(
             self.alphas_cumprod[-1] = 2**-24
 
         # Currently we only support VP-type noise schedule
-        self.alpha_t = torch.sqrt(self.alphas_cumprod)
-        self.sigma_t = torch.sqrt(1 - self.alphas_cumprod)
-        self.lambda_t = torch.log(self.alpha_t) - torch.log(self.sigma_t)
         self.sigmas = ((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5
 
         # standard deviation of the initial noise distribution
