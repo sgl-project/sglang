@@ -79,8 +79,8 @@ def oshape_sig(rec):
 def tag_sig(tag, rec):
     if tag == "OSHAPE":
         return oshape_sig(rec)
-    if tag == "IDXK":
-        # [IDXK] carries two windows: deep prefix (written once) + tail (rewritten)
+    if tag in ("IDXK", "C4KV"):
+        # both carry two windows: deep prefix (written once) + tail (rewritten)
         return f"pre={rec.get('pre')}|tail={rec.get('tail')}"
     return rec.get("md5")
 

@@ -1076,16 +1076,17 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, False)
                 pages = int(buf.shape[0])
+                pre_hi = min(pages, 8)        # deep prefix: written once, never rewritten
+                tail_lo = max(0, pages - 16)  # recent tail: added/rewritten during decode
                 tbl = getattr(self.forward_metadata, "c4_page_table", None)
                 ids = list(range(max(0, pages - 8), pages))
                 if torch.is_tensor(tbl) and tbl.numel():
                     row = [int(v) for v in tbl[0].reshape(-1).tolist()]
                     ids = sorted({max(0, min(int(v), pages - 1)) for v in row[-8:]})
-                lo = min(ids)
-                slab = buf[lo : max(ids) + 1]
                 print(
-                    f"[C4KV] layer={layer_id} lastpos={lastpos} pages={pages} ids={ids} "
-                    f"md5={_md5(slab)} bytes={slab.numel()}",
+                    f"[C4KV] layer={layer_id} lastpos={lastpos} pages={pages} "
+                    f"prehi={pre_hi} pre={_md5(buf[0:pre_hi])} "
+                    f"taillo={tail_lo} tail={_md5(buf[tail_lo:pages])} lastids={ids}",
                     flush=True,
                 )
             except Exception as exc:
