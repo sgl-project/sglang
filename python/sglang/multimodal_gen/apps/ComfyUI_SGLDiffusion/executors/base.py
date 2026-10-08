@@ -37,6 +37,15 @@ def _hash_value(digest, value) -> None:
         digest.update(text)
 
 
+def _row(value, index: int, batch: int):
+    """Row ``index`` of a batched ComfyUI argument; unbatched values pass through."""
+    if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch:
+        return value[index : index + 1]
+    if type(value) in (list, tuple):
+        return type(value)(_row(item, index, batch) for item in value)
+    return value
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
@@ -175,5 +184,24 @@ class SGLDiffusionExecutor(torch.nn.Module):
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):
+        batch = int(x.shape[0]) if torch.is_tensor(x) else 1
+        if batch == 1:
+            return self._forward_one(x, timestep, context, **kwargs)
+        # ComfyUI batches CFG cond/uncond (and batch_size > 1) into one call,
+        # but the worker's comfyui path is per-sample: req.timesteps is its
+        # schedule and seq lens are per request. Send one request per row.
+        return torch.cat(
+            [
+                self._forward_one(
+                    _row(x, i, batch),
+                    _row(timestep, i, batch),
+                    _row(context, i, batch),
+                    **{key: _row(value, i, batch) for key, value in kwargs.items()},
+                )
+                for i in range(batch)
+            ]
+        )
+
+    def _forward_one(self, x, timestep, context, **kwargs):
         packed = self.adapter.pack(x, timestep, context, **kwargs)
         return self._execute_packed(packed, x, timestep)
