@@ -25,6 +25,15 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def validate_schedule_policy(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.schedule_policy == "priority":
+        raise ValueError(
+            "--schedule-policy priority is not a scheduling policy. Use "
+            "--enable-priority-scheduling together with --schedule-policy fcfs or lof."
+        )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
