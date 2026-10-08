@@ -22,6 +22,8 @@ config was measured to win.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 import triton
@@ -246,3 +248,7 @@ def test_wrapper_dispatch_matches_arch():
     finally:
         m._sparse_attn_v4_paged_prefill_kernel = orig_kernel
         m._is_gfx1250 = orig_flag
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
