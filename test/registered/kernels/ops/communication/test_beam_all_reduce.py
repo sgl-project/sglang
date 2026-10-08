@@ -169,6 +169,30 @@ class TestBeamAllReduce(CustomTestCase):
         with patch.object(get_parallel().tp_group, "ca_comm", self.comm):
             limits = model._all_reduce_limits(hidden)
             self.assertIsNotNone(limits)
+            # EP changes expert reduction ownership, not attention's TP group.
+            with get_parallel().override(
+                moe_ep_size=dist.get_world_size(),
+                moe_tp_size=1,
+                moe_ep_rank=dist.get_rank(),
+                moe_tp_rank=0,
+            ):
+                self.assertEqual(model._all_reduce_limits(hidden), (limits[0], 0))
+            with get_parallel().override(
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_tp_group=None,
+                attn_dp_size=dist.get_world_size(),
+                attn_dp_rank=dist.get_rank(),
+            ):
+                self.assertIsNone(model._all_reduce_limits(hidden))
+            with get_parallel().override(
+                attn_cp_size=2,
+                attn_cp_rank=dist.get_rank() // (dist.get_world_size() // 2),
+                attn_tp_size=dist.get_world_size() // 2,
+                attn_tp_rank=dist.get_rank() % (dist.get_world_size() // 2),
+                attn_tp_group=None,
+            ):
+                self.assertIsNone(model._all_reduce_limits(hidden))
             self.assertIsNone(model._beam_all_reduce_comm)
             # Eligibility does not allocate; first use during capture must fall back.
             with patch("torch.cuda.is_current_stream_capturing", return_value=True):
@@ -203,6 +227,13 @@ class TestBeamAllReduce(CustomTestCase):
                 self.assertIsNone(model._all_reduce_limits(unsupported))
             with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
                 self.assertIsNone(model._all_reduce_limits(hidden))
+            if dist.get_world_size() == 4:
+                with patch("torch.cuda.get_device_capability", return_value=(10, 3)):
+                    hidden64 = torch.empty(
+                        64, 5120, device="cuda", dtype=torch.bfloat16
+                    )
+                    self.assertEqual(model._all_reduce_limits(hidden64[:32]), (32, 32))
+                    self.assertIsNone(model._all_reduce_limits(hidden64))
 
     def test_attention_projection_reduction_ownership(self):
         """Deferring o_proj must perform exactly one collective before its norm."""
