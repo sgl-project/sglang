@@ -103,12 +103,12 @@ def _hugetlb_supported(
     )
 
 
-def host_memory_requested_bytes(
-    mapping_bytes: Iterable[int],
+def host_memory_allocation_bytes(
+    mapping_lengths: Iterable[int],
     allocator: Optional[HostTensorAllocator] = None,
     device: Optional[Union[str, torch.device]] = None,
 ) -> int:
-    """Return the host memory the given mappings request.
+    """Return the host-memory allocation size for the given mapping lengths.
 
     With normal pages this is the plain sum. With hugepages each mapping
     rounds up to a whole page on its own (alloc_mmap).
@@ -116,12 +116,14 @@ def host_memory_requested_bytes(
     if _hugetlb_supported(allocator, device):
         page_size = hugepage_size_requested()
         if page_size and hugepage_mode(page_size) != HUGEPAGE_MODE_OFF:
-            return sum(-(-b // page_size) * page_size for b in mapping_bytes)
-    return sum(mapping_bytes)
+            return sum(
+                -(-length // page_size) * page_size for length in mapping_lengths
+            )
+    return sum(mapping_lengths)
 
 
 def host_memory_budget_bytes(
-    requested_bytes: int = 0,
+    allocation_bytes: int = 0,
     allocator: Optional[HostTensorAllocator] = None,
     device: Optional[Union[str, torch.device]] = None,
     *,
@@ -135,7 +137,7 @@ def host_memory_budget_bytes(
     Auto-sizing requires successful cgroup discovery; explicit pool sizing
     can fall back to checking host availability when discovery fails.
 
-    Inside host_memory_budget_scope, requested_bytes is booked against the
+    Inside host_memory_budget_scope, allocation_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
 
     When ``allocator`` maps MAP_HUGETLB (SGLANG_HUGEPAGE_SIZE) the pool may
@@ -150,8 +152,8 @@ def host_memory_budget_bytes(
     """
     available = _host_memory_budget.get()
     if available is not None:
-        if requested_bytes <= available:
-            _host_memory_budget.set(available - requested_bytes)
+        if allocation_bytes <= available:
+            _host_memory_budget.set(available - allocation_bytes)
         return available
 
     free = (
@@ -297,16 +299,18 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        requested_bytes = host_memory_requested_bytes(
-            self.get_mapping_bytes(), self.allocator, self.device_pool.device
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(),
+            self.allocator,
+            self.device_pool.device,
         )
         available_bytes = host_memory_budget_bytes(
-            requested_bytes, self.allocator, self.device_pool.device
+            allocation_bytes, self.allocator, self.device_pool.device
         )
-        if requested_bytes > available_bytes:
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
@@ -319,7 +323,7 @@ class HostKVCache(abc.ABC):
                     "target_layers=%d, draft_layers=%d, total_layers=%d.",
                     pool_label,
                     self.size,
-                    requested_bytes / 1e9,
+                    allocation_bytes / 1e9,
                     self.target_layer_num,
                     draft_layer_num,
                     self.layer_num,
@@ -329,7 +333,7 @@ class HostKVCache(abc.ABC):
                     "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
                     pool_label,
                     self.size,
-                    requested_bytes / 1e9,
+                    allocation_bytes / 1e9,
                 )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -339,8 +343,8 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
-    def get_mapping_bytes(self) -> list[int]:
-        """Return the bytes each host mapping reserves, one entry per mapping.
+    def get_mapping_lengths(self) -> list[int]:
+        """Return the requested byte length of each host mapping.
 
         One fused buffer by default. Pools that map K/V or scale blocks
         separately override this so the budget check rounds each mapping to

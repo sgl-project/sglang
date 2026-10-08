@@ -1234,7 +1234,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_ksize_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
-    def get_mapping_bytes(self) -> list[int]:
+    def get_mapping_lengths(self) -> list[int]:
         kv_bytes = self.size * self.size_per_token
         k_bytes = self.size * self.get_ksize_per_token()
         return [k_bytes, kv_bytes - k_bytes]

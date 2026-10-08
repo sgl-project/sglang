@@ -410,12 +410,12 @@ class TestHostMemoryBudget(CustomTestCase):
                 self.assertEqual(budget, 64 * gib // 8)
                 allocator.free_hugetlb_bytes.assert_not_called()
 
-    def test_request_rounds_each_mapping_only_on_the_hugetlb_path(self):
+    def test_allocation_bytes_rounds_each_mapping_on_the_hugetlb_path(self):
         # Two 1.1 GiB mappings reserve 4 pages of a 1 GiB-page pool, not the
         # 3 pages their plain sum suggests: each MAP_HUGETLB mapping rounds up
         # on its own.
         gib = 1024**3
-        mappings = [int(1.1 * gib), int(1.1 * gib)]
+        mapping_lengths = [int(1.1 * gib), int(1.1 * gib)]
         allocator = unittest.mock.Mock(
             supports_hugetlb=unittest.mock.Mock(return_value=True)
         )
@@ -424,18 +424,18 @@ class TestHostMemoryBudget(CustomTestCase):
             envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
         ):
             self.assertEqual(
-                base.host_memory_requested_bytes(mappings, allocator, "cuda"),
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
                 4 * gib,
             )
             # npu pins through torch and never maps MAP_HUGETLB: plain sum.
             self.assertEqual(
-                base.host_memory_requested_bytes(mappings, allocator, "npu"),
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "npu"),
                 2 * int(1.1 * gib),
             )
         # Without SGLANG_HUGEPAGE_SIZE there is no page size to round to.
         with envs.SGLANG_HUGEPAGE_SIZE.override(""):
             self.assertEqual(
-                base.host_memory_requested_bytes(mappings, allocator, "cuda"),
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
                 2 * int(1.1 * gib),
             )
         # mode=off opts out of rounding even with a page size set.
@@ -444,7 +444,7 @@ class TestHostMemoryBudget(CustomTestCase):
             envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
         ):
             self.assertEqual(
-                base.host_memory_requested_bytes(mappings, allocator, "cuda"),
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
                 2 * int(1.1 * gib),
             )
 

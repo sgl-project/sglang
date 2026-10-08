@@ -11,8 +11,8 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
-    host_memory_requested_bytes,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -145,22 +145,24 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        requested_bytes = host_memory_requested_bytes(
-            self.get_mapping_bytes(), self.allocator, self.device_pool.device
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(),
+            self.allocator,
+            self.device_pool.device,
         )
         available_bytes = host_memory_budget_bytes(
-            requested_bytes, self.allocator, self.device_pool.device
+            allocation_bytes, self.allocator, self.device_pool.device
         )
-        if requested_bytes > available_bytes:
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
                 f"size of the hierarchical cache."
             )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.layout,
         )
 
@@ -392,7 +394,7 @@ class MambaPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
-    def get_mapping_bytes(self) -> list[int]:
+    def get_mapping_lengths(self) -> list[int]:
         token_layer_bytes = self.size * self.num_mamba_layers
         return [
             token_layer_bytes
