@@ -473,6 +473,48 @@ def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
     )
 
 
+def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        extend_seq_lens=seq_lens,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0] * bs,
+    )
+
+
+def test_unified_eager_table_must_be_packed():
+    """XQA and fmha_v2 index a page table as packed rows (row length = width,
+    strides ignored). A plan whose table an earlier captured reader had built in
+    its own wider buffer hands a graphs-off reader a strided view, which they
+    would misread for every row after the first."""
+    backend = _make_backend_for_hook_test()
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    translator = backend.kv_index_translator
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    assert backend.forward_metadata.page_table.is_contiguous()
+    _assert_reads_only_current_pages(backend, v2p)
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
+    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
+    with pytest.raises(AssertionError, match="packed rows"):
+        backend.init_forward_metadata(forward_batch)
+
+
 def test_hybrid_wrappers_forward_in_graph_hook():
     # The hybrid backend reads the mode from the published configuration.
     from sglang.srt.runtime_context import get_context

@@ -1273,8 +1273,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.kv_loc_plan, rows=forward_batch.batch_size
         )
         if kv_view.is_translated:
-            # No fill kernel: the kernels take the tensor's own width/stride
-            # and bound their reads by cache_seqlens.
+            # No fill kernel: the kernels bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
             metadata.swa_page_table = (
                 self.kv_index_translator.read_table(
@@ -1285,6 +1284,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
                 is not None
                 else None
+            )
+            # XQA and fmha_v2 take a page table's row length from its width and
+            # ignore its strides, so a view into a wider table would be misread.
+            assert metadata.page_table.is_contiguous() and (
+                metadata.swa_page_table is None
+                or metadata.swa_page_table.is_contiguous()
+            ), (
+                "trtllm_mha reads its page tables as packed rows, but the plan's "
+                "table is a strided view of a wider buffer"
             )
         else:
             has_swa = self._swa_kv_pool is not None
