@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=True)
+
     def __init__(
         self,
         config: PretrainedConfig,
