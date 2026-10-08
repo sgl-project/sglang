@@ -97,6 +97,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -3704,10 +3705,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
-            # DSV4 non-fused layers carry no residual across layers; the key is
-            # required by the next layer's op_mhc_prepare_attn (ignored) and by
-            # _model_forward_tbo_merge_outputs (None -> None).
-            residual=None,
+            # mHC carries its residual internally; TBO merge expects an empty stream.
+            residual=ResidualStream(),
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
