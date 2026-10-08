@@ -181,7 +181,6 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
 
 
 def jinja_template_reads_reasoning_content(chat_template: str) -> bool:
-    """Detect ``reasoning_content`` read as an attribute, item or ``get`` key."""
     if not isinstance(chat_template, str):
         return False
 

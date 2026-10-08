@@ -429,9 +429,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return False
 
     def _chat_template_reads_reasoning_content(self) -> bool:
-        """Whether the configured Jinja chat template reads ``reasoning_content``;
-        a server-default ``chat_template`` kwarg replaces the tokenizer's template.
-        """
         template = self.default_chat_template_kwargs.get("chat_template")
         if template is None and self.tokenizer_manager.tokenizer is not None:
             template = self.tokenizer_manager.tokenizer.chat_template
@@ -3181,8 +3178,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
-        """Whether the encoder, or a response-template model's Jinja template that
-        reads it, takes ``reasoning_content`` rather than inline wire markers; see
+        """Whether the chat encoder or template takes history as ``reasoning_content``
+        rather than via :meth:`wrap_reasoning_history`; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
         return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (

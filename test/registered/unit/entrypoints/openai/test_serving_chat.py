@@ -3407,7 +3407,6 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
     def test_response_template_messages_thinking_replay(self):
-        """Preserve thinking in reasoning_content or inline, as the template requires."""
         from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
         from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
         from sglang.srt.parser.beam import BeamReasoningDetector
@@ -3432,10 +3431,11 @@ class ServingChatTestCase(CustomTestCase):
             "{{ messages[1].content }}",
         )
         cases = [
-            # (tokenizer template, server-default chat_template, conversation
-            # template, takes reasoning_content)
             (reads, None, None, True),
+            ("{{ messages[1]['reasoning_content'] }}", None, None, True),
+            ("{{ messages[1].get('reasoning_content') }}", None, None, True),
             (content_only, None, None, False),
+            ("{# reasoning_content #}" + content_only, None, None, False),
             (content_only, reads, None, True),
             (reads, content_only, None, False),
             (reads, None, "chatml", False),
