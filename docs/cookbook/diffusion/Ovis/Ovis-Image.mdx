@@ -78,6 +78,10 @@ Floating-point reduction order can differ across parallel topologies and attenti
 backends. Compare runs using the same seed, CPU generator, dimensions, precision,
 and scheduler; output differences do not imply a change to the CFG algorithm.
 
+To stay on the reference numerics, transformer TP row projections all-reduce
+FP32 partial products and round once. This doubles their all-reduce traffic; on
+B200 at 1024 x 1024, TP2 denoising is about 15–20% slower than BF16 reduction.
+
 ## 5. Reproduce correctness checks
 
 Checkpoint-free component tests use real tensors and official small models:
