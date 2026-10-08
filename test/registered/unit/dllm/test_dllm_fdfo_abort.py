@@ -31,7 +31,7 @@ class TestFdfoAbort(unittest.TestCase):
             block_size=4,
             mask_id=0,
             max_running_requests=2,
-            first_done_first_out_mode=True,
+            first_done_first_out_mode=True, requires_separate_context_encoding=False,
         )
         req = Req(
             rid="cancel-me",
@@ -42,10 +42,12 @@ class TestFdfoAbort(unittest.TestCase):
         )
         req.init_next_round_input()
         req.dllm_block_id = 1
-        req.set_extend_range(0, 4)
+        req.prefix_len = 0
+        req.extend_end = 4
         if holds_kv:
             req.kv = ReqKvInfo(req_pool_idx=1, kv_allocated_len=4, kv_committed_len=4)
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_continuous_input_polling = False
         scheduler.chunked_req = None
         scheduler.mm_receiver = None
         scheduler.waiting_queue = []
@@ -89,8 +91,8 @@ class TestFdfoAbort(unittest.TestCase):
                 scheduler.enable_overlap = overlap
                 calls = []
 
-                def release(req, tree_cache, is_insert):
-                    self.assertFalse(is_insert)
+                def release(req, tree_cache, checkpoint):
+                    self.assertFalse(checkpoint)
                     self.assertTrue(req.finished())
                     self.assertEqual(
                         scheduler.future_map.dllm_block_tokens_buf[1].tolist(), [-1] * 4

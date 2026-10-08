@@ -286,7 +286,8 @@ template <
     bool kNorm,
     typename WeightT,
     bool kMhc = false,
-    bool kQuant = false>
+    bool kQuant = false,
+    bool kCollapse = false>
 __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
@@ -377,7 +378,14 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   if constexpr (!kNorm) {
     const auto red = reduce_vec(vec);
     ptx::st_global_16B(red, params.out, vid);
-    if constexpr (kMhc) mhc_post_vec<kHiddenDim>(params, red, row_idx, hvec);
+    if constexpr (kMhc) {
+      if constexpr (kCollapse) {
+        const auto combined = mhc_post_vec<kHiddenDim, true>(params, red, row_idx, hvec);
+        ptx::st_global_16B(combined, params.normalized, vid);
+      } else {
+        mhc_post_vec<kHiddenDim>(params, red, row_idx, hvec);
+      }
+    }
     // ensure epoch is consumed, so flipping it won't lead to error
     barrier_cluster_wait();
   } else {
@@ -447,7 +455,8 @@ template <
     bool kUsePDL,
     typename WeightT,
     bool kMhc = false,
-    bool kQuant = false>
+    bool kQuant = false,
+    bool kCollapse = false>
 struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
@@ -466,7 +475,8 @@ struct MoeFinalizeAllReduceKernel {
       kNorm,
       WeightT,
       kMhc,
-      kQuant>;
+      kQuant,
+      kCollapse>;
 
  public:
   /// out = [allreduce over ranks of] finalize(gemm2_out, idx, weights) [+ shared] [-> RMSNorm(norm_weight, eps)].
@@ -500,7 +510,7 @@ struct MoeFinalizeAllReduceKernel {
   }
 
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
-  static void run_mhc(
+  static void run_mhc_post(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -528,7 +538,7 @@ struct MoeFinalizeAllReduceKernel {
         comb);
   }
 
-  static void run_mhc_norm(
+  static void run_mhc_post_combine_norm(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -562,7 +572,7 @@ struct MoeFinalizeAllReduceKernel {
         normalized);
   }
 
-  static void run_mhc_quant(
+  static void run_mhc_post_combine_norm_quant(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -663,7 +673,7 @@ struct MoeFinalizeAllReduceKernel {
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
     if constexpr (kQuant) {
-      CHECK_HOST(num_tokens <= 8);
+      CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());
       TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
       TensorMatcher({(kHiddenDim / 32) * 128})
@@ -673,7 +683,7 @@ struct MoeFinalizeAllReduceKernel {
     }
     if constexpr (kMhc) {
       static_assert(kHiddenDim == 5120);
-      if (norm_weight.has_value()) {
+      if (norm_weight.has_value() || kCollapse) {
         TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(pre.value());
         TensorMatcher({T, kHiddenDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(normalized.value());
       }

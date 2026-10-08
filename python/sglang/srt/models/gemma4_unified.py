@@ -40,7 +40,6 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -53,6 +52,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -144,7 +144,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         # Skip Gemma4ForConditionalGeneration.__init__ (it builds the SigLIP /
         # conformer towers we do not have) and initialise the HF base directly.
         PreTrainedModel.__init__(self, config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 

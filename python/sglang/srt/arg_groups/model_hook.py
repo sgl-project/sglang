@@ -32,12 +32,16 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
@@ -137,9 +141,9 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 
 
 def handle_model_specific_adjustments(server_args: Any):
-
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -164,6 +168,13 @@ def handle_model_specific_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+
+    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "NPU decode context parallelism is currently implemented only for "
+            "DeepSeek DSA models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+        )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
@@ -195,9 +206,26 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
-    _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+    decision_config = model_config.decision_config
+    if (
+        decision_config is not None
+        and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
+    ):
+        # A cached prefix or a prefill chunk would attend to only part of its prompt.
+        logger.info(
+            "Radix cache and chunked prefill are disabled for a decision "
+            "checkpoint with noncausal full attention."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+        )
+
+    _hybrid_spec = get_linear_attn_spec(hf_config)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
-        handle_mamba_radix_cache(server_args, model_arch)
+        handle_mamba_radix_cache(server_args, hf_config)
 
     # Collect the declarative model overrides (registry) on the
     # pristine config and stash them for publish-time flags resolution;
@@ -222,6 +250,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+
+    if model_arch == "Glm5NextForConditionalGeneration":
+        from sglang.srt.arg_groups.glm5_next_hook import (
+            apply_glm5_next_spec_backend_defaults,
+        )
+
+        apply_glm5_next_spec_backend_defaults(server_args)
 
     if model_arch in [
         "DeepseekV4ForCausalLM",
@@ -284,10 +319,15 @@ def handle_model_specific_adjustments(server_args: Any):
                     )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
-                    if cfg.dp_size < cfg.tp_size:
+                    attn_tp_size = derive_attn_tp_size(
+                        tp_size=cfg.tp_size,
+                        attn_cp_size=cfg.attn_cp_size,
+                        attn_dp_size=cfg.attn_dp_size,
+                    )
+                    if attn_tp_size > 1:
                         logger.warning(
-                            f"DSA with TP mode is active, dp_size={cfg.dp_size}, tp_size={cfg.tp_size}, "
-                            f"attn_tp_size={cfg.tp_size}, attention weights will be sharded across {cfg.tp_size} ranks."
+                            f"DSA with TP mode is active, attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size}, "
+                            f"attn_tp_size={attn_tp_size}, attention weights will be sharded across {attn_tp_size} ranks."
                         )
 
                 # The DSA page-size selection moved to the override registry
@@ -398,10 +438,24 @@ def handle_model_specific_adjustments(server_args: Any):
             if is_deepseek_dsa(hf_config) and not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 # Prefer HIP top-k by default while honoring an explicit selection.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
+            if not attn_dp_enabled_of(resolved_view(server_args)) and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
-                logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
+
+                if model_arch == "GlmMoeDsaForCausalLM":
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        enable_aiter_allreduce_fusion=True,
+                    )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        disable_aiter_allreduce_fusion_in_prefill=True,
+                    )
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
+                    )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
             # resolution pipeline (arg_groups/overrides.py:
@@ -415,16 +469,19 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
-            validate_deepseek_v4_mega_moe_token_budget,
+            validate_deepseek_v41_features,
         )
 
+        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
-        validate_deepseek_v4_mega_moe_token_budget(server_args)
 
         if get_platform().is_sm120:
-            # SM120 lacks tcgen05/TMEM: disable features that depend on
-            # DeepGEMM or require >99KB SMEM (topk_v2).
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
+            # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
+            if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            # The default top-k v2 path still requires unsupported resources.
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
@@ -485,13 +542,15 @@ def handle_model_specific_adjustments(server_args: Any):
         quant_method = get_quantization_config(hf_config)
         is_mxfp4_quant_format = quant_method == "mxfp4"
         if (
-            not resolved_view(server_args).enable_dp_attention
+            not attn_dp_enabled_of(resolved_view(server_args))
             and cfg.nnodes == 1
             and get_platform().is_hip
         ):
             # TODO (Hubert): Put this back later
             # server_args.enable_aiter_allreduce_fusion = True
-            logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            pass
+
         quantization_config = getattr(hf_config, "quantization_config", None)
         is_mxfp4_quant_format = (
             quantization_config is not None
@@ -512,8 +571,11 @@ def handle_model_specific_adjustments(server_args: Any):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
             view = resolved_view(server_args)
-            attn_dp_size = cfg.dp_size if view.enable_dp_attention else 1
-            effective_attn_tp_size = cfg.tp_size // attn_dp_size // view.attn_cp_size
+            effective_attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=view.attn_cp_size,
+                attn_dp_size=cfg.attn_dp_size,
+            )
             if (
                 expected_attn_tp_size is not None
                 and expected_attn_tp_size % effective_attn_tp_size != 0
@@ -524,10 +586,9 @@ def handle_model_specific_adjustments(server_args: Any):
                     "qkv_proj weights are "
                     f"TP={expected_attn_tp_size}-interleaved; got "
                     f"{effective_attn_tp_size} "
-                    f"(tp_size={cfg.tp_size}, dp_size={cfg.dp_size}, "
-                    f"enable_dp_attention={view.enable_dp_attention}, "
+                    f"(tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
                     f"attn_cp_size={view.attn_cp_size}). "
-                    "Set --tp, --dp, --enable-dp-attention, and "
+                    "Set --tp, --attn-dp-size, and "
                     "--attention-context-parallel-size so the effective "
                     f"attention TP size is {expected_attn_tp_size}."
                 )
@@ -600,7 +661,11 @@ def handle_model_specific_adjustments(server_args: Any):
         # The prefill attention backend default + validation moved to the
         # override registry (arg_groups/overrides.py: _moss_vl_overrides).
         pass
-    elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
+    elif model_arch in [
+        "Exaone4ForCausalLM",
+        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
+    ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
             # (arg_groups/overrides.py: _exaone_overrides).
@@ -665,7 +730,7 @@ def handle_model_specific_adjustments(server_args: Any):
     # for them this re-invocation is an idempotent no-op plus validation.
     # Kept ahead of the sparse-head pass: the legacy per-branch calls
     # resolved before that tail write of disable_overlap_schedule.
-    handle_mamba_radix_cache(server_args, model_arch)
+    handle_mamba_radix_cache(server_args, hf_config)
 
     run_post_process_pass(server_args, _sparse_head_overlap_disable)
 
@@ -909,7 +974,7 @@ def handle_model_capability_adjustments(server_args: Any):
         )
 
 
-def handle_mamba_radix_cache(server_args: Any, model_arch: str):
+def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
     # _mamba_radix_cache_resolution), invoked here at each legacy call
     # slot; this handler keeps the validation.
@@ -921,20 +986,26 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
     if not view.uses_mamba_radix_cache:
+        # auto is arch-gated, so only an explicit strategy reaches a non-mamba
+        # arch here, where it would arm the mamba paths and crash at prefill.
+        if mamba_extra_buffer_of(view):
+            raise ValueError(
+                f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy} "
+                f"needs mamba state, got {hf_config.architectures[0]}."
+            )
         return
 
     if mamba_extra_buffer_of(view):
         validate_mamba_extra_buffer(
             view,
-            model_arch,
+            hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
     else:
-        validate_mamba_no_buffer(view, model_arch)
+        validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 
 def handle_language_model_only(server_args: Any):
-
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return

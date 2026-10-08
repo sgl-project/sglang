@@ -23,7 +23,7 @@ impl Overloaded {
 impl EligibilityFilter for Overloaded {
     fn keep(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<bool> {
         (workers.iter())
-            .map(|w| w.active_load() < self.max_in_flight)
+            .map(|w| w.router_inflight_load() < self.max_in_flight)
             .collect()
     }
 
@@ -42,7 +42,7 @@ impl Policy for Overloaded {
             .collect();
         eligible
             .iter()
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| w.router_inflight_load())
             .map(Arc::clone)
     }
 
@@ -63,7 +63,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 

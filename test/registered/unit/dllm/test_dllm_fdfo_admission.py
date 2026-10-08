@@ -19,8 +19,8 @@ class TestDllmFdfoAdmission(unittest.TestCase):
             with self.subTest(fdfo=fdfo, result_processed=incomplete):
                 req = SimpleNamespace(
                     full_untruncated_fill_ids=array("q", [1] * 6 + [0] * 32),
-                    prefix_indices=[],
-                    extend_range=SimpleNamespace(start=0, end=32, length=32),
+                    prefix_len=0,
+                    extend_end=32, extend_len=32,
                     dllm_incomplete_ids=array("q", [1] * 32)
                     if incomplete
                     else array("q"),
@@ -30,15 +30,9 @@ class TestDllmFdfoAdmission(unittest.TestCase):
                     retracted_stain=False,
                 )
 
-                def set_range(start, end):
-                    req.extend_range = SimpleNamespace(
-                        start=start, end=end, length=end - start
-                    )
-
-                req.set_extend_range = set_range
                 adder = SimpleNamespace(
-                    dllm_config=SimpleNamespace(first_done_first_out_mode=fdfo),
-                    _get_dllm_remain_tokens=lambda: 32,
+                    dllm_config=SimpleNamespace(first_done_first_out_mode=fdfo, requires_separate_context_encoding=False),
+                    _get_dllm_remain_tokens=lambda req: 32,
                     can_run_list=[],
                     _update_prefill_budget=lambda *args, **kwargs: None,
                     _mamba_gap_budget_for_req=lambda req: 0,
@@ -46,14 +40,14 @@ class TestDllmFdfoAdmission(unittest.TestCase):
                 result = PrefillAdder.add_dllm_staging_req(adder, req)
                 self.assertEqual(result, AddReqResult.CONTINUE)
                 self.assertEqual(adder.can_run_list, [req])
-                self.assertEqual(req.extend_range.end, 32)
+                self.assertEqual(req.extend_end, 32)
 
                 adder.can_run_list.clear()
-                adder._get_dllm_remain_tokens = lambda: 16
+                adder._get_dllm_remain_tokens = lambda req: 16
                 result = PrefillAdder.add_dllm_staging_req(adder, req)
                 self.assertEqual(result, AddReqResult.NO_TOKEN)
                 self.assertEqual(adder.can_run_list, [])
-                self.assertEqual(req.extend_range.end, 32)
+                self.assertEqual(req.extend_end, 32)
 
 
 if __name__ == "__main__":

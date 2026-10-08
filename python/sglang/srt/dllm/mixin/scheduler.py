@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -27,6 +27,11 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+
+    def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
+        if self.dllm_config is None:
+            return None
+        return self.dllm_config.validate_request(req)
 
     def get_new_batch_dllm(
         self: Scheduler, running_batch: ScheduleBatch
@@ -74,6 +79,18 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        if (
+            self.dllm_config.requires_separate_context_encoding
+            and not batch.forward_mode.is_dllm_extend()
+        ):
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            return
+
         block_tokens = result.next_token_ids.tolist()
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         assert not fdfo_mode or result.dllm_block_done is not None, (
@@ -112,8 +129,8 @@ class SchedulerDllmMixin:
             req.dllm_incomplete_ids = array("q")
             req.dllm_algo_state = None
 
-            # extend_range.end accounts for KV-budget truncation.
-            len_fill = req.extend_range.end
+            # extend_end accounts for KV-budget truncation.
+            len_fill = req.extend_end
             req.full_untruncated_fill_ids[len_fill - block_size : len_fill] = array(
                 "q", next_token_ids
             )
@@ -129,11 +146,7 @@ class SchedulerDllmMixin:
             req.output_ids.extend(next_token_ids)
             req.update_finish_state(new_accepted_len=len(next_token_ids))
 
-            if req.finished():
-                if fdfo_mode:
-                    self._clear_dllm_future(req)
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.set_completion_time()
+            self._finish_dllm_request_if_needed(req)
 
         if fdfo_mode or has_new_tokens:
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -145,6 +158,59 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
+        if (
+            not req.finished()
+            and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
+        ):
+            req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+
+        if req.finished():
+            if self.dllm_config.first_done_first_out_mode:
+                self._clear_dllm_future(req)
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                checkpoint=not self.dllm_config.requires_separate_context_encoding,
+            )
+            req.time_stats.set_completion_time()
+
+    def _stash_dllm_context(self: Scheduler, req: Req) -> None:
+        context_len = req.dllm_block_offset
+        block_size = self.dllm_config.block_size
+        assert req.extend_end == context_len + block_size
+        assert req.kv is not None and req.kv.req_pool_idx is not None
+
+        allocated_len = req.kv.kv_allocated_len
+        page_size = self.token_to_kv_pool_allocator.page_size
+        free_start = -(-context_len // page_size) * page_size
+        if free_start < allocated_len:
+            slots = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, free_start:allocated_len
+            ]
+            self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
+
+        req.kv.kv_committed_len = context_len
+        req.kv.kv_allocated_len = context_len
+        assert req.kv.max_evicted_seqlen <= context_len
+        req.extend_end = context_len
+        self.stash_chunked_request(req)
+
+    def finish_dllm_forward(self: Scheduler, req: Req) -> None:
+        """Commit or discard KV after one scheduler-visible dLLM forward."""
+        fdfo_mode = self.dllm_config.first_done_first_out_mode
+        if fdfo_mode and req.dllm_incomplete_ids:
+            return
+
+        if req.is_dllm_prefill():
+            self.stash_chunked_request(req)
+        elif self.dllm_config.requires_separate_context_encoding:
+            self._stash_dllm_context(req)
+        else:
+            # The row stays with the request between blocks: a later abort
+            # releases its KV and tree lock through it.
+            self.stash_chunked_request(req)
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
@@ -198,8 +264,6 @@ class SchedulerDllmMixin:
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
     ) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
-        forward_mode = ForwardMode.DLLM_EXTEND
-
         # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
@@ -209,6 +273,11 @@ class SchedulerDllmMixin:
                 DllmReqPhase.STAGING_PREFILL,
                 DllmReqPhase.INCOMING_PREFILL,
                 running_batch=running_batch,
+            )
+            return (
+                ForwardMode.EXTEND
+                if self.dllm_config.requires_separate_context_encoding
+                else ForwardMode.DLLM_EXTEND
             )
         else:
             # Fall back to decode batch
@@ -220,8 +289,7 @@ class SchedulerDllmMixin:
                 DllmReqPhase.INCOMING_DECODE,
                 running_batch=running_batch,
             )
-
-        return forward_mode
+            return ForwardMode.DLLM_EXTEND
 
     def _process_batch_by_phase(
         self,
@@ -333,12 +401,12 @@ class SchedulerDllmMixin:
         for req in reqs:
             if req.kv.holds_kv:
                 # Prompt chunks can advance without waiting for overlap results.
-                if req.extend_range.end <= len(req.origin_input_ids):
+                if req.extend_end <= len(req.origin_input_ids):
                     req.dllm_block_done = True
                 if req.dllm_block_done:
                     if self.dllm_config.first_done_first_out_mode:
                         self._clear_dllm_future(req)
-                    self.stash_chunked_request(req)
+                    self.finish_dllm_forward(req)
                     self.req_to_token_pool.free(req)
                     req.init_next_round_input()
             res = adder.add_dllm_staging_req(req)

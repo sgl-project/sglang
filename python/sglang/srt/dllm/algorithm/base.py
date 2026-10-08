@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -11,6 +11,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 _is_npu = is_npu()
 
@@ -28,6 +31,13 @@ class DllmAlgorithm:
     synchronous and FDFO (``--dllm-fdfo``) execution loops in ``run``.
     """
 
+    supported_architectures: Tuple[str, ...] = ()
+    requires_separate_context_encoding = False
+    required_attention_backend: Optional[str] = None
+    reuse_forward_metadata: bool = False
+    supported_attention_backends: Tuple[str, ...] = ()
+    capture_input_preparation: bool = False
+
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
         self.mask_id = config.mask_id
@@ -41,6 +51,24 @@ class DllmAlgorithm:
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         return [None] * forward_batch.batch_size
 
+    @classmethod
+    def configure_server_args(cls, server_args: ServerArgs) -> None:
+        """Apply launch-time constraints owned by an algorithm."""
+
+    @classmethod
+    def validate_request(cls, req: Req) -> Optional[str]:
+        """Return an error for unsupported request features, if any."""
+        return None
+
+    def prepare_inputs(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        states: List[Any],
+    ) -> None:
+        """Prepare algorithm-specific inputs immediately before a model forward."""
+        pass
+
     def max_steps(self, block_size: int) -> int:
         return block_size + 1
 
@@ -49,10 +77,13 @@ class DllmAlgorithm:
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> torch.Tensor:
-        """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+    ) -> List[bool]:
+        """Advance one denoise step in place and report which blocks may emit.
+
+        Algorithms that retain generated-block KV must not report completion
+        until a forward has persisted their final tokens. Algorithms with a
+        separate context pass may emit immediately because that block KV is
+        discarded and encoded causally in the next round.
         """
         raise NotImplementedError
 
@@ -70,24 +101,25 @@ class DllmAlgorithm:
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
+        start_list = self._block_start_list(forward_batch)
         block_tokens = forward_batch.input_ids.view(batch_size, self.block_size)
+        states = self.init_step_state(forward_batch)
+        self.prepare_inputs(model_runner, forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        if not bool((block_tokens == self.mask_id).any()):
+        if all(start == self.block_size for start in start_list):
             return DllmRunOutput(
                 out.logits_output, block_tokens.clone(), None, None, out.can_run_graph
             )
 
-        states = self.init_step_state(forward_batch)
-        # NPU: attention metadata is stable across a block's denoise steps (the
-        # first forward above already planned it), so mark it ready once and let
-        # every later forward skip re-planning.
-        if _is_npu:
-            forward_batch.mark_forward_metadata_ready()
+        # The first forward has planned the fixed canvas's attention metadata.
+        if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
-            if bool(done.all()):
+            if all(done):
                 break
+            self.prepare_inputs(model_runner, forward_batch, states)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
         return DllmRunOutput(
@@ -114,8 +146,10 @@ class DllmAlgorithm:
             else:
                 states.append(carried)
 
+        self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
+        done = torch.as_tensor(done, dtype=torch.bool, device=forward_batch.input_ids.device)
         # Clone so a later in-place step cannot race the async D2H of this result.
         block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
 

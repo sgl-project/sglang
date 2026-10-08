@@ -4,11 +4,12 @@ import unittest
 from array import array
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.dllm.mixin.scheduler import DllmManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -60,14 +61,21 @@ class _FakeTreeCache:
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
 
-    def is_chunk_cache(self):
-        return True
+    def supports_prefix_sharing(self):
+        return False
+
+    def maybe_hand_to_session(self, req):
+        pass
+
+    def prefix_device_indices(self, req):
+        return req.tree_prefix
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
-        prefix_indices=torch.tensor(prefix, dtype=torch.int32),
+        tree_prefix=torch.tensor(prefix, dtype=torch.int32),
+        prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         dllm_block_done=False,
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
@@ -89,10 +97,7 @@ def _remove_allocated_req_slots(pool, *reqs):
 
 def _make_batch(pool, allocator, reqs, extend_lens):
     seq_lens_cpu = torch.tensor(
-        [
-            len(req.prefix_indices) + extend_len
-            for req, extend_len in zip(reqs, extend_lens)
-        ],
+        [req.prefix_len + extend_len for req, extend_len in zip(reqs, extend_lens)],
         dtype=torch.int64,
     )
     return SimpleNamespace(
@@ -101,7 +106,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
-        prefix_lens=[len(req.prefix_indices) for req in reqs],
+        prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
         seq_lens_cpu=seq_lens_cpu,
@@ -112,8 +117,9 @@ def _make_batch(pool, allocator, reqs, extend_lens):
 
 
 def _seed_retained_block(pool, req, values):
-    prefix_len = len(req.prefix_indices)
-    pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.prefix_indices
+    prefix_len = req.prefix_len
+    if prefix_len:
+        pool.req_to_token[req.kv.req_pool_idx, :prefix_len] = req.tree_prefix
     pool.req_to_token[req.kv.req_pool_idx, prefix_len : prefix_len + len(values)] = (
         torch.tensor(values, dtype=torch.int32)
     )
@@ -176,7 +182,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                         block_size=4,
                         mask_id=0,
                         max_running_requests=2,
-                        first_done_first_out_mode=fdfo,
+                        first_done_first_out_mode=fdfo, requires_separate_context_encoding=False,
                     )
                     req = Req(
                         rid="completed",
@@ -188,7 +194,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     req.init_next_round_input()
                     req.dllm_block_id = 7
                     req.dllm_block_done = done
-                    req.set_extend_range(0, 4)
+                    req.prefix_len = 0
+                    req.extend_end = 4
                     if done and len(prompt) < 4:
                         req.output_ids = array("q", [4, 5])
                     req.kv = ReqKvInfo(
@@ -200,6 +207,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     manager.waiting_queue = [req]
                     self.assertEqual(manager.staging_queue, [])
                     scheduler = Scheduler.__new__(Scheduler)
+                    scheduler.disaggregation_mode = DisaggregationMode.NULL
                     scheduler.dllm_config = config
                     scheduler.enable_overlap = True
                     scheduler.req_to_token_pool = self.pool
@@ -218,7 +226,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     adder = SimpleNamespace(
                         dllm_config=config,
                         can_run_list=[],
-                        _get_dllm_remain_tokens=lambda: budget[0],
+                        _get_dllm_remain_tokens=lambda req: budget[0],
                         _update_prefill_budget=lambda *args, **kwargs: None,
                         _mamba_gap_budget_for_req=lambda req: 0,
                     )
@@ -235,7 +243,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                         self.assertFalse(req.dllm_block_done)
                         self.assertEqual(req.dllm_block_id, 7)
                         self.assertEqual(req.dllm_block_offset, 0)
-                        self.assertEqual(req.prefix_indices.tolist(), [])
+                        self.assertEqual(req.prefix_len, 0)
                         self.assertEqual(req.kv.req_pool_idx, 1)
                         self.assertEqual(req.get_fill_ids().tolist(), [2, 3, 0, 0])
                         self.assertEqual(
@@ -247,7 +255,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     self.assertTrue(req.dllm_block_done)
                     self.assertIsNone(req.kv.req_pool_idx)
                     self.assertEqual(
-                        req.prefix_indices.tolist(), [100, 101, 102, 103]
+                        scheduler.tree_cache.prefix_device_indices(req).tolist(), [100, 101, 102, 103]
                     )
                     self.assertEqual(
                         scheduler.future_map.dllm_block_tokens_buf[1].tolist(),
@@ -266,7 +274,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
                     self.assertEqual(req.dllm_block_id, 7)
                     self.assertTrue(req.dllm_block_done)
                     self.assertEqual(
-                        (req.extend_range.start, req.extend_range.end), (4, 8)
+                        (req.prefix_len, req.extend_end), (4, 8)
                     )
 
                     class AllocationComplete(Exception):
@@ -400,6 +408,39 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         )
         self.assertEqual(manager.waiting_queue, [keep])
         self.assertEqual(manager.staging_queue, [])
+
+
+class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
+    def test_resolved_block_keeps_row_until_next_block(self):
+        """A resolved FDFO block used to hand its row back to the pool while the
+        request kept running. An abort before the next block then skipped
+        release_kv_cache (it only runs for row holders), leaking the request's
+        tree lock and any KV the tree does not own."""
+        pool = ReqToTokenPool(
+            size=4, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        req = SimpleNamespace(
+            dllm_incomplete_ids=array("q"),
+            is_dllm_prefill=lambda: False,
+            kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+        )
+        pool.alloc([req])
+        row = req.kv.req_pool_idx
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(
+                first_done_first_out_mode=True,
+                requires_separate_context_encoding=False,
+            ),
+            req_to_token_pool=pool,
+            stash_chunked_request=Mock(),
+        )
+
+        SchedulerDllmMixin.finish_dllm_forward(scheduler, req)
+
+        scheduler.stash_chunked_request.assert_called_once_with(req)
+        self.assertTrue(req.kv.holds_kv)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        self.assertNotIn(row, pool.free_slots)
 
 
 if __name__ == "__main__":
