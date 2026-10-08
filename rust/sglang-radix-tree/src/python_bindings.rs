@@ -3990,14 +3990,12 @@ fn register_inspection_component_factories() {
     REGISTERED.call_once(|| {
         register_tree_component(
             "inspection_swa",
-            SWA,
             |args: &TreeComponentArgument<'_>| SwaComponent::new(args.params),
             false,
         )
         .expect("inspection component factory registration failed");
         register_tree_component(
             "inspection_factory_panic",
-            FULL,
             |_: &TreeComponentArgument<'_>| -> FullComponent {
                 panic!("named component factory test panic")
             },

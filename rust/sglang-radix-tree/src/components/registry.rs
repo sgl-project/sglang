@@ -79,26 +79,19 @@ pub enum TreeComponentRegistryError {
     InactiveComponent(ComponentType),
     #[error("duplicate component type {0:?}")]
     DuplicateComponent(ComponentType),
-    #[error("component factory {name:?} has type {actual:?}, expected {expected:?}")]
-    ComponentTypeMismatch {
-        name: String,
-        expected: ComponentType,
-        actual: ComponentType,
-    },
 }
-
-type FactoryEntry = (ComponentType, Arc<dyn TreeComponentFactoryFamily>);
 
 pub struct TreeComponentRegistry {
-    factories: RwLock<HashMap<String, FactoryEntry>>,
+    factories: RwLock<HashMap<String, Arc<dyn TreeComponentFactoryFamily>>>,
 }
 
-pub struct TreeComponentFactorySnapshot {
+/// Factory references resolved together for one tree's construction.
+pub struct ResolvedTreeComponentFactories {
     factories: HashMap<ComponentType, Arc<dyn TreeComponentFactoryFamily>>,
 }
 
-impl TreeComponentFactorySnapshot {
-    /// Invoke this tree's captured factory without holding a registry lock.
+impl ResolvedTreeComponentFactories {
+    /// Invoke this tree's selected factory without holding a registry lock.
     pub fn create<K: TreeComponentKey>(
         &self,
         component_type: ComponentType,
@@ -132,7 +125,6 @@ impl Default for TreeComponentRegistry {
         registry
             .register_tree_component(
                 "full_default",
-                ComponentType::Full,
                 |_: &TreeComponentArgument<'_>| FullComponent,
                 false,
             )
@@ -140,7 +132,6 @@ impl Default for TreeComponentRegistry {
         registry
             .register_tree_component(
                 "swa_default",
-                ComponentType::Swa,
                 |argument: &TreeComponentArgument<'_>| SwaComponent::new(argument.params),
                 false,
             )
@@ -148,7 +139,6 @@ impl Default for TreeComponentRegistry {
         registry
             .register_tree_component(
                 "mamba_default",
-                ComponentType::Mamba,
                 |argument: &TreeComponentArgument<'_>| MambaComponent::new(argument.params),
                 false,
             )
@@ -158,11 +148,10 @@ impl Default for TreeComponentRegistry {
 }
 
 impl TreeComponentRegistry {
-    /// Register or explicitly replace a factory for future trees, preserving its kind.
+    /// Register or explicitly replace a named factory for future trees.
     pub fn register_tree_component(
         &self,
         name: &str,
-        component_type: ComponentType,
         factory: impl TreeComponentFactoryFamily + 'static,
         replace: bool,
     ) -> Result<(), TreeComponentRegistryError> {
@@ -172,29 +161,20 @@ impl TreeComponentRegistry {
         let factory: Arc<dyn TreeComponentFactoryFamily> = Arc::new(factory);
         let previous = {
             let mut factories = self.factories.write().unwrap();
-            if let Some((registered_type, _)) = factories.get(name) {
-                if !replace {
-                    return Err(TreeComponentRegistryError::DuplicateKey(name.to_owned()));
-                }
-                if *registered_type != component_type {
-                    return Err(TreeComponentRegistryError::ComponentTypeMismatch {
-                        name: name.to_owned(),
-                        expected: *registered_type,
-                        actual: component_type,
-                    });
-                }
+            if !replace && factories.contains_key(name) {
+                return Err(TreeComponentRegistryError::DuplicateKey(name.to_owned()));
             }
-            factories.insert(name.to_owned(), (component_type, factory))
+            factories.insert(name.to_owned(), factory)
         };
         drop(previous);
         Ok(())
     }
 
-    pub fn snapshot(
+    pub fn resolve(
         &self,
         component_types: &[ComponentType],
         overrides: &HashMap<ComponentType, String>,
-    ) -> Result<TreeComponentFactorySnapshot, TreeComponentRegistryError> {
+    ) -> Result<ResolvedTreeComponentFactories, TreeComponentRegistryError> {
         let mut configured = HashSet::new();
         for &component_type in component_types {
             if !configured.insert(component_type) {
@@ -221,20 +201,13 @@ impl TreeComponentRegistry {
                     .get(&component_type)
                     .map(String::as_str)
                     .unwrap_or_else(|| default_factory_key(component_type));
-                let (actual, factory) = registry
+                let factory = registry
                     .get(key)
                     .ok_or_else(|| TreeComponentRegistryError::UnknownKey(key.to_owned()))?;
-                if *actual != component_type {
-                    return Err(TreeComponentRegistryError::ComponentTypeMismatch {
-                        name: key.to_owned(),
-                        expected: component_type,
-                        actual: *actual,
-                    });
-                }
                 Ok((component_type, Arc::clone(factory)))
             })
             .collect::<Result<_, _>>()?;
-        Ok(TreeComponentFactorySnapshot { factories })
+        Ok(ResolvedTreeComponentFactories { factories })
     }
 }
 
@@ -245,18 +218,17 @@ fn tree_component_registry() -> &'static TreeComponentRegistry {
 
 pub fn register_tree_component(
     name: &str,
-    component_type: ComponentType,
     factory: impl TreeComponentFactoryFamily + 'static,
     replace: bool,
 ) -> Result<(), TreeComponentRegistryError> {
-    tree_component_registry().register_tree_component(name, component_type, factory, replace)
+    tree_component_registry().register_tree_component(name, factory, replace)
 }
 
 pub fn resolve_tree_component_factories(
     component_types: &[ComponentType],
     overrides: &HashMap<ComponentType, String>,
-) -> Result<TreeComponentFactorySnapshot, TreeComponentRegistryError> {
-    tree_component_registry().snapshot(component_types, overrides)
+) -> Result<ResolvedTreeComponentFactories, TreeComponentRegistryError> {
+    tree_component_registry().resolve(component_types, overrides)
 }
 
 pub fn default_factory_key(component_type: ComponentType) -> &'static str {

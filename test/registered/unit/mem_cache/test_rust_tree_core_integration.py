@@ -180,25 +180,33 @@ def test_named_component_factory_builds_working_bindings(is_bigram, partial_over
 
 @pytest.mark.parametrize("is_bigram", [False, True])
 @pytest.mark.parametrize(
-    "overrides,message",
+    "overrides,error_type,message",
     [
-        ({0: "unregistered_factory"}, "unknown component factory"),
-        ({0: ""}, "must be non-empty"),
-        ({1: "swa_default"}, "component Swa is not enabled"),
-        ({255: "full_default"}, "unknown component type"),
-        ({0: "swa_default"}, "has type Swa, expected Full"),
+        ({0: "unregistered_factory"}, ValueError, "unknown component factory"),
+        ({0: ""}, ValueError, "must be non-empty"),
+        ({1: "swa_default"}, ValueError, "component Swa is not enabled"),
+        ({255: "full_default"}, ValueError, "unknown component type"),
+        (
+            {0: "swa_default"},
+            RuntimeError,
+            "component factory returned the wrong kind for Full",
+        ),
     ],
 )
 def test_named_component_factory_rejects_invalid_overrides(
-    is_bigram, overrides, message
+    is_bigram, overrides, error_type, message
 ):
     binding_class = (
         mem_cache.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else mem_cache.RustUnifiedTreeCoreBinding
     )
-    with pytest.raises(ValueError, match=message):
-        binding_class(mem_cache.TreeCoreInitParamsBinding(), [0], overrides)
+    with pytest.raises(error_type, match=message):
+        binding_class(
+            mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0],
+            overrides,
+        )
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])

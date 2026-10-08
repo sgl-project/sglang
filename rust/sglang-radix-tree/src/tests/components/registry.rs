@@ -10,77 +10,83 @@ fn full_factory(_: &TreeComponentArgument<'_>) -> FullComponent {
 }
 
 struct KeyedFactoryForTest {
-    key_modes: Arc<Mutex<Vec<bool>>>,
+    calls: Arc<Mutex<Vec<(ComponentType, bool)>>>,
 }
 
 impl<K: ChildKeyType> TreeComponentFactory<K> for KeyedFactoryForTest {
     fn create(&self, argument: &TreeComponentArgument<'_>) -> TreeComponentInstance<K> {
-        assert_eq!(argument.component_type, FULL);
         assert_eq!(argument.is_bigram, K::IS_BIGRAM);
-        self.key_modes.lock().unwrap().push(K::IS_BIGRAM);
-        Arc::new(FullComponent)
+        self.calls
+            .lock()
+            .unwrap()
+            .push((argument.component_type, K::IS_BIGRAM));
+        match argument.component_type {
+            FULL => Arc::new(FullComponent),
+            SWA => Arc::new(SwaComponent::new(argument.params)),
+            _ => unreachable!(),
+        }
     }
 }
 
 #[test]
-fn one_generic_factory_registration_supports_both_key_types() {
+fn one_factory_key_supports_multiple_component_and_key_types() {
     let registry = TreeComponentRegistry::default();
-    let key_modes = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
     registry
         .register_tree_component(
-            "keyed_full",
-            FULL,
+            "shared_factory",
             KeyedFactoryForTest {
-                key_modes: Arc::clone(&key_modes),
+                calls: Arc::clone(&calls),
             },
             false,
         )
         .unwrap();
-    let snapshot = registry
-        .snapshot(&[FULL], &HashMap::from([(FULL, "keyed_full".to_owned())]))
+    let selection = registry
+        .resolve(
+            &[FULL, SWA],
+            &HashMap::from([
+                (FULL, "shared_factory".to_owned()),
+                (SWA, "shared_factory".to_owned()),
+            ]),
+        )
         .unwrap();
-    let params = CacheInitParams::default();
-    snapshot.create::<Vec<i64>>(FULL, &params);
-    snapshot.create::<Vec<(i64, i64)>>(FULL, &params);
-    assert_eq!(*key_modes.lock().unwrap(), [false, true]);
+    let params = CacheInitParams {
+        swa_sliding_window_size: Some(4),
+        ..Default::default()
+    };
+    selection.create::<Vec<i64>>(FULL, &params);
+    selection.create::<Vec<i64>>(SWA, &params);
+    selection.create::<Vec<(i64, i64)>>(FULL, &params);
+    selection.create::<Vec<(i64, i64)>>(SWA, &params);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [(FULL, false), (SWA, false), (FULL, true), (SWA, true)]
+    );
 }
 
 #[test]
-fn registration_requires_explicit_replacement_and_preserves_kind() {
+fn registration_requires_explicit_replacement() {
     let registry = TreeComponentRegistry::default();
     for key in ["", " \t"] {
         assert!(matches!(
-            registry.register_tree_component(key, FULL, full_factory, false),
+            registry.register_tree_component(key, full_factory, false),
             Err(TreeComponentRegistryError::EmptyKey)
         ));
     }
     assert!(matches!(
-        registry.register_tree_component("full_default", FULL, full_factory, false),
+        registry.register_tree_component("full_default", full_factory, false),
         Err(TreeComponentRegistryError::DuplicateKey(_))
     ));
-    assert!(matches!(
-        registry.register_tree_component("full_default", SWA, full_factory, true),
-        Err(TreeComponentRegistryError::ComponentTypeMismatch {
-            expected: FULL,
-            actual: SWA,
-            ..
-        })
-    ));
     registry
-        .register_tree_component("full_default", FULL, full_factory, true)
+        .register_tree_component("full_default", full_factory, true)
         .unwrap();
     registry
-        .register_tree_component("custom_full", FULL, full_factory, false)
+        .register_tree_component("custom_full", full_factory, false)
         .unwrap();
     assert!(
         registry
-            .snapshot(&[FULL], &HashMap::from([(FULL, "custom_full".to_owned())]))
+            .resolve(&[FULL], &HashMap::from([(FULL, "custom_full".to_owned())]))
             .is_ok()
-    );
-    assert!(
-        TreeComponentRegistry::default()
-            .snapshot(&[FULL], &HashMap::from([(FULL, "custom_full".to_owned())]))
-            .is_err()
     );
 }
 
@@ -108,15 +114,10 @@ fn selection_validates_slots_and_keys_before_invoking_factories() {
             HashMap::from([(FULL, "missing".to_owned())]),
             "unknown component factory",
         ),
-        (
-            vec![FULL],
-            HashMap::from([(FULL, "swa_default".to_owned())]),
-            "has type Swa, expected Full",
-        ),
     ] {
         assert!(
             registry
-                .snapshot(&component_types, &overrides)
+                .resolve(&component_types, &overrides)
                 .err()
                 .unwrap()
                 .to_string()
@@ -125,14 +126,13 @@ fn selection_validates_slots_and_keys_before_invoking_factories() {
     }
 }
 
-fn exercise_snapshot<K: TreeComponentKey>() {
+fn exercise_selection<K: TreeComponentKey>() {
     let registry = Arc::new(TreeComponentRegistry::default());
     let events = Arc::new(Mutex::new(Vec::new()));
     let old_events = Arc::clone(&events);
     registry
         .register_tree_component(
             "swa_default",
-            SWA,
             move |argument: &TreeComponentArgument<'_>| {
                 old_events.lock().unwrap().push("old");
                 SwaComponent::new(argument.params)
@@ -145,7 +145,6 @@ fn exercise_snapshot<K: TreeComponentKey>() {
     registry
         .register_tree_component(
             "full_default",
-            FULL,
             move |argument: &TreeComponentArgument<'_>| {
                 assert_eq!(argument.component_type, FULL);
                 assert_eq!(argument.is_bigram, K::IS_BIGRAM);
@@ -161,7 +160,6 @@ fn exercise_snapshot<K: TreeComponentKey>() {
                 registry
                     .register_tree_component(
                         "swa_default",
-                        SWA,
                         move |argument: &TreeComponentArgument<'_>| {
                             new_events.lock().unwrap().push("new");
                             SwaComponent::new(argument.params)
@@ -179,20 +177,20 @@ fn exercise_snapshot<K: TreeComponentKey>() {
         swa_sliding_window_size: Some(4),
         ..Default::default()
     };
-    let snapshot = registry.snapshot(&[FULL, SWA], &HashMap::new()).unwrap();
-    snapshot.create::<K>(FULL, &params);
-    snapshot.create::<K>(SWA, &params);
+    let selection = registry.resolve(&[FULL, SWA], &HashMap::new()).unwrap();
+    selection.create::<K>(FULL, &params);
+    selection.create::<K>(SWA, &params);
     assert_eq!(*events.lock().unwrap(), ["full", "old"]);
-    let next = registry.snapshot(&[FULL, SWA], &HashMap::new()).unwrap();
+    let next = registry.resolve(&[FULL, SWA], &HashMap::new()).unwrap();
     next.create::<K>(FULL, &params);
     next.create::<K>(SWA, &params);
     assert_eq!(*events.lock().unwrap(), ["full", "old", "full", "new"]);
 }
 
 #[test]
-fn snapshots_are_atomic_and_factories_can_register_replacements() {
-    exercise_snapshot::<Vec<i64>>();
-    exercise_snapshot::<Vec<(i64, i64)>>();
+fn resolved_factories_are_consistent_across_registration_changes() {
+    exercise_selection::<Vec<i64>>();
+    exercise_selection::<Vec<(i64, i64)>>();
 }
 
 struct FactoryDropForTest {
@@ -210,7 +208,7 @@ impl Drop for FactoryDropForTest {
                 .expect("factory drops without the registry lock"),
         );
         registry
-            .register_tree_component("from_drop", FULL, full_factory, false)
+            .register_tree_component("from_drop", full_factory, false)
             .unwrap();
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
@@ -227,7 +225,6 @@ fn replacement_drops_old_factories_outside_the_write_lock() {
     registry
         .register_tree_component(
             "replaceable",
-            FULL,
             move |_: &TreeComponentArgument<'_>| {
                 let _ = &probe;
                 FullComponent
@@ -236,7 +233,7 @@ fn replacement_drops_old_factories_outside_the_write_lock() {
         )
         .unwrap();
     registry
-        .register_tree_component("replaceable", FULL, full_factory, true)
+        .register_tree_component("replaceable", full_factory, true)
         .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
@@ -248,7 +245,6 @@ fn ordinary_native_construction_resolves_registered_defaults() {
     let observed = Arc::clone(&calls);
     register_tree_component(
         "full_default",
-        FULL,
         move |_: &TreeComponentArgument<'_>| {
             if std::thread::current().id() == thread {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -260,7 +256,7 @@ fn ordinary_native_construction_resolves_registered_defaults() {
     .unwrap();
     UnifiedTreeCore::<Vec<i64>>::new(CacheInitParams::default(), vec![FULL]);
     UnifiedTreeCore::<Vec<(i64, i64)>>::new(CacheInitParams::default(), vec![FULL]);
-    register_tree_component("full_default", FULL, full_factory, true).unwrap();
+    register_tree_component("full_default", full_factory, true).unwrap();
     assert_eq!(observed.load(Ordering::SeqCst), 2);
 }
 
@@ -269,10 +265,10 @@ fn ordinary_native_construction_resolves_registered_defaults() {
 fn selected_factory_rejects_a_different_produced_kind() {
     let registry = TreeComponentRegistry::default();
     registry
-        .register_tree_component("wrong_result", SWA, full_factory, false)
+        .register_tree_component("wrong_result", full_factory, false)
         .unwrap();
-    let snapshot = registry
-        .snapshot(&[SWA], &HashMap::from([(SWA, "wrong_result".to_owned())]))
+    let selection = registry
+        .resolve(&[SWA], &HashMap::from([(SWA, "wrong_result".to_owned())]))
         .unwrap();
-    snapshot.create::<Vec<i64>>(SWA, &CacheInitParams::default());
+    selection.create::<Vec<i64>>(SWA, &CacheInitParams::default());
 }

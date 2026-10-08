@@ -228,7 +228,6 @@ fn exercise_registered_factory<K: TreeComponentKey>(key: K) {
     registry
         .register_tree_component(
             "counting",
-            SWA,
             move |argument: &TreeComponentArgument<'_>| {
                 assert_eq!(argument.component_type, SWA);
                 assert_eq!(argument.is_bigram, K::IS_BIGRAM);
@@ -241,14 +240,12 @@ fn exercise_registered_factory<K: TreeComponentKey>(key: K) {
         .unwrap();
     let component_types = vec![FULL, SWA];
     let selected = registry
-        .snapshot(
+        .resolve(
             &component_types,
             &HashMap::from([(SWA, "counting".to_owned())]),
         )
         .unwrap();
-    let defaults = registry
-        .snapshot(&component_types, &HashMap::new())
-        .unwrap();
+    let defaults = registry.resolve(&component_types, &HashMap::new()).unwrap();
     let params = CacheInitParams {
         swa_sliding_window_size: Some(4),
         ..Default::default()

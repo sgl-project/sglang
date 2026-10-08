@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
 use crate::components::registry::{
-    TreeComponentFactorySnapshot, TreeComponentKey, resolve_tree_component_factories,
+    ResolvedTreeComponentFactories, TreeComponentKey, resolve_tree_component_factories,
 };
 use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
@@ -816,7 +816,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn with_component_factories(
         params: CacheInitParams,
         component_types: Vec<ComponentType>,
-        factories: TreeComponentFactorySnapshot,
+        factories: ResolvedTreeComponentFactories,
     ) -> Self
     where
         K: TreeComponentKey,
