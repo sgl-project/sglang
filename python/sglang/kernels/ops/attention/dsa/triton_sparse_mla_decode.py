@@ -312,6 +312,7 @@ def _sparse_mla_decode_split_kernel(
     BLOCK_K: tl.constexpr,
     len_ptr=None,  # [N] valid prefix of each idx row; read when USE_LENGTH
     USE_LENGTH: tl.constexpr = False,
+    LSE_SCALE: tl.constexpr = 1.0,  # ln(2) when a lone split stores the final LSE
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -474,7 +475,7 @@ def _sparse_mla_decode_split_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.where(has_data[:, None], acc3 * inv_denom[:, None], 0.0)
 
-    lse = tl.where(has_data, tl.log2(l_i) + m_i, neg_large)
+    lse = tl.where(has_data, tl.log2(l_i) + m_i, neg_large) * LSE_SCALE
 
     H_padded = tl.cdiv(H, BLOCK_H) * BLOCK_H
     lse_base = t * KV_SPLITS * H_padded + pid_k * H_padded
@@ -649,10 +650,17 @@ def triton_sparse_mla_decode_splitk(
     if optimize_gfx950_fp8:
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
 
-    lse_partial, acc_partial = _get_splitk_bufs(
-        bs, kv_splits, h_padded, d_v, q_nope.device, workspace
-    )
     out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    # A lone split already holds the final output, laid out as [N, 1, H, D_V]
+    # when no head padding is needed; store it and the LSE in place.
+    direct = kv_splits == 1 and return_lse and h_padded == H
+    if direct:
+        lse = torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
+        lse_partial, acc_partial = lse, out
+    else:
+        lse_partial, acc_partial = _get_splitk_bufs(
+            bs, kv_splits, h_padded, d_v, q_nope.device, workspace
+        )
 
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():
@@ -681,9 +689,12 @@ def triton_sparse_mla_decode_splitk(
             BLOCK_K=BLOCK_K,
             len_ptr=lengths,
             USE_LENGTH=lengths is not None,
+            LSE_SCALE=0.6931471805599453 if direct else 1.0,
             num_warps=split_num_warps,
             num_stages=2,
         )
+    if direct:
+        return out.unsqueeze(0), lse
 
     D_CHUNK = _reduce_d_chunk(active_splits, bs * H) if optimize_gfx950_fp8 else 64
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
