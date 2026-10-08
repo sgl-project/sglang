@@ -1166,6 +1166,30 @@ class OpenAIServingChat(OpenAIServingBase):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
 
+    def _can_reuse_text_only_prompt_ids(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> bool:
+        # Moss-VL invokes its processor for text-only requests, and that processor
+        # requires the rendered text rather than pre-tokenized ids.
+        is_moss_vl = (
+            "MossVLForConditionalGeneration"
+            in self.tokenizer_manager.model_config.hf_config.architectures
+        )
+        return (
+            is_multimodal
+            and not is_moss_vl
+            and self.chat_encoding_spec is None
+            and self.template_manager.chat_template_name is None
+            and not self._prompt_text_round_trip_is_lossy
+            and not self._tokenizer_auto_adds_specials
+            and isinstance(processed_messages.prompt_ids, list)
+            and bool(processed_messages.prompt_ids)
+            and not processed_messages.image_data
+            and not processed_messages.video_data
+            and not processed_messages.audio_data
+            and not processed_messages.modalities
+        )
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1233,7 +1257,9 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Handle single vs multiple requests
-        if request.input_ids is not None:
+        if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
+            processed_messages, is_multimodal
+        ):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         else:
             prompt_key, prompt_value = self._engine_prompt(
@@ -1337,8 +1363,12 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        # Only tool-bearing requests get the full-assistant EBNF: its terminal
+        # state finishes a request even under ignore_eos.
+        glm_constraint = (
+            self.tool_call_parser == "glm47"
+            and bool(effective_tools)
+            and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
@@ -2057,6 +2087,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
+                    # K2 templates require preserved thinking, including empty reasoning.
                     yield build_sse_content(
                         chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
@@ -2064,6 +2095,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         index=index,
                         role="assistant",
                         content="",
+                        reasoning_content=(
+                            ""
+                            if self.reasoning_parser == "k2_horizon"
+                            and request.separate_reasoning
+                            else None
+                        ),
                     )
                     stream_started = True
 
@@ -2416,7 +2453,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     role="assistant",
                     content=text if text else "",
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
+                    # Only K2 templates replay empty reasoning; other parsers report None.
+                    reasoning_content=(
+                        reasoning_text
+                        if reasoning_text or self.reasoning_parser == "k2_horizon"
+                        else None
+                    ),
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

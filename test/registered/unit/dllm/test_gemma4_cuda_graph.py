@@ -15,6 +15,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 )
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -35,6 +36,7 @@ class _ReadStream:
         out,
         kv_start_idx=None,
         sliding_window=False,
+        token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])
@@ -179,20 +181,20 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             runner.load_batch(batch)
 
 
-class TestGemma4VocabularyShards(unittest.TestCase):
+class TestGemma4VocabularyShards(CustomTestCase):
     def test_padded_shards_load_and_reconstruct_soft_embeddings(self):
         torch.manual_seed(123)
         config = SimpleNamespace(vocab_size=73, hidden_size=4)
         weight = torch.randn(73, 4)
         probabilities = torch.randn(6, 73).softmax(dim=-1)
         expected = probabilities @ weight * 2.0
-        for tp_size in (1, 2, 4):
+        # TP3 does not divide the 64-padded vocab (128), so padding scales with TP.
+        for tp_size in (1, 2, 3, 4):
             with self.subTest(tp_size=tp_size):
                 partials = []
                 for rank in range(tp_size):
-                    with patch(
-                        "sglang.srt.layers.vocab_parallel_embedding.get_parallel",
-                        return_value=SimpleNamespace(tp_rank=rank, tp_size=tp_size),
+                    with published_topology(
+                        device="cpu", tp_size=tp_size, ranks={"world_rank": rank}
                     ):
                         embedding = DiffusionGemmaTextEmbedding(config)
                     embedding.weight_loader(embedding.weight, weight)

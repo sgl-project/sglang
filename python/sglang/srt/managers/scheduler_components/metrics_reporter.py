@@ -219,6 +219,13 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
+        parallel = get_parallel()
+        # The max/mean token ratio is engine-wide; one scheduler reports it.
+        self.reports_dp_token_imbalance_ratio = (
+            parallel.attn_dp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
+        )
         self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
@@ -287,10 +294,6 @@ class SchedulerMetricsReporter:
         self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
             None
         )
-        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
-            enabled=self.enable_metrics
-        )
-
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
 
@@ -312,6 +315,19 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
+        # PDMux event polling across green-context streams is not validated;
+        # keep its overlap label at `none` without disabling forward timing.
+        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
+            enabled=self.enable_metrics,
+            query_forward_active=(
+                self.forward_pass_device_timer.is_active
+                if self.enable_metrics
+                and self.forward_pass_device_timer is not None
+                and self.scheduler.device == "cuda"
+                and not get_disagg().enable_pdmux
+                else None
+            ),
+        )
 
         self._init_fpm()
 
@@ -409,7 +425,9 @@ class SchedulerMetricsReporter:
                 prefill_lengths.add(len(req.origin_input_ids))
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
-            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
+            # each req's own prefix was already advanced by result processing.
+            sum_prefill_kv_tokens = sum(batch.prefix_lens[: len(prefill_reqs)])
 
         decode_kv = WelfordAccumulator()
         if batch.forward_mode.is_mixed():
@@ -1105,6 +1123,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.current_scheduler_metrics_enabled
+            and (dp_balance_stats := batch.dp_balance_stats) is not None
+        ):
+            self.metrics_collector.observe_dp_balance(dp_balance_stats)
+            if self.reports_dp_token_imbalance_ratio:
+                self.metrics_collector.observe_dp_token_imbalance_ratio(
+                    dp_balance_stats
+                )
+
         if not isinstance(result, GenerationBatchResult):
             return
 
@@ -1307,13 +1335,15 @@ class SchedulerMetricsReporter:
             self._forward_occupancy_log_window.reset(now_wall_ns)
         self.scheduler_stage_metrics.start(now_wall_ns)
 
-    def record_scheduler_active(self) -> None:
-        self._record_scheduler_time(is_idle=False)
+    def record_scheduler_active(self, event_ns: int) -> None:
+        """End CPU-side idle at event_ns (monotonic nanoseconds)."""
+        self._record_scheduler_time(is_idle=False, event_ns=event_ns)
 
     def record_scheduler_idle(self) -> None:
-        self._record_scheduler_time(is_idle=True)
+        """Start CPU-side idle at the current monotonic time."""
+        self._record_scheduler_time(is_idle=True, event_ns=time.monotonic_ns())
 
-    def _record_scheduler_time(self, is_idle: bool) -> None:
+    def _record_scheduler_time(self, is_idle: bool, event_ns: int) -> None:
         if not (self.enable_metrics or ENABLE_METRICS_DEVICE_TIMER):
             return
 
@@ -1330,17 +1360,22 @@ class SchedulerMetricsReporter:
             self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
-        if ENABLE_METRICS_DEVICE_TIMER:
-            window = self._forward_occupancy_log_window
-            if is_idle and not accounting.is_idle:
-                # Drain the completed burst once, then retain the new idle
-                # window across polls so the next request includes its idle gap.
-                self.forward_pass_device_timer._report()
-                window.reset(now_wall_ns)
-            elif accounting.is_idle:
-                window.idle_ns += now_wall_ns - accounting.last_sample_ns
+        # Clamp delayed events to the still-unaccounted wall-time range.
+        event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
+        if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
+            # Drain the completed burst once, then retain the new idle
+            # window across polls so the next request includes its idle gap.
+            self.forward_pass_device_timer._report()
+            self._forward_occupancy_log_window.reset(event_ns)
 
+        idle_ns_before = accounting.accumulate_idle_ns
+        accounting.sample(event_ns, is_idle)
+        # Reporting and stage drains stay at now, after any completed receive span.
         accounting.sample(now_wall_ns, is_idle)
+        if ENABLE_METRICS_DEVICE_TIMER:
+            self._forward_occupancy_log_window.idle_ns += (
+                accounting.accumulate_idle_ns - idle_ns_before
+            )
         if not self.enable_metrics or not accounting.should_record(now_wall_ns):
             return
 
@@ -1353,11 +1388,11 @@ class SchedulerMetricsReporter:
         self.metrics_collector.increment_scheduler_process_cpu_seconds(
             elapsed_process_cpu_ns / 1e9
         )
-        for stage, elapsed_wall_ns in self.scheduler_stage_metrics.drain(
+        for (stage, overlap), elapsed_wall_ns in self.scheduler_stage_metrics.drain(
             now_wall_ns
         ).items():
             self.metrics_collector.increment_scheduler_stage_seconds(
-                stage=stage, seconds=elapsed_wall_ns / 1e9
+                stage=stage, seconds=elapsed_wall_ns / 1e9, forward_overlap=overlap
             )
         accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
 
@@ -1375,6 +1410,9 @@ class SchedulerMetricsReporter:
         )
         self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
             transfer_queue, priority_enabled
+        )
+        self.stats.num_decode_deferred_kv_release_reqs = (
+            self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
         )
         host_reqs = (
             [req for req in transfer_queue if req.host_staged]

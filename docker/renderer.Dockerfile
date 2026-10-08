@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY rust/Cargo.toml rust/Cargo.lock rust/rust-toolchain.toml rust/
 # Cargo loads every workspace member even when building only the renderer.
+COPY proto/ proto/
 COPY rust/sglang-grpc/Cargo.toml rust/sglang-grpc/
 COPY rust/sglang-grpc/src/ rust/sglang-grpc/src/
 COPY rust/sglang-mm/Cargo.toml rust/sglang-mm/
@@ -43,13 +44,14 @@ RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/carg
 # Run the existing unit suite in the same Linux toolchain used for the image.
 # This sibling stage is selected by CI and is not a dependency of the runtime.
 FROM build AS test
-COPY rust/sglang-processor/tests/ rust/sglang-processor/tests/
 COPY rust/sglang-renderer/tests/ rust/sglang-renderer/tests/
 COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json experimental/sgl-router/tests/fixtures/tiny_tokenizer.json
 RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=renderer-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=renderer-target-${TARGETARCH},target=/build/rust/target,sharing=locked \
-    cargo test --manifest-path rust/Cargo.toml -p sglang-processor -p sglang-renderer --locked
+    cargo test --manifest-path rust/Cargo.toml -p sglang-processor -p sglang-renderer --locked \
+    && cargo check --manifest-path rust/Cargo.toml -p sglang-processor --locked \
+        --no-default-features --features render,tokenizer
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
