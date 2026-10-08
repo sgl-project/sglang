@@ -760,6 +760,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
+    # Encoder replay folded into the extend: per-row window floor [num_tokens]
+    # int64 (the request's replay start, 0 for other requests), and per-request
+    # leading replay rows the low-ratio compressors skip [bs] int32.
+    encoder_swa_row_floor: Optional[torch.Tensor] = None
+    encoder_swa_compress_skip: Optional[torch.Tensor] = None
+    encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
