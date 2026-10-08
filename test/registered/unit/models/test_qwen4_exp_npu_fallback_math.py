@@ -8,12 +8,14 @@ import torch
 from qwen4_exp_cpu_test_utils import forbidden, load
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestQwen4NPUFallbackMath(unittest.TestCase):
+class TestQwen4NPUFallbackMath(CustomTestCase):
     def setUp(self):
+        super().setUp()
         torch.manual_seed(42)
         self.alias = patch.object(torch.Tensor, "is_cuda", property(lambda self: True))
         self.alias.start()

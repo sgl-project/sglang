@@ -13,6 +13,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -78,7 +79,7 @@ def function(path, name, cls=None):
     return namespace[name]
 
 
-class TestDeviceDispatch(unittest.TestCase):
+class TestDeviceDispatch(CustomTestCase):
     def test_npu_gr_constructor_does_not_compile(self):
         path = ROOT / "srt/layers/hyperconnection.py"
         tree = ast.parse(path.read_text())

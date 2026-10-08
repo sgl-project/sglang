@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from qwen4_exp_cpu_test_utils import load
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -24,7 +25,7 @@ def config_module(npu=True, enabled=True):
     )
 
 
-class TestNPUDenseQSA(unittest.TestCase):
+class TestNPUDenseQSA(CustomTestCase):
     def test_requires_npu_and_explicit_opt_in(self):
         for npu in (True, False):
             for enabled in (True, False):

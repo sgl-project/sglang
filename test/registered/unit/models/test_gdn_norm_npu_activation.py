@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from qwen4_exp_cpu_test_utils import forbidden, load
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -27,7 +28,7 @@ def module(kernel=forbidden):
     )
 
 
-class TestNPUGatedNormActivation(unittest.TestCase):
+class TestNPUGatedNormActivation(CustomTestCase):
     def test_sigmoid_matches_reference_for_both_norm_orders(self):
         torch.manual_seed(8)
         code = module()
