@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Flow-matching rollout step utilities for log-prob computation."""
 
+from __future__ import annotations
+
 import math
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutSessionData,
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
 )
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
