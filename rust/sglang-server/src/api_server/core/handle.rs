@@ -303,48 +303,49 @@ impl CoreHandle {
         skip_tokenizer_init: bool,
         timeout: Duration,
     ) -> Result<(), CoreError> {
-        tokio::time::timeout(timeout, self.run_warm_up(skip_tokenizer_init))
-            .await
-            .unwrap_or_else(|_| {
-                Err(CoreError::Internal(format!(
-                    "startup warmup timed out after {timeout:?}"
-                )))
-            })
+        let request = self.warm_up_request(skip_tokenizer_init);
+        tokio::time::timeout(timeout, async {
+            let mut call = self.generate(request).await?;
+            loop {
+                match call.recv().await {
+                    Some(CoreEvent::Finished(_)) => return Ok(()),
+                    Some(CoreEvent::Failed(e)) => return Err(e),
+                    Some(CoreEvent::Delta(_)) => {}
+                    None => return Err(CoreError::ResponseTruncated),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(CoreError::Internal(format!(
+                "startup warmup timed out after {timeout:?}"
+            )))
+        })
     }
 
-    async fn run_warm_up(&self, skip_tokenizer_init: bool) -> Result<(), CoreError> {
+    fn warm_up_request(&self, skip_tokenizer_init: bool) -> GenerateRequest {
         let (text, input_ids) = if skip_tokenizer_init {
             (None, Some(vec![10, 11, 12]))
         } else {
             (Some("The capital city of France is".to_string()), None)
         };
-        let mut call = self
-            .generate(GenerateRequest {
-                rid: Rid::new(),
-                text,
-                input_ids,
-                sampling_params: SamplingParams {
-                    max_new_tokens: Some(8),
-                    temperature: 0.0,
-                    ignore_eos: self.inner.is_disaggregation,
-                    ..Default::default()
-                },
-                stream: false,
-                bootstrap_host: self
-                    .inner
-                    .is_disaggregation
-                    .then(|| FAKE_BOOTSTRAP_HOST.into()),
-                bootstrap_room: self.inner.is_disaggregation.then_some(0),
+        GenerateRequest {
+            rid: Rid::new(),
+            text,
+            input_ids,
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(8),
+                temperature: 0.0,
+                ignore_eos: self.inner.is_disaggregation,
                 ..Default::default()
-            })
-            .await?;
-        loop {
-            match call.recv().await {
-                Some(CoreEvent::Finished(_)) => return Ok(()),
-                Some(CoreEvent::Failed(e)) => return Err(e),
-                Some(CoreEvent::Delta(_)) => {}
-                None => return Err(CoreError::ResponseTruncated),
-            }
+            },
+            stream: false,
+            bootstrap_host: self
+                .inner
+                .is_disaggregation
+                .then(|| FAKE_BOOTSTRAP_HOST.into()),
+            bootstrap_room: self.inner.is_disaggregation.then_some(0),
+            ..Default::default()
         }
     }
 
