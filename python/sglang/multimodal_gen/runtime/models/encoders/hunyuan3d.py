@@ -11,6 +11,7 @@ from transformers import (
     Dinov2Model,
 )
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningEncoderMixin
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -32,7 +33,39 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
-class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+# transformers 5.19 renamed Dinov2's attention projections and split its SwiGLU input
+# projection into gate/up. from_pretrained remaps legacy checkpoints on its own, but
+# Hunyuan3D builds Dinov2Model from a config and loads its own state dict, where a
+# non-strict load would silently leave these weights randomly initialized.
+_DINOV2_LEGACY_RENAMES = (
+    ("attention.attention.query.", "attention.q_proj."),
+    ("attention.attention.key.", "attention.k_proj."),
+    ("attention.attention.value.", "attention.v_proj."),
+    ("attention.output.dense.", "attention.o_proj."),
+    ("mlp.weights_out.", "mlp.down_proj."),
+)
+
+
+def _remap_legacy_dinov2_keys(module, state_dict, prefix, *args):
+    if not hasattr(module.encoder.layer[0].attention, "q_proj"):
+        return  # transformers < 5.19 still uses the checkpoint's layout
+    layer_prefix = prefix + "encoder.layer."
+    for key in [k for k in state_dict if k.startswith(layer_prefix)]:
+        for old, new in _DINOV2_LEGACY_RENAMES:
+            if old in key:
+                state_dict[key.replace(old, new)] = state_dict.pop(key)
+                break
+        else:
+            if ".mlp.weights_in." in key:
+                # SwiGLU computed silu(first half) * second half of weights_in.
+                gate, up = state_dict.pop(key).chunk(2, dim=0)
+                state_dict[key.replace("mlp.weights_in.", "mlp.gate_proj.")] = gate
+                state_dict[key.replace("mlp.weights_in.", "mlp.up_proj.")] = up
+
+
+class ImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "model.encoder.layer",
@@ -57,6 +90,8 @@ class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
             self.model = self.MODEL_CLASS.from_pretrained(version)
         else:
             self.model = self.MODEL_CLASS(self.MODEL_CONFIG_CLASS.from_dict(config))
+        if isinstance(self.model, Dinov2Model):
+            self.model.register_load_state_dict_pre_hook(_remap_legacy_dinov2_keys)
         self.model.eval()
         self.model.requires_grad_(False)
         self.use_cls_token = use_cls_token
@@ -212,7 +247,9 @@ def build_image_encoder(config):
         raise ValueError(f"Unknown image encoder type: {config['type']}")
 
 
-class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class DualImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",
@@ -249,7 +286,9 @@ class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         return outputs
 
 
-class SingleImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class SingleImageEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",

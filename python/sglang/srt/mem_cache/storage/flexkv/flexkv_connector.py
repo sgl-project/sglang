@@ -2,7 +2,7 @@
 
 The public surface is small (see "Public API" below). The class owns:
 
-* the FlexKV ``KVManager`` (server-client mode when ``dp_size > 1`` or
+* the FlexKV ``KVManager`` (server-client mode when ``num_dp_ranks > 1`` or
   multi-instance; in-process otherwise — handled by FlexKV itself);
 * the per-rank ``KVTPClient`` that registers this rank's GPU KV cache
   with the FlexKV TransferManager;
@@ -586,22 +586,6 @@ class FlexKVConnector:
         if self._sync_ctx.needs_sync:
             completed_handles = self._sync_ctx.scatter(completed_handles)
         return completed_handles
-
-    def wait_store(self, handle: CacheRequestHandle, timeout: float = 30.0) -> bool:
-        """Block until a single store task identified by ``handle`` finishes."""
-        fkv_task_id = self._inflight_stores.pop(handle, -1)
-        if fkv_task_id < 0:
-            return True
-        if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
-            return True
-        try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[FlexKV] wait_store: %s", exc)
-            return False
-        return (
-            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-        )
 
     # ------------------------------------------------------------------
     # Public API — prefetch
