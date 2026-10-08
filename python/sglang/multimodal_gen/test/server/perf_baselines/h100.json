@@ -1559,7 +1559,7 @@
                 "LatentPreparationStage": 0.11,
                 "TimestepPreparationStage": 2.13,
                 "DenoisingStage": 12704.94,
-                "DecodingStage": 1098.67
+                "DecodingStage": 2172.17
             },
             "denoise_step_ms": {
                 "0": 152.87,
@@ -1613,7 +1613,7 @@
                 "48": 257.43,
                 "49": 254.6
             },
-            "expected_e2e_ms": 14853.56,
+            "expected_e2e_ms": 15599.56,
             "expected_avg_denoise_ms": 253.29,
             "expected_median_denoise_ms": 256.21,
             "load_peak_vram_mb": 17610.0,
@@ -1761,14 +1761,14 @@
                 "TimestepPreparationStage": 30.08,
                 "LatentPreparationStage": 0.1,
                 "DmdDenoisingStage": 252.46,
-                "DecodingStage": 1073.1
+                "DecodingStage": 2173.4
             },
             "denoise_step_ms": {
                 "0": 35.0,
                 "1": 25.92,
                 "2": 112.67
             },
-            "expected_e2e_ms": 2444.17,
+            "expected_e2e_ms": 3073.51,
             "expected_avg_denoise_ms": 83.86,
             "expected_median_denoise_ms": 112.67,
             "load_peak_vram_mb": 17610.0,
