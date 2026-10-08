@@ -22,7 +22,9 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import functools
 import threading
+import warnings
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -153,17 +155,21 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
-    captured args lets the shared mempool reclaim per-layer intermediates
-    between segments — storage stays alive for each segment CUDAGraph's
-    lifetime via its pool use_count.
+    """Return a weak-ref view for nonempty accelerator tensors; recurse into
+    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
+    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
+    intermediates between segments — storage stays alive for each segment
+    CUDAGraph's lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
     an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
-        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+        if x.numel() == 0 or x.device.type == "cpu":
+            return x
+        from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
+            weak_ref_tensors,
+        )
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
@@ -213,11 +219,27 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
-    def decorator(inner: Callable):
-        if not enable:
-            return inner
+def eager_on_graph(
+    fn: Optional[Callable] = None,
+    capture_stub: Optional[Callable] = None,
+    *,
+    enable: Optional[bool] = None,
+):
+    """Record an eager call between captured segments.
 
+    Arguments retain their capture-time identity. Tensors must use the static
+    buffers owned by the graph runner; request-specific state must be read
+    inside the eager function at execution time.
+    """
+
+    # Transitional support while model callers migrate to the bare decorator.
+    if isinstance(fn, bool):
+        enable, fn = fn, None
+    if enable is False:
+        return lambda inner: inner
+
+    def decorator(inner: Callable):
+        @functools.wraps(inner)
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None:
@@ -266,7 +288,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
         return wrapper
 
-    return decorator
+    return decorator(fn) if fn is not None else decorator
 
 
 class BreakableCUDAGraph:
@@ -394,14 +416,18 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
-        graph.capture_end()
+        # A segment that enqueued no kernels (back-to-back breaks, or a segment
+        # whose ops all ran eagerly) captures an empty graph, which replays as a
+        # no-op. Torch warns about it on every such capture_end; expected here.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
+            graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
 
 
-@eager_on_graph(True)
+@eager_on_graph
 def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
-    pass

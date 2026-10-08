@@ -18,6 +18,8 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -35,6 +37,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.attention.autotune import (
+    install as install_attention_backend_autotune,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
@@ -42,7 +47,14 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
+    get_request_skip_softmax_params,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_attn_backend_context,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
@@ -62,7 +74,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -78,6 +90,10 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+
+# Set ``SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK=1`` to drop the SP tail-pad mask
+# and run dense attention on the padded layout.
+_SP_PAD_MASK_DISABLED = envs.SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK
 
 
 def _resolve_sp_attention_mode(
@@ -344,6 +360,18 @@ def apply_attention_backend_override(
     layer.backend = target
 
 
+def supports_skip_softmax(layer: nn.Module) -> bool:
+    return (
+        not layer.is_cross_attention
+        and layer.head_size in (128, 256)
+        and layer.dtype in (torch.float16, torch.bfloat16)
+        and (
+            layer._required_attention_backend is None
+            or layer.backend is AttentionBackendEnum.FA
+        )
+    )
+
+
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""
 
@@ -357,6 +385,7 @@ class UlyssesAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -392,10 +421,14 @@ class UlyssesAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -404,6 +437,7 @@ class UlyssesAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -658,10 +692,14 @@ class LocalAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             causal=causal,
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -670,6 +708,7 @@ class LocalAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
 
     def forward(
@@ -697,6 +736,13 @@ class LocalAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
 
         if attn_mask is not None:
+            if (
+                not self.is_cross_attention
+                and get_request_skip_softmax_params() is not None
+            ):
+                raise NotImplementedError(
+                    "Skip Softmax does not support LocalAttention masks."
+                )
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
@@ -721,7 +767,7 @@ class LocalAttention(nn.Module):
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -821,10 +867,14 @@ class USPAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=num_kv_heads,
             prefix=f"{prefix}.impl",
+            is_cross_attention=is_cross_attention,
             **extra_impl_args,
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -833,6 +883,7 @@ class USPAttention(nn.Module):
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
         self._required_attention_backend = required_attention_backend
+        self.is_cross_attention = is_cross_attention
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
@@ -897,6 +948,14 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        if (
+            attn_mask is not None
+            and get_request_skip_softmax_params() is not None
+            and not self.is_cross_attention
+        ):
+            raise NotImplementedError(
+                "Skip Softmax does not support USPAttention masks."
+            )
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
@@ -934,6 +993,15 @@ class USPAttention(nn.Module):
             if isinstance(attn_mask_meta, DynamicVarlenMaskMeta)
             else attn_mask
         )
+
+        if (
+            _SP_PAD_MASK_DISABLED
+            and attn_mask is None
+            and not effective_skip_sp
+            and get_sequence_parallel_world_size() > 1
+        ):
+            attn_mask_meta = None
+
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -1143,12 +1211,23 @@ class USPAttention(nn.Module):
                     k = torch.cat([k_prefix, k], dim=1)
                     v = torch.cat([v_prefix, v], dim=1)
 
+                # an all-valid key mask masks nothing; the dense SDPA mask below
+                # would pin a slow kernel (cutlassF on sm100)
+                if (
+                    attn_mask_meta is not None
+                    and "indices" in attn_mask_meta
+                    and attn_mask.dim() == 2
+                    and not torch.is_floating_point(attn_mask)
+                    and attn_mask_meta["indices"].shape[0] == attn_mask.numel()
+                ):
+                    return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
                     else nullcontext()
                 )
@@ -1166,13 +1245,13 @@ class USPAttention(nn.Module):
             if get_ring_parallel_world_size() > 1:
                 if (
                     meta_only_pad
-                    and q.shape[0] == 1
                     and self.backend == AttentionBackendEnum.FA
+                    and not self.causal
                 ):
                     return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
                     "USPAttention masked path supports ring parallelism only "
-                    "for batch-1 tail-pad metadata on the FA backend."
+                    "for non-causal tail-pad metadata on the FA backend."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1320,7 +1399,7 @@ class USPAttention(nn.Module):
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -1426,15 +1505,15 @@ class USPAttention(nn.Module):
             attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
-        )
+        ).reshape_as(q)
         # Match the Ulysses tail path: masked query rows read as zeros. This
         # rank's chunk covers global rows [rank*chunk, (rank+1)*chunk).
         pad_from = (
-            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[0]
+            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[1]
         )
-        if pad_from < out.shape[0]:
-            out[max(pad_from, 0) :].zero_()
-        return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
+        if pad_from < out.shape[1]:
+            out[:, max(pad_from, 0) :].zero_()
+        return _usp_output_all_to_all(out, head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
@@ -1447,15 +1526,19 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
+        # slicing along dim 1 keeps the original row stride, so the shard is
+        # contiguous only while the batch dim is 1; all_gather_into_tensor
+        # requires a contiguous input, so materialize the shard before the
+        # collective
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
-            sharded = tensor[:, num_replicated_prefix:]
+            sharded = tensor[:, num_replicated_prefix:].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([replicated, gathered], dim=1)
 
         if num_replicated_suffix:
             replicated = tensor[:, -num_replicated_suffix:]
-            sharded = tensor[:, :-num_replicated_suffix]
+            sharded = tensor[:, :-num_replicated_suffix].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
@@ -1607,7 +1690,7 @@ class USPAttention(nn.Module):
             v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
@@ -1826,7 +1909,7 @@ class USPAttention(nn.Module):
         v_ = v.transpose(1, 2)
         mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
@@ -2060,3 +2143,29 @@ for _attn_cls in (
 ):
     _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
 del _attn_cls
+
+
+def _maybe_install_backend_autotune(
+    layer, backend, required_attention_backend: AttentionBackendEnum | None
+) -> None:
+    """Opt-in: let the layer pick its backend by measurement on its first big call."""
+    try:
+        server_args = server_args_module.get_global_server_args()
+        if not server_args.enable_attention_backend_autotune:
+            return
+    except Exception:  # no ServerArgs yet (unit tests, tooling)
+        return
+    component_context = get_component_attn_backend_context()
+    if (
+        required_attention_backend is not None
+        or get_global_forced_attn_backend() is not None
+        or (
+            component_context is not None
+            and component_context.require_backend_selection
+        )
+        or server_args.is_arg_explicitly_set("attention_backend")
+    ):
+        return
+    layer.backend = backend
+    layer._default_attn_backend = backend
+    install_attention_backend_autotune(layer)

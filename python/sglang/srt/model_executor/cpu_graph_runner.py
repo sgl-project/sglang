@@ -468,6 +468,19 @@ def register_fake_ops(tp_size: int):
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
+    @register_cpu_compile_fake("fp8_per_tensor_scaled_mm_cpu")
+    def _(
+        mat1,
+        mat2,
+        scale2,
+        bias,
+        out_dtype,
+        is_vnni,
+    ):
+        M = mat1.shape[0]
+        N = mat2.shape[0]
+        return mat1.new_empty(M, N, dtype=out_dtype)
+
     @register_cpu_compile_fake("mxfp4_scaled_mm_cpu")
     def _(mat1, mat2, scales2, bias, is_vnni):
         sizes = list(mat1.shape)
@@ -596,21 +609,17 @@ class CPUGraphRunner:
         self.graphs_cross = {}
         self.output_buffers = {}
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer()
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
-        )
+        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.speculative_algorithm = get_spec().speculative_algorithm
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -635,7 +644,7 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
+        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture
@@ -741,7 +750,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.captured_req_width,
-                tp_group=self.model_runner.tp_group,
+                tp_group=get_parallel().tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
                     bs, forward, skip_cross_attention=True
@@ -822,6 +831,7 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -844,7 +854,7 @@ class CPUGraphRunner:
                     forward_batch.spec_info,
                 )
                 with torch.no_grad():
-                    self.model_runner.tp_group.barrier()
+                    get_parallel().tp_group.barrier()
                     self.model_runner.model.forward(
                         forward_batch.input_ids,
                         forward_batch.positions,
@@ -866,7 +876,7 @@ class CPUGraphRunner:
 
                 with torch.no_grad():
                     for _ in range(2):
-                        self.model_runner.tp_group.barrier()
+                        get_parallel().tp_group.barrier()
                         out = run_once()
                     # Save the captured forward_batch in the appropriate dict
                     if skip_cross_attention:
@@ -940,8 +950,10 @@ class CPUGraphRunner:
             )
             captured_forward_batch.encoder_out_cache_loc = None
         if enable_num_token_non_padded():
+            # CPUGraphRunner asserts not require_gathered_buffer, so this path is
+            # never attn-TP sharded: LOCAL == GLOBAL.
             captured_forward_batch.num_token_non_padded.copy_(
-                forward_batch.num_token_non_padded
+                forward_batch.global_num_token_non_padded
             )
 
         self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)

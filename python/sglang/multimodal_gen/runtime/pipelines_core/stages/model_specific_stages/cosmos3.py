@@ -206,9 +206,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        return VerificationResult()
-
     def _load_control_video(
         self,
         control_path: str,
@@ -1063,6 +1060,11 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
 
 
 class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /

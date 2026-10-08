@@ -6,6 +6,7 @@ use crate::server::error::ApiError;
 use crate::tokenizer::adapter;
 use axum::extract::State;
 use axum::Json;
+use dynamo_tokenizers::Tokenizer;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -40,14 +41,22 @@ pub struct DetokenizeResponse {
     pub text: String,
 }
 
+/// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
+fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
+    ctx.tokenizers.get(model).ok_or_else(|| {
+        if model == ctx.config.model.id {
+            ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
+        } else {
+            ApiError::ModelNotFound(model.to_owned())
+        }
+    })
+}
+
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
-    let tok = ctx
-        .tokenizers
-        .get(&req.model)
-        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+    let tok = tokenizer_for(&ctx, &req.model)?;
     // Structured log on failure so an operator can correlate
     // "every encode for model X errors" against the route, model id, and
     // prompt size. The generic anyhow-chain log in ApiError::Internal still
@@ -75,10 +84,7 @@ pub async fn detokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, ApiError> {
-    let tok = ctx
-        .tokenizers
-        .get(&req.model)
-        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+    let tok = tokenizer_for(&ctx, &req.model)?;
     let text =
         adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
             tracing::error!(
@@ -112,17 +118,28 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "x".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
-                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
+                disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                dp_aware: false,
+                bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -130,7 +147,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            active_load: crate::config::ActiveLoadConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(
@@ -334,6 +351,24 @@ mod tests {
             d_explicit.text, d_omitted.text,
             "explicit skip_special_tokens=false must produce same result as omitted"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_tokenizer_is_a_bad_request() {
+        let mut ctx = ctx_with_tiny();
+        Arc::get_mut(&mut ctx).unwrap().tokenizers = Default::default();
+        let res = crate::server::app::build_router(ctx)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"tiny","prompt":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

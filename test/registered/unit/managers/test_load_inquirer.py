@@ -12,7 +12,7 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
@@ -43,7 +43,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 class TestSchedulerLoadInquirer(unittest.TestCase):
     def make_inquirer(self, waiting_queue_prefix_matched):
         waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
-        chunked_req = SimpleNamespace(seqlen=50, prefix_indices=range(10))
+        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
         return SimpleNamespace(
             disaggregation_mode=DisaggregationMode.NULL,
             get_waiting_queue=lambda: [waiting_req],

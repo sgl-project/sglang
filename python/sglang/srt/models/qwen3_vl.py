@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -27,7 +28,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -37,11 +37,19 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearParallelGroup,
+    RowParallelLinear,
+    resolve_linear_parallel_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -71,6 +79,12 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
@@ -102,23 +116,16 @@ _is_cpu = is_cpu()
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
-def _resolve_vision_tp(
+def _resolve_vision_parallel_group(
     *,
     use_data_parallel: bool,
-    tp_size: Optional[int],
-    tp_rank: Optional[int],
-) -> tuple[int, int]:
+    parallel_group: Optional[LinearParallelGroup],
+) -> LinearParallelGroup:
     if use_data_parallel:
-        if tp_size is not None or tp_rank is not None:
+        if parallel_group is not None:
             raise ValueError("Explicit vision TP cannot be combined with data parallel")
-        return 1, 0
-    if (tp_size is None) != (tp_rank is None):
-        raise ValueError("Vision tp_size and tp_rank must be set together")
-    if tp_size is None:
-        parallel = get_parallel()
-        return parallel.attn_tp_size, parallel.attn_tp_rank
-    assert tp_rank is not None
-    return tp_size, tp_rank
+        return "replicated"
+    return "attn_tp" if parallel_group is None else parallel_group
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -131,14 +138,22 @@ class Qwen3_VisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+        parallel_group = _resolve_vision_parallel_group(
+            use_data_parallel=use_data_parallel, parallel_group=parallel_group
+        )
+        _, tp_size = resolve_linear_parallel_group(parallel_group)
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
         )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
@@ -146,17 +161,16 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
+        self.tp_group = self.linear_fc1.tp_group
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
@@ -287,45 +301,55 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
+        disable_merger_proj: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.disable_merger_proj = disable_merger_proj
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.padded_context_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = RowParallelLinear(
-            self.padded_context_dim,
-            dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
-        )
+        if not disable_merger_proj:
+            parallel_group = _resolve_vision_parallel_group(
+                use_data_parallel=use_data_parallel, parallel_group=parallel_group
+            )
+            _, tp_size = resolve_linear_parallel_group(parallel_group)
+            # TODO: this layer shards over attention TP but reduces over the full TP
+            # group without attention DP; reduce over the attention-TP group so
+            # attention CP narrower than TP can run it.
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=tp_size,
+                reduces_over_attn_tp=is_dp_attention_enabled(),
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
+            )
+            self.linear_fc1 = ColumnParallelLinear(
+                self.hidden_size,
+                self.padded_context_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc1", prefix),
+                parallel_group=parallel_group,
+            )
+            self.tp_group = self.linear_fc1.tp_group
+            self.act_fn = nn.GELU()
+            self.linear_fc2 = RowParallelLinear(
+                self.padded_context_dim,
+                dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc2", prefix),
+                parallel_group=parallel_group,
+                use_dp_attention_reduce=is_dp_attention_enabled(),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_postshuffle_norm:
@@ -333,10 +357,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
-        x_parallel, _ = self.linear_fc1(x)
-        x_parallel = self.act_fn(x_parallel)
-        out, _ = self.linear_fc2(x_parallel)
-        return out
+        if not self.disable_merger_proj:
+            x_parallel, _ = self.linear_fc1(x)
+            x_parallel = self.act_fn(x_parallel)
+            x, _ = self.linear_fc2(x_parallel)
+        return x
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
@@ -349,7 +374,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -363,9 +388,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_hidden_size = vision_config.out_hidden_size * (
-            1 + len(self.deepstack_visual_indexes)
+        self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
+        merger_out_dim = (
+            self.hidden_size * self.spatial_merge_unit
+            if self.disable_merger_proj
+            else vision_config.out_hidden_size
         )
+        self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
@@ -435,6 +464,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            disable_merger_proj=self.disable_merger_proj,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -449,6 +479,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    disable_merger_proj=self.disable_merger_proj,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -1029,6 +1060,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
 
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         cu_seqlens = cu_seqlens.to("cpu")
         return self.graph_runners.run(
             x=x,
@@ -1036,6 +1068,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def forward_with_cuda_graph(
@@ -1186,21 +1219,23 @@ class Qwen3LLMModel(Qwen3Model):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            capture_output = (
+                aux_hidden_states.capture
+                if layer_idx in self.layers_to_capture
+                else None
+            )
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -1209,29 +1244,31 @@ class Qwen3LLMModel(Qwen3Model):
                 deepstack_embeds = self.get_deepstack_embeds(
                     layer_idx - 1, input_deepstack_embeds
                 )
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     post_residual_addition=deepstack_embeds,
+                    capture_output=capture_output,
                 )
             else:
                 # Inference path: add deepstack directly to hidden_states at the end of the layer
                 # (original, grounding-correct order).
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
+                    capture_output=capture_output,
                 )
                 if (
                     input_deepstack_embeds is not None
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states.add_(
-                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    hidden_states = residual_batch.add_to_output(
+                        hidden_states,
+                        forward_batch,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
         # Handle deepstack for the last processed layer (HF-order path only).
@@ -1242,20 +1279,14 @@ class Qwen3LLMModel(Qwen3Model):
         )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
-                    )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            post_residual_addition=last_deepstack,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1289,7 +1320,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -1365,7 +1396,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config.vision_config.deepstack_visual_indexes
             )
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+            # Only enable deepstack when the checkpoint declares deepstack
+            # capture layers (Qwen4-Exp ships an empty list).
+            self.use_deepstack = (
+                {Modality.IMAGE: True, Modality.VIDEO: True}
+                if self.num_deepstack_embeddings > 0
+                else {}
+            )
         else:
             self.deepstack_visual_indexes = []
             self.num_deepstack_embeddings = 0
@@ -1397,7 +1434,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -1427,13 +1464,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pixel_values_device=self.visual.device,
                 pixel_values_dtype=self.visual.dtype,
             )
-        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+            items, range(len(items)), preserve_for_reprefill=True
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
-        return self.visual(pixel_values, grid_thw=grid_thw)
+        visual_features = self.visual(pixel_values, grid_thw=grid_thw)
+        if borrowed_items:
+            self._offload_packed_visual_inputs(
+                pixel_values, borrowed_items, packed_ready
+            )
+        return visual_features
 
     def _materialize_visual_items(
-        self, items: List[MultimodalDataItem], indices: Iterable[int]
-    ) -> torch.Tensor:
+        self,
+        items: List[MultimodalDataItem],
+        indices: Iterable[int],
+        preserve_for_reprefill: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         device = self.visual.device
         device_index = device.index
         if device.type == "cuda" and device_index is None:
@@ -1443,14 +1490,114 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             consumer_count = max(parallel.tp_size, 1)
 
         features = []
+        borrowed_items = []
+        feature_offset = 0
         for index in indices:
             item = items[index]
             if device.type == "cuda":
-                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+                proxy = item.feature
+                model_specific_data = getattr(item, "model_specific_data", {})
+                pending_copy = model_specific_data.pop(
+                    CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
+                )
+                if pending_copy is not None:
+                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
+                borrow_requested = model_specific_data.pop(
+                    BORROW_CUDA_IPC_FEATURE_KEY, False
+                )
+                can_borrow = (
+                    preserve_for_reprefill
+                    and consumer_count == 1
+                    and isinstance(proxy, CudaIpcTensorTransportProxy)
+                    and borrow_requested
+                )
+                borrowed = (
+                    proxy.borrow_on_target_device(device_index) if can_borrow else None
+                )
+                if borrowed is not None:
+                    item.feature = borrowed
+                    model_specific_data[RETAINED_CUDA_IPC_FEATURE_PROXY_KEY] = proxy
+                    borrowed_items.append(
+                        (item, proxy, feature_offset, borrowed.shape[0])
+                    )
+                elif RETAINED_CUDA_IPC_FEATURE_PROXY_KEY not in model_specific_data:
+                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
             features.append(item.feature)
-        return materialize_multimodal_features(
-            features, device=device, dtype=self.visual.dtype
-        )
+            feature_offset += item.feature.shape[0]
+        try:
+            materialized = materialize_multimodal_features(
+                features, device=device, dtype=self.visual.dtype
+            )
+        except Exception:
+            for item, proxy, _, _ in borrowed_items:
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a borrowed CUDA IPC feature after "
+                        "materialization failed",
+                        exc_info=True,
+                    )
+                item.feature = None
+            raise
+        packed_ready = None
+        if borrowed_items:
+            source_stream = torch.cuda.current_stream(device_index)
+            packed_ready = torch.cuda.Event()
+            packed_ready.record(source_stream)
+            for item, proxy, offset, length in borrowed_items:
+                item.feature = materialized.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = packed_ready
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a copied CUDA IPC feature; retaining "
+                        "its lease until request cleanup",
+                        exc_info=True,
+                    )
+        if preserve_for_reprefill:
+            return materialized, borrowed_items, packed_ready
+        return materialized
+
+    def _offload_packed_visual_inputs(
+        self, materialized: torch.Tensor, borrowed_items: list, packed_ready
+    ) -> None:
+        """Preserve inputs for re-prefill without delaying the ViT launch."""
+        try:
+            host_features = torch.empty(
+                materialized.shape,
+                dtype=materialized.dtype,
+                device="cpu",
+                pin_memory=torch.cuda.is_available(),
+            )
+            copy_stream = getattr(self, "_mm_feature_copy_stream", None)
+            if copy_stream is None:
+                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                self._mm_feature_copy_stream = copy_stream
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(packed_ready)
+                host_features.copy_(materialized, non_blocking=True)
+                host_ready = torch.cuda.Event()
+                host_ready.record(copy_stream)
+            if materialized.is_cuda:
+                materialized.record_stream(copy_stream)
+            for item, _, offset, length in borrowed_items:
+                item.feature = host_features.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
+        except Exception:
+            # The generic multimodal path will offload the owned CUDA slices.
+            logger.warning(
+                "Failed to preserve CUDA IPC features on the copy stream; "
+                "falling back to the generic offload path",
+                exc_info=True,
+            )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1595,10 +1742,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading visual/language model weights
-                if (
-                    self.config.encoder_only or self.config.language_only
-                ) and name not in params_dict:
+                # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
+                # that were remapped gate_proj -> gate_up_proj but are not params).
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1630,17 +1776,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 def _require_vision(model) -> None:

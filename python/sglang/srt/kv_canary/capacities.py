@@ -3,6 +3,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
+from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
@@ -115,4 +119,15 @@ class CanaryLaunchCapacities:
             per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=max_bs,
             per_forward_write_entry_capacity=write_entry_capacity,
+        )
+
+    def per_forward_workspace_bytes(self, *, num_buffer_groups: int) -> int:
+        return (
+            num_buffer_groups
+            * (
+                VerifyPlan.allocation_bytes(self.per_forward_verify_capacity)
+                + WritePlan.allocation_bytes(self.per_forward_write_req_capacity)
+            )
+            + ExpectedInputs.allocation_bytes(self.per_forward_write_entry_capacity)
+            + PlanInput.allocation_bytes(self.per_forward_write_req_capacity)
         )
