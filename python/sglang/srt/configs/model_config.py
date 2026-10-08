@@ -122,13 +122,13 @@ def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
-    if layout is None:
+    if layout in (None, "split"):
         return None
     if layout != "fused_qkv":
         raise ValueError(
             "MiMoV2 hf_config has unsupported "
-            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
-            "or unset."
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv', "
+            "'split' or unset."
         )
 
     num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
@@ -255,6 +255,10 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) == "DSparkDraftModel"
 
 
+# The decision_config.json attention mode whose full-attention layers read the whole prompt.
+NONCAUSAL_FULL_ATTENTION = "noncausal_full_attention"
+
+
 @lru_cache
 def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
     """decision_config.json of a checkpoint whose LM head is a decision readout."""
@@ -272,6 +276,17 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
         raise ValueError(
             f"decision_config.json format_version {config['format_version']} "
             "is not supported, only version 1 is"
+        )
+    # Serving a mode this loader does not honor would silently change the answers.
+    attention_mode = config.get("attention_mode", "causal")
+    if attention_mode not in ("causal", NONCAUSAL_FULL_ATTENTION):
+        raise ValueError(
+            f"decision_config.json attention_mode {attention_mode!r} is not supported"
+        )
+    pooling = config.get("pooling", "last")
+    if pooling != "last":
+        raise ValueError(
+            f"decision_config.json pooling {pooling!r} is not supported, only 'last' is"
         )
     return config
 
@@ -523,6 +538,12 @@ class ModelConfig:
             if self.decision_config is not None:
                 # A bare backbone whose readout the loader places in the LM head.
                 self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+                if (
+                    self.decision_config.get("attention_mode")
+                    == NONCAUSAL_FULL_ATTENTION
+                ):
+                    # Full attention sees the whole prompt, while linear attention stays causal.
+                    self.hf_text_config.is_causal = False
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )

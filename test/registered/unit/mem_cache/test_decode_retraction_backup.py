@@ -589,7 +589,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         cached_indices = queue._pre_alloc(cached)
         self._seed_pool(env.target_pool, cached_indices, base=500)
         cached_values = self._snapshot_pool(env.target_pool, cached_indices)
-        cache.checkpoint(cached, up_to=cached.extend_range.end)
+        cache.checkpoint(cached, up_to=cached.extend_end)
         pressure = env.allocator.alloc(self.pool_size // 2 - 4)
 
         req = make_req("receiving", 8)
@@ -614,11 +614,11 @@ class TestDecodeRetractionBackup(CustomTestCase):
         # Prebuilt preparation retains the full-transfer/root state, then
         # restores before normal cache insertion deduplicates the prefix.
         req.init_next_round_input(None)
-        req.set_extend_range(0, 8)
+        req.extend_end = 8
         restore_kv_cache(req, cache, env.req_to_token_pool, env.allocator, "host_pool")
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
         free_before_insert = env.allocator.available_size()
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         row = env.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :8]
         self.assertTrue(torch.equal(row[:4], cached_indices))
