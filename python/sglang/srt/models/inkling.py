@@ -1017,7 +1017,11 @@ class InklingForConditionalGeneration(nn.Module):
         )
 
         inkling_quant_config = get_quantization_config(
-            SimpleNamespace(hf_config=self.config, model_path=get_model().model_path)
+            SimpleNamespace(
+                hf_config=self.config,
+                model_path=get_model().model_path,
+                revision=get_model().revision,
+            )
         )
         if inkling_quant_config is not None:
             quant_config = inkling_quant_config

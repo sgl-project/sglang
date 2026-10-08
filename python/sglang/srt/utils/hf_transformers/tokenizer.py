@@ -63,7 +63,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     import transformers
 
     try:
-        revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
+        revision = kwargs.get("revision")
         config_file = _resolve_local_or_cached_file(
             tokenizer_name, "tokenizer_config.json", revision
         )
@@ -472,7 +472,7 @@ def get_tokenizer(
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
-    tokenizer_revision: Optional[str] = None,
+    revision: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
@@ -512,13 +512,13 @@ def get_tokenizer(
 
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
-        tokenizer_revision=tokenizer_revision,
+        revision=revision,
         clean_up_tokenization_spaces=False,
         **kwargs,
     )
 
     try:
-        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+        if is_bare_tekken_checkpoint(tokenizer_name, revision):
             from transformers.tokenization_mistral_common import (
                 MistralCommonTokenizer,
             )
@@ -532,7 +532,7 @@ def get_tokenizer(
             )
 
             tokenizer = MistralCommonTokenizer.from_pretrained(
-                tokenizer_name, revision=tokenizer_revision
+                tokenizer_name, revision=revision
             )
         else:
             tokenizer = _auto_tokenizer_from_pretrained(
@@ -550,7 +550,7 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(tokenizer, tokenizer_name, revision)
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(
