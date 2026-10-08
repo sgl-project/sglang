@@ -67,46 +67,30 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                     DeepseekV4AttnBackend._low_ratio_prefill_indexer_metadata(
                         backend, core, 1
                     )
-                    self.assertEqual(metadata_ctor.call_args.kwargs["row_chunk"], 2048)
+                    self.assertEqual(
+                        metadata_ctor.call_args.kwargs["row_chunk"],
+                        min(2048, (2048 * 16384) // context),
+                    )
 
             with envs.SGLANG_DSV41_BCG_DENSE_INDEXER.override(True):
                 max_context.return_value = 32768
                 DeepseekV4AttnBackend._low_ratio_prefill_indexer_metadata(
                     backend, core, 1
                 )
-                self.assertEqual(metadata_ctor.call_args.kwargs["row_chunk"], 2048)
-                self.assertTrue(metadata_ctor.call_args.kwargs["use_topk_v2"])
+                self.assertEqual(metadata_ctor.call_args.kwargs["row_chunk"], 1024)
+                self.assertFalse(metadata_ctor.call_args.kwargs["use_topk_v2"])
 
-    def test_dsv41_bcg_dense_k_layout_uses_live_request_order(self):
+    def test_dsv41_bcg_dense_offsets_use_live_request_order(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _prefill_graph_dense_k_layout,
+            _prefill_graph_dense_k_offsets,
         )
 
-        req_to_token = torch.arange(8)[:, None] * 1000 + torch.arange(10)[None, :] * 2
-        pool = SimpleNamespace(
-            get_low_ratio_index_k_fp4=lambda layer, slots: (
-                slots[:, None].expand(-1, 64).contiguous(),
-                slots.clone(),
-            )
-        )
-        ks, slots, packed = _prefill_graph_dense_k_layout(
-            req_to_token,
-            pool,
-            1,
-            2,
+        ks = _prefill_graph_dense_k_offsets(
             5,
             torch.tensor([7, 3, 7, 3]),
             torch.tensor([7, 3, 0, 0, 0, 0, 0, 0]),
-            torch.tensor([8, 6, 0, 0, 0, 0, 0, 0]),
         )
         torch.testing.assert_close(ks, torch.tensor([0, 5, 0, 5], dtype=torch.int32))
-        torch.testing.assert_close(
-            slots[:10],
-            torch.tensor([3500, 3502, 3504, 3506, 0, 1500, 1502, 1504, 0, 0]),
-        )
-        self.assertEqual(slots.shape, (40,))
-        torch.testing.assert_close(packed[0][:, 0], slots)
-        torch.testing.assert_close(packed[1], slots)
 
     def test_dsv41_dense_logits_offsets_are_int32(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
