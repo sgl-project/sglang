@@ -994,12 +994,40 @@ def validate_mesh_correctness(
     cd_threshold_ratio: float = 0.01,
     random_seed: int = 42,
 ):
-    """Validate mesh geometric similarity against a reference via Chamfer Distance.
+    """Validate mesh similarity using a scale-invariant squared Chamfer score.
 
-    Downloads the reference mesh from a URL (cached), samples point clouds from
-    both meshes, and asserts Chamfer Distance is within threshold.
+    With D the reference bounding-box diagonal, the score is the sum of the
+    two directional mean squared nearest-neighbor distances divided by D**2.
+    It must be <= cd_threshold_ratio: 0.01 is a normalized squared-distance
+    sum, not a 1% RMS distance. Neither mesh is independently aligned or scaled.
+    Sampling uses independent local RNGs seeded with random_seed and seed + 1.
+    The reference download is cached. Success returns None.
     """
+    from numbers import Integral, Real
+
     import numpy as np
+
+    for name, value, minimum in (
+        ("num_sample_points", num_sample_points, 1),
+        ("random_seed", random_seed, 0),
+    ):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Integral)
+            or value < minimum
+        ):
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    try:
+        valid_ratio = (
+            isinstance(cd_threshold_ratio, Real)
+            and math.isfinite(cd_threshold_ratio)
+            and cd_threshold_ratio >= 0
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid_ratio = False
+    if not valid_ratio:
+        raise ValueError("cd_threshold_ratio must be finite and nonnegative")
+    num_sample_points, random_seed = int(num_sample_points), int(random_seed)
 
     try:
         import trimesh
@@ -1008,41 +1036,79 @@ def validate_mesh_correctness(
 
     from scipy.spatial import cKDTree
 
-    # Load generated mesh
-    generated_mesh = trimesh.load(generated_mesh_path)
-    if isinstance(generated_mesh, trimesh.Scene):
-        generated_mesh = generated_mesh.dump(concatenate=True)
+    def load_mesh(path, label):
+        try:
+            # Preserve invalid coordinates for validation instead of silently
+            # removing them during trimesh's default processing.
+            mesh = trimesh.load(str(path), process=False)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+        except Exception as exc:
+            raise AssertionError(
+                f"Invalid {label} mesh: failed to load {path}: {exc}"
+            ) from exc
+        assert (
+            isinstance(mesh, trimesh.Trimesh)
+            and len(mesh.vertices) > 0
+            and len(mesh.faces) > 0
+            and mesh.faces.ndim == 2
+            and mesh.faces.shape[1] == 3
+            and mesh.faces.min() >= 0
+            and mesh.faces.max() < len(mesh.vertices)
+        ), f"Invalid {label} mesh: expected a non-empty triangle mesh"
+        assert np.isfinite(mesh.vertices).all(), (
+            f"Invalid {label} mesh: non-finite coordinates"
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            area = mesh.area
+        assert np.isfinite(area) and area > 0, (
+            f"Invalid {label} mesh: area must be finite and positive (area={area})"
+        )
+        return mesh
 
-    # Download and load reference mesh
-    ref_path = _download_reference_mesh(reference_url)
-    reference_mesh = trimesh.load(str(ref_path))
-    if isinstance(reference_mesh, trimesh.Scene):
-        reference_mesh = reference_mesh.dump(concatenate=True)
+    generated_mesh = load_mesh(generated_mesh_path, "generated")
+    reference_mesh = load_mesh(_download_reference_mesh(reference_url), "reference")
 
-    # Bounding box diagonal for threshold normalization
-    ref_bbox = reference_mesh.bounding_box.bounds
-    bbox_diagonal = float(np.linalg.norm(ref_bbox[1] - ref_bbox[0]))
-    cd_threshold = cd_threshold_ratio * bbox_diagonal
-
-    # Sample point clouds
-    np.random.seed(random_seed)
-    gen_points = np.array(
-        generated_mesh.sample(num_sample_points, return_index=True)[0]
+    with np.errstate(over="ignore", invalid="ignore"):
+        bounds = reference_mesh.bounds
+        bbox_diagonal = float(np.linalg.norm(bounds[1] - bounds[0]))
+    assert np.isfinite(bbox_diagonal) and bbox_diagonal > 0, (
+        f"Invalid reference mesh: bounding-box diagonal must be finite and positive (D={bbox_diagonal})"
     )
-    ref_points = np.array(
-        reference_mesh.sample(num_sample_points, return_index=True)[0]
+    diagonal_squared = bbox_diagonal * bbox_diagonal
+    assert np.isfinite(diagonal_squared) and diagonal_squared > 0, (
+        f"Invalid reference mesh: squared bounding-box diagonal must be finite and positive (D={bbox_diagonal})"
     )
 
-    # Bidirectional Chamfer Distance
-    tree1 = cKDTree(gen_points)
-    tree2 = cKDTree(ref_points)
-    forward_cd = float(np.mean(tree2.query(gen_points)[0] ** 2))
-    backward_cd = float(np.mean(tree1.query(ref_points)[0] ** 2))
-    total_cd = forward_cd + backward_cd
+    def sample_points(mesh, seed, label):
+        try:
+            points, _ = trimesh.sample.sample_surface(
+                mesh, num_sample_points, seed=seed
+            )
+        except Exception as exc:
+            raise AssertionError(f"Failed to sample {label} mesh: {exc}") from exc
+        assert np.isfinite(points).all(), f"Non-finite {label} mesh sampled coordinates"
+        return points
 
-    assert total_cd <= cd_threshold, (
-        f"Chamfer Distance check failed: total_cd={total_cd:.6f}, "
-        f"threshold={cd_threshold:.6f} ({cd_threshold_ratio * 100:.2f}% of bbox diagonal {bbox_diagonal:.4f})"
+    gen_points = sample_points(generated_mesh, random_seed, "generated")
+    ref_points = sample_points(reference_mesh, random_seed + 1, "reference")
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        forward_cd = float(np.mean(cKDTree(ref_points).query(gen_points)[0] ** 2))
+        backward_cd = float(np.mean(cKDTree(gen_points).query(ref_points)[0] ** 2))
+        normalized_cd = (forward_cd + backward_cd) / diagonal_squared
+
+    diagnostics = (
+        f"generated_to_reference_mse={forward_cd:.17g}, "
+        f"reference_to_generated_mse={backward_cd:.17g}, "
+        f"reference_diagonal={bbox_diagonal:.17g}, "
+        f"normalized_cd={normalized_cd:.17g}, threshold={cd_threshold_ratio:.17g}"
+    )
+    logger.info(f"Mesh Chamfer Distance: {diagnostics}")
+    assert np.isfinite([forward_cd, backward_cd, normalized_cd]).all(), (
+        f"Non-finite generated/reference Chamfer Distance: {diagnostics}"
+    )
+    assert normalized_cd <= cd_threshold_ratio, (
+        f"Chamfer Distance check failed: {diagnostics}"
     )
 
 
