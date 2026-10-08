@@ -236,6 +236,153 @@ class MultimodalProcessorMixin:
         """Worker count when none is requested; serving overrides this."""
         return 1
 
+    @staticmethod
+    def _shutdown_broken_cpu_executor(
+        failed_executor: concurrent.futures.ProcessPoolExecutor,
+    ) -> None:
+        try:
+            failed_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.warning(
+                "Failed to shut down a broken multimodal CPU preprocess pool",
+                exc_info=True,
+            )
+
+    @classmethod
+    def _load_single_item(
+        cls,
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
+    ):
+        """
+        Load a single multimodal data.
+
+        If data is processor_output or precomputed embedding, return directly.
+
+        Class method that can be pickled for multiprocessing
+        """
+        if cls._is_preprocessed_input(data):
+            return data
+        try:
+            if modality == Modality.IMAGE:
+                img, _ = load_image(data, cls.gpu_image_decode)
+                if isinstance(img, torch.Tensor):
+                    return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
+                if discard_alpha_channel:
+                    if cls.smart_rgb_conversion:
+                        return smart_to_rgb(img)
+                    if img.mode != "RGB":
+                        return img.convert("RGB")
+                img.load()
+                return img
+            elif modality == Modality.VIDEO:
+                return load_video(data, frame_count_limit)
+            elif modality == Modality.AUDIO:
+                return load_audio(data, audio_sample_rate)
+
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            data_str = str(data)
+            if len(data_str) > 100:
+                data_str = data_str[:100] + "..."
+            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+        except Exception as e:
+            data_str = str(data)
+            if len(data_str) > 100:
+                data_str = data_str[:100] + "..."
+            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+
+    @staticmethod
+    def _get_preprocessed_input_format(data):
+        """returns the detailed format if the provided data is already preprocessed.
+        returns none if the provided data is not preprocessed
+        """
+        if not isinstance(data, dict):
+            return None
+        data_format = data.get("format")
+        if isinstance(data_format, MultimodalInputFormat):
+            return data_format
+        if data_format in (
+            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
+            "processor_output",
+        ):
+            return MultimodalInputFormat.PROCESSOR_OUTPUT
+        if data_format in (
+            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
+            "precomputed_embedding",
+        ):
+            return MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+        return None
+
+    @classmethod
+    def _is_preprocessed_input(cls, data):
+        """returns if the data is already preprocessed (by the vlm processor)"""
+        return cls._get_preprocessed_input_format(data) is not None
+
+    @classmethod
+    def _all_mm_data_is_preprocessed(cls, *data_lists):
+        has_mm_data = False
+        for data_list in data_lists:
+            if not data_list:
+                continue
+            if not isinstance(data_list, list):
+                data_list = [data_list]
+            for item in data_list:
+                if item is None:
+                    continue
+                has_mm_data = True
+                if not cls._is_preprocessed_input(item):
+                    return False
+        return has_mm_data
+
+    @staticmethod
+    def _validate_one_modality(modality: Modality, data_list: Optional[list]):
+        if data_list is None:
+            return
+        if not isinstance(data_list, list):
+            raise TypeError(
+                f"{modality.name} must be a list or None, got {type(data_list)}"
+            )
+
+        formatted_indices = []
+        for idx, item in enumerate(data_list):
+            if MultimodalProcessorMixin._is_preprocessed_input(item):
+                formatted_indices.append(idx)
+
+        if formatted_indices:
+            if len(data_list) != 1:
+                raise ValueError(
+                    f"For {modality}, when providing a 'processor_output' or "
+                    f"'precomputed_embedding', you must pass exactly one item; "
+                    f"received {len(data_list)} items (formatted at indices {formatted_indices})."
+                )
+
+    @staticmethod
+    def validate_mm_data(
+        image_data: Optional[list] = None,
+        video_data: Optional[list] = None,
+        audio_data: Optional[list] = None,
+    ):
+        """
+        Validate multimodal input lists per modality.
+
+        Rule per modality (image/video/audio):
+        - Either the list has exactly one item and that single item is a dict with
+          format in {"processor_output", "precomputed_embedding"};
+        - Or, the list contains only "normal" items (i.e., does not include any
+          item whose format is one of the two above).
+
+        Empty or None lists are considered valid.
+        """
+
+        MultimodalProcessorMixin._validate_one_modality(Modality.IMAGE, image_data)
+        MultimodalProcessorMixin._validate_one_modality(Modality.VIDEO, video_data)
+        MultimodalProcessorMixin._validate_one_modality(Modality.AUDIO, audio_data)
+
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
@@ -557,18 +704,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             name="sglang-mm-cpu-pool-cleanup",
             daemon=True,
         ).start()
-
-    @staticmethod
-    def _shutdown_broken_cpu_executor(
-        failed_executor: concurrent.futures.ProcessPoolExecutor,
-    ) -> None:
-        try:
-            failed_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            logger.warning(
-                "Failed to shut down a broken multimodal CPU preprocess pool",
-                exc_info=True,
-            )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -991,97 +1126,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
         return estimated_frames_list
 
-    @classmethod
-    def _load_single_item(
-        cls,
-        data,
-        modality: Modality,
-        frame_count_limit=None,
-        audio_sample_rate: Optional[int] = None,
-        discard_alpha_channel=True,
-    ):
-        """
-        Load a single multimodal data.
-
-        If data is processor_output or precomputed embedding, return directly.
-
-        Class method that can be pickled for multiprocessing
-        """
-        if cls._is_preprocessed_input(data):
-            return data
-        try:
-            if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
-                if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
-                if discard_alpha_channel:
-                    if cls.smart_rgb_conversion:
-                        return smart_to_rgb(img)
-                    if img.mode != "RGB":
-                        return img.convert("RGB")
-                img.load()
-                return img
-            elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
-            elif modality == Modality.AUDIO:
-                return load_audio(data, audio_sample_rate)
-
-        except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
-        except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
-
-    @staticmethod
-    def _get_preprocessed_input_format(data):
-        """returns the detailed format if the provided data is already preprocessed.
-        returns none if the provided data is not preprocessed
-        """
-        if not isinstance(data, dict):
-            return None
-        data_format = data.get("format")
-        if isinstance(data_format, MultimodalInputFormat):
-            return data_format
-        if data_format in (
-            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
-            "processor_output",
-        ):
-            return MultimodalInputFormat.PROCESSOR_OUTPUT
-        if data_format in (
-            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
-            "precomputed_embedding",
-        ):
-            return MultimodalInputFormat.PRECOMPUTED_EMBEDDING
-        return None
-
-    @classmethod
-    def _is_preprocessed_input(cls, data):
-        """returns if the data is already preprocessed (by the vlm processor)"""
-        return cls._get_preprocessed_input_format(data) is not None
-
-    @classmethod
-    def _all_mm_data_is_preprocessed(cls, *data_lists):
-        has_mm_data = False
-        for data_list in data_lists:
-            if not data_list:
-                continue
-            if not isinstance(data_list, list):
-                data_list = [data_list]
-            for item in data_list:
-                if item is None:
-                    continue
-                has_mm_data = True
-                if not cls._is_preprocessed_input(item):
-                    return False
-        return has_mm_data
-
     def _submit_mm_data_loading_tasks_simple(
         self,
         data_list: Optional[list],
@@ -1194,50 +1238,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 pass
 
         return futures, task_info
-
-    @staticmethod
-    def _validate_one_modality(modality: Modality, data_list: Optional[list]):
-        if data_list is None:
-            return
-        if not isinstance(data_list, list):
-            raise TypeError(
-                f"{modality.name} must be a list or None, got {type(data_list)}"
-            )
-
-        formatted_indices = []
-        for idx, item in enumerate(data_list):
-            if BaseMultimodalProcessor._is_preprocessed_input(item):
-                formatted_indices.append(idx)
-
-        if formatted_indices:
-            if len(data_list) != 1:
-                raise ValueError(
-                    f"For {modality}, when providing a 'processor_output' or "
-                    f"'precomputed_embedding', you must pass exactly one item; "
-                    f"received {len(data_list)} items (formatted at indices {formatted_indices})."
-                )
-
-    @staticmethod
-    def validate_mm_data(
-        image_data: Optional[list] = None,
-        video_data: Optional[list] = None,
-        audio_data: Optional[list] = None,
-    ):
-        """
-        Validate multimodal input lists per modality.
-
-        Rule per modality (image/video/audio):
-        - Either the list has exactly one item and that single item is a dict with
-          format in {"processor_output", "precomputed_embedding"};
-        - Or, the list contains only "normal" items (i.e., does not include any
-          item whose format is one of the two above).
-
-        Empty or None lists are considered valid.
-        """
-
-        BaseMultimodalProcessor._validate_one_modality(Modality.IMAGE, image_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
