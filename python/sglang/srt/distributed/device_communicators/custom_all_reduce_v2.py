@@ -81,9 +81,8 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
-    from torch._C._distributed_c10d import _SymmetricMemory
-
     import torch.distributed._symmetric_memory as torch_symm_mem
+    from torch._C._distributed_c10d import _SymmetricMemory
 
     if str(torch_symm_mem.get_backend(device) or "").upper() == "NVSHMEM":
         # The NVSHMEM allocator refuses the group-scoped allocation form; the

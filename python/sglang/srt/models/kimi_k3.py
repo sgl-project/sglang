@@ -791,6 +791,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
         )
         from sglang.srt.runtime_context import get_parallel
 
@@ -816,6 +817,7 @@ class KimiK3MoE(nn.Module):
             num_topk=self._mega_top_k,
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
         )
 
         if num_tokens > 0:
