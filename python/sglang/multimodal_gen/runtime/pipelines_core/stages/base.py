@@ -384,15 +384,6 @@ class PipelineStage(StageDedupMixin, ABC):
             current_platform.device_type,
         )
 
-    def set_logging(self, enable: bool):
-        """
-        Enable or disable logging for this stage.
-
-        Args:
-            enable: Whether to enable logging.
-        """
-        self._enable_logging = enable
-
     def __call__(
         self,
         batch: Req,

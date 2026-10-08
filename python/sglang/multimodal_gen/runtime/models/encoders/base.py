@@ -218,7 +218,6 @@ class TextEncoder(
     # shard conditions left in the root group stays sharded unless the entry
     # point is registered; loaders read this and register each name.
     _fsdp_forward_methods: tuple[str, ...] = ()
-    _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends
     )
@@ -227,7 +226,6 @@ class TextEncoder(
         super().__init__()
         self.config = config
         self._fsdp_shard_conditions = config.arch_config._fsdp_shard_conditions
-        self._stacked_params_mapping = config.arch_config.stacked_params_mapping
         if not self.supported_attention_backends:
             raise ValueError(
                 f"Subclass {self.__class__.__name__} must define _supported_attention_backends"
