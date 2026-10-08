@@ -38,6 +38,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
         self._spec_scratch_capacity = 0
+        self._spec_device_buffer_size = 0
 
         self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
             self._size_full,
@@ -74,16 +75,28 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
 
-    def configure_spec_scratch(self, capacity: int) -> None:
-        if capacity < 0 or capacity % self.page_size != 0:
+    def configure_spec_scratch(
+        self, capacity: int, *, device_buffer_size: int = 0
+    ) -> None:
+        if any(
+            size < 0 or size % self.page_size for size in (capacity, device_buffer_size)
+        ):
             raise ValueError(
-                "HiSparse spec scratch capacity must be a non-negative multiple "
-                f"of page_size, got capacity={capacity}, page_size={self.page_size}."
+                "HiSparse spec scratch and device buffer sizes must be "
+                f"non-negative multiples of page_size={self.page_size}."
             )
         self._spec_scratch_capacity = capacity
+        self._spec_device_buffer_size = device_buffer_size if capacity else 0
 
-    def request_slot_reserve(self, *, has_req_pool_slot: bool) -> int:
-        return 0 if has_req_pool_slot else self._spec_scratch_capacity
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        paged_prefill = -(-prefill_tokens // self.page_size) * self.page_size
+        # Prefill KV is reused by the persistent buffer. Charge only its
+        # missing slots, including on chunks whose scratch was already allocated.
+        buffer_reserve = max(self._spec_device_buffer_size - paged_prefill, 0)
+        scratch_reserve = 0 if has_req_pool_slot else self._spec_scratch_capacity
+        return buffer_reserve + scratch_reserve
 
     @property
     def size_full(self) -> int:

@@ -76,12 +76,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
-    def request_slot_reserve(self, *, has_req_pool_slot: bool) -> int:
-        """One-time token-equivalent storage charged when a request gets a slot.
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
 
-        Most allocators keep no storage outside the ordinary KV allocation.
-        Composite allocators may override this when assigning a request-pool
-        slot also creates allocator-owned state.
+        ``prefill_tokens`` includes the cached prefix and selected extension.
         """
         return 0
 

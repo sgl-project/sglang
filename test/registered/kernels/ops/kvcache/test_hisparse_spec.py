@@ -174,6 +174,39 @@ def _assert_output_matches_tokens(
 
 
 class TestHiSparseSpec(CustomTestCase):
+    def test_fixed_width_device_commit_copy_supports_cuda_graph(self) -> None:
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+
+        pool = object.__new__(HiSparseDSATokenToKVPool)
+        pool.bytes_per_token = 576
+        pool.kv_buffer = [
+            torch.arange(32 * 144, dtype=torch.int32, device=DEVICE).reshape(32, 144)
+            + layer * 10000
+            for layer in range(2)
+        ]
+        originals = [buf.clone() for buf in pool.kv_buffer]
+        pool.data_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in pool.kv_buffer],
+            dtype=torch.uint64,
+            device=DEVICE,
+        )
+        pool.data_strides = torch.full_like(pool.data_ptrs, pool.bytes_per_token)
+        src = torch.tensor([6, 1, 8, 3, 0, 0], device=DEVICE)
+        dst = torch.tensor([1, 1, 3, 3, 0, 0], device=DEVICE)
+
+        pool.transfer_values_on_device(dst, src)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pool.transfer_values_on_device(dst, src)
+        for buf, original in zip(pool.kv_buffer, originals):
+            buf.copy_(original)
+        graph.replay()
+
+        for buf, original in zip(pool.kv_buffer, originals):
+            original[[1, 3]] = original[[6, 8]]
+            torch.testing.assert_close(buf, original)
+
     def test_deduplicates_repeated_misses_and_copies_full_items(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k, item_words = 4, 2048, 72

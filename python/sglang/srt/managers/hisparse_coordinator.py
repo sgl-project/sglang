@@ -334,11 +334,27 @@ class HiSparseSpecSwapManager:
                 f"got {verify_cache_locs.numel()}."
             )
 
+        # CPU-side logical reservations cover verify even when overlap lags seq_lens.
+        for req in batch.reqs:
+            req_pool_idx = req.kv.req_pool_idx
+            allocated_len = int(
+                coordinator.req_to_host_pool_allocated_len[req_pool_idx]
+            )
+            if req.kv.kv_allocated_len > allocated_len:
+                coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req_pool_idx,
+                    allocated_len,
+                    req.kv.kv_allocated_len - allocated_len,
+                )
+
         extra_start = coordinator.device_buffer_size + 1
-        total_slots = req_pool_indices.numel() * self.num_draft_tokens
         row_indices = torch.repeat_interleave(req_pool_indices, self.num_draft_tokens)
         offsets = (
-            torch.arange(total_slots, dtype=torch.int64, device=req_pool_indices.device)
+            torch.arange(
+                expected_slots, dtype=torch.int64, device=req_pool_indices.device
+            )
             % self.num_draft_tokens
         )
         token_positions = (
@@ -360,11 +376,7 @@ class HiSparseSpecSwapManager:
         ] = device_locs
 
     def _backup_device_locs_to_host(
-        self,
-        host_locs: torch.Tensor,
-        device_locs: torch.Tensor,
-        *,
-        wait: bool,
+        self, host_locs: torch.Tensor, device_locs: torch.Tensor
     ) -> None:
         if host_locs.numel() == 0:
             return
@@ -390,8 +402,7 @@ class HiSparseSpecSwapManager:
                 device_locs.record_stream(coordinator.decode_backup_stream)
             coordinator._backup_done_event.record()
         coordinator._has_pending_backup = True
-        if wait:
-            coordinator.wait_for_pending_backup()
+        coordinator.wait_for_pending_backup()
 
     def commit_accept_tokens(
         self, batch: ScheduleBatch, accept_indices: torch.Tensor
@@ -400,14 +411,7 @@ class HiSparseSpecSwapManager:
         if batch.forward_mode.is_idle():
             return
         coordinator = self._coordinator
-        req_pool_indices = batch.req_pool_indices
-        req_pool_indices_cpu = batch.req_pool_indices_cpu
-        if req_pool_indices_cpu is None:
-            req_pool_indices_cpu = req_pool_indices.cpu()
-        seq_lens = batch.seq_lens
-        seq_lens_cpu = batch.seq_lens_cpu
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.cpu()
+        req_pool_indices = batch.req_pool_indices[:, None]
         verify_cache_locs = batch.out_cache_loc
 
         if verify_cache_locs.numel() == 0:
@@ -416,98 +420,70 @@ class HiSparseSpecSwapManager:
         if batch_size == 0 or verify_cache_locs.numel() % batch_size != 0:
             raise ValueError("HiSparse verify cache locations are not request-aligned.")
 
-        counts = (accept_indices >= 0).sum(dim=1).to(torch.int64)
-        counts_cpu = counts.cpu()
-        num_accept_tokens = int(counts_cpu.sum().item())
+        valid = accept_indices >= 0
+        counts = valid.sum(dim=1)
+        steps = torch.arange(accept_indices.shape[1], device=accept_indices.device)
+        positions = batch.seq_lens[:, None].to(torch.int64) + steps
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
-        if num_accept_tokens == 0:
-            mapping[verify_cache_locs] = 0
-            return
-        accept_offsets = accept_indices[accept_indices >= 0].to(torch.int64)
-        if torch.any(accept_offsets >= verify_cache_locs.numel()):
-            raise ValueError("HiSparse accept_indices point outside verify_cache_locs.")
-
-        accept_source_locs = verify_cache_locs[accept_offsets]
-        source_device_locs = mapping[accept_source_locs].clone()
-        accept_req_indices = torch.repeat_interleave(req_pool_indices, counts)
-        segment_offsets = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int64, device=counts.device),
-                counts.cumsum(dim=0),
-            ]
+        # Keep a fixed width: boolean indexing and GPU-sized repeat_interleave sync.
+        verify_width = verify_cache_locs.numel() // batch_size
+        row_offsets = (
+            torch.arange(batch_size, device=accept_indices.device)[:, None]
+            * verify_width
         )
-        positions_in_req = torch.arange(
-            num_accept_tokens, dtype=torch.int64, device=counts.device
-        ) - torch.repeat_interleave(segment_offsets[:-1], counts)
-        accept_positions = (
-            torch.repeat_interleave(seq_lens.to(torch.int64), counts) + positions_in_req
-        )
+        source_offsets = torch.where(valid, accept_indices, row_offsets + steps)
+        source_device_locs = mapping[verify_cache_locs[source_offsets]].clone()
         canonical_locs = coordinator.req_to_token_pool.req_to_token[
-            accept_req_indices, accept_positions
+            req_pool_indices, positions
         ]
 
-        destination_locs = source_device_locs.clone()
-        hot_mask = accept_positions < coordinator.device_buffer_size
-        if torch.any(hot_mask):
-            destination_locs[hot_mask] = coordinator.req_to_device_buffer[
-                accept_req_indices[hot_mask], accept_positions[hot_mask]
-            ]
-        last_offsets = segment_offsets[1:] - 1
-        last_positions = accept_positions[last_offsets]
-        newest_columns = last_positions.clamp(max=coordinator.device_buffer_size)
-        newest_locs = coordinator.req_to_device_buffer[req_pool_indices, newest_columns]
-        destination_locs[last_offsets] = newest_locs
+        # Keep hot tokens and each request's newest token in persistent slots.
+        cache_mask = valid & (
+            (positions < coordinator.device_buffer_size)
+            | (steps == counts[:, None] - 1)
+        )
+        cache_positions = torch.where(
+            cache_mask,
+            positions.clamp(max=coordinator.device_buffer_size),
+            coordinator.device_buffer_size + 1 + steps,
+        )
+        cache_locs = coordinator.req_to_device_buffer[req_pool_indices, cache_positions]
+        destination_locs = torch.where(cache_mask, cache_locs, source_device_locs)
+        coordinator.mem_pool_device.transfer_values_on_device(
+            dst_indices=destination_locs.flatten(),
+            src_indices=source_device_locs.flatten(),
+        )
 
-        needs_copy = destination_locs != source_device_locs
-        if torch.any(needs_copy):
-            coordinator.mem_pool_device.transfer_values_on_device(
-                dst_indices=destination_locs[needs_copy],
-                src_indices=source_device_locs[needs_copy],
-            )
-
-        host_locs = []
-        for req_pool_idx, seq_len, count in zip(
-            req_pool_indices_cpu.tolist(),
-            seq_lens_cpu.tolist(),
-            counts_cpu.tolist(),
-            strict=True,
-        ):
-            count = int(count)
-            if count > 0:
-                host_locs.append(
-                    coordinator.mem_pool_host.alloc_paged_token_slots(
-                        coordinator.req_to_host_pool,
-                        coordinator.req_to_host_pool_allocated_len,
-                        int(req_pool_idx),
-                        int(seq_len),
-                        count,
-                    )
-                )
+        # Rejected padding goes to this request's reserved, not-yet-visible host slots.
+        host_locs = coordinator.req_to_host_pool[req_pool_indices, positions]
         self._backup_device_locs_to_host(
-            torch.cat(host_locs), destination_locs, wait=True
+            host_locs.flatten(), destination_locs.flatten()
         )
 
         mapping[verify_cache_locs] = 0
-        if torch.any(hot_mask):
-            mapping[canonical_locs[hot_mask]] = destination_locs[hot_mask]
-            coordinator.req_device_buffer_tokens[
-                :, accept_req_indices[hot_mask], accept_positions[hot_mask]
-            ] = accept_positions[hot_mask].to(torch.int32).unsqueeze(0)
-            coordinator.req_device_buffer_token_locs[
-                :, accept_req_indices[hot_mask], accept_positions[hot_mask]
-            ] = destination_locs[hot_mask].to(torch.int32).unsqueeze(0)
-
-        mapping[canonical_locs[last_offsets]] = newest_locs
-        coordinator.req_device_buffer_tokens[:, req_pool_indices, newest_columns] = (
-            last_positions.to(torch.int32).unsqueeze(0)
+        mapping[canonical_locs] = torch.where(cache_mask, cache_locs, 0)
+        coordinator.req_device_buffer_tokens[:, req_pool_indices, cache_positions] = (
+            torch.where(
+                cache_mask,
+                positions.to(torch.int32),
+                coordinator.req_device_buffer_tokens[
+                    :, req_pool_indices, cache_positions
+                ],
+            )
         )
         coordinator.req_device_buffer_token_locs[
-            :, req_pool_indices, newest_columns
-        ] = newest_locs.to(torch.int32).unsqueeze(0)
-        for req_pool_idx in req_pool_indices_cpu.tolist():
-            coordinator._skip_first_backup[int(req_pool_idx)] = True
+            :, req_pool_indices, cache_positions
+        ] = torch.where(
+            cache_mask,
+            cache_locs.to(torch.int32),
+            coordinator.req_device_buffer_token_locs[
+                :, req_pool_indices, cache_positions
+            ],
+        )
+        for req in batch.reqs:
+            coordinator._skip_first_backup[req.kv.req_pool_idx] = True
 
     def swap_in(
         self,
@@ -709,7 +685,8 @@ class HiSparseCoordinator:
         )
         if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
             self.token_to_kv_pool_allocator.configure_spec_scratch(
-                self.spec_swap.scratch_capacity
+                self.spec_swap.scratch_capacity,
+                device_buffer_size=self.padded_buffer_size,
             )
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
@@ -948,22 +925,15 @@ class HiSparseCoordinator:
         else:
             allocated_len = req.kv.kv_allocated_len
             page_size = self.mem_pool_device.page_size
-            if self.spec_swap.enabled:
-                # Spec verify writes into the extra page and its CUDA-graph
-                # workspace cannot grow on demand. Reserve both before the
-                # request becomes runnable so allocator availability accounts
-                # for their real scheduling cost.
+            # Allocate only enough for current tokens (page-aligned).
+            # When prefill already fills device_buffer_size, include the reserved page.
+            alloc_size = min(
+                ((allocated_len + page_size - 1) // page_size) * page_size,
+                self.device_buffer_size,
+            )
+            # Spec verify needs the complete, graph-stable buffer even for short prompts.
+            if self.spec_swap.enabled or alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
-            else:
-                # Allocate only enough for current tokens (page-aligned).
-                # When prefill already fills device_buffer_size, include the
-                # reserved page.
-                alloc_size = min(
-                    ((allocated_len + page_size - 1) // page_size) * page_size,
-                    self.device_buffer_size,
-                )
-                if alloc_size == self.device_buffer_size:
-                    alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -1452,22 +1422,22 @@ class HiSparseCoordinator:
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req_pool_idx,
-            self.req_to_host_pool_allocated_len[req_pool_idx],
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
-        self.req_to_device_buffer[req_pool_idx, :] = 0
-        self.req_device_buffer_size[req_pool_idx] = 0
-        self.req_to_host_pool[req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req_pool_idx] = 0
-        self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
+        self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :] = -1
+        self.req_to_device_buffer[req.kv.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.kv.req_pool_idx] = 0
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
         self.spec_swap.clear_scratch(req_pool_idx)
-        self._skip_first_backup[req_pool_idx] = False
+        self._skip_first_backup[req.kv.req_pool_idx] = False
 
     def _run_swap_in_kernel(
         self,

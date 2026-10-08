@@ -782,9 +782,14 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
-    def _request_slot_reserve_for_req(self, req: Req) -> int:
+    def _request_slot_reserve_for_req(
+        self, req: Req, *, extend_input_len: Optional[int] = None
+    ) -> int:
+        if extend_input_len is None:
+            extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         return self.token_to_kv_pool_allocator.request_slot_reserve(
-            has_req_pool_slot=req.kv.req_pool_idx is not None
+            has_req_pool_slot=req.kv.req_pool_idx is not None,
+            prefill_tokens=req.prefix_len + extend_input_len,
         )
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -1096,6 +1101,20 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        request_slot_reserve = self._request_slot_reserve_for_req(
+            req, extend_input_len=new_len
+        )
+        if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
+            paged_input=(
+                self.ceil_paged_tokens(new_len)
+                + self.per_req_token_overhead
+                + request_slot_reserve
+            ),
+            extend_input_len=new_len,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=self.rem_chunk_tokens,
+        ):
+            return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=req.prefix_len, extend_len=new_len
@@ -1114,7 +1133,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            request_slot_reserve=self._request_slot_reserve_for_req(req),
+            request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
             compute_charge=req.extend_len if self.exact_chunk_fill else None,
         )
@@ -1275,7 +1294,9 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                request_slot_reserve=self._request_slot_reserve_for_req(req),
+                request_slot_reserve=self._request_slot_reserve_for_req(
+                    req, extend_input_len=trunc_len
+                ),
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
@@ -1435,10 +1456,7 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            # Successful materialization has no remaining admission gates.
-            self._commit_prefill_admission(
-                req, admission, mamba_gap_reserve, request_slot_reserve
-            )
+            self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -1527,11 +1545,7 @@ class PrefillAdder:
         return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
 
     def _commit_prefill_admission(
-        self,
-        req: Req,
-        admission: _PrefillAdmission,
-        mamba_gap_reserve: int,
-        request_slot_reserve: int,
+        self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
     ) -> None:
         assert req.prefix_len == admission.prefix_len
         req.extend_end = admission.prefix_len + admission.extend_len
@@ -1545,7 +1559,9 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=mamba_gap_reserve,
-            request_slot_reserve=request_slot_reserve,
+            request_slot_reserve=self._request_slot_reserve_for_req(
+                req, extend_input_len=admission.extend_len
+            ),
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )

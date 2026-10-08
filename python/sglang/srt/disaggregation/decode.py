@@ -1324,17 +1324,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
-        # Each admitted req needs padded_buffer_size from hisparse device pool.
+        # Each admitted req needs a padded buffer plus its speculative scratch.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
+            coordinator = self.scheduler.hisparse_coordinator
+            per_req_device_tokens = (
+                coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
+            )
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
             hisparse_req_budget = max(
                 0,
-                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
+                hisparse_avail // per_req_device_tokens
                 - len(self.transfer_queue.queue),
             )
 

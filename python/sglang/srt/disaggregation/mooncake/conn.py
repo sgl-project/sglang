@@ -1283,20 +1283,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     compression_ratios = compression_ratios[start:end]
                 host_backed_kv_count = sum(ratio == 4 for ratio in compression_ratios)
             else:
-                # Target KV is the host-backed prefix; appended draft KV keeps
-                # the indexer's logical page IDs and uses the device-only suffix.
-                start = self.kv_args.prefill_start_layer
-                end = self.kv_args.prefill_end_layer
-                if end is None:
-                    raise ValueError(
-                        "HiSparse spec PD transfer requires prefill_end_layer"
-                    )
-                host_backed_kv_count = end - start
-                if not 0 <= host_backed_kv_count < len(dst_kv_ptrs):
+                # The remote target prefix is host-backed, even across PP stages;
+                # only the draft suffix uses logical device page IDs.
+                num_draft_entries = self.kv_args.num_draft_entries
+                if not 0 < num_draft_entries < len(dst_kv_ptrs):
                     raise ValueError(
                         "HiSparse spec PD transfer requires an appended device-only "
                         "draft KV buffer"
                     )
+                host_backed_kv_count = len(dst_kv_ptrs) - num_draft_entries
             dst_device_kv_ptrs = set(dst_kv_ptrs[host_backed_kv_count:])
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,

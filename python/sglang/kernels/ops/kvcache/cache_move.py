@@ -145,6 +145,7 @@ def copy_all_layer_kv_cache_tiled(
 
     src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
     tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
+    mask_loc = mask_loc & (src != tgt)
 
     src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
     tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]

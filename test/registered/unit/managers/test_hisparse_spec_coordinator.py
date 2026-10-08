@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
@@ -12,6 +13,7 @@ from sglang.srt.managers.hisparse_coordinator import (
 )
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,19 +37,8 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             hisparse_coordinator=object(),
         )
 
-        def assign_on_cpu(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            batch_size,
-        ):
-            del end_offset, batch_size
-            start = int(start_offset[0])
-            req_to_token[
-                int(req_pool_indices[0]), start : start + out_cache_loc.numel()
-            ] = out_cache_loc
+        def assign_on_cpu(req_indices, table, start, end, locs, batch_size):
+            table[int(req_indices[0]), int(start[0]) : int(end[0])] = locs
 
         with (
             patch.object(allocation, "evict_from_tree_cache"),
@@ -84,51 +75,33 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         freed = allocator.hisparse_attn_allocator.free.call_args.args[0]
         torch.testing.assert_close(freed, torch.tensor([64, 65]))
 
-    def test_spec_swap_manager_owns_runtime_state(self):
-        coordinator = MagicMock()
-        coordinator.mem_pool_device.layer_num = 2
-        coordinator.req_to_token_pool.req_to_token = torch.empty((3, 16))
-        coordinator.device = "cpu"
-        coordinator.is_dsv4_hisparse = False
-        coordinator.top_k = 1024
-        coordinator.device_buffer_size = 4096
-
-        spec_swap = HiSparseSpecSwapManager(
-            coordinator,
-            num_draft_tokens=2,
-        )
-
-        self.assertTrue(spec_swap.enabled)
-        self.assertEqual(spec_swap.num_draft_tokens, 2)
-        self.assertEqual(spec_swap.scratch_capacity, 1024)
-        self.assertEqual(len(spec_swap.states), 2)
-        self.assertEqual(spec_swap.req_to_scratch.shape, (2, 3, 1024))
-        self.assertEqual(spec_swap.top_k_device_locs.shape, (3, 2, 1024))
-        self.assertIs(
-            spec_swap.states[0].scratch_state, spec_swap.states[1].scratch_state
-        )
-
     def test_scratch_allocation_has_per_layer_location_views(self):
         scratch_allocator = MagicMock()
-        scratch_allocator.alloc.return_value = torch.arange(9, 13)
+        scratch_allocator.alloc.return_value = torch.arange(64, 1088)
         token_allocator = SimpleNamespace(
             hisparse_attn_allocator=scratch_allocator,
             free_hisparse_indices=MagicMock(),
         )
-        coordinator = SimpleNamespace(token_to_kv_pool_allocator=token_allocator)
-        spec_swap = object.__new__(HiSparseSpecSwapManager)
-        spec_swap._coordinator = coordinator
-        spec_swap.enabled = True
-        spec_swap.scratch_capacity = 4
-        spec_swap._scratch_reqs = set()
-        spec_swap.req_to_scratch = torch.zeros((3, 2, 4), dtype=torch.int32)
+        coordinator = MagicMock(
+            token_to_kv_pool_allocator=token_allocator,
+            mem_pool_device=SimpleNamespace(layer_num=3),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 16))),
+            device="cpu",
+            is_dsv4_hisparse=False,
+            top_k=1024,
+            device_buffer_size=4096,
+        )
+        spec_swap = HiSparseSpecSwapManager(coordinator, num_draft_tokens=2)
 
         spec_swap.allocate_scratch(1)
 
-        expected = torch.arange(9, 13, dtype=torch.int32)
+        expected = torch.arange(64, 1088, dtype=torch.int32)
         for layer_id in range(3):
             torch.testing.assert_close(spec_swap.req_to_scratch[layer_id, 1], expected)
         self.assertIn(1, spec_swap._scratch_reqs)
+        self.assertIs(
+            spec_swap.states[0].scratch_state, spec_swap.states[1].scratch_state
+        )
 
         owned_locs = spec_swap.extend_owned_locs(
             1, torch.tensor([20], dtype=torch.int32)
@@ -183,12 +156,9 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
 
         coordinator.alloc_device_buffer(req)
 
-        coordinator.token_to_kv_pool_allocator.alloc_device_buffer.assert_called_once()
-        self.assertEqual(
-            coordinator.token_to_kv_pool_allocator.alloc_device_buffer.call_args.args[
-                1
-            ],
-            4160,
+        self.assertEqual(int(coordinator.req_device_buffer_size[0]), 4160)
+        torch.testing.assert_close(
+            coordinator.req_to_device_buffer[0], buffer_indices.to(torch.int32)
         )
         coordinator.spec_swap.allocate_scratch.assert_called_once_with(0)
         coordinator.spec_swap.reset.assert_called_once_with(0)
@@ -196,14 +166,15 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
     def test_accept_commit_keeps_hot_and_newest_device_slots(self):
         coordinator = object.__new__(HiSparseCoordinator)
         coordinator.device_buffer_size = 5
+        coordinator.page_size = 8
         coordinator.req_to_device_buffer = torch.tensor(
-            [[20, 21, 22, 23, 24, 25, 26]], dtype=torch.int64
+            [list(range(20, 33))], dtype=torch.int64
         )
         coordinator.req_device_buffer_tokens = torch.full(
-            (2, 1, 7), -1, dtype=torch.int32
+            (2, 1, 13), -1, dtype=torch.int32
         )
         coordinator.req_device_buffer_token_locs = torch.full(
-            (2, 1, 7), -1, dtype=torch.int32
+            (2, 1, 13), -1, dtype=torch.int32
         )
         coordinator._skip_first_backup = [False]
 
@@ -213,7 +184,6 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         coordinator.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
 
         full_to_device_mapping = torch.zeros(128, dtype=torch.int64)
-        full_to_device_mapping[verify_cache_locs] = torch.tensor([10, 11, 12, 13])
         transfer_values = MagicMock()
         coordinator.mem_pool_device = SimpleNamespace(
             transfer_values_on_device=transfer_values
@@ -222,50 +192,78 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             full_to_hisparse_device_index_mapping=full_to_device_mapping
         )
 
-        alloc_host = MagicMock(
-            side_effect=lambda _pool, _allocated, _req, start, count: torch.arange(
-                1000 + start, 1000 + start + count, dtype=torch.int64
-            )
+        coordinator.mem_pool_host = HiSparseHostPoolMixin()
+        coordinator.mem_pool_host.page_size = 8
+        coordinator.mem_pool_host.alloc_page = MagicMock(
+            return_value=torch.arange(1000, 1008)
         )
-        coordinator.mem_pool_host = SimpleNamespace(alloc_paged_token_slots=alloc_host)
         coordinator.req_to_host_pool = torch.full((1, 16), -1, dtype=torch.int64)
         coordinator.req_to_host_pool_allocated_len = torch.zeros(1, dtype=torch.int64)
 
         spec_swap = object.__new__(HiSparseSpecSwapManager)
         spec_swap._coordinator = coordinator
+        spec_swap.enabled = True
+        spec_swap.num_draft_tokens = 4
         spec_swap._backup_device_locs_to_host = MagicMock()
 
         batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0, kv_allocated_len=8))
+            ],
             forward_mode=SimpleNamespace(is_idle=lambda: False),
             req_pool_indices=torch.tensor([0]),
             req_pool_indices_cpu=torch.tensor([0]),
             seq_lens=torch.tensor([4]),
-            seq_lens_cpu=torch.tensor([4]),
+            seq_lens_cpu=torch.tensor([2]),  # CPU metadata can lag during overlap.
             out_cache_loc=verify_cache_locs,
         )
-        spec_swap.commit_accept_tokens(
-            batch=batch,
-            accept_indices=torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
-        )
+        spec_swap.prepare_verify(batch)
+        spec_swap.prepare_verify(batch)
+        coordinator.mem_pool_host.alloc_page.assert_called_once_with(1)
+        self.assertEqual(int(coordinator.req_to_host_pool_allocated_len[0]), 8)
+        accept_indices = torch.tensor([[0, 1, 2, -1]], dtype=torch.int32)
+
+        class NoDataDependentOps(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in (
+                    torch.ops.aten._local_scalar_dense.default,
+                    torch.ops.aten.nonzero.default,
+                    torch.ops.aten.repeat_interleave.Tensor,
+                ):
+                    raise AssertionError(f"Synchronizing operation: {func}")
+                if func in (
+                    torch.ops.aten.index.Tensor,
+                    torch.ops.aten.index_put_.default,
+                ):
+                    if any(
+                        idx is not None and idx.dtype == torch.bool for idx in args[1]
+                    ):
+                        raise AssertionError("Dynamically sized boolean indexing")
+                return func(*args, **(kwargs or {}))
+
+        with (
+            patch.object(
+                torch.Tensor, "cpu", side_effect=AssertionError("CPU readback")
+            ),
+            NoDataDependentOps(),
+        ):
+            spec_swap.commit_accept_tokens(batch=batch, accept_indices=accept_indices)
 
         transfer_call = transfer_values.call_args
         torch.testing.assert_close(
-            transfer_call.kwargs["src_indices"], torch.tensor([10, 12])
+            transfer_call.kwargs["src_indices"], torch.tensor([26, 27, 28, 29])
         )
         torch.testing.assert_close(
-            transfer_call.kwargs["dst_indices"], torch.tensor([24, 25])
+            transfer_call.kwargs["dst_indices"], torch.tensor([24, 27, 25, 29])
         )
         backup_call = spec_swap._backup_device_locs_to_host.call_args
         torch.testing.assert_close(
-            backup_call.args[0], torch.tensor([1004, 1005, 1006])
+            backup_call.args[0], torch.tensor([1004, 1005, 1006, 1007])
         )
-        torch.testing.assert_close(backup_call.args[1], torch.tensor([24, 11, 25]))
-        self.assertTrue(backup_call.kwargs["wait"])
-
-        self.assertEqual(full_to_device_mapping[50], 24)
-        self.assertEqual(full_to_device_mapping[51], 0)
-        self.assertEqual(full_to_device_mapping[52], 25)
-        self.assertEqual(full_to_device_mapping[53], 0)
+        torch.testing.assert_close(backup_call.args[1], torch.tensor([24, 27, 25, 29]))
+        torch.testing.assert_close(
+            full_to_device_mapping[verify_cache_locs], torch.tensor([24, 0, 25, 0])
+        )
         torch.testing.assert_close(
             coordinator.req_device_buffer_tokens[:, 0, 4],
             torch.tensor([4, 4], dtype=torch.int32),
@@ -273,6 +271,10 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         torch.testing.assert_close(
             coordinator.req_device_buffer_tokens[:, 0, 5],
             torch.tensor([6, 6], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            coordinator.req_device_buffer_tokens[:, 0, 6:10],
+            torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]], dtype=torch.int32),
         )
         self.assertTrue(coordinator._skip_first_backup[0])
 

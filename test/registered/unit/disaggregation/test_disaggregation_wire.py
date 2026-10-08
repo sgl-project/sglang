@@ -1193,35 +1193,53 @@ class TestStagingWatermark(unittest.TestCase):
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
     def test_draft_buffers_use_logical_device_indices(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.kv_args = SimpleNamespace(
-            mla_compression_ratios=None,
-            prefill_start_layer=10,
-            prefill_end_layer=12,
-            kv_data_ptrs=[1, 2, 3],
-            kv_item_lens=[4, 4, 4],
-            kv_layer_ids=[],
-        )
-        manager._send_kvcache_generic = Mock(return_value=0)
-        device_indices = np.array([7, 8], dtype=np.int32)
+        """A local target layer count must not turn remote target KV into draft KV."""
+        for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):
+            with self.subTest(pp_size=pp_size, stage_start=stage_start):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None,
+                    prefill_start_layer=stage_start,
+                    prefill_end_layer=stage_start + 2,
+                    kv_data_ptrs=[1000, 2000, 3000],
+                    kv_item_lens=[100, 100, 100],
+                    kv_layer_ids=[],
+                    num_draft_entries=1,
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 0
+                manager.pp_size = pp_size
+                manager._transfer_data = Mock(return_value=0)
+                dst_ptrs = (
+                    [10000, 20000, 50000]
+                    if pp_size == 1
+                    else [10000, 20000, 30000, 40000, 50000]
+                )
+                with patch(
+                    "sglang.srt.disaggregation.mooncake.conn.get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ):
+                    status = manager.send_kvcache(
+                        mooncake_session_id="session",
+                        prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                        dst_kv_ptrs=dst_ptrs,
+                        dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                        dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                        executor=None,
+                    )
 
-        with patch(
-            "sglang.srt.disaggregation.mooncake.conn.get_memory",
-            return_value=SimpleNamespace(enable_unified_memory=False),
-        ):
-            status = manager.send_kvcache(
-                mooncake_session_id="session",
-                prefill_kv_indices=np.array([1, 2], dtype=np.int32),
-                dst_kv_ptrs=[101, 102, 201],
-                dst_kv_indices=np.array([11, 12], dtype=np.int32),
-                executor=Mock(),
-                dst_device_kv_indices=device_indices,
-            )
-
-        self.assertEqual(status, 0)
-        kwargs = manager._send_kvcache_generic.call_args.kwargs
-        self.assertEqual(kwargs["dst_device_data_ptrs"], {201})
-        np.testing.assert_array_equal(kwargs["dst_device_data_indices"], device_indices)
+                self.assertEqual(status, 0)
+                blocks = manager._transfer_data.call_args.args[1]
+                self.assertEqual(
+                    blocks,
+                    [
+                        (1100, dst_ptrs[stage_start] + 700, 200),
+                        (2100, dst_ptrs[stage_start + 1] + 700, 200),
+                        (3100, dst_ptrs[-1] + 2100, 200),
+                    ],
+                )
 
 
 class TestHiSparseStagedSpecRelay(CustomTestCase):
