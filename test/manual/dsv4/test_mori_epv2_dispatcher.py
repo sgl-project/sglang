@@ -1,8 +1,8 @@
 """Eight-GPU identity round trip through the SGLang MORI EPv2 adapter.
 
 TBO=1 runs the FP4-asymmetric two-child TBO path instead; there TEST_CUDA_GRAPH=1
-captures and replays REPLAY_ITERS times (default 3), and
-SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT=0/1 exercises staging or direct writes.
+captures and replays REPLAY_ITERS times (default 3), with each child writing its
+expert output directly into its own combine staging view.
 The identity expert checks buffer correctness, not AITER performance.
 """
 
@@ -180,11 +180,16 @@ def main():
     dispatched = dispatcher.dispatch(hidden, topk_output)
     impl = dispatcher._get_impl()
     assert impl.dispatch_dtype.name == dispatch, (impl.dispatch_dtype, dispatch)
-    assert impl.combine_dtype.name == combine, (impl.combine_dtype, combine)
+    # MORI builds without the saturation fix fall back to blockwise fp8.
+    expected_combine = combine
+    saturates = adapter._mori_epv2_fp8_direct_cast_saturates()
+    if combine == "fp8_direct_cast" and not saturates:
+        expected_combine = "fp8"
+    assert impl.combine_dtype.name == expected_combine, (impl.combine_dtype, combine)
     expected_cap = 0
     if impl._manual_recv_cap > 0:
         expected_cap = min(impl._manual_recv_cap, impl.mori_op.cfg.effective_max_recv)
-    elif impl._trim_recv:
+    elif impl._trim_recv and impl._is_recv_layout_verified():
         cluster_rows = (
             sum(sender_rows)
             if attn_dp_size > 1
@@ -401,7 +406,7 @@ def _run_tbo(rank, world_size):
                 assert output.recv_cap == min(
                     child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
                 )
-            elif child._trim_recv and probe_trim:
+            elif child._trim_recv and probe_trim and child._is_recv_layout_verified():
                 expected_cap = round_logical_recv_rows(
                     sum(child_token_counts[child_id]),
                     pow2_buckets=child._recv_cap_pow2_buckets,
@@ -409,9 +414,7 @@ def _run_tbo(rank, world_size):
                 assert output.recv_cap == expected_cap
             else:
                 assert output.recv_cap == 0
-            expected_direct = child._direct_output and callable(
-                getattr(child.mori_op, "combine_in_view", None)
-            )
+            expected_direct = callable(getattr(child.mori_op, "combine_in_view", None))
             assert (output.expert_output is not None) == expected_direct
             if output.expert_output is not None:
                 assert (

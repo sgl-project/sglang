@@ -516,10 +516,6 @@ def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
     parallel = get_parallel()
     world_size = parallel.moe_ep_size
     rank = parallel.moe_ep_rank
-    if world_size > 8:
-        raise ValueError(
-            f"MORI EPv2 is currently intranode-only (world_size<=8); got {world_size}"
-        )
 
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = group.broadcast_object(uid, src=0)
@@ -531,6 +527,22 @@ def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
         f"instance={instance_id} per_rank_vmm_gb={per_rank_vmm_gb}"
     )
     return comm
+
+
+def _cco_lsa_size(comm) -> int:
+    """Ranks in this rank's cco LSA team, i.e. the ones sharing its flat VA."""
+    import mori.cco.cco as _cco
+    from mori.cco.communicator import DevCommHandle
+
+    # The Communicator does not expose the team; a device comm without GDA QPs
+    # reads it cheaply.
+    requirements = _cco.DevCommRequirements()
+    requirements.gda_connection_type = _cco.GDA_CONNECTION_NONE
+    handle = DevCommHandle(comm, requirements=requirements)
+    try:
+        return handle.lsa_size
+    finally:
+        handle.close()
 
 
 def _epv2_arena_bytes(cfg) -> int:
@@ -634,7 +646,7 @@ def init_mori_epv2_op(
     parallel = get_parallel()
     world_size = parallel.moe_ep_size
     rank = parallel.moe_ep_rank
-    cfg = EpDispatchCombineConfig(
+    cfg_kwargs = dict(
         rank=rank,
         world_size=world_size,
         hidden_dim=hidden_size,
@@ -649,6 +661,9 @@ def init_mori_epv2_op(
         combine_mode="gather",
         quant_type=_EPV2_COMBINE_QUANT[combine_dtype],
         max_total_recv_tokens=max_total_recv_tokens,
+    )
+    cfg = EpDispatchCombineConfig(
+        **cfg_kwargs,
         dispatch_block_num=launch_config.dispatch_block_num,
         combine_block_num=launch_config.combine_block_num,
         warp_num_per_block=launch_config.dispatch_warp_num_per_block,
@@ -657,6 +672,22 @@ def init_mori_epv2_op(
     comm = _init_cco_communicator(
         group=group, instance_id=instance_id, per_rank_vmm_gb=_epv2_per_rank_vmm_gb(cfg)
     )
+    # Ranks share the flat VA only within the cco LSA team (a host, or a UALink
+    # vPOD on gfx1250); a wider EP group needs MORI's internode path, which only
+    # the hip backend has. MORI rejects the configs that path cannot run.
+    lsa_size = _cco_lsa_size(comm)
+    if lsa_size < world_size:
+        if "gpu_per_node" not in EpDispatchCombineConfig.__dataclass_fields__:
+            raise ValueError(
+                f"MORI EPv2 ep_size={world_size} spans more than its cco LSA team "
+                f"({lsa_size} GPUs), and this MORI has no internode EPv2; "
+                "set SGLANG_MORI_EP_V2=false to use EPv1"
+            )
+        # The launch config is tuned for the intranode kernels; let MORI's
+        # internode tables pick the geometry.
+        cfg = EpDispatchCombineConfig(
+            **cfg_kwargs, gpu_per_node=lsa_size, kernel_backend="hip"
+        )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     if _supports_dynamic_recv_cap(op):
@@ -667,9 +698,10 @@ def init_mori_epv2_op(
             op.prepare_recv_cap(cap)
             cap *= 2
     logger.info(
-        f"[MORI EPv2 init] world={world_size} rank={rank} hidden={hidden_size} "
-        f"experts={num_experts} local_experts={num_local_experts} topk={router_topk} "
-        f"max_tokens={max_tokens_per_rank} recv_cap={cfg.effective_max_recv} "
+        f"[MORI EPv2 init] world={world_size} rank={rank} lsa_size={lsa_size} "
+        f"hidden={hidden_size} experts={num_experts} local_experts={num_local_experts} "
+        f"topk={router_topk} max_tokens={max_tokens_per_rank} "
+        f"recv_cap={cfg.effective_max_recv} "
         f"dispatch_dtype={dispatch_dtype} combine_dtype={combine_dtype} "
         f"combine_mode={cfg.combine_mode} launch_config={launch_config} "
         f"schedule={cfg.schedule}"
@@ -880,9 +912,8 @@ class _MoriEPDispatcherImplBase:
     def _apply_dispatch_dtype_override(self):
         """Apply the SGLANG_MORI_DISPATCH_DTYPE override."""
         dispatch_dtype = envs.SGLANG_MORI_DISPATCH_DTYPE.get().lower()
-        if self._is_epv2 and dispatch_dtype not in (
-            "", "auto", "bf16", "fp8", "fp4", "mxfp8"
-        ):
+        epv2_dtypes = ("", "auto", "bf16", "fp8", "fp4", "mxfp8")
+        if self._is_epv2 and dispatch_dtype not in epv2_dtypes:
             raise ValueError(
                 "SGLANG_MORI_DISPATCH_DTYPE must be auto, bf16, fp8, fp4 or mxfp8 "
                 f"for EPv2; got {dispatch_dtype!r}"
@@ -1342,9 +1373,6 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         # EPv2 forwards exactly top-k routed experts and has no fake expert slot.
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
-        # TBO children own separate arenas (instance_id); combine waits on the
-        # compute event recorded after the expert writes into its child's view.
-        self._direct_output = envs.SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT.get()
         # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
         # comm stream with the events async_finish records.
         if self._tbo_enabled and async_finish:
@@ -1521,11 +1549,13 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         # the compute stream that already waited for the dispatch.
         if _should_record_expert_distribution():
             _record_local_expert_count(self.mori_op.local_expert_count())
+        # Let AITER write the expert output straight into combine's staging view so
+        # combine skips its copy. TBO children own separate arenas (instance_id);
+        # combine waits on the compute event recorded after the expert writes.
         expert_output = None
-        if self._direct_output:
-            combine_in_view = getattr(self.mori_op, "combine_in_view", None)
-            if combine_in_view is not None:
-                expert_output = combine_in_view()[: recv_hidden.shape[0]]
+        combine_in_view = getattr(self.mori_op, "combine_in_view", None)
+        if combine_in_view is not None:
+            expert_output = combine_in_view()[: recv_hidden.shape[0]]
         return MoriEPNormalDispatchOutput(
             hidden_states=recv_hidden,
             hidden_states_scale=recv_scales,

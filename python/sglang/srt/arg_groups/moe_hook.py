@@ -32,6 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
     get_bool_env_var,
+    is_gfx1250_supported,
     is_sm100_supported,
     parse_connector_type,
 )
@@ -698,17 +699,28 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
 
 
 def _resolve_mori_ep_v2(server_args: Any) -> bool:
-    """Whether to use MORI EPv2; unset or true prefers EPv2 and falls back to EPv1."""
+    """Whether to use MORI EPv2.
+
+    Unset prefers EPv2 and falls back to EPv1 where it is unsupported; an explicit
+    true keeps EPv2 regardless, and false selects EPv1.
+    """
     if not envs.SGLANG_MORI_EP_V2.get():
         return False
 
     reason = _mori_epv2_unsupported_reason(server_args)
     if reason is None:
         return True
+    if envs.SGLANG_MORI_EP_V2.is_set():
+        logger.warning(
+            "SGLANG_MORI_EP_V2=true is set explicitly, so MORI EPv2 is used even "
+            "though it does not support %s.",
+            reason,
+        )
+        return True
 
     logger.warning(
         "MORI EPv2 does not support %s; falling back to MORI EPv1. "
-        "Set SGLANG_MORI_EP_V2=false to select EPv1 explicitly.",
+        "Set SGLANG_MORI_EP_V2=true to force EPv2, or false to select EPv1.",
         reason,
     )
     # Worker processes inherit the env, so every reader agrees on EPv1.
@@ -724,8 +736,10 @@ def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
     from sglang.srt.configs.model_config import is_deepseek_v4
 
     cfg = resolved_view(server_args)
-    if cfg.tp_size > 8:
-        return f"ep_size={cfg.tp_size} (EPv2 is intranode-only, ep_size<=8)"
+    # gfx1250 forms its LSA team from the UALink vPOD, which can span hosts and is
+    # only known once cco is up, so init_mori_epv2_op checks that EP fits in it.
+    if cfg.tp_size > 8 and not is_gfx1250_supported():
+        return f"ep_size={cfg.tp_size} across hosts (EPv2 is validated within one host)"
     if not envs.SGLANG_USE_AITER.get():
         return "SGLANG_USE_AITER=0 (EPv2 experts run on the aiter MoE runner)"
     if get_bool_env_var("MORI_ENABLE_SDMA", "false"):
