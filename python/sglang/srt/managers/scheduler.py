@@ -284,7 +284,6 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
-    OutputBudgetReservation,
     allocate_distinct_stream,
     is_health_check_generate_req,
     validate_input_length,
@@ -297,10 +296,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1291,7 +1287,7 @@ class Scheduler(
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
         self.enable_continuous_input_polling = False
-        self.enable_overlap_output_budget = False
+        self.enable_skip_finishing_decode = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1931,42 +1927,12 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
-    def _init_overlap_output_budget(self) -> None:
-        self.enable_overlap_output_budget = False
-        if not envs.SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET.get():
-            return
-
-        parallel = get_parallel()
-        self.enable_overlap_output_budget = (
-            is_cuda()
-            and self.is_generation
-            and self.enable_overlap
-            and not self.enable_pdmux
-            and not self.enable_overlap_mlx
-            and parallel.pp_size == 1
-            and not self.require_mlp_sync
-            and self.spec_algorithm.is_none()
-            and self.disaggregation_mode == DisaggregationMode.NULL
-            and self.dllm_config is None
-            and not self.enable_hisparse
-            and not self.enable_unified_memory
-            and not self.enable_priority_preemption
-            and not self.is_hybrid_swa
-            and not self.is_hybrid_ssm
-            and not self.model_config.is_encoder_decoder
-        )
-
-        if self.enable_overlap_output_budget:
-            logger.info("Overlap output budget enabled.")
-        else:
-            logger.warning(
-                "SGLANG_ENABLE_OVERLAP_OUTPUT_BUDGET was requested, "
-                "but is unsupported by the current scheduler configuration."
-            )
-
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        self.enable_skip_finishing_decode = self._is_skip_finishing_decode_enabled()
+        # Requests dropped from decode this step because their queued result finishes them.
+        self.reqs_finishing_in_flight: List[Req] = []
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2012,17 +1978,9 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                reservations = (
-                    self._build_output_budget_reservations(batch)
-                    if self.enable_overlap_output_budget
-                    else ()
-                )
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
-                if reservations:
-                    assert isinstance(batch_result, GenerationBatchResult)
-                    batch_result.reserve_output_budget(reservations)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2035,6 +1993,10 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            for req in self.reqs_finishing_in_flight:
+                assert req.finished(), f"{req.rid=} skipped decode but did not finish"
+            self.reqs_finishing_in_flight.clear()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -3801,14 +3763,19 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                decode_batch = self.update_running_batch(running_batch)
-                if decode_batch is not None:
-                    running_batch = decode_batch
-                ret = (
-                    decode_batch
-                    if decode_batch is not None and not decode_batch.is_empty()
-                    else None
-                )
+                finishing_reqs = self._filter_reqs_finishing_in_flight(running_batch)
+                if (
+                    finishing_reqs
+                    and not running_batch.is_empty()
+                    and not running_batch.check_decode_mem()
+                ):
+                    # The queued result frees the finishing requests' KV at the end of
+                    # this step; decode the rest next step instead of retracting them.
+                    running_batch.batch_is_full = False
+                    ret = None
+                else:
+                    running_batch = self.update_running_batch(running_batch)
+                    ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 
@@ -4194,9 +4161,8 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            exhausted_reqs = self._get_output_budget_exhausted_reqs(running_batch)
-            running_batch.filter_batch(chunked_req_to_exclude=list(exhausted_reqs))
-            if exhausted_reqs:
+            running_batch.filter_batch()
+            if self._filter_reqs_finishing_in_flight(running_batch):
                 running_batch.batch_is_full = False
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
@@ -4249,52 +4215,61 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _get_output_budget_exhausted_reqs(self, batch: ScheduleBatch) -> set[Req]:
-        """Find active requests whose remaining output is already in flight."""
-        if (
-            not self.enable_overlap_output_budget
-            or batch.is_empty()
-            or not batch.spec_algorithm.is_none()
-        ):
-            return set()
+    def _is_skip_finishing_decode_enabled(self) -> bool:
+        """Check support once on entry to the overlap loop."""
+        if not envs.SGLANG_ENABLE_OVERLAP_SKIP_FINISHING_DECODE.get():
+            return False
+        enabled = (
+            is_cuda()
+            and self.is_generation
+            and not self.require_mlp_sync
+            and self.spec_algorithm.is_none()
+            and self.dllm_config is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not self.enable_priority_preemption
+            and not self.is_hybrid_swa
+            and not self.is_hybrid_ssm
+            and not self.model_config.is_encoder_decoder
+        )
+        if not enabled:
+            logger.warning(
+                "SGLANG_ENABLE_OVERLAP_SKIP_FINISHING_DECODE is unsupported by the "
+                "current scheduler configuration; decoding every running request."
+            )
+        return enabled
 
-        exhausted_reqs = set()
-        for req in batch.reqs:
-            max_new_tokens = req.sampling_params.max_new_tokens
-            if (
-                req.num_pending_output_tokens > 0
-                and max_new_tokens is not None
-                and max_new_tokens > 0
-                and not req.finished()
-                and req.to_finish is None
-                and not req.is_retracted
-                and len(req.output_ids) + req.num_pending_output_tokens
-                >= max_new_tokens
-            ):
-                exhausted_reqs.add(req)
-
-        return exhausted_reqs
+    def _filter_reqs_finishing_in_flight(self, batch: ScheduleBatch) -> List[Req]:
+        """Drop requests whose queued result commits their last output by length."""
+        if not self.enable_skip_finishing_decode or not self.result_queue:
+            return []
+        # At scheduling time the overlap loop has processed every result but the last.
+        assert len(self.result_queue) == 1
+        queued_reqs = set(self.result_queue[0][0].reqs)
+        finishing_reqs = [
+            req
+            for req in batch.reqs
+            if req in queued_reqs
+            and req.beam_group is None
+            and req.grammar is None
+            and req.next_output_finishes_by_length()
+        ]
+        if finishing_reqs:
+            batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
+            self.reqs_finishing_in_flight.extend(finishing_reqs)
+        return finishing_reqs
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        exhausted_reqs = self._get_output_budget_exhausted_reqs(batch)
-        batch.filter_batch(chunked_req_to_exclude=list(exhausted_reqs))
-
+        batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
 
-        kv_full_retract_flag = not batch.check_decode_mem()
-        if exhausted_reqs and kv_full_retract_flag:
-            # Pending terminal results still own their KV. Consume them before
-            # retrying decode for the surviving requests.
-            batch.batch_is_full = False
-            return None
-
         # Check if decode out of memory
-        if kv_full_retract_flag or (
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             if self.decode_offload_manager is not None:
@@ -4429,40 +4404,6 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
-
-    @staticmethod
-    def _build_output_budget_reservations(
-        batch: ScheduleBatch,
-    ) -> tuple[OutputBudgetReservation, ...]:
-        """Snapshot ordinary output reservations before submitting a batch."""
-        if not batch.spec_algorithm.is_none():
-            return ()
-
-        if batch.forward_mode not in (
-            ForwardMode.EXTEND,
-            ForwardMode.MIXED,
-            ForwardMode.DECODE,
-        ):
-            return ()
-
-        middle_chunk_req = None if batch.forward_mode.is_decode() else batch.chunked_req
-
-        return tuple(
-            OutputBudgetReservation(
-                req=req,
-                retraction_count=req.retraction_count,
-                num_tokens=1,
-            )
-            for req in batch.reqs
-            if req is not middle_chunk_req
-            and req.beam_group is None
-            and req.grammar is None
-            and not req.finished()
-            and req.to_finish is None
-            and not req.is_retracted
-            and req.sampling_params.max_new_tokens is not None
-            and req.sampling_params.max_new_tokens > 0
-        )
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
@@ -4920,13 +4861,6 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-
-        # Retire reservations after this result has been consumed.
-        if (
-            isinstance(result, GenerationBatchResult)
-            and result.output_budget_reservations
-        ):
-            result.settle_output_budget()
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5933,10 +5867,9 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 
 def _dispatch_event_loop_once(scheduler: Scheduler):
-    scheduler._init_overlap_output_budget()
-
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
+    scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:

@@ -1069,9 +1069,6 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
-        # Output slots reserved by submitted forwards in the current execution,
-        # but not yet settled by result processing.
-        self.num_pending_output_tokens = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1568,6 +1565,15 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def next_output_finishes_by_length(self) -> bool:
+        # Whether committing one more output token reaches max_new_tokens
+        max_new_tokens = self.sampling_params.max_new_tokens
+        return (
+            not self.finished()
+            and max_new_tokens is not None
+            and len(self.output_ids) + 1 >= max_new_tokens
+        )
+
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
@@ -1978,8 +1984,6 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
-        # Invalidate output reservations from the previous execution.
-        self.num_pending_output_tokens = 0
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None

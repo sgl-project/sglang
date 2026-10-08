@@ -46,15 +46,6 @@ def allocate_distinct_stream(device_module, avoid_streams):
     raise RuntimeError("Unable to allocate a distinct stream")
 
 
-@dataclasses.dataclass(frozen=True)
-class OutputBudgetReservation:
-    """Output budget reserved for one request by one submitted forward."""
-
-    req: Req
-    retraction_count: int
-    num_tokens: int
-
-
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -91,8 +82,6 @@ class GenerationBatchResult:
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1
-    # Scheduler-owned reservations, settled when this result is processed.
-    output_budget_reservations: tuple[OutputBudgetReservation, ...] = ()
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets
     # these once — eagerly via the scheduler's grammar barrier inside verify(), or
@@ -154,39 +143,6 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
-
-    def reserve_output_budget(
-        self, reservations: tuple[OutputBudgetReservation, ...]
-    ) -> None:
-        """Register output reservations for this forward result."""
-        assert not self.output_budget_reservations
-
-        # Validate every record before changing any request's accounting.
-        for reservation in reservations:
-            assert reservation.num_tokens >= 0
-            assert reservation.retraction_count == reservation.req.retraction_count
-
-        for reservation in reservations:
-            reservation.req.num_pending_output_tokens += reservation.num_tokens
-
-        self.output_budget_reservations = reservations
-
-    def settle_output_budget(self) -> None:
-        """Settle this result's reservations without touching newer executions."""
-        reservations = self.output_budget_reservations
-
-        # Validate before changing any request's accounting.
-        for reservation in reservations:
-            req = reservation.req
-            if reservation.retraction_count == req.retraction_count:
-                assert req.num_pending_output_tokens >= reservation.num_tokens
-
-        for reservation in reservations:
-            req = reservation.req
-            if reservation.retraction_count == req.retraction_count:
-                req.num_pending_output_tokens -= reservation.num_tokens
-
-        self.output_budget_reservations = ()
 
     @property
     def has_sampled_token_ids(self) -> bool:
