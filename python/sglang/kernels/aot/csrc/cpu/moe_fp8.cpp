@@ -307,7 +307,7 @@ void fused_experts_fp8_pertensor_kernel_impl(
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
       const float* __restrict__ B_bias = with_bias ? w1_bias + expert_id * 2 * N + nb * BLOCK_N : nullptr;
-      
+
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
       bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
 
@@ -407,7 +407,7 @@ void fused_experts_fp8_pertensor_kernel_impl(
           /*   ldc          */ BLOCK_N,
           /*   brg          */ use_brgemm,
           /*   do_unpack    */ do_unpack);
-      
+
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
       for (int64_t m = 0; m < m_size; ++m) {
