@@ -122,7 +122,9 @@ def gpu_arch_name() -> str:
             properties = torch.musa.get_device_properties(device)
             return f"mp_{int(properties.major)}{int(properties.minor)}"
         except Exception:
-            logger.warning("Cannot detect MUSA architecture; the JIT cache target degrades.")
+            logger.warning(
+                "Cannot detect MUSA architecture; the JIT cache target degrades."
+            )
             return "unknown"
     if not is_hip_runtime():
         return get_jit_cuda_arch().target_name
