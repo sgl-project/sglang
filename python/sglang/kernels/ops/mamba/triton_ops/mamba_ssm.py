@@ -12,6 +12,7 @@ import triton.language as tl
 from packaging import version
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 PAD_SLOT_ID = -1
 
@@ -162,9 +163,56 @@ def _selective_scan_update_kernel(
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    STATIC_SHAPES_STRIDES: tl.constexpr = None,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+
+    # Individual aliases preserve the generic argument ABI; Triton does not
+    # accept tuple assignment from a constexpr tuple to runtime arguments.
+    if STATIC_SHAPES_STRIDES is not None:
+        T = STATIC_SHAPES_STRIDES[1]
+        nheads = STATIC_SHAPES_STRIDES[2]
+        dim = STATIC_SHAPES_STRIDES[3]
+        dstate = STATIC_SHAPES_STRIDES[4]
+        nheads_ngroups_ratio = STATIC_SHAPES_STRIDES[5]
+        stride_state_batch = STATIC_SHAPES_STRIDES[6]
+        stride_state_head = STATIC_SHAPES_STRIDES[7]
+        stride_state_dim = STATIC_SHAPES_STRIDES[8]
+        stride_state_dstate = STATIC_SHAPES_STRIDES[9]
+        stride_x_batch = STATIC_SHAPES_STRIDES[10]
+        stride_x_T = STATIC_SHAPES_STRIDES[11]
+        stride_x_head = STATIC_SHAPES_STRIDES[12]
+        stride_x_dim = STATIC_SHAPES_STRIDES[13]
+        stride_dt_batch = STATIC_SHAPES_STRIDES[14]
+        stride_dt_T = STATIC_SHAPES_STRIDES[15]
+        stride_dt_head = STATIC_SHAPES_STRIDES[16]
+        stride_dt_dim = STATIC_SHAPES_STRIDES[17]
+        stride_dt_bias_head = STATIC_SHAPES_STRIDES[18]
+        stride_dt_bias_dim = STATIC_SHAPES_STRIDES[19]
+        stride_A_head = STATIC_SHAPES_STRIDES[20]
+        stride_A_dim = STATIC_SHAPES_STRIDES[21]
+        stride_A_dstate = STATIC_SHAPES_STRIDES[22]
+        stride_B_batch = STATIC_SHAPES_STRIDES[23]
+        stride_B_T = STATIC_SHAPES_STRIDES[24]
+        stride_B_group = STATIC_SHAPES_STRIDES[25]
+        stride_B_dstate = STATIC_SHAPES_STRIDES[26]
+        stride_C_batch = STATIC_SHAPES_STRIDES[27]
+        stride_C_T = STATIC_SHAPES_STRIDES[28]
+        stride_C_group = STATIC_SHAPES_STRIDES[29]
+        stride_C_dstate = STATIC_SHAPES_STRIDES[30]
+        stride_D_head = STATIC_SHAPES_STRIDES[31]
+        stride_D_dim = STATIC_SHAPES_STRIDES[32]
+        stride_z_batch = STATIC_SHAPES_STRIDES[33]
+        stride_z_T = STATIC_SHAPES_STRIDES[34]
+        stride_z_head = STATIC_SHAPES_STRIDES[35]
+        stride_z_dim = STATIC_SHAPES_STRIDES[36]
+        stride_out_batch = STATIC_SHAPES_STRIDES[37]
+        stride_out_T = STATIC_SHAPES_STRIDES[38]
+        stride_out_head = STATIC_SHAPES_STRIDES[39]
+        stride_out_dim = STATIC_SHAPES_STRIDES[40]
+        stride_retrieve_parent_token_batch = STATIC_SHAPES_STRIDES[41]
+        stride_retrieve_parent_token_T = STATIC_SHAPES_STRIDES[42]
 
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -222,7 +270,9 @@ def _selective_scan_update_kernel(
             cache_idx = pid_b
 
     current_step_idx = 0
-    for _ in range(T):
+    for _ in tl.range(
+        T, loop_unroll_factor=4 if STATIC_SHAPES_STRIDES is not None else 1
+    ):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             if current_step_idx != 0 and cache_idx >= 0:
                 parent_ptr = (
@@ -497,6 +547,71 @@ def selective_state_update(
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
+    # The values remain runtime arguments in the generic kernel. For the
+    # qualified four-token verify shape, expose these same values as constants
+    # so Triton can fold address calculations and unroll the existing loop.
+    shape_stride_args = (
+        batch,
+        T,
+        nheads,
+        dim,
+        dstate,
+        nheads // ngroups,
+        state.stride(0),
+        state.stride(1),
+        state.stride(2),
+        state.stride(3),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        dt.stride(0),
+        dt.stride(1),
+        dt.stride(2),
+        dt.stride(3),
+        *((dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else (0, 0)),
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        B.stride(3),
+        C.stride(0),
+        C.stride(1),
+        C.stride(2),
+        C.stride(3),
+        *((D.stride(0), D.stride(1)) if D is not None else (0, 0)),
+        z_strides[0],
+        z_strides[1],
+        z_strides[2],
+        z_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        retrieve_parent_token_strides[0],
+        retrieve_parent_token_strides[1],
+    )
+    if (
+        envs.SGLANG_SM120_MAMBA_STATIC_VERIFY.get()
+        and T == 4
+        and (nheads, dim, dstate, ngroups) == (128, 64, 128, 8)
+        and disable_state_update
+        and state.dtype == x.dtype == torch.bfloat16
+        and intermediate_states_buffer is not None
+        and intermediate_states_buffer.dtype == torch.bfloat16
+        and state_batch_indices is not None
+        and intermediate_state_indices is not None
+        and retrieve_parent_token is not None
+        and cache_steps == 4
+        and tie_hdim
+        and not enable_stochastic_rounding
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (12, 0)
+    ):
+        pdl_kwargs["STATIC_SHAPES_STRIDES"] = shape_stride_args
+
     with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
@@ -516,47 +631,7 @@ def selective_state_update(
             retrieve_parent_token,
             intermediate_state_indices,
             rand_seed,
-            batch,
-            T,
-            nheads,
-            dim,
-            dstate,
-            nheads // ngroups,
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            x.stride(3),
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
-            dt.stride(3),
-            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            B.stride(3),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            C.stride(3),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            z_strides[3],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            retrieve_parent_token_strides[0],
-            retrieve_parent_token_strides[1],
+            *shape_stride_args,
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
