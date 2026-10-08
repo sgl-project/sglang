@@ -383,6 +383,18 @@ def get_config(
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
+            elif (
+                key in ("rope_scaling", "rope_parameters")
+                and isinstance(value, dict)
+                and isinstance(current, dict)
+            ):
+                # transformers v5 keeps the RoPE base inside rope_parameters and
+                # makes rope_scaling an alias whose setter replaces that dict
+                # wholesale. A partial override (for example restating the
+                # checkpoint's own scaling) would then drop rope_theta and
+                # get_rope_config would fall back to 10000, so merge instead:
+                # override keys win, the rest survives from the loaded config.
+                setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
 

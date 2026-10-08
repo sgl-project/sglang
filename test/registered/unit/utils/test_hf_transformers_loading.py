@@ -129,6 +129,61 @@ class TestHFTransformersLoading(unittest.TestCase):
         self.assertEqual(get_context_length(text), 1024)
         self.assertEqual(config.vision_config.patch_size, 14)
 
+    def llama3_rope_config(self):
+        config = self.text_config()
+        config["rope_parameters"] = {
+            "rope_type": "llama3",
+            "rope_theta": 500000.0,
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 128,
+        }
+        return config
+
+    def test_rope_scaling_override_keeps_the_rope_base(self):
+        """Under transformers v5 the RoPE base lives inside rope_parameters and
+        rope_scaling is an alias whose setter replaces that dict wholesale, so
+        `--json-model-override-args '{"rope_scaling": {...}}'` used to drop
+        rope_theta and get_rope_config fell back to 10000 (issue #41227). The
+        override must only change the keys it names."""
+        self.write_config(self.llama3_rope_config())
+        restated = {
+            "rope_type": "llama3",
+            "factor": 32.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 128,
+        }
+
+        for key in ("rope_scaling", "rope_parameters"):
+            with self.subTest(key=key):
+                config = get_config(
+                    self.model_path,
+                    trust_remote_code=False,
+                    local_files_only=True,
+                    model_override_args={key: restated},
+                )
+                theta, rope = get_rope_config(get_hf_text_config(config))
+
+                self.assertEqual(theta, 500000.0)
+                self.assertEqual(rope["factor"], 32.0)
+                self.assertEqual(rope["rope_type"], "llama3")
+
+    def test_rope_scaling_override_can_still_change_the_base(self):
+        self.write_config(self.llama3_rope_config())
+
+        config = get_config(
+            self.model_path,
+            trust_remote_code=False,
+            local_files_only=True,
+            model_override_args={"rope_scaling": {"rope_theta": 1000000.0}},
+        )
+        theta, rope = get_rope_config(get_hf_text_config(config))
+
+        self.assertEqual(theta, 1000000.0)
+        self.assertEqual(rope["factor"], 8.0)
+
     def test_tokenizer_loading_preserves_batch_special_tokens_and_chat(self):
         self.write_config(self.text_config())
         self.make_tokenizer().save_pretrained(self.model_path)
