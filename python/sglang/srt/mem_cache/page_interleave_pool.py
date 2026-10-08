@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.page_interleave import (
     PageShardSpec,
 )
 from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import ceil_div, get_bool_env_var
 
 if TYPE_CHECKING:
@@ -686,6 +687,8 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
+        if self._try_store_sharded_raw_fp8(layer_id, loc, cache_k_nope, cache_k_rope):
+            return
         if self._shard_extend_active:
             slot = self._slots[layer_id % 2]
             rows = self._translate_loc_cached(loc)
@@ -702,6 +705,66 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             cache_k_rope.index_select(0, owned_idx),
             layer_id_override=layer_id_override,
         )
+
+    def _try_store_sharded_raw_fp8(
+        self, layer_id, loc, cache_k_nope, cache_k_rope
+    ) -> bool:
+        """Convert once and share staging across both destinations when supported."""
+        if not (
+            self._shard_extend_active
+            and not self.dsa_kv_cache_store_fp8
+            and self.dtype == torch.float8_e4m3fn
+            and loc.ndim == 1
+            and loc.numel() >= 768
+            and loc.dtype in (torch.int32, torch.int64)
+            and cache_k_rope is not None
+            and cache_k_nope.ndim >= 2
+            and cache_k_rope.ndim >= 2
+            and cache_k_nope.shape[-1] == 512
+            and cache_k_rope.shape[-1] == 64
+            and cache_k_nope.dtype == cache_k_rope.dtype
+            and cache_k_nope.dtype
+            in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            and cache_k_nope.is_cuda
+            and cache_k_rope.device == cache_k_nope.device == loc.device
+            and not get_parallel().dcp_enabled
+        ):
+            return False
+        from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
+            can_use_set_sharded_mla_kv_buffer,
+            set_sharded_mla_kv_buffer,
+            sharded_mla_kv_buffer_inputs_supported,
+        )
+
+        if not can_use_set_sharded_mla_kv_buffer(512, 64):
+            return False
+        # Retain PyTorch's conversion, including FP8 overflow/NaN behavior.
+        # The kernel only scatters these bytes; it does not requantize them.
+        nope = cache_k_nope.to(self.dtype).view(torch.uint8)
+        rope = cache_k_rope.to(self.dtype).view(torch.uint8)
+        scratch = self._slots[layer_id % 2].tensors["kv"].view(torch.uint8)
+        local = self.kv_buffer[layer_id - self.start_layer].view(torch.uint8)
+        # Do not memoize by pointer: callers may mutate/reuse their loc tensors.
+        scratch_loc = self.translate_loc_to_scratch(loc)
+        logical_loc = loc.to(dtype=scratch_loc.dtype).contiguous()
+        args = (
+            scratch,
+            scratch_loc,
+            local,
+            logical_loc,
+            nope,
+            rope,
+            self.page_size,
+            self.shard_size,
+            self.shard_rank,
+        )
+        if not sharded_mla_kv_buffer_inputs_supported(*args):
+            return False
+        # Both existing destination scatters skip physical row zero.
+        set_sharded_mla_kv_buffer(
+            *args, scratch_reserved_skip_index=0, local_reserved_skip_index=0
+        )
+        return True
 
     def get_kv_buffer_shape(self):
         # Shape probes (e.g. the eager runner's DCP-metadata prep) must not
@@ -903,6 +966,55 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_buffer(layer_id)
+
+    def try_store_sharded_index_k_cache(self, layer_id, key, loc) -> bool:
+        """Fuse ordinary BF16/FP32-scale quantization with owner-aware dual stores."""
+        if not (
+            self._shard_extend_active
+            and self.page_size == 64
+            and self.index_head_dim == 128
+            and self.quant_block_size == 128
+            and key.dtype == torch.bfloat16
+            and key.ndim >= 2
+            and key.shape[-1] == 128
+            and key.is_cuda
+            and loc.ndim == 1
+            and loc.dtype == torch.int64
+            and loc.device == key.device
+            and key.numel() == loc.numel() * 128
+        ):
+            return False
+        local = self.index_key_cache.buffer[layer_id - self.start_layer]
+        if not local.shape[0]:
+            return False
+        scratch = self._slots[layer_id % 2].tensors["index_k"]
+        if any(
+            buf.dtype != torch.uint8
+            or buf.ndim != 2
+            or buf.shape[1] != self.page_size * 132
+            or not buf.is_contiguous()
+            or buf.device != key.device
+            for buf in (scratch, local)
+        ):
+            return False
+        from sglang.kernels.ops.attention.fused_store_index_cache import (
+            can_use_dsa_sharded_store,
+            fused_store_sharded_index_k_cache,
+        )
+
+        if not can_use_dsa_sharded_store(key.dtype, loc.dtype, self.page_size):
+            return False
+        fused_store_sharded_index_k_cache(
+            key,
+            scratch,
+            self.translate_loc_to_scratch(loc),
+            local,
+            loc,
+            self.shard_size,
+            self.shard_rank,
+            self.page_size,
+        )
+        return True
 
     def set_kv_buffer(
         self,

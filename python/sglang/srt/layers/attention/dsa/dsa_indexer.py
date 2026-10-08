@@ -1810,9 +1810,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
+        sharded_pool = get_kv_shard_pool(pool)
         if (
             _is_cuda
-            and get_kv_shard_pool(pool) is None
+            and not _is_fp8_fnuz
+            and self.block_size == 128
+            and self.scale_fmt is None
+            and sharded_pool is not None
+            and hasattr(sharded_pool, "try_store_sharded_index_k_cache")
+            and sharded_pool.try_store_sharded_index_k_cache(
+                layer_id, key, out_cache_loc
+            )
+        ):
+            return
+
+        if (
+            _is_cuda
+            and sharded_pool is None
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,

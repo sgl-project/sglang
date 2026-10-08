@@ -21,6 +21,10 @@ struct FusedStoreCacheParam {
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
+  void* __restrict__ shard_cache = nullptr;
+  const void* __restrict__ logical_indices = nullptr;
+  uint32_t shard_size = 1;
+  uint32_t shard_rank = 0;
 };
 
 [[maybe_unused]]
@@ -34,7 +38,7 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
 }
 
-template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL, bool kSharded = false>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
@@ -42,7 +46,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, shard_cache, logical_indices, shard_size, shard_rank] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -74,7 +78,27 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
   static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  if constexpr (kSharded) {
+    if (lane_id == 0) *static_cast<float*>(scale_ptr) = scale;
+  } else {
+    static_cast<float*>(scale_ptr)[0] = scale;
+  }
+
+  if constexpr (kSharded) {
+    // Scratch consumes every token; persistent storage only consumes this
+    // rank's pages. Reuse the exact same quantized bytes and FP32 scale.
+    const auto logical = static_cast<const IndicesT*>(logical_indices)[global_wid];
+    const auto logical_page = logical >> kPageBits;
+    if (logical_page % shard_size == shard_rank) {
+      const auto local_page = logical_page / shard_size;
+      const auto local_offset = logical & ((1 << kPageBits) - 1);
+      const auto local_ptr = pointer::offset(shard_cache, local_page * kPageBytes);
+      static_cast<OutStorage*>(pointer::offset(local_ptr, local_offset * 128))[lane_id] = result;
+      if (lane_id == 0) {
+        *static_cast<float*>(pointer::offset(local_ptr, 128 << kPageBits, local_offset * 4)) = scale;
+      }
+    }
+  }
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
@@ -88,6 +112,49 @@ struct FusedStoreCacheIndexerKernel {
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
+
+  static void run_sharded(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView scratch,
+      tvm::ffi::TensorView scratch_indices,
+      tvm::ffi::TensorView shard_cache,
+      tvm::ffi::TensorView logical_indices,
+      int64_t shard_size,
+      int64_t shard_rank) {
+    using namespace host;
+    RuntimeCheck(shard_size > 1 && shard_size <= UINT32_MAX, "invalid shard size");
+    RuntimeCheck(shard_rank >= 0 && shard_rank < shard_size, "invalid shard rank");
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({N, 128}).with_dtype<KeyT>().with_device(device_).verify(input);
+    TensorMatcher({-1, kPageBytes})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(scratch);
+    TensorMatcher({-1, kPageBytes})
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(shard_cache);
+    TensorMatcher({N}).with_dtype<IndicesT>().with_device(device_).verify(scratch_indices);
+    TensorMatcher({N}).with_dtype<IndicesT>().with_device(device_).verify(logical_indices);
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
+    const auto params = FusedStoreCacheParam{
+        .input = input.data_ptr(),
+        .cache = scratch.data_ptr(),
+        .indices = scratch_indices.data_ptr(),
+        .num_tokens = num_tokens,
+        .shard_cache = shard_cache.data_ptr(),
+        .logical_indices = logical_indices.data_ptr(),
+        .shard_size = static_cast<uint32_t>(shard_size),
+        .shard_rank = static_cast<uint32_t>(shard_rank),
+    };
+    constexpr auto sharded_kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL, true>;
+    LaunchKernel(div_ceil(num_tokens, 4u), 128, device_.unwrap()).enable_pdl(kUsePDL)(sharded_kernel, params);
+  }
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
     using namespace host;

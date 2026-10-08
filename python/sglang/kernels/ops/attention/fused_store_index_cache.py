@@ -103,3 +103,90 @@ def fused_store_index_k_cache(
 
     module = _jit_dsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
     module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+
+
+@cache_once
+def _jit_dsa_sharded_store_module(page_size: int) -> Module:
+    args = make_cpp_args(torch.bfloat16, torch.int64, page_size, is_arch_support_pdl())
+    return load_jit(
+        "fused_store_sharded_index_k_cache",
+        *args,
+        cuda_files=["dsa/fused_store_index_cache.cuh"],
+        cuda_wrappers=[("store", f"FusedStoreCacheIndexerKernel<{args}>::run_sharded")],
+    )
+
+
+@cache_once
+def can_use_dsa_sharded_store(
+    key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
+) -> bool:
+    """Probe the optional CUDA BF16/FP8 dual-store kernel before dispatch."""
+    if (
+        key_dtype != torch.bfloat16
+        or indices_dtype != torch.int64
+        or page_size != 64
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+    ):
+        return False
+    try:
+        _jit_dsa_sharded_store_module(page_size)
+        return True
+    except Exception as exc:
+        logger.warning("Failed to load sharded DSA fused store JIT kernel: %s", exc)
+        return False
+
+
+@debug_kernel_api
+def fused_store_sharded_index_k_cache(
+    key: torch.Tensor,
+    scratch: torch.Tensor,
+    scratch_loc: torch.Tensor,
+    shard_cache: torch.Tensor,
+    logical_loc: torch.Tensor,
+    shard_size: int,
+    shard_rank: int,
+    page_size: int = 64,
+) -> None:
+    """Quantize once, stage every row and persist only this rank's pages.
+
+    ``key`` contains BF16 rows with 128 elements. Quantization uses the normal
+    FP32 abs-max scale, not a rounded/power-of-two scale. Both destination
+    buffers have shape ``(num_pages, page_size * 132)`` and retain the DSA
+    layout: all FP8 K rows, followed by all FP32 scales within each page.
+
+    Locations are valid, nonnegative token addresses (including reserved row
+    zero). Padding must already point to a valid scratch trash/reserved row;
+    there is no negative-index skip convention. Non-owned rows still update
+    scratch. Like the ordinary store, concurrent duplicate destinations with
+    different keys are not supported. Inputs may be strided; output buffers
+    must be contiguous and disjoint.
+    """
+    assert 1 < shard_size <= 2**32 - 1 and 0 <= shard_rank < shard_size
+    assert page_size == 64
+    assert key.ndim >= 2 and key.shape[-1] == 128
+    assert key.dtype == torch.bfloat16
+    assert scratch.dtype == shard_cache.dtype == torch.uint8
+    assert scratch_loc.dtype == logical_loc.dtype == torch.int64
+    assert scratch_loc.ndim == logical_loc.ndim == 1
+    assert scratch.ndim == shard_cache.ndim == 2
+    assert scratch.shape[1] == shard_cache.shape[1] == page_size * 132
+    assert scratch.is_contiguous() and shard_cache.is_contiguous()
+    assert key.numel() // 128 == scratch_loc.numel() == logical_loc.numel()
+    assert key.is_cuda
+    assert all(
+        tensor.device == key.device
+        for tensor in (scratch, scratch_loc, shard_cache, logical_loc)
+    )
+    if logical_loc.numel() == 0:
+        return
+    key = key.reshape(-1, 128).contiguous()
+    _jit_dsa_sharded_store_module(page_size).store(
+        key,
+        scratch,
+        scratch_loc.contiguous(),
+        shard_cache,
+        logical_loc.contiguous(),
+        shard_size,
+        shard_rank,
+    )
