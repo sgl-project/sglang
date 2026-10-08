@@ -50,6 +50,7 @@ class AttentionBackendEnum(enum.Enum):
     SOL_ATTN = enum.auto()
     SUBBLOCK_SPARSE_ATTN = enum.auto()
     CUBE_SPARSE_ATTN = enum.auto()
+    FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -207,6 +208,12 @@ class Platform:
         if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 12
+
+    @classmethod
+    def is_gfx1151(cls) -> bool:
+        """True on the gfx1151 (Strix Halo) ROCm arch. Overridden on
+        RocmPlatform; every other platform is False."""
+        return False
 
     @classmethod
     def is_cuda_static(cls) -> bool:

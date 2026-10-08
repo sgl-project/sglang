@@ -61,7 +61,7 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         url: url.into(),
         mode,
         model_ids: Vec::new(),
-        bootstrap_port: None,
+        ..Default::default()
     }
 }
 
@@ -740,7 +740,7 @@ async fn removed_awaits_pending_added() {
 /// independently — 2N round-trips for N workers.
 #[tokio::test]
 async fn manager_emits_single_server_info_fetch_per_worker() {
-    use sgl_router::policies::kv_events::KvEventIndex;
+    use sgl_router::state::kv_events::KvEventIndex;
 
     let body = json!({
         "served_model_name": "m",
@@ -904,4 +904,51 @@ async fn reconcile_recovers_worker_with_unresolved_model_ids() {
     drop(tx);
     h.await.unwrap();
     let _ = shutdown_tx.send(());
+}
+
+/// Membership updates race initial introspection and must update the live
+/// worker without resetting its in-flight accounting or circuit breaker.
+#[tokio::test]
+async fn service_membership_updates_preserve_live_worker_state() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let handle = tokio::spawn(manager::run(rx, registry.clone()));
+    let spec = spec_for("w", &url, WorkerMode::Plain);
+    let id = spec.id.clone();
+    tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
+    // This must wait for registration, rather than losing the membership.
+    tx.send(DiscoveryEvent::ServicesChanged {
+        id: id.clone(),
+        services: ["ns/short".into()].into(),
+    })
+    .await
+    .unwrap();
+    wait_until(
+        || {
+            registry
+                .get(&id)
+                .is_some_and(|w| w.services().contains("ns/short"))
+        },
+        "initial service membership",
+    )
+    .await;
+    let worker = registry.get(&id).unwrap();
+    let _guard = worker.load_guard();
+    tx.send(DiscoveryEvent::ServicesChanged {
+        id: id.clone(),
+        services: ["ns/long".into()].into(),
+    })
+    .await
+    .unwrap();
+    wait_until(
+        || worker.services().contains("ns/long"),
+        "changed service membership",
+    )
+    .await;
+    assert!(!worker.services().contains("ns/short"));
+    assert!(Arc::ptr_eq(&worker, &registry.get(&id).unwrap()));
+    assert_eq!(worker.router_inflight_load(), 1);
+    drop(tx);
+    handle.await.unwrap();
 }

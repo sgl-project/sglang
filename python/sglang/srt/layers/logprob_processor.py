@@ -18,7 +18,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -151,18 +151,21 @@ def get_token_ids_logprobs_raw(
     no_copy_to_cpu: bool = False,
 ):
     vals, idxs = [], []
+    pin_memory = is_pin_memory_available(logprobs.device)
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None:
-                vals.append([])
-                idxs.append([])
+                # The CPU copy expects a tensor in every entry under no_copy_to_cpu.
+                # A new empty one does not keep the full logprobs alive like a view.
+                row = logprobs.new_empty((0,))
+                token_ids = []
             else:
-                token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                    logprobs.device, non_blocking=True
-                )
+                token_ids_tensor = torch.tensor(
+                    token_ids, dtype=torch.long, pin_memory=pin_memory
+                ).to(logprobs.device, non_blocking=True)
                 row = logprobs[i, token_ids_tensor]
-                vals.append(row if no_copy_to_cpu else row.tolist())
-                idxs.append(token_ids)
+            vals.append(row if no_copy_to_cpu else row.tolist())
+            idxs.append(token_ids)
     else:  # prefill
         pt = 0
         for i, (token_ids, pruned_len) in enumerate(
@@ -178,9 +181,9 @@ def get_token_ids_logprobs_raw(
                 idxs.append([])
                 pt += pruned_len
                 continue
-            token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                logprobs.device, non_blocking=True
-            )
+            token_ids_tensor = torch.tensor(
+                token_ids, dtype=torch.long, pin_memory=pin_memory
+            ).to(logprobs.device, non_blocking=True)
             pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
             idxs.append([token_ids for _ in range(pruned_len)])
@@ -987,8 +990,12 @@ class OutputLogprobProcessor:
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
+            # no_copy_to_cpu avoids the .item()/.tolist() CUDA sync that regresses
+            # prefill-only Score throughput at high concurrency.
             (
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+            ) = get_token_ids_logprobs(
+                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            )
         return result
