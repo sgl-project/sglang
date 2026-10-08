@@ -4,6 +4,7 @@
 import pytest
 import torch
 from diffusers import AutoencoderKL as ReferenceAutoencoderKL
+from diffusers.models.attention_processor import AttnAddedKVProcessor, AttnProcessor
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
@@ -56,6 +57,13 @@ def test_kl_encode_decode_matches_diffusers(flux2, quant_conv, mode, dtype):
     model.use_tiling = reference.use_tiling = mode == "tiled"
     x = torch.randn(2, 3, 24, 28, device=device, dtype=dtype)
     expected = reference.encode(x).latent_dist
+    processors = model.attn_processors
+    processor_keys = tuple(processors)
+    model.set_attn_processor(processors)
+    assert processors == {}
+    assert tuple(model.attn_processors) == processor_keys
+    with pytest.raises(ValueError, match="number of processors"):
+        model.set_attn_processor({})
     for _ in range(2):
         posterior = model.encode(x.unsqueeze(2) if flux2 else x)
         if not flux2:
@@ -83,3 +91,10 @@ def test_kl_encode_decode_matches_diffusers(flux2, quant_conv, mode, dtype):
             rtol=0,
             atol=0,
         )
+    for processor_cls in (AttnProcessor, AttnAddedKVProcessor):
+        model.set_attn_processor(processor_cls())
+        model.set_default_attn_processor()
+        assert all(type(p) is processor_cls for p in model.attn_processors.values())
+    model.set_attn_processor(object())
+    with pytest.raises(ValueError, match="Cannot call"):
+        model.set_default_attn_processor()
