@@ -183,6 +183,7 @@ def minimax_sparse_prefill(
                     cu_seqlens=cu_seqlens,
                     seq_lens=seq_lens,
                     prefix_lens=prefix_lens,
+                    max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,
                     block_size_k=block_size_k,
                     page_size=page_size,

@@ -171,6 +171,7 @@ def test_native_q8kv8_score_handles_varlen_paged_batches():
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         prefix_lens=prefix_lens,
+        max_seqlen_q=max(q_lens),
         max_seqlen_k=max_seq_len,
         block_size_k=128,
         page_size=128,

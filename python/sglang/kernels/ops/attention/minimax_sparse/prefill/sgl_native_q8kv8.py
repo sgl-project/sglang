@@ -187,6 +187,7 @@ def sgl_native_q8kv8_sparse_prefill_score(
     cu_seqlens: torch.Tensor,
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
     max_seqlen_k: int,
     block_size_k: int,
     page_size: int,
@@ -245,6 +246,8 @@ def sgl_native_q8kv8_sparse_prefill_score(
         raise ValueError("slot_ids length must match the prefill batch size")
     if seq_lens.numel() != batch_size or prefix_lens.numel() != batch_size:
         raise ValueError("sequence metadata length must match the prefill batch size")
+    if total_q > 0 and max_seqlen_q <= 0:
+        raise ValueError("max_seqlen_q must be positive when total_q > 0")
     if max_seqlen_k <= 0:
         raise ValueError("max_seqlen_k must be positive")
     if torch.cuda.get_device_capability(q.device)[0] != 9:
@@ -279,6 +282,7 @@ def sgl_native_q8kv8_sparse_prefill_score(
             seq_lens,
             prefix_lens,
             int(total_q),
+            int(max_seqlen_q),
             int(num_q_heads),
             int(num_kv_heads),
             int(max_slots),

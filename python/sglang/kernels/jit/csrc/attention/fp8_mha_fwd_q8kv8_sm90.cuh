@@ -639,6 +639,7 @@ inline void launch_fp8_mha_score_q8k8_sm90(
     const int32_t* seq_lens,
     const int32_t* prefix_lens,
     int total_q,
+    int max_seqlen_q,
     int num_q_heads,
     int num_kv_heads,
     int max_slots,
@@ -676,7 +677,7 @@ inline void launch_fp8_mha_score_q8k8_sm90(
   auto kernel = &fp8_mha_score_q8k8_kernel;
   constexpr size_t smem_size = sizeof(ScoreSharedStorage);
   KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  const int max_q_tiles = (total_q + kQueriesPerCta - 1) / kQueriesPerCta;
+  const int max_q_tiles = (max_seqlen_q + kQueriesPerCta - 1) / kQueriesPerCta;
   kernel<<<dim3(batch_size * max_q_tiles, num_q_heads, max_seqblocks), kWarpGroupSize, smem_size, stream>>>(
       score,
       q,
