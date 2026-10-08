@@ -790,11 +790,13 @@ class TestCPZigzagStrategy(CustomTestCase):
         metadata = self._metadata_for_rank(
             0,
             cp_size=cp_size,
-            seq_lens=[8],
-            extend_seq_lens=[8],
+            seq_lens=[12],
+            extend_seq_lens=[12],
         )
+        with get_parallel().override(attn_cp_size=cp_size):
+            pad_logical_token_to_physical(metadata)
         fb = SimpleNamespace(attn_cp_metadata=metadata)
-        q = torch.arange(6 * 2).view(6, 2)
+        q = torch.arange(8 * 2).view(8, 2)
         calls = []
 
         def attn_fn(logical_q):
@@ -802,17 +804,17 @@ class TestCPZigzagStrategy(CustomTestCase):
             return logical_q + 100
 
         out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
-            q,
-            fb,
+            q=q,
+            forward_batch=fb,
             device=torch.device("cpu"),
             attn_fn=attn_fn,
             attention_backend=CPAttentionBackendKind.FLASHINFER,
         )
 
         self.assertEqual(len(calls), 1)
-        self.assertTrue(torch.equal(calls[0], q[:4]))
-        self.assertTrue(torch.equal(out[:4], q[:4] + 100))
-        self.assertTrue(torch.equal(out[4:], torch.zeros_like(q[4:])))
+        self.assertTrue(torch.equal(calls[0], q[:6]))
+        self.assertTrue(torch.equal(out[:6], q[:6] + 100))
+        self.assertTrue(torch.equal(out[6:], torch.zeros_like(q[6:])))
 
 
 class TestCPInterleaveStrategy(CustomTestCase):

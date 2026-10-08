@@ -35,7 +35,6 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
 )
-from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -433,11 +432,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
         self.prefill_cp_enabled = bool(
             prefill_backend == "flashinfer"
-            and model_runner.server_args.enable_prefill_cp
-            and model_runner.server_args.attn_cp_size > 1
+            and get_parallel().enable_prefill_cp
+            and get_parallel().attn_cp_size > 1
         )
         if self.prefill_cp_enabled:
-            self._validate_prefill_cp_configuration(model_runner)
+            self._validate_prefill_cp_configuration(
+                model_config=model_runner.model_config,
+                sliding_window_size=model_runner.sliding_window_size,
+            )
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -561,15 +563,13 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
-    def _validate_prefill_cp_configuration(self, model_runner: ModelRunner) -> None:
-        server_args = model_runner.server_args
-        model_config = model_runner.model_config
+    def _validate_prefill_cp_configuration(
+        self, *, model_config, sliding_window_size
+    ) -> None:
         if not (
-            enable_cp_v2()
-            and server_args.cp_strategy == "zigzag"
-            and server_args.moe_dense_tp_size == 1
+            get_parallel().cp_strategy == "zigzag"
             and model_config.attention_arch == AttentionArch.MHA
-            and model_runner.sliding_window_size is None
+            and sliding_window_size is None
             and not model_config.is_encoder_decoder
             and model_config.head_dim == model_config.v_head_dim
             and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
@@ -577,8 +577,8 @@ class FlashInferAttnBackend(AttentionBackend):
             and not self.prefill_uses_dequant_workspace
         ):
             raise ValueError(
-                "FlashInfer prefill context parallelism requires eager CP-v2 zigzag "
-                "with replicated dense MLP weights and direct NHD dense causal MHA/GQA."
+                "FlashInfer prefill context parallelism requires eager zigzag "
+                "with direct NHD dense causal MHA/GQA."
             )
 
     def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
@@ -1416,7 +1416,9 @@ class FlashInferAttnBackend(AttentionBackend):
         cp_wrapper = self.forward_metadata.cp_wrapper
         if cp_wrapper is not None:
             cp_strategy = get_cp_strategy()
-            cp_strategy.materialize_full_kv(forward_batch, layer, k, v)
+            cp_strategy.materialize_full_kv(
+                forward_batch=forward_batch, layer=layer, k=k, v=v
+            )
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             def _flashinfer_cp_attn(logical_q: torch.Tensor) -> torch.Tensor:
@@ -1434,10 +1436,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             output = cp_strategy.run_attention(
-                q,
-                forward_batch,
-                q.device,
-                _flashinfer_cp_attn,
+                q=q,
+                forward_batch=forward_batch,
+                device=q.device,
+                attn_fn=_flashinfer_cp_attn,
                 attention_backend=CPAttentionBackendKind.FLASHINFER,
             )
             return output.view(-1, layer.tp_q_head_num * layer.head_dim)
