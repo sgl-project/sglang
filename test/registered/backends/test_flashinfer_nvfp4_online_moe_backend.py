@@ -23,6 +23,7 @@ class FlashinferNvFp4OnlineMoeBackendBase:
     extra_args = []
     extra_env = {}
     eval_args = {}
+    gsm8k_threshold = 0.90
     spec_accept_length_threshold = None
 
     @classmethod
@@ -65,7 +66,7 @@ class FlashinferNvFp4OnlineMoeBackendBase:
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.90)
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
         if self.spec_accept_length_threshold is not None:
             server_info = requests.get(self.base_url + "/server_info").json()
             avg_spec_accept_length = server_info["internal_states"][0][
@@ -163,6 +164,22 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "SGLANG_MOE_NVFP4_DISPATCH": "0",
         "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
     }
+
+
+class TestFlashinferTrtllmGenMoeBackendNvFp4OnlineRelu2(
+    FlashinferNvFp4OnlineMoeBackendBase, CustomTestCase
+):
+    """Non-gated RELU^2 experts; hidden 2688 is padded to 3072 for per-token.
+
+    Few-shot completion GSM8K is a weak signal for this model (BF16 scores ~0.5),
+    so the threshold only separates working output from the garbage (~0.02)
+    an unpadded per-token RELU^2 MoE produces.
+    """
+
+    backend = "flashinfer_trtllm"
+    model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    eval_args = {"api": "completion", "max_tokens": 512}
+    gsm8k_threshold = 0.30
 
 
 if __name__ == "__main__":

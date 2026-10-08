@@ -250,11 +250,12 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
 
 class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
     extra_env = {}
+    gsm8k_threshold = 0.89
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "nvidia/Qwen3-30B-A3B-NVFP4"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -289,7 +290,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.89)
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8(
@@ -333,6 +334,22 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
 ):
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """Non-gated RELU^2 experts; hidden 2688 is padded to 3072 for per-token.
+
+    Few-shot completion GSM8K is a weak signal for this model (BF16 scores ~0.5),
+    so the threshold only separates working output from the garbage (~0.02)
+    an unpadded per-token RELU^2 MoE produces.
+    """
+
+    model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
+    backend = "flashinfer_trtllm"
+    gsm8k_threshold = 0.30
 
 
 if __name__ == "__main__":
