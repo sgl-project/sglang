@@ -13,7 +13,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
-#ifndef USE_ROCM
+#if defined(USE_MUSA) || defined(__MUSACC__)
+#include <musa_runtime.h>
+#elif !defined(USE_ROCM)
 #include <cuda_runtime.h>
 #else
 #include <hip/hip_runtime.h>

@@ -13,8 +13,7 @@ import sys
 
 import msgspec
 import pytest
-
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +64,26 @@ def _entries(paths) -> list:
             cache._DepEntry(root=root, relpath=relpath, digest=cache._file_digest(path))
         )
     return out
+
+
+def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
+    monkeypatch.setattr(toolchain, "device_compiler_path", lambda: "/opt/musa/bin/mcc")
+    monkeypatch.setattr(toolchain, "base_cuda_flags", lambda: ["-fPIC", "-x", "musa"])
+    monkeypatch.setattr(toolchain, "target_flags", lambda: ["--offload-arch=mp_31"])
+
+    build_file = ninja.generate(
+        _spec(
+            cuda_files=("/tmp/fused_rope.cu",),
+            cpp_wrappers=(),
+            cuda_wrappers=(("run", "Kernel::run"),),
+        )
+    )
+
+    assert "device_compiler = /opt/musa/bin/mcc" in build_file
+    assert "command = $device_compiler " in build_file
+    assert "--offload-arch=mp_31" in build_file
+    assert "-x musa" in build_file
+    assert "nvcc =" not in build_file
 
 
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:

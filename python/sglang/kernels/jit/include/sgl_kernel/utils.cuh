@@ -30,13 +30,18 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
 #include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#elif defined(USE_MUSA) || defined(__MUSACC__)
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <musa_fp8.h>
+#include <musa_runtime.h>
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -67,9 +72,42 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
 
+#if defined(USE_MUSA) || defined(__MUSACC__)
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+using cudaError_t = musaError_t;
+using cudaStream_t = musaStream_t;
+using cudaLaunchConfig_t = musaLaunchConfig_t;
+using cudaLaunchAttribute = musaLaunchAttribute;
+inline constexpr auto cudaSuccess = musaSuccess;
+#define cudaStreamPerThread musaStreamPerThread
+#define cudaGetErrorString musaGetErrorString
+#define cudaGetLastError musaGetLastError
+#define cudaLaunchKernel musaLaunchKernel
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define cudaMemcpy musaMemcpy
+#define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaGetDevice musaGetDevice
+#define cudaRuntimeGetVersion musaRuntimeGetVersion
+#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
+#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#define cudaDevAttrMaxSharedMemoryPerBlock musaDevAttrMaxSharedMemoryPerBlock
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin musaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
+#define cudaFuncSetAttribute musaFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#endif
+
 namespace sglang {
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -83,6 +121,22 @@ using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
 using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
+
+using fp32x4_t = float4;
+#elif defined(USE_MUSA) || defined(__MUSACC__)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __mt_bfloat16;
+using fp8_e4m3_t = __mt_fp8_e4m3;
+using fp8_e5m2_t = __mt_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __mt_bfloat162;
+using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
+using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
+using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
+using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -104,14 +158,14 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
 // DLPack device type for the current platform
-#ifndef USE_ROCM
+#if !defined(USE_ROCM)
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
@@ -128,7 +182,7 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM)
+#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -138,6 +192,9 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#elif defined(USE_MUSA) || defined(__MUSACC__)
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #else  // USE_ROCM
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
@@ -340,12 +397,21 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
+#if defined(USE_MUSA) || defined(__MUSACC__)
+inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
+  if (error != ::musaSuccess) {
+    [[unlikely]];
+    host::panic(location, "MUSA error: ", ::musaGetErrorString(error));
+  }
+}
+#else
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
     host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
+#endif
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
@@ -369,7 +435,7 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
     return static_cast<uint32_t>(blocks);
   };
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_MUSA) || defined(__MUSACC__)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
@@ -460,6 +526,13 @@ struct LaunchKernel {
 #ifdef USE_ROCM
     (void)enabled;
     m_config.numAttrs = 0;
+#elif defined(USE_MUSA) || defined(__MUSACC__)
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = musaLaunchAttributeIgnore;
+      attr.val.programmaticStreamSerializationAllowed = true;
+      m_config.attrs = m_attrs;
+    }
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
@@ -472,7 +545,7 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_MUSA) || defined(__MUSACC__)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -515,6 +588,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
+#elif defined(USE_MUSA) || defined(__MUSACC__)
+    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
@@ -543,10 +618,15 @@ struct LaunchKernel {
   // Memo hit after load-time configure(); stream-constructed launches use the current device.
   template <typename T>
   void apply_prefer_l1(T&& kernel) const {
+#if defined(USE_MUSA) || defined(__MUSACC__)
+    (void)kernel;
+    return;
+#else
     int device_id = m_device_id;
     if (device_id < 0) RuntimeDeviceCheck(::cudaGetDevice(&device_id));
     const dim3 block = m_config.blockDim;
     ensure_prefer_l1(+kernel, device_id, block.x * block.y * block.z, m_config.dynamicSmemBytes);
+#endif
   }
 
   cudaLaunchConfig_t m_config;
@@ -558,10 +638,17 @@ struct LaunchKernel {
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
+#if defined(USE_MUSA) || defined(__MUSACC__)
+#define CHECK_CUDA(COND)                                                \
+  if (const auto error = (COND); error == ::musaSuccess) [[likely]] {   \
+  } else                                                                \
+    host::Error() << "MUSA error: " << ::musaGetErrorString(error) << ". "
+#else
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
     host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+#endif
 
 }  // namespace host
 

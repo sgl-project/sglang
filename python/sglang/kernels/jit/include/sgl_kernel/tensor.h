@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -33,7 +32,7 @@
 #include <type_traits>
 #include <utility>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 #include <sgl_kernel/utils.cuh>
 #elif defined(__HIPCC__)
 #include <sgl_kernel/utils.cuh>
@@ -72,7 +71,7 @@ struct DLDataTypeTrait<T> {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 template <>
 struct DLDataTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};
@@ -133,7 +132,7 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
-  constexpr auto max_type = stdr::max(map | stdv::keys);
+  constexpr auto max_type = static_cast<std::size_t>(DLDeviceType::kDLTrn);
   auto result = std::array<std::string_view, max_type + 1>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
@@ -315,7 +314,7 @@ struct SymbolicDType {
 
  private:
   auto m_check(DLDataType value) const -> bool {
-    return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
+    return m_options.empty() || (std::find(m_options.begin(), m_options.end(), value) != m_options.end());
   }
 
   std::span<const DLDataType> m_options;
@@ -382,7 +381,7 @@ struct SymbolicDevice {
 
  private:
   auto m_check(DLDevice value) const -> bool {
-    return stdr::empty(m_options) || (stdr::any_of(m_options, [value](const DLDevice& opt) {
+    return m_options.empty() || (std::any_of(m_options.begin(), m_options.end(), [value](const DLDevice& opt) {
              // device type must exactly match
              if (opt.device_type != value.device_type) return false;
              // device id can be wildcarded

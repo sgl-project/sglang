@@ -100,7 +100,7 @@ def generate(spec: BuildSpec) -> str:
     lines = [
         "ninja_required_version = 1.3",
         f"cxx = {_arg(host_cc)}",
-        f"nvcc = {_arg(device_cc)}",
+        f"device_compiler = {_arg(device_cc)}",
         f"cxxflags = {' '.join(cxxflags)}",
         f"cudaflags = {' '.join(cudaflags)}",
         f"ldflags = {' '.join(ldflags)}",
@@ -111,7 +111,7 @@ def generate(spec: BuildSpec) -> str:
         "",
         "rule compile_cuda",
         "  depfile = $out.d",
-        '  command = $nvcc -MD -MF "$out.d" $cudaflags -c "$in" -o "$out"',
+        '  command = $device_compiler -MD -MF "$out.d" $cudaflags -c "$in" -o "$out"',
         "",
         "rule link",
         '  command = $cxx $in $ldflags -o "$out"',
