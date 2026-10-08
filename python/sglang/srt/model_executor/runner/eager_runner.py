@@ -31,10 +31,9 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
+from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    build_eager_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
 )
@@ -427,19 +426,46 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        tail = None
+        if (
+            capture_aux_hidden_states
+            and getattr(model.model, "late_layer_start", None) is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = self.model_runner.attn_backend.tail_forward_metadata.late_layer_tail
+            assert tail.cp_metadata is not None
+
+        # The body restores the full CP metadata on exit, but DSpark bounded
+        # replay returns compact tail tensors. Gather with their own layout,
+        # then restore the batch even if a collective fails.
+        full_cp_metadata = forward_batch.attn_cp_metadata
+        if tail is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
         stream = torch.cuda.current_stream()
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
-        # DSpark aux tensors ride the same CP token split; gather them the same way.
-        if aux_hidden_states is not None:
-            if isinstance(aux_hidden_states, torch.Tensor):
-                aux_hidden_states = cp_gather_after_forward(
-                    aux_hidden_states, forward_batch, stream
-                )
-            else:
-                aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
-                    for aux in aux_hidden_states
-                ]
+        try:
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            if aux_hidden_states is not None:
+                if isinstance(aux_hidden_states, torch.Tensor):
+                    aux_hidden_states = cp_gather_after_forward(
+                        aux_hidden_states, forward_batch, stream
+                    )
+                else:
+                    aux_hidden_states = [
+                        cp_gather_after_forward(aux, forward_batch, stream)
+                        for aux in aux_hidden_states
+                    ]
+        finally:
+            forward_batch.attn_cp_metadata = full_cp_metadata
+
+        logits_metadata = forward_batch
+        if tail is not None:
+            input_ids = tail.global_rows(input_ids)
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
@@ -448,14 +474,17 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
+        output = model.logits_processor(
             input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.global_token_indices
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

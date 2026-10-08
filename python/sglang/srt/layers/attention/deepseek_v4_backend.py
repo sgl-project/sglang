@@ -1716,6 +1716,12 @@ class DeepseekV4AttnBackend(
             per_rank_logical_token=counts,
             gather_index=gather_index,
             local_index=local_metadata_rows,
+            # Prepare an independent tail count before replaying the front graph.
+            # Lazy pageable H2D in the first tail MoE would wait for that graph;
+            # sharing its count buffer would also race with graph execution.
+            moe_local_token_count=async_h2d(
+                [counts[cp_rank]], dtype=torch.int32, device=device
+            ).squeeze(0),
         )
         return dict(
             cp_metadata=cp_metadata,
