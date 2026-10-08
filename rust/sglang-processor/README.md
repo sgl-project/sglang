@@ -11,6 +11,10 @@ validation, transport and runtime.
 Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer` and
 `dynamo_tokenizers` so their Dynamo versions match the processor's.
 
+The `render`, `tokenizer` and `parser` features (all default) gate each
+component and its Dynamo crate, so a host that only renders and tokenizes
+skips `dynamo-parsers`.
+
 ```text
 src/
   model_files.rs   find files in a model dir or the HF cache
@@ -53,8 +57,12 @@ setting and picks one per request.
 select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<String>)
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
+ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(String, String), TemplateError>  // DeepSeek-V4
+DeepSeekV4Profile::from_checkpoint(profile_override, encoder_source) -> Result<DeepSeekV4Profile, String>
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
+requested_effort(&body) -> Option<&Value>
+requested_thinking(&body) -> Option<bool>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -63,7 +71,8 @@ native formatters.
 
 | Model | Formatter |
 |---|---|
-| DeepSeek V4, V3.2, Kimi K3, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
+| DeepSeek V4 | `models/deepseek_v4.rs` on Dynamo's V4 encoder |
+| DeepSeek V3.2, Kimi K3, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
 | Everything else | `load_chat_formatter` |
 
 `load_chat_formatter` (`loader.rs`) follows Python's `template_manager.py`
@@ -74,17 +83,34 @@ error string is returned so the host can report it per request.
 
 `render_prompt` is pass-through to `OAIPromptFormatter::render_prompt` for
 Jinja and native formatters. It keeps Dynamo's segments so Kimi K3 can encode
-with `encode_segments`. The SGLang additions hook in as follows:
+with `encode_segments`.
+`render_request` takes the SGLang request body, because DeepSeek-V4 reads
+`task`, `continue_final_message` and the `reasoning` object, which
+`OAIChatLikeRequest` lacks. It returns the continuation prefix separately, since
+SGLang tokenizes it on its own. `default_kwargs` are the server's
+`--default-chat-template-kwargs`, which apply after the request's own values.
+On a DeepSeek-V4 formatter, `render_prompt` rebuilds the body from the trait.
+`from_checkpoint` lets a host that fetches model files itself, such as
+sgl-router, build `ChatFormatter::DeepSeekV4` directly. `requested_effort` and
+`requested_thinking` (`reasoning.rs`) port `protocol.py`'s `reasoning` handling
+once, for the renderer and DeepSeek-V4 alike. The SGLang additions hook in as follows:
 
 | Code | Mirrors | Hook |
 |---|---|---|
 | `thinking.rs` | `parser/template_detection.py` | Reads the Jinja template's thinking toggle and its default; `resolve_thinking` writes that default into the kwargs before rendering. |
 | `legacy/` | `parser/conversation.py` | Replaces Dynamo: a native port of `Conversation.get_prompt()`, the built-in templates, and model-path inference. |
-| `models/deepseek_v4.rs` | `entrypoints/openai/chat_encoding.py` | Detects the checkpoint's preview or official effort profile, then maps the request effort onto Dynamo's tier before `DeepSeekV4Formatter`. |
+| `models/deepseek_v4.rs` | `entrypoints/openai/serving_chat.py`, `encoding_dsv4.py`, `chat_encoding.py` | Replaces the OAI formatter. It normalises the request the way SGLang does (message dump, part flattening, tool field order, final assistant turn, `task`, thinking and effort, the checkpoint's effort profile), then calls `deepseek::v4::encode_messages_with_options`. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
+
+**Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
+SGLang's Python serving path rendered and tokenized, written by
+`tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture. To
+add a model, follow the
+[`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
+skill.
 
 ## parser
 

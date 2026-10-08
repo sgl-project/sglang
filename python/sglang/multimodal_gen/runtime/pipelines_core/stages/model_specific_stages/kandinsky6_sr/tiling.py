@@ -58,23 +58,6 @@ def extract_all_tiles(
     return tiles
 
 
-def _normalize_blend(acc: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Normalize Hann-weighted tiles without flooring positive weights.
-
-    Corner weights are tiny but valid; clamping them darkens tile boundaries.
-    Pixels outside all tiles have zero weight and remain zero."""
-    covered = weight > 0
-    safe_weight = torch.where(covered, weight, torch.ones_like(weight))
-    return torch.where(covered, acc / safe_weight, torch.zeros_like(acc))
-
-
-def hanning_window_2d(h: int, w: int, device: torch.device) -> torch.Tensor:
-    """Create a [h, w] Hann window with nonzero endpoints."""
-    wy = torch.hann_window(h + 2, device=device)[1:-1]
-    wx = torch.hann_window(w + 2, device=device)[1:-1]
-    return wy[:, None] * wx[None, :]
-
-
 def stitch_tiles_hanning(
     tiles: list[torch.Tensor],
     grid: TileGrid,
@@ -88,8 +71,11 @@ def stitch_tiles_hanning(
     hr_tile_h, hr_tile_w = first.shape[2], first.shape[3]
     device = first.device
 
-    window = hanning_window_2d(hr_tile_h, hr_tile_w, device)
-    window = window.unsqueeze(0).unsqueeze(0)  # [1, 1, hr_tile_h, hr_tile_w]
+    # nonzero endpoints keep the outermost tile pixels covered
+    wy = torch.hann_window(hr_tile_h + 2, device=device)[1:-1]
+    wx = torch.hann_window(hr_tile_w + 2, device=device)[1:-1]
+    window = (wy[:, None] * wx[None, :])[None, None]
+    del wy, wx
 
     out_h = original_h * scale
     out_w = original_w * scale
@@ -106,7 +92,10 @@ def stitch_tiles_hanning(
             weight_acc[:, :, y : y + hr_tile_h, x : x + hr_tile_w] += window
             tile_idx += 1
 
-    return _normalize_blend(pred_acc, weight_acc)
+    # preserve tiny positive corner weights; only uncovered pixels stay zero
+    covered = weight_acc > 0
+    safe_weight = torch.where(covered, weight_acc, torch.ones_like(weight_acc))
+    return torch.where(covered, pred_acc / safe_weight, torch.zeros_like(pred_acc))
 
 
 def axis_positions_even(
@@ -179,18 +168,6 @@ def closest_base_resolution(
     return min(resolutions[visual_size], key=lambda hw: abs(hw[1] / hw[0] - ratio))
 
 
-def upsample_tiles_to_base(
-    raw_tiles: list[torch.Tensor], base_h: int, base_w: int
-) -> list[torch.Tensor]:
-    """Bilinearly resize ``[T, C, h, w]`` tiles to ``base_h x base_w`` and return ``[T, H, W, C]``."""
-    return [
-        functional.interpolate(
-            tile.float(), size=(base_h, base_w), mode="bilinear", align_corners=False
-        ).permute(0, 2, 3, 1)
-        for tile in raw_tiles
-    ]
-
-
 def resolve_scale_request(scale: float) -> tuple[int, float]:
     """Decompose total scale into (integer tiling scale, pixel pre-upscale)."""
     requested = float(scale)
@@ -240,9 +217,3 @@ def pad_to_spatial_factor(
         return video, (height, width)
     padded = functional.pad(video, (0, pad_w, 0, pad_h), mode="replicate")
     return padded, (height, width)
-
-
-def crop_to_hw(video: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
-    """Crop [..., H, W] to hw from the top-left, undoing bottom/right padding."""
-    height, width = hw
-    return video[..., :height, :width]

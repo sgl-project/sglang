@@ -30,7 +30,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     SkipSoftmaxParams,
     _json_safe,
-    quality_allows_kernel_fusions,
+    normalize_quality,
+    quality_allows,
     resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -54,17 +55,30 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(num_outputs_per_prompt=0)
 
     def test_quality_defaults_to_lossless(self):
+        # The default runs every fast path that keeps the reference math;
+        # "exact" is the opt-in for bit-identical output.
         self.assertEqual(SamplingParams().quality, "lossless")
 
     def test_quality_levels_are_cumulative(self):
-        self.assertEqual(QUALITY_LEVELS, ("lossless", "extra-high", "high"))
+        self.assertEqual(QUALITY_LEVELS, ("exact", "lossless", "high"))
         for quality in QUALITY_LEVELS:
             with self.subTest(quality=quality):
                 self.assertEqual(SamplingParams(quality=quality).quality, quality)
 
-        self.assertFalse(quality_allows_kernel_fusions("lossless"))
-        self.assertTrue(quality_allows_kernel_fusions("extra-high"))
-        self.assertTrue(quality_allows_kernel_fusions("high"))
+        # A request admits the fast paths of its own tier and of every
+        # stricter one, so the levels stay cumulative.
+        for request, admits in (
+            ("exact", {"exact"}),
+            ("lossless", {"exact", "lossless"}),
+            ("high", {"exact", "lossless", "high"}),
+        ):
+            for tier in QUALITY_LEVELS:
+                with self.subTest(request=request, tier=tier):
+                    self.assertEqual(quality_allows(request, tier), tier in admits)
+
+    def test_extra_high_is_accepted_as_the_former_name_of_lossless(self):
+        self.assertEqual(SamplingParams(quality="extra-high").quality, "lossless")
+        self.assertEqual(normalize_quality("extra-high"), "lossless")
 
     def test_quality_rejects_invalid_values(self):
         for bad in ("ultra", "draft", "fast", "", True, 1):
@@ -371,7 +385,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
-        for quality in ("extra-high", "high"):
+        for quality in ("exact", "lossless", "high", "extra-high"):
             with self.subTest(quality=quality):
                 self.assertEqual(
                     self._parse_cli_kwargs(["--quality", quality])["quality"], quality
