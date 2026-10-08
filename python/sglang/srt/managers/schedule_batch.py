@@ -1567,12 +1567,7 @@ class Req(ReqDllmMixin):
 
     def next_output_finishes_by_length(self) -> bool:
         # Whether committing one more output token reaches max_new_tokens
-        max_new_tokens = self.sampling_params.max_new_tokens
-        return (
-            not self.finished()
-            and max_new_tokens is not None
-            and len(self.output_ids) + 1 >= max_new_tokens
-        )
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
 
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)

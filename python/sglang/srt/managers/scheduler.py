@@ -1930,7 +1930,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.enable_skip_finishing_decode = self._is_skip_finishing_decode_enabled()
+        self.enable_skip_finishing_decode = True
         # Requests dropped from decode this step because their queued result finishes them.
         self.reqs_finishing_in_flight: List[Req] = []
         self.result_queue: Deque[
@@ -4215,30 +4215,6 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _is_skip_finishing_decode_enabled(self) -> bool:
-        """Check support once on entry to the overlap loop."""
-        if not envs.SGLANG_ENABLE_OVERLAP_SKIP_FINISHING_DECODE.get():
-            return False
-        enabled = (
-            is_cuda()
-            and self.is_generation
-            and not self.require_mlp_sync
-            and self.spec_algorithm.is_none()
-            and self.dllm_config is None
-            and not self.enable_hisparse
-            and not self.enable_unified_memory
-            and not self.enable_priority_preemption
-            and not self.is_hybrid_swa
-            and not self.is_hybrid_ssm
-            and not self.model_config.is_encoder_decoder
-        )
-        if not enabled:
-            logger.warning(
-                "SGLANG_ENABLE_OVERLAP_SKIP_FINISHING_DECODE is unsupported by the "
-                "current scheduler configuration; decoding every running request."
-            )
-        return enabled
-
     def _filter_reqs_finishing_in_flight(self, batch: ScheduleBatch) -> List[Req]:
         """Drop requests whose queued result commits their last output by length."""
         if not self.enable_skip_finishing_decode or not self.result_queue:
@@ -4251,7 +4227,6 @@ class Scheduler(
             for req in batch.reqs
             if req in queued_reqs
             and req.beam_group is None
-            and req.grammar is None
             and req.next_output_finishes_by_length()
         ]
         if finishing_reqs:

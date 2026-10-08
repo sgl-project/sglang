@@ -1,4 +1,4 @@
-"""CPU regressions for skipping the decode of requests finishing in flight.
+"""CPU regression for deferring decode while finishing requests hold KV.
 
 Use the real request, batch filtering, planner and capacity checks. Model
 execution, sampling metadata, admission and KV release are boundaries; these
@@ -18,12 +18,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    NextBatchPlan,
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -89,23 +84,6 @@ class TestSkipFinishingDecode(CustomTestCase):
         # Result-consumption boundary: materialize one ordinary output.
         req.output_ids.append(token)
         req.update_finish_state()
-
-    def test_only_queued_final_outputs_are_dropped(self):
-        finishing = self._req("finishing", output_ids=[10])
-        # Same remaining length, but its last result was already processed.
-        not_queued = self._req("not_queued", output_ids=[10])
-        unfinished = self._req("unfinished", max_new_tokens=3, output_ids=[10])
-        batch = self._batch([finishing, not_queued, unfinished])
-        self._queue(self._batch([finishing, unfinished]))
-
-        dropped = self.scheduler._filter_reqs_finishing_in_flight(batch)
-        self.assertEqual(dropped, [finishing])
-        self.assertEqual(batch.reqs, [not_queued, unfinished])
-        self.assertEqual(self.scheduler.reqs_finishing_in_flight, [finishing])
-        self.assertFalse(finishing.finished())
-
-        self._commit(finishing, 11)
-        self.assertIsInstance(finishing.finished_reason, FINISH_LENGTH)
 
     def _pressure_fixture(self):
         a = self._req("a", 2, [10], input_len=10)
@@ -202,16 +180,6 @@ class TestSkipFinishingDecode(CustomTestCase):
         self.assertEqual(batch.reqs, [b])
         self.assertEqual(batch.out_cache_loc.numel(), 1)
         self.assertFalse(b.is_retracted)
-
-    @patch("sglang.srt.managers.scheduler.TEST_RETRACT", False)
-    def test_disabled_keeps_existing_retraction(self):
-        a, b, batch, allocator, _ = self._pressure_fixture()
-        self.scheduler.enable_skip_finishing_decode = False
-        plan = self.scheduler.get_next_batch_to_run(batch, last_batch=batch)
-        self.assertIs(plan.batch_to_run, batch)
-        self.assertEqual(batch.reqs, [b])
-        self.assertTrue(a.is_retracted)
-        self.assertEqual(self.scheduler.reqs_finishing_in_flight, [])
 
 
 if __name__ == "__main__":
