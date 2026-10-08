@@ -295,7 +295,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0)},
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         elif draft_cfg.attention_sink_bias:
             # Per-head sink bias; each TP rank owns its slice of the
@@ -306,7 +306,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0)},
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         self.attn = RadixAttention(
             num_heads=self.num_heads,

@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -123,7 +122,10 @@ class TestPrefillAdder(CustomTestCase):
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
-        req.prefix_indices = []
+        req.prefix_len = 0
+        # A spec=Req mock gets a per-instance class; derive extend_len like Req.
+        type(req).extend_len = Req.extend_len
+        req.extend_end = None
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
@@ -194,11 +196,6 @@ class TestPrefillAdder(CustomTestCase):
         req.swa_host_hit_length = 0
         req.last_node = MagicMock()
         req.full_untruncated_fill_ids = list(range(12))
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return req
 
     def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
@@ -234,7 +231,7 @@ class TestPrefillAdder(CustomTestCase):
             continuation, waiting, adder.rem_chunk_tokens, adder.page_size
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
-        self.assertEqual(continuation.extend_range.length, 2560)
+        self.assertEqual(continuation.extend_len, 2560)
         for req in waiting:
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
         self.assertEqual(adder.can_run_list, [continuation, *waiting])
@@ -252,14 +249,14 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(adder.new_chunked_req)
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("host-miss")
         req.full_untruncated_fill_ids = list(range(1024))
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.prefix_len = 0
         req.host_hit_length = 768
         req.best_match_node = req.last_node
         req.needs_host_load_back.return_value = True
@@ -273,7 +270,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.mock_tree_cache.init_load_back.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
 
     def test_shortest_prefill_preserves_memory_admission(self):
         adder = self.create_shortest_prefill_adder()
@@ -291,7 +288,7 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_shared_req("continuation")
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_range.length, 4096)
+        self.assertEqual(req.extend_len, 4096)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
@@ -321,7 +318,7 @@ class TestPrefillAdder(CustomTestCase):
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
                 )
-                self.assertEqual(req.extend_range.length, expected)
+                self.assertEqual(req.extend_len, expected)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
@@ -371,7 +368,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertIs(adder.add_chunked_req(req), req)
                 self.assertEqual(adder.can_run_list, [])
-                req.set_extend_range.assert_not_called()
+                self.assertIsNone(req.extend_end)
                 self.assertEqual(
                     (adder.memory_budget.total_offset, adder.memory_budget.swa_offset),
                     before,
@@ -381,7 +378,7 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_shared_adder()
         req = self.create_shared_req("continuation", max_new_tokens=80)
         self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_range.length, 8)
+        self.assertEqual(req.extend_len, 8)
         self.assertEqual(adder.memory_budget.total_offset, 12)
         self.assertEqual(adder.memory_budget.swa_offset, 12)
 
@@ -787,11 +784,6 @@ class TestPrefillAdder(CustomTestCase):
         req.origin_input_ids = list(range(16))
         req.full_untruncated_fill_ids = list(range(16))
         req.last_node = MagicMock()
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
 
         result = adder.add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
@@ -799,7 +791,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
 
     def create_sharded_adder(
         self,
@@ -840,7 +832,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_sharded_req(self, rid, *, prefix_len=12, extend_len=4):
         req = self.create_shared_req(rid, max_new_tokens=1)
-        req.prefix_indices = list(range(prefix_len))
+        req.prefix_len = prefix_len
         req.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
         return req
 
@@ -862,7 +854,7 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [first])
-        second.set_extend_range.assert_not_called()
+        self.assertIsNone(second.extend_end)
         self.assertEqual((adder.rem_total_tokens, adder.rem_chunk_tokens), remaining)
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
@@ -941,7 +933,7 @@ class TestPrefillAdder(CustomTestCase):
                     AddReqResult.OTHER,
                 )
                 self.assertEqual(adder.can_run_list, reqs[:8])
-                reqs[8].set_extend_range.assert_not_called()
+                self.assertIsNone(reqs[8].extend_end)
                 self.assertEqual(
                     (
                         adder.rem_total_tokens,
@@ -986,7 +978,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder.can_run_list, [req])
                 self.assertIs(adder.new_chunked_req, req)
-                self.assertEqual(req.extend_range, Range(12, 12 + selected))
+                self.assertEqual((req.prefix_len, req.extend_end), (12, 12 + selected))
                 self.assertEqual(adder.kv_shard_block_bound_pages, 2)
                 self.assertEqual(adder.kv_shard_chunk_pages, selected // 4)
 
@@ -1000,7 +992,7 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.assertEqual(adder.kv_shard_block_bound_pages, 0)
         self.assertEqual(adder.kv_shard_chunk_pages, 0)
 
@@ -1039,17 +1031,8 @@ class TestPrefillAdder(CustomTestCase):
             )
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
-        req.prefix_indices = []
+        req.prefix_len = 0
         req.full_untruncated_fill_ids = list(range(extend_input_len))
-        # set_extend_range is the only writer of extend_range; the production
-        # path reads req.extend_range.length right after calling it, so the mock
-        # must actually set the attribute (a spec=Req mock has the method but
-        # not the instance attribute).
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -1066,8 +1049,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_range.assert_called_once()
-        start, end = req.set_extend_range.call_args.args
+        start, end = req.prefix_len, req.extend_end
         new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
@@ -1084,7 +1066,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
@@ -1151,16 +1133,11 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req(
             "resume", priority=0, max_new_tokens=40, output_len=10
         )
-        req.prefix_indices = list(range(PREFIX))
+        req.prefix_len = PREFIX
         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.last_node = MagicMock()
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 
         # Pre-fix: a constant sliding-window reservation rejects the resume.
@@ -1201,7 +1178,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator, self.mock_tree_cache
             )
             req = self.create_mock_req("dropped-fetch", priority=0, max_new_tokens=8)
-            req.prefix_indices = torch.empty(0, dtype=torch.int64)
+            req.prefix_len = 0
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
             req.swa_host_hit_length = WINDOW
@@ -1210,10 +1187,6 @@ class TestPrefillAdder(CustomTestCase):
             req.best_match_node = MagicMock()
             req.kv = SimpleNamespace(cache_protected_len=0)
 
-            def set_extend_range(start, end):
-                req.extend_range = Range(start, end)
-
-            req.set_extend_range = MagicMock(side_effect=set_extend_range)
             req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
 
             def load_back(params):
@@ -1243,9 +1216,9 @@ class TestPrefillAdder(CustomTestCase):
         # budget. A successful load must not run admission gates again.
         _, admitted, req = run(HOST_HIT + 4, remaining_after_load=0)
         self.assertEqual(len(admitted), 1)
-        self.assertEqual(len(req.prefix_indices), HOST_HIT + 4)
+        self.assertEqual(req.prefix_len, HOST_HIT + 4)
         self.assertEqual(req.kv.cache_protected_len, HOST_HIT + 4)
-        req.set_extend_range.assert_called_once_with(HOST_HIT + 4, SPAN)
+        self.assertEqual((req.prefix_len, req.extend_end), (HOST_HIT + 4, SPAN))
         # A partial FULL load stays fatal.
         with self.assertRaisesRegex(RuntimeError, "promised"):
             run(HOST_HIT // 2)
@@ -1335,7 +1308,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIs(result, AddReqResult.NO_TOKEN)
                 self.assertEqual(adder.can_run_list, admitted_before)
                 self.assertIsNone(adder.new_chunked_req)
-                req.set_extend_range.assert_not_called()
+                self.assertIsNone(req.extend_end)
                 self.assertEqual(
                     (
                         adder.memory_budget.remaining_swa,
@@ -1366,7 +1339,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertIs(result, AddReqResult.CONTINUE)
         self.assertEqual(adder.can_run_list, [req])
-        self.assertEqual(req.extend_range, Range(0, 8192))
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 8192))
         self.assertGreaterEqual(adder.memory_budget.remaining_swa, 0)
         self.assertEqual(self.mock_tree_cache.inc_lock_ref.call_count, 3)
         self.assertEqual(self.mock_tree_cache.dec_lock_ref.call_count, 2)
@@ -1378,28 +1351,28 @@ class TestPrefillAdder(CustomTestCase):
                 dict(
                     restored_tokens=6144, restored_swa_tokens=1024, available_swa=3328
                 ),
-                Range(6144, 8192),
+                (6144, 8192),
                 128,
                 AddReqResult.CONTINUE,
             ),
             (
                 "exact_fit_ring",
                 dict(ring=True),
-                Range(0, 8192),
+                (0, 8192),
                 0,
                 AddReqResult.NO_TOKEN,
             ),
             (
                 "fitting_chunk",
                 dict(chunk_tokens=2048),
-                Range(0, 2048),
+                (0, 2048),
                 1920,
                 AddReqResult.OTHER,
             ),
             (
                 "never_fits",
                 dict(size_swa=4096),
-                Range(0, 2944),
+                (0, 2944),
                 1024,
                 AddReqResult.CONTINUE,
             ),
@@ -1414,10 +1387,11 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIs(result, expected_result)
                 self.mock_tree_cache.init_load_back.assert_called_once()
                 self.assertEqual(adder.can_run_list, [req])
-                self.assertEqual(req.extend_range, expected_range)
-                self.assertEqual(req.host_loaded_length, expected_range.start)
+                expected_start, expected_end = expected_range
+                self.assertEqual((req.prefix_len, req.extend_end), expected_range)
+                self.assertEqual(req.host_loaded_length, expected_start)
                 self.assertIs(
-                    adder.new_chunked_req, req if expected_range.end < 8192 else None
+                    adder.new_chunked_req, req if expected_end < 8192 else None
                 )
                 self.assertEqual(adder.memory_budget.remaining_swa, remaining_swa)
 
@@ -1430,11 +1404,11 @@ class TestPrefillAdder(CustomTestCase):
             adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
 
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
 
     def _create_host_hit_req(self, *, prefix_len=0, host_hit=8192, tail=1024):
         req = self._create_delayer_req(prefix_len + host_hit + tail)
-        req.prefix_indices = torch.arange(prefix_len)
+        req.prefix_len = prefix_len
         req.host_hit_length = host_hit
         req.needs_host_load_back.return_value = True
         req.best_match_node = req.last_node
@@ -1514,7 +1488,7 @@ class TestPrefillAdder(CustomTestCase):
                     tile_gate.assert_called_once()
                 self.mock_tree_cache.init_load_back.assert_called_once()
                 self.assertEqual(adder.can_run_list, [req])
-                req.set_extend_range.assert_called_once_with(24, 24 + extend)
+                self.assertEqual((req.prefix_len, req.extend_end), (24, 24 + extend))
                 self.mock_tree_cache.inc_lock_ref.assert_any_call(restored_node)
                 self.assertIs(
                     self.mock_tree_cache.dec_lock_ref.call_args.args[0], old_node
@@ -1680,11 +1654,6 @@ class TestPrefillAdder(CustomTestCase):
         req.host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return req
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
@@ -1702,7 +1671,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
-        req.set_extend_range.assert_called_once_with(0, 200)
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
 
     def _adder_with_extend_lens(self, extend_lens):
