@@ -10,7 +10,7 @@ use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
 use sglang_mm::driver::{ImageSource, MmInput};
 
 use crate::message::multimodal::MmItem;
-use crate::message::request::{MmData, ProcessorExtensions};
+use crate::message::request::MmData;
 use crate::message::types::TokenIds;
 
 /// Fully resolved media for a multimodal processor. I/O sources were
@@ -23,9 +23,6 @@ pub struct ResolvedMediaWork {
     pub images: Vec<Bytes>,
     pub videos: Vec<Bytes>,
     pub audios: Vec<Bytes>,
-    /// Request fields owned by the selected processor rather than this shared
-    /// payload layer.
-    pub processor_extensions: ProcessorExtensions,
 }
 
 /// Resolve all modality fields in the fixed image/video/audio prefetch order.
@@ -42,7 +39,6 @@ fn resolve_media_work_with_budget(
         image_data,
         video_data,
         audio_data,
-        processor_extensions,
         prefetched,
         mm_hashes: _,
     } = mm;
@@ -59,7 +55,6 @@ fn resolve_media_work_with_budget(
         images,
         videos,
         audios,
-        processor_extensions,
     })
 }
 
@@ -83,16 +78,13 @@ fn collect_media(
                     fetch_bytes_budgeted(&source, budget).map(Bytes::from)
                 }
             }
-            MmItem::Preprocessed { format } => Err(format!(
-                "unsupported {field} item: preprocessed `{format}` input"
-            )),
         })
         .collect()
 }
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
-/// on the fixed MM worker pool (see `api_server::prefetch`). `data:` and bare
+/// on the fixed MM worker pool (see `core::prefetch`). `data:` and bare
 /// base64 are pure CPU and stay on the worker. Lives next to [`image_source`]
 /// so the prefetch walk and the parse walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {
@@ -120,15 +112,11 @@ pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
         image_data,
         video_data,
         audio_data,
-        processor_extensions,
         prefetched,
         mm_hashes: _,
     } = mm;
     if !video_data.is_empty() || !audio_data.is_empty() {
         return Err("unsupported modality: video/audio input".into());
-    }
-    if !processor_extensions.is_empty() {
-        return Err("unsupported generate extensions for this processor".into());
     }
     let mut prefetched = prefetched.iter();
     let images = image_data
@@ -155,9 +143,6 @@ fn image_source(
                 .map(|bytes| ImageSource::Bytes(bytes.to_vec()))
                 .ok_or_else(|| "I/O-backed image source was not prefetched".to_string())
         }
-        MmItem::Preprocessed { format } => Err(format!(
-            "unsupported image_data item: preprocessed `{format}` input"
-        )),
     }
 }
 
@@ -206,31 +191,6 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("video/audio")
-        );
-
-        let err = to_mm_input(
-            IDS.to_vec(),
-            image_work(vec![MmItem::Preprocessed {
-                format: "processor_output".into(),
-            }]),
-        )
-        .err()
-        .unwrap();
-        assert!(err.contains("preprocessed `processor_output`"), "{err}");
-
-        let extension = MmData {
-            processor_extensions: std::iter::once((
-                "multimodal_custom".to_owned(),
-                rmpv::Value::Boolean(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        assert!(
-            to_mm_input(IDS.to_vec(), extension)
-                .err()
-                .unwrap()
-                .contains("unsupported generate extensions")
         );
     }
 
