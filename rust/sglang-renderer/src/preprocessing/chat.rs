@@ -879,14 +879,27 @@ mod tests {
     fn deepseek_v4_continues_the_final_turn_as_sglang_does() {
         let formatter = ChatFormatter::DeepSeekV4(sglang_processor::DeepSeekV4Profile::Official);
         let preprocessor = chat_preprocessor_with(None, None, formatter);
-        // SGLang flattens parts, blanks null and drops the continuation's leading BOS.
-        for (content, continuation) in [
+        // SGLang flattens parts, blanks null, drops the continuation's leading BOS
+        // and tokenizes the continuation on its own.
+        let user = serde_json::json!({"role": "user", "content": "Hi"});
+        let after_user = "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>";
+        let parts =
+            serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+        for (first, content, prompt, continuation) in [
+            (&user, parts, after_user, "a b"),
+            (&user, JsonValue::Null, after_user, ""),
             (
-                serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]),
-                "a b",
+                &user,
+                serde_json::json!("<｜begin▁of▁sentence｜>abc"),
+                after_user,
+                "abc",
             ),
-            (JsonValue::Null, ""),
-            (serde_json::json!("<｜begin▁of▁sentence｜>abc"), "abc"),
+            (
+                &serde_json::json!({"role": "system", "content": "a"}),
+                serde_json::json!("b"),
+                "<｜begin▁of▁sentence｜>a",
+                "b",
+            ),
         ] {
             let mut request = chat_request(None);
             request.tools = None;
@@ -897,14 +910,18 @@ mod tests {
             )
             .unwrap();
             request.messages = serde_json::from_value(serde_json::json!([
-                {"role": "user", "content": "Hi"},
+                first,
                 {"role": "assistant", "content": content}
             ]))
             .unwrap();
-            let prompt = preprocessor.lower_to_text(request).unwrap().prompt;
+            let rendered = preprocessor.lower_to_text(request).unwrap().prompt;
+            assert_eq!(rendered.as_str(), format!("{prompt}{continuation}"));
+            let segments = rendered
+                .segments()
+                .map(|segments| segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>());
             assert_eq!(
-                prompt.as_str(),
-                format!("<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>{continuation}")
+                segments,
+                (!continuation.is_empty()).then(|| vec![prompt, continuation])
             );
         }
     }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 use dynamo_renderer::deepseek::common::tokens;
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt};
+use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt, RenderedSegment};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -100,7 +100,13 @@ impl ChatFormatter {
                 let (prompt, prefix) = self.render_request(body)?;
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
-                Ok(RenderedPrompt::text(prompt + prefix))
+                if prefix.is_empty() {
+                    return Ok(RenderedPrompt::text(prompt));
+                }
+                Ok(RenderedPrompt::segmented(vec![
+                    RenderedSegment::new(prompt, true),
+                    RenderedSegment::new(prefix, true),
+                ]))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }

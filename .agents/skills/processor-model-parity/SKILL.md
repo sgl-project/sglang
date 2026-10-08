@@ -125,7 +125,8 @@ renders the model:
 - **Tokens**: Python's `tokenizer.encode` adds special tokens by default; the
   continuation prefix is encoded alone and loses a leading BOS
   (`_append_assistant_prefix_to_prompt_ids`). `tests/parity.rs` does both, using the
-  fixture's `bos_token_id`.
+  fixture's `bos_token_id`; `render_prompt` returns the prefix as its own segment so
+  hosts keep that boundary. (`continuation_bos`, `continuation_after_text`)
 - **Errors**: reject what Python rejects. A case Python raises on is recorded with
   `error`, and `tests/parity.rs` then requires `render_request` to fail. That
   includes pydantic rejections and Python crashes (a 500 is still a rejection).
