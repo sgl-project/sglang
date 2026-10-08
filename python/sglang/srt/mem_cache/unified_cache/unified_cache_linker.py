@@ -193,7 +193,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
-        device_hit_len = int(result.device_indices.numel())
+        device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
             return result
 
@@ -289,7 +289,7 @@ class UnifiedCacheLinkerWrapper:
 
     def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
         cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
+        empty_indices = cache.tree_core.empty_device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return empty_indices, req.last_node

@@ -1193,7 +1193,7 @@ class BufferModePipeline:
             cache_salt=span_key.cache_salt,
         )
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
-        return len(match.device_indices) >= len(key)
+        return match.device_prefix_len >= len(key)
 
     def set_prefix_ctx(
         self,
@@ -1391,7 +1391,7 @@ class BufferModePipeline:
         req = params.req
         assert req is not None
         request = req.cache_request_handle
-        empty = cache.tree_core.empty_match_result.device_indices
+        empty = cache.tree_core.empty_device_indices
         unchanged = (empty, req.last_node)
         f = self.staged_prefetches.get(request)
         if f is None:
@@ -1632,10 +1632,12 @@ class BufferModePipeline:
             aux_device_releases=aux_device_releases,
         )
         match = cache.match_prefix(MatchPrefixParams(key=key))
+        canonical = cache.path_device_indices(match.last_device_node)[
+            splice_base:span_end
+        ]
         self.release_anchor_lock(request)
-        canonical = match.device_indices[splice_base:span_end]
-        owned = len(match.device_indices) >= span_end and torch.equal(
-            match.device_indices[splice_base:span_end], device_indices
+        owned = match.device_prefix_len >= span_end and torch.equal(
+            canonical, device_indices
         )
         if not owned:
             # Fail-stop: the insert freed or replaced slots the in-flight H2D
@@ -1644,7 +1646,7 @@ class BufferModePipeline:
                 "HiCache buffer load-back ownership violation "
                 f"req={f.request.rid}: "
                 f"insert prefix_len={insert_result.prefix_len} "
-                f"expected={splice_base}, matched={len(match.device_indices)} "
+                f"expected={splice_base}, matched={match.device_prefix_len} "
                 f"span_end={span_end} splice_base={splice_base}; "
                 f"in-flight H2D targets freed slots"
             )

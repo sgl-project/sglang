@@ -69,7 +69,7 @@ class DecodeHiCachePreallocMixin:
         Performs the optional L3 storage hit length query when decode-side
         HiCache is enabled and the last host node is backed up.
         """
-        prefix_indices = result.device_indices
+        prefix_indices = self.tree_cache.prefix_device_indices(req)
         l1_prefix_len = len(prefix_indices)
         l2_host_hit_length = result.host_hit_length
 
@@ -219,6 +219,7 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             max_prefix_len=pm.decode_prefix_len,
         )
+        rematched_indices = self.tree_cache.prefix_device_indices(dr.req)
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
@@ -230,12 +231,12 @@ class DecodeHiCacheTransferMixin:
         # boundary; point it back at the prefix the prealloc matched and locked.
         dr.req.last_node = pm.last_device_node
         # Failback: total coverage < required prefix means device alloc likely failed.
-        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+        if rematch.device_prefix_len + len(new_indices) < pm.decode_prefix_len:
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
                 "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
                 dr.req.rid,
-                len(rematch.device_indices),
+                rematch.device_prefix_len,
                 len(new_indices),
                 pm.decode_prefix_len,
                 pm.l1_prefix_len,
@@ -246,7 +247,7 @@ class DecodeHiCacheTransferMixin:
             return False
 
         dr.hicache_restored_kv_indices = torch.cat(
-            [rematch.device_indices[pm.l1_prefix_len :], new_indices]
+            [rematched_indices[pm.l1_prefix_len :], new_indices]
         )[: pm.restore_token_count]
         dr.hicache_restore_lock = self.tree_cache.lock(restored_node)
 
