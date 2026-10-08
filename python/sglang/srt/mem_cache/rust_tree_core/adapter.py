@@ -440,9 +440,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self._empty_match_result = _match_result_from_binding(
             self._binding.empty_match_result()
         )
-        self._empty_device_indices = torch.empty(
-            (0,), dtype=torch.int64, device=self.device
-        )
 
     def _binding_class(self) -> type:
         """The extension binding class this core constructs."""
@@ -719,10 +716,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def empty_match_result(self) -> MatchResult:
         return self._empty_match_result
-
-    @property
-    def empty_device_indices(self) -> torch.Tensor:
-        return self._empty_device_indices
 
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
         return self._binding.is_full_device_evicted(node_id)
