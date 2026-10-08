@@ -438,7 +438,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
-    def refresh_prefix(self, key: RadixKey) -> None:
+    def touch_prefix(self, key: RadixKey) -> None:
         """Touch the cached prefix of ``key`` so LRU eviction sees it as recent.
 
         The scheduler calls this periodically for waiting requests. It walks the

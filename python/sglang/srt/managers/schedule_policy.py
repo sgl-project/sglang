@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.common import match_kv_cache, refresh_waiting_prefix
+from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -130,9 +130,9 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
 
-# Inherited from the LPM/HRRN fallback bound in _determine_active_policy;
-# not a measured optimum.
-WAITING_PREFIX_REFRESH_MAX_QUEUE = 128
+# Per-round prefix work on the waiting queue stops at this depth: LPM/HRRN fall
+# back to FCFS above it, and the waiting-prefix refresh covers only this many.
+WAITING_QUEUE_PREFIX_MATCH_MAX = 128
 # A refresh only has to keep waiting prefixes newer than idle ones, so it need not
 # run every round; bounds the per-second walk cost under a long queue.
 WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
@@ -276,11 +276,9 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._refresh_waiting_prefixes(policy, waiting_queue)
+        self._touch_waiting_prefixes(policy, waiting_queue)
 
-    def _refresh_waiting_prefixes(
-        self, policy: Policy, waiting_queue: List[Req]
-    ) -> None:
+    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
         # Under LRU a waiting prefix ages and is evicted before idle ones; refresh in
         # admission order, head last. Cache-aware policies refresh as they match, and
         # other eviction strategies do not rank by recency (MRU would invert it).
@@ -298,8 +296,8 @@ class SchedulePolicy:
         if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
             return
         self._last_waiting_prefix_refresh = now
-        for r in reversed(waiting_queue[:WAITING_PREFIX_REFRESH_MAX_QUEUE]):
-            refresh_waiting_prefix(r, self.tree_cache)
+        for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
+            touch_waiting_prefix(r, self.tree_cache)
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
@@ -308,7 +306,7 @@ class SchedulePolicy:
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
             )
-            and len(waiting_queue) > 128
+            and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS

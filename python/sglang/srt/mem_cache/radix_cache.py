@@ -412,7 +412,7 @@ class RadixCache(BasePrefixCache):
             best_match_node=last_node,
         )
 
-    def refresh_prefix(self, key: RadixKey) -> None:
+    def touch_prefix(self, key: RadixKey) -> None:
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return
