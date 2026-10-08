@@ -16,6 +16,7 @@ kernels."""
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import partial
 from typing import Optional
 
 import torch
@@ -87,8 +88,11 @@ def _fused_rmsnorm_fp8_per_token_quant(
                   and returns updated residual_out as second element.
 
     Returns:
-        If residual is None:  (out_fp8, scale)
-        If residual provided: ((out_fp8, scale), residual_out)
+        If residual is None:  (out_fp8, scale, orig_dtype)
+        If residual provided: ((out_fp8, scale, orig_dtype), residual_out)
+
+    ``orig_dtype`` carries the pre-quant activation dtype so apply_fp8_linear
+    can preserve it (FP16 must not be silently promoted to BF16).
     """
     if _is_gfx1250_supported:
         # per-token quant == group quant with group_size == hidden size, giving
@@ -107,6 +111,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale)
 
     M, N = hidden_states.shape
+    orig_dtype = hidden_states.dtype
     out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
     if residual is not None:
@@ -121,7 +126,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
             epsilon,
             0,  # group_size=0 → per-token
         )
-        return (out_fp8, scale.unsqueeze(1)), residual_out
+        return (out_fp8, scale.unsqueeze(1), orig_dtype), residual_out
     else:
         _aiter_rmsnorm_quant(
             out_fp8,
@@ -131,7 +136,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
             epsilon,
             0,  # group_size=0 → per-token
         )
-        return (out_fp8, scale.unsqueeze(1))
+        return (out_fp8, scale.unsqueeze(1), orig_dtype)
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -182,6 +187,13 @@ def aiter_ar_fusion_applies(input_tensor: torch.Tensor, forward_batch: ForwardBa
     )
 
 
+def _norm_weight(norm):
+    """GemmaRMSNorm normalizes with ``(1 + weight)`` and pre-folds that into
+    ``gemma_weight``. The fused kernels take the folded weight so they match
+    the eager norm; the raw weight silently corrupts their output."""
+    return getattr(norm, "gemma_weight", norm.weight)
+
+
 def _update_and_read_residual_plain(
     norm, hidden_states, residual, post_residual_addition
 ):
@@ -196,7 +208,7 @@ def _update_and_read_residual_aiter_mxfp4(
     # post_residual_addition is not applied on this path.
     output, *_, residual_out = fused_rms_mxfp4_quant(
         hidden_states,
-        norm.weight,
+        _norm_weight(norm),
         norm.variance_epsilon,
         None,
         None,
@@ -207,15 +219,16 @@ def _update_and_read_residual_aiter_mxfp4(
 
 
 def _update_and_read_residual_aiter_fp8_group(
-    norm, hidden_states, residual, post_residual_addition
+    norm, hidden_states, residual, post_residual_addition, keep_bf16=False
 ):
-    """aiter (ROCm gfx95) fused RMSNorm + FP8 group quant. Under DSA the
-    unquantized bf16 output rides along as a third element, so the DSA indexer
-    can skip dequantizing. post_residual_addition is not applied on this path."""
-    needs_bf16 = get_attn_tp_context().is_dsa
+    """aiter (ROCm gfx95) fused RMSNorm + FP8 group quant. The unquantized bf16
+    output can ride along for two consumers: the DSA indexer, which then skips
+    dequantizing, and a second projection off this norm that reads bf16
+    (``keep_bf16``). post_residual_addition is not applied on this path."""
+    dsa_needs_bf16 = get_attn_tp_context().is_dsa
     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
         hidden_states,
-        norm.weight,
+        _norm_weight(norm),
         norm.variance_epsilon,
         inp2=None,
         inp2_weight=None,
@@ -223,12 +236,16 @@ def _update_and_read_residual_aiter_fp8_group(
         group_size=128,
         dtype_quant=torch.float8_e4m3fn,
         res1=residual,
-        output_unquantized_inp1=needs_bf16,
+        output_unquantized_inp1=dsa_needs_bf16 or keep_bf16,
         transpose_scale=False,
     )
     if _use_aiter_bpreshuffle_gfx95:
         output = materialize_bpreshuffle_fp8_scale_tuple(output)
-    if needs_bf16:
+    # The two consumers expect different layouts: a bf16-reading projection
+    # takes (bf16, fp8, scale), the DSA indexer takes (fp8, scale, bf16).
+    if keep_bf16:
+        output = (unquantized, output[0], output[1])
+    elif dsa_needs_bf16:
         output = (output[0], output[1], unquantized)
     return output, hidden_states if residual is None else residual_out
 
@@ -238,17 +255,17 @@ def _update_and_read_residual_aiter_fp8_per_token(
 ):
     if residual is None:
         output = _fused_rmsnorm_fp8_per_token_quant(
-            hidden_states, norm.weight.data, norm.variance_epsilon
+            hidden_states, _norm_weight(norm), norm.variance_epsilon
         )
         return output, hidden_states
     if post_residual_addition is not None:
         residual = residual + post_residual_addition
     return _fused_rmsnorm_fp8_per_token_quant(
-        hidden_states, norm.weight.data, norm.variance_epsilon, residual=residual
+        hidden_states, _norm_weight(norm), norm.variance_epsilon, residual=residual
     )
 
 
-def _norm_quant_kernel(quant_format: str):
+def _norm_quant_kernel(quant_format: str, keep_bf16: bool = False):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
@@ -256,8 +273,10 @@ def _norm_quant_kernel(quant_format: str):
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
-        return _update_and_read_residual_aiter_fp8_group
-    if _use_aiter and quant_format == "fp8_per_token":
+        return partial(_update_and_read_residual_aiter_fp8_group, keep_bf16=keep_bf16)
+    # The per-token kernel has no bf16 side output, so a layer needing the
+    # sidecar reads the plain norm instead.
+    if _use_aiter and quant_format == "fp8_per_token" and not keep_bf16:
         return _update_and_read_residual_aiter_fp8_per_token
     return _update_and_read_residual_plain
 
@@ -317,6 +336,15 @@ class NormQuantReadout:
     is_plain_norm = True
     reads_before_dp_gather: bool = False
     fp8_input: Optional[Fp8Input] = None
+    # The format the consumer's GEMM wants, when the model knows it at
+    # construction. A per-forward ``quant_format`` overrides it.
+    quant_format: str = ""
+
+    @property
+    def keeps_bf16(self) -> bool:
+        """Whether a second projection off this norm reads the unquantized
+        output alongside the quantized tuple."""
+        return self.fp8_input is Fp8Input.TUPLE_AND_BF16
 
     def init_residual(self, hidden_states):
         return hidden_states
@@ -324,7 +352,9 @@ class NormQuantReadout:
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         if residual.shape[0] == 0:
             return residual, residual
-        return _norm_quant_kernel(quant_format)(norm, residual, None, None)
+        return _norm_quant_kernel(quant_format or self.quant_format, self.keeps_bf16)(
+            norm, residual, None, None
+        )
 
     def update_and_read(
         self,
@@ -339,7 +369,7 @@ class NormQuantReadout:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        return _norm_quant_kernel(quant_format)(
+        return _norm_quant_kernel(quant_format or self.quant_format, self.keeps_bf16)(
             norm, hidden_states, residual, post_residual_addition
         )
 
