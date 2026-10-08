@@ -379,6 +379,34 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
         )
 
 
+class TestDisabledUnifiedRadixCache(CustomTestCase):
+    def _params(self, disable):
+        return CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=disable,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+            enable_kv_cache_events=True,
+            eviction_policy="lru",
+            eviction_policy_config={"not_an_lru_option": 1},
+        )
+
+    def test_disabled_cache_skips_events_and_eviction_config(self):
+        cache = UnifiedRadixCache(params=self._params(disable=True))
+        cache.reset()
+        self.assertEqual(cache.take_events(), [])
+
+        with self.assertRaises(TypeError):
+            UnifiedRadixCache(params=self._params(disable=False))
+
+
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists (#26177)."""
