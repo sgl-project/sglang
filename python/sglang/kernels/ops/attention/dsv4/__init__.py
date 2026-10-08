@@ -31,6 +31,7 @@ from .moe import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
+    silu_and_mul_psum_post_quant,
 )
 from .topk import plan_topk_v2, topk_transform_paged, topk_transform_paged_v2
 from .utils import make_name
@@ -63,4 +64,5 @@ __all__ = [
     "silu_and_mul_clamp",
     "silu_and_mul_masked_post_quant",
     "silu_and_mul_contig_post_quant",
+    "silu_and_mul_psum_post_quant",
 ]

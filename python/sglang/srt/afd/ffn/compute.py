@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 import tqdm
 
-from sglang.srt.afd.afd_config import AFDRole
+from sglang.srt.afd.afd_config import AFDRole, is_direct_afd_backend
 from sglang.srt.afd.afd_handshake import (
     AFDFFNCapacityPlan,
 )
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if TYPE_CHECKING:
+    from sglang.srt.afd.direct_deepep import AFDDirectDeepEPDispatchOutput
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -94,9 +95,12 @@ class AFDFFNCompute:
         self._disable_padding = get_exec().graph.disable_cuda_graph_padding
         self._enable_cudagraph_gc = get_exec().graph.enable_cudagraph_gc
         self._enable_memory_saver = get_exec().features.enable_memory_saver
+        direct_backend = is_direct_afd_backend(get_disagg().afd_backend)
         self._scattered = get_disagg().afd_ffn_moe_backend == "deepep"
         self._deepep_adapter = (
-            DeepEPCudaGraphRunnerAdapter() if self._scattered else None
+            DeepEPCudaGraphRunnerAdapter()
+            if self._scattered and not direct_backend
+            else None
         )
         self._uses_deepep_low_latency = (
             self._scattered and get_exec().moe.deepep_mode != "normal"
@@ -248,6 +252,69 @@ class AFDFFNCompute:
                 (layer.layer_id, capacity), static_forward_batch=None
             )
         return output[:num_tokens]
+
+    def run_direct_deepep(
+        self,
+        layer_index: int,
+        dispatch_output: AFDDirectDeepEPDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLDispatchOutput,
+            DeepEPNormalDispatchOutput,
+        )
+
+        layer = self._layers[layer_index]
+        if dispatch_output.masked_m is not None:
+            expert_capacity = dispatch_output.expert_capacity
+            combine_input = layer.experts.run_moe_core(
+                DeepEPLLDispatchOutput(
+                    hidden_states=dispatch_output.hidden_states,
+                    hidden_states_scale=dispatch_output.hidden_states_scale,
+                    topk_ids=dispatch_output.topk_ids,
+                    topk_weights=dispatch_output.topk_weights,
+                    masked_m=dispatch_output.masked_m,
+                    expected_m=expert_capacity,
+                )
+            )
+            output = combine_input.hidden_states
+            num_local_experts = dispatch_output.masked_m.shape[0]
+            expected_shape = (
+                num_local_experts,
+                expert_capacity,
+                layer.hidden_size,
+            )
+            if tuple(output.shape) != expected_shape:
+                raise RuntimeError(
+                    f"AFD layer {layer.layer_id} NVFP4 output mismatch: "
+                    f"expected shape={expected_shape}, got {tuple(output.shape)}"
+                )
+            output = output.reshape(-1, layer.hidden_size)
+            self._validate_output(layer, output, output.shape[0])
+            return output
+
+        num_recv_tokens = dispatch_output.hidden_states.shape[0]
+        if num_recv_tokens == 0:
+            return dispatch_output.hidden_states.new_empty(
+                dispatch_output.hidden_states.shape,
+                dtype=self._dtype,
+            )
+
+        combine_input = layer.experts.run_moe_core(
+            DeepEPNormalDispatchOutput(
+                hidden_states=dispatch_output.hidden_states,
+                hidden_states_scale=dispatch_output.hidden_states_scale,
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=dispatch_output.topk_weights,
+                num_recv_tokens_per_expert=dispatch_output.expert_psum,
+            )
+        )
+        output = combine_input.hidden_states
+        self._validate_output(
+            layer,
+            output,
+            num_recv_tokens,
+        )
+        return output
 
     def graph_capacity_for(self, num_tokens: int) -> int | None:
         if not self._graph_buckets or num_tokens > self._graph_buckets[-1]:
@@ -558,6 +625,8 @@ class _AFDFFNDecodeStepGraph:
         self,
         compute: AFDFFNCompute,
         run_step: Callable[[tuple[int, ...], tuple[int, ...]], None],
+        *,
+        direct_data_plane: bool = False,
     ):
         self._compute = compute
         self._run_step = run_step
@@ -565,7 +634,9 @@ class _AFDFFNDecodeStepGraph:
             compute,
             enable_memory_saver=compute.enable_memory_saver,
         )
-        self._deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self._deepep_adapter = (
+            None if direct_data_plane else DeepEPCudaGraphRunnerAdapter()
+        )
         self._keys: dict[
             tuple[int, ...],
             tuple[str, tuple[int, ...], tuple[int, ...]],
@@ -585,12 +656,14 @@ class _AFDFFNDecodeStepGraph:
             compute_capacities,
         )
         set_is_extend_in_batch(False)
-        max_compute_capacity = max(compute_capacities)
-        self._compute.prepare_integrated_capture_inputs(max_compute_capacity)
-        self._deepep_adapter.capture(is_extend_in_batch=False)
-
-        def reset_inputs() -> None:
+        reset_inputs = None
+        if self._deepep_adapter is not None:
+            max_compute_capacity = max(compute_capacities)
             self._compute.prepare_integrated_capture_inputs(max_compute_capacity)
+            self._deepep_adapter.capture(is_extend_in_batch=False)
+
+            def reset_inputs() -> None:
+                self._compute.prepare_integrated_capture_inputs(max_compute_capacity)
 
         self._backend.capture_one(
             key,
@@ -603,7 +676,8 @@ class _AFDFFNDecodeStepGraph:
         key = self._keys.get(wire_capacities)
         if key is None:
             return False
-        self._deepep_adapter.replay()
+        if self._deepep_adapter is not None:
+            self._deepep_adapter.replay()
         with self._backend.replay_session():
             self._backend.replay(key, static_forward_batch=None)
         return True

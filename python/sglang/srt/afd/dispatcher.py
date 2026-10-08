@@ -12,11 +12,16 @@ from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 import torch
 
 from sglang.srt.afd.comm.base import AFDCommBackend
+from sglang.srt.afd.direct_deepep import AFDDirectDeepEPDispatchOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.afd.afd_handshake import AFDGraphCaptureVariant
     from sglang.srt.afd.comm.nvshmem import NVSHMEMRuntimeOwner
+    from sglang.srt.afd.direct_deepep import (
+        AFDDirectDeepEPAdapter,
+        AFDDirectDeepEPCombineOutput,
+    )
     from sglang.srt.afd.layers import AFDMoELayer
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,9 @@ class AFDWorkHandle:
     # caching allocator. Retain direct request inputs until the ordered
     # response has been enqueued.
     request_tensors: Optional[tuple[torch.Tensor, ...]] = None
+
+
+AFDDispatchWorkHandle = AFDWorkHandle | AFDDirectDeepEPDispatchOutput
 
 
 @dataclass
@@ -340,6 +348,7 @@ class AFDDispatcher:
         device: torch.device,
         scattered: bool,
         num_slots: int = 1,
+        direct_deepep_lanes: Sequence[AFDDirectDeepEPAdapter] = (),
         compute_num_sms: int | None = None,
     ):
         self._comm = comm
@@ -348,25 +357,31 @@ class AFDDispatcher:
         self._dtype = dtype
         self._device = device
         self._scattered = scattered
+        self._direct_deepep_lanes = tuple(direct_deepep_lanes)
         self._ffn_global_ranks = tuple(
             comm.config.ffn_global_rank(rank)
             for rank in comm.config.ffn_ranks_for_attn(
-                comm.config.instance_rank, scattered=scattered
+                comm.config.instance_rank,
+                scattered=scattered,
             )
         )
         self._padding_topk_id = -1 if scattered else 0
         self._num_slots = num_slots
         self._compute_num_sms = compute_num_sms
-        self._pool = AFDFixedBufferPool(
-            layers=self._layers,
-            token_buckets=token_buckets,
-            dtype=dtype,
-            device=device,
-            role="attn",
-            with_router_logits=False,
-            num_slots=num_slots,
-            decode_transport=self._decode_transport,
-            with_response_scratch=len(self._ffn_global_ranks) > 1,
+        self._pool = (
+            None
+            if self._direct_deepep_lanes
+            else AFDFixedBufferPool(
+                layers=self._layers,
+                token_buckets=token_buckets,
+                dtype=dtype,
+                device=device,
+                role="attn",
+                with_router_logits=False,
+                num_slots=num_slots,
+                decode_transport=self._decode_transport,
+                with_response_scratch=len(self._ffn_global_ranks) > 1,
+            )
         )
         self._next_step_id = 0
         self._step_id: Optional[int] = None
@@ -376,7 +391,8 @@ class AFDDispatcher:
         self._child_wire_capacities: tuple[int, ...] = ()
         self._next_dispatch_index = 0
         self._next_combine_index = 0
-        self._active_handles: deque[AFDWorkHandle] = deque()
+        self._active_handles: deque[AFDDispatchWorkHandle] = deque()
+        self._pending_direct_combines: deque[AFDDirectDeepEPCombineOutput] = deque()
         self._communication_graph_capacities: frozenset[int] = frozenset()
         self._parent_graph_variants_by_batch_size: dict[
             int, AFDGraphCaptureVariant
@@ -392,6 +408,12 @@ class AFDDispatcher:
 
     @property
     def needs_empty_decode_dispatch(self) -> bool:
+        if (
+            (self._direct_deepep_lanes)
+            and self._forward_mode is not None
+            and is_afd_fixed_shape_mode(self._forward_mode)
+        ):
+            return True
         return (
             self._scattered
             and self._forward_mode is not None
@@ -400,8 +422,63 @@ class AFDDispatcher:
         )
 
     @property
+    def num_layers(self) -> int:
+        return len(self._layers)
+
+    @property
+    def current_num_children(self) -> int:
+        return len(self._child_wire_capacities)
+
+    @property
+    def compute_num_sms(self) -> int | None:
+        return self._compute_num_sms
+
+    def shared_expert_compute_num_sms(self, num_lanes: int) -> int | None:
+        if (
+            self._direct_deepep_lanes
+            and num_lanes > 1
+            and self._compute_num_sms is not None
+        ):
+            lane_sms = self._direct_deepep_lanes[0].overlap_communication_num_sms
+            # Attention overlaps the other lanes; shared experts also overlap
+            # their own dispatch/combine. Reserve that additional active lane,
+            # including during warmup so capture uses the same GEMM kernels.
+            num_sms = min(
+                self._compute_num_sms,
+                self._compute_num_sms + (self._num_slots - 1 - num_lanes) * lane_sms,
+            )
+            num_sms = num_sms // 2 * 2
+            if num_sms <= 0:
+                raise RuntimeError("AFD shared experts have no compute SMs left")
+            return num_sms
+        return None
+
+    @property
+    def _prepost_direct_combines(self) -> bool:
+        # First-use module loading may synchronize the device. Preserve eager
+        # and warmup ordering; the captured graph uses already-warmed kernels.
+        return (
+            self._capturing_parent_graph
+            and bool(self._direct_deepep_lanes)
+            and len(self._child_wire_capacities) > 1
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    @property
     def use_eager_parent_graph_breaks(self) -> bool:
         return self._use_eager_parent_graph_breaks
+
+    def enable_communication_graph_variants(
+        self, variants: Sequence[AFDGraphCaptureVariant]
+    ) -> None:
+        if self._direct_deepep_lanes:
+            self._direct_deepep_lanes[0].arm_capture_start_barrier()
+        normalized = self._enable_parent_graph_variants(variants, paired=True)
+        self._communication_graph_capacities = frozenset(
+            variant.child_wire_capacities[0]
+            for variant in normalized
+            if len(variant.child_wire_capacities) == 1
+        )
 
     def enable_local_parent_graph_variants(
         self, variants: Sequence[AFDGraphCaptureVariant]
@@ -409,23 +486,38 @@ class AFDDispatcher:
         self._enable_parent_graph_variants(variants, paired=False)
         self._use_eager_parent_graph_breaks = True
 
-    def select_parent_graph_variant(self, can_run_graph: bool) -> bool:
-        variant = self._prepared_parent_graph_variant
-        return (
-            can_run_graph
-            and variant is not None
-            and len(variant.child_wire_capacities) > 1
+    def _enable_parent_graph_variants(
+        self,
+        variants: Sequence[AFDGraphCaptureVariant],
+        *,
+        paired: bool,
+    ) -> tuple[AFDGraphCaptureVariant, ...]:
+        normalized = tuple(variants)
+        self._parent_graph_variants_by_batch_size = {
+            variant.attn_batch_size: variant for variant in normalized
+        }
+        self._parent_graph_variants_by_wire = tuple(
+            sorted(
+                normalized,
+                key=lambda variant: variant.attn_wire_capacity,
+            )
         )
+        self._paired_parent_graph_variants = (
+            frozenset(normalized) if paired else frozenset()
+        )
+        return normalized
 
-    def enable_communication_graph_variants(
-        self, variants: Sequence[AFDGraphCaptureVariant]
-    ) -> None:
-        normalized = self._enable_parent_graph_variants(variants, paired=True)
-        self._communication_graph_capacities = frozenset(
-            variant.child_wire_capacities[0]
-            for variant in normalized
-            if len(variant.child_wire_capacities) == 1
-        )
+    def graph_capture_child_plan(self, attn_batch_size: int) -> tuple[int, ...]:
+        variant = self._parent_graph_variants_by_batch_size.get(attn_batch_size)
+        return () if variant is None else variant.child_wire_capacities
+
+    def select_graph_variant(
+        self, minimum_parent_wire_capacity: int
+    ) -> Optional[AFDGraphCaptureVariant]:
+        for variant in self._parent_graph_variants_by_wire:
+            if variant.attn_wire_capacity >= minimum_parent_wire_capacity:
+                return variant
+        return None
 
     def can_capture_communication_graph(self, capacity: int) -> bool:
         return (
@@ -444,6 +536,20 @@ class AFDDispatcher:
             use_parent_graph or use_single_batch_graph
         )
         return self._current_batch_uses_paired_communication_graph
+
+    def select_parent_graph_variant(self, can_run_graph: bool) -> bool:
+        variant = self._prepared_parent_graph_variant
+        return (
+            can_run_graph
+            and variant is not None
+            and len(variant.child_wire_capacities) > 1
+        )
+
+    def prepared_parent_graph_child_plan(self) -> Optional[tuple[int, ...]]:
+        """Child plan prepared for the current parent graph, if any."""
+        if self._prepared_parent_graph_variant is None:
+            return None
+        return self._prepared_parent_graph_variant.child_wire_capacities
 
     def begin_batch(
         self,
@@ -512,6 +618,100 @@ class AFDDispatcher:
         self._next_combine_index = 0
         return step_id
 
+    def run_inactive_direct_step(
+        self,
+        forward_mode: ForwardMode,
+        wire_capacity: int,
+        child_wire_capacities: Sequence[int] = (),
+        *,
+        do_cpu_sync: bool | None = None,
+    ) -> None:
+        child_wire_capacities = tuple(child_wire_capacities) or (wire_capacity,)
+        self.begin_batch(
+            forward_mode=forward_mode,
+            dp_capacity=0,
+            wire_capacity=wire_capacity,
+            child_wire_capacities=child_wire_capacities,
+        )
+        layer = self._layers[0]
+        hidden_states = torch.empty(
+            (0, layer.hidden_size), dtype=self._dtype, device=self._device
+        )
+        topk_ids = torch.empty((0, layer.top_k), dtype=torch.int32, device=self._device)
+        topk_weights = torch.empty(
+            (0, layer.top_k), dtype=torch.float32, device=self._device
+        )
+        handles = [
+            self.dispatch(
+                layer.layer_id,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                direct_do_cpu_sync=do_cpu_sync,
+            )
+            for _ in child_wire_capacities
+        ]
+        # Match the active wavefront by refilling each lane after its combine wait.
+        for layer_index in range(len(self._layers)):
+            next_layer_index = layer_index + 1
+            next_handles = []
+            for handle in handles:
+                self.combine(handle)
+                if next_layer_index < len(self._layers):
+                    next_handles.append(
+                        self.dispatch(
+                            self._layers[next_layer_index].layer_id,
+                            hidden_states,
+                            topk_ids,
+                            topk_weights,
+                            direct_do_cpu_sync=do_cpu_sync,
+                        )
+                    )
+            handles = next_handles
+
+    @contextmanager
+    def capture_parent_graph(self, attn_batch_size: int) -> Iterator[None]:
+        variant = self._parent_graph_variants_by_batch_size[attn_batch_size]
+        # Keep this field list (and the restore below) in sync with every
+        # batch-level attribute mutated by begin_batch() or graph selection.
+        saved_state = (
+            self._next_step_id,
+            self._step_id,
+            self._forward_mode,
+            self._dp_capacity,
+            self._wire_capacity,
+            self._child_wire_capacities,
+            self._next_dispatch_index,
+            self._next_combine_index,
+            self._prepared_parent_graph_variant,
+            self._current_batch_uses_paired_communication_graph,
+            self._capturing_parent_graph,
+        )
+        self._capturing_parent_graph = True
+        self.begin_batch(
+            forward_mode=ForwardMode.DECODE,
+            dp_capacity=variant.attn_wire_capacity,
+            wire_capacity=sum(variant.child_wire_capacities),
+            child_wire_capacities=variant.child_wire_capacities,
+            graph_variant=variant,
+        )
+        try:
+            yield
+        finally:
+            (
+                self._next_step_id,
+                self._step_id,
+                self._forward_mode,
+                self._dp_capacity,
+                self._wire_capacity,
+                self._child_wire_capacities,
+                self._next_dispatch_index,
+                self._next_combine_index,
+                self._prepared_parent_graph_variant,
+                self._current_batch_uses_paired_communication_graph,
+                self._capturing_parent_graph,
+            ) = saved_state
+
     def _can_send_nccl_request_directly(
         self,
         hidden_states: torch.Tensor,
@@ -534,7 +734,7 @@ class AFDDispatcher:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> AFDWorkHandle:
+    ) -> AFDDispatchWorkHandle:
         capacity = hidden_states.shape[0]
         layer = next(
             (layer for layer in self._layers if layer.layer_id == layer_id),
@@ -543,6 +743,16 @@ class AFDDispatcher:
         if layer is None:
             raise RuntimeError(f"AFD has no MoE layer {layer_id}")
         self._validate_request(layer, hidden_states, topk_ids, topk_weights)
+
+        if self._direct_deepep_lanes:
+            return self._direct_deepep_lanes[0].dispatch(
+                layer_id,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                num_max_dispatch_tokens_per_rank=capacity,
+                do_cpu_sync=False,
+            )
 
         work = self._pool.acquire(
             slot_id=0,
@@ -579,8 +789,10 @@ class AFDDispatcher:
     def combine_decode_graph_wave(
         self,
         layer_id: int,
-        work: AFDWorkHandle,
+        work: AFDDispatchWorkHandle,
     ) -> torch.Tensor:
+        if not isinstance(work, AFDWorkHandle):
+            return self._direct_deepep_lanes[work.lane_id].combine_attn(work).wait()
 
         capacity = work.capacity
         peers = self._ffn_global_ranks
@@ -654,7 +866,9 @@ class AFDDispatcher:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> AFDWorkHandle:
+        *,
+        direct_do_cpu_sync: bool | None = None,
+    ) -> AFDDispatchWorkHandle:
         if self._step_id is None or self._forward_mode is None:
             raise RuntimeError("AFD dispatch called before begin_batch")
         num_children = len(self._child_wire_capacities)
@@ -701,6 +915,30 @@ class AFDDispatcher:
                     f"child={child_index}, capacity={capacity}, "
                     f"input={input_tokens}"
                 )
+            if self._direct_deepep_lanes:
+                async_with_compute_stream = num_children > 1
+                handle = self._direct_deepep_lanes[child_index].dispatch(
+                    layer_id,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    num_max_dispatch_tokens_per_rank=capacity,
+                    do_cpu_sync=(
+                        not async_with_compute_stream
+                        if direct_do_cpu_sync is None
+                        else direct_do_cpu_sync
+                    ),
+                    async_with_compute_stream=async_with_compute_stream,
+                )
+                self._active_handles.append(handle)
+                self._next_dispatch_index += 1
+                if self._prepost_direct_combines:
+                    self._pending_direct_combines.append(
+                        self._direct_deepep_lanes[child_index].combine_attn(
+                            handle, async_with_compute_stream=True
+                        )
+                    )
+                return handle
             handle = self._pool.acquire(
                 slot_id=child_index,
                 layer_id=layer_id,
@@ -775,7 +1013,7 @@ class AFDDispatcher:
         self._next_dispatch_index += 1
         return handle
 
-    def combine(self, handle: AFDWorkHandle) -> torch.Tensor:
+    def combine(self, handle: AFDDispatchWorkHandle) -> torch.Tensor:
         if self._forward_mode is None:
             raise RuntimeError("AFD combine called without an active forward mode")
         if not self._active_handles or self._active_handles[0] is not handle:
@@ -793,6 +1031,30 @@ class AFDDispatcher:
                 f"dispatched={self._next_dispatch_index}, "
                 f"required={required_dispatches}"
             )
+
+        if not isinstance(handle, AFDWorkHandle):
+            if num_children > 1:
+                if not self._pending_direct_combines:
+                    # Fork every lane before the next layer queues A compute.
+                    for pending_handle in self._active_handles:
+                        self._pending_direct_combines.append(
+                            self._direct_deepep_lanes[
+                                pending_handle.lane_id
+                            ].combine_attn(
+                                pending_handle,
+                                async_with_compute_stream=True,
+                            )
+                        )
+                combine_output = self._pending_direct_combines.popleft()
+            else:
+                combine_output = self._direct_deepep_lanes[handle.lane_id].combine_attn(
+                    handle,
+                    async_with_compute_stream=False,
+                )
+            output = combine_output.wait()
+            self._active_handles.popleft()
+            self._next_combine_index += 1
+            return output
 
         if (
             is_afd_fixed_shape_mode(self._forward_mode)
@@ -840,100 +1102,6 @@ class AFDDispatcher:
         self._active_handles.popleft()
         self._next_combine_index += 1
         return output
-
-    @property
-    def num_layers(self) -> int:
-        return len(self._layers)
-
-    @property
-    def current_num_children(self) -> int:
-        return len(self._child_wire_capacities)
-
-    def _enable_parent_graph_variants(
-        self,
-        variants: Sequence[AFDGraphCaptureVariant],
-        *,
-        paired: bool,
-    ) -> tuple[AFDGraphCaptureVariant, ...]:
-        normalized = tuple(variants)
-        self._parent_graph_variants_by_batch_size = {
-            variant.attn_batch_size: variant for variant in normalized
-        }
-        self._parent_graph_variants_by_wire = tuple(
-            sorted(
-                normalized,
-                key=lambda variant: variant.attn_wire_capacity,
-            )
-        )
-        self._paired_parent_graph_variants = (
-            frozenset(normalized) if paired else frozenset()
-        )
-        return normalized
-
-    def graph_capture_child_plan(self, attn_batch_size: int) -> tuple[int, ...]:
-        variant = self._parent_graph_variants_by_batch_size.get(attn_batch_size)
-        return () if variant is None else variant.child_wire_capacities
-
-    def select_graph_variant(
-        self, minimum_parent_wire_capacity: int
-    ) -> Optional[AFDGraphCaptureVariant]:
-        for variant in self._parent_graph_variants_by_wire:
-            if variant.attn_wire_capacity >= minimum_parent_wire_capacity:
-                return variant
-        return None
-
-    def prepared_parent_graph_child_plan(self) -> Optional[tuple[int, ...]]:
-        """Child plan prepared for the current parent graph, if any."""
-        if self._prepared_parent_graph_variant is None:
-            return None
-        return self._prepared_parent_graph_variant.child_wire_capacities
-
-    @contextmanager
-    def capture_parent_graph(self, attn_batch_size: int) -> Iterator[None]:
-        variant = self._parent_graph_variants_by_batch_size[attn_batch_size]
-        # Keep this field list (and the restore below) in sync with every
-        # batch-level attribute mutated by begin_batch() or graph selection.
-        saved_state = (
-            self._next_step_id,
-            self._step_id,
-            self._forward_mode,
-            self._dp_capacity,
-            self._wire_capacity,
-            self._child_wire_capacities,
-            self._next_dispatch_index,
-            self._next_combine_index,
-            self._prepared_parent_graph_variant,
-            self._current_batch_uses_paired_communication_graph,
-            self._capturing_parent_graph,
-        )
-        self._capturing_parent_graph = True
-        self.begin_batch(
-            forward_mode=ForwardMode.DECODE,
-            dp_capacity=variant.attn_wire_capacity,
-            wire_capacity=sum(variant.child_wire_capacities),
-            child_wire_capacities=variant.child_wire_capacities,
-            graph_variant=variant,
-        )
-        try:
-            yield
-        finally:
-            (
-                self._next_step_id,
-                self._step_id,
-                self._forward_mode,
-                self._dp_capacity,
-                self._wire_capacity,
-                self._child_wire_capacities,
-                self._next_dispatch_index,
-                self._next_combine_index,
-                self._prepared_parent_graph_variant,
-                self._current_batch_uses_paired_communication_graph,
-                self._capturing_parent_graph,
-            ) = saved_state
-
-    @property
-    def compute_num_sms(self) -> int | None:
-        return self._compute_num_sms
 
     def _validate_request(
         self,

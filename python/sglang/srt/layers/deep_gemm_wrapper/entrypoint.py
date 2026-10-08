@@ -136,6 +136,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    use_psum_layout: bool = False,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -152,6 +154,17 @@ def grouped_gemm_nt_f8f8bf16_contig(
         fp4_kwargs["recipe_a"] = recipe_a
     if recipe_b is not None:
         fp4_kwargs["recipe_b"] = recipe_b
+    if use_psum_layout:
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            use_psum_layout=True,
+            expected_m_for_psum_layout=expected_m_for_psum_layout,
+            **fp4_kwargs,
+        )
+        return
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(

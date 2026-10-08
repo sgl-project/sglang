@@ -1,8 +1,14 @@
-"""One-shot typed startup handshake between attention and FFN instances.
+"""One-shot startup handshake between the attn and ffn instances.
 
-The attention instance connects to the FFN API address with a fixed port
-offset. The handshake checks model and topology before creating the joint
-NCCL communicator, so incompatible peers fail before the first forward.
+Runs over ZMQ REQ (attn) / ROUTER (ffn). Users only deal with server API
+addresses: the attn
+side points ``--afd-ffn-addr`` at the ffn instance's ``--host:--port``, and
+both sides derive the internal handshake port from the ffn API port with a
+fixed delta (same pattern as ``ZMQ_TCP_PORT_DELTA``). Startup order is
+arbitrary (the attn request is queued until the ffn side binds).
+Exchanges identity/topology so that every later mismatch (different model,
+different backend, incompatible world sizes) fails loudly at startup
+instead of hanging mid-forward.
 """
 
 from __future__ import annotations
@@ -17,42 +23,86 @@ from typing import Sequence, Tuple
 import msgspec
 import zmq
 
-from sglang.srt.afd.dispatcher import build_decode_token_buckets, split_afd_batch_size
+from sglang.srt.afd.afd_config import is_direct_afd_backend
+from sglang.srt.afd.dispatcher import (
+    build_decode_token_buckets,
+    split_afd_batch_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_zmq_socket
 
 logger = logging.getLogger(__name__)
 
+# The handshake port is derived from the ffn instance's server API port so
+# users never configure an extra port (cf. ZMQ_TCP_PORT_DELTA in server_args).
 AFD_HANDSHAKE_PORT_DELTA = 300
+# The sync (control plane) channel binds next to the handshake port.
 SYNC_PORT_OFFSET = 1
+# Rendezvous store of the joint attn∪ffn data-plane group (ffn rank 0 hosts).
 DIST_PORT_OFFSET = 2
+# Each additional attn session gets its own control port. Session-local NCCL
+# communicators also get a distinct rendezvous port; Direct shares one.
 SESSION_PORT_STRIDE = 2
 _NVSHMEM_REMOTE_TRANSPORTS = frozenset({"none", "ibgda"})
 
 
+def afd_handshake_port(ffn_api_port: int) -> int:
+    port = ffn_api_port + AFD_HANDSHAKE_PORT_DELTA
+    if port + DIST_PORT_OFFSET > 65535:
+        port = ffn_api_port - AFD_HANDSHAKE_PORT_DELTA
+    return port
+
+
 @dataclass
 class AFDHandshakeInfo:
-    role: str
+    role: str  # AFDRole value
     model_identity: str
+    # Number of data-plane ranks (attn: DP ranks, one per GPU since
+    # attn_tp_size == 1 is enforced; ffn: local TP ranks).
     num_ranks: int
+    # Node identity for each instance rank, in rank order. NVSHMEM uses this
+    # to assign node-major PEs independently of the logical A/F rank space.
     rank_node_ids: list[str] = field(repr=False)
     afd_backend: str
+    # Logical F-internal expert layout. The attn process advertises the same
+    # layout after replacing its process-local backend with AFDAttnMoE.
     afd_ffn_moe_backend: str
     wire_dtype: str
     moe_layers: list[dict] = field(repr=False)
-    # A wire capacities: global tokens for FULL, per-rank tokens for SCATTERED.
+    direct_backend_version: str | None = field(default=None, repr=False)
+    # F-authoritative per-layer activation quantization scales for native
+    # Direct NVFP4 dispatch. An empty list selects the FP8 activation path.
+    direct_nvfp4_input_scales: list[float] = field(default_factory=list, repr=False)
+    # F selects the FP8 scale encoding for every A/F rank, including empty inputs.
+    direct_deepep_fp8_scale_ue8m0: bool | None = None
+    # F owns the GEMM layout; every dispatcher must use matching expert offsets.
+    direct_deepep_expert_alignment: int = 128
+    # F-authoritative communication budget. Its meaning is data-plane specific;
+    # Direct DeepEP also uses it to size A-side Elastic kernels.
+    afd_comm_sm_budget: int | None = field(default=None, repr=False)
+    # A-authoritative wire capacities. FULL uses global-token capacities;
+    # SCATTERED uses per-rank capacities.
     decode_token_buckets: list[int] = field(default_factory=list, repr=False)
-    # Attn reports wire capacities; FFN reports expert-input capacities.
+    # Stable first dimensions captured by this role's local decode graphs.
+    # Attn reports transport wire capacities; ffn reports expert capacities.
     decode_graph_token_buckets: list[int] = field(default_factory=list, repr=False)
     disable_cuda_graph_padding: bool = False
+    # A-authoritative count used by the ffn side to allocate decode slots.
     decode_num_microbatches: int = 1
     # F-authoritative graph policy negotiated before A captures decode graphs.
     requires_eager_decode_communication: bool = False
-    afd_comm_sm_budget: int | None = None
+    # Per-rank NVML fabric identity: (cluster UUID, clique ID). Missing or
+    # incomplete information conservatively requires a remote transport.
     rank_nvshmem_fabric_keys: list[tuple[bytes, int] | None] = field(
         default_factory=list, repr=False
     )
+    # F-authoritative transport selected from the joint NVSHMEM topology.
     nvshmem_remote_transport: str | None = field(default=None, repr=False)
+    # A-authoritative fixed target-forward rows per request. Ordinary decode
+    # uses one; static EAGLE target verification uses its draft-token count.
+    decode_num_tokens_per_bs: int = 1
+    # F selects one transport mode for every rank and lane.
+    direct_deepep_allow_hybrid: bool = True
 
 
 class _HandshakeRequest(msgspec.Struct, tag="request", forbid_unknown_fields=True):
@@ -65,9 +115,9 @@ class _HandshakeReply(msgspec.Struct, tag="reply", forbid_unknown_fields=True):
     dist_host: str
     sync_port: int
     dist_port: int
-    nvshmem_uid: bytes | None = None
-    session_id: int = 0
-    attn_members: tuple[AFDHandshakeInfo, ...] | None = None
+    nvshmem_uid: bytes | None
+    session_id: int
+    attn_members: tuple[AFDHandshakeInfo, ...] | None
 
 
 class _HandshakeError(msgspec.Struct, tag="error", forbid_unknown_fields=True):
@@ -85,14 +135,36 @@ class AFDHandshakeResult:
     dist_host: str
     sync_port: int
     dist_port: int
-    nvshmem_uid: bytes | None = None
+    nvshmem_uid: bytes | None = field(default=None, repr=False)
+    # Index assigned by the ffn side in handshake-arrival order. Each attn
+    # instance forms its own session against a (possibly shared) ffn instance.
     session_id: int = 0
-    attn_members: tuple[AFDHandshakeInfo, ...] | None = None
+    # All attn instances sharing the ffn instance, in session order. Populated
+    # when the data plane forms one static world across every member.
+    attn_members: tuple[AFDHandshakeInfo, ...] | None = field(default=None, repr=False)
 
     @property
     def requires_eager_decode_communication(self) -> bool:
         ffn = self.local if self.local.role == "ffn" else self.peer
         return ffn.requires_eager_decode_communication
+
+    @property
+    def total_attn_ranks(self) -> int:
+        if self.attn_members is None:
+            attn = self.local if self.local.role == "attn" else self.peer
+            return attn.num_ranks
+        return sum(member.num_ranks for member in self.attn_members)
+
+    @property
+    def attn_instance_rank_offset(self) -> int:
+        if self.attn_members is None:
+            return 0
+        if not 0 <= self.session_id < len(self.attn_members):
+            raise RuntimeError(
+                "AFD handshake session is outside the attn member roster: "
+                f"session={self.session_id}, members={len(self.attn_members)}"
+            )
+        return sum(member.num_ranks for member in self.attn_members[: self.session_id])
 
 
 def select_nvshmem_remote_transport(
@@ -131,7 +203,8 @@ class AFDGraphCaptureVariant:
 
 @dataclass(frozen=True)
 class AFDGraphCapturePlan:
-    # Match the attention runner's descending capture order.
+    # Kept in the attn runner's descending capture order. Different parent
+    # buckets may intentionally share the same child shape tuple.
     attn_graph_variants: tuple[AFDGraphCaptureVariant, ...]
     ffn_graph_variants: tuple[tuple[int, int], ...]
 
@@ -147,7 +220,9 @@ class AFDFFNCapacityPlan:
 
 
 def _select_ffn_graph_capacity(
-    ffn_buckets: list[int], wire_capacity: int, disable_padding: bool
+    ffn_buckets: list[int],
+    wire_capacity: int,
+    disable_padding: bool,
 ) -> int | None:
     index = bisect.bisect_left(ffn_buckets, wire_capacity)
     if index == len(ffn_buckets):
@@ -173,9 +248,7 @@ def _build_attn_graph_shapes(
             f"transport={transport_capacities}"
         )
 
-    wire_token_multiplier = (
-        1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
-    )
+    wire_token_multiplier = _attn_wire_tokens_per_bs(attn)
     shapes = []
     for attn_wire_capacity in attn_graph_capacities:
         if attn_wire_capacity % wire_token_multiplier != 0:
@@ -289,6 +362,17 @@ def build_afd_ffn_capacity_plan(
     )
 
 
+def _attn_wire_tokens_per_bs(attn: AFDHandshakeInfo) -> int:
+    num_tokens_per_bs = attn.decode_num_tokens_per_bs
+    if not isinstance(num_tokens_per_bs, int) or num_tokens_per_bs <= 0:
+        raise RuntimeError(
+            "AFD decode_num_tokens_per_bs must be a positive integer; "
+            f"got {num_tokens_per_bs!r}"
+        )
+    rank_multiplier = 1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
+    return num_tokens_per_bs * rank_multiplier
+
+
 def build_afd_attn_local_graph_variants(
     handshake: AFDHandshakeResult,
 ) -> tuple[AFDGraphCaptureVariant, ...]:
@@ -314,7 +398,6 @@ def build_afd_attn_local_graph_variants(
 def build_afd_graph_capture_plan(
     handshake: AFDHandshakeResult,
 ) -> AFDGraphCapturePlan:
-
     if handshake.requires_eager_decode_communication:
         # F chooses singleton/cohort membership only after receiving A's
         # control message. Keep NCCL outside the A model graph so that this
@@ -328,11 +411,32 @@ def build_afd_graph_capture_plan(
     ffn = handshake.local if handshake.local.role == "ffn" else handshake.peer
     attn_graph_shapes = _build_attn_graph_shapes(attn)
     attn_graph_capacities = tuple(shape[1] for shape in attn_graph_shapes)
+    if is_direct_afd_backend(attn.afd_backend):
+        if attn_graph_capacities and not ffn.decode_graph_token_buckets:
+            raise RuntimeError(
+                "AFD direct paired CUDA graph requires FULL graphs on the ffn instance"
+            )
+        return AFDGraphCapturePlan(
+            attn_graph_variants=tuple(
+                AFDGraphCaptureVariant(
+                    attn_batch_size=attn_batch_size,
+                    attn_wire_capacity=attn_wire_capacity,
+                    child_wire_capacities=child_wire_capacities,
+                    child_compute_capacities=(None,) * len(child_wire_capacities),
+                )
+                for (
+                    attn_batch_size,
+                    attn_wire_capacity,
+                    child_wire_capacities,
+                ) in attn_graph_shapes
+            ),
+            ffn_graph_variants=(),
+        )
 
+    transport_buckets = sorted(set(attn.decode_token_buckets))
+    transport_capacities = tuple(reversed(transport_buckets))
     scattered = attn.afd_ffn_moe_backend == "deepep"
-    wire_token_multiplier = (
-        1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
-    )
+    wire_token_multiplier = _attn_wire_tokens_per_bs(attn)
     ffn_max_fan_in = (
         (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
     )
@@ -352,7 +456,7 @@ def build_afd_graph_capture_plan(
         )
     else:
         candidate_capacities = (
-            tuple(sorted(set(attn.decode_token_buckets), reverse=True))
+            transport_capacities
             if attn.afd_backend == "nvshmem"
             else attn_graph_capacities
         )
@@ -386,6 +490,7 @@ def build_afd_graph_capture_plan(
             f"missing_edge_to_ffn={missing_capacities}, "
             f"ffn_buckets={ffn_buckets}"
         )
+
     attn_variants: list[AFDGraphCaptureVariant] = []
     for (
         attn_batch_size,
@@ -428,7 +533,8 @@ def build_afd_graph_capture_plan(
 
     if attn.decode_num_microbatches > 1:
         # All overlap F graphs are captured in the paired A/F phase via the attn
-        # variants above.
+        # variants above. Unlike serial NVSHMEM, there are no standalone
+        # transport-only F graph variants.
         standalone_ffn_variants: tuple[tuple[int, int], ...] = ()
     else:
         standalone_ffn_variants = tuple(ffn_capacity_by_wire.items())
@@ -437,13 +543,6 @@ def build_afd_graph_capture_plan(
         attn_graph_variants=tuple(attn_variants),
         ffn_graph_variants=standalone_ffn_variants,
     )
-
-
-def afd_handshake_port(ffn_api_port: int) -> int:
-    port = ffn_api_port + AFD_HANDSHAKE_PORT_DELTA
-    if port + DIST_PORT_OFFSET > 65535:
-        port = ffn_api_port - AFD_HANDSHAKE_PORT_DELTA
-    return port
 
 
 def parse_ffn_addr(ffn_addr: str) -> Tuple[str, int]:
@@ -490,6 +589,16 @@ def _check_compatible(local: AFDHandshakeInfo, peer: AFDHandshakeInfo) -> None:
             f"AFD handshake: --afd-backend mismatch, attn={attn.afd_backend!r} "
             f"ffn={ffn.afd_backend!r}"
         )
+    if is_direct_afd_backend(attn.afd_backend) and (
+        not attn.direct_backend_version
+        or attn.direct_backend_version != ffn.direct_backend_version
+    ):
+        raise RuntimeError(
+            "AFD handshake: direct backend component version mismatch, "
+            f"backend={attn.afd_backend!r} "
+            f"attn={attn.direct_backend_version!r} "
+            f"ffn={ffn.direct_backend_version!r}"
+        )
     if attn.afd_ffn_moe_backend != ffn.afd_ffn_moe_backend:
         raise RuntimeError(
             "AFD handshake: --moe-a2a-backend mismatch, "
@@ -500,6 +609,14 @@ def _check_compatible(local: AFDHandshakeInfo, peer: AFDHandshakeInfo) -> None:
         raise RuntimeError(
             f"AFD handshake: wire dtype mismatch, attn={attn.wire_dtype!r} "
             f"ffn={ffn.wire_dtype!r}"
+        )
+    if (
+        attn.afd_backend == "direct_deepep"
+        and not ffn.direct_nvfp4_input_scales
+        and not isinstance(ffn.direct_deepep_fp8_scale_ue8m0, bool)
+    ):
+        raise RuntimeError(
+            "AFD handshake: direct_deepep requires the FFN FP8 scale encoding"
         )
     if attn.num_ranks <= 0 or ffn.num_ranks <= 0:
         raise RuntimeError(
@@ -560,6 +677,7 @@ def _check_attn_members_compatible(
         "decode_graph_token_buckets",
         "disable_cuda_graph_padding",
         "decode_num_microbatches",
+        "decode_num_tokens_per_bs",
     )
     for session_id, member in enumerate(attn_members[1:], start=1):
         for name in fields:
@@ -625,7 +743,8 @@ class AFDHandshakeServer:
 
     Uses a ROUTER socket so every attn peer's request can be collected before
     any reply is sent. Sessions are numbered in handshake-arrival order.
-    Each session uses dedicated control and data-plane rendezvous ports.
+    Backends with a static joint world receive the full member list; direct
+    backends also share one data-plane rendezvous port across all sessions.
     """
 
     def __init__(self, port: int):
@@ -663,12 +782,15 @@ class AFDHandshakeServer:
         attn_infos = tuple(peer for _, peer, _ in pending)
         try:
             _check_attn_members_compatible(attn_infos)
-            capacity_plan = build_afd_ffn_capacity_plan(
-                local,
-                attn_infos,
-                use_deepep_low_latency,
-            )
-            local.decode_graph_token_buckets = list(capacity_plan.graph_token_buckets)
+            if not is_direct_afd_backend(local.afd_backend):
+                capacity_plan = build_afd_ffn_capacity_plan(
+                    local,
+                    attn_infos,
+                    use_deepep_low_latency,
+                )
+                local.decode_graph_token_buckets = list(
+                    capacity_plan.graph_token_buckets
+                )
             if local.afd_backend == "nvshmem":
                 nvshmem_remote_transport = select_nvshmem_remote_transport(
                     local, attn_infos
@@ -680,17 +802,24 @@ class AFDHandshakeServer:
                     nvshmem_remote_transport,
                 )
             else:
+                nvshmem_remote_transport = None
                 nvshmem_uid = None
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as e:
             self._reply_error_all([entry[0] for entry in pending], str(e))
             raise
 
-        attn_members = attn_infos if local.afd_backend == "nvshmem" else None
+        attn_members = (
+            attn_infos
+            if local.afd_backend == "nvshmem"
+            or is_direct_afd_backend(local.afd_backend)
+            else None
+        )
         results: list[AFDHandshakeResult] = []
         for session_id, (identity, peer, dist_host) in enumerate(pending):
             sync_port = self._port + SYNC_PORT_OFFSET + SESSION_PORT_STRIDE * session_id
             dist_port = self._port + DIST_PORT_OFFSET
-            dist_port += SESSION_PORT_STRIDE * session_id
+            if not is_direct_afd_backend(local.afd_backend):
+                dist_port += SESSION_PORT_STRIDE * session_id
             self._socket.send_multipart(
                 [
                     identity,

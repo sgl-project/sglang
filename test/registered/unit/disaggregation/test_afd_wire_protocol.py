@@ -23,11 +23,16 @@ from sglang.srt.afd.afd_handshake import (
     run_handshake_attn,
 )
 from sglang.srt.afd.afd_sync import (
+    AFDDirectCommonPlan,
+    AFDDirectControlClient,
+    AFDDirectControlServer,
+    AFDDirectProposal,
     AFDSyncMsg,
     AFDSyncMsgReceiver,
     AFDSyncMsgSender,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -71,6 +76,16 @@ class TestAFDControlWireProtocol(unittest.TestCase):
         receiver.socket.setsockopt(zmq.RCVTIMEO, 5000)
         return sender, receiver
 
+    def _direct_channel(self):
+        endpoint = f"inproc://afd-direct-test-{uuid4()}"
+        server = AFDDirectControlServer(endpoint, session_id=0)
+        client = AFDDirectControlClient(endpoint, session_id=0)
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        server.socket.setsockopt(zmq.RCVTIMEO, 5000)
+        client._socket.setsockopt(zmq.RCVTIMEO, 5000)
+        return client, server
+
     def test_sync_roundtrip_preserves_types_and_step_order(self):
         sender, receiver = self._sync_channel()
         for step_id in range(2):
@@ -109,6 +124,68 @@ class TestAFDControlWireProtocol(unittest.TestCase):
                     receiver.recv()
         sender.send(AFDSyncMsg(0, [1], 1, 1))
         self.assertEqual(receiver.recv().step_id, 0)
+
+    def test_direct_idle_replacement_preserves_work_and_wire_types(self):
+        client, server = self._direct_channel()
+        idle = AFDDirectProposal(0, (0, 0), int(ForwardMode.IDLE), 0)
+        active = AFDDirectProposal(1, (3, 4), int(ForwardMode.DECODE), 8, True, (4, 4))
+        client.send_proposal(idle)
+        self.assertEqual(server.recv_proposal(), idle)
+        client.send_proposal(active)
+        self.assertEqual(client.next_proposal_id, 2)
+
+        old_plan = AFDDirectCommonPlan(
+            union_step_id=0,
+            observed_proposal_ids=(0, 2),
+            active_mask=(False, True),
+            forward_mode=int(ForwardMode.DECODE),
+            parent_wire_capacity=8,
+            wire_capacity=8,
+            communication_graph=True,
+            child_wire_capacities=(4, 4),
+        )
+        server.send_plan(old_plan)
+        self.assertEqual(client.recv_plan(), old_plan)
+        self.assertTrue(client.has_outstanding_proposal)
+
+        actual_proposal = server.recv_proposal()
+        self.assertEqual(actual_proposal, active)
+        self.assertIsInstance(actual_proposal.tokens_per_rank, tuple)
+        self.assertIsInstance(actual_proposal.child_wire_capacities, tuple)
+        self.assertIs(actual_proposal.can_run_graph, True)
+        active_plan = AFDDirectCommonPlan(
+            union_step_id=1,
+            observed_proposal_ids=(1, 2),
+            active_mask=(True, False),
+            forward_mode=int(ForwardMode.DECODE),
+            parent_wire_capacity=8,
+            wire_capacity=8,
+            communication_graph=True,
+            child_wire_capacities=(4, 4),
+        )
+        server.send_plan(active_plan)
+        actual_plan = client.recv_plan()
+        self.assertEqual(actual_plan, active_plan)
+        self.assertIsInstance(actual_plan.active_mask, tuple)
+        self.assertIs(actual_plan.active_mask[0], True)
+        self.assertIs(actual_plan.active_mask[1], False)
+        self.assertIsInstance(actual_plan.child_wire_capacities, tuple)
+        self.assertIs(actual_plan.communication_graph, True)
+        self.assertFalse(client.has_outstanding_proposal)
+        self.assertEqual(client.next_proposal_id, 2)
+
+    def test_direct_channels_reject_the_wrong_message_type(self):
+        client, server = self._direct_channel()
+        client._socket.send(msgspec.msgpack.encode(AFDSyncMsg(0, [1], 1, 1)))
+        with self.assertRaises(msgspec.ValidationError):
+            server.recv_proposal()
+        proposal = AFDDirectProposal(0, (1,), 1, 1)
+        client.send_proposal(proposal)
+        server.recv_proposal()
+        server.socket.send(msgspec.msgpack.encode(proposal))
+        with self.assertRaises(msgspec.ValidationError):
+            client.recv_plan()
+        self.assertTrue(client.has_outstanding_proposal)
 
 
 class TestAFDHandshakeWireProtocol(unittest.TestCase):
@@ -209,7 +286,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
 
     def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
         for transport, (num_attn, num_ffn, backend, num_sessions) in product(
-            ("nccl", "nvshmem"),
+            ("nccl", "nvshmem", "direct_deepep"),
             (
                 (1, 1, "none", 1),
                 (3, 2, "none", 1),
@@ -219,6 +296,8 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 (2, 3, "deepep", 2),
             ),
         ):
+            if transport == "direct_deepep" and backend != "deepep":
+                continue
             with self.subTest(
                 transport=transport,
                 num_attn=num_attn,
@@ -230,6 +309,11 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 ffn_info = _handshake_info("ffn")
                 attn_info = _handshake_info("attn")
                 ffn_info.afd_backend = attn_info.afd_backend = transport
+                if transport == "direct_deepep":
+                    ffn_info.direct_backend_version = (
+                        attn_info.direct_backend_version
+                    ) = "test-version"
+                    ffn_info.direct_deepep_fp8_scale_ue8m0 = False
                 ffn_info.rank_node_ids = ["node-0"] * num_ffn
                 attn_info.rank_node_ids = ["node-0"] * num_attn
                 uid = b"\x00\xffnvshmem-uid"
@@ -277,7 +361,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                     self.assertEqual(
                         result.attn_members,
                         tuple(peer.peer for peer in peer_results)
-                        if transport == "nvshmem"
+                        if transport != "nccl"
                         else None,
                     )
                     self.assertEqual(result.local, attn_info)
@@ -286,9 +370,28 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                     self.assertEqual(peer_result.peer, attn_info)
                     self.assertEqual(result.dist_host, "127.0.0.1")
                     self.assertEqual(result.sync_port, port + 1 + 2 * session_id)
-                    self.assertEqual(result.dist_port, port + 2 + 2 * session_id)
+                    self.assertEqual(
+                        result.dist_port,
+                        port
+                        + 2
+                        + (0 if transport == "direct_deepep" else 2 * session_id),
+                    )
+                    if transport != "nccl":
+                        self.assertEqual(
+                            result.total_attn_ranks, num_attn * num_sessions
+                        )
+                        self.assertEqual(
+                            result.attn_instance_rank_offset, num_attn * session_id
+                        )
+                        self.assertEqual(result.attn_members[session_id], result.local)
                     self.assertEqual(result.sync_port, peer_result.sync_port)
                     self.assertEqual(result.dist_port, peer_result.dist_port)
+                    if transport == "direct_deepep":
+                        self.assertEqual(
+                            result.peer.direct_backend_version, "test-version"
+                        )
+                        self.assertIs(result.peer.direct_deepep_fp8_scale_ue8m0, False)
+                        continue
                     fan_in = (
                         (num_attn + num_ffn - 1) // num_ffn
                         if backend == "deepep"

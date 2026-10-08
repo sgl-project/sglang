@@ -38,7 +38,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
-from sglang.srt.afd.layers import AFDDispatchHandle
+from sglang.srt.afd.layers import AFDDispatchHandle, afd_shared_expert_sm_budget
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -945,9 +945,10 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
         ):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
+            with afd_shared_expert_sm_budget(handle):
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
 
         return DeepseekAFDMoEPending(
             handle=handle,

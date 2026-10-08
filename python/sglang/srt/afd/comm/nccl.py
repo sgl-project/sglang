@@ -26,7 +26,9 @@ class NCCLCommBackend(AFDCommBackend):
     def __init__(self, config: AFDCommConfig):
         super().__init__(config)
         num_local_ranks = (
-            config.num_attn_ranks if config.role.is_attn() else config.num_ffn_ranks
+            config.num_local_attn_ranks
+            if config.role.is_attn()
+            else config.num_ffn_ranks
         )
         logger.info(
             "AFD NCCL backend init: role=%s local_rank=%d/%d global_rank=%d/%d "
@@ -59,6 +61,13 @@ class NCCLCommBackend(AFDCommBackend):
             config.global_rank,
             config.world_size,
         )
+
+    @property
+    def nccl_comm_ptr(self) -> int:
+        comm_ptr = self._comm.comm.value
+        if comm_ptr is None:
+            raise RuntimeError("AFD NCCL communicator has no device handle")
+        return int(comm_ptr)
 
     def send_to(
         self,

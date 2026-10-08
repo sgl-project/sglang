@@ -3309,8 +3309,12 @@ class ServerArgs:
         NS("disagg"),
     ] = None
     afd_backend: A[
-        Literal["nccl", "nvshmem"],
-        "The AFD data-plane backend for transferring routed expert tensors.",
+        Literal["nccl", "nvshmem", "direct_deepep"],
+        "The AFD data-plane backend. 'nccl' uses staged NCCL transfers, "
+        "'nvshmem' uses a symmetric arena for decode and NCCL exact-size "
+        "transfers for prefill, and 'direct_deepep' dispatches decode tokens "
+        "directly from attention ranks to expert-owning ffn ranks, retaining "
+        "staged NCCL transfers for prefill.",
         NS("disagg"),
     ] = "nccl"
     afd_decode_num_microbatches: A[
@@ -3319,23 +3323,35 @@ class ServerArgs:
         "currently support 1, 2, or 3.",
         NS("disagg"),
     ] = 1
-    afd_attn_instances: A[
-        int,
+    afd_direct_deepep_disable_hybrid: A[
+        bool,
+        "Use direct RDMA instead of hierarchical RDMA/NVLink for Direct "
+        "DeepEP. Set only on the ffn instance; the handshake distributes "
+        "the mode to all ranks. Requires NCCL full GIN connectivity.",
         NS("disagg"),
-        "Number of attention instances served by this FFN instance (FFN-side "
-        "argument). All instances must complete their startup handshakes "
-        "before the FFN instance starts serving. Staged backends automatically "
-        "batch compatible ready steps across multiple instances.",
-    ] = 1
+    ] = False
     afd_comm_sm_budget: A[
         Optional[int],
         Arg(
-            help="F-side SM budget reserved for communication during AFD "
-            "decode microbatch overlap. Defaults to 8 for NCCL and 2 for NVSHMEM.",
+            help="F-authoritative SM budget for AFD decode communication. "
+            "Defaults to 8 for NCCL, 2 for NVSHMEM, and 24 for Direct DeepEP. "
+            "Set it only on the ffn instance. Its exact use is data-plane "
+            "specific: staged backends reserve F compute capacity only during "
+            "overlap; Direct DeepEP uses the full budget for serial communication "
+            "and divides it across overlapping decode lanes.",
             resolvable=True,
         ),
         NS("disagg"),
     ] = None
+    afd_attn_instances: A[
+        int,
+        "Number of attn instances served by this ffn instance (ffn-side "
+        "arg). The ffn instance accepts this many handshakes before "
+        "serving. NVSHMEM and Direct DeepEP form one static joint world, "
+        "so every instance must be up before serving starts. Staged backends "
+        "automatically batch compatible ready steps across multiple instances.",
+        NS("disagg"),
+    ] = 1
     afd_ffn_moe_backend: A[str, Arg(no_cli=True, resolvable=True), NS("disagg")] = (
         "none"
     )

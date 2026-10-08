@@ -1,16 +1,16 @@
-"""FFN-side AFD lifecycle and shared-worker session scheduling."""
+"""FFN-side AFD lifecycle and event loops for staged and Direct sessions."""
 
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 import zmq
 
-from sglang.srt.afd.afd_config import AFDRole
+from sglang.srt.afd.afd_config import AFDRole, is_direct_afd_backend
 from sglang.srt.afd.afd_handshake import (
     AFDGraphCapturePlan,
     AFDHandshakeResult,
@@ -19,9 +19,15 @@ from sglang.srt.afd.afd_handshake import (
     build_afd_ffn_capacity_plan,
     build_afd_graph_capture_plan,
 )
-from sglang.srt.afd.afd_sync import AFDSyncMsg, AFDSyncMsgReceiver
+from sglang.srt.afd.afd_sync import (
+    AFDDirectCommonPlan,
+    AFDDirectControlServer,
+    AFDDirectProposal,
+    AFDSyncMsg,
+    AFDSyncMsgReceiver,
+)
 from sglang.srt.afd.comm import AFDCommBackend
-from sglang.srt.afd.dispatcher import is_afd_fixed_shape_mode
+from sglang.srt.afd.dispatcher import is_afd_fixed_shape_mode, select_token_bucket
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
 from sglang.srt.afd.scheduler_common import (
@@ -272,7 +278,12 @@ def _log_ffn_step(session: _AFDFFNSession, compute, msg: AFDSyncMsg, rank: int) 
         and msg.wire_capacity > 0
         and not msg.child_wire_capacities
     ):
-        if backend.decode_transport is not None or msg.communication_graph:
+        if (
+            is_direct_afd_backend(handshake.local.afd_backend)
+            and msg.communication_graph
+        ):
+            graph_capacity = msg.wire_capacity
+        elif backend.decode_transport is not None or msg.communication_graph:
             graph_capacity = session.ffn_graph_variants.get(msg.wire_capacity)
         elif not session.plan.enabled:
             graph_capacity = compute.graph_capacity_for(msg.wire_capacity)
@@ -306,11 +317,15 @@ def _log_ffn_step(session: _AFDFFNSession, compute, msg: AFDSyncMsg, rank: int) 
         )
     else:
         compute_capacity = msg.wire_capacity
-    compute_graph = graph_capacity is not None
+    compute_graph = graph_capacity is not None or (
+        is_direct_afd_backend(handshake.local.afd_backend) and msg.communication_graph
+    )
+    path = "direct" if is_direct_afd_backend(handshake.local.afd_backend) else "staged"
     logger.info(
-        "AFD step: side=ffn path=staged session=%d session_step=%d mode=%s "
+        "AFD step: side=ffn path=%s session=%d session_step=%d mode=%s "
         "tokens_per_rank=%s total_tokens=%d wire=%d children=%s "
         "communication_graph=%s compute_graph=%s compute_capacity=%d",
+        path,
         session.session_id,
         msg.step_id,
         forward_mode.name,
@@ -496,6 +511,232 @@ def _event_loop_afd_ffn_cohort(
             at_busy_boundary = False
 
 
+def _build_direct_union_action(
+    session: _AFDFFNSession,
+    proposals: Sequence[AFDDirectProposal],
+    selected_sessions: Sequence[int],
+    union_step_id: int,
+) -> tuple[AFDDirectCommonPlan, AFDSyncMsg]:
+    selected = frozenset(selected_sessions)
+    if not selected:
+        raise RuntimeError("AFD Direct union action requires active work")
+
+    selected_proposals = [proposals[index] for index in selected_sessions]
+    fixed_shape = is_afd_fixed_shape_mode(
+        ForwardMode(selected_proposals[0].forward_mode)
+    )
+
+    communication_graph = False
+    child_wire_capacities: tuple[int, ...] = ()
+    if fixed_shape:
+        minimum_wire_capacity = max(
+            max(proposal.tokens_per_rank) for proposal in selected_proposals
+        )
+        parent_wire_capacity = select_token_bucket(
+            session.handshake.peer.decode_token_buckets,
+            minimum_wire_capacity,
+        )
+        if all(proposal.can_run_graph for proposal in selected_proposals):
+            graph_variant = min(
+                (
+                    variant
+                    for variant in session.plan.attn_graph_variants
+                    if variant.attn_wire_capacity >= minimum_wire_capacity
+                ),
+                key=lambda variant: variant.attn_wire_capacity,
+                default=None,
+            )
+            if graph_variant is not None and (
+                not session.handshake.peer.disable_cuda_graph_padding
+                or all(
+                    max(proposal.tokens_per_rank) == graph_variant.attn_wire_capacity
+                    for proposal in selected_proposals
+                )
+            ):
+                communication_graph = True
+                parent_wire_capacity = graph_variant.attn_wire_capacity
+                if len(graph_variant.child_wire_capacities) > 1:
+                    child_wire_capacities = graph_variant.child_wire_capacities
+        if not communication_graph:
+            child_plans = [
+                proposal.child_wire_capacities for proposal in selected_proposals
+            ]
+            num_microbatches = session.handshake.peer.decode_num_microbatches
+            if num_microbatches > 1 and all(
+                len(children) == num_microbatches for children in child_plans
+            ):
+                child_wire_capacities = tuple(
+                    max(capacities) for capacities in zip(*child_plans, strict=True)
+                )
+        wire_capacity = (
+            sum(child_wire_capacities)
+            if child_wire_capacities
+            else parent_wire_capacity
+        )
+        plan_forward_mode = ForwardMode.DECODE
+    else:
+        parent_wire_capacity = max(
+            proposal.wire_capacity for proposal in selected_proposals
+        )
+        wire_capacity = parent_wire_capacity
+        plan_forward_mode = ForwardMode.EXTEND
+
+    active_mask = tuple(index in selected for index in range(len(proposals)))
+    plan = AFDDirectCommonPlan(
+        union_step_id=union_step_id,
+        observed_proposal_ids=tuple(proposal.proposal_id for proposal in proposals),
+        active_mask=active_mask,
+        forward_mode=int(plan_forward_mode),
+        parent_wire_capacity=parent_wire_capacity,
+        wire_capacity=wire_capacity,
+        communication_graph=communication_graph,
+        child_wire_capacities=child_wire_capacities,
+    )
+    tokens_per_rank = [
+        num_tokens if active else 0
+        for proposal, active in zip(proposals, active_mask, strict=True)
+        for num_tokens in proposal.tokens_per_rank
+    ]
+    msg = AFDSyncMsg(
+        step_id=union_step_id,
+        tokens_per_rank=tokens_per_rank,
+        forward_mode=int(plan_forward_mode),
+        wire_capacity=wire_capacity,
+        communication_graph=communication_graph,
+        child_wire_capacities=child_wire_capacities,
+    )
+    return plan, msg
+
+
+def _select_direct_union_sessions(
+    proposals: Sequence[AFDDirectProposal],
+) -> list[int]:
+    active_sessions = [
+        index
+        for index, proposal in enumerate(proposals)
+        if sum(proposal.tokens_per_rank) > 0
+    ]
+    prefill_sessions = [
+        index
+        for index in active_sessions
+        if not is_afd_fixed_shape_mode(ForwardMode(proposals[index].forward_mode))
+    ]
+    return prefill_sessions or active_sessions
+
+
+def _event_loop_afd_ffn_direct_union(
+    scheduler: Scheduler,
+    handshakes: list[AFDHandshakeResult],
+) -> None:
+    rank = scheduler.ps.tp_rank
+    is_rank0 = rank == 0
+    session = _build_ffn_session(
+        scheduler,
+        handshakes[0],
+        scheduler.afd_ffn_compute,
+    )
+    scheduler_input_socket = None
+    poller = None
+    controls: list[AFDDirectControlServer] = []
+    if is_rank0:
+        scheduler_input_socket = scheduler.ipc_channels.recv_from_tokenizer
+        poller = zmq.Poller()
+        poller.register(scheduler_input_socket, zmq.POLLIN)
+        for handshake in handshakes:
+            control = AFDDirectControlServer(
+                f"tcp://*:{handshake.sync_port}",
+                handshake.session_id,
+            )
+            controls.append(control)
+            poller.register(control.socket, zmq.POLLIN)
+        logger.info(
+            "AFD Direct union event loop started: sessions=%d attn_ranks=%d",
+            len(handshakes),
+            session.backend.config.num_attn_ranks,
+        )
+
+    pending: dict[int, AFDDirectProposal] = {}
+    union_step_id = 0
+    try:
+        while True:
+            if is_rank0:
+                assert poller is not None
+                while True:
+                    events = dict(poller.poll())
+                    if scheduler_input_socket in events:
+                        action = (None, sock_recv(scheduler_input_socket))
+                        break
+                    for session_id, control in enumerate(controls):
+                        if control.socket in events:
+                            proposal = control.recv_proposal()
+                            pending[session_id] = proposal
+                    if len(pending) != len(controls) or not any(
+                        sum(proposal.tokens_per_rank) > 0
+                        for proposal in pending.values()
+                    ):
+                        continue
+
+                    proposals = [pending[index] for index in range(len(controls))]
+                    selected_sessions = _select_direct_union_sessions(proposals)
+                    plan, msg = _build_direct_union_action(
+                        session,
+                        proposals,
+                        selected_sessions,
+                        union_step_id,
+                    )
+                    for control in controls:
+                        control.send_plan(plan)
+                    pending.clear()
+                    union_step_id += 1
+                    action = (plan, msg)
+                    break
+                if scheduler.ps.tp_size > 1:
+                    broadcast_pyobj(
+                        [action],
+                        rank,
+                        scheduler.tp_cpu_group,
+                        src=0,
+                    )
+            else:
+                (action,) = broadcast_pyobj(
+                    [],
+                    rank,
+                    scheduler.tp_cpu_group,
+                    src=0,
+                )
+
+            plan, msg = action
+            if plan is None:
+                if _handle_ffn_scheduler_request(scheduler, msg, is_rank0):
+                    break
+                continue
+
+            if is_rank0 and should_log_step(msg.step_id):
+                logger.info(
+                    "AFD step: side=ffn path=direct union_step=%d active=%s "
+                    "mode=%s tokens_per_rank=%s total_tokens=%d "
+                    "parent_wire=%d wire=%d children=%s "
+                    "communication_graph=%s compute_graph=%s",
+                    msg.step_id,
+                    plan.active_mask,
+                    ForwardMode(msg.forward_mode).name,
+                    msg.tokens_per_rank,
+                    sum(msg.tokens_per_rank),
+                    plan.parent_wire_capacity,
+                    msg.wire_capacity,
+                    msg.child_wire_capacities,
+                    msg.communication_graph,
+                    msg.communication_graph,
+                )
+            session.executor.run_step(msg)
+    finally:
+        for control in controls:
+            control.close()
+        session.backend.close()
+    if is_rank0:
+        logger.info("AFD Direct union event loop exited")
+
+
 def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     """Ffn-side event loop for AFD steps and scheduler management requests.
 
@@ -534,12 +775,32 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
         # ports) to build its data-plane comm backends.
         (handshakes,) = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
 
-    capacity_plan = build_afd_ffn_capacity_plan(
-        handshakes[0].local,
-        tuple(handshake.peer for handshake in handshakes),
-        use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
-    )
-    compute.configure_staged_capacity(capacity_plan)
+    backend = handshakes[0].local.afd_backend
+    if backend == "direct_deepep":
+        if get_exec().moe.deepep_mode != "normal":
+            ffn_ranks = handshakes[0].local.num_ranks
+            union_fan_in = (handshakes[0].total_attn_ranks + ffn_ranks - 1) // ffn_ranks
+            dispatch_limit = max(
+                max(handshakes[0].peer.decode_token_buckets) * union_fan_in,
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
+            )
+            if dispatch_limit > 1024:
+                raise RuntimeError(
+                    "AFD Direct DeepEP requires at most 1024 native DeepEP "
+                    f"dispatch tokens per F rank; required={dispatch_limit}"
+                )
+            compute.configure_native_deepep_dispatch_limit(dispatch_limit)
+    elif not is_direct_afd_backend(backend):
+        capacity_plan = build_afd_ffn_capacity_plan(
+            handshakes[0].local,
+            tuple(handshake.peer for handshake in handshakes),
+            use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
+        )
+        compute.configure_staged_capacity(capacity_plan)
+
+    if is_direct_afd_backend(backend) and num_sessions > 1:
+        _event_loop_afd_ffn_direct_union(scheduler, handshakes)
+        return
 
     sessions: list[_AFDFFNSession] = [
         _build_ffn_session(scheduler, handshake, compute) for handshake in handshakes

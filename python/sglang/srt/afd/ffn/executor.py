@@ -85,6 +85,7 @@ class AFDFFNExecutor:
         self._rank = self._comm.config.instance_rank
         self._num_ranks = self._comm.config.num_ffn_ranks
         self._scattered = get_disagg().afd_ffn_moe_backend == "deepep"
+        direct_deepep = handshake.local.afd_backend == "direct_deepep"
         self._attn_ranks = self._comm.config.attn_ranks_for_ffn(
             self._rank,
             scattered=self._scattered,
@@ -93,11 +94,12 @@ class AFDFFNExecutor:
         self._decode_num_microbatches = handshake.peer.decode_num_microbatches
         self._cohort_graph_child_plans: frozenset[tuple[int, ...]] = frozenset()
         self._max_scattered_source_count = 0
-        staged_overlap = self._decode_num_microbatches > 1
+        staged_overlap = self._decode_num_microbatches > 1 and not direct_deepep
         self._communication_stream = (
             torch.cuda.Stream(device=self._device) if staged_overlap else None
         )
-        # NVSHMEM request and response signals can progress independently.
+        # NVSHMEM request/response regions and signals are independent. NCCL
+        # keeps one stream because its untagged P2P operations require order.
         self._response_stream = (
             torch.cuda.Stream(device=self._device)
             if staged_overlap and self._decode_transport is not None
@@ -129,6 +131,26 @@ class AFDFFNExecutor:
                 f"{self._tp_group.world_size}"
             )
 
+        self._direct_deepep_lanes = ()
+        if direct_deepep:
+            from sglang.srt.afd.direct_deepep import (
+                build_afd_direct_deepep_adapters,
+            )
+
+            self._direct_deepep_lanes = build_afd_direct_deepep_adapters(
+                comm=comm,
+                layers=self._layers,
+                token_buckets=handshake.peer.decode_token_buckets,
+                num_lanes=self._decode_num_microbatches,
+                tokens_per_batch=handshake.peer.decode_num_tokens_per_bs,
+                dtype=self._dtype,
+                comm_sm_budget=handshake.local.afd_comm_sm_budget,
+                nvfp4_input_scales=handshake.local.direct_nvfp4_input_scales,
+                fp8_scale_ue8m0=handshake.local.direct_deepep_fp8_scale_ue8m0,
+                expert_alignment=handshake.local.direct_deepep_expert_alignment,
+                allow_hybrid_mode=handshake.local.direct_deepep_allow_hybrid,
+            )
+
         if self._decode_num_microbatches > 1:
             overlap_sm_budget = handshake.local.afd_comm_sm_budget
             assert overlap_sm_budget is not None
@@ -140,9 +162,15 @@ class AFDFFNExecutor:
                 communication_num_sms,
             ) = resolve_overlap_sm_partition(
                 total_num_sms=total_num_sms,
+                num_microbatches=self._decode_num_microbatches,
                 overlap_sm_budget=overlap_sm_budget,
+                direct_deepep_communication_num_sms_per_lane=(
+                    self._direct_deepep_lanes[0].overlap_communication_num_sms
+                    if direct_deepep
+                    else None
+                ),
             )
-            if self._decode_transport is None:
+            if not direct_deepep and self._decode_transport is None:
                 self._compute._graph_compute_num_sms = self._compute_num_sms
             if self._rank == 0:
                 logger.info(
@@ -173,15 +201,19 @@ class AFDFFNExecutor:
         decode_pool_transport = self._decode_transport
         if self._scattered and len(self._attn_ranks) > 1:
             decode_pool_transport = None
-        self._decode_pool = AFDFixedBufferPool(
-            layers=self._layers,
-            token_buckets=decode_pool_token_buckets,
-            dtype=self._dtype,
-            device=self._device,
-            role="ffn",
-            with_router_logits=True,
-            num_slots=self._decode_num_microbatches,
-            decode_transport=decode_pool_transport,
+        self._decode_pool = (
+            None
+            if self._direct_deepep_lanes
+            else AFDFixedBufferPool(
+                layers=self._layers,
+                token_buckets=decode_pool_token_buckets,
+                dtype=self._dtype,
+                device=self._device,
+                role="ffn",
+                with_router_logits=True,
+                num_slots=self._decode_num_microbatches,
+                decode_transport=decode_pool_transport,
+            )
         )
 
         logger.info(
@@ -205,6 +237,9 @@ class AFDFFNExecutor:
             tuple(variant.child_wire_capacities) for variant in plan.attn_graph_variants
         )
         if not plan.enabled:
+            return
+        if self._direct_deepep_lanes:
+            self._capture_direct_deepep_graphs(plan)
             return
 
         ffn_variants = dict(plan.ffn_graph_variants)
@@ -293,6 +328,35 @@ class AFDFFNExecutor:
             full_steps,
             len(temporary_graphs),
         )
+
+    def _capture_direct_deepep_graphs(
+        self,
+        plan: AFDGraphCapturePlan,
+    ) -> None:
+        variants = [
+            (variant.child_wire_capacities, ()) for variant in plan.attn_graph_variants
+        ]
+
+        if self._rank == 0:
+            logger.info(
+                "Capture AFD Direct DeepEP graphs begin: wire_capacities=%s",
+                [wire_capacities for wire_capacities, _ in variants],
+            )
+        self._decode_step_graph = _AFDFFNDecodeStepGraph(
+            self._compute,
+            self._run_direct_deepep_graph_step,
+            direct_data_plane=True,
+        )
+        self._comm.startup_barrier()
+        # A reaches this barrier at its first MoE after local graph warmup.
+        self._comm.startup_barrier()
+        self._capture_variants(variants)
+        self._comm.startup_barrier()
+        if self._rank == 0:
+            logger.info(
+                "AFD Direct DeepEP graphs ready: full_steps=%d",
+                len(variants),
+            )
 
     def _decode_source_segments(
         self, edge_wire_capacity: int
@@ -608,6 +672,40 @@ class AFDFFNExecutor:
         if msg.child_wire_capacities and not fixed_shape:
             raise RuntimeError("AFD child plan requires DECODE")
 
+        if self._direct_deepep_lanes and fixed_shape:
+            child_wire_capacities = msg.effective_child_wire_capacities
+            if msg.child_wire_capacities:
+                if len(child_wire_capacities) != self._decode_num_microbatches:
+                    raise RuntimeError(
+                        "AFD Direct DeepEP child count does not match the "
+                        "configured microbatch count: "
+                        f"children={len(child_wire_capacities)}, "
+                        f"configured={self._decode_num_microbatches}"
+                    )
+                if sum(child_wire_capacities) != msg.wire_capacity:
+                    raise RuntimeError(
+                        "AFD Direct DeepEP child capacities do not match the "
+                        f"parent: children={child_wire_capacities}, "
+                        f"parent={msg.wire_capacity}"
+                    )
+            with torch.inference_mode():
+                if (
+                    msg.communication_graph
+                    and self._decode_step_graph is not None
+                    and self._decode_step_graph.replay(child_wire_capacities)
+                ):
+                    return
+                if msg.communication_graph:
+                    raise RuntimeError(
+                        "AFD ffn has no Direct DeepEP graph for child wire "
+                        f"capacities {child_wire_capacities}"
+                    )
+                self._run_direct_deepep_step(
+                    child_wire_capacities,
+                    do_cpu_sync=len(child_wire_capacities) == 1,
+                )
+            return
+
         decode_children = self._prepare_decode_children(msg) if fixed_shape else ()
         source_segments = (
             decode_children[0].source_segments
@@ -689,6 +787,131 @@ class AFDFFNExecutor:
                 forward_mode,
                 source_segments,
             )
+
+    def _run_direct_deepep_graph_step(
+        self,
+        wire_capacities: tuple[int, ...],
+        _compute_capacities: tuple[int, ...],
+    ) -> None:
+        self._run_direct_deepep_step(
+            wire_capacities,
+            do_cpu_sync=False,
+        )
+
+    def _run_direct_deepep_step(
+        self,
+        wire_capacities: tuple[int, ...],
+        *,
+        do_cpu_sync: bool,
+    ) -> None:
+        compute_num_sms = self._compute_num_sms if len(wire_capacities) > 1 else None
+        with compute_sm_budget(compute_num_sms):
+            self._run_direct_deepep_step_impl(
+                wire_capacities,
+                do_cpu_sync=do_cpu_sync,
+            )
+
+    def _run_direct_deepep_step_impl(
+        self,
+        wire_capacities: tuple[int, ...],
+        *,
+        do_cpu_sync: bool,
+    ) -> None:
+        num_children = len(wire_capacities)
+        async_with_compute_stream = num_children > 1
+        # Module loading and first-use library setup may synchronize the device.
+        # Keep warmup/eager in layer order so these operations cannot wait behind
+        # a next-layer receive whose peer is still warming the current layer.
+        prefetch_next_layer = (
+            async_with_compute_stream and torch.cuda.is_current_stream_capturing()
+        )
+
+        first = self._layers[0]
+        hidden_states = torch.empty(
+            (0, first.hidden_size),
+            dtype=self._dtype,
+            device=self._device,
+        )
+        topk_ids = torch.empty(
+            (0, first.top_k),
+            dtype=torch.int64,
+            device=self._device,
+        )
+        topk_weights = torch.empty(
+            (0, first.top_k),
+            dtype=torch.float32,
+            device=self._device,
+        )
+        set_is_extend_in_batch(False)
+        dispatches = [
+            self._direct_deepep_lanes[child_index].dispatch(
+                first.layer_id,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                num_max_dispatch_tokens_per_rank=wire_capacity,
+                do_cpu_sync=do_cpu_sync,
+                async_with_compute_stream=async_with_compute_stream,
+            )
+            for child_index, wire_capacity in enumerate(wire_capacities)
+        ]
+        final_combines = []
+        for layer_index in range(len(self._layers)):
+            scaling_factor = self._layers[layer_index].routed_scaling_factor
+            layer_combines = []
+            next_dispatches = []
+            for child_index, dispatch_output in enumerate(dispatches):
+                dispatch_output.wait()
+                expert_output = self._compute.run_direct_deepep(
+                    layer_index,
+                    dispatch_output,
+                )
+                layer_combines.append(
+                    self._direct_deepep_lanes[child_index].combine(
+                        expert_output,
+                        dispatch_output,
+                        routed_scaling_factor=(
+                            1.0 if scaling_factor is None else float(scaling_factor)
+                        ),
+                        async_with_compute_stream=async_with_compute_stream,
+                    )
+                )
+                if prefetch_next_layer and layer_index + 1 < len(self._layers):
+                    # Refill this lane behind its combine on the same communication
+                    # stream. Waiting for other children's compute would delay the
+                    # next request even when this lane's A-side result is ready.
+                    next_dispatches.append(
+                        self._direct_deepep_lanes[child_index].dispatch(
+                            self._layers[layer_index + 1].layer_id,
+                            hidden_states,
+                            topk_ids,
+                            topk_weights,
+                            num_max_dispatch_tokens_per_rank=wire_capacities[
+                                child_index
+                            ],
+                            do_cpu_sync=do_cpu_sync,
+                            async_with_compute_stream=async_with_compute_stream,
+                        )
+                    )
+            if layer_index + 1 == len(self._layers):
+                final_combines = layer_combines
+            elif not prefetch_next_layer:
+                next_dispatches = [
+                    self._direct_deepep_lanes[child_index].dispatch(
+                        self._layers[layer_index + 1].layer_id,
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                        num_max_dispatch_tokens_per_rank=wire_capacity,
+                        do_cpu_sync=do_cpu_sync,
+                        async_with_compute_stream=async_with_compute_stream,
+                    )
+                    for child_index, wire_capacity in enumerate(wire_capacities)
+                ]
+            dispatches = next_dispatches
+
+        for combine_output in final_combines:
+            combine_output.wait()
 
     def _run_eager_step(
         self,

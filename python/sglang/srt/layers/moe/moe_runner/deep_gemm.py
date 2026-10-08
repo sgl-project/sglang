@@ -268,6 +268,7 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    use_psum_layout: bool = False
     hidden_states_scale_tma_aligned: bool = False
 
     @property
@@ -361,7 +362,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import (
+            silu_and_mul_contig_post_quant,
+            silu_and_mul_psum_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -374,6 +378,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        use_psum_layout = runner_input.use_psum_layout
         trace_deepep_v2_contig = (
             envs.SGLANG_DEEPEP_V2_TRACE_CONTIG.get()
             and running_state.get("deepep_v2_expanded", False)
@@ -423,6 +428,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m,
         )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
@@ -485,7 +492,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        elif self.use_swizzle:
+        elif self.use_swizzle or use_psum_layout:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
                 "deepep_v2_disable_contig_swizzle", False
@@ -504,16 +511,35 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-            silu_and_mul_contig_post_quant(
-                input=gateup_output,
-                output=down_input_fp8,
-                output_scale=down_input_scale,
-                quant_group_size=scale_block_size,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                swiglu_limit=swiglu_limit_arg,
-                swizzle=use_contig_swizzle,
-            )
+            if use_psum_layout:
+                import deep_gemm
+
+                assert m_indices is not None
+                expert_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+                if isinstance(expert_alignment, tuple):
+                    expert_alignment = expert_alignment[0]
+                silu_and_mul_psum_post_quant(
+                    input=gateup_output,
+                    output=down_input_fp8,
+                    output_scale=down_input_scale,
+                    expert_psum=m_indices,
+                    expert_alignment=expert_alignment,
+                    quant_group_size=scale_block_size,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    swiglu_limit=swiglu_limit_arg,
+                )
+            else:
+                silu_and_mul_contig_post_quant(
+                    input=gateup_output,
+                    output=down_input_fp8,
+                    output_scale=down_input_scale,
+                    quant_group_size=scale_block_size,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    swiglu_limit=swiglu_limit_arg,
+                    swizzle=use_contig_swizzle,
+                )
             del gateup_output
         else:
             from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -581,6 +607,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a_down,
             recipe_b=recipe_b,
+            use_psum_layout=use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m,
         )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
@@ -1347,7 +1375,12 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 
-    all_tokens = sum(num_recv_tokens_per_expert)
+    use_psum_layout = isinstance(num_recv_tokens_per_expert, torch.Tensor)
+    running_state["use_psum_layout"] = use_psum_layout
+    if use_psum_layout:
+        all_tokens = hidden_states.shape[0]
+    else:
+        all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
 
     K = hidden_states.shape[1]
@@ -1361,6 +1394,20 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
+
+    if use_psum_layout:
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=num_recv_tokens_per_expert,
+            use_psum_layout=True,
+            hidden_states_scale_tma_aligned=True,
+            expected_m=max(
+                1,
+                all_tokens // num_recv_tokens_per_expert.shape[0],
+            ),
+        )
 
     # Deterministic inference zero-fills the scatter buffers: expert-alignment
     # padding leaves slots that ep_scatter never writes, and pad garbage in
@@ -1444,6 +1491,13 @@ def post_permute_deep_gemm_to_deepep_normal(
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
+    if running_state["use_psum_layout"]:
+        return DeepEPNormalCombineInput(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
     output_index = running_state["output_index"]
 
     gather_out = torch.empty(

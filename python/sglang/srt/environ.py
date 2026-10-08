@@ -686,6 +686,8 @@ class Envs:
     SGLANG_AFD_LOG_INTERVAL = EnvInt(100)
     # F-side staged multi-A join window; zero only batches already-ready work.
     SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US = EnvInt(0)
+    # FFN-selected alignment propagated to all Direct DeepEP ranks.
+    SGLANG_AFD_DIRECT_DEEPEP_EXPERT_ALIGNMENT = EnvInt(128)
 
     # ===================================================================
     # Distributed and model-parallel runtime

@@ -22,12 +22,16 @@ from sglang.srt.afd.afd_scheduler import (
     _decide_afd_attn_graph,
     prepare_afd_attn_batch,
 )
-from sglang.srt.afd.afd_sync import AFDSyncMsg
+from sglang.srt.afd.afd_sync import AFDDirectProposal, AFDSyncMsg
 from sglang.srt.afd.comm.base import AFDCommConfig
 from sglang.srt.afd.dispatcher import AFDDispatcher
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
-from sglang.srt.afd.ffn.scheduler import _AFDFFNCohortSelector
+from sglang.srt.afd.ffn.scheduler import (
+    _AFDFFNCohortSelector,
+    _build_direct_union_action,
+    _select_direct_union_sessions,
+)
 from sglang.srt.afd.layers import AFDMoELayer
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
@@ -219,7 +223,7 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             backend,
             "float32",
             [],
-            list(range(1, 17)),
+            decode_token_buckets=list(range(1, 17)),
         )
         ffn = AFDHandshakeInfo(
             "ffn",
@@ -232,7 +236,9 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             [],
         )
         handshake = AFDHandshakeResult(ffn, attn, "localhost", 30002, 30003)
-        disagg = SimpleNamespace(afd_ffn_moe_backend="deepep" if scattered else "none")
+        disagg = SimpleNamespace(
+            afd_backend="nccl", afd_ffn_moe_backend="deepep" if scattered else "none"
+        )
         with (
             patch("sglang.srt.afd.ffn.compute.get_disagg", return_value=disagg),
             patch("sglang.srt.afd.ffn.executor.get_disagg", return_value=disagg),
@@ -261,7 +267,9 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
 
     def _comm(self, role, rank, num_attn, num_ffn, channels):
         return _CPUComm(
-            AFDCommConfig(role, num_attn, num_ffn, rank, "localhost", 30001, "cpu"),
+            AFDCommConfig(
+                role, num_attn, num_ffn, num_attn, rank, "localhost", 30001, "cpu"
+            ),
             channels,
         )
 
@@ -482,7 +490,15 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
 
     def test_low_latency_fanin_capacity_updates_every_native_dispatcher(self):
         attn = AFDHandshakeInfo(
-            "attn", "model", 3, [], "nccl", "deepep", "float32", [], [32, 64, 96]
+            "attn",
+            "model",
+            3,
+            [],
+            "nccl",
+            "deepep",
+            "float32",
+            [],
+            decode_token_buckets=[32, 64, 96],
         )
         ffn = AFDHandshakeInfo("ffn", "model", 2, [], "nccl", "deepep", "float32", [])
         attn.decode_graph_token_buckets = [32, 64]
@@ -636,10 +652,14 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                 scheduler = SimpleNamespace(
                     afd_handshake=SimpleNamespace(
                         local=SimpleNamespace(
-                            num_ranks=len(tokens), decode_token_buckets=[4, 8]
+                            num_ranks=len(tokens),
+                            decode_token_buckets=[4, 8],
+                            decode_graph_token_buckets=[],
+                            decode_num_tokens_per_bs=1,
                         )
                     ),
                     ps=SimpleNamespace(tp_rank=0),
+                    _afd_attn_coordinator=None,
                     _afd_sync_sender=Mock(),
                     tp_worker=SimpleNamespace(model_runner=SimpleNamespace()),
                 )
@@ -664,11 +684,9 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                 with (
                     patch(
                         "sglang.srt.afd.afd_scheduler.get_disagg",
-                        return_value=SimpleNamespace(afd_decode_num_microbatches=1),
-                    ),
-                    patch(
-                        "sglang.srt.afd.afd_scheduler.is_afd_attn_moe_scattered",
-                        return_value=True,
+                        return_value=SimpleNamespace(
+                            afd_decode_num_microbatches=1, afd_ffn_moe_backend="deepep"
+                        ),
                     ),
                     patch(
                         "sglang.srt.afd.afd_scheduler.get_afd_dispatcher",
@@ -707,7 +725,7 @@ class TestAFDSchedulerRouting(unittest.TestCase):
         layer = AFDMoELayer(0, torch.nn.Identity(), 2, 4, 2, 4, 0, None)
         channels = {(0, 1): Queue(), (1, 0): Queue()}
         comm = _CPUComm(
-            AFDCommConfig(AFDRole.ATTN, 1, 1, 0, "localhost", 1, "cpu"), channels
+            AFDCommConfig(AFDRole.ATTN, 1, 1, 1, 0, "localhost", 1, "cpu"), channels
         )
         dispatcher = AFDDispatcher(
             comm=comm,
@@ -722,7 +740,12 @@ class TestAFDSchedulerRouting(unittest.TestCase):
         )
         with patch("sglang.srt.afd.afd_scheduler.AFDSyncMsgSender") as transport:
             sender = AFDSyncSender(
-                SimpleNamespace(dist_host="localhost", sync_port=1, session_id=0)
+                SimpleNamespace(
+                    dist_host="localhost",
+                    sync_port=1,
+                    session_id=0,
+                    local=SimpleNamespace(afd_backend="nccl"),
+                )
             )
         for capacity, can_run_graph, expected in (
             (4, True, True),
@@ -936,6 +959,69 @@ class TestAFDHandshake(unittest.TestCase):
         attn0.decode_token_buckets[-1] = 2048
         normal = build_afd_ffn_capacity_plan(ffn, (attn0,), False)
         self.assertIsNone(normal.deepep_dispatch_limit)
+
+
+class TestAFDDirectUnion(unittest.TestCase):
+    def test_direct_union_uses_common_bucket_for_full_and_partial_graph(self):
+        peer = _handshake_info(
+            "attn",
+            num_ranks=2,
+            backend="direct_deepep",
+            decode_token_buckets=[16, 32, 64],
+            decode_graph_token_buckets=[64],
+            decode_num_microbatches=2,
+        )
+        handshake = SimpleNamespace(peer=peer)
+        session = SimpleNamespace(
+            handshake=handshake,
+            plan=SimpleNamespace(
+                attn_graph_variants=(
+                    AFDGraphCaptureVariant(128, 128, (64, 64), (None, None)),
+                    AFDGraphCaptureVariant(64, 64, (32, 32), (None, None)),
+                )
+            ),
+        )
+        proposals = [
+            AFDDirectProposal(3, (24, 32), int(ForwardMode.DECODE), 32, True, (16, 16)),
+            AFDDirectProposal(5, (40, 48), int(ForwardMode.DECODE), 64, True, (32, 32)),
+        ]
+
+        plan, msg = _build_direct_union_action(session, proposals, [0, 1], 7)
+        self.assertTrue(plan.communication_graph)
+        self.assertEqual((plan.parent_wire_capacity, msg.wire_capacity), (64, 64))
+        self.assertEqual(plan.child_wire_capacities, (32, 32))
+        self.assertEqual(msg.tokens_per_rank, [24, 32, 40, 48])
+
+        peer.disable_cuda_graph_padding = True
+        eager_plan, _ = _build_direct_union_action(session, proposals, [0, 1], 8)
+        self.assertFalse(eager_plan.communication_graph)
+        peer.disable_cuda_graph_padding = False
+
+        partial_plan, partial_msg = _build_direct_union_action(
+            session, proposals, [0], 9
+        )
+        self.assertTrue(partial_plan.communication_graph)
+        self.assertEqual(partial_plan.child_wire_capacities, (32, 32))
+        self.assertEqual(partial_msg.tokens_per_rank, [24, 32, 0, 0])
+
+        prefill_proposals = [
+            AFDDirectProposal(7, (9, 7), int(ForwardMode.MIXED), 9),
+            proposals[0],
+            AFDDirectProposal(11, (3, 5), int(ForwardMode.EXTEND), 5),
+        ]
+        prefill_sessions = _select_direct_union_sessions(prefill_proposals)
+        self.assertEqual(prefill_sessions, [0, 2])
+
+        prefill_plan, prefill_msg = _build_direct_union_action(
+            session,
+            prefill_proposals,
+            prefill_sessions,
+            10,
+        )
+        self.assertEqual(prefill_plan.active_mask, (True, False, True))
+        self.assertEqual(ForwardMode(prefill_plan.forward_mode), ForwardMode.EXTEND)
+        self.assertEqual(prefill_msg.wire_capacity, 9)
+        self.assertEqual(prefill_msg.tokens_per_rank, [9, 7, 0, 0, 3, 5])
 
 
 if __name__ == "__main__":

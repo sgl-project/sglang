@@ -115,7 +115,7 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    num_recv_tokens_per_expert: List[int] | torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat:

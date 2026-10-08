@@ -6,7 +6,10 @@ import ctypes
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.afd.afd_config import AFDRole
+from sglang.srt.afd.afd_config import (
+    AFDRole,
+    is_direct_afd_backend,
+)
 from sglang.srt.afd.afd_handshake import (
     AFDHandshakeInfo,
     AFDHandshakeResult,
@@ -17,14 +20,21 @@ from sglang.srt.afd.comm import (
     AFDCommConfig,
     create_afd_comm_backend,
 )
-from sglang.srt.afd.dispatcher import build_decode_token_buckets
+from sglang.srt.afd.dispatcher import (
+    build_decode_token_buckets,
+)
 from sglang.srt.afd.layers import collect_afd_moe_layers
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.numa_utils import _get_nvml_device_index
 
@@ -34,6 +44,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# Log the first few steps and then a heartbeat, so bring-up is visible
+# without flooding the log at decode rate.
 _VERBOSE_FIRST_STEPS = 5
 _LOG_INTERVAL = envs.SGLANG_AFD_LOG_INTERVAL.get()
 if _LOG_INTERVAL < 0:
@@ -96,18 +109,26 @@ def build_local_handshake_info(
     rank_node_ids: list[str],
     rank_nvshmem_fabric_keys: list[tuple[bytes, int] | None],
 ) -> AFDHandshakeInfo:
-    model_runner = scheduler.tp_worker.model_runner
-    moe_layers = collect_afd_moe_layers(model_runner.model, role)
-    scattered = get_disagg().afd_ffn_moe_backend == "deepep"
+    moe_layers = collect_afd_moe_layers(
+        scheduler.tp_worker.model_runner.model,
+        role,
+    )
     decode_token_buckets = []
     decode_graph_token_buckets = []
     decode_config = get_exec().graph.cuda_graph_config.decode
-    wire_token_multiplier = 1 if scattered else scheduler.ps.tp_size
+    scattered = get_disagg().afd_ffn_moe_backend == "deepep"
+    decode_num_tokens_per_bs = 1
+    wire_token_multiplier = decode_num_tokens_per_bs * (
+        1 if scattered else scheduler.ps.tp_size
+    )
     if role.is_attn():
         if decode_config.backend == Backend.DISABLED:
             local_batch_sizes = decode_config.bs
         else:
-            local_batch_sizes, _ = get_batch_sizes_to_capture(model_runner, 1)
+            local_batch_sizes, _ = get_batch_sizes_to_capture(
+                scheduler.tp_worker.model_runner,
+                decode_num_tokens_per_bs,
+            )
             decode_graph_token_buckets = [
                 batch_size * wire_token_multiplier for batch_size in local_batch_sizes
             ]
@@ -115,30 +136,42 @@ def build_local_handshake_info(
             raise RuntimeError("AFD requires normalized decode batch sizes")
         decode_token_buckets = build_decode_token_buckets(
             local_batch_sizes=local_batch_sizes,
-            max_local_requests=model_runner.max_running_requests,
+            max_local_requests=scheduler.tp_worker.model_runner.max_running_requests,
             wire_token_multiplier=wire_token_multiplier,
         )
     elif decode_config.backend == Backend.FULL:
         decode_graph_token_buckets = list(decode_config.bs)
+
+    direct_backend_version = None
+    direct_nvfp4_input_scales = []
+    direct_deepep_fp8_scale_ue8m0 = None
+    if role.is_ffn() and is_direct_afd_backend(get_disagg().afd_backend):
+        from sglang.srt.afd.layers import get_direct_nvfp4_input_scales
+
+        direct_nvfp4_input_scales = get_direct_nvfp4_input_scales(moe_layers)
+    if get_disagg().afd_backend == "direct_deepep":
+        from sglang.srt.afd.direct_deepep import get_direct_deepep_version
+
+        direct_backend_version = get_direct_deepep_version()
+        if role.is_ffn() and not direct_nvfp4_input_scales:
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            direct_deepep_fp8_scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+
     return AFDHandshakeInfo(
         role=role.value,
         model_identity=compute_model_identity(get_model().model_path),
         num_ranks=scheduler.ps.tp_size,
         rank_node_ids=rank_node_ids,
-        rank_nvshmem_fabric_keys=rank_nvshmem_fabric_keys,
         afd_backend=get_disagg().afd_backend,
         afd_ffn_moe_backend=get_disagg().afd_ffn_moe_backend,
-        wire_dtype=str(model_runner.dtype).removeprefix("torch."),
-        decode_token_buckets=decode_token_buckets,
-        decode_graph_token_buckets=decode_graph_token_buckets,
-        disable_cuda_graph_padding=get_exec().graph.disable_cuda_graph_padding,
-        decode_num_microbatches=(
-            get_disagg().afd_decode_num_microbatches if role.is_attn() else 1
-        ),
-        requires_eager_decode_communication=(
-            role.is_ffn()
-            and get_disagg().afd_backend == "nccl"
-            and get_disagg().afd_attn_instances > 1
+        wire_dtype=str(scheduler.tp_worker.model_runner.dtype).removeprefix("torch."),
+        direct_backend_version=direct_backend_version,
+        direct_nvfp4_input_scales=direct_nvfp4_input_scales,
+        direct_deepep_fp8_scale_ue8m0=direct_deepep_fp8_scale_ue8m0,
+        direct_deepep_allow_hybrid=(not get_disagg().afd_direct_deepep_disable_hybrid),
+        direct_deepep_expert_alignment=(
+            envs.SGLANG_AFD_DIRECT_DEEPEP_EXPERT_ALIGNMENT.get()
         ),
         afd_comm_sm_budget=get_disagg().afd_comm_sm_budget,
         moe_layers=[
@@ -152,6 +185,19 @@ def build_local_handshake_info(
             }
             for layer in moe_layers
         ],
+        decode_token_buckets=decode_token_buckets,
+        decode_graph_token_buckets=decode_graph_token_buckets,
+        decode_num_tokens_per_bs=decode_num_tokens_per_bs,
+        disable_cuda_graph_padding=get_exec().graph.disable_cuda_graph_padding,
+        decode_num_microbatches=(
+            get_disagg().afd_decode_num_microbatches if role.is_attn() else 1
+        ),
+        requires_eager_decode_communication=(
+            role.is_ffn()
+            and get_disagg().afd_backend == "nccl"
+            and get_disagg().afd_attn_instances > 1
+        ),
+        rank_nvshmem_fabric_keys=rank_nvshmem_fabric_keys,
     )
 
 
@@ -171,21 +217,49 @@ def _afd_device(scheduler: Scheduler) -> str:
 def init_afd_comm_backend(
     scheduler: Scheduler, role: AFDRole, handshake: AFDHandshakeResult
 ) -> AFDCommBackend:
+    """Create the data-plane backend right after the handshake (fail-fast;
+    both instances are alive at this point, so the rendezvous cannot stall
+    on a missing peer)."""
+    uses_direct_union = is_direct_afd_backend(handshake.local.afd_backend)
     if role.is_attn():
-        num_attn_ranks = handshake.local.num_ranks
+        num_attn_ranks = (
+            handshake.total_attn_ranks
+            if uses_direct_union
+            else handshake.local.num_ranks
+        )
+        num_local_attn_ranks = handshake.local.num_ranks
         num_ffn_ranks = handshake.peer.num_ranks
     else:
-        num_attn_ranks = handshake.peer.num_ranks
+        num_attn_ranks = (
+            handshake.total_attn_ranks
+            if uses_direct_union
+            else handshake.peer.num_ranks
+        )
+        num_local_attn_ranks = num_attn_ranks
         num_ffn_ranks = handshake.local.num_ranks
+
     config = AFDCommConfig(
         role=role,
         num_attn_ranks=num_attn_ranks,
         num_ffn_ranks=num_ffn_ranks,
+        # Same numbering space as the handshake's num_ranks (= tp_size).
         instance_rank=scheduler.ps.tp_rank,
         store_host=handshake.dist_host,
         store_port=handshake.dist_port,
         device=_afd_device(scheduler),
+        attn_instance_rank_offset=(
+            handshake.attn_instance_rank_offset
+            if uses_direct_union and role.is_attn()
+            else 0
+        ),
+        num_local_attn_ranks=num_local_attn_ranks,
     )
     return create_afd_comm_backend(
-        get_disagg().afd_backend, config, handshake=handshake
+        (
+            "nccl"
+            if is_direct_afd_backend(get_disagg().afd_backend)
+            else get_disagg().afd_backend
+        ),
+        config,
+        handshake=handshake,
     )

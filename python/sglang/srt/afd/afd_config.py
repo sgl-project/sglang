@@ -1,4 +1,8 @@
-"""AFD role definition and server-argument resolution."""
+"""AFD role definition and server-args validation.
+
+The role is derived from ``ServerArgs.afd_role`` so every process spawned
+with the same args agrees on it without extra plumbing.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +22,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_COMM_SM_BUDGETS = {
+    "nccl": 8,
+    "nvshmem": 2,
+    "direct_deepep": 24,
+}
+
+_DIRECT_AFD_BACKENDS = frozenset({"direct_deepep"})
+
 
 class AFDRole(Enum):
     ATTN = "attn"
@@ -36,16 +48,33 @@ def afd_role_from_args(server_args: ServerArgs) -> Optional[AFDRole]:
     return AFDRole(server_args.afd_role)
 
 
-def is_afd_attn_moe_scattered() -> bool:
-    from sglang.srt.runtime_context import get_disagg
+def is_direct_afd_backend(backend: str) -> bool:
+    return backend in _DIRECT_AFD_BACKENDS
 
-    server_args = get_disagg()
-    role = afd_role_from_args(server_args)
-    return (
-        role is not None
-        and role.is_attn()
-        and server_args.afd_ffn_moe_backend == "deepep"
-    )
+
+def resolve_overlap_sm_partition(
+    *,
+    total_num_sms: int,
+    num_microbatches: int,
+    overlap_sm_budget: int,
+    direct_deepep_communication_num_sms_per_lane: Optional[int] = None,
+) -> tuple[int, int]:
+    communication_num_sms = overlap_sm_budget
+    if direct_deepep_communication_num_sms_per_lane is not None:
+        # The compute lane is between its dispatch and combine, so only the
+        # other lanes can own communication CTAs concurrently.
+        communication_num_sms = (
+            num_microbatches - 1
+        ) * direct_deepep_communication_num_sms_per_lane
+
+    compute_num_sms = total_num_sms - communication_num_sms
+    if compute_num_sms <= 0 or compute_num_sms % 2 != 0:
+        raise RuntimeError(
+            "AFD overlap requires a positive, even compute SM count: "
+            f"total={total_num_sms}, reserved={communication_num_sms}, "
+            f"compute={compute_num_sms}"
+        )
+    return compute_num_sms, communication_num_sms
 
 
 def prepare_afd_ffn_moe_backend(server_args: ServerArgs) -> None:
@@ -53,6 +82,35 @@ def prepare_afd_ffn_moe_backend(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     role = afd_role_from_args(server_args)
     if role is None:
+        return
+
+    if is_direct_afd_backend(cfg.afd_backend):
+        declare_resolution(
+            server_args,
+            "prepare_afd_ffn_moe_backend",
+            afd_ffn_moe_backend="deepep",
+            moe_a2a_backend="afd" if role.is_attn() else "deepep",
+        )
+        if role.is_ffn():
+            if cfg.moe_runner_backend == "auto":
+                declare_resolution(
+                    server_args,
+                    "prepare_afd_ffn_moe_backend",
+                    moe_runner_backend=(
+                        "flashinfer_cutedsl"
+                        if cfg.quantization == "modelopt_fp4"
+                        else "deep_gemm"
+                    ),
+                )
+            # Direct owns decode. This mode only selects the native dispatcher
+            # used by the staged prefill fallback.
+            declare_resolution(
+                server_args,
+                "prepare_afd_ffn_moe_backend",
+                deepep_mode="low_latency"
+                if cfg.moe_runner_backend == "flashinfer_cutedsl"
+                else "auto",
+            )
         return
 
     requested_backend = cfg.moe_a2a_backend
@@ -69,13 +127,51 @@ def prepare_afd_ffn_moe_backend(server_args: ServerArgs) -> None:
         )
 
 
+def is_afd_attn_moe_scattered() -> bool:
+    from sglang.srt.runtime_context import get_disagg
+
+    server_args = get_disagg()
+    role = afd_role_from_args(server_args)
+    return (
+        role is not None
+        and role.is_attn()
+        and server_args.afd_ffn_moe_backend == "deepep"
+    )
+
+
 def check_afd_server_args(server_args: ServerArgs) -> None:
-    """Resolve AFD roles and reject unsupported execution combinations."""
+    """Validate AFD and declare its resolved configuration before publishing.
+
+    No-op when AFD is disabled. Raises ValueError on unsupported combinations
+    (fail-fast at startup instead of hanging at runtime).
+    """
     cfg = resolving_view(server_args)
     role = afd_role_from_args(server_args)
+    afd_decode_num_microbatches = cfg.afd_decode_num_microbatches
+    if cfg.afd_direct_deepep_disable_hybrid and (
+        role is not AFDRole.FFN or cfg.afd_backend != "direct_deepep"
+    ):
+        raise ValueError(
+            "--afd-direct-deepep-disable-hybrid requires --afd-role ffn "
+            "and --afd-backend direct_deepep"
+        )
+    expert_alignment = envs.SGLANG_AFD_DIRECT_DEEPEP_EXPERT_ALIGNMENT.get()
+    if expert_alignment not in (16, 32, 64, 128):
+        raise ValueError(
+            "SGLANG_AFD_DIRECT_DEEPEP_EXPERT_ALIGNMENT must be 16, 32, 64, or 128"
+        )
+    if expert_alignment != 128 and (
+        role is not AFDRole.FFN or cfg.afd_backend != "direct_deepep"
+    ):
+        raise ValueError(
+            "SGLANG_AFD_DIRECT_DEEPEP_EXPERT_ALIGNMENT requires --afd-role ffn "
+            "and --afd-backend direct_deepep"
+        )
     _check_comm_sm_budget_args(server_args, role)
     if role is None:
-        if cfg.afd_decode_num_microbatches != 1:
+        if is_direct_afd_backend(cfg.afd_backend):
+            raise ValueError(f"--afd-backend {cfg.afd_backend} requires --afd-role")
+        if afd_decode_num_microbatches != 1:
             raise ValueError("--afd-decode-num-microbatches requires --afd-role attn")
         if cfg.afd_attn_instances != 1:
             raise ValueError("--afd-attn-instances requires --afd-role ffn")
@@ -85,13 +181,77 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
 
     prepare_afd_ffn_moe_backend(server_args)
     _check_common_args(server_args)
+    _check_direct_args(server_args, role)
     _configure_cuda_graph(server_args, role)
-    _check_decode_microbatch_args(server_args, role, cfg.afd_decode_num_microbatches)
+    _check_decode_microbatch_args(server_args, role, afd_decode_num_microbatches)
     if role.is_attn():
         _check_attn_args(server_args)
+        endpoint = f"ffn_addr={cfg.afd_ffn_addr}"
     else:
         _check_ffn_args(server_args)
-    logger.info("AFD enabled: role=%s backend=%s", role.value, cfg.afd_backend)
+        endpoint = f"api_port={cfg.port}"
+
+    logger.info(
+        "AFD enabled: role=%s backend=%s %s",
+        role.value,
+        cfg.afd_backend,
+        endpoint,
+    )
+
+
+def _check_comm_sm_budget_args(
+    server_args: ServerArgs, role: Optional[AFDRole]
+) -> None:
+    cfg = resolving_view(server_args)
+    budget = cfg.afd_comm_sm_budget
+    if role is None:
+        if budget is not None:
+            raise ValueError("--afd-comm-sm-budget requires --afd-role ffn")
+        return
+    if role.is_attn():
+        declare_resolution(
+            server_args, "_check_comm_sm_budget_args", afd_comm_sm_budget=None
+        )
+        return
+    if budget is None:
+        declare_resolution(
+            server_args,
+            "_check_comm_sm_budget_args",
+            afd_comm_sm_budget=_DEFAULT_COMM_SM_BUDGETS[cfg.afd_backend],
+        )
+    elif budget <= 0:
+        raise ValueError("--afd-comm-sm-budget must be positive")
+
+
+def _check_decode_microbatch_args(
+    server_args: ServerArgs,
+    role: AFDRole,
+    num_microbatches: int,
+) -> None:
+    cfg = resolving_view(server_args)
+    if num_microbatches == 1:
+        return
+    if not role.is_attn():
+        raise ValueError("--afd-decode-num-microbatches is an attn-side argument")
+    if num_microbatches not in (2, 3):
+        raise ValueError(
+            "--afd-decode-num-microbatches currently supports only 1, 2, or 3"
+        )
+    if not cfg.enable_dp_attention or cfg.dp_size <= 1:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 requires DP attention with "
+            "--dp-size greater than 1"
+        )
+    if cfg.tp_size != cfg.dp_size:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 currently requires "
+            "attention TP size 1 "
+            "(--tp must equal --dp-size)"
+        )
+    if cfg.enable_lora:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 currently does not support LoRA"
+        )
 
 
 def _check_common_args(server_args: ServerArgs) -> None:
@@ -134,6 +294,19 @@ def _configure_cuda_graph(server_args: ServerArgs, role: AFDRole) -> None:
         logger.info("AFD: disabling prefill CUDA graph")
         config = with_phase(config, Phase.PREFILL, backend=Backend.DISABLED)
 
+    if (
+        is_direct_afd_backend(cfg.afd_backend)
+        and config.decode.backend != Backend.DISABLED
+        and config.decode.backend != Backend.FULL
+    ):
+        logger.info(
+            "AFD direct backend: switching %s decode CUDA graph backend "
+            "from %s to full",
+            role.value,
+            config.decode.backend,
+        )
+        config = with_phase(config, Phase.DECODE, backend=Backend.FULL)
+
     if role.is_attn():
         if config.decode.backend not in (
             Backend.FULL,
@@ -155,6 +328,35 @@ def _configure_cuda_graph(server_args: ServerArgs, role: AFDRole) -> None:
     if config is not cfg.cuda_graph_config:
         declare_resolution(
             server_args, "_configure_cuda_graph", cuda_graph_config=config
+        )
+
+
+def _check_direct_args(server_args: ServerArgs, role: AFDRole) -> None:
+    cfg = resolving_view(server_args)
+    if not is_direct_afd_backend(cfg.afd_backend):
+        return
+    if role.is_ffn():
+        supported_runners = ("deep_gemm", "flashinfer_cutedsl")
+        if cfg.moe_runner_backend not in supported_runners:
+            raise ValueError(
+                f"AFD {cfg.afd_backend} requires --moe-runner-backend "
+                f"{' or '.join(supported_runners)} on "
+                f"the ffn instance, got {cfg.moe_runner_backend!r}"
+            )
+        if cfg.moe_runner_backend == "flashinfer_cutedsl":
+            declare_resolution(
+                server_args, "_check_direct_args", deepep_mode="low_latency"
+            )
+        else:
+            declare_resolution(server_args, "_check_direct_args", deepep_mode="normal")
+    if cfg.enable_torch_compile:
+        raise ValueError(
+            "AFD direct backends do not support --enable-torch-compile yet"
+        )
+    if role.is_ffn() and (cfg.ep_size != cfg.tp_size or cfg.moe_dp_size != 1):
+        raise ValueError(
+            "AFD direct ffn instances require pure expert parallelism: "
+            "--ep-size must equal --tp-size and --moe-dp-size must be 1"
         )
 
 
@@ -241,7 +443,9 @@ def _check_attn_args(server_args: ServerArgs) -> None:
             "AFD attn instance requires --ep-size 1 and --moe-dp-size 1; "
             "configure expert parallelism only on the ffn instance"
         )
-    # FULL uses the native DP/TP collectives for expert inputs and outputs.
+    # FULL gathers expert inputs and combines ffn shard outputs through the
+    # attn instance's native DP/TP collectives. Additional attn ranks can
+    # contribute zero remote routed output to the same collective.
     if cfg.tp_size > 1 and not (cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size):
         raise ValueError(
             "AFD attn instance requires attn_tp_size == 1: with --tp > 1, pass "
@@ -265,6 +469,7 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
         raise ValueError("--afd-attn-instances must be at least 1")
     if (
         cfg.afd_attn_instances > 1
+        and not is_direct_afd_backend(cfg.afd_backend)
         and envs.SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US.get() < 0
     ):
         raise ValueError(
@@ -290,75 +495,3 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
         # would block forever waiting for a completion.
         logger.info("AFD ffn role: forcing skip_server_warmup=True")
         declare_resolution(server_args, "_check_ffn_args", skip_server_warmup=True)
-
-
-def _check_decode_microbatch_args(
-    server_args: ServerArgs,
-    role: AFDRole,
-    num_microbatches: int,
-) -> None:
-    cfg = resolving_view(server_args)
-    if num_microbatches == 1:
-        return
-    if not role.is_attn():
-        raise ValueError("--afd-decode-num-microbatches is an attn-side argument")
-    if num_microbatches not in (2, 3):
-        raise ValueError(
-            "--afd-decode-num-microbatches currently supports only 1, 2, or 3"
-        )
-    if not cfg.enable_dp_attention or cfg.dp_size <= 1:
-        raise ValueError(
-            "--afd-decode-num-microbatches greater than 1 requires DP attention with "
-            "--dp-size greater than 1"
-        )
-    if cfg.tp_size != cfg.dp_size:
-        raise ValueError(
-            "--afd-decode-num-microbatches greater than 1 currently requires "
-            "attention TP size 1 "
-            "(--tp must equal --dp-size)"
-        )
-    if cfg.enable_lora:
-        raise ValueError(
-            "--afd-decode-num-microbatches greater than 1 currently does not support LoRA"
-        )
-
-
-def _check_comm_sm_budget_args(
-    server_args: ServerArgs, role: Optional[AFDRole]
-) -> None:
-    cfg = resolving_view(server_args)
-    budget = cfg.afd_comm_sm_budget
-    if role is None:
-        if budget is not None:
-            raise ValueError("--afd-comm-sm-budget requires --afd-role ffn")
-        return
-    if role.is_attn():
-        declare_resolution(
-            server_args, "_check_comm_sm_budget_args", afd_comm_sm_budget=None
-        )
-        return
-    if budget is None:
-        declare_resolution(
-            server_args,
-            "_check_comm_sm_budget_args",
-            afd_comm_sm_budget={"nccl": 8, "nvshmem": 2}[cfg.afd_backend],
-        )
-    elif budget <= 0:
-        raise ValueError("--afd-comm-sm-budget must be positive")
-
-
-def resolve_overlap_sm_partition(
-    *,
-    total_num_sms: int,
-    overlap_sm_budget: int,
-) -> tuple[int, int]:
-    communication_num_sms = overlap_sm_budget
-
-    compute_num_sms = total_num_sms - communication_num_sms
-    if compute_num_sms <= 0 or compute_num_sms % 2 != 0:
-        raise RuntimeError(
-            "AFD overlap requires a positive, even compute SM count: "
-            f"total={total_num_sms}, reserved={communication_num_sms}, "
-            f"compute={compute_num_sms}"
-        )
-    return compute_num_sms, communication_num_sms

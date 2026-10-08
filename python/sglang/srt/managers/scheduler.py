@@ -1853,6 +1853,7 @@ class Scheduler(
 
     def maybe_init_afd(self):
         self._afd_sync_sender = None
+        self._afd_attn_coordinator = None
         self.afd_handshake = None
         if get_disagg().afd_role != "attn":
             return
@@ -1869,6 +1870,13 @@ class Scheduler(
         from sglang.srt.afd.afd_scheduler import prepare_afd_attn_batch
 
         prepare_afd_attn_batch(self, batch)
+
+    def _afd_on_idle(self) -> bool:
+        coordinator = self._afd_attn_coordinator
+        if coordinator is None:
+            return False
+        coordinator.on_idle()
+        return True
 
     def release_host_resources(self) -> None:
         if get_disagg().afd_role == "ffn":
@@ -4683,6 +4691,8 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
+        # AFD coordination must run on all TP ranks regardless of local idle state.
+        afd_idle = self._afd_on_idle()
 
         # Publish before the fully-idle gate: a no-batch-but-not-idle stall
         # (queues parked under KV pressure / disagg transfer) has no
@@ -4755,6 +4765,9 @@ class Scheduler(
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
+
+        if afd_idle:
+            return
 
         # sleep until next event
         self.maybe_sleep_on_idle()
@@ -5324,6 +5337,8 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        if self._afd_attn_coordinator is not None:
+            raise RuntimeError("AFD coordinated multi-A does not support pausing one A")
         assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 

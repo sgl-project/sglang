@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,10 +11,11 @@ from torch import nn
 
 from sglang.srt.afd.afd_config import AFDRole
 from sglang.srt.afd.dispatcher import (
-    AFDWorkHandle,
+    AFDDispatchWorkHandle,
     get_afd_dispatcher,
     get_afd_dispatcher_or_none,
 )
+from sglang.srt.layers.compute_sm import compute_sm_budget
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
@@ -38,25 +40,60 @@ class AFDMoELayer:
     routed_scaling_factor: Optional[float]
 
 
+def get_direct_nvfp4_input_scales(layers: Sequence[AFDMoELayer]) -> list[float]:
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptNvFp4FusedMoEMethod,
+    )
+
+    first_quant_method = getattr(layers[0].experts, "quant_method", None)
+    if not isinstance(first_quant_method, ModelOptNvFp4FusedMoEMethod):
+        return []
+
+    scales = []
+    for layer in layers:
+        scale = getattr(layer.experts, "w13_input_scale_quant", None)
+        if not isinstance(scale, torch.Tensor) or scale.numel() == 0:
+            raise RuntimeError(
+                "AFD Direct NVFP4 requires a GEMM1 input scale for "
+                f"MoE layer; layer={layer.layer_id}"
+            )
+        scales.append(float(scale.reshape(-1)[0].item()))
+    return scales
+
+
 @dataclass
 class _AFDGraphBreakHandle:
     input_tokens: int
     hidden_size: int
     dtype: torch.dtype
     device: torch.device
-    handle: Optional[AFDWorkHandle] = None
+    handle: Optional[AFDDispatchWorkHandle] = None
 
 
 @dataclass(frozen=True)
 class _AFDCommunicationGraphHandle:
-    handle: AFDWorkHandle
+    handle: AFDDispatchWorkHandle
 
     @property
     def input_tokens(self) -> int:
         return self.handle.input_tokens
 
 
-AFDDispatchHandle = AFDWorkHandle | _AFDGraphBreakHandle | _AFDCommunicationGraphHandle
+AFDDispatchHandle = (
+    AFDDispatchWorkHandle | _AFDGraphBreakHandle | _AFDCommunicationGraphHandle
+)
+
+
+def afd_shared_expert_sm_budget(handle: AFDDispatchHandle):
+    dispatcher = get_afd_dispatcher()
+    # A standalone communication graph bypasses begin_batch(); its wave always
+    # uses one lane, regardless of the last eager or parent-graph child plan.
+    num_lanes = (
+        1
+        if isinstance(handle, _AFDCommunicationGraphHandle)
+        else dispatcher.current_num_children
+    )
+    return compute_sm_budget(dispatcher.shared_expert_compute_num_sms(num_lanes))
 
 
 @eager_on_graph(True)
@@ -119,7 +156,11 @@ def _combine_overlap_remote_experts(
 
 
 class AFDAttnMoE(nn.Module):
-    """Attention-side routing endpoint with no expert parameters."""
+    """MoE placeholder on the attention instance.
+
+    The attn side owns gate/topk and sends the routed expert payload to the ffn
+    instance. It intentionally has no expert parameters.
+    """
 
     def __init__(
         self,
@@ -143,7 +184,8 @@ class AFDAttnMoE(nn.Module):
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_local_experts = 0
-        # Send unscaled routing weights; F returns a scale-final routed output.
+        # AFD always sends unscaled topk weights. The ffn side returns a
+        # scale-final routed output using its native quant method and runner.
         self.should_fuse_routed_scaling_factor_in_topk = False
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
@@ -269,6 +311,7 @@ def collect_afd_moe_layers(model: nn.Module, role: AFDRole) -> list[AFDMoELayer]
         (module for module in model.modules() if isinstance(module, experts_type)),
         key=lambda experts: experts.layer_id,
     )
+
     moe_layers = [
         AFDMoELayer(
             layer_id=experts.layer_id,
