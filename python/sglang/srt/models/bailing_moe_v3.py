@@ -75,6 +75,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
+from sglang.srt.models.bailing_moe import is_unused_bailing_checkpoint_weight
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
@@ -1804,6 +1805,9 @@ class BailingMoeV3ForCausalLM(nn.Module):
             num_groups=None if num_groups == 0 else num_groups,
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_bailing_checkpoint_weight(name, self.config, is_nextn=False)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
     ) -> Set[str]:
@@ -1867,19 +1871,11 @@ class BailingMoeV3ForCausalLM(nn.Module):
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         for name, loaded_weight in weights:
-            if name.startswith("model.mtp"):
+            if self.is_unused_checkpoint_weight(name):
                 continue
             layer_idx = None
             if "model.layers." in name:
                 layer_idx = int(name.split(".")[2])
-                if not is_nextn and layer_idx >= self.config.num_hidden_layers:
-                    continue
-            if (
-                ("v_head" in name)
-                or ("inv_freq" in name)
-                or (self.config.tie_word_embeddings and "lm_head" in name)
-            ):
-                continue
 
             if is_nextn:
                 if not name.startswith(nextn_layer_prefix):

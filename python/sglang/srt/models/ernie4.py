@@ -339,10 +339,13 @@ class Ernie4_5_ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self.config.tie_word_embeddings and "lm_head.weight" in name
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
@@ -367,6 +370,11 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return super().is_unused_checkpoint_weight(name) or name.startswith(
+            "model.mtp_"
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -376,9 +384,7 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
         )
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-            if name.startswith("model.mtp_"):
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if "moe_statics.e_score_correction_bias" in name:
                 name = name.replace("moe_statics", "gate")

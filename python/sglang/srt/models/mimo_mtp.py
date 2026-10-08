@@ -119,6 +119,29 @@ class MiMoMTP(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if (
+            "rotary_emb.inv_freq" in name
+            or "projector" in name
+            or "rotary_emb.cos_cached" in name
+            or "rotary_emb.sin_cached" in name
+            or (self.config.tie_word_embeddings and "lm_head.weight" in name)
+        ):
+            return True
+        mapped = self.map_model_name_to_mtp_param_name(name)
+        return not any(
+            part in mapped
+            for part in (
+                "mtp_block",
+                "embed_tokens",
+                "lm_head",
+                "token_layernorm",
+                "hidden_layernorm",
+                "input_proj",
+                "final_layernorm",
+            )
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -131,13 +154,7 @@ class MiMoMTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue

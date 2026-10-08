@@ -294,6 +294,14 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             hidden_states_before_norm=pre_hc_head,
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if getattr(self.config, "num_nextn_predict_layers", None) != 1:
+            return False
+        name = self.remap_weight_name_to_dpsk_hf_format(
+            name, is_nextn=True, num_hidden_layers=self.config.num_hidden_layers
+        )
+        return self._is_unused_checkpoint_weight(name, is_nextn=True)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 

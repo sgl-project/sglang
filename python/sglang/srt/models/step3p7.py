@@ -157,6 +157,14 @@ class Step3p7ForConditionalGeneration(nn.Module):
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # The multimodal loader makes the same name transformation before
+        # delegating language weights to Step3p5ForCausalLM.
+        name = name.replace("language_model.", "", 1)
+        if "vision_model" in name or "vit_large_projector" in name:
+            return False
+        return self.language_model.is_unused_checkpoint_weight(name)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = list(weights)
 

@@ -41,6 +41,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    is_unused_nextn_checkpoint_weight,
+)
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -311,6 +314,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, is_nextn=True)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

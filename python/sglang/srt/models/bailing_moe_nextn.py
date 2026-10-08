@@ -38,7 +38,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.bailing_moe import BailingMoEBlock, BailingMoEForCausalLM
+from sglang.srt.models.bailing_moe import (
+    BailingMoEBlock,
+    BailingMoEForCausalLM,
+    is_unused_bailing_checkpoint_weight,
+)
 from sglang.srt.models.bailing_moe_linear import (
     BailingMoELinearDecoderLayer,
     BailingMoeV2_5ForCausalLM,
@@ -287,6 +291,9 @@ class BailingMoeForCausalLMNextN(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_bailing_checkpoint_weight(name, self.config, is_nextn=True)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)

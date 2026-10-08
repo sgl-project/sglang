@@ -245,6 +245,26 @@ Top-level arguments that tune how safetensors weights are read, independent of `
   </tbody>
 </table>
 
+## Model-owned checkpoint shard selection
+
+The Default Loader uses optional model rules to skip safetensors shards containing
+only unused weights, such as target-only shards when loading an MTP draft. No
+additional flag is needed. Selection reads local headers before tensor iteration
+and prefetching; it does not avoid Hugging Face checkpoint downloads.
+
+Mixed shards remain intact and in their original order. Models without an
+applicable rule, prefixed sources, and empty selections retain the full file list.
+Indexed drafts require a dedicated draft-index-aware rule. PyTorch loading is
+unchanged, and local header-read errors still propagate.
+
+For model implementations, `is_unused_checkpoint_weight(name)` receives raw
+checkpoint names and returns `True` only for unused tensors. Reuse the existing
+model loading rule, retaining required shared weights and quantization metadata.
+Inventory-dependent models can pair `begin_checkpoint_weight_selection()` with
+`observe_checkpoint_weight_names(names)` to reset and accumulate header names,
+including skipped shards. Model loading and missing-weight validation stay in
+`load_weights`.
+
 ## See also
 
 - [Loading Models from Object Storage](./object_storage)

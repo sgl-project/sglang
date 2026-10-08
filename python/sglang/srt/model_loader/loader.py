@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -115,6 +116,8 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_map,
+    filter_safetensors_files_by_weight_name,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
@@ -418,8 +421,25 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        is_unused_weight: Optional[Callable[[str], bool]] = None
+        """Optional model rule over original checkpoint names, before remapping.
+
+        True must mean the weight is unused. False may conservatively retain
+        extra weights; the model's load_weights still owns mapping and loading.
+        """
+
+        is_unused_weight_with_draft_model_idx: Optional[Callable[[str], bool]] = None
+        """Optional raw-name rule for a model that loads one indexed draft layer."""
+
+        observe_weight_names: Optional[Callable[[Iterable[str]], None]] = None
+        """Observe the complete checkpoint header names before shard selection."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            observe = getattr(model, "observe_checkpoint_weight_names", None)
+            begin_selection = getattr(model, "begin_checkpoint_weight_selection", None)
+            if observe is not None and begin_selection is not None:
+                begin_selection()
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -429,6 +449,11 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
+                is_unused_weight_with_draft_model_idx=getattr(
+                    model, "is_unused_checkpoint_weight_with_draft_model_idx", None
+                ),
+                observe_weight_names=observe,
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -599,6 +624,52 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _select_safetensors_files(self, source: Source, files: List[str]) -> List[str]:
+        # Prefixing and draft layer remapping happen after file iteration.
+        is_unused = (
+            source.is_unused_weight_with_draft_model_idx
+            if self.load_config.draft_model_idx is not None
+            else source.is_unused_weight
+        )
+        if source.prefix:
+            is_unused = None
+        return filter_safetensors_files_by_weight_name(
+            hf_weights_files=files,
+            is_unused_weight=is_unused,
+            observe_weight_names=source.observe_weight_names,
+        )
+
+    @staticmethod
+    def _weight_sources(model_config: ModelConfig, model) -> Iterable[Source]:
+        primary = DefaultModelLoader.Source.init_new(model_config, model)
+        yield primary
+        for source in cast(
+            Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
+        ):
+            observer = primary.observe_weight_names
+            if observer is not None:
+                if source.prefix:
+                    prefix = source.prefix
+                    model_observer = observer
+
+                    def observe_prefixed(names, observe=model_observer, prefix=prefix):
+                        observe(prefix + name for name in names)
+
+                    observer = observe_prefixed
+                secondary_observer = source.observe_weight_names
+                if secondary_observer is None:
+                    source = dataclasses.replace(source, observe_weight_names=observer)
+                elif secondary_observer is not observer:
+
+                    def observe_both(names, first=observer, second=secondary_observer):
+                        first(names)
+                        second(names)
+
+                    source = dataclasses.replace(
+                        source, observe_weight_names=observe_both
+                    )
+            yield source
+
     def _get_weights_iterator(
         self,
         source: Source,
@@ -624,6 +695,10 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_folder,
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
+                )
+            if use_safetensors:
+                hf_weights_files = self._select_safetensors_files(
+                    source=source, files=hf_weights_files
                 )
         else:
             hf_folder = resolved_source.hf_folder
@@ -761,13 +836,7 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
-        primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
-
-        secondary_weights = cast(
-            Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
-        )
-        for source in secondary_weights:
+        for source in self._weight_sources(model_config, model):
             yield from self._get_weights_iterator(source)
 
     def resolve_model_weights(
@@ -776,16 +845,8 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Tuple[ResolvedSource, ...]:
         """Resolve all checkpoint files before background startup prefetching."""
-        sources = [DefaultModelLoader.Source.init_new(model_config, model)]
-        sources.extend(
-            cast(
-                Iterable[DefaultModelLoader.Source],
-                getattr(model, "secondary_weights", ()),
-            )
-        )
-
         resolved_sources = []
-        for source in sources:
+        for source in self._weight_sources(model_config, model):
             hf_folder, weight_files, use_safetensors = self._prepare_weights(
                 source.model_or_path,
                 source.revision,
@@ -798,6 +859,10 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_folder,
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
+                )
+            if use_safetensors:
+                weight_files = self._select_safetensors_files(
+                    source=source, files=weight_files
                 )
             resolved_sources.append(
                 DefaultModelLoader.ResolvedSource(
@@ -3945,6 +4010,8 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
     Note: Metadata files must be pre-downloaded via
     ObjectStorageModel.download_and_get_path() before instantiation.
+
+    Models can expose is_unused_checkpoint_weight to skip complete unused shards.
     """
 
     @dataclasses.dataclass
@@ -3966,8 +4033,18 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        is_unused_weight: Optional[Callable[[str], bool]] = None
+        """Model-owned rule over original checkpoint names, before remapping."""
+
+        observe_weight_names: Optional[Callable[[Iterable[str]], None]] = None
+        """Observe checkpoint names, including weights in skipped shards."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            observe = getattr(model, "observe_checkpoint_weight_names", None)
+            begin_selection = getattr(model, "begin_checkpoint_weight_selection", None)
+            if observe is not None and begin_selection is not None:
+                begin_selection()
             model_weights = model_config.model_path
             if hasattr(model_config, "model_weights"):
                 model_weights = model_config.model_weights
@@ -3977,6 +4054,8 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
+                is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
+                observe_weight_names=observe,
             )
 
     def __init__(self, load_config: LoadConfig):
@@ -4070,6 +4149,38 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files
 
+    def _select_safetensors_files(
+        self, source: Source, root: str, files: List[str]
+    ) -> List[str]:
+        from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+
+        if (
+            source.is_unused_weight is None
+            or source.prefix
+            or self.load_config.draft_model_idx is not None
+        ):
+            return files
+        if not is_runai_obj_uri(root):
+            return filter_safetensors_files_by_weight_name(
+                hf_weights_files=files,
+                is_unused_weight=source.is_unused_weight,
+                observe_weight_names=source.observe_weight_names,
+            )
+        try:
+            with open(
+                os.path.join(ObjectStorageModel.get_path(root), SAFE_WEIGHTS_INDEX_NAME)
+            ) as index:
+                weight_map = json.load(index)["weight_map"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return files
+        return filter_safetensors_files_by_weight_map(
+            files=files,
+            model_root=root,
+            weight_map=weight_map,
+            is_unused_weight=source.is_unused_weight,
+            observe_weight_names=source.observe_weight_names,
+        )
+
     def _get_weights_iterator(
         self, source: Source
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -4090,8 +4201,24 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 source.model_config.hf_config,
             )
 
+        selected_files = self._select_safetensors_files(
+            source=source, root=hf_folder, files=hf_weights_files
+        )
+        if self._is_distributed and torch.distributed.is_initialized():
+            # RunAI distributes across node-local or WORLD groups, not only TP.
+            # Missing optional metadata on one rank must not change file IDs.
+            selections = get_parallel().world_group.all_gather_object(
+                (hf_weights_files, selected_files)
+            )
+            if all(files == hf_weights_files for files, _ in selections):
+                needed = {path for _, selected in selections for path in selected}
+                selected_files = [path for path in hf_weights_files if path in needed]
+            else:
+                # Preserve pre-existing node-local paths instead of substituting
+                # files from a different source or host.
+                selected_files = hf_weights_files
         weights_iterator = runai_safetensors_weights_iterator(
-            hf_weights_files, self._is_distributed, self.target_device_str
+            selected_files, self._is_distributed, self.target_device_str
         )
 
         if self.load_config.draft_model_idx is not None:
