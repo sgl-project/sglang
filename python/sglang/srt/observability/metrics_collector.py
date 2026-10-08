@@ -1101,23 +1101,23 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 "once per engine, by the scheduler of DP rank 0."
             ),
             labelnames=labels.keys(),
+            # Coarse, widely supported boundaries: downstream metrics gateways
+            # with a fixed bucket preset drop the series when a boundary is not in it.
             buckets=(
                 1.0,
-                1.05,
-                1.1,
-                1.25,
                 1.5,
                 2.0,
+                2.5,
                 3.0,
                 4.0,
-                6.0,
-                8.0,
-                12.0,
-                16.0,
-                24.0,
-                32.0,
-                48.0,
-                64.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
             ),
         )
         self.dp_attention_sync_wait_seconds = Histogram(
