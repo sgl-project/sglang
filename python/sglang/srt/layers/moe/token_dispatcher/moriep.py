@@ -304,29 +304,17 @@ def _get_epv1_launch_configs(
     }
 
 
-def _get_epv2_launch_config(
-    tbo_enabled: bool,
-    dispatch_block_num: int,
-    combine_block_num: int,
-    dispatch_warp_num_per_block: int,
-    combine_warp_num_per_block: int,
-) -> _MoriEPv2LaunchConfig:
+def _get_epv2_launch_config(tbo_enabled: bool) -> _MoriEPv2LaunchConfig:
     if not tbo_enabled:
+        # MORI picks its own schedule.
         return _MoriEPv2LaunchConfig(None, None, None, None)
-    values = {
-        "SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM": dispatch_block_num,
-        "SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM": combine_block_num,
-        "SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK": dispatch_warp_num_per_block,
-        "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK": combine_warp_num_per_block,
-    }
-    for env_name, value in values.items():
-        if value <= 0:
-            raise ValueError(f"{env_name} must be positive; got {value}")
+    # Under TBO a sibling batch computes while this one communicates, so cap the
+    # grid to leave CUs for it.
     return _MoriEPv2LaunchConfig(
-        dispatch_block_num,
-        dispatch_warp_num_per_block,
-        combine_block_num,
-        combine_warp_num_per_block,
+        dispatch_block_num=32,
+        dispatch_warp_num_per_block=4,
+        combine_block_num=48,
+        combine_warp_num_per_block=4,
     )
 
 
@@ -491,32 +479,25 @@ def init_mori_op(
 
 
 class CommStreamPool:
-    _streams = {}
+    _streams = {}  # key -> torch.cuda.Stream
 
     @classmethod
-    def get_stream_from_pool(cls, group, priority: int = 0) -> torch.cuda.Stream:
-        key = (torch.cuda.current_device(), id(group), priority)
+    def _make_key(cls, group):
+        return (torch.cuda.current_device(), id(group))
+
+    @classmethod
+    def get_stream_from_pool(cls, group) -> torch.cuda.Stream:
+        key = cls._make_key(group)
         stream = cls._streams.get(key)
         if stream is None:
-            stream = torch.cuda.Stream(priority=priority)
+            stream = torch.cuda.Stream(priority=0)
             cls._streams[key] = stream
         return stream
 
     @classmethod
     def clear_group(cls, group):
-        prefix = (torch.cuda.current_device(), id(group))
-        for key in list(cls._streams):
-            if key[:2] == prefix:
-                cls._streams.pop(key)
-
-
-def _get_tbo_comm_stream(group, tbo_enabled: bool, async_finish: bool):
-    if not (tbo_enabled and async_finish):
-        return None
-    if not envs.SGLANG_MORI_EPV2_TBO_USE_COMM_STREAM.get():
-        return None
-    priority = envs.SGLANG_MORI_EPV2_TBO_COMM_STREAM_PRIORITY.get()
-    return CommStreamPool.get_stream_from_pool(group, priority)
+        key = (torch.cuda.current_device(), id(group))
+        cls._streams.pop(key, None)
 
 
 def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
@@ -567,17 +548,9 @@ _EPV2_MIN_PER_RANK_VMM_GB = 4
 
 
 def _epv2_per_rank_vmm_gb(cfg) -> int:
+    # The window only reserves virtual address space, so size it to the arena.
     required_gb = -(-_epv2_arena_bytes(cfg) // (1 << 30))
-    per_rank_vmm_gb = envs.SGLANG_MORI_EPV2_PER_RANK_VMM_GB.get()
-    if per_rank_vmm_gb is None:
-        return max(_EPV2_MIN_PER_RANK_VMM_GB, required_gb)
-    if per_rank_vmm_gb < required_gb:
-        raise ValueError(
-            f"SGLANG_MORI_EPV2_PER_RANK_VMM_GB={per_rank_vmm_gb} is below the "
-            f"{required_gb} GiB MORI EPv2 arena for this config; raise it, "
-            "lower SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, or unset it"
-        )
-    return per_rank_vmm_gb
+    return max(_EPV2_MIN_PER_RANK_VMM_GB, required_gb)
 
 
 # MORI EPv2 per-token scale layout: (scale_dim, bytes per scale) for each dispatch dtype.
@@ -600,6 +573,11 @@ def _epv2_dispatch_torch_dtype(dispatch_dtype: DispatchDtype) -> torch.dtype:
     if dispatch_dtype == DispatchDtype.fp4:
         return torch.float4_e2m1fn_x2
     return fp8_dtype
+
+
+def _supports_dynamic_recv_cap(op) -> bool:
+    # MORI quantized combines run in scatter mode, which only takes the full cap.
+    return hasattr(op, "prepare_recv_cap") and not op.cfg.is_scatter
 
 
 # One op (and its own cco window, sized for its arena) per distinct config;
@@ -671,15 +649,12 @@ def init_mori_epv2_op(
     )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
-    prepare_recv_cap = getattr(op, "prepare_recv_cap", None)
-    if prepare_recv_cap is not None:
-        # Pre-compile the power-of-two receive caps that CUDA graphs may capture.
-        cap_max = min(
-            envs.SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX.get(), cfg.effective_max_recv
-        )
+    if _supports_dynamic_recv_cap(op):
+        # Pre-compile every power-of-two receive cap _select_recv_cap can pick, so
+        # CUDA graph capture never compiles a new tier.
         cap = MORI_MIN_LOGICAL_RECV_ROWS
-        while cap <= cap_max:
-            prepare_recv_cap(cap)
+        while cap <= cfg.effective_max_recv:
+            op.prepare_recv_cap(cap)
             cap *= 2
     logger.info(
         f"[MORI EPv2 init] world={world_size} rank={rank} hidden={hidden_size} "
@@ -1361,24 +1336,14 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         # EPv2 forwards exactly top-k routed experts and has no fake expert slot.
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
-        tbo_enabled = self._tbo_enabled
         # TBO children own separate arenas (instance_id); combine waits on the
         # compute event recorded after the expert writes into its child's view.
         self._direct_output = envs.SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT.get()
-        self._comm_stream = _get_tbo_comm_stream(
-            self.group, tbo_enabled=tbo_enabled, async_finish=async_finish
-        )
-        self._launch_config = _get_epv2_launch_config(
-            tbo_enabled=tbo_enabled,
-            dispatch_block_num=envs.SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM.get(),
-            combine_block_num=envs.SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM.get(),
-            dispatch_warp_num_per_block=(
-                envs.SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK.get()
-            ),
-            combine_warp_num_per_block=(
-                envs.SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK.get()
-            ),
-        )
+        # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
+        # comm stream with the events async_finish records.
+        if self._tbo_enabled and async_finish:
+            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+        self._launch_config = _get_epv2_launch_config(self._tbo_enabled)
         self._mori_op = None
         self.fp8_quant_func = None
         self.fp4_quant_func = None
@@ -1459,7 +1424,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self._launch_config,
         )
         # Keep logical caps on the power-of-two ladder init_mori_epv2_op pre-compiled.
-        self._recv_cap_pow2_buckets = hasattr(self._mori_op, "prepare_recv_cap")
+        self._recv_cap_pow2_buckets = _supports_dynamic_recv_cap(self._mori_op)
 
     @property
     def mori_op(self):
@@ -1499,7 +1464,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         self, hidden_states, topk_weights, topk_ids, scale, output_dtype, ready_event
     ) -> DispatchOutput:
         kwargs = {"return_routing": True}
-        if hasattr(self.mori_op, "prepare_recv_cap"):
+        if _supports_dynamic_recv_cap(self.mori_op):
             # A manual cap is an exact MoE input limit, not a MORI graph tier.
             # Keep the full transport view so arbitrary caps need no new JIT
             # specialization during capture; AITER applies the logical slice.

@@ -878,22 +878,10 @@ class Envs:
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
-    # Unset sizes the cco window from the EPv2 arena of the op being built.
-    SGLANG_MORI_EPV2_PER_RANK_VMM_GB = EnvInt(None)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
     # Let AITER write EPv2 expert outputs straight into the combine input buffer.
     SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT = EnvBool(True)
-    # Largest power-of-two EPv2 receive cap pre-compiled for CUDA graphs.
-    SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX = EnvInt(8192)
-    # EPv2 under TBO: dispatch/combine on a dedicated comm stream, and its priority.
-    SGLANG_MORI_EPV2_TBO_USE_COMM_STREAM = EnvBool(True)
-    SGLANG_MORI_EPV2_TBO_COMM_STREAM_PRIORITY = EnvInt(0)
-    # EPv2 kernel launch config under TBO: block count and warps per block.
-    SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM = EnvInt(32)
-    SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM = EnvInt(48)
-    SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK = EnvInt(4)
-    SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK = EnvInt(4)
 
     # ===================================================================
     # AMD, ROCm, and AITER
