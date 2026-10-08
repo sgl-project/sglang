@@ -5,11 +5,13 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
+from sglang.srt.models.nemotron_h_utils import make_stage_boundary
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -82,9 +84,18 @@ class TestNemotronMTPReduction(CustomTestCase):
                     # A MoE stand-in leaving its output's sum to the exit.
                     layer.mixer = _Partial(tp)
                     layer.norm = _Norm()
-                    layer._init_stage_boundary(
-                        SimpleNamespace(hybrid_override_pattern="*E"), 1
-                    )
+                    # The MoE layer follows the pattern's attention layer,
+                    # built elsewhere: the stack reads it as a neighbour.
+                    with layer_stack(
+                        previous_layers=[
+                            lambda: make_stage_boundary(
+                                _Norm(), pattern="*E", layer_idx=0
+                            )
+                        ]
+                    ):
+                        layer._init_stage_boundary(
+                            SimpleNamespace(hybrid_override_pattern="*E"), 1
+                        )
                     partial = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
                     expected = partial * tp + residual

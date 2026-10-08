@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -241,6 +241,16 @@ class DecLockRefParams:
 
 
 @dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
 class DecLockRefResult:
     """Result of an dec_lock_ref operation."""
 
@@ -261,7 +271,11 @@ class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
     Attributes:
-        device_indices  :   Indices of the KV cache on the device matched by common prefix.
+        device_prefix_len:  Length of the device-resident matched prefix. Its KV
+                            indices lie on the path to ``last_device_node``, except
+                            slots LMCache loaded but has not published (which
+                            ``prefix_device_indices`` appends) and a streaming
+                            session's match, which lives in the lent row.
         last_device_node:   The last TreeNode on the device that was matched.
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
@@ -289,7 +303,7 @@ class MatchResult(NamedTuple):
                             host, independent of other components.
     """
 
-    device_indices: torch.Tensor
+    device_prefix_len: int
     last_device_node: Any
     last_host_node: Any
     best_match_node: Any
@@ -312,9 +326,7 @@ def zero_match_result(
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
-        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
-        # without allocating a fresh empty tensor.
-        device_indices=match_result.device_indices[:0],
+        device_prefix_len=0,
         last_device_node=root,
         last_host_node=root,
         best_match_node=root,
@@ -510,20 +522,38 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
-    def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``; a cache
-        whose acquire returned a receipt releases with it here."""
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+    def lock(self, node: Any) -> Optional[TreeLock]:
+        """Take a tree lock on ``node`` for one holder; ``unlock`` releases it."""
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
+
+    def path_device_indices(self, node: Any) -> torch.Tensor:
+        """Device KV indices on the path from the root to ``node``; valid until
+        the next allocation or eviction unless the path is locked."""
+        raise NotImplementedError
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        """KV indices of req's matched prefix, read off the path to its locked
+        match node; valid from match until allocation writes them into the row."""
+        path = self.path_device_indices(req.last_node)
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
+
+    def maybe_hand_to_session(self, req: Req) -> None:
+        """A cache that keeps records across requests (a streaming session) takes
+        the just-allocated row and the request's tree lock; the request borrows it."""
 
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The row is freed and the lock dropped; ``inserted`` says whether the
-        KV went into the tree first. Drop per-request state kept outside the tree."""
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        """The row is freed and the lock dropped; ``checkpointed`` says whether
+        the KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0
@@ -556,11 +586,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[Tuple[torch.Tensor, Any]]:
-        """
-        Prepare host-to-device loading. None means retry admission; an empty
-        tensor can be a successful auxiliary-only load or a recompute fallback.
-        """
+    ) -> Optional[Tuple[int, Any]]:
+        """Prepare host-to-device loading; returns (loaded FULL tokens, new last
+        node). None means retry admission; zero can be a successful
+        auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
@@ -651,20 +680,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
+    def session_records(self) -> dict[str, ReqKvInfo]:
+        """The KV records sessions own, by session id. Pool accounting counts them
+        as session-held, including while a request runs on one."""
+        return {}
 
     def supports_prefix_sharing(self) -> bool:
         """Whether a request's prefix stays in the cache for other requests to

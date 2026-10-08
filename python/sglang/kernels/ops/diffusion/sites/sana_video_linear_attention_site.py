@@ -6,7 +6,7 @@ requesting an FP32 output/accumulator from cuBLAS.  The second GEMM stays in
 FP32.  This removes two large dtype-conversion kernels and lets the first GEMM
 use BF16 Tensor Cores, at the cost of half-precision input rounding.
 
-The default ``quality="lossless"`` path remains the original FP32-input chain
+The default ``quality="exact"`` path remains the original FP32-input chain
 bit-for-bit.  Only the single-batch CUDA layout used by native SANA-Video is
 eligible; unsupported dtypes and layouts fall back to the reference path.
 """

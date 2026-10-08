@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
     HostPoolStorageInfo,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -98,16 +99,21 @@ def make_dsa_indexer_pool_decl(
     pool: DSATokenToKVPool, *, name: PoolName = PoolName.INDEXER
 ) -> HostPoolDecl:
     """Index key buffers riding on the full-KV pages: indices and layout both follow KV."""
+    index_page_bytes = pool.index_page_size * dsa_indexer_bytes_per_token_per_layer(
+        index_head_dim=pool.index_head_dim,
+        quant_block_size=pool.quant_block_size,
+    )
+    assert index_page_bytes % pool.page_size == 0, (
+        f"index page of {index_page_bytes} bytes does not split over "
+        f"page_size={pool.page_size} tokens"
+    )
     return HostPoolDecl(
         pool_name=name,
         device_pool=pool,
         indices_from_pool=PoolName.KV,
         layout_source=PoolName.KV,
         storage_info=HostPoolStorageInfo(
-            bytes_per_token_per_layer=dsa_indexer_bytes_per_token_per_layer(
-                index_head_dim=pool.index_head_dim,
-                quant_block_size=pool.quant_block_size,
-            ),
+            bytes_per_token_per_layer=index_page_bytes // pool.page_size,
             dtype=DSATokenToKVPool.index_k_with_scale_buffer_dtype,
         ),
         host_pool_builder=DSAIndexerHostPoolBuilder(),
@@ -290,7 +296,10 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(

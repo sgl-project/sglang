@@ -1772,9 +1772,11 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_mps": "is_mps",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
@@ -1991,13 +1993,12 @@ def exports_expert_balancedness_to_prometheus() -> bool:
 
 
 def cutedsl_moe_max_num_tokens() -> int:
-    """The CuteDSL A2A per-rank token budget.
+    """Largest token count one forward routes through a CuteDSL MoE layer on one
+    DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this derives from the bags and follows a post-publish override;
-    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
-    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
-    capture, and the decode/verify bound.
+    this follows a post-publish override. Max over the prefill bound, the
+    piecewise-prefill capture, and the decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -2058,6 +2059,12 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # socket; present iff
                                               # load_endpoint_port_base
                                               # is present
+            "replay_endpoint_port_base": 5558,
+                                              # ROUTER replay port; rank r
+                                              # = base + r, same host rule
+                                              # as the SUB endpoints;
+                                              # present only when
+                                              # replay_endpoint is tcp
         }
 
     Returns None (i.e. "no publisher to describe") when any of:
@@ -2132,4 +2139,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     if resolved_range is not None:
         descriptor["load_endpoint_port_base"] = resolved_range[1]
         descriptor["load_topic"] = LOAD_TOPIC
+    resolved_replay = parse_advertisable_tcp(cfg.replay_endpoint)
+    if resolved_replay is not None:
+        descriptor["replay_endpoint_port_base"] = resolved_replay[1]
     return descriptor

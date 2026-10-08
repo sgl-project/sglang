@@ -133,8 +133,11 @@ def _qwen_norm_out(
     scale, shift = torch.chunk(emb, 2, dim=1)
     if (
         _QWEN_NORM_OUT.disabled
+        or not hidden_states.is_cuda
         or not is_plain_layer_norm(norm_out.norm, hidden_states.shape[-1])
-        or not can_use_fused_layernorm_modulate(hidden_states, scale, shift)
+        or not can_use_fused_layernorm_modulate(
+            hidden_states.dtype, hidden_states.shape[-1]
+        )
     ):
         return (
             norm_out.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
@@ -380,27 +383,29 @@ class QwenEmbedRope(nn.Module):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
-        pos_index = torch.arange(4096)
-        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.scale_rope = scale_rope
+        self._init_freqs()
+
+    def _init_freqs(self, device=None):
+        pos_index = torch.arange(4096, device=device)
+        neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
+        # not buffers: module dtype casts must preserve the imaginary part
         self.pos_freqs = torch.cat(
-            [
-                self.rope_params(pos_index, self.axes_dim[0], self.theta),
-                self.rope_params(pos_index, self.axes_dim[1], self.theta),
-                self.rope_params(pos_index, self.axes_dim[2], self.theta),
-            ],
+            [self.rope_params(pos_index, dim, self.theta) for dim in self.axes_dim],
             dim=1,
         )
         self.neg_freqs = torch.cat(
-            [
-                self.rope_params(neg_index, self.axes_dim[0], self.theta),
-                self.rope_params(neg_index, self.axes_dim[1], self.theta),
-                self.rope_params(neg_index, self.axes_dim[2], self.theta),
-            ],
+            [self.rope_params(neg_index, dim, self.theta) for dim in self.axes_dim],
             dim=1,
         )
 
-        # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
-        self.scale_rope = scale_rope
+    def _prepare_freqs(self, device):
+        # meta initialization has no storage to copy; rebuild on the target device
+        if self.pos_freqs.device.type == "meta":
+            self._init_freqs(device)
+        elif self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -437,32 +442,7 @@ class QwenEmbedRope(nn.Module):
             device: (`torch.device`):
                 The device on which to perform the RoPE computation.
         """
-        # When models are initialized under a "meta" device context (e.g. init_empty_weights),
-        # tensors created during __init__ become meta tensors. Calling .to(...) on a meta tensor
-        # raises "Cannot copy out of meta tensor". Rebuild the frequencies on the target device
-        # in that case; otherwise move them if just on a different device.
-        if getattr(self.pos_freqs, "device", torch.device("meta")).type == "meta":
-            pos_index = torch.arange(4096, device=device)
-            neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
-            self.pos_freqs = torch.cat(
-                [
-                    self.rope_params(pos_index, self.axes_dim[0], self.theta),
-                    self.rope_params(pos_index, self.axes_dim[1], self.theta),
-                    self.rope_params(pos_index, self.axes_dim[2], self.theta),
-                ],
-                dim=1,
-            ).to(device=device)
-            self.neg_freqs = torch.cat(
-                [
-                    self.rope_params(neg_index, self.axes_dim[0], self.theta),
-                    self.rope_params(neg_index, self.axes_dim[1], self.theta),
-                    self.rope_params(neg_index, self.axes_dim[2], self.theta),
-                ],
-                dim=1,
-            ).to(device=device)
-        elif self.pos_freqs.device != device:
-            self.pos_freqs = self.pos_freqs.to(device)
-            self.neg_freqs = self.neg_freqs.to(device)
+        self._prepare_freqs(device)
 
         if isinstance(video_fhw, list):
             video_fhw = video_fhw[0]
@@ -492,15 +472,17 @@ class QwenEmbedRope(nn.Module):
     def _compute_video_freqs(
         self, frame: int, height: int, width: int, idx: int = 0
     ) -> torch.Tensor:
+        return self._compute_freqs(frame, height, width, idx)
+
+    def _compute_freqs(self, frame, height, width, idx=0, *, condition=False):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
-        freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
-            .view(frame, 1, 1, -1)
-            .expand(frame, height, width, -1)
+        frame_freqs = (
+            freqs_neg[0][-1:] if condition else freqs_pos[0][idx : idx + frame]
         )
+        freqs_frame = frame_freqs.view(frame, 1, 1, -1).expand(frame, height, width, -1)
         if self.scale_rope:
             freqs_height = torch.cat(
                 [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
@@ -534,84 +516,14 @@ class QwenEmbedRope(nn.Module):
         return freqs.clone().contiguous()
 
 
-class QwenEmbedLayer3DRope(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
-        pos_index = torch.arange(4096)
-        neg_index = torch.arange(4096).flip(0) * -1 - 1
-        self.pos_freqs = torch.cat(
-            [
-                self.rope_params(pos_index, self.axes_dim[0], self.theta),
-                self.rope_params(pos_index, self.axes_dim[1], self.theta),
-                self.rope_params(pos_index, self.axes_dim[2], self.theta),
-            ],
-            dim=1,
-        )
-        self.neg_freqs = torch.cat(
-            [
-                self.rope_params(neg_index, self.axes_dim[0], self.theta),
-                self.rope_params(neg_index, self.axes_dim[1], self.theta),
-                self.rope_params(neg_index, self.axes_dim[2], self.theta),
-            ],
-            dim=1,
-        )
-
-        self.scale_rope = scale_rope
-
-    def rope_params(self, index, dim, theta=10000):
-        """
-        Args:
-            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
-        """
-        device = index.device
-        assert dim % 2 == 0
-        freqs = torch.outer(
-            index,
-            (
-                1.0
-                / torch.pow(
-                    theta,
-                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
-                )
-            ).to(device=device),
-        )
-        freqs = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs
-
+class QwenEmbedLayer3DRope(QwenEmbedRope):
     def forward(self, video_fhw, txt_seq_lens, device):
         """
         Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
         txt_length: [bs] a list of 1 integers representing the length of the text
         """
 
-        # When models are initialized under a "meta" device context (e.g. init_empty_weights),
-        # tensors created during __init__ become meta tensors. Calling .to(...) on a meta tensor
-        # raises "Cannot copy out of meta tensor". Rebuild the frequencies on the target device
-        # in that case; otherwise move them if just on a different device.
-        if getattr(self.pos_freqs, "device", torch.device("meta")).type == "meta":
-            pos_index = torch.arange(4096, device=device)
-            neg_index = torch.arange(4096, device=device).flip(0) * -1 - 1
-            self.pos_freqs = torch.cat(
-                [
-                    self.rope_params(pos_index, self.axes_dim[0], self.theta),
-                    self.rope_params(pos_index, self.axes_dim[1], self.theta),
-                    self.rope_params(pos_index, self.axes_dim[2], self.theta),
-                ],
-                dim=1,
-            ).to(device=device)
-            self.neg_freqs = torch.cat(
-                [
-                    self.rope_params(neg_index, self.axes_dim[0], self.theta),
-                    self.rope_params(neg_index, self.axes_dim[1], self.theta),
-                    self.rope_params(neg_index, self.axes_dim[2], self.theta),
-                ],
-                dim=1,
-            ).to(device=device)
-        elif self.pos_freqs.device != device:
-            self.pos_freqs = self.pos_freqs.to(device)
-            self.neg_freqs = self.neg_freqs.to(device)
+        self._prepare_freqs(device)
 
         if isinstance(video_fhw, list):
             video_fhw = video_fhw[0]
@@ -645,87 +557,11 @@ class QwenEmbedLayer3DRope(nn.Module):
 
     @functools.lru_cache(maxsize=None)
     def _compute_video_freqs(self, frame, height, width, idx=0):
-        seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-
-        freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
-            .view(frame, 1, 1, -1)
-            .expand(frame, height, width, -1)
-        )
-        if self.scale_rope:
-            freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
-                dim=0,
-            )
-            freqs_height = freqs_height.view(1, height, 1, -1).expand(
-                frame, height, width, -1
-            )
-            freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
-                dim=0,
-            )
-            freqs_width = freqs_width.view(1, 1, width, -1).expand(
-                frame, height, width, -1
-            )
-        else:
-            freqs_height = (
-                freqs_pos[1][:height]
-                .view(1, height, 1, -1)
-                .expand(frame, height, width, -1)
-            )
-            freqs_width = (
-                freqs_pos[2][:width]
-                .view(1, 1, width, -1)
-                .expand(frame, height, width, -1)
-            )
-
-        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
-            seq_lens, -1
-        )
-        return freqs.clone().contiguous()
+        return self._compute_freqs(frame, height, width, idx)
 
     @functools.lru_cache(maxsize=None)
     def _compute_condition_freqs(self, frame, height, width):
-        seq_lens = frame * height * width
-        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
-
-        freqs_frame = (
-            freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
-        )
-        if self.scale_rope:
-            freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
-                dim=0,
-            )
-            freqs_height = freqs_height.view(1, height, 1, -1).expand(
-                frame, height, width, -1
-            )
-            freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
-                dim=0,
-            )
-            freqs_width = freqs_width.view(1, 1, width, -1).expand(
-                frame, height, width, -1
-            )
-        else:
-            freqs_height = (
-                freqs_pos[1][:height]
-                .view(1, height, 1, -1)
-                .expand(frame, height, width, -1)
-            )
-            freqs_width = (
-                freqs_pos[2][:width]
-                .view(1, 1, width, -1)
-                .expand(frame, height, width, -1)
-            )
-
-        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
-            seq_lens, -1
-        )
-        return freqs.clone().contiguous()
+        return self._compute_freqs(frame, height, width, condition=True)
 
 
 def _joint_qkv_layers(
@@ -996,8 +832,8 @@ class QwenImageCrossAttention(nn.Module):
                     prefix=f"{prefix}.to_added_qkv",
                 )
                 if self._unquantized_added_qkv_is_packed:
-                    # Packing changes BF16 GEMM reduction association. Keep it
-                    # off for lossless and mount it at extra-high or high.
+                    # Packing changes BF16 GEMM reduction association, so it
+                    # is off at exact and mounts at lossless or high.
                     mark_qwen_image_added_qkv_site(self)
             else:
                 self.add_q_proj = ColumnParallelLinear(

@@ -41,15 +41,16 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -828,8 +829,8 @@ class XllmMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -838,8 +839,7 @@ class XllmMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -848,8 +848,7 @@ class XllmMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -954,15 +953,13 @@ class XllmSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if (
-                        get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_mori()
-                        or get_moe_a2a_backend().is_flashinfer()
-                    )
-                    else {}
-                ),
+                parallel_group="replicated"
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mori()
+                    or get_moe_a2a_backend().is_flashinfer()
+                )
+                else "tp",
             )
         else:
             self.shared_experts = None
@@ -1081,7 +1078,6 @@ class XllmAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -1107,8 +1103,7 @@ class XllmAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -1117,8 +1112,7 @@ class XllmAttention(nn.Module):
             hidden_size,
             bias=qkv_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -1256,8 +1250,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("q_proj", prefix),
         )
         self.k_proj = ColumnParallelLinear(
@@ -1265,8 +1258,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_kv_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("k_proj", prefix),
         )
         self.gate_proj = ColumnParallelLinear(
@@ -1274,8 +1266,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             self.total_num_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("gate_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -1283,8 +1274,7 @@ class _XllmMoVAAttentionBase(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -1352,8 +1342,7 @@ class XllmGatedAttention(_XllmMoVAAttentionBase):
             self.total_num_kv_heads * self.head_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("v_proj", prefix),
         )
 
@@ -1400,8 +1389,7 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             self.num_values,
             config.hidden_size,
             self.total_num_kv_heads * self.head_dim,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="attn_tp",
         )
 
     def _project_value(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1495,7 +1483,6 @@ class XllmDecoderLayer(nn.Module):
                 config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
             )
 
-        is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
         if self.is_layer_sparse:
@@ -1506,24 +1493,20 @@ class XllmDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = XllmMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -1532,12 +1515,6 @@ class XllmDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(

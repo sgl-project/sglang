@@ -382,14 +382,10 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [self.tp_rank]
-
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
-            dest_tp_ranks=dest_tp_ranks,
-            pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
         self._process_req(req)
@@ -597,6 +593,7 @@ class SchedulerDisaggregationPrefillMixin:
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
+            req.prefix_len = req.extend_end
             return
 
         checkpoint_kv_cache(req, cache)
@@ -608,7 +605,7 @@ class SchedulerDisaggregationPrefillMixin:
             sender.abort()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1063,12 +1060,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req.inflight_middle_chunks -= 1
 
                 # Still chunking iff its next chunk was launched: either it is
-                # still self.chunked_req, or its final chunk (extend_range
+                # still self.chunked_req, or its final chunk (extend_end
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                    req.extend_end is not None
+                    and req.extend_end >= len(req.origin_input_ids)
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -1189,7 +1186,8 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # unlock the tree
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
@@ -1265,7 +1263,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        # unlock the tree
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
@@ -1309,7 +1308,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1331,7 +1330,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1400,7 +1399,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
-                    req.extend_range.end,
+                    req.extend_end,
                     len(req.origin_input_ids),
                 )
             else:
@@ -1428,9 +1427,7 @@ class SchedulerDisaggregationPrefillMixin:
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
         if self.enable_staging and req.early_send_prefix_end is None:
-            req.early_send_prefix_end = max(
-                0, len(req.prefix_indices) - req.host_hit_length
-            )
+            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
         if req.pending_bootstrap:
             return
@@ -1439,7 +1436,7 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = (
             req.early_send_prefix_end
             if self.enable_staging
-            else len(req.prefix_indices) - req.host_hit_length
+            else req.prefix_len - req.host_hit_length
         )
         if cached_end <= req.start_send_idx:
             return
@@ -1471,7 +1468,7 @@ class SchedulerDisaggregationPrefillMixin:
                 value = 0
             else:
                 if end_idx is None:
-                    end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                    end_idx = min(req.extend_end, len(req.origin_input_ids))
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
@@ -1491,9 +1488,7 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
-            end_idx
-            if end_idx is not None
-            else min(req.extend_range.end, transfer_input_len)
+            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1526,7 +1521,7 @@ class SchedulerDisaggregationPrefillMixin:
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
+            seq_len = min(req.extend_end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
@@ -1700,7 +1695,7 @@ class SchedulerDisaggregationPrefillMixin:
         self._release_aborted_request(req)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
