@@ -566,13 +566,7 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    # A graph-padding row can be empty on every DCP shard.  In that case every
-    # sanitized LSE is -inf and weight_sum is zero.  Keep the online-softmax
-    # identity explicit so the fused combine returns a finite zero output
-    # instead of 0 / 0 -> NaN.
-    has_data = weight_sum > 0.0
-    safe_weight_sum = tl.where(has_data, weight_sum, 1.0)
-    acc = tl.where(has_data, acc / safe_weight_sum, 0.0)
+    acc = acc / weight_sum
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -581,10 +575,9 @@ def _dcp_lse_combine_kernel(
 
     if RETURN_LSE:
         if IS_BASE_E:
-            global_lse = tl.log(safe_weight_sum) + lse_max
+            global_lse = tl.log(weight_sum) + lse_max
         else:
-            global_lse = tl.log2(safe_weight_sum) + lse_max
-        global_lse = tl.where(has_data, global_lse, -float("inf"))
+            global_lse = tl.log2(weight_sum) + lse_max
         out_lse_offset = batch_idx * recv_lse_stride_B + head_idx * recv_lse_stride_H
         tl.store(out_lse_ptr + out_lse_offset, global_lse)
 
@@ -678,10 +671,7 @@ def _lse_weighted_combine_cpu(
         weights = torch.pow(2.0, centered)
 
     weight_sum = weights.sum(dim=0, keepdim=True)
-    safe_weight_sum = torch.where(
-        weight_sum > 0, weight_sum, torch.ones_like(weight_sum)
-    )
-    weights = weights / safe_weight_sum
+    weights = weights / weight_sum
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
