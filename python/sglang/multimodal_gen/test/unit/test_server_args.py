@@ -940,7 +940,7 @@ class TestMiniMaxH3Routing(unittest.TestCase):
             )
 
     def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
-        for backend in ("laser_attn", "fia_attn"):
+        for backend in ("laser_attn", "fia_attn", "eqbsa_attn"):
             with self.subTest(backend=backend):
                 args = self._routing_args(
                     {
@@ -960,7 +960,7 @@ class TestMiniMaxH3Routing(unittest.TestCase):
                 )
 
     def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
-        for backend in ("laser_attn", "fia_attn"):
+        for backend in ("laser_attn", "fia_attn", "eqbsa_attn"):
             with self.subTest(backend=backend):
                 args = self._routing_args(
                     {

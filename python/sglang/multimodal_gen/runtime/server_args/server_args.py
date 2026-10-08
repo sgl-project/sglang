@@ -1112,10 +1112,10 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend in ("laser_attn", "fia_attn")
+            and self.attention_backend in ("laser_attn", "fia_attn", "eqbsa_attn")
             and "text_encoder" not in self.component_attention_backends
         ):
-            # Laser and FIA target the MiniMax-H3 transformer. Keep the
+            # Laser, FIA, and EQBSA target the MiniMax-H3 transformer. Keep the
             # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "

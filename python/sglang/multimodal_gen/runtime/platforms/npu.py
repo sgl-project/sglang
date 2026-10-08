@@ -153,6 +153,14 @@ class NPUPlatformBase(Platform):
                     "FIA Attention backend requires MindIE-SD with quant_attention support."
                 ) from e
 
+        elif selected_backend == AttentionBackendEnum.EQBSA_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.eqbsa_attn import (  # noqa: F401
+                EQBSAAttentionBackend,
+            )
+
+            logger.info("Using MindIE-SD EQBSA Attention backend (rf_v3)")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.eqbsa_attn.EQBSAAttentionBackend"
+
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
