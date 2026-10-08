@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -30,6 +31,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -42,7 +44,7 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
-if is_musa():
+if is_musa() or is_xpu():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -72,7 +74,7 @@ logger = logging.getLogger(__name__)
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
-_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 
 
 def _trace_e2e_sampler(stage: str, **fields) -> None:
@@ -262,7 +264,11 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                logits[:] = (
+                    torch.softmax(logits, dim=-1)
+                    if self.enable_deterministic
+                    else sampler_softmax(logits)
+                )
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
@@ -361,9 +367,9 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
-            if backend == "flashinfer":
+            if backend in ("flashinfer", "intel_xpu"):
                 assert sampling_info.sampling_seed is None, (
-                    "Sampling seed is not supported for flashinfer backend"
+                    f"Sampling seed is not supported for {backend} backend"
                 )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)

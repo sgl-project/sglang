@@ -303,11 +303,11 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
                 observed_mid_chunk = True
-                prefix_len: int = len(req.prefix_indices)
+                prefix_len: int = req.prefix_len
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len == protected_len, (
                     f"page_size=1 must take the no-tail else branch: "
-                    f"len(prefix_indices)={prefix_len} != "
+                    f"prefix_len={prefix_len} != "
                     f"cache_protected_len={protected_len} (a partial-page tail "
                     f"was appended, which only happens for page_size > 1)"
                 )
@@ -358,7 +358,7 @@ class TestRadixHitCountInvariant(ScriptedTestCase):
                 for node_id, base_count in baseline.items():
                     if node_id in cur:
                         assert cur[node_id] == base_count, (
-                            f"_inc_hit_count(chunked=True) inflated existing "
+                            f"re-inserting an earlier chunk inflated existing "
                             f"node id={node_id} hit_count: baseline={base_count}, "
                             f"now={cur[node_id]}"
                         )
@@ -459,10 +459,10 @@ class TestRadixPartialPage(ScriptedTestCase):
         for _ in range(800):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
-                prefix_len: int = len(req.prefix_indices)
+                prefix_len: int = req.prefix_len
                 protected_len: int = req.kv.cache_protected_len
                 assert prefix_len >= protected_len, (
-                    f"len(prefix_indices)={prefix_len} dropped below "
+                    f"prefix_len={prefix_len} dropped below "
                     f"cache_protected_len={protected_len}: tail was freed "
                     f"prematurely"
                 )
