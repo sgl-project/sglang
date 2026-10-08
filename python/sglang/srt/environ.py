@@ -1856,11 +1856,18 @@ class Envs:
     # fail-closes to the split GEMM chain when the chip, shape or AITER build
     # cannot service it, so enabling one on unsupported hardware is a no-op.
     SGLANG_ROCM_K3_AITER_MLA_GATE = EnvBool(False)
+    SGLANG_ROCM_K3_AITER_KDA_GROUP64 = EnvBool(False)
+    # Extend the KDA and MoE pre-route fusions from the single-token bucket to
+    # two tokens.
+    SGLANG_ROCM_K3_AITER_B2_FUSIONS = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStrWithAlias(
         "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
     )
+    # Restore the pre-tuning (rows_per_wave, weight_cache_modifier) pair for
+    # the KDA group64 projection so the per-bucket tuning can be A/B'd.
+    SGLANG_ROCM_K3_KDA_GROUP64_LEGACY_LAUNCH = EnvBool(False)
     # Prepend an SGLang-shipped BF16 tuned-GEMM profile for M=16384 to AITER's
     # config search path. Read before any import can initialize AITER_CONFIGS.
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
