@@ -78,7 +78,7 @@ class TestAscendSamplingMask(CustomTestCase):
 
     def test_top_k_sampling_mask(self):
         body = self._generate({"top_k": _TOP_K, "top_p": 1.0})
-        output_ids = body["meta_info"]["output_ids"]
+        output_ids = body["output_ids"]
         masks = body["meta_info"]["output_token_sampling_mask"]
         sampling_logprobs = body["meta_info"]["output_token_sampling_logprobs"]
 
@@ -97,7 +97,7 @@ class TestAscendSamplingMask(CustomTestCase):
     def test_greedy_sampling_mask(self):
         # Greedy sampling pins top_k to 1, so the support is the single argmax token.
         body = self._generate({"temperature": 0.0, "top_k": 1})
-        output_ids = body["meta_info"]["output_ids"]
+        output_ids = body["output_ids"]
         masks = body["meta_info"]["output_token_sampling_mask"]
 
         self.assertEqual(len(masks), len(output_ids))
