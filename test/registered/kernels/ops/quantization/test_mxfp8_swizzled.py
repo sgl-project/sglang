@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.diffusion import indexed_scale_shift_bf16_
 from sglang.kernels.ops.quantization import mxfp8_swizzled_triton
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
     can_use_silu_mul_mxfp8,
@@ -16,6 +17,7 @@ from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     mxfp8_quantize_swizzled,
     silu_mul_mxfp8,
     swiglu_oai_mxfp8,
+    swiglu_oai_mxfp8_deepgemm,
 )
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     swiglu_no_interleaved_with_alpha_and_limit,
@@ -95,6 +97,29 @@ def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
         assert torch.equal(x, snapshot)
         ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
         _assert_matches_flashinfer(got, ref)
+
+
+@pytest.mark.parametrize("rows", [1, 7, 128, 333, 2050])
+@pytest.mark.parametrize("n", [768, 1536])
+@pytest.mark.parametrize("scale", [0.0, 1e-3, 1.0, 30.0])
+def test_swiglu_oai_mxfp8_deepgemm_matches_eager_chain(
+    rows: int, n: int, scale: float
+) -> None:
+    g = torch.Generator(device="cuda").manual_seed(rows * 31 + n)
+    x = (torch.randn((rows, 2 * n + 64), device="cuda", generator=g) * scale).to(
+        torch.bfloat16
+    )[:, : 2 * n]
+    ref_q, ref_s = sglang_per_token_group_quant_fp8(
+        swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0).contiguous(),
+        32,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+    )
+    q, s = swiglu_oai_mxfp8_deepgemm(x, 1.702, 7.0)
+    assert s.shape == ref_s.shape and s.stride() == ref_s.stride()
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s, ref_s)
 
 
 @pytest.mark.parametrize("keep_bf16", [True, False])
