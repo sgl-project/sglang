@@ -910,6 +910,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
+        if self.use_flashinfer_cutlass:
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_moe import (
+                prepare_lossless_bf16_moe,
+            )
+
+            prepare_lossless_bf16_moe(layer)
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -1151,6 +1157,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
+            from sglang.kernels.ops.gemm.sm120_lossless_bf16_moe import (
+                lossless_bf16_moe_buffers,
+            )
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 FlashInferCutlassMoeQuantInfo,
             )
@@ -1165,6 +1174,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
                 apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
+                lossless_bf16_buffers=lossless_bf16_moe_buffers(layer),
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_trtllm_moe:
