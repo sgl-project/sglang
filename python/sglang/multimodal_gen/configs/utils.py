@@ -1,9 +1,21 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import math
 import os
 from dataclasses import fields
 from operator import attrgetter
 from typing import Any
+
+
+def optional_positive_finite_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a number")
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return out
 
 
 def expand_path_fields(obj) -> None:
