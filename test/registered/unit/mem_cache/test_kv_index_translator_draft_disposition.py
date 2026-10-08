@@ -142,7 +142,7 @@ def _source(allocator, pool_obj):
     )
 
 
-class TestKVIndexSourceDraftDisposition(unittest.TestCase):
+class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
     def setUp(self):
         # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
@@ -221,6 +221,203 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         _, other_alloc, _, other_draft = _build()
         src = _source(allocator, other_draft)
         self.assertFalse(src.is_translating)
+
+    def test_seq_len_delta_matches_widened_lens(self):
+        """``seq_len_delta=k`` must be byte-identical to building with
+        ``seq_lens + k`` -- the two spellings of the whole-sequence verify
+        widening. A kernel applying the delta to the page count but not the
+        loads (or vice versa) silently truncates the verify tail."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        max_pages = -(-(3 + delta) // _PS)
+        widened = src.build_index_table(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            max_pages=max_pages,
+            seq_len_delta=delta,
+        )
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+        # The delta genuinely widened: entries exist past the unwidened prefix.
+        plain_pages = -(-3 // _PS)
+        self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
+
+    def test_widened_index_table_matches_widened_lens(self):
+        """`widened_index_table` (the verify entry point) must equal the
+        widened-lens build over the SAME batch: derive max_pages from the
+        widened max and forward the delta. Deriving max_pages from the
+        un-widened lens silently truncates the verify tail's pages."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        fb = SimpleNamespace(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            seq_lens_cpu=seq.cpu(),
+            # `seq_lens_sum` is the liveness signal for seq_lens_cpu: it is a
+            # non-None but STALE slice on a gpu_only batch, so the build only
+            # trusts it when the sum is present. Without the field the stand-in
+            # batch falls back to the full req_to_token width.
+            seq_lens_sum=int(seq.sum()),
+            out_cache_loc=None,
+            spec_info=None,
+        )
+        widened = src.widened_index_table(fb, seq_len_delta=delta)
+        max_pages = -(-(3 + delta) // _PS)
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+
+    def test_target_hidden_writers_write_physical_ids(self):
+        """BUG REGRESSION. DFLASH and DSPARK do not compute their draft KV from
+        the draft's own forward -- they PROJECT the target's hidden states and
+        write them straight into the draft pool, at locs read off the target's
+        req_to_token (VIRTUAL). Under fusion the draft pool takes the target's
+        physical ids, so an untranslated write lands at the wrong row: the
+        draft attends over the wrong KV and accept length collapses to 1.0
+        with no crash. Each writer must hand the pool translated ids and leave
+        the caller's locs virtual (the compact req_to_token rebuild re-reads
+        them)."""
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+        from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+            TargetHiddenKvInjector,
+        )
+
+        class _Shift:
+            """A translating runner whose physical id is the virtual + 100."""
+
+            is_translating = True
+
+            def translate_full_attn_ids(self, ids, *, out=None):
+                return ids + 100
+
+        virtual = torch.tensor([4, 5, 6, 9], dtype=torch.int64)
+        physical = virtual + 100
+        hidden = torch.randn(4, 8)
+        positions = torch.arange(4)
+        commit_lens = torch.tensor([2, 1], dtype=torch.int32)
+
+        writes = {}
+
+        class _DflashPool:
+            def set_kv_buffer(self, layer, loc, k, v, k_scale, v_scale):
+                writes["loc"] = loc
+
+            def set_kv_buffer_prefix_valid(
+                self, layer, cache_loc_2d, commit_lens, k, v, k_scale, v_scale
+            ):
+                writes["loc_2d"] = cache_loc_2d
+
+        attn = SimpleNamespace(
+            kv_proj_only=lambda h: (h[:, :4], h[:, 4:]),
+            apply_k_norm=lambda k: k,
+            apply_k_rope=lambda pos, k: k,
+            num_kv_heads=1,
+            head_dim=4,
+            attn=SimpleNamespace(k_scale=None, v_scale=None),
+        )
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(device=torch.device(_DEV)),
+            draft_model_runner=SimpleNamespace(
+                kv_index_translator=_Shift(), token_to_kv_pool=_DflashPool()
+            ),
+            draft_model=SimpleNamespace(
+                project_target_hidden=lambda h: h,
+                prepare_context_hidden_for_kv=lambda layer, h: h,
+                layers=[SimpleNamespace(self_attn=attn)],
+            ),
+            draft_owns_attention=False,
+            lilicorr=None,
+            _use_fused_kv_materialize=False,
+            _fused_kv_helper=None,
+        )
+        worker._append_target_hidden_sequential = lambda **kw: (
+            DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
+        )
+
+        # Per-token writes (prefill).
+        cache_loc = virtual.clone()
+        DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
+            worker, target_hidden=hidden, cache_loc=cache_loc, positions=positions
+        )
+        self.assertTrue(writes["loc"].physical)
+        torch.testing.assert_close(writes["loc"].loc, physical, rtol=0, atol=0)
+        torch.testing.assert_close(cache_loc, virtual, rtol=0, atol=0)
+
+        # Prefix-valid writes (post-verify), from the 2-D view of the same ids.
+        cache_loc, cache_loc_2d = virtual.clone(), virtual.clone().view(2, 2)
+        DFlashWorkerV2._append_target_hidden_to_draft_kv_by_loc(
+            worker,
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+        torch.testing.assert_close(
+            writes["loc_2d"], physical.view(2, 2), rtol=0, atol=0
+        )
+        torch.testing.assert_close(cache_loc_2d, virtual.view(2, 2), rtol=0, atol=0)
+
+        # DSPARK's injector, on an MHA draft pool.
+        injected = {}
+
+        def write_target_hidden_kv(**kwargs):
+            injected.update(kwargs)
+
+        injector = TargetHiddenKvInjector(
+            draft_model=SimpleNamespace(write_target_hidden_kv=write_target_hidden_kv),
+            draft_model_runner=SimpleNamespace(
+                kv_index_translator=_Shift(), token_to_kv_pool=SimpleNamespace()
+            ),
+            model_runner=SimpleNamespace(device=torch.device(_DEV)),
+            device=torch.device(_DEV),
+            verify_num_draft_tokens=2,
+            block_pos_offsets=torch.arange(2),
+        )
+        cache_loc, cache_loc_2d = virtual.clone(), virtual.clone().view(2, 2)
+        injector.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+        torch.testing.assert_close(injected["cache_loc"], physical, rtol=0, atol=0)
+        torch.testing.assert_close(
+            injected["cache_loc_2d"], physical.view(2, 2), rtol=0, atol=0
+        )
+        torch.testing.assert_close(cache_loc, virtual, rtol=0, atol=0)
+        torch.testing.assert_close(cache_loc_2d, virtual.view(2, 2), rtol=0, atol=0)
 
     def test_full_flat_v2p_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what

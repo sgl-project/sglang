@@ -803,7 +803,8 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
-                # The draft pool is static, so its slot ids are physical.
+                # Translated by the injector (physical by allocation on a plain
+                # pool).
                 pool.set_kv_buffer(
                     attn.attn,
                     KVWriteLoc(cache_loc, physical=True),

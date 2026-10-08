@@ -1759,6 +1759,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
+        `cache_loc_2d` holds the same ids as `cache_loc`, row-major.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1843,6 +1844,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(device, non_blocking=True)
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
+
+        # On a translating pool the translate writes a new tensor, so the
+        # callers' locs stay virtual: the post-verify 2-D buffer is re-read as
+        # virtual ids by the compact req_to_token rebuild. On a plain pool it
+        # returns `cache_loc` itself.
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            # Same ids, so reshape the translated copy rather than translate
+            # them a second time.
+            cache_loc_2d = cache_loc.reshape(cache_loc_2d.shape)
 
         with (
             torch.inference_mode(),
@@ -1950,7 +1962,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            # The draft pool is static, so its slot ids are physical.
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 KVWriteLoc(ctx_cache_loc, physical=True),
@@ -2525,7 +2536,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
-            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
@@ -2545,6 +2555,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Hand-built draft batch bypasses ForwardBatch.init_new: under the
+        # unified pool the write loc must be rebound to the draft's
+        # kernel-facing ids here (no-op on plain pools).
+        self.draft_model_runner.kv_index_translator.rebind_write_loc(forward_batch)
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None

@@ -70,6 +70,16 @@ class TargetHiddenKvInjector:
                 device=device, dtype=torch.int64, non_blocking=True
             )
 
+        # On a translating pool the translate writes a new tensor, so the
+        # callers' locs stay virtual; on a plain pool it returns `cache_loc`
+        # itself.
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            # Callers pass `cache_loc` viewed [bs, verify_len]: reshape the
+            # translated copy rather than translate the same ids twice.
+            cache_loc_2d = cache_loc.reshape(cache_loc_2d.shape)
+
         pool = self.draft_model_runner.token_to_kv_pool
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if target_hidden_is_projected:
