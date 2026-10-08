@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Adapters exposing the official Wan encoder API over the diffusers/transformers models the
-# sglang loaders produce: text_encoder takes list[str] and returns list[torch.Tensor] of
-# [L_i, 4096]; image_encoder.visual takes list[torch.Tensor] of [C, T, H, W] and returns
+# sglang loaders produce: image_encoder.visual takes list[torch.Tensor] of [C, T, H, W] and returns
 # [B, 257, 1280]; vae.encode/decode fold in the Wan latent scaling.
 from __future__ import annotations
 
@@ -11,67 +10,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPImageProcessor, PreTrainedTokenizerBase
+from transformers import CLIPImageProcessor
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-
-
-class _PaddedTokenizer:
-    """Tokenize ``list[str]`` to ``(input_ids, attention_mask)``, both ``[B, text_len]`` int64 (padded / truncated)."""
-
-    def __init__(self, hf_tokenizer: PreTrainedTokenizerBase, text_len: int) -> None:
-        self._tokenizer = hf_tokenizer
-        self.text_len = text_len
-
-    def __call__(self, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
-        enc = self._tokenizer(
-            texts,
-            padding="max_length",
-            max_length=self.text_len,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        return enc["input_ids"], enc["attention_mask"]
-
-
-class WanAnimate2TextEncoderAdapter:
-    """Text encoding over a ``UMT5EncoderModel``: ``__call__`` takes one ``str`` and returns its
-    ``[L, 4096]`` embedding truncated to the non-pad length, in the encoder dtype."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        tokenizer: PreTrainedTokenizerBase,
-        text_len: int = 512,
-        device: torch.device | str | None = None,
-    ) -> None:
-        self.model = model
-        self.text_len = text_len
-        self.device = device
-        self.tokenizer = _PaddedTokenizer(tokenizer, self.text_len)
-
-    def _resolve_device(self) -> torch.device:
-        if self.device is not None:
-            return torch.device(self.device)
-        return next(self.model.parameters()).device
-
-    def _tokenize(self, text: str) -> tuple[torch.Tensor, torch.Tensor, int]:
-        ids, mask = self.tokenizer([text])  # the tokenizer batches; batch of one
-        num_tokens = int(mask[0].gt(0).sum())
-        device = self._resolve_device()
-        return ids.to(device), mask.to(device), num_tokens
-
-    @torch.no_grad()
-    def __call__(self, text: str) -> torch.Tensor:
-        ids, mask, num_tokens = self._tokenize(text)
-
-        # sglang-native encoders need an active forward context; harmless for plain HF.
-        with set_forward_context(current_timestep=0, attn_metadata=None):
-            output = self.model(input_ids=ids, attention_mask=mask)
-
-        # Truncate to the true (non-pad) length.
-        return output.last_hidden_state[0, :num_tokens]
 
 
 class WanAnimate2ImageEncoderAdapter:

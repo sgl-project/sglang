@@ -10,7 +10,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
     WanAnimate2ImageEncoderAdapter,
-    WanAnimate2TextEncoderAdapter,
     WanAnimate2VaeAdapter,
 )
 
@@ -19,6 +18,5 @@ __all__ = [
     "WanAnimate2DenoisingStage",
     "WanAnimate2OutputStage",
     "WanAnimate2ImageEncoderAdapter",
-    "WanAnimate2TextEncoderAdapter",
     "WanAnimate2VaeAdapter",
 ]

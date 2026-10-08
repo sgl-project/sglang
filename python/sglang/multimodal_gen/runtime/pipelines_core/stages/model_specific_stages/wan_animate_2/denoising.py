@@ -25,11 +25,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_gather,
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGBranch,
+    CFGPolicy,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -227,7 +230,28 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                 "for its cond/uncond split); using the sequential two-pass CFG path."
             )
             cfg_parallel = False
-        cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
+        branches = [
+            CFGBranch(
+                "conditional",
+                True,
+                {
+                    "encoder_hidden_states": prompt_embeddings,
+                    "is_unconditional": False,
+                },
+            )
+        ]
+        if perform_cfg:
+            branches.append(
+                CFGBranch(
+                    "unconditional",
+                    False,
+                    {
+                        "encoder_hidden_states": negative_prompt_embeddings,
+                        "is_unconditional": True,
+                    },
+                )
+            )
+        cfg_policy = CFGPolicy(branches=branches)
 
         latents = clip_condition.init_noise  # [16, latent_t, latent_h, latent_w] fp32
 
@@ -256,78 +280,34 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                 perf_dump_path_provided=batch.perf_dump_path is not None,
                 record_as_step=True,
             ):
-                if cfg_parallel:
-                    # Both ranks built the same (text-independent) reference K/V from the same
-                    # clip_cond; only the text context differs.
-                    is_unconditional_branch = cfg_rank == 1
-                    cfg_branch_prompt_embeddings = (
-                        negative_prompt_embeddings
-                        if is_unconditional_branch
-                        else prompt_embeddings
-                    )
 
+                def predict(branch: CFGBranch) -> torch.Tensor:
                     with set_forward_context(
                         current_timestep=step_index,
                         attn_metadata=None,
                         forward_batch=batch,
                     ):
-                        cfg_branch_predictions = self.transformer(
+                        prediction = self.transformer(
                             hidden_states=latents,
-                            encoder_hidden_states=cfg_branch_prompt_embeddings,
                             timestep=timestep,
                             encoder_hidden_states_image=reference_image_embeddings,
                             clip_cond=clip_condition,
                             reference_kv=reference_kv,
-                            is_unconditional=is_unconditional_branch,
+                            **branch.kwargs,
                         )
-                    # separate_tensors=True returns [cond, uncond], order-identical on
-                    # every rank.
-                    gathered = cfg_model_parallel_all_gather(
-                        cfg_branch_predictions.contiguous(),
-                        dim=0,
-                        separate_tensors=True,
-                    )
-                    noise_pred_cond, noise_pred_uncond = gathered[0], gathered[1]
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
-                else:
-                    # USPAttention asserts a forward context even at tp=1/sp=1.
-                    with set_forward_context(
-                        current_timestep=step_index,
-                        attn_metadata=None,
-                        forward_batch=batch,
-                    ):
-                        noise_pred_cond = self.transformer(
-                            hidden_states=latents,
-                            encoder_hidden_states=prompt_embeddings,
-                            timestep=timestep,
-                            encoder_hidden_states_image=reference_image_embeddings,
-                            clip_cond=clip_condition,
-                            reference_kv=reference_kv,
-                            is_unconditional=False,
-                        )
+                    return prediction.contiguous() if cfg_parallel else prediction
 
-                    if perform_cfg:
-                        with set_forward_context(
-                            current_timestep=step_index,
-                            attn_metadata=None,
-                            forward_batch=batch,
-                        ):
-                            noise_pred_uncond = self.transformer(
-                                hidden_states=latents,
-                                encoder_hidden_states=negative_prompt_embeddings,
-                                timestep=timestep,
-                                encoder_hidden_states_image=reference_image_embeddings,
-                                clip_cond=clip_condition,
-                                reference_kv=reference_kv,
-                                is_unconditional=True,
-                            )
-                        noise_pred = noise_pred_uncond + guidance_scale * (
-                            noise_pred_cond - noise_pred_uncond
-                        )
-                    else:
-                        noise_pred = noise_pred_cond
+                predictions = (
+                    run_cfg_parallel(cfg_policy, predict)
+                    if cfg_parallel
+                    else [predict(branch) for branch in cfg_policy.branches]
+                )
+                noise_pred = predictions[0]
+                if perform_cfg:
+                    # Preserve the sampler's serial arithmetic, without optional CFG postprocess.
+                    noise_pred = predictions[1] + guidance_scale * (
+                        noise_pred - predictions[1]
+                    )
 
                 denoising_step_output = self.scheduler.step(
                     noise_pred,

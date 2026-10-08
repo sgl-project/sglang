@@ -47,6 +47,10 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
     return prompt_embeds_tensor
 
 
+def animate2_postprocess_text(outputs: BaseEncoderOutput, text_inputs) -> torch.Tensor:
+    return outputs.last_hidden_state[0, : text_inputs["num_tokens"]]
+
+
 @dataclass
 class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
@@ -322,6 +326,20 @@ class Wan_Animate_2_14B_Config(WanI2V720PConfig):
 
     # Denoising stage. Used when building the sigma grid.
     flow_shift: float | None = 5.0
+
+    postprocess_text_funcs: tuple[Callable, ...] = field(
+        default_factory=lambda: (animate2_postprocess_text,)
+    )
+
+    def tokenize_prompt(self, prompt, tokenizer, tok_kwargs):
+        text_inputs = super().tokenize_prompt(
+            prompt,
+            tokenizer,
+            {**tok_kwargs, "max_length": self.dit_config.arch_config.text_len},
+        )
+        # Count on the host before TextEncodingStage uploads inputs; no GPU scalar sync.
+        text_inputs["num_tokens"] = int(text_inputs["attention_mask"][0].gt(0).sum())
+        return text_inputs
 
     # The component manager casts the VAE to this dtype at its first use (the reference
     # encode in the before-denoising stage), so it is the precision the whole bespoke

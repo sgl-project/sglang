@@ -31,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multi
     DPMSolverMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.audio import (
     extract_reference_video_audio,
 )
@@ -44,6 +43,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     validate_and_get_single_string,
     zigzag_padding,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -52,7 +54,6 @@ if TYPE_CHECKING:
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
         WanAnimate2ImageEncoderAdapter,
-        WanAnimate2TextEncoderAdapter,
         WanAnimate2VaeAdapter,
     )
 
@@ -474,22 +475,24 @@ def build_clip_conditioning(
     )
 
 
-class WanAnimate2BeforeDenoisingStage(PipelineStage):
-    """Produce the per-clip Wan-Animate-2 conditioning and attach it to the Req; ``vae`` / ``image_encoder`` /
-    ``text_encoder`` are the ``encoder_adapters`` exposing the official Wan API (shapes documented there)."""
+class WanAnimate2BeforeDenoisingStage(TextEncodingStage):
+    """Native text encoding plus the model-specific reference and clip conditioning."""
+
+    # Text-only stage dedup must not skip fresh image/video conditions or the request RNG.
+    deduplicated_output_fields = ()
 
     def __init__(
         self,
         vae: WanAnimate2VaeAdapter,
         image_encoder: WanAnimate2ImageEncoderAdapter,
-        text_encoder: WanAnimate2TextEncoderAdapter,
+        text_encoder: torch.nn.Module,
+        tokenizer,
         pipeline_config: Wan_Animate_2_14B_Config,
         scheduler: DPMSolverMultistepScheduler,
     ) -> None:
-        super().__init__()
+        super().__init__(text_encoders=[text_encoder], tokenizers=[tokenizer])
         self.vae = vae
         self.image_encoder = image_encoder
-        self.text_encoder = text_encoder
         self.pipeline_config = pipeline_config
         self._silent_reference_logged = False
         self._audio_failure_logged = False
@@ -500,15 +503,8 @@ class WanAnimate2BeforeDenoisingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        # T5 runs once per request, so it may be offloaded after this stage. VAE and CLIP
-        # are reused mid-denoise (clips > 0), so they must stay resident.
         name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(
-                stage_name=name,
-                component_name="text_encoder",
-                preferred_ready_after_request=True,
-            ),
+        return super().component_uses(server_args, stage_name) + [
             ComponentUse(stage_name=name, component_name="vae"),
             ComponentUse(stage_name=name, component_name="image_encoder"),
         ]
@@ -528,6 +524,7 @@ class WanAnimate2BeforeDenoisingStage(PipelineStage):
             device,
             sp_size,
             generator,
+            server_args,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
         )
@@ -552,6 +549,7 @@ class WanAnimate2BeforeDenoisingStage(PipelineStage):
         device: torch.device,
         sp_size: int,
         generator: torch.Generator,
+        server_args: ServerArgs,
         *,
         audio: torch.Tensor | None,
         audio_sample_rate: int | None,
@@ -627,16 +625,11 @@ class WanAnimate2BeforeDenoisingStage(PipelineStage):
                 [reference_image_pixel_values]
             ).to(torch.bfloat16)  # [1, 257, 1280] bf16
 
-            # T5 runs only here; the prompt embeddings are clip-invariant. Declared as "text_encoder"
-            # so --text-encoder-cpu-offload can evict it after this stage.
-            with self.use_declared_component(
-                component_name="text_encoder", module=self.text_encoder.model
-            ):
-                prompt_embeddings = self.text_encoder(inputs.prompt).to(device)
-                prompt_ref_embeddings = self.text_encoder(inputs.prompt_ref).to(device)
-                negative_prompt_embeddings = self.text_encoder(
-                    inputs.negative_prompt
-                ).to(device)
+            # Keep batch-one encoder arithmetic while sharing native caching and residency.
+            prompt_embeddings, prompt_ref_embeddings, negative_prompt_embeddings = [
+                self.encode_text(prompt, server_args, device=device)[0][0]
+                for prompt in (inputs.prompt, inputs.prompt_ref, inputs.negative_prompt)
+            ]
 
         return WanAnimate2RequestState(
             device=device,

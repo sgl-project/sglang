@@ -5,7 +5,8 @@ Stages: WanAnimate2BeforeDenoisingStage (per-clip conditioning) -> WanAnimate2De
 (per-clip denoise + in-loop VAE decode) -> WanAnimate2OutputStage (emit frames).
 Routed by model_index.json ``_class_name == "WanAnimate2Pipeline"``; config comes from
 the registry detector (Wan_Animate_2_14B_Config). Every component loads through the
-standard component loaders; the encoders are then wrapped in the ``encoder_adapters``.
+standard component loaders. Text uses TextEncodingStage; CLIP and VAE adapters
+preserve the reference preprocessing and latent scaling.
 """
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -21,7 +22,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     WanAnimate2DenoisingStage,
     WanAnimate2ImageEncoderAdapter,
     WanAnimate2OutputStage,
-    WanAnimate2TextEncoderAdapter,
     WanAnimate2VaeAdapter,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -62,12 +62,6 @@ class WanAnimate2Pipeline(ComposedPipelineBase):
         # Keep native modules visible to residency and layerwise-offload management;
         # adapters only translate the model-specific stage API.
         device = get_local_torch_device()
-        text_encoder = WanAnimate2TextEncoderAdapter(
-            self.get_module("text_encoder"),
-            self.get_module("tokenizer"),
-            text_len=server_args.pipeline_config.dit_config.arch_config.text_len,
-            device=device,
-        )
         image_encoder = WanAnimate2ImageEncoderAdapter.from_loaded(
             self.get_module("image_encoder"),
             image_processor=self.get_module("image_processor"),
@@ -79,12 +73,13 @@ class WanAnimate2Pipeline(ComposedPipelineBase):
             stage=WanAnimate2BeforeDenoisingStage(
                 vae=vae,
                 image_encoder=image_encoder,
-                text_encoder=text_encoder,
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
                 pipeline_config=server_args.pipeline_config,
                 scheduler=self.get_module("scheduler"),
             ),
         )
-        # vae is used for the in-loop decode of every clip; keep it resident.
+        # Decode each clip before constructing the following clip's conditions.
         self.add_stage(
             stage_name="wan_animate_2_denoising",
             stage=WanAnimate2DenoisingStage(

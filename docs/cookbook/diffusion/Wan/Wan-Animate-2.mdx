@@ -47,7 +47,8 @@ Both inputs are the base `image_path` / `video_path` sampling fields shared with
 other video models; Wan-Animate-2 adds no model-specific input field. Offline runs
 pass both through a `--config` file (or `--image-path` / `--video-path`), and the
 online API forwards `video_path` into the pipeline while the reference image rides
-`input_reference`. The path must be readable by the server process.
+`input_reference`. Local paths must be readable by the server process. HTTP(S)
+video URLs use SGLang's shared media loader before decoding, without a disk cache.
 
 ### 1.2 Defaults
 
@@ -93,6 +94,10 @@ uses the existing key storage and is released after the clip; it is not an
 approximate timestep-skipping cache.
 Clips containing only padding that would be removed from the final video are not
 denoised. The padding and conditioning of every retained clip are unchanged.
+
+Text encoding uses the native `TextEncodingStage` and its conditioning cache and
+residency management. CFG-parallel dispatch shares the native CFG utilities while
+retaining the single-GPU arithmetic order.
 
 Measured on one H200, with a 576×1024 budget, 8 steps, CFG 3, seed 42,
 `clip_len=37`, text-encoder CPU offload, and MP4 plus raw-frame output, the initial

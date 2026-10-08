@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
+from io import BytesIO
 from typing import Literal
 
 import cv2
 import msgspec
 import numpy as np
 import torch
+
+from sglang.srt.utils.common import get_video_bytes
 
 __all__ = [
     "LetterboxInfo",
@@ -249,6 +252,11 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
     exists only in CUDA builds); decord2 is the arm64 build of the same API; PyAV is the
     fallback when neither is installed.
     """
+    source = (
+        BytesIO(get_video_bytes(path))
+        if path.startswith(("http://", "https://", "data:"))
+        else path
+    )
     try:
         from decord import VideoReader
     except ImportError:
@@ -258,7 +266,7 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
             VideoReader = None
 
     if VideoReader is not None:
-        video_reader = VideoReader(path)
+        video_reader = VideoReader(source)
         num_frames_source = len(video_reader)
         fps_source = video_reader.get_avg_fps()
         num_frames_target = int(num_frames_source / fps_source * fps_target)
@@ -270,7 +278,7 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
     import av
 
     # Decode everything once so num_frames_source matches decord's len() exactly.
-    with av.open(path) as container:
+    with av.open(source) as container:
         stream = container.streams.video[0]
         fps_source = float(stream.average_rate)
         frames_source = [

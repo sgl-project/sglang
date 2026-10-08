@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from transformers import BatchEncoding
 
 from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import (
     WanAnimate2ArchConfig,
@@ -75,7 +76,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     get_sampling_sigmas,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
-    WanAnimate2TextEncoderAdapter,
     WanAnimate2VaeAdapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.preprocess import (
@@ -89,7 +89,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     write_reference_video,
     zigzag_padding,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_VIDEO_STEPS,
@@ -104,15 +104,24 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 
 
 def test_text_encoder_counts_tokens_before_device_transfer():
-    ids = torch.tensor([[1, 2, 0, 0]])
-    mask = torch.tensor([[1, 1, 0, 0]])
-    adapter = WanAnimate2TextEncoderAdapter(
-        SimpleNamespace(), SimpleNamespace(), device="meta"
+    config = Wan_Animate_2_14B_Config()
+    tokens = BatchEncoding(
+        {
+            "input_ids": torch.tensor([[1, 2, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 0]]),
+        }
     )
-    adapter.tokenizer = lambda texts: (ids, mask)
-    transferred_ids, transferred_mask, num_tokens = adapter._tokenize("prompt")
-    assert transferred_ids.device.type == transferred_mask.device.type == "meta"
-    assert num_tokens == 2
+    inputs = config.tokenize_prompt(["prompt"], lambda *args, **kwargs: tokens, {})
+    inputs.to("meta")
+    assert (
+        inputs["input_ids"].device.type
+        == inputs["attention_mask"].device.type
+        == "meta"
+    )
+    assert inputs["num_tokens"] == 2
+    output = SimpleNamespace(last_hidden_state=torch.empty(1, 4, 8, device="meta"))
+    assert config.postprocess_text_funcs[0](output, inputs).shape == (2, 8)
+    assert not WanAnimate2BeforeDenoisingStage.has_deduplicated_output_fields()
 
 
 def test_pipeline_keeps_native_modules_visible_to_memory_managers():
@@ -147,7 +156,8 @@ def test_pipeline_keeps_native_modules_visible_to_memory_managers():
         )
     args = before.call_args.kwargs
     assert "load_modules" not in vars(WanAnimate2Pipeline)
-    assert args["text_encoder"].model is modules["text_encoder"]
+    assert args["text_encoder"] is modules["text_encoder"]
+    assert args["tokenizer"] is modules["tokenizer"]
     assert args["image_encoder"].model is modules["image_encoder"]
     assert args["vae"].vae is vae
     assert denoise.call_args.kwargs["vae"] is args["vae"]
@@ -1444,6 +1454,9 @@ def _server_args(input_save_path: str) -> SimpleNamespace:
     return SimpleNamespace(
         pipeline_class_name="WanAnimate2Pipeline",
         pipeline_config=Wan_Animate_2_14B_Config(),
+        component_precisions={},
+        enable_layerwise_nvtx_marker=False,
+        comfyui_mode=False,
         warmup_steps=1,
         warmup_num_frames=None,
         warmup_resolutions=None,
@@ -1486,6 +1499,20 @@ def _single_clip_schedule(inputs: _WanAnimate2Inputs) -> list[int]:
     ]
 
 
+def test_reference_video_url_uses_native_media_loading(tmp_path):
+    path = tmp_path / "reference.mp4"
+    write_reference_video(str(path), np.full((5, 16, 16, 3), 128, dtype=np.uint8), 16)
+    expected = read_reference_video_frames(str(path), 8)
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "wan_animate_2.preprocess.get_video_bytes",
+        return_value=path.read_bytes(),
+    ) as download:
+        actual = read_reference_video_frames("https://example.com/reference.mp4", 8)
+    download.assert_called_once_with("https://example.com/reference.mp4")
+    np.testing.assert_array_equal(actual, expected)
+
+
 class _StubVae:
     """encode: [3, T, H, W] -> [16, (T-1)//4+1, H//8, W//8] fp32 zeros; the VAE module itself
     is only handed to the residency manager."""
@@ -1508,19 +1535,12 @@ class _StubImageEncoder:
         return torch.zeros(len(videos), 257, 1280)
 
 
-class _StubTextEncoder:
-    def __init__(self) -> None:
-        self.model = torch.nn.Identity()
-
-    def __call__(self, text: str) -> torch.Tensor:
-        return torch.full((max(1, len(text)), 4096), 0.5)
-
-
 def _before_denoising_stage(pipeline_config) -> WanAnimate2BeforeDenoisingStage:
-    return WanAnimate2BeforeDenoisingStage(
+    stage = WanAnimate2BeforeDenoisingStage(
         vae=_StubVae(),
         image_encoder=_StubImageEncoder(),
-        text_encoder=_StubTextEncoder(),
+        text_encoder=torch.nn.Identity(),
+        tokenizer=object(),
         pipeline_config=pipeline_config,
         scheduler=DPMSolverMultistepScheduler(
             num_train_timesteps=1000,
@@ -1529,6 +1549,11 @@ def _before_denoising_stage(pipeline_config) -> WanAnimate2BeforeDenoisingStage:
             flow_shift=pipeline_config.flow_shift,
         ),
     )
+    stage.encode_text = lambda text, *args, **kwargs: (
+        [torch.full((max(1, len(text)), 4096), 0.5)],
+        [],
+    )
+    return stage
 
 
 def test_server_warmup_request_denoises_one_clip_of_a_synthetic_driving_video(tmp_path):
@@ -1626,6 +1651,7 @@ def test_before_denoising_stage_populates_the_standard_denoising_inputs(
     server_args = _server_args(str(tmp_path))
     (req,) = _build_server_warmup_reqs(server_args)
     req.clip_len = clip_len
+    set_global_server_args(server_args)
     stage = _before_denoising_stage(server_args.pipeline_config)
 
     with (
