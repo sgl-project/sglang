@@ -6,6 +6,20 @@ them to Mooncake as one bundle and returns ``meta_info["output_store_ref"]`` ins
 The bundle uses the ``MooncakeBundleTransfer`` dict layout: each field is one dense
 tensor, stored as the single row of the bundle's tensor batch, so a reader built on
 the same transfer, with the same ``key_prefix``, can fetch it.
+
+Key assumptions:
+
+- Non-streaming requests only; a response carries its ref only after the object is
+  stored.
+- One reader reads each ref once and then removes the object, even when the read
+  fails; SGLang keeps no copy of the ref.
+- Objects are hard-pinned, so Mooncake never evicts them; a full store fails the put,
+  and with it the request.
+- SGLang removes an object only when its request is cancelled while the put runs. A
+  ref that is never read keeps its object until the Mooncake master restarts: the
+  client disconnects after the put, a sibling fails a batch or ``n>1`` request, a
+  chat response fails to build, or the reader crashes before reading.
+- SGLang is a pure Mooncake client and hosts none of the store's segments.
 """
 
 from __future__ import annotations
@@ -140,8 +154,8 @@ class OutputStoreWriter(ABC):
     The ref is ``{"handle": ..., "fields": {name: {"dtype", "shape"}}}``: ``handle``
     is the writer's JSON-safe locator, and ``fields`` gives each tensor's dtype
     without the ``torch.`` prefix (``int32``, ``bfloat16``) and its shape, so readers
-    parse one format whatever wrote it. The reader removes the object after reading
-    it; ``cleanup_after`` covers a ref that is never delivered.
+    parse one format whatever wrote it. A failed put must leave no object, since
+    nothing else removes it.
 
     ``MooncakeBundleWriter`` serves ``--output-store-backend mooncake`` from the
     tokenizer process. GPU-resident outputs, such as SpecForge's hidden-state
