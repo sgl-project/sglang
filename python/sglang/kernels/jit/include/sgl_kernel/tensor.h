@@ -133,7 +133,7 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
   constexpr auto max_type = static_cast<std::size_t>(DLDeviceType::kDLTrn);
 #else
   constexpr auto max_type = stdr::max(map | stdv::keys);
@@ -319,7 +319,7 @@ struct SymbolicDType {
 
  private:
   auto m_check(DLDataType value) const -> bool {
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
     return m_options.empty() || (std::find(m_options.begin(), m_options.end(), value) != m_options.end());
 #else
     return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
@@ -390,7 +390,7 @@ struct SymbolicDevice {
 
  private:
   auto m_check(DLDevice value) const -> bool {
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
     return m_options.empty() || (std::any_of(m_options.begin(), m_options.end(), [value](const DLDevice& opt) {
 #else
     return stdr::empty(m_options) || (stdr::any_of(m_options, [value](const DLDevice& opt) {

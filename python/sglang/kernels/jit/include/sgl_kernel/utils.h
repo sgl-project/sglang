@@ -168,7 +168,7 @@ namespace stdr = std::ranges;
 namespace stdv = stdr::views;
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
 template <std::integral T>
 struct IntegerRange {
   T begin_value;

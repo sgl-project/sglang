@@ -30,14 +30,14 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
-#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#elif defined(USE_MUSA) || defined(__MUSACC__)
+#elif defined(USE_MUSA)
 #include <musa_bf16.h>
 #include <musa_fp16.h>
 #include <musa_fp8.h>
@@ -72,7 +72,7 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
 
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
@@ -107,7 +107,7 @@ inline constexpr auto cudaSuccess = musaSuccess;
 
 namespace sglang {
 
-#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -123,7 +123,7 @@ using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
 using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
-#elif defined(USE_MUSA) || defined(__MUSACC__)
+#elif defined(USE_MUSA)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __mt_bfloat16;
@@ -158,7 +158,7 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
@@ -182,7 +182,7 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM) && !defined(USE_MUSA) && !defined(__MUSACC__)
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -192,7 +192,7 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#elif defined(USE_MUSA) || defined(__MUSACC__)
+#elif defined(USE_MUSA)
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #else  // USE_ROCM
@@ -397,7 +397,7 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
 inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
   if (error != ::musaSuccess) {
     [[unlikely]];
@@ -435,7 +435,7 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
     return static_cast<uint32_t>(blocks);
   };
-#if defined(USE_ROCM) || defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_ROCM) || defined(USE_MUSA)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
@@ -526,7 +526,7 @@ struct LaunchKernel {
 #ifdef USE_ROCM
     (void)enabled;
     m_config.numAttrs = 0;
-#elif defined(USE_MUSA) || defined(__MUSACC__)
+#elif defined(USE_MUSA)
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
       attr.id = musaLaunchAttributeIgnore;
@@ -545,7 +545,7 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#if defined(USE_ROCM) || defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_ROCM) || defined(USE_MUSA)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -588,7 +588,7 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
-#elif defined(USE_MUSA) || defined(__MUSACC__)
+#elif defined(USE_MUSA)
     RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
@@ -618,7 +618,7 @@ struct LaunchKernel {
   // Memo hit after load-time configure(); stream-constructed launches use the current device.
   template <typename T>
   void apply_prefer_l1(T&& kernel) const {
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
     (void)kernel;
     return;
 #else
@@ -638,7 +638,7 @@ struct LaunchKernel {
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::musaSuccess) [[likely]] { \
   } else                                                              \

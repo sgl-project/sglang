@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
-#if defined(USE_MUSA) || defined(__MUSACC__)
+#if defined(USE_MUSA)
 #include <musa_runtime.h>
 #elif !defined(USE_ROCM)
 #include <cuda_runtime.h>
