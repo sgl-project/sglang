@@ -344,6 +344,8 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    # Cached MiniMax goldens require its implicit-quality cache mode.
+    pin_consistency_quality: bool = True
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -373,7 +375,19 @@ class DiffusionTestCase:
         # removes the pin.
         # Replaces rather than mutates: several cases share one module-level
         # sampling-params instance.
-        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+        cache_dit_requested = self.sampling_params.extras.get("enable_cache_dit")
+        if cache_dit_requested is None:
+            cache_dit_requested = self.server_args.enable_cache_dit or (
+                self.server_args.env_vars.get("SGLANG_CACHE_DIT_ENABLED", "").lower()
+                == "true"
+            )
+        # Cached goldens require the cached path; an explicit exact tier disables
+        # MiniMax-H3's environment-selected Cache-DiT configuration.
+        if (
+            self.run_consistency_check
+            and "quality" not in self.sampling_params.extras
+            and (self.pin_consistency_quality or not cache_dit_requested)
+        ):
             object.__setattr__(
                 self,
                 "sampling_params",
@@ -710,16 +724,21 @@ MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
     extras={"num_inference_steps": 50, "seed": 0},
 )
 
+# Keep the release asset locally so image-edit CI does not depend on GitHub I/O.
+TI2I_QWEN_IMAGE_EDIT_INPUT = (
+    Path(__file__).parent / "assets" / "TI2I_Qwen_Image_Edit_Input.jpg"
+)
+
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
     output_size="512x512",
     extras={"num_inference_steps": 8, "seed": 0},
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
 )
 
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(

@@ -21,6 +21,42 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 
 
+@pytest.mark.parametrize("request_override", [None, True, False])
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_cache_selection(
+    request_override, pin_consistency_quality
+):
+    extras = {} if request_override is None else {"enable_cache_dit": request_override}
+    case = DiffusionTestCase(
+        "cached_consistency",
+        DiffusionServerArgs(
+            model_path="test",
+            modality="video",
+            env_vars={"SGLANG_CACHE_DIT_ENABLED": "true"},
+        ),
+        DiffusionSamplingParams(prompt="test", extras=extras),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    if pin_consistency_quality or request_override is False:
+        assert case.sampling_params.extras["quality"] == "exact"
+    else:
+        # An explicit quality tier suppresses the legacy MiniMax cache mode.
+        assert "quality" not in case.sampling_params.extras
+
+
+@pytest.mark.parametrize("pin_consistency_quality", [True, False])
+def test_cached_consistency_case_preserves_explicit_quality(pin_consistency_quality):
+    case = DiffusionTestCase(
+        "explicit_quality",
+        DiffusionServerArgs(model_path="test", modality="video", enable_cache_dit=True),
+        DiffusionSamplingParams(prompt="test", extras={"quality": "exact"}),
+        run_consistency_check=True,
+        pin_consistency_quality=pin_consistency_quality,
+    )
+    assert case.sampling_params.extras["quality"] == "exact"
+
+
 @pytest.mark.parametrize("generate_baseline", [False, True])
 def test_e2e_only_does_not_require_stage_metrics(monkeypatch, generate_baseline):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", str(int(generate_baseline)))
