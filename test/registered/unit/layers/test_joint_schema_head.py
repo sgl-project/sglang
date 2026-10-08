@@ -3,12 +3,14 @@ the batched forward against a per-request loop over the stock torch modules."""
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.joint_schema_head import (
     JointSchemaHead,
+    JointSchemaPooler,
     LayoutQuestion,
     pack_decision_layout,
     parse_decision_layout,
@@ -66,6 +68,40 @@ class TestDecisionLayout(CustomTestCase):
         for name, (values, num_tokens) in invalid.items():
             with self.subTest(name), self.assertRaises(ValueError):
                 parse_decision_layout(values, num_tokens)
+
+
+class _RecordingHead:
+    """Stands in for the head, scoring each option with its request's length."""
+
+    def __init__(self):
+        self.calls = []
+
+    def forward_batch(self, hidden, input_ids, lengths, layouts, embedding_weight):
+        self.calls.append(lengths)
+        return [
+            torch.full((sum(len(q.option_spans) for q in layout),), float(length))
+            for length, layout in zip(lengths, layouts)
+        ]
+
+
+class TestJointSchemaPooler(CustomTestCase):
+    def test_a_layout_cut_from_its_prompt_is_skipped_and_neighbors_are_scored(self):
+        """A prompt shorter than its layout, as after a truncation, must not stop the
+        scheduler or the other requests of its batch."""
+        head = _RecordingHead()
+        pooler = JointSchemaPooler(head, lambda: torch.zeros(1))
+        layout = pack_decision_layout(40, _questions())
+        lengths = [40, 35, 40]
+        forward_batch = SimpleNamespace(
+            decision_layouts=[layout, layout, layout],
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens_cpu=[0, 0, 0],
+            batch_size=3,
+            input_ids=torch.zeros(sum(lengths), dtype=torch.long),
+        )
+        output = pooler(torch.zeros(sum(lengths), 8), forward_batch)
+        self.assertEqual([len(scores) for scores in output.embeddings], [5, 0, 5])
+        self.assertEqual(head.calls, [[40], [40]])
 
 
 def _reference_logits(head, hidden, input_ids, questions, lm_head):

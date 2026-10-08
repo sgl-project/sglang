@@ -483,18 +483,24 @@ class JointSchemaPooler(nn.Module):
             hidden_states.new_empty(0, dtype=torch.float32) for _ in lengths
         ]
         # The tokenizer manager checks every layout against its prompt, and the
-        # server runs each prompt in one uncached prefill. Anything else gets
-        # no scores, which the decision route reports as a server error.
-        valid = [
-            i
-            for i, (layout, prefix) in enumerate(zip(raw_layouts, prefix_lengths))
-            if layout is not None and prefix == 0
-        ]
+        # server runs each prompt in one uncached prefill. A layout that no longer
+        # fits its prompt, as after a truncation, gets no scores, which the
+        # decision route reports as a server error.
+        layouts = {}
+        for i, (layout, prefix, length) in enumerate(
+            zip(raw_layouts, prefix_lengths, lengths)
+        ):
+            if layout is None or prefix != 0:
+                continue
+            try:
+                layouts[i] = parse_decision_layout(layout, length)
+            except ValueError:
+                continue
         offsets = [0]
         for length in lengths:
             offsets.append(offsets[-1] + length)
         runs: List[List[int]] = []
-        for i in valid:
+        for i in layouts:
             if runs and runs[-1][-1] == i - 1:
                 runs[-1].append(i)
             else:
@@ -505,7 +511,7 @@ class JointSchemaPooler(nn.Module):
                 hidden_states[start:end],
                 forward_batch.input_ids[start:end],
                 [lengths[i] for i in run],
-                [parse_decision_layout(raw_layouts[i], lengths[i]) for i in run],
+                [layouts[i] for i in run],
                 self._output_embedding(),
             )
             for i, values in zip(run, logits):
