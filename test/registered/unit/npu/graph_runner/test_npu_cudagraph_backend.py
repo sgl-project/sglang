@@ -30,13 +30,9 @@ def _make_backend():
         set_device=mock.Mock(),
         Event=mock.Mock(),
     )
-    runner = SimpleNamespace(
-        device_module=device_module,
-        model_runner=SimpleNamespace(tp_group=SimpleNamespace(barrier=mock.Mock())),
-        enable_torch_compile=False,
-    )
+    runner = SimpleNamespace(device_module=device_module, enable_torch_compile=False)
     with (
-        get_parallel().override(tp_group=runner.model_runner.tp_group),
+        get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
     ):
         return mod.NPUCudaGraphBackend(runner), runner
@@ -67,7 +63,7 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         self.assertEqual(forward.call_count, 3)
         self.assertEqual(post_warmup_hook.call_count, 2)
         self.assertEqual(runner.device_module.synchronize.call_count, 2)
-        self.assertEqual(runner.model_runner.tp_group.barrier.call_count, 2)
+        self.assertEqual(backend._tp_group.barrier.call_count, 2)
         graph_context.assert_called_once_with(
             graph, pool=None, stream=None, auto_dispatch_capture=True
         )
