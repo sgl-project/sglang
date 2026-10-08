@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    _hf_arch,
     is_dspark_draft,
     is_kimi_k3,
     is_minimax_sparse,
@@ -41,7 +40,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    process_model_config,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -87,23 +92,30 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+def _should_use_verify_shared_kv(
+    *,
+    model_config,
+    is_draft_runner,
+    target_hf_config,
+    topk,
+    use_mla,
+    use_verify_splitkv,
+):
     if not is_gfx95_supported() or topk != 1:
         return False
-    if use_mla:
-        return is_kimi_k3(model_config.hf_config)
-    if is_dspark_draft(model_config.hf_config):
-        return use_verify_splitkv
-    # GQA archs tuned for all local query heads on one TP-local KV head
     hf_config = model_config.hf_config
-    if not (
-        is_qwen3_5(hf_config)
-        or is_minimax_sparse(hf_config)
-        or _hf_arch(hf_config) == "LlamaForCausalLMEagle3"
-    ):
-        return False
+    if use_mla:
+        return is_kimi_k3(hf_config)
+    if is_dspark_draft(hf_config):
+        return use_verify_splitkv
+    if is_draft_runner:
+        # an EAGLE draft mirrors its target's attention shape; validated for M3's draft only
+        tuned = is_minimax_sparse(target_hf_config)
+    else:
+        tuned = is_qwen3_5(hf_config) or is_minimax_sparse(hf_config)
     return (
-        use_verify_splitkv
+        tuned
+        and use_verify_splitkv
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -243,11 +255,19 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
         # exactly one TP-local KV head (Qwen3.5, MiniMax-M3 and its EAGLE3 draft).
+        # a draft runner's own config does not name the target it drafts for
+        target_hf_config = (
+            process_model_config().hf_config
+            if model_runner.is_draft_worker
+            else model_runner.model_config.hf_config
+        )
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
-            model_runner.model_config,
-            self.topk,
-            self.use_mla,
-            self.use_verify_splitkv,
+            model_config=model_runner.model_config,
+            is_draft_runner=model_runner.is_draft_worker,
+            target_hf_config=target_hf_config,
+            topk=self.topk,
+            use_mla=self.use_mla,
+            use_verify_splitkv=self.use_verify_splitkv,
         )
         # decode reuses the verify kernel as one extend row per request
         self._decode_shared_kv_qo_indptr = (
