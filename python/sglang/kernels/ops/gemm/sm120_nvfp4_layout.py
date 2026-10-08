@@ -43,16 +43,29 @@ class Nvfp4LayoutCycle:
         if len({weight.data_ptr() for weight in weights}) != len(weights):
             raise ValueError("Expert weights in a layout cycle must not alias")
         self.original = tuple(weights)
-        self.scratch = torch.empty_like(first)
-        self.pair = tuple(
-            weight.view(512, 1344, 1024)
-            for weight in (self.scratch, *self.original[:-1])
-        )
+        self.workspace_bytes = first.numel()
+        self.scratch = None
+        self.pair = ()
         self.is_pair = False
         self.switches = 0
         # Compile before any graph capture can reach the state transition.
         self._forward = _transpose_module(1024, 1344)
         self._inverse = _transpose_module(1344, 1024)
+
+    def prepare_workspace(self):
+        if self.scratch is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NVFP4 workspace must be prepared before graph capture")
+        # Use runtime workspace headroom, like graph/kernel scratch allocations.
+        # Allocating this before Mamba/KV pool sizing incorrectly charges it as
+        # persistent checkpoint storage and can round the state pool below one
+        # request. The normal graph warmup prepares stable pointers before use.
+        self.scratch = torch.empty_like(self.original[0])
+        self.pair = tuple(
+            weight.view(512, 1344, 1024)
+            for weight in (self.scratch, *self.original[:-1])
+        )
 
     def ensure(self, pair: bool):
         if pair == self.is_pair:
@@ -60,6 +73,7 @@ class Nvfp4LayoutCycle:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("NVFP4 layout transitions must run before graph capture")
         if pair:
+            self.prepare_workspace()
             for original, paired in zip(self.original, self.pair):
                 self._forward.run(original, paired)
         else:

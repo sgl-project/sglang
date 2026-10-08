@@ -58,6 +58,8 @@ class TestNvfp4LayoutCycle(CustomTestCase):
         raw = [w["w2"].view(torch.uint8).reshape(512, 1024, 1344) for w in weights]
         gold = [x.clone() for x in raw]
         manager = Nvfp4LayoutCycle(raw)
+        self.assertIsNone(manager.scratch)
+        manager.prepare_workspace()
         initial_ptrs = [t.data_ptr() for t in (*manager.original, *manager.pair)]
         assert manager.scratch.numel() == 704643072
         records = []

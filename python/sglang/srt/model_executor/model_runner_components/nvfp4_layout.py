@@ -55,7 +55,7 @@ def initialize_nvfp4_layout(model, *, is_draft_worker):
     logger.info(
         "Prepared reversible NVFP4 FC2 layout cycle: %d layers, %d extra bytes",
         len(experts),
-        cycle.scratch.numel(),
+        cycle.workspace_bytes,
     )
     return cycle
 
