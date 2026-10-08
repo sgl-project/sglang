@@ -273,6 +273,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.components = {}
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)

@@ -412,18 +412,13 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
-            # follow-up to #34798 and #35769.
-            # FULL and FULL+SWA only: Mamba has no state-handoff channel on
-            # the admission-time load-back read path and is not layer-gated.
-            # Lifting the fence also needs the admission charge: a staged
-            # state slot is request-pinned at consumption and must ride
-            # req.mamba_host_hit_length the way the SWA window does.
-            supported = {ComponentType.FULL, ComponentType.SWA}
+            # Other components (e.g. the DSv4 compressed regions) have no
+            # buffer-mode staging path.
+            supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA unified trees; got components "
+                    "FULL/SWA/MAMBA unified trees; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -488,6 +483,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa_component=swa,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
+            for component in self.components.values():
+                component.validate_buffer_mode()
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
                 max_context_len=get_model().context_length or 0,

@@ -1298,6 +1298,9 @@ class PrefillAdder:
             and self.rem_mamba_slots is not None
             and mamba_gap_reserve // self._mamba_slot_cost > self.rem_mamba_slots
         ):
+            pipeline = getattr(self.tree_cache, "buffer_pipeline", None)
+            if pipeline is not None:
+                pipeline.defer_staged_admission(req, pool="mamba")
             return AddReqResult.NO_TOKEN
 
         # The temporary pin excludes this prefix from the evictable budget.

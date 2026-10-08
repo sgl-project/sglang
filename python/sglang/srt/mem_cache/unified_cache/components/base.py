@@ -99,6 +99,28 @@ class PrepareLoadBackResult:
     allocated_mamba_slot: Optional[torch.Tensor] = None
 
 
+class BufferLoadBack:
+    """A component's part in one buffer-mode load-back; the default has none.
+
+    ``load_xfers`` are H2D destinations beyond the staged transfers. After
+    ``cc.load``, ``finish`` sees its outcome; on success the insert takes
+    ``insert_fields()`` and the transfer ack frees ``redundant_destinations``.
+    """
+
+    load_xfers: tuple[PoolTransfer, ...] = ()
+
+    def finish(self, success: bool) -> None:
+        pass
+
+    def insert_fields(self) -> dict[str, Any]:
+        return {}
+
+    def redundant_destinations(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        return []
+
+
 @dataclasses.dataclass(frozen=True)
 class PreparePrefetchResult:
     """Outcome of prepare_prefetch; default = the component takes no part."""
@@ -740,6 +762,16 @@ class TreeComponent(ABC):
         component owns; None picks the built-in one for the transfer's hit
         policy."""
         return None
+
+    def validate_buffer_mode(self) -> None:
+        """Raise if buffer mode cannot run on this component's pools."""
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBack]:
+        """This component's part in loading a staged prefetch at admission;
+        None when the device cannot take it yet."""
+        return BufferLoadBack()
 
     def build_hicache_transfers(
         self,
