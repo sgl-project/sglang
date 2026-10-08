@@ -345,7 +345,8 @@ def declare_ffn(
 
 def _resolve_stage(stage, variant, following=None):
     axes, attention, local, full = _row_layouts(variant)
-    if stage.update.applied_at_exit:
+    # Non-plain FFN updates, at exit or deferred, have never run with these layouts.
+    if stage.kind is StageKind.FFN and not stage.update.is_plain_add:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
