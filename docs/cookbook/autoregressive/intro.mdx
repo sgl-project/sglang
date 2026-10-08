@@ -190,7 +190,7 @@ metatags:
   <Card
     title="Perplexity"
     mode="card"
-    href="/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b"
+    href="/cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B"
     img="/cards/logos/perplexity.png"
   />
 </CardGroup>

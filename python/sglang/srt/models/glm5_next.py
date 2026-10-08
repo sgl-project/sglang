@@ -98,6 +98,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.glm4v import glm4v_vision_reduces_over_attn_tp
 from sglang.srt.models.glm_ocr import (
     GlmOcrRMSNorm,
     GlmOcrVisionBlock,
@@ -240,6 +241,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
@@ -392,7 +396,6 @@ class Glm5NextLinearAttention(nn.Module):
     ) -> None:
         super().__init__()
         head_shard_size = get_parallel().attn_tp_size
-        head_shard_rank = get_parallel().attn_tp_rank
 
         self.hidden_size = hidden_size
         self.config = config
@@ -431,8 +434,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -444,8 +446,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -455,8 +456,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.qkv_proj",
             )
 
@@ -467,8 +467,7 @@ class Glm5NextLinearAttention(nn.Module):
                     [self.head_dim, self.head_dim],
                     quant_config=None,
                     prefix=f"{prefix}.fused_bfg_a_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
                 self.bfg_split_sizes = [self.local_num_heads, 2 * self.head_dim]
                 self.fused_fg_b_proj = ColumnParallelBatchedLinear(
@@ -476,8 +475,7 @@ class Glm5NextLinearAttention(nn.Module):
                     self.head_dim,
                     projection_size,
                     dtype=self.fused_bfg_a_proj.params_dtype,
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
             else:
                 self.f_a_proj = ReplicatedLinear(
@@ -494,8 +492,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.f_b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
                 self.b_proj = ColumnParallelLinear(
@@ -504,8 +501,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
                 self.g_a_proj = ReplicatedLinear(
@@ -521,8 +517,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.g_b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
         self.dt_bias = nn.Parameter(
@@ -531,7 +526,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0)},
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -540,8 +535,7 @@ class Glm5NextLinearAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_tp",
         )
         # ColumnParallelLinear's loader cannot reshape conv1d weights, so add the
         # singleton dimension after construction.
@@ -552,7 +546,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2)},
+            {"weight_loader": sharded_weight_loader(2, parallel_group="attn_tp")},
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -565,8 +559,7 @@ class Glm5NextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_tp",
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -738,18 +731,14 @@ class Glm5NextDecoderLayer(nn.Module):
                 reduce_results=False,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm5NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 swiglu_limit=config.swiglu_limit,
                 reduce_results=False,
                 allow_fused_down=False,
