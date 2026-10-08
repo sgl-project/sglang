@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     to_device_no_sync,
     track_pinned_staging,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -412,7 +413,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if (
             self.layout != "page_first"
             or not self.device_rows_packed
-            or (_is_npu or _is_xpu or _is_mps)
+            or not current_platform.capabilities.hicache_device_kernels
         ):
             return
 
