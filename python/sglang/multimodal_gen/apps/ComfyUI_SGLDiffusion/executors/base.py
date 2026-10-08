@@ -2,6 +2,7 @@
 Base executor class for SGLang Diffusion ComfyUI integration.
 """
 
+import hashlib
 import uuid
 
 import torch
@@ -18,6 +19,15 @@ except ImportError as exc:
     )
 else:
     _RUNTIME_IMPORT_ERROR = None
+
+
+def _hash_value(digest, value) -> None:
+    if not torch.is_tensor(value):
+        digest.update(repr(value).encode())
+        return
+    tensor = value.detach().contiguous().cpu()
+    digest.update(f"{tensor.dtype}{tuple(tensor.shape)}".encode())
+    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
 
 
 class SGLDiffusionExecutor(torch.nn.Module):
@@ -41,7 +51,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter = self.adapter_cls()
         self.session_id = uuid.uuid4().hex
         self._run_id = 0
-        self._sent_conds: set[tuple] = set()
+        self._sent_conds: set[str] = set()
 
     @staticmethod
     def should_suppress_logs(timestep):
@@ -84,24 +94,29 @@ class SGLDiffusionExecutor(torch.nn.Module):
     def comfyui_session_id(self) -> str:
         return f"{self.session_id}:{self._run_id}"
 
-    def _cond_key(self, packed) -> tuple | None:
+    def _cond_key(self, packed) -> str | None:
         embeds = packed.prompt_embeds
         if not embeds:
             return None
         tensor = embeds[0]
         if not torch.is_tensor(tensor) or tensor.numel() == 0:
             return None
-        flat = tensor.reshape(-1)
-        return (
-            tuple(int(dim) for dim in tensor.shape),
-            float(flat[0].item()),
-            float(flat[-1].item()),
-        )
+        # Hash everything drop_cached_fields removes: a hit means the worker
+        # restores all of it, so a partial key would revive another cond.
+        digest = hashlib.blake2b(digest_size=16)
+        for value in (
+            *embeds,
+            *(packed.pooled_embeds or ()),
+            packed.extra_req.get("image_latent"),
+        ):
+            _hash_value(digest, value)
+        digest.update(repr(packed.prompt_seq_lens).encode())
+        return digest.hexdigest()
 
     def _mark_and_maybe_drop(self, packed) -> None:
         key = self._cond_key(packed)
         if key is not None:
-            packed.extra_req["comfyui_cond_key"] = repr(key)
+            packed.extra_req["comfyui_cond_key"] = key
             if key in self._sent_conds:
                 self.adapter.drop_cached_fields(packed)
             else:
