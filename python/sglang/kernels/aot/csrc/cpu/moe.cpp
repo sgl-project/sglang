@@ -1073,16 +1073,8 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
 
-      auto w1s = w1_scale.value();
-      auto w2s = w2_scale.value();
       if (block_size.has_value()) {
-        auto block_size_val = block_size.value();
-        int64_t block_size_N = block_size_val[0];
-        int64_t block_size_K = block_size_val[1];
-        TORCH_CHECK(w1s.size(1) == div_up(2 * N, block_size_N));
-        TORCH_CHECK(w1s.size(2) == div_up(K, block_size_K));
-        TORCH_CHECK(w2s.size(1) == div_up(K, block_size_N));
-        TORCH_CHECK(w2s.size(2) == div_up(N, block_size_K));
+        CHECK_MOE_SCALES_FP8(1, 2)
         fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
             out_hidden_states.data_ptr<scalar_t>(),
             intermediate_cache0,
@@ -1115,7 +1107,8 @@ at::Tensor fused_experts_cpu(
             act_func,
             with_bias);
       } else {
-        TORCH_CHECK(!with_bias, "per-tensor fp8 w8a16 MoE does not support expert bias.");
+        auto w1s = w1_scale.value();
+        auto w2s = w2_scale.value();
         TORCH_CHECK(w1s.scalar_type() == at::kFloat, "expect per-tensor fp8 w1_scale to be float32.");
         TORCH_CHECK(w2s.scalar_type() == at::kFloat, "expect per-tensor fp8 w2_scale to be float32.");
         TORCH_CHECK(w1s.numel() == E, "expect per-tensor fp8 w1_scale.numel() == num_experts.");
@@ -1131,6 +1124,8 @@ at::Tensor fused_experts_cpu(
             hidden_states.data_ptr<scalar_t>(),
             packed_w1.data_ptr<at::Float8_e4m3fn>(),
             packed_w2.data_ptr<at::Float8_e4m3fn>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
             w1s.data_ptr<float>(),
             w2s.data_ptr<float>(),
             topk_weights_.data_ptr<float>(),
@@ -1145,7 +1140,8 @@ at::Tensor fused_experts_cpu(
             num_tokens_post_pad,
             alpha.has_value() ? float(alpha.value()) : 0,
             limit.has_value() ? float(limit.value()) : 0,
-            act_func);
+            act_func,
+            with_bias);
       }
     } else if (moe_comp_method == CPUQuantMethod::MXFP4) {
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));

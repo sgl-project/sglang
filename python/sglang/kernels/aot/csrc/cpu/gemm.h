@@ -207,6 +207,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
     const scalar_t* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
     const float* __restrict__ w1s,
     const float* __restrict__ w2s,
     const float* __restrict__ topk_weights,
@@ -221,7 +223,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUActMethod act_func);
+    CPUActMethod act_func,
+    bool with_bias);
 
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>

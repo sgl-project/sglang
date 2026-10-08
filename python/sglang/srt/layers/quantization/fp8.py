@@ -2970,6 +2970,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
+            w1_scale = (
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            )
+            w2_scale = (
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            )
             output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
@@ -2978,16 +2986,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 CPUQuantMethod.FP8_W8A16,
-                (
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),  # w1_scale
-                (
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),  # w2_scale
+                w1_scale,  # w1_scale
+                w2_scale,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
                 self.weight_block_size if self.block_quant else None,  # block_size

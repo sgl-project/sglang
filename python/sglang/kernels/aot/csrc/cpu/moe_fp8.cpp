@@ -265,6 +265,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
     const scalar_t* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
     const float* __restrict__ w1s,
     const float* __restrict__ w2s,
     const float* __restrict__ topk_weights,
@@ -279,7 +281,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUActMethod act_func) {
+    CPUActMethod act_func,
+    bool with_bias) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
@@ -301,6 +304,9 @@ void fused_experts_fp8_pertensor_kernel_impl(
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+      const float* __restrict__ B_bias = with_bias ? w1_bias + expert_id * 2 * N + nb * BLOCK_N : nullptr;
+      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
+      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
 
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       if (nb_offset == 0) {
@@ -313,20 +319,21 @@ void fused_experts_fp8_pertensor_kernel_impl(
 
       const int64_t offset = offsets[mb];
       tinygemm_kernel<scalar_t>(
-          A,
-          B,
-          ic0 + offset * 2 * N + nb * BLOCK_N,
-          B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
-          C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
-          nullptr,
-          w1s[expert_id],
-          m_size,
-          n_size,
-          K,
-          K,
-          n_size,
-          2 * N,
-          use_brgemm);
+          /*   A            */ A,
+          /*   B            */ B,
+          /*   C            */ ic0 + offset * 2 * N + nb * BLOCK_N,
+          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+          /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
+          /*   Bbias        */ B_bias,
+          /*   scale        */ w1s[expert_id],
+          /*   M            */ m_size,
+          /*   N            */ n_size,
+          /*   K            */ K,
+          /*   lda          */ K,
+          /*   ldb          */ n_size,
+          /*   ldc          */ 2 * N,
+          /*   brg          */ use_brgemm,
+          /*   do_unpack    */ do_unpack);
     });
 
     if (use_brgemm) {
@@ -375,6 +382,9 @@ void fused_experts_fp8_pertensor_kernel_impl(
 
       int32_t expert_id = expert_ids[mb];
       const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const float* __restrict__ B_bias = w2_bias ? w2_bias + expert_id * OC + nb * BLOCK_N : nullptr;
+      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
+      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
 
       tinygemm_kernel<scalar_t>(
           A,
@@ -382,7 +392,7 @@ void fused_experts_fp8_pertensor_kernel_impl(
           C,
           B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
           C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
-          nullptr,
+          B_bias,
           w2s[expert_id],
           m_size,
           n_size,
@@ -390,7 +400,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
           IC,
           n_size,
           BLOCK_N,
-          use_brgemm);
+          use_brgemm,
+          do_unpack);
 
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
@@ -423,6 +434,8 @@ void fused_experts_fp8_pertensor_kernel_impl(
       const TYPE* __restrict__ input,                          \
       const at::Float8_e4m3fn* __restrict__ packed_w1,         \
       const at::Float8_e4m3fn* __restrict__ packed_w2,         \
+      const float* __restrict__ w1_bias,                       \
+      const float* __restrict__ w2_bias,                       \
       const float* __restrict__ w1s,                           \
       const float* __restrict__ w2s,                           \
       const float* __restrict__ topk_weights,                  \
@@ -437,39 +450,11 @@ void fused_experts_fp8_pertensor_kernel_impl(
       int64_t num_tokens_post_pad,                             \
       float alpha,                                             \
       float limit,                                             \
-      CPUActMethod act_func)
+      CPUActMethod act_func,                                   \
+      bool with_bias)
 
 INSTANTIATE_MOE_FP8_PERTENSOR_TEMPLATE(at::BFloat16);
-
-template <>
-void fused_experts_fp8_pertensor_kernel_impl<at::Half>(
-    at::Half* __restrict__,
-    at::Half* __restrict__,
-    at::Half* __restrict__,
-    at::Half* __restrict__,
-    at::Half* __restrict__,
-    at::Half* __restrict__,
-    float* __restrict__,
-    const at::Half* __restrict__,
-    const at::Float8_e4m3fn* __restrict__,
-    const at::Float8_e4m3fn* __restrict__,
-    const float* __restrict__,
-    const float* __restrict__,
-    const float* __restrict__,
-    const int32_t* __restrict__,
-    const int32_t* __restrict__,
-    const int32_t* __restrict__,
-    int64_t,
-    int64_t,
-    int64_t,
-    int64_t,
-    int64_t,
-    int64_t,
-    float,
-    float,
-    CPUActMethod) {
-  TORCH_CHECK(false, "per-tensor fp8 w8a16 MoE supports bfloat16 hidden states only.");
-}
+INSTANTIATE_MOE_FP8_PERTENSOR_TEMPLATE(at::Half);
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
