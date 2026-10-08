@@ -1128,44 +1128,41 @@ def set_cuda_arch():
 
 
 @lru_cache(maxsize=1)
+def _hip_gcn_arch() -> str:
+    """The gcnArchName of HIP device 0, or "" on non-HIP builds and when no device is visible.
+
+    These arch checks run at import time, including in processes that see no device
+    (e.g. a num_gpus=0 Ray actor): there HIP init fails with hipErrorNoDevice even
+    though torch.cuda.is_available() can be True, and such a process runs on no arch.
+    """
+    if not torch.version.hip:
+        return ""
+    try:
+        return torch.cuda.get_device_properties(0).gcnArchName
+    except RuntimeError:
+        return ""
+
+
 def is_gfx95_supported():
     """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
 
     False on every non-HIP build, so callers do not need their own is_hip().
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
+    return "gfx95" in _hip_gcn_arch()
 
 
-@lru_cache(maxsize=1)
 def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
-        return False
+    return "gfx942" in _hip_gcn_arch()
 
 
-@lru_cache(maxsize=1)
 def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if not torch.version.hip:
-        return False
-    try:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-    except RuntimeError:
-        # No visible device (e.g. a num_gpus=0 Ray actor): HIP init fails with
-        # hipErrorNoDevice even though torch.cuda.is_available() can be True.
-        return False
-    return "gfx1250" in gcn_arch
+    return "gfx1250" in _hip_gcn_arch()
 
 
 def get_hip_version():
