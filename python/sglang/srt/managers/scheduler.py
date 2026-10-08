@@ -28,6 +28,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -47,7 +48,6 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -164,14 +164,14 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
-    RecoverElasticEPReqInput,
-    RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -5813,6 +5813,17 @@ class Scheduler(
                 recovery_phase=state.recovery_phase,
                 terminal=True,
             )
+        if state.recovery_succeeded is not None:
+            return make_output(
+                success=state.recovery_succeeded,
+                message=(
+                    f"Recovery operation {recv_req.operation_id} completed."
+                    if state.recovery_succeeded
+                    else state.recovery_error
+                ),
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
         return make_output(
             success=True,
             message=f"Recovery operation {recv_req.operation_id} is restoring.",
@@ -5843,13 +5854,11 @@ class Scheduler(
             operation_id
         ):
             return
-        token_id = self.tokenizer.bos_token_id
+        token_id = self.tokenizer.bos_token_id if self.tokenizer is not None else None
         if token_id is None:
             token_id = next(iter(self.model_config.hf_eos_token_id), None)
         if token_id is None:
-            ElasticEPStateManager.complete_recovery_warmup(
-                operation_id, success=False
-            )
+            self._report_recovery_warmup_result(operation_id, success=False)
             return
         self.handle_generate_request(
             TokenizedGenerateReqInput(
@@ -5884,32 +5893,40 @@ class Scheduler(
         rid = f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{state.recovery_operation_id}"
         for req in batch.reqs:
             if req.rid == rid and req.finished():
-                success = not isinstance(req.finished_reason, FINISH_ABORT)
-                completed = ElasticEPStateManager.complete_recovery_warmup(
-                    state.recovery_operation_id,
-                    success=success,
+                success = not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ) and ElasticEPStateManager.recovery_membership_matches(
+                    state.recovery_operation_id
                 )
-                if get_parallel().tp_rank == 0:
-                    from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
-
-                    self.ipc_channels.send_to_tokenizer.send_output(
-                        ElasticScaleUpdateReq(
-                            success=success and completed,
-                            terminal=True,
-                            effective_ep_size=state.effective_ep_size,
-                            operation_id=state.recovery_operation_id,
-                            recovery_update=True,
-                            recovery_phase=(
-                                "ready" if success and completed else "warming_up"
-                            ),
-                            error=(
-                                None
-                                if success and completed
-                                else "Replacement-including recovery warmup failed."
-                            ),
-                        )
-                    )
+                self._report_recovery_warmup_result(
+                    state.recovery_operation_id, success=success
+                )
                 return
+
+    def _report_recovery_warmup_result(
+        self, operation_id: str, *, success: bool
+    ) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        completed = ElasticEPStateManager.complete_recovery_warmup(
+            operation_id, success=success
+        )
+        state = ElasticEPStateManager.instance()
+        if state is None or not completed or get_parallel().tp_rank != 0:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            ElasticScaleUpdateReq(
+                success=success,
+                terminal=True,
+                effective_ep_size=state.effective_ep_size,
+                operation_id=operation_id,
+                recovery_update=True,
+                recovery_phase=state.recovery_phase,
+                error=state.recovery_error,
+            )
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

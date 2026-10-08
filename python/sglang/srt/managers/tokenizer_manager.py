@@ -528,6 +528,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_recovery_rank_offset = None
         self.elastic_recovery_phase = "idle"
         self.elastic_recovery_succeeded = None
+        self.elastic_recovery_error = None
+        self.elastic_active_rank_status = [True] * self.elastic_worker_count
         self._elastic_recovery_lock = asyncio.Lock()
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
@@ -3528,6 +3530,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.elastic_active_rank_status = list(ranks.status)
+        self.recover_elastic_ep_communicator.set_fan_out(
+            sum(self.elastic_active_rank_status)
+        )
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
@@ -3542,7 +3548,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_recovery_phase = msg.recovery_phase or "failed"
             if msg.terminal:
                 self.elastic_recovery_succeeded = msg.success
-                self.elastic_last_error = None if msg.success else msg.error
+                self.elastic_recovery_error = None if msg.success else msg.error
             return
         if not msg.operation_update:
             if msg.runtime_health is not None:
@@ -3615,6 +3621,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "recovery_topology_generation": self.elastic_recovery_topology_generation,
             "recovery_allocation_id": self.elastic_recovery_allocation_id,
             "recovery_rank_offset": self.elastic_recovery_rank_offset,
+            "recovery_error": self.elastic_recovery_error,
         }
 
     async def scale_elastic_ep(
@@ -3654,19 +3661,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         recovery_phase=self.elastic_recovery_phase,
                         terminal=self.elastic_recovery_succeeded is not None,
                     )
-                return RecoverElasticEPReqOutput(
-                    success=self.elastic_recovery_succeeded is not False,
-                    message=(
-                        self.elastic_last_error
-                        if self.elastic_recovery_succeeded is False
-                        else f"Returning existing recovery operation {operation_id}."
-                    ),
-                    operation_id=operation_id,
-                    recovery_phase=self.elastic_recovery_phase,
-                    terminal=self.elastic_recovery_succeeded is not None,
-                )
+                if self.elastic_recovery_phase != "submission_unknown":
+                    return self._current_elastic_recovery_output(operation_id)
+                self.elastic_recovery_phase = "reconciling_submission"
+                self.elastic_recovery_error = None
             if self.elastic_recovery_operation_id is not None and (
-                self.elastic_recovery_succeeded is None
+                self.elastic_recovery_succeeded is None and not existing
             ):
                 return RecoverElasticEPReqOutput(
                     success=False,
@@ -3677,12 +3677,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     terminal=True,
                 )
 
-            self.elastic_recovery_operation_id = operation_id
-            self.elastic_recovery_topology_generation = obj.topology_generation
-            self.elastic_recovery_allocation_id = obj.allocation_id
-            self.elastic_recovery_rank_offset = obj.rank_offset
-            self.elastic_recovery_phase = "submitting"
-            self.elastic_recovery_succeeded = None
+            if not existing:
+                self.elastic_recovery_operation_id = operation_id
+                self.elastic_recovery_topology_generation = obj.topology_generation
+                self.elastic_recovery_allocation_id = obj.allocation_id
+                self.elastic_recovery_rank_offset = obj.rank_offset
+                self.elastic_recovery_phase = "submitting"
+                self.elastic_recovery_succeeded = None
+                self.elastic_recovery_error = None
             scheduler_obj = RecoverElasticEPReqInput(
                 operation_id=operation_id,
                 runtime_instance_id=self.elastic_instance_id,
@@ -3698,21 +3700,46 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     timeout=self.elastic_scheduler_response_timeout,
                 )
             except BaseException:
+                if self.elastic_recovery_succeeded is not None:
+                    return self._current_elastic_recovery_output(operation_id)
                 self.elastic_recovery_phase = "submission_unknown"
                 raise
+            if self.elastic_recovery_succeeded is not None:
+                return self._current_elastic_recovery_output(operation_id)
             if not responses:
                 self.elastic_recovery_phase = "submission_unknown"
-                raise RuntimeError("Recovery submission returned no scheduler responses.")
-            failed = next((response for response in responses if not response.success), None)
+                raise RuntimeError(
+                    "Recovery submission returned no scheduler responses."
+                )
+            failed = next(
+                (response for response in responses if not response.success), None
+            )
             if failed is not None:
                 self.elastic_recovery_succeeded = False
                 self.elastic_recovery_phase = failed.recovery_phase
+                self.elastic_recovery_error = failed.message
                 failed.operation_id = operation_id
                 return failed
 
             self.elastic_recovery_phase = responses[0].recovery_phase
             responses[0].operation_id = operation_id
             return responses[0]
+
+    def _current_elastic_recovery_output(
+        self, operation_id: str
+    ) -> RecoverElasticEPReqOutput:
+        success = self.elastic_recovery_succeeded is not False
+        return RecoverElasticEPReqOutput(
+            success=success,
+            message=(
+                self.elastic_recovery_error or "Recovery operation failed."
+                if not success
+                else f"Returning existing recovery operation {operation_id}."
+            ),
+            operation_id=operation_id,
+            recovery_phase=self.elastic_recovery_phase,
+            terminal=self.elastic_recovery_succeeded is not None,
+        )
 
     def _current_elastic_scale_output(
         self, operation_id: str, new_ep_size: int

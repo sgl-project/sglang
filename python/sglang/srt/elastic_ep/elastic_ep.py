@@ -112,9 +112,10 @@ class RecoveryLifecycle:
         self.phase = next_phase
 
 
-def _recovery_operation_key(
-    runtime_instance_id: str, operation_id: str
-) -> str:
+_PENDING_RECOVERY_PHASES = frozenset({"restoring", "slot_restored", "warming_up"})
+
+
+def _recovery_operation_key(runtime_instance_id: str, operation_id: str) -> str:
     return (
         f"{_RECOVERY_OPERATION_KEY_PREFIX}/"
         f"{quote(runtime_instance_id, safe='')}/{quote(operation_id, safe='')}"
@@ -294,6 +295,8 @@ class ElasticEPState:
     recovery_allocation_id: Optional[str] = None
     recovery_rank_offset: Optional[int] = None
     recovery_phase: str = "idle"
+    recovery_succeeded: Optional[bool] = None
+    recovery_error: Optional[str] = None
     recovery_warmup_succeeded: bool = False
 
     def is_active_equal_last(self) -> bool:
@@ -466,7 +469,7 @@ class ElasticEPStateManager:
         if (
             inst.pending_ep_size is not None
             or inst.runtime_health == "recovery_unsupported"
-            or inst.recovery_phase != "idle"
+            or inst.recovery_phase in _PENDING_RECOVERY_PHASES
         ):
             return False
         register_scale_operation(
@@ -494,22 +497,28 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return False
-        if inst.recovery_phase != "idle":
-            if (
-                inst.recovery_operation_id == operation.operation_id
-                and inst.runtime_instance_id == operation.runtime_instance_id
-                and inst.recovery_topology_generation == operation.topology_generation
-                and inst.recovery_allocation_id == operation.allocation_id
-                and inst.recovery_rank_offset == operation.rank_offset
-            ):
-                return True
+        same_operation = (
+            inst.recovery_operation_id == operation.operation_id
+            and inst.runtime_instance_id == operation.runtime_instance_id
+            and inst.recovery_topology_generation == operation.topology_generation
+            and inst.recovery_allocation_id == operation.allocation_id
+            and inst.recovery_rank_offset == operation.rank_offset
+        )
+        if same_operation:
+            return True
+        if inst.recovery_phase in _PENDING_RECOVERY_PHASES:
             raise RuntimeError(
                 "Recovery operation conflicts with the pending recovery operation."
             )
         if inst.pending_ep_size is not None:
             return False
+        topology = get_runtime_topology()
+        if topology is None:
+            raise RuntimeError("Elastic EP runtime topology is not initialized.")
+        operation.validate(topology)
         if (
             inst.active_ranks_cpu is None
+            or operation.rank_offset >= len(inst.active_ranks_cpu)
             or inst.active_ranks_cpu[operation.rank_offset].item() != 0
         ):
             raise RuntimeError(
@@ -522,9 +531,9 @@ class ElasticEPStateManager:
         inst.recovery_allocation_id = operation.allocation_id
         inst.recovery_rank_offset = operation.rank_offset
         inst.recovery_phase = "restoring"
+        inst.recovery_succeeded = None
+        inst.recovery_error = None
         inst.recovery_warmup_succeeded = False
-        inst.operation_succeeded = None
-        inst.last_error = None
         return True
 
     @classmethod
@@ -558,16 +567,37 @@ class ElasticEPStateManager:
         ):
             return False
         if not success:
-            inst.last_error = "Replacement-including recovery warmup failed."
-            return False
-        RecoveryLifecycle(inst.recovery_phase).advance(
-            "ready", warmup_succeeded=True
-        )
+            inst.recovery_phase = "failed"
+            inst.recovery_succeeded = False
+            inst.recovery_error = "Replacement-including recovery warmup failed."
+            return True
+        RecoveryLifecycle(inst.recovery_phase).advance("ready", warmup_succeeded=True)
         inst.recovery_phase = "ready"
+        inst.recovery_succeeded = True
+        inst.recovery_error = None
         inst.recovery_warmup_succeeded = True
-        inst.operation_succeeded = True
-        inst.last_error = None
         return True
+
+    @classmethod
+    def recovery_membership_matches(cls, operation_id: str) -> bool:
+        inst = cls._instance
+        if (
+            inst is None
+            or inst.recovery_operation_id != operation_id
+            or inst.recovery_topology_generation is None
+            or inst.recovery_rank_offset is None
+            or inst.active_ranks_cpu is None
+            or inst.recovery_rank_offset >= len(inst.active_ranks_cpu)
+            or inst.active_ranks_cpu[inst.recovery_rank_offset].item() != 1
+        ):
+            return False
+        topology = get_runtime_topology()
+        return (
+            topology is not None
+            and topology.runtime_instance_id == inst.runtime_instance_id
+            and topology.topology_generation == inst.recovery_topology_generation
+            and topology.effective_ep_size == inst.effective_ep_size
+        )
 
     @classmethod
     def get_operation_id(cls) -> Optional[str]:
@@ -646,6 +676,10 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return
+        if inst.recovery_phase in _PENDING_RECOVERY_PHASES:
+            inst.recovery_phase = "failed"
+            inst.recovery_succeeded = False
+            inst.recovery_error = error
         inst.runtime_health = "recovery_unsupported"
         inst.runtime_error = error
 

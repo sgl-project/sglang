@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -12,12 +12,14 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     RecoveryLifecycle,
     RecoveryOperation,
-    get_scale_cohort,
     get_recovery_operation,
+    get_scale_cohort,
     register_scale_cohort,
     register_scale_operation,
 )
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
+    ActiveRanksOutput,
     ElasticScaleUpdateReq,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
@@ -79,6 +81,8 @@ def _manager() -> TokenizerManager:
     manager.elastic_recovery_rank_offset = None
     manager.elastic_recovery_phase = "idle"
     manager.elastic_recovery_succeeded = None
+    manager.elastic_recovery_error = None
+    manager.elastic_active_rank_status = [True] * manager.elastic_worker_count
     manager._elastic_recovery_lock = asyncio.Lock()
     manager.auto_create_handle_loop = MagicMock()
     manager.scale_elastic_ep_communicator = AsyncMock(
@@ -108,7 +112,7 @@ def _manager() -> TokenizerManager:
     return manager
 
 
-class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
+class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
     async def test_retry_returns_existing_operation_without_resubmitting(self):
         manager = _manager()
         request = ScaleElasticEPReqInput(
@@ -391,8 +395,118 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["runtime_health"], "recovery_unsupported")
         self.assertEqual(status["runtime_error"], "rank recovery requires a restart")
 
+    async def test_recovery_fanout_waits_only_for_active_workers(self):
+        """A dead rank must not remain in the recovery response quorum."""
+        manager = _manager()
+        sent = []
+        manager.recover_elastic_ep_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=4,
+            mode="queueing",
+            correlation_attr="submission_id",
+        )
+        ranks = ActiveRanksOutput(status=[True, True, False, True])
+        manager.update_active_ranks(ranks)
 
-class TestElasticEPCohortBinding(unittest.TestCase):
+        task = asyncio.create_task(
+            manager.recover_elastic_ep(
+                RecoverElasticEPReqInput(
+                    operation_id="recover-1",
+                    runtime_instance_id="ignored",
+                    topology_generation=3,
+                    allocation_id="pod-uid-5",
+                    rank_offset=2,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        submission_id = sent[0].submission_id
+        for _ in range(3):
+            manager.recover_elastic_ep_communicator.handle_recv(
+                RecoverElasticEPReqOutput(
+                    success=True,
+                    message="accepted",
+                    operation_id="recover-1",
+                    submission_id=submission_id,
+                    recovery_phase="restoring",
+                )
+            )
+
+        result = await task
+        self.assertTrue(result.success)
+        manager._dispatch_to_scheduler.assert_called_once_with(ranks)
+
+    async def test_unknown_recovery_submission_is_reconciled(self):
+        """A timed-out admission must be resubmitted with the same identity."""
+        manager = _manager()
+        manager.recover_elastic_ep_communicator.side_effect = [
+            TimeoutError("response lost"),
+            [
+                RecoverElasticEPReqOutput(
+                    success=True,
+                    message="accepted",
+                    recovery_phase="restoring",
+                )
+            ],
+        ]
+        request = RecoverElasticEPReqInput(
+            operation_id="recover-1",
+            runtime_instance_id="ignored",
+            topology_generation=3,
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+
+        with self.assertRaises(TimeoutError):
+            await manager.recover_elastic_ep(request)
+        result = await manager.recover_elastic_ep(request)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.recovery_phase, "restoring")
+        self.assertEqual(manager.recover_elastic_ep_communicator.await_count, 2)
+
+    async def test_terminal_recovery_update_wins_over_late_acceptance(self):
+        """A terminal update must not regress to the earlier admission phase."""
+        manager = _manager()
+
+        async def complete_then_accept(request):
+            manager.forward_elastic_scale_update(
+                ElasticScaleUpdateReq(
+                    success=True,
+                    terminal=True,
+                    effective_ep_size=4,
+                    operation_id=request.operation_id,
+                    operation_update=False,
+                    recovery_update=True,
+                    recovery_phase="ready",
+                )
+            )
+            return [
+                RecoverElasticEPReqOutput(
+                    success=True,
+                    message="accepted",
+                    submission_id=request.submission_id,
+                    recovery_phase="restoring",
+                )
+            ]
+
+        manager.recover_elastic_ep_communicator.side_effect = complete_then_accept
+        result = await manager.recover_elastic_ep(
+            RecoverElasticEPReqInput(
+                operation_id="recover-1",
+                runtime_instance_id="ignored",
+                topology_generation=3,
+                allocation_id="pod-uid-5",
+                rank_offset=2,
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.terminal)
+        self.assertEqual(result.recovery_phase, "ready")
+
+
+class TestElasticEPCohortBinding(CustomTestCase):
     def test_cohort_inherits_operation_and_runtime_identity(self):
         store = _Store()
         with patch(
@@ -469,7 +583,7 @@ class TestElasticEPCohortBinding(unittest.TestCase):
                 register_scale_cohort(4, 8, 1, "stale-pod-uid")
 
 
-class TestElasticEPRecoveryLifecycle(unittest.TestCase):
+class TestElasticEPRecoveryLifecycle(CustomTestCase):
     def setUp(self):
         self.store = _Store()
         self.store_patch = patch(
@@ -496,8 +610,11 @@ class TestElasticEPRecoveryLifecycle(unittest.TestCase):
             effective_ep_size=4,
             runtime_instance_id="runtime-1",
         )
+        self.state.active_ranks_cpu.__len__.return_value = 4
         self.state.active_ranks_cpu.__getitem__.return_value.item.return_value = 0
-        self.instance_patch = patch.object(ElasticEPStateManager, "_instance", self.state)
+        self.instance_patch = patch.object(
+            ElasticEPStateManager, "_instance", self.state
+        )
         self.instance_patch.start()
         self.addCleanup(self.instance_patch.stop)
 
@@ -548,6 +665,19 @@ class TestElasticEPRecoveryLifecycle(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "inactive"):
             ElasticEPStateManager.request_recovery(active)
+
+    def test_recovery_rejects_out_of_bounds_rank_before_indexing(self):
+        operation = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-oob",
+            allocation_id="pod-uid-5",
+            rank_offset=99,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rank offset"):
+            ElasticEPStateManager.request_recovery(operation)
+        self.state.active_ranks_cpu.__getitem__.assert_not_called()
 
     def test_recovery_rejects_wrong_runtime_primary_slot_and_non_tp1_width(self):
         invalid_operations = [
@@ -633,54 +763,149 @@ class TestElasticEPRecoveryLifecycle(unittest.TestCase):
             )
         )
         self.assertEqual(self.state.recovery_phase, "warming_up")
-        self.assertFalse(
-            ElasticEPStateManager.complete_recovery_warmup(
-                "recover-1", success=False
-            )
-        )
-        self.assertEqual(self.state.recovery_phase, "warming_up")
         self.assertTrue(
-            ElasticEPStateManager.complete_recovery_warmup(
-                "recover-1", success=True
-            )
+            ElasticEPStateManager.complete_recovery_warmup("recover-1", success=False)
+        )
+        self.assertEqual(self.state.recovery_phase, "failed")
+        self.assertFalse(self.state.recovery_succeeded)
+        self.state.recovery_phase = "slot_restored"
+        self.state.recovery_succeeded = None
+        self.assertTrue(ElasticEPStateManager.begin_recovery_warmup("recover-1"))
+        self.assertTrue(
+            ElasticEPStateManager.complete_recovery_warmup("recover-1", success=True)
         )
         self.assertEqual(self.state.recovery_phase, "ready")
 
     def test_scheduler_warmup_completion_requires_a_successful_normal_request(self):
         scheduler = Scheduler.__new__(Scheduler)
         self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_topology_generation = 3
+        self.state.recovery_rank_offset = 2
+        self.state.recovery_phase = "warming_up"
+        self.state.active_ranks_cpu.__getitem__.return_value.item.return_value = 1
+        finished = MagicMock(
+            rid="health-check-elastic-recovery-recover-1",
+            finished=MagicMock(return_value=True),
+            finished_reason=MagicMock(),
+        )
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.HEALTH_CHECK_RID_PREFIX",
+                "health-check-",
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(tp_rank=1),
+            ),
+        ):
+            scheduler._maybe_complete_recovery_warmup(MagicMock(reqs=[finished]))
+        self.assertEqual(self.state.recovery_phase, "ready")
+
+    def test_scheduler_rejects_warmup_when_membership_is_lost(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ipc_channels = MagicMock()
+        self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_topology_generation = 3
+        self.state.recovery_rank_offset = 2
         self.state.recovery_phase = "warming_up"
         finished = MagicMock(
             rid="health-check-elastic-recovery-recover-1",
             finished=MagicMock(return_value=True),
             finished_reason=MagicMock(),
         )
-        with patch(
-            "sglang.srt.managers.scheduler.HEALTH_CHECK_RID_PREFIX",
-            "health-check-",
-        ), patch(
-            "sglang.srt.managers.scheduler.get_parallel",
-            return_value=MagicMock(tp_rank=1),
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.HEALTH_CHECK_RID_PREFIX",
+                "health-check-",
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(tp_rank=0),
+            ),
         ):
             scheduler._maybe_complete_recovery_warmup(MagicMock(reqs=[finished]))
-        self.assertEqual(self.state.recovery_phase, "ready")
 
-    async def test_tokenizer_recovery_fanout_uses_a_submission_correlation_id(self):
-        manager = _manager()
-        result = await manager.recover_elastic_ep(
-            RecoverElasticEPReqInput(
-                operation_id="recover-1",
-                runtime_instance_id="ignored",
-                topology_generation=3,
-                allocation_id="pod-uid-5",
-                rank_offset=2,
-            )
+        self.assertEqual(self.state.recovery_phase, "failed")
+        update = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertFalse(update.success)
+        self.assertEqual(update.recovery_phase, "failed")
+
+    def test_tokenizerless_scheduler_uses_model_eos_for_warmup(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tokenizer = None
+        scheduler.model_config = MagicMock(hf_eos_token_id={7})
+        scheduler.handle_generate_request = MagicMock()
+        self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_phase = "slot_restored"
+
+        scheduler._maybe_schedule_recovery_warmup()
+
+        request = scheduler.handle_generate_request.call_args.args[0]
+        self.assertEqual(list(request.input_ids), [7])
+
+    def test_scheduler_reports_failure_when_no_warmup_token_exists(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tokenizer = None
+        scheduler.model_config = MagicMock(hf_eos_token_id=set())
+        scheduler.ipc_channels = MagicMock()
+        self.state.recovery_operation_id = "recover-1"
+        self.state.recovery_phase = "slot_restored"
+
+        with patch(
+            "sglang.srt.managers.scheduler.get_parallel",
+            return_value=MagicMock(tp_rank=0),
+        ):
+            scheduler._maybe_schedule_recovery_warmup()
+
+        update = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertFalse(update.success)
+        self.assertTrue(update.terminal)
+        self.assertEqual(update.recovery_phase, "failed")
+
+    def test_recovery_preserves_scale_result_and_releases_terminal_exclusion(self):
+        self.state.operation_id = "grow-1"
+        self.state.operation_succeeded = False
+        self.state.last_error = "scale failed"
+        first = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-1",
+            allocation_id="pod-uid-5",
+            rank_offset=2,
+        )
+        self.assertTrue(ElasticEPStateManager.request_recovery(first))
+        self.assertFalse(self.state.operation_succeeded)
+        self.assertEqual(self.state.last_error, "scale failed")
+        self.state.recovery_phase = "warming_up"
+        self.assertTrue(
+            ElasticEPStateManager.complete_recovery_warmup("recover-1", success=True)
+        )
+        self.assertFalse(self.state.operation_succeeded)
+        self.assertEqual(self.state.last_error, "scale failed")
+
+        second = RecoveryOperation(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            operation_id="recover-2",
+            allocation_id="replacement-pod",
+            rank_offset=2,
+        )
+        self.assertTrue(ElasticEPStateManager.request_recovery(second))
+        self.assertEqual(self.state.recovery_operation_id, "recover-2")
+
+    def test_terminal_recovery_allows_a_later_scale(self):
+        self.state.recovery_phase = "ready"
+        self.state.recovery_succeeded = True
+
+        accepted = ElasticEPStateManager.request_scale(
+            8,
+            "runtime-1",
+            "grow-after-recovery",
+            ["pod-uid-6"],
         )
 
-        self.assertTrue(result.success)
-        submitted = manager.recover_elastic_ep_communicator.await_args.args[0]
-        self.assertEqual(submitted.runtime_instance_id, "runtime-1")
-        self.assertIsNotNone(submitted.submission_id)
+        self.assertTrue(accepted)
+        self.assertEqual(self.state.operation_id, "grow-after-recovery")
 
     def test_conflicting_pending_recovery_is_terminal(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -723,8 +948,15 @@ class TestElasticEPRecoveryLifecycle(unittest.TestCase):
         self.assertTrue(second.success)
         self.assertEqual(second.recovery_phase, "restoring")
 
+        self.state.recovery_phase = "ready"
+        self.state.recovery_succeeded = True
+        terminal = scheduler.handle_recover_elastic_ep(request)
+        self.assertTrue(terminal.success)
+        self.assertTrue(terminal.terminal)
+        self.assertEqual(terminal.recovery_phase, "ready")
 
-class TestElasticEPSchedulerIdempotency(unittest.TestCase):
+
+class TestElasticEPSchedulerIdempotency(CustomTestCase):
     def test_same_operation_is_reconciled_while_pending(self):
         state = ElasticEPState(
             active_ranks=None,
