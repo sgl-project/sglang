@@ -278,7 +278,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self._padded_output_zeroed: Optional[tuple[int, int, int]] = None
         cfg = model_runner.model_config.hf_text_config
         self._tail_refresh_layers = _tail_refresh_layers(
-            cfg.compress_ratios, getattr(cfg, "index_source_layer_ids", ())
+            cfg.compress_ratios, cfg.index_source_layer_ids
         )
         # topk_v2 writes the c4 tail in place only when no ratio-1/2 layer shares the table.
         self.trtllm_topk_writes_table = (

@@ -1038,14 +1038,14 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         swa_width: int = 128,
         seq_lens=None,
     ):
-        from dataclasses import fields
+        from dataclasses import MISSING, fields
 
         from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
         n = 64  # tile-aligned, so no per-step pad parents are involved
         core = object.__new__(DSV4AttnMetadata)
-        for f in fields(DSV4AttnMetadata):  # unset fields default to None
-            if not hasattr(core, f.name):
+        for f in fields(DSV4AttnMetadata):  # fields without a default start as None
+            if f.default is MISSING:
                 setattr(core, f.name, None)
         core.cuda_int32_kwargs = self.kw
         core.trtllm_table_pool = self.pool
@@ -1092,14 +1092,9 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         )
 
     def test_copy_metadata_skips_pool_backed_tables(self):
-        pooled = (
-            "trtllm_swa_lens",
-            "trtllm_c4_indices",
-            "trtllm_c4_lens",
-            "c4_sparse_page_indices",
-        )
         dst, src = self._core(), self._core()  # same pool parents
-        kept = {name: getattr(dst, name) for name in pooled}
+        swa_lens, c4_indices = dst.trtllm_swa_lens, dst.trtllm_c4_indices
+        c4_lens, c4_tail = dst.trtllm_c4_lens, dst.c4_sparse_page_indices
         parents = [
             (b.data_ptr(), b.data_ptr() + b.numel() * b.element_size())
             for b in self.pool._bufs.values()
@@ -1114,8 +1109,10 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         with mock.patch.object(torch.Tensor, "copy_", spy):
             dst.copy_(src)
         # Captured table objects survive replay copies: no rebind, no self-copy.
-        for name, tensor in kept.items():
-            self.assertIs(getattr(dst, name), tensor, name)
+        self.assertIs(dst.trtllm_swa_lens, swa_lens)
+        self.assertIs(dst.trtllm_c4_indices, c4_indices)
+        self.assertIs(dst.trtllm_c4_lens, c4_lens)
+        self.assertIs(dst.c4_sparse_page_indices, c4_tail)
         self.assertTrue(copied_into)  # the non-pool fields were copied
         for ptr in copied_into:
             self.assertFalse(any(lo <= ptr < hi for lo, hi in parents), ptr)
@@ -1138,7 +1135,7 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         )
 
         for ratio in (1, 2):
-            getattr(core, f"c{ratio}_sparse_page_indices").fill_(ratio)
+            core.sparse_page_indices(ratio).fill_(ratio)
             _refresh_indexed_tail(
                 core,
                 ratio,
