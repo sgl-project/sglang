@@ -179,7 +179,7 @@ async fn chat_completions(
 
     let stream = request.stream.unwrap_or(false);
     let n = request.n.unwrap_or(1) as usize;
-    let routing = match routing.into_routing(1, n) {
+    let routing = match routing.into_normalized(1, n) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };

@@ -22,7 +22,7 @@ pub(super) struct PDRoutingFields {
 }
 
 /// Validated per-prompt columns, ready for admission.
-pub(super) struct PDRouting {
+pub(super) struct NormalizedPDRouting {
     pub(super) bootstrap: BootstrapColumns,
     pub(super) routed_dp_rank: Option<i64>,
     pub(super) disagg_prefill_dp_rank: Option<i64>,
@@ -31,7 +31,11 @@ pub(super) struct PDRouting {
 impl PDRoutingFields {
     /// Normalize bootstrap fields per prompt and bound the handlers' host clones
     /// across choices. DP hints remain scalar.
-    pub(super) fn into_routing(self, prompt_count: usize, n: usize) -> Result<PDRouting, Error> {
+    pub(super) fn into_normalized(
+        self,
+        prompt_count: usize,
+        choices_per_prompt: usize,
+    ) -> Result<NormalizedPDRouting, Error> {
         let hosts = self
             .bootstrap_host
             .and_then(wire::string_or_list)
@@ -52,7 +56,7 @@ impl PDRoutingFields {
             rooms,
             prompt_count,
         )?;
-        if n > 1 {
+        if choices_per_prompt > 1 {
             check_broadcast_budget(
                 bootstrap
                     .bootstrap_hosts
@@ -60,11 +64,11 @@ impl PDRoutingFields {
                     .filter_map(Option::as_ref)
                     .map(String::len)
                     .sum(),
-                n,
+                choices_per_prompt,
                 "bootstrap_host",
             )?;
         }
-        Ok(PDRouting {
+        Ok(NormalizedPDRouting {
             bootstrap,
             routed_dp_rank: self.routed_dp_rank,
             disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
@@ -89,7 +93,7 @@ mod tests {
             "disagg_prefill_dp_rank": 3,
         }))
         .unwrap();
-        let routing = fields.into_routing(2, 2).unwrap();
+        let routing = fields.into_normalized(2, 2).unwrap();
         assert_eq!(
             routing.bootstrap.bootstrap_hosts,
             vec![Some("prefill-a".to_owned()), Some("prefill-b".to_owned())]
@@ -118,7 +122,7 @@ mod tests {
         // 263173 bytes fit for one choice, but 255 choices exceed 64 MiB.
         let fields: PDRoutingFields =
             serde_json::from_value(json!({"bootstrap_host": ["x".repeat(263173)]})).unwrap();
-        let error = fields.into_routing(1, 255).err().unwrap().to_string();
+        let error = fields.into_normalized(1, 255).err().unwrap().to_string();
         assert!(error.contains("bootstrap_host"), "{error}");
         assert!(error.contains("would allocate more than"), "{error}");
     }

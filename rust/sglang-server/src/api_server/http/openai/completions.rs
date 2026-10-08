@@ -149,7 +149,7 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.into_routing(prompts.len(), n) {
+    let routing = match routing.into_normalized(prompts.len(), n) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
