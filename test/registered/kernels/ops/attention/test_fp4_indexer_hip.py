@@ -35,6 +35,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    index_k_page8_views,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
     pack_fp4_query_flydsl,
@@ -43,6 +44,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_prefill_workspace,
     prepare_fp4_rowgroup_decode_workspace,
     read_fp4_index_k_split,
+    rowgroup_paged_mqa_logits,
     store_fp4_index_k_cache_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
@@ -854,6 +856,90 @@ def test_rowgroup_decode_logits_match_varctx(
         ), f"row {row} top-{k}"
 
 
+def _page8_copy(payload, scale):
+    """The same K cache in the page8 layout (shapes and bytes per 64-slot page unchanged)."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+        pack_kv_cache,
+    )
+
+    slots = torch.arange(payload.shape[0] * PAGE_SIZE, device=get_device())
+    packed, exps = _read_index_k_cache(payload, scale, slots)
+    ref_kv, ref_ks = pack_kv_cache(packed, exps.contiguous(), page_size=8)
+    payload8 = torch.zeros_like(payload.view(torch.uint8)).view(payload.dtype)
+    scale8 = torch.zeros_like(scale)
+    kv8, ks8 = index_k_page8_views(payload8, scale8)
+    kv8.view(-1).copy_(ref_kv.reshape(-1))
+    ks8.view(-1).copy_(ref_ks.reshape(-1))
+    return payload8, scale8
+
+
+def _rowgroup_logits(case, rows_per_request: int, *, page8: bool, is_decode: bool):
+    block_tables, max_seq_len = _guard_page_table(
+        case["page_table"][::rows_per_request].contiguous()
+    )
+    rows = case["q_fp4"].shape[0]
+    return rowgroup_paged_mqa_logits(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload8"] if page8 else case["payload"],
+        k_scale=case["scale8"] if page8 else case["scale"],
+        weights=case["weights"],
+        weight_scale=case["weight_scale"],
+        block_tables=block_tables,
+        query_start_loc=torch.arange(
+            0, rows + 1, rows_per_request, dtype=torch.int32, device=get_device()
+        ),
+        row_ends=case["c4_seq_lens"],
+        max_query_len=rows_per_request,
+        max_seq_len=max_seq_len,
+        page8=page8,
+        pages_per_block=8 if page8 else 1,
+        is_decode=is_decode,
+    )
+
+
+def _page8_case(batch, seq_len, rows_per_request, *, ctx_lens=None):
+    case = _verify_rows_case(
+        _build_logits_case(batch, seq_len, ctx_lens=ctx_lens, shuffle_pages=True),
+        rows_per_request,
+    )
+    case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+    return case
+
+
+@pytest.mark.parametrize("is_decode", [True, False])
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request,ctx_lens",
+    [
+        (1, 256, 1, None),
+        (3, 512, 6, [512, 77, 300]),
+        (6, 1024, 6, None),
+        (8, 2048, 1, [2048, 1, 9, 1000, 2047, 64, 65, 1500]),
+    ],
+)
+def test_page8_full_scoring_matches_page64(
+    batch, seq_len, rows_per_request, ctx_lens, is_decode
+) -> None:
+    """The page8 pool scored through the 64-slot page table (pages_per_block=8) gives the
+    page-64 pool's logits: same keys, same rows; only the walk granularity differs."""
+    torch.manual_seed(batch * 400 + seq_len + rows_per_request)
+    case = _page8_case(batch, seq_len, rows_per_request, ctx_lens=ctx_lens)
+    ref = _rowgroup_logits(case, rows_per_request, page8=False, is_decode=is_decode)
+    got = _rowgroup_logits(case, rows_per_request, page8=True, is_decode=is_decode)
+    for row, ctx in enumerate(case["context"].tolist()):
+        if ctx == 0:
+            continue
+        torch.testing.assert_close(
+            got[row, :ctx], ref[row, :ctx], rtol=1e-5, atol=1e-6, msg=f"row {row}"
+        )
+        torch.testing.assert_close(
+            got[row, :ctx],
+            case["ref_logits_fp4"][row, :ctx],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+        )
+
+
 @pytest.mark.parametrize("is_decode", [True, False])
 def test_logits_with_ragged_context_lengths(is_decode: bool) -> None:
     """Sizing the persistent grid for uneven contexts is the scheduler's job.
@@ -1071,6 +1157,74 @@ def test_index_k_split_writer_matches_the_triton_chain(ratio: int) -> None:
     )
     assert torch.equal(payload, ref_payload)
     assert torch.equal(scale, ref_scale)
+
+
+@pytest.mark.parametrize("writer", ["hip", "triton"])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_index_k_page8_writers_match_pack_kv_cache(writer: str, ratio: int) -> None:
+    """A page8 pool holds the bytes aiter's pack_kv_cache(page_size=8) lays out for the rows
+    the page-64 writer stores, slot for slot, and reads back as those rows."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+        pack_kv_cache,
+    )
+
+    torch.manual_seed(ratio + 7 * (writer == "hip"))
+    num_tokens, page_size, num_pages, max_pos = 200, 64, 5, 4096
+    x = (torch.randn(num_tokens, 128, device="cuda") * 3).bfloat16()
+    norm_weight = (1 + 0.1 * torch.randn(128, device="cuda")).bfloat16()
+    freqs_cis = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    freqs = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(0, max_pos, (num_tokens,), device="cuda")
+    loc = torch.randperm(num_pages * page_size - 1, device="cuda")[:num_tokens] + 1
+
+    def write(page8: bool):
+        payload = torch.zeros(
+            num_pages, 1, 4, page_size, 16, dtype=torch.uint8, device="cuda"
+        )
+        scale = torch.zeros(
+            num_pages, 1, 4, page_size, dtype=torch.uint8, device="cuda"
+        )
+        if writer == "hip":
+            index_k_norm_rope_pack_store_split(
+                x,
+                norm_weight,
+                1e-6,
+                freqs,
+                positions,
+                loc,
+                payload,
+                scale,
+                ratio=ratio,
+                page8=page8,
+            )
+        else:
+            store_fp4_index_k_cache_split(
+                x, payload, scale, loc, page_size=page_size, rne=True, page8=page8
+            )
+        return payload, scale
+
+    payload64, scale64 = write(False)
+    payload8, scale8 = write(True)
+
+    slots = torch.arange(num_pages * page_size, device="cuda")
+    rows, packed_sf = read_fp4_index_k_split(
+        payload64, scale64, slots, page_size=page_size
+    )
+    sf_bytes = torch.stack([(packed_sf >> (8 * c)) & 0xFF for c in range(4)], dim=-1)
+    ref_kv, ref_ks = pack_kv_cache(
+        rows.view(torch.uint8), sf_bytes.to(torch.uint8), page_size=8
+    )
+    kv8, ks8 = index_k_page8_views(payload8, scale8)
+    assert torch.equal(kv8.flatten(), ref_kv.flatten())
+    assert torch.equal(ks8.flatten(), ref_ks.flatten())
+
+    rows8, packed8 = read_fp4_index_k_split(
+        payload8, scale8, loc, page_size=page_size, page8=True
+    )
+    ref_rows, ref_packed = read_fp4_index_k_split(
+        payload64, scale64, loc, page_size=page_size
+    )
+    assert torch.equal(rows8, ref_rows) and torch.equal(packed8, ref_packed)
 
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])

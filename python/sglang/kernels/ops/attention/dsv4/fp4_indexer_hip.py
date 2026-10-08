@@ -358,38 +358,88 @@ def _rowgroup_decode_logits(
     weight_scale: float,
     workspace: FP4RowgroupDecodeWorkspace,
     row_ends: torch.Tensor,
+    page8: bool = False,
+    is_decode: bool = True,
 ) -> torch.Tensor:
     """Decode logits from AITER's row-group kernel over a row-group workspace."""
+    q = workspace.rows_per_seq
+    return rowgroup_paged_mqa_logits(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        k_payload=k_payload,
+        k_scale=k_scale,
+        weights=weights,
+        weight_scale=weight_scale,
+        block_tables=workspace.guarded_page_table[::q],
+        query_start_loc=workspace.query_start_loc,
+        row_ends=row_ends,
+        max_query_len=q,
+        max_seq_len=workspace.max_seq_len,
+        page8=page8,
+        pages_per_block=8 if page8 else 1,
+        is_decode=is_decode,
+    )
+
+
+def rowgroup_paged_mqa_logits(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    page8: bool,
+    pages_per_block: int = 1,
+    is_decode: bool = True,
+) -> torch.Tensor:
+    """[rows, max_seq_len] fp32 logits from AITER's row-group kernel: sequence b's rows
+    query_start_loc[b] .. [b + 1] - 1 score the keys of block_tables[b] up to their own
+    row_ends. An entry names a 64-slot page of the pool, or with page8 pages_per_block of
+    the pool's 8-slot pages (8: the 64-slot page table as is; 1: an 8-slot page each, the
+    candidate table). Past a row's bound the logits are left unwritten; the length-aware
+    top-k never reads them."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, make_fp4_mqa_plan
 
     num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
-    q = workspace.rows_per_seq
-    max_seq_len = workspace.max_seq_len
+    if page8:
+        kv, ks = index_k_page8_views(k_payload, k_scale)
+        page_size = 8
+    else:
+        assert pages_per_block == 1, "a 64-slot page entry names one page"
+        kv, ks = k_payload.view(torch.uint8), k_scale
+        page_size = _KV_BLOCK_SIZE
     plan = make_fp4_mqa_plan(
-        num_seqs=num_rows // q,
-        max_qlen=q,
+        num_seqs=query_start_loc.shape[0] - 1,
+        max_qlen=max_query_len,
         num_rows=num_rows,
         heads=heads,
-        page_size=_KV_BLOCK_SIZE,
+        page_size=page_size,
         max_seq_len=max_seq_len,
+        pages_per_block=pages_per_block,
     )
-    # past each row's bound the logits are left unwritten; the length-aware top-k never reads them
-    logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, is_decode=True)
+    logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, is_decode)
     flydsl_pa_mqa_logits_fp4(
         q_fp4.view(torch.uint8).reshape(num_rows, 1, heads, _HEAD_DIM // 2),
         q_scale.reshape(num_rows, 1, *_Q_SCALE_SHAPE),
-        k_payload.view(torch.uint8),
-        k_scale,
-        workspace.guarded_page_table[::q],
+        kv,
+        ks,
+        block_tables,
         weights,
         None,
         max_seq_len,
         weight_scale=weight_scale,
-        kv_block_size=_KV_BLOCK_SIZE,
+        kv_block_size=page_size,
         out=logits,
-        row_ends=row_ends,
-        query_start_loc=workspace.query_start_loc,
-        max_query_len=q,
+        row_ends=_as_int32_1d(row_ends),
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        pages_per_block=pages_per_block,
         plan=plan,
     )
     return logits
@@ -411,8 +461,11 @@ def aiter_fp4_paged_mqa_logits(
     ] = None,
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
     page_table_bucket: int = 4,
+    page8: bool = False,
 ) -> torch.Tensor:
-    """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
+    """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel. A page8 pool
+    is read by the row-group kernel only: without a row-group decode workspace every row
+    scores as its own sequence."""
     from aiter.ops.flydsl import (
         flydsl_pa_mqa_logits_fp4,
         flydsl_pa_mqa_logits_fp4_prefill,
@@ -425,7 +478,16 @@ def aiter_fp4_paged_mqa_logits(
     # can leave it stale, in which case fall back to building the schedule here.
     if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
         workspace = None
-    if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace):
+    rowgroup_ws = (
+        workspace
+        if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace)
+        else None
+    )
+    if page8 and rowgroup_ws is None:
+        rowgroup_ws = prepare_fp4_rowgroup_decode_workspace(
+            page_table, 1, page_table_bucket=page_table_bucket
+        )
+    if rowgroup_ws is not None:
         return _rowgroup_decode_logits(
             q_fp4=q_fp4,
             q_scale=q_scale,
@@ -433,8 +495,10 @@ def aiter_fp4_paged_mqa_logits(
             k_scale=k_scale,
             weights=weights,
             weight_scale=weight_scale,
-            workspace=workspace,
+            workspace=rowgroup_ws,
             row_ends=c4_seq_lens,
+            page8=page8,
+            is_decode=is_decode,
         )
     # Built on the fallback path below; kept in scope so the schedule scratch
     # outlives the logits kernel that reads it.
@@ -654,6 +718,7 @@ def _store_fp4_index_k_split_kernel(
     loc,
     page_size: tl.constexpr,
     BLOCK: tl.constexpr,
+    PAGE8: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     cache_loc = tl.load(loc + token_id)
@@ -665,6 +730,23 @@ def _store_fp4_index_k_split_kernel(
     chunk = offsets // 16
     byte = offsets - chunk * 16
     k = tl.load(k_fp4 + token_id * BLOCK + offsets)
+    sf = tl.load(k_sf + token_id)
+    sf_offsets = tl.arange(0, 4)
+    sf_bytes = ((sf >> (sf_offsets * 8)) & 0xFF).to(tl.uint8)
+    if PAGE8:
+        # aiter's row-group 8-slot page: payload [t % 4][chunk][t // 4][16 B], scales [chunk][t]
+        page8 = cache_loc // 8
+        t = cache_loc % 8
+        tl.store(
+            payload
+            + page8 * (8 * BLOCK)
+            + ((t % 4) * 4 + chunk) * 32
+            + (t // 4) * 16
+            + byte,
+            k,
+        )
+        tl.store(scale + page8 * 32 + sf_offsets * 8 + t, sf_bytes)
+        return
     tl.store(
         payload
         + page * (4 * page_size * 16)
@@ -675,9 +757,6 @@ def _store_fp4_index_k_split_kernel(
     )
     # scale [page, 1, 4, page_size]: the slot axis is a 16 x 4 tile transposed (the FlyDSL K ABI)
     shuffled = (page_offset % 16) * 4 + page_offset // 16
-    sf = tl.load(k_sf + token_id)
-    sf_offsets = tl.arange(0, 4)
-    sf_bytes = ((sf >> (sf_offsets * 8)) & 0xFF).to(tl.uint8)
     tl.store(
         scale + page * (4 * page_size) + sf_offsets * page_size + shuffled, sf_bytes
     )
@@ -691,10 +770,12 @@ def store_fp4_index_k_cache_split(
     *,
     page_size: int,
     rne: bool = False,
+    page8: bool = False,
 ) -> None:
     """Quantize input [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
     loc[i] of the split FlyDSL K layout (payload [pages, 1, 4, page_size, 16],
-    scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
+    scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed); with page8
+    each page holds eight 8-slot pages of aiter's row-group layout (pack_kv_cache)."""
     assert input.shape[-1] == _HEAD_DIM
     assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
     assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
@@ -711,17 +792,43 @@ def store_fp4_index_k_cache_split(
         loc,
         page_size,
         BLOCK=64,
+        PAGE8=page8,
+    )
+
+
+def index_k_page8_views(
+    payload: torch.Tensor, scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A page8 pool's buffers as aiter's 8-slot pages: (payload uint8 [pages * 8, 512],
+    scale uint8 [pages * 8, 32]); 8-slot page p covers slots 8p .. 8p + 7."""
+    pages8 = payload.shape[0] * (payload.shape[3] // 8)
+    return (
+        payload.view(torch.uint8).view(pages8, 8 * _HEAD_DIM // 2),
+        scale.view(pages8, 8 * _HEAD_DIM // 32),
     )
 
 
 def read_fp4_index_k_split(
-    payload: torch.Tensor, scale: torch.Tensor, slots: torch.Tensor, *, page_size: int
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    slots: torch.Tensor,
+    *,
+    page_size: int,
+    page8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Inverse of store_fp4_index_k_cache_split: (payload int8 [n, 64], scales
     int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
     quantize_fp4_indexer_tensor."""
     assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
     slots = slots.to(torch.int64)
+    if page8:
+        kv8, ks8 = index_k_page8_views(payload, scale)
+        page, t = slots // 8, slots % 8
+        kv8 = kv8.view(-1, 4, 4, 2, 16)  # [page8, t % 4, chunk, t // 4, 16]
+        rows = kv8[page, t % 4, :, t // 4, :].reshape(-1, 64).view(torch.int8)
+        sf = ks8.view(-1, 4, 8)[page, :, t].to(torch.int32)  # [n, 4]
+        packed = sf[:, 0] | (sf[:, 1] << 8) | (sf[:, 2] << 16) | (sf[:, 3] << 24)
+        return rows, packed
     page, off = slots // page_size, slots % page_size
     rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
     rows = rows.reshape(-1, 64).view(torch.int8)
