@@ -157,7 +157,7 @@ def test_preabort_detaches_session_and_preserves_slot():
         page_size=16,
         match_results=[
             MatchResult(
-                device_indices=torch.tensor([], dtype=torch.int64),
+                device_prefix_len=0,
                 last_device_node=None,
                 last_host_node=None,
                 best_match_node=None,
@@ -189,7 +189,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     assert slot.kv.req_pool_idx == 0
     assert slot.kv.kv_committed_len == 48
     assert slot.kv.kv_allocated_len == 48
-    assert len(result.device_indices) == 0
+    assert result.device_prefix_len == 0
 
 
 def test_trim_overshoot_postcondition():
@@ -242,7 +242,7 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
         tree_cache.session.slots["session-a"] = SessionSlot(kv=req.detach_kv())
         req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=0)
         result = tree_cache.match_prefix(SimpleNamespace(req=req, key=list(range(38))))
-        assert result.device_indices.tolist() == list(range(32))
+        assert result.device_prefix_len == 32
 
     # Rewound to floor_align(38) = 32; every cursor lands page-aligned.
     assert req.kv.kv_allocated_len == 32

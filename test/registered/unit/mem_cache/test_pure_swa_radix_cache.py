@@ -85,7 +85,7 @@ class TestPureSWARadixCache(CustomTestCase):
 
         # [0, 4) went into the tree; [4, 6) was window-evicted; [6, 8) is freed.
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
-        self.assertEqual(len(match.device_indices), 4)
+        self.assertEqual(match.device_prefix_len, 4)
         self.assertEqual(allocator.freed, [6, 7])
         self.assertEqual(allocator.skipped, [4, 5])
 
