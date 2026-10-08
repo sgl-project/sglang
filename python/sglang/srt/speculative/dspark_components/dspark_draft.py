@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from typing import Optional
 
 import msgspec
@@ -19,7 +18,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -235,9 +233,7 @@ class DraftBlockProposer:
         self._draft_sampler = draft_sampler
 
     def _base_logits_context(self):
-        if self._dp_moe_sync:
-            return draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
-        return nullcontext()
+        return draft_tp_context(self._dp_moe_sync)
 
     def propose(
         self,
@@ -350,6 +346,7 @@ class DraftBlockProposer:
         empty_long = torch.empty((0,), dtype=torch.int64, device=device)
         idle_batch = ForwardBatch(
             forward_mode=ForwardMode.IDLE,
+            out_cache_loc_is_physical=True,
             batch_size=0,
             input_ids=empty_long,
             req_pool_indices=empty_long,
@@ -419,6 +416,7 @@ class DraftBlockProposer:
         draft_num_tokens = bs * query_token_num
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,

@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _pp_exchange_outputs_before_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -36,9 +37,8 @@ def _published_topology():
         ranks={"world_rank": 12, "dp_rank": 1},
         tp_size=8,
         pp_size=2,
-        dp_size=2,
+        attn_dp_size=2,
         attn_cp_size=2,
-        enable_dp_attention=True,
     )
 
 
@@ -47,25 +47,13 @@ def _fake_group() -> SimpleNamespace:
 
 
 def _make_receiver() -> SchedulerRequestReceiver:
-    tp_group = _fake_group()
-    attn_tp_group = _fake_group()
-    attn_cp_group = _fake_group()
-    world_group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        tp_group=tp_group,
-        tp_cpu_group=tp_group,
-        attn_tp_group=attn_tp_group,
-        attn_tp_cpu_group=attn_tp_group,
-        attn_cp_group=attn_cp_group,
-        attn_cp_cpu_group=attn_cp_group,
-        world_group=world_group,
         server_args=SimpleNamespace(
-            enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
         ),
         model_config=SimpleNamespace(is_multimodal=False),
@@ -83,7 +71,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=True,
             attn_tp_rank=0,
             attn_cp_rank=0,
@@ -117,13 +105,14 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=False,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
             attn_cp_size=1,
             tp_size=32,
+            tp_group=_fake_group(),
         )
 
         with (
@@ -154,15 +143,16 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         self.assertEqual(result, [control_req])
         broadcast.assert_called_once_with(
             [control_req],
-            receiver.tp_group.rank,
-            receiver.tp_cpu_group,
-            src=receiver.tp_group.ranks[0],
+            parallel.tp_group.rank,
+            parallel.tp_group.cpu_group,
+            src=parallel.tp_group.ranks[0],
         )
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         enter_scope(self, _published_topology())
+        enter_scope(self, get_parallel().override(world_group=_fake_group()))
         calls = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):

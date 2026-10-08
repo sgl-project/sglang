@@ -29,6 +29,8 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from sglang.srt.observability import req_time_stats
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,6 +99,22 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
+
+    def test_decode_retraction_queue_time_excludes_decoding_before_it(self):
+        """After a PD-decode retraction, queue_time counts waits, not earlier decoding."""
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        req = self._new_req(priority=0)
+        stats = SchedulerReqTimeStats(disagg_mode=DisaggregationMode.DECODE)
+        req.time_stats = stats
+        t0 = 1000.0
+        stats.set_wait_queue_entry_time(t0)
+        stats.set_forward_entry_time(t0 + 0.1)
+
+        with patch.object(req_time_stats.time, "perf_counter", return_value=t0 + 10.0):
+            scheduler._add_request_to_queue(req, is_retracted=True)
+        stats.set_forward_entry_time(t0 + 12.0)
+
+        self.assertAlmostEqual(stats.get_queueing_time(), 0.1 + 2.0)
 
     def test_priority_disabled_abort_validation_applies_to_decode_mode(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
@@ -189,7 +207,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 req_pool_idx=1,
                 cache_protected_len=2,
             ),
-            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
+            prefix_len=2,
             priority=3,
             extra_key=None,
             cache_salt=None,
@@ -259,15 +277,13 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         last_node = req.last_node
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.advance_unpublished_req(req, chunked=True)
+            cache.advance_unpublished_req(req)
 
-        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
         self.assertEqual(req.kv.cache_protected_len, 2)
         self.assertIs(req.last_node, last_node)
         prepare_params = component.prepare_for_caching_req.call_args.kwargs[
             "insert_params"
         ]
-        self.assertTrue(prepare_params.chunked)
         self.assertEqual(prepare_params.prev_prefix_len, 2)
         component.free_out_of_window_slots.assert_called_once_with(
             req, 3, prepare_params
@@ -310,12 +326,12 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 return_value=SimpleNamespace(tp_rank=0),
             ),
         ):
-            cache.advance_unpublished_req(req, chunked=True)
+            cache.advance_unpublished_req(req)
             SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(scheduler, req)
 
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()
-        release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
+        release_kv_cache.assert_called_once_with(req, cache, checkpoint=False)
         cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
@@ -326,19 +342,26 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.int32).reshape(1, 8)
+        )
         scheduler.tree_cache = cache
-        req = SimpleNamespace(pending_bootstrap=True)
-
-        SchedulerDisaggregationPrefillMixin.cache_unfinished_disagg_prefill(
-            scheduler, req, chunked=True
+        req = SimpleNamespace(
+            pending_bootstrap=True,
+            kv=SimpleNamespace(req_pool_idx=0),
+            extend_end=5,
         )
 
-        cache.advance_unpublished_req.assert_called_once_with(req, chunked=True)
+        SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
+
+        cache.advance_unpublished_req.assert_called_once_with(req)
+        # The next chunk still resumes after this one.
+        self.assertEqual(req.prefix_len, 5)
 
     def test_bootstrap_success_publishes_once(self):
         scheduler = SimpleNamespace(
             disagg_prefill_bootstrap_queue=MagicMock(),
-            cache_unfinished_disagg_prefill=MagicMock(),
+            checkpoint_disagg_prefill=MagicMock(),
         )
         scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.return_value = True
         req = SimpleNamespace(rid="req")
@@ -351,7 +374,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue.finalize_bootstrap.assert_called_once_with(
             req
         )
-        scheduler.cache_unfinished_disagg_prefill.assert_called_once_with(req)
+        scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
 
     def test_waiting_abort_releases_without_insert(self):
         scheduler = SimpleNamespace(
@@ -375,7 +398,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             )
 
         release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
+            req, scheduler.tree_cache, checkpoint=False
         )
         sender.abort.assert_called_once()
         self.assertFalse(req.pending_bootstrap)

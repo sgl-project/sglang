@@ -1,7 +1,6 @@
 import logging
 from array import array
 from contextlib import nullcontext
-from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -26,14 +25,16 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
+    append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -41,7 +42,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
-    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -52,10 +52,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -98,6 +98,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.glm4v import glm4v_vision_reduces_over_attn_tp
 from sglang.srt.models.glm_ocr import (
     GlmOcrRMSNorm,
     GlmOcrVisionBlock,
@@ -123,7 +124,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
-    make_layers,
+    make_pp_layers,
     set_weight_attrs,
 )
 
@@ -240,6 +241,9 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
@@ -318,11 +322,14 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             swiglu_limit=vision_config.swiglu_limit,
         )
 
-        self.downsample = nn.Conv2d(
+        # These non-overlapping patches are equivalent to unfold + linear and
+        # avoid MIOpen's expensive per-shape convolution search on ROCm.
+        self.downsample = Conv2dLayer(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
+            disable_linear=False,
         )
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
@@ -360,10 +367,10 @@ class Glm5NextLinearAttention(nn.Module):
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "quark",
         }:
             return False
 
-        probe = LinearBase(1, 1)
         source_projs = [
             proj
             for fused_proj in fused_projs
@@ -372,10 +379,7 @@ class Glm5NextLinearAttention(nn.Module):
         if "fused_qkvbfg_a_proj" in fused_projs:
             source_projs.append("qkv_proj")
         return all(
-            isinstance(
-                quant_config.get_quant_method(probe, prefix=f"{prefix}.{proj}"),
-                UnquantizedLinearMethod,
-            )
+            quant_config.is_linear_unquantized(f"{prefix}.{proj}")
             for proj in source_projs
         )
 
@@ -391,10 +395,7 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_parallel().tp_size
         head_shard_size = get_parallel().attn_tp_size
-        head_shard_rank = get_parallel().attn_tp_rank
-        _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
 
         self.hidden_size = hidden_size
         self.config = config
@@ -433,8 +434,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -446,8 +446,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -457,8 +456,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.qkv_proj",
             )
 
@@ -469,8 +467,7 @@ class Glm5NextLinearAttention(nn.Module):
                     [self.head_dim, self.head_dim],
                     quant_config=None,
                     prefix=f"{prefix}.fused_bfg_a_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
                 self.bfg_split_sizes = [self.local_num_heads, 2 * self.head_dim]
                 self.fused_fg_b_proj = ColumnParallelBatchedLinear(
@@ -478,8 +475,7 @@ class Glm5NextLinearAttention(nn.Module):
                     self.head_dim,
                     projection_size,
                     dtype=self.fused_bfg_a_proj.params_dtype,
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
             else:
                 self.f_a_proj = ReplicatedLinear(
@@ -496,8 +492,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.f_b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
                 self.b_proj = ColumnParallelLinear(
@@ -506,8 +501,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
                 self.g_a_proj = ReplicatedLinear(
@@ -523,8 +517,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.g_b_proj",
-                    tp_rank=head_shard_rank,
-                    tp_size=head_shard_size,
+                    parallel_group="attn_tp",
                 )
 
         self.dt_bias = nn.Parameter(
@@ -533,7 +526,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -542,8 +535,7 @@ class Glm5NextLinearAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_tp",
         )
         # ColumnParallelLinear's loader cannot reshape conv1d weights, so add the
         # singleton dimension after construction.
@@ -554,7 +546,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, _head_shard_rank_getter)},
+            {"weight_loader": sharded_weight_loader(2, parallel_group="attn_tp")},
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -567,8 +559,7 @@ class Glm5NextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            parallel_group="attn_tp",
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -727,7 +718,6 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
         if self.is_layer_sparse:
@@ -738,21 +728,20 @@ class Glm5NextDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                reduce_results=False,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm5NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 swiglu_limit=config.swiglu_limit,
+                reduce_results=False,
+                allow_fused_down=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -794,7 +783,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(read=residual.attn_readout, update=residual.attn_update),
                 self.input_layernorm,
@@ -813,14 +802,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse,
-                next_layer_sparse=self.is_layer_sparse,
-                update=residual.ffn_update,
-            )
-            if layer_id != 0
-            else None,
-            terminal=terminal,
         )
 
     def _hc_pre(
@@ -965,13 +946,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
+        with _mlp_ctx:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return (hidden_states, topk_indices)
 
@@ -1011,7 +992,7 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm5NextDecoderLayer(
                 config=config,
@@ -1020,8 +1001,6 @@ class Glm5NextModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -1237,7 +1216,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self.pp_group = get_parallel().pp_group
         self.config = text_config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
@@ -1383,6 +1361,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "HIP shared experts fusion requires the validated "
                     "clamped SiLU G1U1 activation."
                 )
+            if quant_config is not None and quant_config.get_name() == "quark":
+                return cls._quark_mxfp4_shared_fusion_disable_reason(
+                    text_config, quant_config
+                )
             if (
                 quant_config is None
                 or quant_config.get_name() != "fp8"
@@ -1410,6 +1392,51 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
         return None
 
+    @staticmethod
+    def _quark_mxfp4_shared_fusion_disable_reason(text_config, quant_config):
+        from sglang.srt.layers.quantization.quark.utils import (
+            deep_compare,
+            should_ignore_layer,
+        )
+
+        reason = (
+            "HIP shared experts fusion requires routed and shared experts to "
+            "use the same Quark MXFP4 layout."
+        )
+        if not quant_config.can_fuse_shared_expert():
+            return reason
+        lookup_stub = torch.nn.Module()
+        first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+        for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+            moe_prefix = f"model.layers.{layer_id}.mlp"
+            routed_name = f"{moe_prefix}.experts"
+            shared_names = [
+                f"{moe_prefix}.shared_experts.{proj}"
+                for proj in ("gate_up_proj", "down_proj")
+            ]
+            if any(
+                should_ignore_layer(
+                    name,
+                    ignore=quant_config.exclude_layers,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                )
+                for name in (routed_name, *shared_names)
+            ):
+                return reason
+            try:
+                routed = quant_config._find_matched_config(routed_name, lookup_stub)
+                shared = [
+                    quant_config._find_matched_config(name, lookup_stub)
+                    for name in shared_names
+                ]
+            except ValueError:
+                return reason
+            if not quant_config._is_mx_fp4(
+                routed.get("weight"), routed.get("input_tensors")
+            ) or not all(deep_compare(routed, cfg) for cfg in shared):
+                return reason
+        return None
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
@@ -1420,6 +1447,36 @@ class Glm5NextForConditionalGeneration(nn.Module):
             f"Only 1 fused shared expert is supported for {type(self).__name__}"
         )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+    def wants_prefill_autotune(self) -> bool:
+        backend = get_moe_runner_backend()
+        return (
+            (backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed())
+            and get_moe_a2a_backend().is_none()
+            and not is_dp_attention_enabled()
+        )
+
+    def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
+        seen = set()
+        for module in self.model.modules():
+            if not isinstance(module, Glm5NextMoE):
+                continue
+            experts = module.experts
+            key = (experts.w13_weight.shape, experts.w2_weight.shape)
+            if key in seen:
+                continue
+            seen.add(key)
+            hidden_states = torch.randn(
+                (num_tokens, module.gate.weight.shape[1]),
+                dtype=dtype,
+                device=experts.w13_weight.device,
+            )
+            router_logits = module.gate(hidden_states)
+            experts(hidden_states, module.topk(hidden_states, router_logits))
+            del hidden_states, router_logits
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+            return 0
+        return len(seen)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
@@ -1602,8 +1659,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def maybe_map_fp8_block_scale_name(name: str) -> str:
-            if name.endswith("weight_scale"):
-                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+            # Quark stores dequantization scales without native block-FP8's
+            # "_inv" suffix, including fused w13/w2 expert parameters.
+            if name not in params_dict and name.endswith("weight_scale"):
+                candidate = name + "_inv"
                 if candidate in params_dict:
                     return candidate
             return name
