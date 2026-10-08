@@ -2276,6 +2276,63 @@ class DeepseekV4AscendAttnBackend(
                         )
             except Exception as exc:
                 print(f"[SWAPOS] skipped: {exc}", flush=True)
+        if os.environ.get("DSV4_DUMP_BND"):
+            # Boundary-window fingerprint: hash the KV rows the attention reads
+            # for positions [bnd_lo, bnd_hi), keyed by position. Fires at the
+            # prefill (miss, start_pos=0) and at the boundary step (hit,
+            # start_pos=bnd_hi), so ONE server session (curl #1 = miss, curl #2 =
+            # hit) yields both sides and they can be diffed directly.
+            try:
+                sid = int(os.environ.get("DSV4_DUMP_BND", "0"))
+                bnd_lo = int(os.environ.get("DSV4_DUMP_BND_LO", "16256"))
+                bnd_hi = int(os.environ.get("DSV4_DUMP_BND_HI", "16384"))
+                _bp = getattr(fm, "start_pos", None)
+                sp = (
+                    int(_bp.reshape(-1)[-1].item())
+                    if torch.is_tensor(_bp) and _bp.numel()
+                    else -1
+                )
+                if 0 <= sp <= bnd_hi:
+                    pool = self.token_to_kv_pool
+                    ps = int(pool.swa_kv_pool.kernel_page_size)
+                    buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(sid)]
+                    tbl = getattr(fm, "swa_page_table", None)
+                    vals = (
+                        tbl[0].reshape(-1).tolist()
+                        if torch.is_tensor(tbl) and tbl.numel()
+                        else []
+                    )
+                    rp = forward_batch.req_pool_indices[:1].to(torch.int64)
+                    full = self.req_to_token[rp][0].to(torch.int64)
+                    if vals and full.numel() > bnd_hi:
+                        h = hashlib.md5()
+                        ids: list[int] = []
+                        unmapped = 0
+                        for p in range(bnd_lo, bnd_hi):
+                            col = p // ps
+                            pid = int(vals[col]) if col < len(vals) else -1
+                            if pid <= 0 or pid >= buf.shape[0]:
+                                unmapped += 1
+                                continue
+                            ids.append(pid)
+                            h.update(
+                                buf[pid, p % ps]
+                                .detach()
+                                .view(torch.uint8)
+                                .cpu()
+                                .numpy()
+                                .tobytes()
+                            )
+                        print(
+                            f"[BND] mode={forward_batch.forward_mode} start_pos={sp} "
+                            f"layer={sid} pos=[{bnd_lo},{bnd_hi}) n={len(ids)} "
+                            f"unmapped={unmapped} "
+                            f"ids=[{min(ids) if ids else -1},{max(ids) if ids else -1}] "
+                            f"md5={h.hexdigest()[:16]}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"[BND] skipped: {exc}", flush=True)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
