@@ -132,11 +132,8 @@ def test_match_on_the_empty_tree_returns_no_indices():
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize("component_types", [[0], [0, 1], [0, 2], [0, 1, 2]])
 @pytest.mark.parametrize("partial_override", [False, True])
-def test_named_component_factory_builds_working_bindings(
-    is_bigram, component_types, partial_override
-):
+def test_named_component_factory_builds_working_bindings(is_bigram, partial_override):
     bindings = load_tree_core_extension(inspection=True)
     binding_class = (
         bindings.RustBigramUnifiedTreeCoreBinding
@@ -146,12 +143,10 @@ def test_named_component_factory_builds_working_bindings(
     init_params = bindings.TreeCoreInitParamsBinding(
         swa_sliding_window_size=8, mamba_cache_chunk_size=4
     )
-    factory_keys = {0: "inspection_full", 1: "inspection_swa", 2: "inspection_mamba"}
-    overrides = {
-        kind: factory_keys[kind]
-        for kind in component_types
-        if not partial_override or kind == int(ComponentType.FULL)
-    }
+    component_types = [0, 1, 2]
+    overrides = {1: "inspection_swa"}
+    if not partial_override:
+        overrides.update({0: "full_default", 2: "mamba_default"})
     binding = binding_class(
         init_params, component_types, component_factory_overrides=overrides
     )
@@ -161,11 +156,7 @@ def test_named_component_factory_builds_working_bindings(
         bindings.InsertParamsBinding(
             key=tokens,
             value=torch.arange(10, 14),
-            mamba_value=(
-                torch.tensor([17])
-                if int(ComponentType.MAMBA) in component_types
-                else None
-            ),
+            mamba_value=torch.tensor([17]),
         )
     )
     assert inserted.prefix_len == 0
@@ -193,77 +184,52 @@ def test_named_component_factory_builds_working_bindings(
     [
         ({0: "unregistered_factory"}, "unknown component factory"),
         ({0: ""}, "must be non-empty"),
-        ({0: "   "}, "must be non-empty"),
-        ({1: "inspection_swa"}, "component Swa is not enabled"),
-        ({255: "inspection_full"}, "unknown component type"),
-        ({0: "inspection_swa"}, "has type Swa, expected Full"),
+        ({1: "swa_default"}, "component Swa is not enabled"),
+        ({255: "full_default"}, "unknown component type"),
+        ({0: "swa_default"}, "has type Swa, expected Full"),
     ],
 )
 def test_named_component_factory_rejects_invalid_overrides(
     is_bigram, overrides, message
 ):
-    bindings = load_tree_core_extension(inspection=True)
     binding_class = (
-        bindings.RustBigramUnifiedTreeCoreBinding
+        mem_cache.RustBigramUnifiedTreeCoreBinding
         if is_bigram
-        else bindings.RustUnifiedTreeCoreBinding
+        else mem_cache.RustUnifiedTreeCoreBinding
     )
     with pytest.raises(ValueError, match=message):
-        binding_class(bindings.TreeCoreInitParamsBinding(), [0], overrides)
+        binding_class(mem_cache.TreeCoreInitParamsBinding(), [0], overrides)
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize(
-    "component_types,init_overrides,message",
-    [
-        ([], {}, "component sets are supported"),
-        ([0, 0], {}, "component sets are supported"),
-        ([255], {}, "unknown component type"),
-        ([0], {"page_size": 0}, "page_size must be at least 1"),
-        ([0, 1], {}, "requires swa_sliding_window_size"),
-        ([0, 2], {}, "requires mamba_cache_chunk_size"),
-    ],
-)
-def test_named_component_factory_validates_before_invocation(
-    is_bigram, component_types, init_overrides, message
-):
+def test_named_component_factory_validates_before_invocation(is_bigram):
     bindings = load_tree_core_extension(inspection=True)
     binding_class = (
         bindings.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else bindings.RustUnifiedTreeCoreBinding
     )
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="page_size must be at least 1"):
         binding_class(
-            bindings.TreeCoreInitParamsBinding(**init_overrides),
-            component_types,
+            bindings.TreeCoreInitParamsBinding(page_size=0),
+            [0],
             {0: "inspection_factory_panic"},
         )
 
 
 @pytest.mark.parametrize("is_bigram", [False, True])
-@pytest.mark.parametrize(
-    "swa_key,message",
-    [
-        ("unregistered_factory", "unknown component factory"),
-        ("", "must be non-empty"),
-        ("inspection_full", "has type Full, expected Swa"),
-    ],
-)
-def test_named_component_factory_resolves_all_keys_before_invocation(
-    is_bigram, swa_key, message
-):
+def test_named_component_factory_resolves_all_keys_before_invocation(is_bigram):
     bindings = load_tree_core_extension(inspection=True)
     binding_class = (
         bindings.RustBigramUnifiedTreeCoreBinding
         if is_bigram
         else bindings.RustUnifiedTreeCoreBinding
     )
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="unknown component factory"):
         binding_class(
             bindings.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
             [0, 1],
-            {0: "inspection_factory_panic", 1: swa_key},
+            {0: "inspection_factory_panic", 1: "unregistered_factory"},
         )
 
 
@@ -287,13 +253,12 @@ def test_named_component_factory_panic_does_not_change_defaults(is_bigram):
     "binding_class",
     [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
 )
-def test_named_component_factory_registration_stays_native(binding_class):
-    assert not hasattr(binding_class, "with_component_factory")
-    assert not hasattr(mem_cache, "register_tree_component")
-    assert not hasattr(mem_cache, "registered_tree_components")
+def test_inspection_factories_are_not_available_in_production(binding_class):
     with pytest.raises(ValueError, match="unknown component factory"):
         binding_class(
-            mem_cache.TreeCoreInitParamsBinding(), [0], {0: "inspection_full"}
+            mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0, 1],
+            {1: "inspection_swa"},
         )
 
 

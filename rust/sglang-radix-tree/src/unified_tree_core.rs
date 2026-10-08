@@ -8,7 +8,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::registry::{TreeComponentKey, resolve_tree_component_factories};
+use crate::components::registry::{
+    TreeComponentFactorySnapshot, TreeComponentKey, resolve_tree_component_factories,
+};
 use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
@@ -807,20 +809,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     {
         let factories = resolve_tree_component_factories(&component_types, &HashMap::new())
             .unwrap_or_else(|error| panic!("{error}"));
-        Self::with_component_factory(params, component_types, |component_type, params| {
-            factories.create::<K>(component_type, params)
-        })
+        Self::with_component_factories(params, component_types, factories)
     }
 
-    /// Construct this tree's drivers with a factory invoked once per component kind.
-    pub fn with_component_factory(
+    /// Construct this tree's drivers from a previously resolved factory selection.
+    pub fn with_component_factories(
         params: CacheInitParams,
         component_types: Vec<ComponentType>,
-        mut factory: impl FnMut(
-            ComponentType,
-            &CacheInitParams,
-        ) -> Arc<dyn TreeComponent<K> + Send + Sync>,
-    ) -> Self {
+        factories: TreeComponentFactorySnapshot,
+    ) -> Self
+    where
+        K: TreeComponentKey,
+    {
         assert!(
             !component_types.is_empty(),
             "at least one component type is required"
@@ -877,12 +877,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ongoing_insert_walk_state: None,
         };
         for ct in &component_types {
-            let component = factory(*ct, &params);
-            assert_eq!(
-                component.component_type(),
-                *ct,
-                "component factory returned the wrong kind for {ct:?}"
-            );
+            let component = factories.create::<K>(*ct, &params);
             tree_core.register_component_(component);
         }
         tree_core

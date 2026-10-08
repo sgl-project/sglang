@@ -221,84 +221,6 @@ impl<K: ChildKeyType> TreeComponent<K> for CountingComponentForTest {
     }
 }
 
-fn exercise_component_factory<K: TreeComponentKey>(key: K) {
-    let counter = Arc::new(CountingComponentForTest::default());
-    let weak_counter = Arc::downgrade(&counter);
-    let validator_calls = Arc::clone(&counter.validator_calls);
-    let mut factory_calls = Vec::new();
-    let mut tc = UnifiedTreeCore::with_component_factory(
-        CacheInitParams {
-            swa_sliding_window_size: Some(4),
-            ..Default::default()
-        },
-        vec![FULL, SWA],
-        |component_type, params| {
-            factory_calls.push(component_type);
-            assert_eq!(params.swa_sliding_window_size, Some(4));
-            if component_type == SWA {
-                counter.clone()
-            } else {
-                Arc::new(components::FullComponent)
-            }
-        },
-    );
-    assert_eq!(factory_calls, [FULL, SWA]);
-    drop(counter);
-    assert!(weak_counter.upgrade().is_some());
-
-    for expected_calls in 1..=2 {
-        let values = Tensor::from_slice(&[10i64, 11]);
-        tc.add_new_node_(tc.arena.root(), key.clone(), &values, 0, None);
-        let result = tc.match_prefix(&MatchPrefixParams {
-            key: &key,
-            namespace: Default::default(),
-        });
-        assert!(result.device_indices.equal(&values));
-        assert_eq!(*validator_calls.lock().unwrap(), expected_calls);
-        tc.reset();
-    }
-    assert_eq!(factory_calls, [FULL, SWA]);
-    let default_core = UnifiedTreeCore::<K>::new(
-        CacheInitParams {
-            swa_sliding_window_size: Some(4),
-            ..Default::default()
-        },
-        vec![FULL, SWA],
-    );
-    assert!(!Arc::ptr_eq(
-        &default_core.component_by_type_(SWA),
-        &tc.component_by_type_(SWA),
-    ));
-    drop(tc);
-    assert!(weak_counter.upgrade().is_none());
-}
-
-#[test]
-fn component_factory_is_instance_local_and_survives_reset_for_both_key_types() {
-    exercise_component_factory(vec![1i64, 2]);
-    exercise_component_factory(vec![(1i64, 2i64), (2, 3)]);
-}
-
-#[test]
-#[should_panic(expected = "component factory returned the wrong kind for Full")]
-fn component_factory_rejects_a_different_kind() {
-    UnifiedTreeCore::<Vec<i64>>::with_component_factory(
-        CacheInitParams::default(),
-        vec![FULL],
-        |_, _| Arc::new(CountingComponentForTest::default()),
-    );
-}
-
-#[test]
-#[should_panic(expected = "duplicate component type Full")]
-fn component_factory_rejects_duplicates_before_invoking_the_factory() {
-    UnifiedTreeCore::<Vec<i64>>::with_component_factory(
-        CacheInitParams::default(),
-        vec![FULL, FULL],
-        |_, _| panic!("factory must not run for duplicate component types"),
-    );
-}
-
 fn exercise_registered_factory<K: TreeComponentKey>(key: K) {
     let registry = TreeComponentRegistry::default();
     let validator_calls = Arc::new(Mutex::new(0));
@@ -332,11 +254,7 @@ fn exercise_registered_factory<K: TreeComponentKey>(key: K) {
         ..Default::default()
     };
     let default_driver = defaults.create::<K>(SWA, &params);
-    let mut tc = UnifiedTreeCore::with_component_factory(
-        params,
-        component_types,
-        |component_type, params| selected.create::<K>(component_type, params),
-    );
+    let mut tc = UnifiedTreeCore::with_component_factories(params, component_types, selected);
     assert!(!Arc::ptr_eq(&default_driver, &tc.component_by_type_(SWA)));
     for expected_calls in 1..=2 {
         let values = Tensor::from_slice(&[10i64, 11]);
