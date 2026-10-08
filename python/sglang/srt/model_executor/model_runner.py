@@ -666,7 +666,7 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
-        # drafts publish once the spec worker binds the target's embed and head (Scheduler.maybe_init_draft_worker)
+        # drafts publish once the spec worker binds the target's embed and head (Scheduler.init_memory_pools)
         if not self.is_draft_worker:
             self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info(
                 role="target"

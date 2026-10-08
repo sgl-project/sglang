@@ -102,47 +102,44 @@ class TestPublicationRoles(CustomTestCase):
             get("get_parallelism_config", role="draft"), {"published_by": "draft"}
         )
 
-    def test_drafts_publish_after_the_draft_worker_is_built(self):
-        """Building the draft worker replaces the draft's embed and head with the target's; a table published
-        before that holds freed addresses."""
+    def test_drafts_publish_once_their_pools_bind_the_targets_embed_and_head(self):
+        """EAGLE binds the target's embed and head into its draft while allocating the draft's pools; a table
+        published before that holds the draft's own embed and head, which are freed."""
         events = []
 
         class _Transporter:
-            def __init__(self):
-                self.weight_info = None
-
             def maybe_register_and_publish_weight_info(self, role):
                 events.append(("published", role))
 
         runner = SimpleNamespace(remote_instance_weight_transporter=_Transporter())
 
         class _DraftWorker:
-            def __init__(self, **kwargs):
-                events.append("built")
+            def alloc_memory_pool(self, **kwargs):
+                events.append("bound the target's embed and head")
+
+            def init_hicache_draft_plan(self):
+                pass
 
             def weight_update_runners(self):
                 return [("draft", runner)]
 
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = None
-        scheduler.nccl_port = 0
-        scheduler.tp_worker = None
-        scheduler.spec_algorithm = SimpleNamespace(
-            is_none=lambda: False,
-            is_ngram=lambda: False,
-            create_worker=lambda server_args: _DraftWorker,
+        scheduler.init_target_memory_pool = lambda: None
+        scheduler.tp_worker = SimpleNamespace(
+            get_memory_pool=lambda: (None, None),
+            model_runner=SimpleNamespace(memory_pool_config=None),
         )
-        with (
-            patch.object(
-                scheduler_mod, "get_device", lambda: SimpleNamespace(gpu_id=0)
-            ),
-            patch.object(
-                scheduler_mod, "get_parallel", lambda: SimpleNamespace(pp_size=1)
-            ),
+        scheduler.draft_worker = _DraftWorker()
+        with patch.object(
+            scheduler_mod.kv_cache_builder,
+            "resolve_decode_retraction_backup",
+            lambda tp_worker: None,
         ):
-            scheduler.maybe_init_draft_worker()
+            scheduler.init_memory_pools()
 
-        self.assertEqual(events, ["built", ("published", "draft")])
+        self.assertEqual(
+            events, ["bound the target's embed and head", ("published", "draft")]
+        )
 
 
 if __name__ == "__main__":
