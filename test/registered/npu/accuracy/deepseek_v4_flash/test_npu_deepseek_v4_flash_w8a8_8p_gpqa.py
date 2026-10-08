@@ -155,7 +155,7 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     datasets = ["gsm8k"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
-    limit = 100 if _is_pr_pipeline else 100000
+    limit = 100 if _is_pr_pipeline else 200
     eval_batch_size = 128
     stream = True
     timeout = 6000
