@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -64,7 +64,7 @@ class DecodeHiCachePreallocMixin:
     def _build_decode_prefix_match(
         self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
     ) -> DecodePrefixMatch:
-        """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
+        """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
         Performs the optional L3 storage hit length query when decode-side
         HiCache is enabled and the last host node is backed up.
@@ -211,13 +211,12 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_indices updated to current device state.
-        rematch = match_prefix_for_req(
-            self.tree_cache,
+        # Re-match: req.last_node / prefix_len updated to current device state.
+        rematch = match_kv_cache(
             dr.req,
+            self.tree_cache,
             dr.req.origin_input_ids,
             cow_mamba=False,
-            include_req=True,
             max_prefix_len=pm.decode_prefix_len,
         )
         new_indices, restored_node = self.tree_cache.init_load_back(
@@ -317,9 +316,7 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
-        req.prefix_indices = torch.cat(
-            [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
-        )
+        req.prefix_len = prefix_match.decode_prefix_len
         req.last_node = restore_lock.node
         req.lock = restore_lock
         # Prevent abort cleanup from releasing the transferred lock.

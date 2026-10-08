@@ -26,7 +26,7 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
-from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
@@ -387,18 +387,39 @@ class TestGetDcpLens(CustomTestCase):
         v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
 
         for tp_rank in range(4):
-            layer = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=head_size,
-                total_num_heads=8,
-                total_num_kv_heads=2,
-                bias=False,
-                params_dtype=torch.float32,
-                tp_rank=tp_rank,
+            group = SimpleNamespace(rank_in_group=tp_rank, world_size=4)
+            with rc.get_parallel().override(
+                tp_group=group,
+                attn_tp_group=group,
                 tp_size=4,
-                kv_tp_rank=tp_rank // 2,
-                kv_tp_size=2,
-            )
+                tp_rank=tp_rank,
+                attn_tp_rank=tp_rank,
+                moe_tp_rank=tp_rank,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                moe_ep_rank=0,
+                dcp_rank=tp_rank % 2,
+                **rc.derive_parallel_widths(
+                    tp_size=4,
+                    attn_cp_size=1,
+                    attn_dp_size=1,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    dcp_size=2,
+                    dcp_enabled=True,
+                ),
+            ):
+                layer = QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=8,
+                    total_num_kv_heads=2,
+                    bias=False,
+                    params_dtype=torch.float32,
+                    parallel_group="attn_tp",
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                )
             layer.weight_loader(layer.weight, q_weight, "q")
             layer.weight_loader(layer.weight, k_weight, "k")
             layer.weight_loader(layer.weight, v_weight, "v")
