@@ -91,8 +91,6 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
-    from sglang.srt.runtime_context import get_parallel
-
     from .dense_blocks import DenseBlocksBackend
 
     use_deep_gemm_prefill = _use_deep_gemm_prefill()
@@ -125,8 +123,9 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
     )
-    # A CP rank's rows are an interleaved subset of the batch; the torch prefill
-    # env keeps the sparse table on decode only.
-    if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
+    # CP already supplies rank-local query rows and page-table rows. The sparse
+    # schedule pairs local rows within each request, not consecutive positions.
+    # Only the torch prefill path keeps the sparse table on decode alone.
+    if not use_deep_gemm_prefill:
         return dense_blocks, sparse_table
     return sparse_table, sparse_table
