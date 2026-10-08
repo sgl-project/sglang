@@ -57,7 +57,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapp
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
-    PrepareLoadBackResult,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -68,10 +67,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.pool_host import HostPoolGroup
-    from sglang.srt.mem_cache.unified_cache.components import (
-        MambaComponent,
-        SWAComponent,
-    )
+    from sglang.srt.mem_cache.unified_cache.components import SWAComponent
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
@@ -150,14 +146,6 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     aux_device_releases: list[tuple[PoolName, torch.Tensor]]
 
 
-class _MambaHandoff(msgspec.Struct):
-    """Two H2D destinations sharing a host slot."""
-
-    node_copy: PoolTransfer
-    request_copy: PoolTransfer
-    prep: PrepareLoadBackResult
-
-
 class _AnchorLock(msgspec.Struct):
     """Pins a staged prefetch's FULL device anchor until consumption."""
 
@@ -169,7 +157,6 @@ def validate_buffer_only_stack(
     sidecar_pool_specs: list[SidecarPoolSpec],
     host_pool_group: HostPoolGroup,
     swa_component: Optional[SWAComponent],
-    mamba_component: Optional[MambaComponent],
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Post-assembly buffer-mode fences.
@@ -248,22 +235,6 @@ def validate_buffer_only_stack(
                 "large enough for two minimum Full/SWA transfers "
                 f"({requirement}; got {capacity}): one staging a write "
                 "while one stays reserved for prefetch window allocs."
-            )
-    mamba = mamba_component
-    if mamba is not None:
-        host = mamba._mamba_pool_host
-        if host is None or host.size < 2:
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only on Mamba models "
-                "requires a Mamba host staging pool of at least two state "
-                f"slots (got {0 if host is None else host.size}): one "
-                "staging a write while one stays in the loads reserve."
-            )
-        if mamba.int8_ckpt_pool is not None:
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only does not support "
-                "int8 Mamba checkpoints: the load-back restores into a raw "
-                "Mamba state slot, not a checkpoint slot."
             )
 
 
@@ -738,14 +709,13 @@ class BufferModePipeline:
                 return True
         return anchor_need > cc.mem_pool_host.size
 
-    def _aux_loads_margin(self, pool_name: PoolName, host_pool) -> int:
-        """Reserve at least one prefetch allocation or 10% of the aux pool."""
-        one_prefetch_alloc = (
-            self._swa_window_pages * host_pool.page_size
-            if pool_name == PoolName.SWA
-            else host_pool.page_size
-        )
-        return max(one_prefetch_alloc, host_pool.size // 10)
+    def _aux_loads_margin(self, pool: PoolName, host_pool) -> int:
+        """Aux-pool tokens reserved for loads: at least one prefetch
+        allocation (an SWA trailing window, else one page; a failed alloc
+        forfeits the whole prefetch), plus a 10% burst absorber mirroring
+        live_cap."""
+        one_prefetch = self._swa_window_pages if pool == PoolName.SWA else 1
+        return max(one_prefetch * host_pool.page_size, host_pool.size // 10)
 
     def _validate_backup_intent(
         self, intent: _UnifiedBackupIntent
@@ -1259,7 +1229,16 @@ class BufferModePipeline:
         if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
-            self._resolve_device_covered(req)
+            self._drop_staged_hit(req, reason="device_covered")
+            return True
+        mamba_slots = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.MAMBA and t.host_indices is not None
+        )
+        if not mamba_slots and ComponentType.MAMBA in self._cache.components:
+            # A span is reusable only up to the recurrent state ending it.
+            self._drop_staged_hit(req, reason="no_mamba_state")
             return True
         key = RadixKey(
             f.key_tokens,
@@ -1288,14 +1267,8 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.SWA and t.host_indices is not None
         )
-        # Charged so the adder's Mamba gate reserves the slot consumption binds.
-        mamba_slots = sum(
-            len(t.host_indices)
-            for t in f.aux_xfers
-            if t.name == PoolName.MAMBA and t.host_indices is not None
-        )
         if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
-            self._resolve_device_covered(req)
+            self._drop_staged_hit(req, reason="device_covered")
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
@@ -1310,21 +1283,45 @@ class BufferModePipeline:
         )
         return True
 
-    def _resolve_device_covered(self, req: Req) -> None:
-        self._clear_staged_hit(req)
-        self.release_staged_hold(req.cache_request_handle, reason="device_covered")
-
     def _drop_staged_hit(self, req: Req, reason: str) -> None:
-        self.release_staged_hold(req.cache_request_handle, reason=reason)
-        self._clear_staged_hit(req)
-
-    @classmethod
-    def _clear_staged_hit(cls, req: Req) -> None:
         req.staged_prefetch_plan = None
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
-        cls._clear_storage_hit(req)
+        self._clear_storage_hit(req)
+        self.release_staged_hold(req.cache_request_handle, reason=reason)
+
+    def defer_staged_admission(self, req: Req, *, pool: str) -> None:
+        """Retry a staged hit the device cannot take yet, a bounded number of
+        times, then drop it so the request recomputes."""
+        request = req.cache_request_handle
+        f = self.staged_prefetches.get(request)
+        if f is None:
+            return
+        defers = self._staged_admission_defers.get(request, 0) + 1
+        self._staged_admission_defers[request] = defers
+        self._cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
+        if defers < self.max_staged_admission_defers:
+            logger.warning(
+                "HiCache staged prefetch deferred at admission req=%s "
+                "reason=device_capacity pool=%s tokens=%d defers=%d",
+                req.rid,
+                pool,
+                f.num_tokens,
+                defers,
+            )
+            return
+        # Still unmaterializable: drop the hold so the admission loop stops
+        # breaking on this request, which recomputes on its next pass.
+        logger.warning(
+            "HiCache staged prefetch dropped after %d device_capacity "
+            "deferrals req=%s pool=%s tokens=%d",
+            defers,
+            req.rid,
+            pool,
+            f.num_tokens,
+        )
+        self._drop_staged_hit(req, reason="device_capacity")
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1420,85 +1417,6 @@ class BufferModePipeline:
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
         return True
 
-    def _prepare_mamba_handoff(
-        self, f: _StagedPrefetch, req: Req
-    ) -> Optional[_MambaHandoff]:
-        """Bind node and request H2D destinations to the staged checkpoint.
-
-        None ends this admission attempt; the next round rebuilds the joint prefix.
-        """
-        mamba = self._cache.components[ComponentType.MAMBA]
-        node_copy = next(
-            (
-                t
-                for t in f.aux_xfers
-                if t.name == PoolName.MAMBA
-                and t.host_indices is not None
-                and t.host_indices.numel() > 0
-            ),
-            None,
-        )
-        if node_copy is None:
-            # A span is only reusable up to the recurrent state that ends it,
-            # and the tail node cannot be published without one.
-            logger.warning(
-                "HiCache staged prefetch dropped req=%s reason=no_mamba_state "
-                "tokens_wasted=%d",
-                req.rid,
-                f.num_tokens,
-            )
-            self._drop_staged_hit(req, reason="no_mamba_state")
-            return None
-        prep = mamba.prepare_buffer_load_back(req)
-        if prep is None:
-            self.defer_staged_admission(req, pool="mamba")
-            return None
-        return _MambaHandoff(
-            node_copy=node_copy,
-            request_copy=PoolTransfer(
-                name=PoolName.MAMBA,
-                host_indices=node_copy.host_indices,
-                device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
-            ),
-            prep=prep,
-        )
-
-    def defer_staged_admission(self, req: Req, *, pool: str) -> None:
-        """Bound capacity retries before releasing a staged hit for recomputation.
-
-        The caller must end this admission attempt, including after a drop:
-        the next round's joint match must rebuild the FULL-only splice prefix.
-        """
-        request = req.cache_request_handle
-        f = self.staged_prefetches.get(request)
-        if f is None:
-            return
-        cache = self._cache
-        defers = self._staged_admission_defers.get(request, 0) + 1
-        self._staged_admission_defers[request] = defers
-        cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
-        if defers < self.max_staged_admission_defers:
-            logger.warning(
-                "HiCache staged prefetch deferred at admission req=%s "
-                "reason=device_capacity pool=%s tokens=%d defers=%d",
-                req.rid,
-                pool,
-                f.num_tokens,
-                defers,
-            )
-            return
-        # Still unmaterializable: drop the hold so the admission loop stops
-        # breaking on this request, which recomputes on its next pass.
-        logger.warning(
-            "HiCache staged prefetch dropped after %d device_capacity "
-            "deferrals req=%s pool=%s tokens=%d",
-            defers,
-            req.rid,
-            pool,
-            f.num_tokens,
-        )
-        self._drop_staged_hit(req, reason="device_capacity")
-
     def init_load_back(
         self, params: InitLoadBackParams
     ) -> Optional[tuple[int, NodeId]]:
@@ -1506,12 +1424,14 @@ class BufferModePipeline:
 
         The caller has finished selecting its prefill shape and must acquire
         the request lock after success, without further admission gates. The
-        prefix lock protects allocation-time eviction. None ends the attempt;
-        staging is retained until the bounded admission deferral drops it.
+        prefix lock protects allocation-time eviction. None retains staging
+        and its anchor for the next admission attempt.
 
-        Ownership contract: cc.load queues H2D before insert adjudicates
-        ownership. The prepared boundary must preserve FULL destinations;
-        redundant auxiliary destinations remain live until the transfer ack."""
+        Ownership contract: cc.load queues the H2D before insert adjudicates
+        ownership, so the prepared boundary must ensure the insert can only
+        ADD FULL nodes — a dedup would free slots the in-flight copy still
+        targets (queued use-after-free). Redundant aux destinations live
+        until the transfer ack."""
         cache = self._cache
         req = params.req
         assert req is not None
@@ -1577,15 +1497,18 @@ class BufferModePipeline:
             ),
             0,
         )
-        mamba = cache.components.get(ComponentType.MAMBA)
-        handoff = None
-        if mamba is not None:
-            handoff = self._prepare_mamba_handoff(f, req)
-            if handoff is None:
-                return None
-            # Not staging (its host slots are the node copy's), so it stays
-            # out of the aux_xfers the ack frees.
-            load_xfers.append(handoff.request_copy)
+        shares = []
+        for component in cache.components.values():
+            share = component.prepare_buffer_load_back(req, f.aux_xfers)
+            if share is None:
+                for prepared in shares:
+                    prepared.finish(success=False)
+                return self.defer_staged_admission(
+                    req, pool=component.component_type.name.lower()
+                )
+            shares.append(share)
+            # Not staging, so these stay out of the aux_xfers the ack frees.
+            load_xfers.extend(share.load_xfers)
         swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
         binds_swa_to_full = (
             swa_entry is not None
@@ -1637,10 +1560,8 @@ class BufferModePipeline:
             node_id=load_back_id,
             extra_pools=load_xfers or None,
         )
-        if handoff is not None:
-            mamba.finalize_buffer_load_back(
-                req, handoff.prep, success=device_indices is not None
-            )
+        for share in shares:
+            share.finish(success=device_indices is not None)
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
@@ -1725,26 +1646,22 @@ class BufferModePipeline:
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
         # prev_prefix_len covers the already-device-resident head.
+        insert_fields = {}
+        for share in shares:
+            insert_fields.update(share.insert_fields())
         insert_result = cache.insert(
             InsertParams(
                 key=key,
                 value=torch.cat([prefix_indices, device_indices]),
-                mamba_value=(
-                    handoff.node_copy.device_indices if handoff is not None else None
-                ),
                 prev_prefix_len=splice_base,
                 component_evicted_seqlens={
                     ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0
                 },
+                **insert_fields,
             )
         )
-        if insert_result.mamba_exist:
-            assert handoff is not None
-            # A SWA-only repair can retain the tail's existing checkpoint.
-            # Keep the redundant H2D destination alive until its transfer ack.
-            aux_device_releases.append(
-                (PoolName.MAMBA, handoff.node_copy.device_indices)
-            )
+        for share in shares:
+            aux_device_releases.extend(share.redundant_destinations(insert_result))
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(
             request=f.request,
             num_tokens=load_tokens,

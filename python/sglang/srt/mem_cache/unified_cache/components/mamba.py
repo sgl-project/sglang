@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
+    BufferLoadBack,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -715,16 +716,6 @@ class MambaComponent(TreeComponent):
         assert dst is not None, "Cannot alloc mamba for load_back"
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
-    def finalize_load_back(
-        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
-    ) -> None:
-        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
-        if not success and prep.allocated_mamba_slot is not None:
-            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
-            req.kv.mamba_pool_idx = None
-
-    # ---- Buffer-mode load-back handoff ----
-
     def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
@@ -734,30 +725,46 @@ class MambaComponent(TreeComponent):
             req.kv.mamba_pool_idx = dst[0]
         return dst
 
-    def prepare_buffer_load_back(self, req: Req) -> Optional[PrepareLoadBackResult]:
-        """Ensure a request slot; None if eviction cannot free one."""
-        if req.kv.holds_mamba:
-            return PrepareLoadBackResult()
-        dst = self._alloc_request_state_slot(req)
-        if dst is None:
-            return None
-        return PrepareLoadBackResult(allocated_mamba_slot=dst)
-
-    def finalize_buffer_load_back(
-        self, req: Req, prep: PrepareLoadBackResult, success: bool
+    def finalize_load_back(
+        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
-        """Roll back on failure; on success the H2D supersedes replay and CoW/clear."""
-        if not success:
-            self.finalize_load_back(req, prep, success=False)
-            return
-        write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
-        if write_pos is not None and req.kv.mamba_pool_idx is not None:
-            slot = self.cache.req_to_token_pool.translate_mamba_indices(
-                req.kv.mamba_pool_idx.unsqueeze(0)
+        # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
+        if not success and prep.allocated_mamba_slot is not None:
+            self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
+            req.kv.mamba_pool_idx = None
+
+    def validate_buffer_mode(self) -> None:
+        host = self._mamba_pool_host
+        if host is None or host.size < 2:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only on Mamba models needs a "
+                "Mamba host staging pool of at least two state slots (got "
+                f"{0 if host is None else host.size}): one staging a write "
+                "while one stays in the loads reserve."
             )
-            write_pos[slot] = 0
-        req.kv.mamba_cow_src_index = None
-        req.kv.mamba_needs_clear = False
+        if self.int8_ckpt_pool is not None:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only does not support int8 "
+                "Mamba checkpoints: the load-back restores into a raw state slot."
+            )
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBack]:
+        node_copy = next(
+            t
+            for t in staged
+            if t.name == PoolName.MAMBA
+            and t.host_indices is not None
+            and t.host_indices.numel() > 0
+        )
+        prep = PrepareLoadBackResult()
+        if not req.kv.holds_mamba:
+            dst = self._alloc_request_state_slot(req)
+            if dst is None:
+                return None
+            prep = PrepareLoadBackResult(allocated_mamba_slot=dst)
+        return _MambaBufferLoadBack(self, req, node_copy, prep)
 
     def prepare_prefetch(
         self,
@@ -1014,3 +1021,52 @@ class MambaComponent(TreeComponent):
         raise AssertionError(
             f"MambaComponent: unhandled ComponentAction {type(action).__name__}"
         )
+
+
+class _MambaBufferLoadBack(BufferLoadBack):
+    """Loads the staged state into the published node's slot and, layer-gated,
+    into the request's own: a device CoW would run before the layer gate."""
+
+    def __init__(
+        self,
+        component: MambaComponent,
+        req: Req,
+        node_copy: PoolTransfer,
+        prep: PrepareLoadBackResult,
+    ):
+        self.component = component
+        self.req = req
+        self.node_copy = node_copy
+        self.prep = prep
+        self.load_xfers = (
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=node_copy.host_indices,
+                device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+            ),
+        )
+
+    def finish(self, success: bool) -> None:
+        req = self.req
+        if not success:
+            self.component.finalize_load_back(req, self.prep, success=False)
+            return
+        # The H2D supersedes the replay cursor and the deferred CoW/clear.
+        req_to_token_pool = self.component.cache.req_to_token_pool
+        write_pos = req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            slot = req.kv.mamba_pool_idx.unsqueeze(0)
+            write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+
+    def insert_fields(self) -> dict[str, torch.Tensor]:
+        return {"mamba_value": self.node_copy.device_indices}
+
+    def redundant_destinations(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        # A SWA-only repair can keep the tail's existing checkpoint.
+        if not insert_result.mamba_exist:
+            return []
+        return [(PoolName.MAMBA, self.node_copy.device_indices)]

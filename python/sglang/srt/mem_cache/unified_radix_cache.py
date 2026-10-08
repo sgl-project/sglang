@@ -412,8 +412,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # Anything outside this set (e.g. the DSv4 compressed regions)
-            # has no per-pool staging path.
+            # Other components (e.g. the DSv4 compressed regions) have no
+            # buffer-mode staging path.
             supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
@@ -481,9 +481,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
-                mamba_component=self.components.get(ComponentType.MAMBA),
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
+            for component in self.components.values():
+                component.validate_buffer_mode()
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
                 max_context_len=get_model().context_length or 0,

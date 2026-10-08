@@ -3430,32 +3430,6 @@ class UnifiedRadixCacheSuite:
             time.sleep(0.01)
         self.fail(f"prefetch {req_id} did not complete in time")
 
-    def _load_back_req(
-        self,
-        cache,
-        req_id,
-        prefix_len,
-        *,
-        extra_key=None,
-        cache_salt=None,
-        last_node=None,
-    ):
-        """Use a real Req so mock auto-attributes cannot masquerade as slots."""
-        req = Req(
-            rid=req_id.rid,
-            origin_input_text="",
-            origin_input_ids=array("q"),
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-            extra_key=extra_key,
-            cache_salt=cache_salt,
-        )
-        # The staged hold is keyed by the handle the prefetch was issued under,
-        # not by a fresh attempt-0 handle.
-        req.cache_request_handle = req_id
-        req.last_node = cache.root_node_handle() if last_node is None else last_node
-        req.prefix_len = prefix_len
-        return req
-
     def _consume_staged_prefetch(
         self,
         cache,
@@ -3479,14 +3453,13 @@ class UnifiedRadixCacheSuite:
         f = cache.buffer_pipeline.staged_prefetches[req_id]
         if prefix_len is None:
             prefix_len = f.matched_len
-        req = self._load_back_req(
-            cache,
-            req_id,
-            prefix_len,
-            extra_key=extra_key,
-            cache_salt=cache_salt,
-            last_node=last_node,
-        )
+        req = mock.Mock()
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = extra_key
+        req.cache_salt = cache_salt
+        req.prefix_len = prefix_len
+        req.last_node = cache.root_node_handle() if last_node is None else last_node
         joint = cache.match_prefix(
             MatchPrefixParams(
                 key=RadixKey(
@@ -3960,7 +3933,13 @@ class UnifiedRadixCacheSuite:
         cache, _, _ = build_fixture(self.cfg)
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        self._init_buffer_hicache(cache, storage_dir)
+        self._init_hicache(
+            cache,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            host_memory_mode="buffer_only",
+        )
 
     def _init_buffer_hicache(
         self,
@@ -3970,6 +3949,11 @@ class UnifiedRadixCacheSuite:
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
     ):
+        if self.cfg.has_mamba:
+            self.skipTest(
+                "load-back requests here are Mocks; buffer_only Mamba is "
+                "covered by TestUnifiedHybridBufferOnlyBitExact"
+            )
         self._init_hicache(
             cache,
             storage_backend="file",
@@ -4026,7 +4010,7 @@ class UnifiedRadixCacheSuite:
     def _produce_buffer_l3(
         self, storage_dir, seq, marker=None, *, extra_key=None, cache_salt=None
     ):
-        """Push seq to L3; returns (leaf, expected_kv, expected_mamba)."""
+        """Producer tree in buffer mode: insert seq and push it to L3."""
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(prod, storage_dir)
         self._insert(
@@ -4039,49 +4023,17 @@ class UnifiedRadixCacheSuite:
         )
         key = RadixKey(array("q", seq), extra_key=extra_key, cache_salt=cache_salt)
         leaf = prod.match_prefix(MatchPrefixParams(key=key)).last_device_node
-        expected_kv = None
-        expected_mamba = None
+        expected = None
         if marker is not None:
             m = prod.match_prefix(MatchPrefixParams(key=key))
-            prefix = prod.path_device_indices(m.last_device_node)
-            self._fill_full_kv(prod_alloc, prefix, marker=marker)
-            expected_kv = self._snapshot_full_kv(prod_alloc, prefix)
-            if self.cfg.has_mamba:
-                state = (
-                    prod.resolve_node_handle(leaf)
-                    .component_data[ComponentType.MAMBA]
-                    .value
-                )
-                self._fill_mamba_state(prod_rtp, state, marker=marker + 11)
-                expected_mamba = self._snapshot_mamba_state(prod_rtp, state)
-        self._buffer_backup_and_wait(prod, leaf)
-        return leaf, expected_kv, expected_mamba
-
-    def _assert_mamba_state_restored(
-        self, cache, req_to_token_pool, req, leaf, expected
-    ):
-        expected_temporal, expected_conv = expected
-        node_state = (
-            cache.resolve_node_handle(leaf).component_data[ComponentType.MAMBA].value
-        )
-        self.assertIsNotNone(node_state, "published node carries no Mamba state")
-        self.assertIsNotNone(req.kv.mamba_pool_idx, "request bound no Mamba state slot")
-        self.assertIsNone(req.kv.mamba_cow_src_index)
-        self.assertFalse(req.kv.mamba_needs_clear)
-        for label, indices in (
-            ("node", node_state),
-            ("request", req.kv.mamba_pool_idx.unsqueeze(0)),
-        ):
-            temporal, conv = self._snapshot_mamba_state(req_to_token_pool, indices)
-            self.assertTrue(
-                torch.equal(temporal, expected_temporal),
-                f"{label} temporal state does not match the producer's",
+            self._fill_full_kv(
+                prod_alloc, prod.path_device_indices(m.last_device_node), marker=marker
             )
-            for actual, want in zip(conv, expected_conv):
-                self.assertTrue(
-                    torch.equal(actual, want),
-                    f"{label} conv state does not match the producer's",
-                )
+            expected = self._snapshot_full_kv(
+                prod_alloc, prod.path_device_indices(m.last_device_node)
+            )
+        self._buffer_backup_and_wait(prod, leaf)
+        return leaf, expected
 
     def _buffer_swa_seq(self, min_pages=4):
         """Sequence long enough for SWA prefetch (one full window + 1)."""
@@ -4468,12 +4420,11 @@ class UnifiedRadixCacheSuite:
         Data bytes match the producer's; no CPU-tier KV events anywhere;
         declines feed the outcome counters."""
         self._skip_unsupported_hicache_test()
-        self._skip_mamba_state_inspect_on_rust()
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
         seq = self._buffer_swa_seq()
-        _, (expected_k, expected_v), expected_mamba = self._produce_buffer_l3(
+        _, (expected_k, expected_v) = self._produce_buffer_l3(
             storage_dir, seq, marker=7
         )
 
@@ -4539,7 +4490,13 @@ class UnifiedRadixCacheSuite:
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = self._load_back_req(cons, req_id, held.matched_len)
+        req = mock.Mock()
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.last_node = cons.root_node_handle()
+        req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced_len, spliced_node = cons.init_load_back(
             InitLoadBackParams(
@@ -4588,9 +4545,6 @@ class UnifiedRadixCacheSuite:
         )
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
-        if self.cfg.has_mamba:
-            # H2D must fill both the published node and the request slot.
-            self._assert_mamba_state_restored(cons, cons_rtp, req, leaf, expected_mamba)
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         cpu_events = [
             e
@@ -4927,7 +4881,13 @@ class UnifiedRadixCacheSuite:
 
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = self._load_back_req(cons, req_id, held.matched_len)
+        req = mock.Mock()
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.last_node = cons.root_node_handle()
+        req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced_len, last_node = cons.init_load_back(
             InitLoadBackParams(
@@ -5196,7 +5156,7 @@ class UnifiedRadixCacheSuite:
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
         seq = self._buffer_swa_seq()
-        _, expected_kv, _ = self._produce_buffer_l3(storage_dir, seq, marker=3)
+        _, expected_kv = self._produce_buffer_l3(storage_dir, seq, marker=3)
         split_at = len(seq) - page_size
 
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
@@ -5369,7 +5329,13 @@ class UnifiedRadixCacheSuite:
             return real_load(*args, **kwargs)
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = self._load_back_req(cons, req_id, 0)
+        req = mock.Mock()
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.prefix_len = 0
+        req.last_node = cons.root_node_handle()
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         with mock.patch.object(cons.cache_controller, "load", adversarial_load):
             with self.assertRaisesRegex(RuntimeError, "ownership violation"):
@@ -5410,7 +5376,7 @@ class UnifiedRadixCacheSuite:
             self._assert_sibling_head_is_trimmed(storage_dir, seq, window_sized=True)
 
     def _assert_sibling_head_is_trimmed(self, storage_dir, seq, window_sized: bool):
-        _, (expected_k, expected_v), _ = self._produce_buffer_l3(
+        _, (expected_k, expected_v) = self._produce_buffer_l3(
             storage_dir, seq, marker=9
         )
 
@@ -6090,12 +6056,6 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
-
-    def _skip_mamba_state_inspect_on_rust(self):
-        # The Mamba oracle below reads the published node's state slot through
-        # resolve_node_handle, and the Rust tree core has no node_by_id yet.
-        if self.cfg.has_mamba and _selected_tree_core_test_backend() == "rust":
-            self.skipTest("Mamba node-state inspection is Python-core only")
 
     def _simulate_backup(self, cache, node):
         """Simulate D->H backup over the whole root->node path (parent-first)."""
