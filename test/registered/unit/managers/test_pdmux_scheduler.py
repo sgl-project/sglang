@@ -51,10 +51,14 @@ class TestPDMuxScheduler(unittest.TestCase):
         extend_num_tokens=128000,
         scheduler_global_num_tokens=None,
         token_budget=65536,
+        max_split_forward_layers=0,
     ):
         return SimpleNamespace(
             model_config=SimpleNamespace(num_hidden_layers=61),
-            pdmux_config=SimpleNamespace(split_forward_token_budget=token_budget),
+            pdmux_config=SimpleNamespace(
+                split_forward_token_budget=token_budget,
+                max_split_forward_layers=max_split_forward_layers,
+            ),
             running_batch=_Batch(decode_empty),
             split_prefill_batch=SimpleNamespace(
                 split_index=split_index,
@@ -62,6 +66,66 @@ class TestPDMuxScheduler(unittest.TestCase):
                 scheduler_global_num_tokens=scheduler_global_num_tokens,
             ),
         )
+
+    def test_layer_cap_respects_token_budget_and_remaining_layers(self):
+        decode_batch = SimpleNamespace(scheduler_global_num_tokens=[1])
+        cases = (
+            (2048, 0, 2, 2),
+            (131072, 0, 2, 1),
+            (4096, 60, 2, 1),
+            (4096, 0, 0, 16),
+        )
+        for tokens, split_index, cap, expected in cases:
+            with self.subTest(tokens=tokens, split_index=split_index, cap=cap):
+                scheduler = self._make_scheduler(
+                    decode_empty=False,
+                    split_index=split_index,
+                    extend_num_tokens=tokens,
+                    max_split_forward_layers=cap,
+                )
+                self.assertEqual(
+                    SchedulerMultiplexMixin._get_split_forward_count(
+                        scheduler, decode_batch
+                    ),
+                    expected,
+                )
+
+    def test_layer_cap_keeps_active_and_idle_dp_ranks_aligned(self):
+        global_num_tokens = [4096, 1024, 0]
+        decode_batch = SimpleNamespace(scheduler_global_num_tokens=[0, 1, 0])
+        for local_num_tokens in global_num_tokens:
+            with self.subTest(local_num_tokens=local_num_tokens):
+                scheduler = self._make_scheduler(
+                    decode_empty=local_num_tokens == 0,
+                    extend_num_tokens=local_num_tokens,
+                    scheduler_global_num_tokens=global_num_tokens,
+                    max_split_forward_layers=2,
+                )
+                self.assertEqual(
+                    SchedulerMultiplexMixin._get_split_forward_count(
+                        scheduler, decode_batch
+                    ),
+                    2,
+                )
+
+    def test_layer_cap_does_not_split_without_global_decode(self):
+        scheduler = self._make_scheduler(
+            decode_empty=True,
+            split_index=7,
+            extend_num_tokens=4096,
+            max_split_forward_layers=2,
+        )
+        for decode_batch in (
+            None,
+            SimpleNamespace(scheduler_global_num_tokens=[0, 0]),
+        ):
+            with self.subTest(decode_batch=decode_batch):
+                self.assertEqual(
+                    SchedulerMultiplexMixin._get_split_forward_count(
+                        scheduler, decode_batch
+                    ),
+                    54,
+                )
 
     def test_prefill_runs_remaining_layers_without_decode_work(self):
         scheduler = self._make_scheduler(decode_empty=True, split_index=7)

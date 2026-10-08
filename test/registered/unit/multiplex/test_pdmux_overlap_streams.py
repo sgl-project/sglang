@@ -123,6 +123,25 @@ overlap_decode_full_sm: true
                     pdmux_context.get_pdmux_decode_alt_stream(helper), expected
                 )
 
+    def test_layer_cap_loads_and_defaults_to_zero(self):
+        config_body = """sm_group_num: 3
+manual_divisions:
+  - [112, 0, 1]
+split_forward_token_budget: 65536
+overlap_decode_full_sm: true
+"""
+        self.assertEqual(pdmux_context.PDMuxConfig().max_split_forward_layers, 0)
+        self.assertEqual(load_config(config_body).max_split_forward_layers, 0)
+        config = load_config(config_body + "max_split_forward_layers: 2\n")
+        self.assertEqual(config.max_split_forward_layers, 2)
+        self.assertEqual(config.split_forward_token_budget, 65536)
+
+    def test_layer_cap_rejects_invalid_yaml_values(self):
+        for value in ("-1", "1.5", "true", "false", '"2"', "null"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "non-negative integer"):
+                    load_config(f"sm_group_num: 3\nmax_split_forward_layers: {value}\n")
+
     def test_oversubscribed_exclusive_division_is_rejected_early(self):
         config = load_config("""sm_group_num: 3
 manual_divisions:
