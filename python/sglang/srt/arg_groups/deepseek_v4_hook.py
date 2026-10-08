@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
@@ -344,8 +344,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        from sglang.srt.model_executor.cuda_graph_config import Backend
-
         # BCG captures the full-token prefix and runs the request-shaped late
         # layers at an eager break. Other graph backends have no such boundary.
         incompatible = (
