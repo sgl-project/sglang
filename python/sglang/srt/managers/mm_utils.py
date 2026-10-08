@@ -665,6 +665,12 @@ def prepare_mm_inputs(
     use_deepstack: Dict[Modality, bool] = {},
     feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
 ) -> Optional[torch.Tensor]:
+    """Prepare full-sequence embeddings without running the language model.
+
+    Preserve multimodal cache/offload bookkeeping and the MTP embedding copy.
+    Additional language-model inputs, such as DeepStack features, update kwargs.
+    Non-first pipeline ranks consume proxy tensors and return no embeddings.
+    """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
