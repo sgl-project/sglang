@@ -735,9 +735,9 @@ RUN cd sglang \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
-            echo 'transformers==5.17.0' >> /tmp/constraints.txt ; \
+            echo 'transformers==5.19.0' >> /tmp/constraints.txt ; \
             echo 'tokenizers==0.23.2' >> /tmp/constraints.txt ; \
-            echo 'huggingface_hub==1.27.0' >> /tmp/constraints.txt ; \
+            echo 'huggingface_hub==1.33.0' >> /tmp/constraints.txt ; \
             ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \

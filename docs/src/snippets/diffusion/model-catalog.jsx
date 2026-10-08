@@ -219,9 +219,9 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "FastH3",
       modelIds: [
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
       ],
-      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
       name: "VDN-H3",

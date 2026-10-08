@@ -74,9 +74,6 @@ class NPUMXFP4Config(QuantizationConfig):
             return NPUMXFP4DiffusionLinearMethod(self)
         return None
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
 
 class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
     """NPU MXFP4 linear method for Diffusion models (dual-level).

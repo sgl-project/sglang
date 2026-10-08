@@ -94,7 +94,7 @@ dependencies = [
   "torchcodec==0.17.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
   "torchvision",
   "tqdm",
-  "transformers==5.17.0",
+  "transformers==5.19.0",
   "uvicorn",
   "uvloop",
   "watchfiles",
