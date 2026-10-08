@@ -154,6 +154,26 @@ def handle_context_parallelism(server_args: Any):
             "Aiter allreduce fusion is not supported with context parallelism"
         )
 
+    # Must run here: the DP and CP widths are final only after DWDP and the
+    # model's prefill-CP overrides.
+    if cfg.dcp_size > 1:
+        attn_tp_size = derive_attn_tp_size(
+            tp_size=cfg.tp_size,
+            attn_cp_size=view.attn_cp_size,
+            attn_dp_size=view.attn_dp_size,
+        )
+        # DCP groups are contiguous dcp_size chunks of the TP group, so one
+        # that does not divide attention TP spans ranks holding other tokens.
+        if attn_tp_size % cfg.dcp_size != 0:
+            raise ValueError(
+                "Decode context parallelism must nest inside one attention-TP "
+                "group: the attention TP size must be evenly divisible by "
+                "--dcp-size / --decode-context-parallel-size, but got "
+                f"attn_tp_size={attn_tp_size} and dcp_size={cfg.dcp_size} "
+                f"(tp_size={cfg.tp_size}, attn_dp_size={view.attn_dp_size}, "
+                f"attn_cp_size={view.attn_cp_size})."
+            )
+
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert cfg.tp_size % cfg.moe_dp_size == 0, (
@@ -233,40 +253,6 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_size > 1:
-        # initialize_model_parallel rejects this too; repeat it here so the
-        # failure names the flags before torch.distributed comes up.
-        if cfg.tp_size % cfg.dcp_size != 0:
-            raise ValueError(
-                "--tp-size / --tensor-parallel-size must be evenly divisible "
-                "by --dcp-size / --decode-context-parallel-size, but got "
-                f"tp_size={cfg.tp_size} and dcp_size={cfg.dcp_size} "
-                f"(tp_size % dcp_size = {cfg.tp_size % cfg.dcp_size})."
-            )
-
-        # DCP must also nest inside one attention-TP group, or a DCP group can
-        # straddle two DP replicas decoding different batches. dwdp_size is
-        # read directly because this handler runs before handle_dwdp.
-        attn_dp_size = cfg.dwdp_size if cfg.dwdp_size > 1 else cfg.attn_dp_size
-        attn_divisor = attn_dp_size * cfg.attn_cp_size
-        # An indivisible tp_size is handle_context_parallelism's error to
-        # raise; skip rather than report a truncated attn_tp_size here.
-        if attn_divisor > 0 and cfg.tp_size % attn_divisor == 0:
-            attn_tp_size = cfg.tp_size // attn_divisor
-            if attn_tp_size % cfg.dcp_size != 0:
-                raise ValueError(
-                    "Decode context parallelism must nest inside one "
-                    "attention-TP group: the effective attention TP size must "
-                    "be evenly divisible by --dcp-size / "
-                    "--decode-context-parallel-size, but got "
-                    f"attn_tp_size={attn_tp_size} and "
-                    f"dcp_size={cfg.dcp_size} (tp_size={cfg.tp_size}, "
-                    f"attn_dp_size={cfg.attn_dp_size}, "
-                    f"dwdp_size={cfg.dwdp_size}, "
-                    f"attn_cp_size={cfg.attn_cp_size}). A DCP group wider "
-                    "than one attention-TP group would span ranks decoding "
-                    "different batches."
-                )
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "

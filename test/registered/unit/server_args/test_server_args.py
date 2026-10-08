@@ -52,6 +52,7 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -4005,14 +4006,18 @@ class TestDcpGroupGeometryValidation(CustomTestCase):
     """
 
     @staticmethod
-    def _validate(**kwargs):
-        parallel_hook.handle_decode_context_parallelism(
-            ServerArgs(model_path="dummy", **kwargs)
+    def _args(**kwargs):
+        args = ServerArgs(model_path="dummy", **kwargs)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="llama"),
+            is_multimodal=False,
         )
+        return args
 
     def test_ragged_split_is_rejected(self):
         with self.assertRaises(ValueError) as caught:
-            self._validate(tp_size=4, dcp_size=3)
+            handle_context_parallelism(self._args(tp_size=4, dcp_size=3))
         self.assertIn("--dcp-size", str(caught.exception))
         self.assertIn("tp_size=4", str(caught.exception))
 
@@ -4021,29 +4026,23 @@ class TestDcpGroupGeometryValidation(CustomTestCase):
         halves the attention-TP width, so a 4-rank DCP group would straddle two
         replicas decoding different batches."""
         with self.assertRaises(ValueError) as caught:
-            self._validate(tp_size=4, attn_dp_size=2, dcp_size=4)
+            handle_context_parallelism(
+                self._args(tp_size=4, attn_dp_size=2, dcp_size=4)
+            )
         self.assertIn("attn_tp_size=2", str(caught.exception))
 
-    def test_dwdp_is_folded_in_before_it_forces_dp_attention(self):
-        """handle_dwdp runs after this handler and then sets attn_dp_size
-        itself, so dwdp_size has to be read directly or a
-        DWDP run slips past with attn_tp_size=1."""
+    def test_cp_declared_by_a_model_override_is_counted(self):
+        """Prefill-CP model overrides declare attn_cp_size during resolution,
+        after the DCP flags are read; the check must see the declared width."""
+        args = self._args(tp_size=4, dcp_size=4)
+        declare_resolution(args, "test", attn_cp_size=2)
         with self.assertRaises(ValueError) as caught:
-            self._validate(tp_size=4, dwdp_size=4, dcp_size=2)
-        self.assertIn("attn_tp_size=1", str(caught.exception))
+            handle_context_parallelism(args)
+        self.assertIn("attn_cp_size=2", str(caught.exception))
 
     def test_dcp_nested_inside_each_dp_replica_is_accepted(self):
         # Two 2-rank DCP groups, one per replica: [0,1] and [2,3].
-        self._validate(tp_size=4, attn_dp_size=2, dcp_size=2)
-
-    def test_dcp_spanning_the_whole_tp_group_is_accepted(self):
-        self._validate(tp_size=4, dcp_size=4)
-
-    def test_an_indivisible_attention_split_is_left_to_context_parallelism(self):
-        """tp_size not divisible by attn_dp_size * attn_cp_size is
-        handle_context_parallelism's error to raise. Reporting a truncated
-        attn_tp_size here would name the wrong flag."""
-        self._validate(tp_size=4, attn_dp_size=3, dcp_size=2)
+        handle_context_parallelism(self._args(tp_size=4, attn_dp_size=2, dcp_size=2))
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):

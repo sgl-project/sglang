@@ -1426,10 +1426,12 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if get_parallel().dcp_enabled and not self.is_draft_worker:
-                if self.kv_cache_dtype == torch.float8_e4m3fn:
+                if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
                     raise NotImplementedError(
-                        "FP8 KV cache with decode context parallelism is not "
-                        "supported: the LSE path is bf16-only."
+                        f"KV cache dtype {self.kv_cache_dtype} with decode "
+                        "context parallelism is not supported: the DCP sparse "
+                        "attention path has no FP8 handling and is validated "
+                        "only with bf16/fp16 KV."
                     )
                 return forward_dcp_sparse_attention(
                     q_nope=q_nope,
