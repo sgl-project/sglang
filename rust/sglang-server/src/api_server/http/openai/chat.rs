@@ -27,8 +27,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use super::completions::completion_usage;
+use super::pd_routing::PDRoutingFields;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
-use super::routing::PDRoutingFields;
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls,
@@ -179,7 +179,7 @@ async fn chat_completions(
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
     let choices_per_prompt = request.n.unwrap_or(1) as usize;
-    let routing = match routing.into_normalized(prompt_count, choices_per_prompt) {
+    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };

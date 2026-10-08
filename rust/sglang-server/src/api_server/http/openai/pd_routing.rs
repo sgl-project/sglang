@@ -31,7 +31,7 @@ pub(super) struct NormalizedPDRouting {
 impl PDRoutingFields {
     /// Normalize bootstrap fields per prompt and bound the handlers' host clones
     /// across choices. DP hints remain scalar.
-    pub(super) fn into_normalized(
+    pub(super) fn normalize(
         self,
         prompt_count: usize,
         choices_per_prompt: usize,
@@ -93,7 +93,7 @@ mod tests {
             "disagg_prefill_dp_rank": 3,
         }))
         .unwrap();
-        let routing = fields.into_normalized(2, 2).unwrap();
+        let routing = fields.normalize(2, 2).unwrap();
         assert_eq!(
             routing.bootstrap.bootstrap_hosts,
             vec![Some("prefill-a".to_owned()), Some("prefill-b".to_owned())]
@@ -122,7 +122,7 @@ mod tests {
         // 263173 bytes fit for one choice, but 255 choices exceed 64 MiB.
         let fields: PDRoutingFields =
             serde_json::from_value(json!({"bootstrap_host": ["x".repeat(263173)]})).unwrap();
-        let error = fields.into_normalized(1, 255).err().unwrap().to_string();
+        let error = fields.normalize(1, 255).err().unwrap().to_string();
         assert!(error.contains("bootstrap_host"), "{error}");
         assert!(error.contains("would allocate more than"), "{error}");
     }

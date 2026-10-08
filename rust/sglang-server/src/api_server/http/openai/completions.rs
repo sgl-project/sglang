@@ -21,7 +21,7 @@ use dynamo_protocols::types::{
 use futures::StreamExt;
 use serde::Deserialize;
 
-use super::routing::PDRoutingFields;
+use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
@@ -149,7 +149,7 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.into_normalized(prompt_count, choices_per_prompt) {
+    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
