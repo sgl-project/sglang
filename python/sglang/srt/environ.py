@@ -512,6 +512,7 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    SGLANG_ENABLE_NAN_LOGITS_CHECK = EnvBool(False)
     # Signal level for value/index validity checks (nan/inf/oob/...); see
     # invariants.py. OFF (prod default) runs only the free data layer, WARN
     # adds throttled logging, STRICT (CI default) crashes on violations.
