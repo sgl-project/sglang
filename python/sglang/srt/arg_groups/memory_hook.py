@@ -179,9 +179,6 @@ def handle_gpu_memory_settings(server_args: Any):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
-    # A decode graph wider than the running batch can never replay: clamp the
-    # capacity default (an explicit max_bs stays untouched) so small-batch
-    # servers don't capture — and reserve memory for — unreachable sizes.
     if (
         decode_max_bs_is_default
         and cfg.max_running_requests is not None
