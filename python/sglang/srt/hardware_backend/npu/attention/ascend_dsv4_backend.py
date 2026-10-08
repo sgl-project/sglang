@@ -976,6 +976,95 @@ class C4IndexerAscendBackendMixin:
             )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+        self._dump_dsv4_sparse_chain(c4_indexer, topk_idxs, forward_batch)
+
+    def _dump_dsv4_sparse_chain(
+        self,
+        c4_indexer,
+        topk_idxs: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Diagnostic for the DSV4/A5 hit != miss divergence: hash the three
+        links of the sparse chain the A5 attention op consumes, so one hit run
+        and one miss run can be diffed at the same step.
+
+        - ``DSV4_DUMP_CMPIDX`` = c4 layer id (or ""/"all"): the indexer top-k,
+          i.e. ``cmp_sparse_indices`` handed to
+          ``npu_kv_quant_sparse_attn_sharedkv``. Same md5 hit vs miss => the
+          selection is identical (the root is KV/state content); different =>
+          the indexer itself diverges.
+        - ``DSV4_DUMP_IDXK`` = c4 layer id: content of the dedicated indexer-K
+          buffer the top-k reads (small fp8 buffer, hashed whole).
+        - ``DSV4_DUMP_C4KV`` = c4 layer id: content of the compressed c4 KV pages
+          the attention reads (tail pages of req 0's c4 page table).
+        """
+        import hashlib
+        import os
+
+        dump_cmpidx = os.environ.get("DSV4_DUMP_CMPIDX")
+        dump_idxk = os.environ.get("DSV4_DUMP_IDXK")
+        dump_c4kv = os.environ.get("DSV4_DUMP_C4KV")
+        if dump_cmpidx is None and dump_idxk is None and dump_c4kv is None:
+            return
+
+        layer_id = getattr(c4_indexer, "layer_id", -1)
+
+        def _want(val) -> bool:
+            return val is not None and (val in ("", "all") or val == str(layer_id))
+
+        def _md5(t: torch.Tensor) -> str:
+            a = t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+            return hashlib.md5(a).hexdigest()[:16]
+
+        try:
+            lastpos = (
+                int(forward_batch.positions.reshape(-1)[-1].item())
+                if forward_batch.positions.numel()
+                else -1
+            )
+        except Exception:
+            lastpos = -1
+
+        if _want(dump_cmpidx):
+            try:
+                t = topk_idxs.detach().to(torch.int32).cpu()
+                row = t.reshape(t.shape[0], -1)[-1].tolist()[:16]
+                print(
+                    f"[CMPIDX] layer={layer_id} mode={forward_batch.forward_mode} "
+                    f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} tail={row}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[CMPIDX] skipped: {exc}", flush=True)
+
+        if _want(dump_idxk):
+            try:
+                buf = self.token_to_kv_pool.get_compress_buffer(layer_id, True)
+                print(
+                    f"[IDXK] layer={layer_id} shape={tuple(buf.shape)} md5={_md5(buf)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[IDXK] skipped: {exc}", flush=True)
+
+        if _want(dump_c4kv):
+            try:
+                buf = self.token_to_kv_pool.get_compress_buffer(layer_id, False)
+                pages = int(buf.shape[0])
+                tbl = getattr(self.forward_metadata, "c4_page_table", None)
+                ids = list(range(max(0, pages - 8), pages))
+                if torch.is_tensor(tbl) and tbl.numel():
+                    row = [int(v) for v in tbl[0].reshape(-1).tolist()]
+                    ids = sorted({max(0, min(int(v), pages - 1)) for v in row[-8:]})
+                lo = min(ids)
+                slab = buf[lo : max(ids) + 1]
+                print(
+                    f"[C4KV] layer={layer_id} pages={pages} ids={ids} "
+                    f"md5={_md5(slab)} bytes={slab.numel()}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[C4KV] skipped: {exc}", flush=True)
 
     def _cp_local_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Per-rank positions under CP-v2 (the batch keeps full-length ones)."""
