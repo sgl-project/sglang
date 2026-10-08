@@ -37,6 +37,72 @@ def _touch(folder, name):
 
 
 class TestFilterSafetensorsFilesByWeightName(CustomTestCase):
+    def test_remote_model_observer_errors_propagate(self):
+        def observe(_names):
+            raise ValueError("model observer failed")
+
+        with self.assertRaisesRegex(ValueError, "model observer failed"):
+            weight_utils.filter_safetensors_files_by_weight_map(
+                ["s3://bucket/model/draft.safetensors"],
+                "s3://bucket/model",
+                {"draft.weight": "draft.safetensors"},
+                lambda _: False,
+                observe_weight_names=observe,
+            )
+
+    def test_remote_observer_sees_skipped_shard_names_before_selection(self):
+        root = "s3://bucket/model"
+        files = [root + "/main.safetensors", root + "/draft.safetensors"]
+        observed = set()
+
+        def is_unused(name):
+            self.assertEqual(observed, {"main.weight", "draft.weight"})
+            return name == "main.weight"
+
+        self.assertEqual(
+            weight_utils.filter_safetensors_files_by_weight_map(
+                files,
+                root,
+                {
+                    "main.weight": "main.safetensors",
+                    "draft.weight": "draft.safetensors",
+                },
+                is_unused,
+                observe_weight_names=observed.update,
+            ),
+            [root + "/draft.safetensors"],
+        )
+        self.assertEqual(observed, {"main.weight", "draft.weight"})
+
+    def test_remote_ambiguous_or_empty_map_keeps_files(self):
+        files = [
+            "s3://bucket/model/main.safetensors",
+            "s3://bucket/model/draft.safetensors",
+        ]
+        for weight_map in (
+            None,
+            {},
+            [],
+            {1: "main.safetensors"},
+            {"draft.weight": None},
+            {"main.weight": "main.safetensors", "draft.weight": "../draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "/draft.safetensors"},
+            {"main.weight": "main.safetensors", "draft.weight": "./draft.safetensors"},
+        ):
+            with self.subTest(weight_map=weight_map):
+                observed = []
+                self.assertEqual(
+                    weight_utils.filter_safetensors_files_by_weight_map(
+                        files,
+                        "s3://bucket/model",
+                        weight_map,
+                        lambda name: not name.startswith("draft."),
+                        observe_weight_names=observed.extend,
+                    ),
+                    files,
+                )
+                self.assertEqual(observed, [])
+
     def test_keeps_mixed_shards_and_preserves_order_and_values(self):
         with tempfile.TemporaryDirectory() as folder:
             files = []
