@@ -27,7 +27,10 @@ from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
-from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_fia_nz
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    is_fia_nz,
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -1670,6 +1673,11 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
+        if is_mla_preprocess_enabled() and self.use_mla:
+            # DSA callers set save_kv_cache based on whether preprocessing was used.
+            # Only override it for the existing non-sparse MLA path.
+            if topk_indices is None:
+                save_kv_cache = False
         if self.is_dllm_model:
             return self.forward_dllm(
                 q,
@@ -3297,6 +3305,15 @@ class AscendAttnBackend(AttentionBackend):
         **kwargs,
     ):
         return_softmax_lse = bool(kwargs.pop("return_softmax_lse", False))
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and not self._dense_mla_dcp_enabled()
+        ):
+            # DSA callers set save_kv_cache based on whether preprocessing was used.
+            # Only override it for the existing non-sparse MLA path.
+            if topk_indices is None:
+                save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
