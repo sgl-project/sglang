@@ -112,12 +112,18 @@ jobs:
               - "test/registered/kernels/!(ops|benchmark)/**/!(*.md)"
               - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(*.md)"
               - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(diffusion)/**/!(*.md)"
-              - "rust/*"
-              - "rust/!(sglang-renderer|sglang-processor)/**"
+              # rust/Cargo.lock is shared by the whole workspace, so renderer-only
+              # dependency edits rewrite it too; it gates the renderer filter
+              # instead. A dependency change for a shipped crate also edits its
+              # Cargo.toml, which still matches here. `/**/*` (not `/**`) keeps
+              # the per-crate glob from matching rust/Cargo.lock itself.
+              - "rust/!(Cargo.lock)"
+              - "rust/!(sglang-renderer|sglang-processor)/**/*"
               - "proto/**"
             renderer:
               - "rust/sglang-renderer/**"
               - "rust/sglang-processor/**"
+              - "rust/Cargo.lock"
             server_args_docs:
               # test_server_args_docs_coverage.py diffs this doc and its allowlist
               # against the CLI, so a docs only edit can break that test. Kept out

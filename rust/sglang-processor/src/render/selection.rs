@@ -2,15 +2,12 @@
 
 use std::sync::Arc;
 
-use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
 use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 
 use super::models::resolve_dsv4_profile;
 use super::{ChatFormatter, ThinkingTemplates, load_chat_formatter};
 use crate::model_files::{resolve_chat_template_file, resolve_model_file};
-
-const DSV4_REASONING_EFFORT_ENV: &str = "SGLANG_DSV4_REASONING_EFFORT";
 
 /// Model and template sources used to select a chat formatter.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -65,14 +62,7 @@ pub fn select_chat_formatter(
                 Ok(profile) => profile,
                 Err(error) => return (None, Some(error)),
             };
-            return (
-                Some(ChatFormatter::DeepSeekV4 {
-                    formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_chat())),
-                    profile,
-                    environment_effort: std::env::var(DSV4_REASONING_EFFORT_ENV).ok(),
-                }),
-                None,
-            );
+            return (Some(ChatFormatter::DeepSeekV4(profile)), None);
         }
         if identity.is_deepseek_v32() {
             return (
