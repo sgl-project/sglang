@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
 )
 from sglang.srt.utils.common import (
@@ -200,7 +201,11 @@ def _build_moe(fmt, is_gated, activation, dtype):
     )
     layer = torch.nn.Module()
     layer.moe_runner_config = config
-    scheme = CompressedTensorsW4A16Nvfp4MoE()
+    scheme = (
+        CompressedTensorsW4A16Nvfp4MoE()
+        if fmt == "nvfp4"
+        else CompressedTensorsW4A16Mxfp4MoE()
+    )
     scheme.create_weights(
         layer=layer,
         num_experts=NUM_EXPERTS,
@@ -250,7 +255,7 @@ def _moe_reference(x, w13, w2, topk_weights, topk_ids, is_gated, activation):
 
 
 @requires_fp4_marlin
-@pytest.mark.parametrize("fmt", ["nvfp4"])
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
 @pytest.mark.parametrize(
     "is_gated,activation", [(True, "silu"), (False, "relu2"), (False, "silu")]
 )
