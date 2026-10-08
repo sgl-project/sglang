@@ -88,7 +88,9 @@ def load_observations(path: str, config, device: torch.device) -> list[dict]:
 def dummy_observations(
     config, num_samples: int, seed: int, device: torch.device
 ) -> list[dict]:
-    """Match the Thor tutorial's random image/token/noise calibration recipe."""
+    """Generate random image/token/noise calibration inputs following
+    https://jetson-ai-lab.com/tutorials/openpi_on_thor/.
+    """
     from sglang.multimodal_gen.runtime.models.vlas.pi05_core import PALIGEMMA_VOCAB_SIZE
 
     if num_samples <= 0:
@@ -202,7 +204,10 @@ def main() -> None:
     source_group.add_argument(
         "--dummy-calibration",
         action="store_true",
-        help="Explicit synthetic calibration, matching the Thor tutorial fallback",
+        help=(
+            "Explicit synthetic calibration, matching the fallback at "
+            "https://jetson-ai-lab.com/tutorials/openpi_on_thor/"
+        ),
     )
     parser.add_argument("--dummy-num-samples", type=int, default=1)
     parser.add_argument("--dummy-validation-samples", type=int, default=4)

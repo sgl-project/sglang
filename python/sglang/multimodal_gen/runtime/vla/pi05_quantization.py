@@ -27,7 +27,7 @@ _VISION_PROJECTION = re.compile(
 DEFAULT_COMPONENTS = list(_COMPONENT_PREFIXES)
 
 
-def _selected(name: str, component: str) -> bool:
+def _is_selected_projection(name: str, component: str) -> bool:
     prefix = _COMPONENT_PREFIXES[component]
     if not name.startswith(prefix):
         return False
@@ -41,8 +41,13 @@ def _selected(name: str, component: str) -> bool:
     return bool(_PROJECTION.fullmatch(suffix))
 
 
-def _tuple_output(module, inputs, output):
-    # Shared SigLIP linears return (output, bias), unlike nn.Linear.
+def _wrap_tuple_output(module, inputs, output):
+    """Forward hook preserving SigLIP's (output, bias) interface during calibration.
+
+    ModelOpt calibration replaces SGLang linears with nn.Linear, which returns
+    only a tensor. Wrap that tensor so existing callers can still unpack it.
+    nn.Linear already adds the bias to output, so no separate bias is returned.
+    """
     return output, None
 
 
@@ -62,35 +67,39 @@ class Pi05Fp8Linear(ReplicatedLinear):
         return output if self.tensor_output else (output, bias)
 
 
-def projection_names(model: nn.Module, components: list[str]) -> list[str]:
-    """Select executed Linears; exclude Conv2d, time MLP and AdaRMS dense."""
-    if not components or len(set(components)) != len(components):
-        raise ValueError("FP8 components must be nonempty and unique")
-    if set(components) - _COMPONENT_PREFIXES.keys():
+def _validate_components(components: list[str]) -> list[str]:
+    if not isinstance(components, list) or not components:
+        raise ValueError("Pi0.5 FP8 components must be a nonempty list of strings")
+    if not all(isinstance(component, str) for component in components):
+        raise ValueError("Pi0.5 FP8 components must contain only strings")
+    selected = set(components)
+    if len(selected) != len(components):
+        raise ValueError("Pi0.5 FP8 components must be unique")
+    if selected - _COMPONENT_PREFIXES.keys():
         raise ValueError(f"Unsupported Pi0.5 FP8 components: {components}")
+    return components
+
+
+def get_projection_names(model: nn.Module, components: list[str]) -> list[str]:
+    """Select executed Linears; exclude Conv2d, time MLP and AdaRMS dense."""
+    components = _validate_components(components)
     return [
         name
         for name, _ in model.named_modules()
-        if any(_selected(name, component) for component in components)
+        if any(_is_selected_projection(name, component) for component in components)
     ]
 
 
 def validate_quantization_config(config: dict) -> list[str]:
+    if not isinstance(config, dict):
+        raise ValueError("Pi0.5 FP8 quantization config must be a dictionary")
     if (
         config.get("quant_method") != "modelopt"
         or config.get("quant_algo") != "FP8"
         or config.get("pi05_fused_projections") is not True
     ):
         raise ValueError("Pi0.5 requires a fused-projection ModelOpt FP8 checkpoint")
-    components = config.get("components")
-    if not isinstance(components, list) or not components:
-        raise ValueError("Pi0.5 FP8 checkpoint must declare components")
-    if (
-        len(set(components)) != len(components)
-        or set(components) - _COMPONENT_PREFIXES.keys()
-    ):
-        raise ValueError(f"Unsupported Pi0.5 FP8 components: {components}")
-    return components
+    return _validate_components(config.get("components"))
 
 
 def replace_projections(
@@ -107,7 +116,7 @@ def replace_projections(
         ModelOptFp8Config,
     )
 
-    names = projection_names(model, components)
+    names = get_projection_names(model, components)
     for component in components:
         if not any(name.startswith(_COMPONENT_PREFIXES[component]) for name in names):
             raise ValueError(f"No Pi0.5 projections found for {component}")
@@ -138,7 +147,7 @@ def replace_projections(
                 if module.bias is not None:
                     replacement.bias.copy_(module.bias)
             if not isinstance(module, nn.Linear):
-                replacement.register_forward_hook(_tuple_output)
+                replacement.register_forward_hook(_wrap_tuple_output)
         parent_name, _, child_name = name.rpartition(".")
         setattr(model.get_submodule(parent_name), child_name, replacement)
     return names

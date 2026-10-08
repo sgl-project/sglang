@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
 from sglang.multimodal_gen.runtime.vla.pi05_quantization import (
     DEFAULT_COMPONENTS,
     finalize_fp8_weights,
-    projection_names,
+    get_projection_names,
     replace_projections,
     validate_quantization_config,
 )
@@ -133,7 +133,7 @@ class TestPi05ModelOptFp8(CustomTestCase):
 
     def test_export_uses_modelopt_amax_and_preserves_unquantized_weights(self):
         model = tiny_model()
-        names = projection_names(model, ["action_expert"])
+        names = get_projection_names(model, ["action_expert"])
         for name in names:
             layer = model.get_submodule(name)
             # Boundary fixture: ModelOpt's calibrated quantizer state.
@@ -197,10 +197,41 @@ class TestPi05ModelOptFp8(CustomTestCase):
         torch.testing.assert_close(first["tokens"], second["tokens"], atol=0, rtol=0)
         self.assertFalse(torch.equal(first["noise"], held_out["noise"]))
         self.assertEqual(first["noise"].shape, (1, 3, 2))
-        # The tutorial's dummy path marks every camera present, including empties.
+        # https://jetson-ai-lab.com/tutorials/openpi_on_thor/ uses dummy inputs
+        # that mark every camera present, including empty cameras.
         self.assertTrue(all(mask.all() for mask in first["image_masks"]))
         with self.assertRaisesRegex(ValueError, "positive"):
             dummy_observations(config, 0, 123, torch.device("cpu"))
+
+    def test_quantization_config_and_projection_selection_validate_components(self):
+        config = dict(
+            quant_method="modelopt", quant_algo="FP8", pi05_fused_projections=True
+        )
+        for invalid_config in (None, [], "modelopt", 1):
+            with self.subTest(config=invalid_config):
+                with self.assertRaisesRegex(ValueError, "dictionary"):
+                    validate_quantization_config(invalid_config)
+        model = tiny_model()
+        for components, message in (
+            (None, "nonempty list"),
+            ([], "nonempty list"),
+            ("action_expert", "nonempty list"),
+            ([{}], "only strings"),
+            ([["action_expert"]], "only strings"),
+            ([1], "only strings"),
+            (["action_expert", "action_expert"], "unique"),
+            (["unknown"], "Unsupported"),
+        ):
+            with self.subTest(components=components):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_quantization_config({**config, "components": components})
+                with self.assertRaisesRegex(ValueError, message):
+                    get_projection_names(model, components)
+        self.assertEqual(
+            validate_quantization_config({**config, "components": ["action_expert"]}),
+            ["action_expert"],
+        )
+        self.assertEqual(len(get_projection_names(model, ["action_expert"])), 2)
 
     def test_rejects_unfused_checkpoint_and_empty_calibration(self):
         with self.assertRaisesRegex(ValueError, "fused-projection"):

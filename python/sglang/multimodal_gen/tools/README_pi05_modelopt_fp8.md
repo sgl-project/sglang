@@ -4,20 +4,22 @@ The tool calibrates the native Pi0.5 fused projections with NVIDIA ModelOpt and
 exports a checkpoint consumed by SGLang's native FP8 Linear backend. It does not
 export ONNX or require TensorRT.
 
-The default Linear coverage matches the tutorial's pure-FP8 path with its default
-performance options: PaliGemma and action-expert QKV, output, gate/up and down
-projections, SigLIP encoder QKV/output and MLP fc1/fc2, the multimodal projector,
+The default Linear coverage matches the pure-FP8 path and default performance
+options in https://jetson-ai-lab.com/tutorials/openpi_on_thor/: PaliGemma and
+action-expert QKV, output, gate/up and down projections, SigLIP encoder QKV/output and MLP fc1/fc2, the multimodal projector,
 and action input/output heads. Each fused projection has one E4M3 weight scale
 and one static input scale. Conv2d, embeddings, norms/AdaRMS dense and time MLP
-remain unquantized, matching the tutorial's exclusions. There is no executed
+remain unquantized, matching the exclusions in
+https://jetson-ai-lab.com/tutorials/openpi_on_thor/. There is no executed
 language-model output head in this policy.
 
 FP8 GEMMs compute with BF16 activations and biases. Action heads retain FP32
 outputs for the denoising integration, but their weights and inputs are now FP8;
 this does not retain their former FP32 GEMM precision. Tensor/tuple interfaces
 and feature dimensions are preserved for native SigLIP and action callers.
-Attention and KV cache precision remain unchanged. This covers the tutorial's
-Linear quantization, not its optional attention MatMul or NVFP4 quantization.
+Attention and KV cache precision remain unchanged. This covers the Linear
+quantization described at https://jetson-ai-lab.com/tutorials/openpi_on_thor/,
+not its optional attention MatMul or NVFP4 quantization.
 The first version requires a single SM89+ NVIDIA CUDA GPU and resident BF16
 inference; TP/SP and component offload are rejected. CUDA graphs remain available
 after FP8 weight loading is complete. Previously exported two-component
@@ -25,9 +27,9 @@ checkpoints remain supported without enabling additional components.
 
 ## Explicit synthetic calibration
 
-For the initial pipeline check, use the same dummy-input recipe as the Jetson
-Thor tutorial: standard-normal images and action noise, uniformly random full-
-vocabulary token IDs, and all-true image/token masks. This intentionally differs
+For the initial pipeline check, use the dummy-input recipe from
+https://jetson-ai-lab.com/tutorials/openpi_on_thor/: standard-normal images and
+action noise, uniformly random full-vocabulary token IDs, and all-true image/token masks. This intentionally differs
 from normalized real observations. The option is explicit; dataset failures never
 trigger an automatic fallback.
 
@@ -39,9 +41,10 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.multimodal_gen.tools.quantize_pi05_model
   --output-dir /path/to/pi05_fp8_dummy
 ```
 
-The default matches the tutorial fallback: one calibration observation running
-all denoising steps. Four separate synthetic observations with seed `seed + 1`
-validate BF16, fake-quant and the reloaded native checkpoint. Adjust with
+The default matches the fallback at
+https://jetson-ai-lab.com/tutorials/openpi_on_thor/: one calibration observation
+running all denoising steps. Four separate synthetic observations with seed
+`seed + 1` validate BF16, fake-quant and the reloaded native checkpoint. Adjust with
 `--dummy-num-samples` and `--dummy-validation-samples`; `--validation-data` overrides
 the synthetic validation set. Metadata labels synthetic calibration and validation.
 Use this checkpoint to check execution, not robot policy quality.
