@@ -197,7 +197,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
                                         if path == "/v1/chat/completions"
                                         else choice.get("text") or ""
                                     )
-                                    if choice["finish_reason"] is not None:
+                                    if choice.get("finish_reason") is not None:
                                         finished = True
                             self.assertTrue(finished)
                         else:
