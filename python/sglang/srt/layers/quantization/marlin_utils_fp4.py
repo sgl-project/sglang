@@ -437,8 +437,15 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     w13_bias_data = w13_bias.data if hasattr(w13_bias, "data") else w13_bias
     w2_bias_data = w2_bias.data if hasattr(w2_bias, "data") else w2_bias
 
+    # Gated experts fuse gate and up into w13; non-gated experts have only up.
+    # Layers built without a runner config (the fused GPT-OSS paths) are gated.
+    moe_runner_config = getattr(layer, "moe_runner_config", None)
+    num_shards = (
+        1 if moe_runner_config is not None and not moe_runner_config.is_gated else 2
+    )
+
     num_experts = w13.shape[0]
-    intermediate_size = w13.shape[1] // 2
+    intermediate_size = w13.shape[1] // num_shards
     hidden_size = w13.shape[2] * 2
     if hidden_size % 128 == 0:
         padded_intermediate_size = ((intermediate_size + 63) // 64) * 64
@@ -462,11 +469,11 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     def _pad_w13(x: torch.Tensor) -> torch.Tensor:
         if padded_intermediate_size == intermediate_size:
             return x
-        x = x.view(num_experts, 2, intermediate_size, x.shape[-1])
+        x = x.view(num_experts, num_shards, intermediate_size, x.shape[-1])
         x = torch.nn.functional.pad(
             x, (0, 0, 0, padded_intermediate_size - intermediate_size)
         )
-        return x.reshape(num_experts, 2 * padded_intermediate_size, -1)
+        return x.reshape(num_experts, num_shards * padded_intermediate_size, -1)
 
     def _pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
         if padded_intermediate_size == intermediate_size:
@@ -485,7 +492,7 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     if w13_bias_data is not None:
         w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
 
-    w13_size_n, w13_size_k = padded_intermediate_size * 2, hidden_size
+    w13_size_n, w13_size_k = padded_intermediate_size * num_shards, hidden_size
     w2_size_n, w2_size_k = hidden_size, padded_intermediate_size
 
     def _process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:

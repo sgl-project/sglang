@@ -79,11 +79,15 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.hidden_size = hidden_size
 
+        # Gated experts fuse gate and up into w13; non-gated experts have only up.
+        # prepare_moe_mxfp4_layer_for_marlin repacks the same number of shards.
+        w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
+
         # Two fp4 items are packed per byte along the input dimension.
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=torch.uint8,
             ),
@@ -112,7 +116,7 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
         w13_weight_scale = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_num_shards * intermediate_size_per_partition,
                 hidden_size // self.group_size,
                 dtype=torch.uint8,
             ),
@@ -138,7 +142,8 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
             tensor_attrs["quant_method"] = FusedMoeWeightScaleSupported.TENSOR.value
 
             w13_input_global_scale = torch.nn.Parameter(
-                torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
+                requires_grad=False,
             )
             layer.register_parameter("w13_input_global_scale", w13_input_global_scale)
             set_weight_attrs(w13_input_global_scale, tensor_attrs)
