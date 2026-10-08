@@ -169,6 +169,17 @@ class SanaWMBlock(nn.Module):
         tokens_per_frame = N // num_frames
         return x.reshape(B, num_frames, tokens_per_frame, C), tokens_per_frame
 
+    def _prepare_modulation(self, t: torch.Tensor, batch_size: int):
+        if t.dim() == 2:
+            return None, (
+                self.scale_shift_table[None] + t.reshape(batch_size, 6, -1)
+            ).chunk(6, dim=1)
+        num_frames = t.reshape(batch_size, -1, 6, t.shape[-1] // 6).shape[1]
+        t = t.reshape(batch_size, num_frames, 6, -1)
+        return num_frames, (self.scale_shift_table[None, None, :, :] + t).chunk(
+            6, dim=2
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # (B, N, D)
@@ -184,17 +195,8 @@ class SanaWMBlock(nn.Module):
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         B = x.shape[0]
-        if t.dim() == 2:
-            num_frames = None
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + t.reshape(B, 6, -1)
-            ).chunk(6, dim=1)
-        else:
-            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
-            t = t.reshape(B, num_frames, 6, -1)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None, None, :, :] + t
-            ).chunk(6, dim=2)
+        num_frames, modulation = self._prepare_modulation(t, B)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
 
         # Self-attention with UCPE camera branch
         if num_frames is None:
@@ -259,17 +261,8 @@ class SanaWMBlock(nn.Module):
     ) -> Tuple[torch.Tensor, list]:
         """Streaming counterpart of ``forward``: threads the per-block 10-slot ``kv_cache`` through cached attention + FFN."""
         B = x.shape[0]
-        if t.dim() == 2:
-            num_frames = None
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + t.reshape(B, 6, -1)
-            ).chunk(6, dim=1)
-        else:
-            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
-            t = t.reshape(B, num_frames, 6, -1)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None, None, :, :] + t
-            ).chunk(6, dim=2)
+        num_frames, modulation = self._prepare_modulation(t, B)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
 
         if num_frames is None:
             x_in = self._modulate(self.norm1(x), shift_msa, scale_msa)
