@@ -6,7 +6,6 @@ same unified-memory configuration to keep attention reduction order comparable.
 Covers GDN, SWA, tri-pool, and MLA layouts.
 """
 
-import os
 import time
 import unittest
 
@@ -67,7 +66,6 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
 
     model: str = ""
     extra_args: list = []
-    server_env: dict = {}
 
     @classmethod
     def setUpClass(cls):
@@ -76,7 +74,6 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
         base_args = _COMMON_ARGS + cls.extra_args
         cls.hicache_url = "http://127.0.0.1:8157"
         cls.reference_url = "http://127.0.0.1:8158"
-        env = {**os.environ, **cls.server_env} if cls.server_env else None
         hicache_args = ["--enable-hierarchical-cache"]
         if "--hicache-size" not in base_args:
             hicache_args += ["--hicache-ratio", "4"]
@@ -85,7 +82,6 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             cls.hicache_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=base_args + hicache_args,
-            env=env,
         )
         cls.addClassCleanup(kill_process_tree, cls.process_hicache.pid)
         cls.process_reference = popen_launch_server(
@@ -93,7 +89,6 @@ class UnifiedMemoryHiCacheBase(CustomTestCase):
             cls.reference_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=base_args + ["--base-gpu-id", "1"],
-            env=env,
         )
         cls.addClassCleanup(kill_process_tree, cls.process_reference.pid)
 
@@ -188,7 +183,6 @@ class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
 
     # The test revision is the reduced checkpoint used by Inkling CI.
     model = "thinkingmachines/Inkling"
-    server_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_args = _SMALL_POOL + [
         "--revision",
         "test",

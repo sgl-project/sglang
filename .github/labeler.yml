@@ -124,7 +124,6 @@ hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
-      - '**/*hiradix*'
       - '**/HiCache/**/*'
       - 'benchmark/hicache/**/*'
       - 'test/registered/hicache/**/*'
@@ -163,3 +162,11 @@ apple-silicon:
       - '**/*mlx*'
       - '**/mlx/**'
       - '**/*mps*'
+
+rust-renderer:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'rust/sglang-renderer/**/*'
+      - 'rust/sglang-processor/**/*'
+      - 'docker/renderer.Dockerfile'
+      - '.github/workflows/release-docker-renderer.yml'

@@ -1,13 +1,14 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
 // Recipes: https://github.com/sgl-project/sglang/pull/40448
 // SGLang: 983e643854f15cf9ef4370a49dfd74b6af54c3e3.
-// B300 validation reported by the model team. Public V2.6 checkpoints are
+// B300 validation reported by the model team. H200 cells reuse the B300
+// recipes with `--moe-runner-backend marlin` in place of deep_gemm. Public V2.6 checkpoints are
 // XiaomiMiMo/MiMo-V2.6-{Flash,Pro}-RL (MXFP4 experts, bf16 router, bundled
 // dflash/ drafter); modelNames are served aliases, and the checkpoint paths
 // stay editable so a local copy can be used instead.
 export const config = {
   modelName: "MiMo-V2.6",
-  supportedHardware: ["b300"],
+  supportedHardware: ["h200", "b300"],
   variants: [
     { id: "flash", label: "Flash", subtitle: "309B / 15B active · 4 GPUs" },
     { id: "pro", label: "Pro", subtitle: "1.02T / 42B active · 8 GPUs" },
@@ -35,7 +36,7 @@ export const config = {
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","messages":[{"role":"user","content":"What is 15% of 240?"}],"chat_template_kwargs":{"enable_thinking":true}}'`,
   // The MiMo-V2.6 support (PR #40448) is on main, so the nightly tag carries it.
-  dockerImages: { b300: "lmsysorg/sglang:dev" },
+  dockerImages: { h200: "lmsysorg/sglang:dev", b300: "lmsysorg/sglang:dev" },
   dockerMounts: ["\"{{MODEL_ROOT}}:/model:ro\""],
   github: { cookbookModel: "MiMo-V2.6 (Flash / Pro)" },
   playgroundFeatures: {
@@ -130,6 +131,38 @@ export const config = {
         "--cuda-graph-backend-prefill=disabled",
         "--mm-enable-dp-encoder",
         "--mm-attention-backend fa4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "flash", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path '{{FLASH_MODEL_PATH}}'",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend marlin",
+        "--trust-remote-code",
+        "--reasoning-parser mimo",
+        "--tool-call-parser mimo",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "pro", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path '{{PRO_MODEL_PATH}}'",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
+        "--trust-remote-code",
+        "--reasoning-parser mimo",
+        "--tool-call-parser mimo",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

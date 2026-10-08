@@ -11,7 +11,7 @@ from sglang.srt.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _get_llama_4_attn_scale(
@@ -39,6 +39,7 @@ class Ministral3Attention(LlamaAttention):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(
             config=config,
@@ -54,6 +55,7 @@ class Ministral3Attention(LlamaAttention):
             quant_config=quant_config,
             prefix=prefix,
             bias=bias,
+            reduce_results=reduce_results,
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
@@ -128,7 +130,9 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             prefix=add_prefix("self_attn", prefix),
             bias=getattr(config, "attention_bias", False)
             or getattr(config, "bias", False),
+            reduce_results=False,
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
 
 
 class Ministral3Model(LlamaModel):
@@ -141,7 +145,7 @@ class Ministral3Model(LlamaModel):
         # Override layer creation to use Ministral3Attention
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ministral3DecoderLayer(
                 config=config,
@@ -150,8 +154,6 @@ class Ministral3Model(LlamaModel):
                 start_layer=self.start_layer,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
 
