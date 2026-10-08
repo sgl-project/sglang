@@ -288,6 +288,21 @@ def test_cond_key_repeat_still_uses_cache() -> None:
     release_comfyui_session(ex.sid)
 
 
+def test_cond_key_flux_without_pooled_keeps_t5_apart() -> None:
+    ex = _Executor(FluxAdapter())
+    x, t = torch.zeros(1, 16, 8, 8), torch.tensor([0.5])
+    ctx_a, ctx_b = torch.randn(1, 8, 4096), torch.randn(1, 8, 4096)
+    first = ex.send(ex.adapter.pack(x, t, ctx_a, y=None))
+    second = ex.send(ex.adapter.pack(x, t, ctx_b, y=None))
+    assert torch.equal(first.prompt_embeds[1], ctx_a)
+    assert torch.equal(second.prompt_embeds[1], ctx_b)
+    repeat = ex.adapter.pack(x, t, ctx_a.clone(), y=None)
+    restored = ex.send(repeat)
+    assert repeat.prompt_embeds == []  # cached now that y is a tensor
+    assert torch.equal(restored.prompt_embeds[1], ctx_a)
+    release_comfyui_session(ex.sid)
+
+
 def _h3_packed(text, payload):
     return PackedForward(
         latents=torch.zeros(1, 4, 2, 2),

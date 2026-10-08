@@ -5,6 +5,9 @@ import torch
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
 
+# Width of Flux.1's CLIP-L pooled vector (vec_in_dim / pooled_projection_dim).
+_FLUX_POOLED_DIM = 768
+
 
 def _flux_guidance_scale(guidance) -> float:
     if guidance is None:
@@ -21,9 +24,14 @@ class FluxAdapter(ComfyUIModelAdapter):
     def pack(
         self, x, timestep, context, y=None, guidance=None, **kwargs
     ) -> PackedForward:
+        if y is None:
+            # Native ComfyUI Flux zero-fills a missing pooled vector.
+            y = torch.zeros(
+                x.shape[0], _FLUX_POOLED_DIM, device=context.device, dtype=context.dtype
+            )
         packed = self._pack_latents(x)
         t5_seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
-        clip_batch = int(y.shape[0]) if y is not None else 1
+        clip_batch = int(y.shape[0])
         return PackedForward(
             latents=packed,
             timesteps=timestep * 1000.0,
