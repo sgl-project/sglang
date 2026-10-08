@@ -1735,24 +1735,30 @@ def _normalize_media_domain(domain: str) -> str:
 
 def configure_media_url_security(
     allowed_media_domains: Optional[Sequence[str]] = None,
-    max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    max_file_size_mb: Optional[int] = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    *,
+    preserve_allowed_domains: bool = False,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
     A serving worker hosts one engine configuration, while media loading fans
     out to worker threads. Keeping the immutable policy here makes the same
     checks apply to image, video, audio, cache, and model-specific loaders.
+    A None size keeps the current download limit.
     """
 
-    if max_file_size_mb < 0:
+    if max_file_size_mb is not None and max_file_size_mb < 0:
         raise ValueError("media_url_max_file_size_mb must be non-negative")
 
-    normalized_domains = sorted(
-        {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
-    )
     global _allowed_media_domains, _media_url_max_file_size_bytes
+    normalized_domains = sorted(
+        _allowed_media_domains
+        if preserve_allowed_domains
+        else {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
+    )
     _allowed_media_domains = frozenset(normalized_domains)
-    _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    if max_file_size_mb is not None:
+        _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     return normalized_domains
 
 

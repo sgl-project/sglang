@@ -3,10 +3,16 @@
 import http.server
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
 
+from sglang.srt.multimodal.media_processor import TokenSpaceMMProcessor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space.process_strategy import (
+    TokenSpaceProcessStrategy,
+)
 from sglang.srt.utils.common import (
     _normalize_video_input,
     configure_media_url_security,
@@ -100,6 +106,47 @@ class TestMediaURLSecurity(unittest.TestCase):
 
     def _url(self, path, host="127.0.0.1"):
         return f"http://{host}:{self.port}{path}"
+
+    # Token-space host config -> shared loader policy:
+    #   both omitted -> inherit policy
+    #   size only    -> update cap and retain allowed hosts
+    #   hosts only   -> replace hosts and retain the cap
+    def _processor(self, **fields):
+        processor = TokenSpaceMMProcessor(
+            None,
+            SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda text: [])),
+            TokenSpaceProcessStrategy,
+            processor_config=MultimodalProcessorConfig(
+                mm_io_worker_num=1,
+                mm_processor_worker_num=1,
+                cpu_worker_num=1,
+                **fields,
+            ),
+        )
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def test_processor_size_only_limit_preserves_allowed_hosts(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
+        self._processor(media_url_max_file_size_mb=1)
+        with self.assertRaisesRegex(ValueError, "download limit"):
+            download_remote_media(self._url("/oversized"), timeout=5)
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            download_remote_media(self._url("/media", host="localhost"), timeout=5)
+
+    def test_processor_defaults_preserve_the_existing_policy(self):
+        configure_media_url_security(["127.0.0.1"], max_file_size_mb=1)
+        self._processor()
+        with self.assertRaisesRegex(ValueError, "download limit"):
+            download_remote_media(self._url("/oversized"), timeout=5)
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            download_remote_media(self._url("/media", host="localhost"), timeout=5)
+
+    def test_processor_domain_override_preserves_the_download_limit(self):
+        configure_media_url_security(["blocked.example"], max_file_size_mb=1)
+        self._processor(allowed_media_domains=["127.0.0.1"])
+        with self.assertRaisesRegex(ValueError, "download limit"):
+            download_remote_media(self._url("/chunked-oversized"), timeout=5)
 
     def test_unrestricted_mode_preserves_remote_media_compatibility(self):
         self.assertEqual(
