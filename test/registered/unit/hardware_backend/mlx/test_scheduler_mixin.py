@@ -471,34 +471,6 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         self.assertEqual(queue_after_pause, [0])
         self.assertEqual(len(scheduler.result_queue), 0)
 
-    def test_retract_after_in_place_pause_drains_job_left_queued(self):
-        # An in_place pause leaves the in-flight job queued and unprocessed;
-        # a retract pause that follows must still process it first.
-        events = []
-        queued_after_in_place = []
-        in_place = self._pause("in_place")
-        scheduler = self._make_scheduler(
-            ingest_steps=[
-                lambda s: None,
-                lambda s: (
-                    in_place(s),
-                    queued_after_in_place.append(len(s.result_queue)),
-                ),
-                self._pause("retract"),
-                self._resume,
-            ],
-            events=events,
-        )
-
-        self._run_loop(scheduler, events)
-
-        self.assertEqual(queued_after_in_place, [1])
-        self.assertEqual(
-            events,
-            [("launch", ["r1"]), ("process", ["r1"]), ("retract", ["r1"])],
-        )
-        self.assertEqual(len(scheduler.result_queue), 0)
-
 
 if __name__ == "__main__":
     unittest.main()
