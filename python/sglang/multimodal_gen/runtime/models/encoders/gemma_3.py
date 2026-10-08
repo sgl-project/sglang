@@ -39,6 +39,36 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
+def _load_with_shard_id(
+    weight_loader, param, loaded_weight: torch.Tensor, shard_id
+) -> None:
+    """Try the supplied shard ID, then its equivalent q/k/v or integer form."""
+    try:
+        weight_loader(param, loaded_weight, shard_id)
+        return
+    except (AssertionError, TypeError):
+        pass
+
+    if isinstance(shard_id, str):
+        mapping = {"q": 0, "k": 1, "v": 2}
+        if shard_id in mapping:
+            weight_loader(param, loaded_weight, mapping[shard_id])
+            return
+        if shard_id.isdigit():
+            weight_loader(param, loaded_weight, int(shard_id))
+            return
+    elif isinstance(shard_id, int):
+        mapping = {0: "q", 1: "k", 2: "v"}
+        if shard_id in mapping:
+            weight_loader(param, loaded_weight, mapping[shard_id])
+            return
+
+    raise TypeError(
+        f"Unsupported shard_id={shard_id!r} for weight_loader={weight_loader} "
+        f"(param={getattr(param, 'name', '<param>')})."
+    )
+
+
 class Gemma3RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -590,43 +620,6 @@ class Gemma3TextModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        def _load_with_shard_id(
-            weight_loader, param, loaded_weight: torch.Tensor, shard_id
-        ) -> None:
-            """Call param.weight_loader with best-effort shard_id normalization.
-
-            Different fused-QKV implementations expect different shard_id types:
-            - Some expect strings: "q"/"k"/"v"
-            - Some expect integer indices: 0/1/2
-            We try the provided shard_id first, then fall back between str/int forms.
-            """
-            try:
-                weight_loader(param, loaded_weight, shard_id)
-                return
-            except (AssertionError, TypeError):
-                pass
-
-            # Fall back between common representations.
-            if isinstance(shard_id, str):
-                mapping = {"q": 0, "k": 1, "v": 2}
-                if shard_id in mapping:
-                    weight_loader(param, loaded_weight, mapping[shard_id])
-                    return
-                if shard_id.isdigit():
-                    weight_loader(param, loaded_weight, int(shard_id))
-                    return
-            elif isinstance(shard_id, int):
-                mapping = {0: "q", 1: "k", 2: "v"}
-                if shard_id in mapping:
-                    weight_loader(param, loaded_weight, mapping[shard_id])
-                    return
-
-            # Re-raise with a clearer message.
-            raise TypeError(
-                f"Unsupported shard_id={shard_id!r} for weight_loader={weight_loader} "
-                f"(param={getattr(param, 'name', '<param>')})."
-            )
-
         stacked_params_mapping = getattr(
             getattr(self.config, "arch_config", object()),
             "stacked_params_mapping",
@@ -792,42 +785,6 @@ class Gemma3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters())
-
-        def _load_with_shard_id(
-            weight_loader, param, loaded_weight: torch.Tensor, shard_id
-        ) -> None:
-            """Call param.weight_loader with best-effort shard_id normalization.
-
-            Different fused-QKV implementations expect different shard_id types:
-            - Some expect strings: "q"/"k"/"v"
-            - Some expect integer indices: 0/1/2
-            We try the provided shard_id first, then fall back between str/int forms.
-            """
-            try:
-                weight_loader(param, loaded_weight, shard_id)
-                return
-            except (AssertionError, TypeError):
-                pass
-
-            # Fall back between common representations.
-            if isinstance(shard_id, str):
-                mapping = {"q": 0, "k": 1, "v": 2}
-                if shard_id in mapping:
-                    weight_loader(param, loaded_weight, mapping[shard_id])
-                    return
-                if shard_id.isdigit():
-                    weight_loader(param, loaded_weight, int(shard_id))
-                    return
-            elif isinstance(shard_id, int):
-                mapping = {0: "q", 1: "k", 2: "v"}
-                if shard_id in mapping:
-                    weight_loader(param, loaded_weight, mapping[shard_id])
-                    return
-
-            raise TypeError(
-                f"Unsupported shard_id={shard_id!r} for weight_loader={weight_loader} "
-                f"(param={getattr(param, 'name', '<param>')})."
-            )
 
         # Separate weights
         language_model_weights: list[tuple[str, torch.Tensor]] = []
