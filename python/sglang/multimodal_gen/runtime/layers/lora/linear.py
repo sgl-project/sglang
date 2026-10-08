@@ -649,15 +649,6 @@ class BaseLayerWithLoRA(nn.Module):
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: ColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
@@ -714,15 +705,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: MergedColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
         if B.dim() == 3:
@@ -748,15 +730,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: QKVParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def slice_lora_b_weights(
         self, B: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -778,15 +751,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: RowParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor):
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input_)
@@ -865,15 +829,6 @@ class LinearWithLoRA(BaseLayerWithLoRA):
     Unlike custom LinearBase classes, nn.Linear.forward() returns a single tensor,
     not a tuple of (output, bias).
     """
-
-    def __init__(
-        self,
-        base_layer: nn.Linear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
