@@ -15,7 +15,6 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -25,7 +24,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Reuse common functions and classes from mova_video_dit
-from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d
+from .mova_video_dit import (
+    initialize_mova_transformer_layers,
+    precompute_freqs_cis,
+    sinusoidal_embedding_1d,
+)
 
 
 def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
@@ -102,14 +105,11 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Extract parameters from config
         dim = config.dim
         in_dim = config.in_dim
-        ffn_dim = config.ffn_dim
         out_dim = config.out_dim
-        text_dim = config.text_dim
         freq_dim = config.freq_dim
         eps = config.eps
         patch_size = config.patch_size
         num_heads = config.num_heads
-        num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         separated_timestep = config.separated_timestep
@@ -131,26 +131,7 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.patch_embedding = Conv1dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = MLP(
-            text_dim,
-            dim,
-            output_dim=dim,
-            act_type="gelu_pytorch_tanh",
-            quant_config=quant_config,
-        )
-        self.time_embedding = MLP(
-            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
-        )
-        # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(
-            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
-        )
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
-                for _ in range(num_layers)
-            ]
-        )
+        initialize_mova_transformer_layers(self, config, quant_config)
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
