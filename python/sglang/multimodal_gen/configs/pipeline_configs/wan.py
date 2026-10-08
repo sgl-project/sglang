@@ -425,22 +425,6 @@ class Wan_Animate_2_14B_Config(WanI2V720PConfig):
                 "Wan-Animate-2 does not support SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION "
                 "(offline Q/K rotation); unset it for this model."
             )
-        # Upstream issue in the Wan VAE's spatially parallel encoder (wanvae.py,
-        # WanEncoder3d): it splits its input over the SP group but its distributed blocks
-        # gather over the VAE-decode group; the two differ once TP > 1, so every encoded
-        # latent is corrupted. Remove this check once the encoder fix lands upstream.
-        if server_args.tp_size > 1 and server_args.sp_degree > 1:
-            raise ValueError(
-                "Wan-Animate-2 does not support tensor parallelism combined with "
-                f"sequence parallelism (--tp-size {server_args.tp_size} with "
-                f"--ulysses-degree {server_args.ulysses_degree} / --ring-degree "
-                f"{server_args.ring_degree}; sp_degree={server_args.sp_degree}, "
-                "auto-derived from --num-gpus when no SP flag is given) because of an "
-                "upstream issue in the Wan VAE's spatially parallel encoder "
-                "(WanEncoder3d splits over the sequence-parallel group but gathers over "
-                "the VAE-decode group). Use --tp-size N alone, --ulysses-degree N alone, "
-                "or --enable-cfg-parallel with --ulysses-degree 2 or --tp-size 2."
-            )
         super().validate_server_args(server_args)
 
 

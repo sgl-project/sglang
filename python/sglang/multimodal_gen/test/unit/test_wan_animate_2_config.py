@@ -171,32 +171,28 @@ def test_single_expert_has_no_boundary_switching():
 
 
 @pytest.mark.parametrize(
-    "tp_size, ulysses_degree, enable_cfg_parallel, rejected",
+    "tp_size, ulysses_degree, enable_cfg_parallel",
     [
-        (2, 2, False, True),  # TP2 x Ulysses2 (4 GPUs)
-        (2, 2, True, True),  # TP2 x Ulysses2 auto-derived from --num-gpus 8 with CFG
-        (2, 1, False, False),  # TP2 alone
-        (1, 2, False, False),  # Ulysses2 alone
-        (4, 1, False, False),  # TP4
-        (1, 2, True, False),  # CFG-parallel x Ulysses2
+        (2, 2, False),  # TP2 x Ulysses2 (4 GPUs)
+        (2, 2, True),  # TP2 x Ulysses2 auto-derived from --num-gpus 8 with CFG
+        (2, 1, False),  # TP2 alone
+        (1, 2, False),  # Ulysses2 alone
+        (4, 1, False),  # TP4
+        (1, 2, True),  # CFG-parallel x Ulysses2
+        (2, 1, True),  # CFG-parallel x TP2
     ],
 )
-def test_validate_server_args_rejects_tp_combined_with_sequence_parallel(
-    tp_size, ulysses_degree, enable_cfg_parallel, rejected
+def test_validate_server_args_accepts_tp_combined_with_ulysses(
+    tp_size, ulysses_degree, enable_cfg_parallel
 ):
-    """TP combined with Ulysses yields a wrong video on this model (12 dB PSNR vs 1 GPU), so
-    the server must refuse the layout at startup instead of after loading 14B weights."""
+    """TP, Ulysses and CFG-parallel compose freely as long as the degrees divide the
+    40 attention heads; the hybrid TP x Ulysses layout starts like the single-axis ones."""
     server_args = _parallel_server_args(
         tp_size=tp_size,
         ulysses_degree=ulysses_degree,
         enable_cfg_parallel=enable_cfg_parallel,
     )
-    config = Wan_Animate_2_14B_Config()
-    if rejected:
-        with pytest.raises(ValueError, match=r"--tp-size 2 .*--ulysses-degree 2"):
-            config.validate_server_args(server_args)
-    else:
-        config.validate_server_args(server_args)
+    Wan_Animate_2_14B_Config().validate_server_args(server_args)
 
 
 def _parallel_server_args(
@@ -248,6 +244,10 @@ def test_validate_server_args_rejects_ring_sequence_parallelism():
         (1, 16, True),  # 40 heads not divisible by 16
         (3, 1, True),  # 40 heads not divisible by tp 3
         (8, 1, False),
+        (2, 4, False),  # 40 heads / tp 2 = 20 local heads, divisible by 4
+        (4, 2, False),  # 40 heads / tp 4 = 10 local heads, divisible by 2
+        (4, 3, True),  # 10 local heads not divisible by 3
+        (8, 4, True),  # 5 local heads not divisible by 4
     ],
 )
 def test_validate_server_args_checks_head_divisibility(

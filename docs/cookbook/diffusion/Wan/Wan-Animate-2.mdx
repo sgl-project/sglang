@@ -150,7 +150,7 @@ acceleration features and their runtime requirements.
 
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use.
 - `--tp-size {TP_SIZE}`: Tensor parallelism size.
-- `--ulysses-degree {ULYSSES_DEGREE}`: DeepSpeed-Ulysses-style sequence parallelism (USP). The **ring degree must be 1** for this model; `--ring-degree` greater than 1 is rejected with `NotImplementedError`. **Do not combine with `--tp-size`**: tensor parallelism and sequence parallelism cannot be used together on this model, and the server rejects the combination at startup (see [section 3.3](#3-3-multi-gpu-and-memory-presets)).
+- `--ulysses-degree {ULYSSES_DEGREE}`: DeepSpeed-Ulysses-style sequence parallelism (USP). The **ring degree must be 1** for this model; `--ring-degree` greater than 1 is rejected with `NotImplementedError`. Combines with `--tp-size`: Ulysses splits the TP-local attention heads, so `--tp-size` must divide the 40 heads and `--ulysses-degree` must divide the per-shard count (see [section 3.3](#3-3-multi-gpu-and-memory-presets)).
 - `--enable-cfg-parallel`: Split the guided and unguided branches across GPUs.
 - `--text-encoder-cpu-offload`: CPU-offload the text encoder to save memory; it is moved to the GPU for the one encode per request.
 
@@ -161,12 +161,12 @@ acceleration features and their runtime requirements.
 | 1 GPU, 96 GB or more | *(no extra flags)* | DiT resident: about 71 GiB peak per GPU at the default workload. Add `--text-encoder-cpu-offload` to keep the fp32 text encoder off the GPU. |
 | 1 GPU, 80 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer: about 39 GiB peak at the same end-to-end time as the resident DiT; output identical. |
 | 2+ GPUs, long sequences | `--num-gpus N --ulysses-degree N` | Sequence parallel across ranks (ring degree stays 1). |
-| 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. Keep `--tp-size` equal to `--num-gpus` (or to half of it with `--enable-cfg-parallel`): leftover GPUs are auto-assigned to sequence parallelism, which is rejected together with TP (last row). |
+| 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. With `--tp-size` smaller than `--num-gpus` (or than half of it with `--enable-cfg-parallel`), the leftover GPUs are auto-assigned to Ulysses sequence parallelism (last row). |
 | 2 GPUs, split CFG | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided/unguided branches. |
 | 2 GPUs, 80 GB cards | `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | Same speed as resident CFG-parallel at about 42 GiB per GPU, output bit-identical to a single GPU (the CI configuration). |
 | 4 GPUs | `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2` | CFG-parallel across two pairs of Ulysses ranks: the fastest 4-GPU layout. Add `--encoder-parallel replicate --vae-config.use-parallel-decode false` for output bit-identical to a single GPU; pass the flags explicitly to pin the layout instead of relying on the automatic assignment. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (about 43 GiB per GPU, same speed). |
 | FSDP sharding | `--use-fsdp-inference` is **not supported** | Rejected at startup, before any weights load; use `--tp-size` to shard the DiT or `--dit-layerwise-offload` to cut peak memory. |
-| TP combined with Ulysses (e.g. `--tp-size 2 --ulysses-degree 2`) | **not supported** | Rejected at startup with a `ValueError` because of an upstream issue in the Wan VAE's spatially parallel encoder: [`WanEncoder3d`](https://github.com/sgl-project/sglang/blob/41bd213c5f2d7d13b77bd2bd3b370e46022139b3/python/sglang/multimodal_gen/runtime/models/vaes/wanvae.py#L1047-L1048) splits its input over the sequence-parallel group while its distributed blocks gather over the VAE-decode group, and the two groups differ once TP is combined with SP. Use TP alone, Ulysses alone, or CFG-parallel with one of them (`--num-gpus 4 --enable-cfg-parallel --tp-size 2` or `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2`). |
+| 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 35 GiB peak per GPU (27 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 17 percent slower than CFG-parallel x tensor parallel and 33 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
 
 ## 4. Model Invocation
 
@@ -314,16 +314,17 @@ synchronizes the device so the per-stage timings are accurate.
     | 4 GPUs, CFG-parallel x Ulysses, layerwise DiT offload | 4 | `--enable-cfg-parallel --ulysses-degree 2 --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` | 303 | 42.9 |
     | 4 GPUs, Ulysses | 4 | `--ulysses-degree 4` | 342 | 53.5 |
     | 4 GPUs, CFG-parallel x tensor parallel | 4 | `--enable-cfg-parallel --tp-size 2` | 331 | 38.9 |
+    | 4 GPUs, tensor parallel x Ulysses | 4 | `--tp-size 2 --ulysses-degree 2` | 374 | 34.5 |
     | 4 GPUs, tensor parallel | 4 | `--tp-size 4` | 392 | 28.4 |
 
     Layerwise DiT offload cuts the 1-GPU peak by 32 GiB at the same end-to-end time.
     The fastest 4-GPU layout is 3.5x faster than one GPU. The framework default and the explicit CFG-parallel x Ulysses
     layout run at the same speed and produce the same output; the explicit flags pin the layout.
+    Tensor parallel x Ulysses is the memory-leaning 4-GPU layout: the lowest 4-GPU peak after `--tp-size 4`, about 17 percent slower than CFG-parallel x tensor parallel and 33 percent slower than the default.
+    That row was measured separately; its CFG-parallel x tensor parallel and framework-default controls ran 318 s and 280 s against the 331 s and 294 s in the table, so it reads about 4 to 5 percent faster than the other rows.
     Adding `--encoder-parallel replicate --vae-config.use-parallel-decode false` to the CFG-parallel x Ulysses row (the flags that make the output bit-identical to a single GPU) costs about 4 percent (305 s, 75.6 GiB).
     The layerwise rows are the configurations for 80 GB GPUs. With the replicated encoders, serial VAE decode and the
     channels-last VAE layout (`SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1`) the CFG-parallel output is bit-identical to a single GPU.
-    Tensor parallelism combined with Ulysses is rejected at startup (see
-    [section 3.3](#3-3-multi-gpu-and-memory-presets)).
   </Tab>
 </Tabs>
 
@@ -357,8 +358,7 @@ accuracy must be validated separately with pinned versions and aligned settings.
 
 - **OOM**: lower `clip_len` (for example `37` instead of `65`/`81`) or add `--dit-layerwise-offload --layerwise-offload-components transformer`.
 - **`--ring-degree` greater than 1** is rejected at startup with `NotImplementedError`. Use `--ulysses-degree` for sequence parallelism and keep the ring degree at 1.
-- **`--ulysses-degree` that does not divide the attention heads** (40 per TP shard, so 3, 6, 16, ...) is rejected at startup with `ValueError`; use 2, 4, 5, 8, 10, 20 or 40.
-- **`--tp-size` together with `--ulysses-degree` (known limitation)**: the server refuses to start with `Wan-Animate-2 does not support tensor parallelism combined with sequence parallelism`, because of the upstream Wan VAE encoder issue described in [section 3.3](#3-3-multi-gpu-and-memory-presets). It also triggers when leftover GPUs are auto-assigned to sequence parallelism (for example `--num-gpus 8 --tp-size 2`). Run TP alone, Ulysses alone, or CFG-parallel with one of them.
+- **`--ulysses-degree` that does not divide the TP-local attention heads** (40 / `--tp-size`; with TP 1, degrees 3, 6, 16, ... are rejected) fails at startup with `ValueError`; with TP 1 use 2, 4, 5, 8, 10, 20 or 40. The same check covers leftover GPUs auto-assigned to sequence parallelism (for example `--num-gpus 8 --tp-size 2` runs TP 2 x Ulysses 4).
 - **FSDP** (`--use-fsdp-inference`) is not supported for this model and is rejected at startup; use `--tp-size` or DiT layerwise offload for memory.
 - **`--attention-backend`** (or `--component-attention-backends transformer=...`) is rejected at startup with `ValueError`: the in-context self-attention runs on torch `flex_attention` only. The text encoder still accepts `--component-attention-backends text_encoder=<backend>`.
 - **`enable_teacache` / `enable_spectrum`** request fields are rejected with `ValueError`: every block runs at every step, so the cache heuristics do not apply.
