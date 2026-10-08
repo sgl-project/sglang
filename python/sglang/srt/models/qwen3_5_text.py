@@ -40,6 +40,9 @@ _MODEL_PREFIX = "model."
 class Qwen3_5ForCausalLM(nn.Module):
     body_cls = qwen3_5.Qwen3_5ForCausalLM
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self.body_cls.is_unused_checkpoint_weight(name)
+
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
 
