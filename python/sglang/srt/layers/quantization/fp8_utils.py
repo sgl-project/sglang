@@ -2161,12 +2161,41 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
+def _k3_ptpc_scaled_mm() -> bool:
+    """Use aiter's per-token quant for K3 dense PTPC.
+
+    The GEMM stays on ``gemm_a8w8_bpreshuffle`` (``kernel_gemm_0`` on the
+    tuned shapes). hipBLASLt ``torch._scaled_mm`` measured as the slower F8BS
+    solution on those same shapes, so this flag no longer changes the GEMM.
+    ``SGLANG_ROCM_K3_PTPC_SCALED_MM=0`` keeps the group quant kernel. Unset,
+    the switch follows the K3 FP8 flags. Other models are unchanged when
+    those flags are off.
+    """
+    import os
+
+    raw = os.environ.get("SGLANG_ROCM_K3_PTPC_SCALED_MM")
+    if raw is not None:
+        return raw == "1"
+    return any(
+        get_bool_env_var(name)
+        for name in (
+            "SGLANG_ROCM_K3_PTPC_FP8",
+            "SGLANG_ROCM_K3_ONLINE_FP8_ATTN",
+            "SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ",
+            "SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS",
+            "SGLANG_ROCM_K3_MOE_LATENT_FP8",
+        )
+    )
+
+
 def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
     # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
     # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
     # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
     # 14us against 90us for the cktile instance that does accept it.
+    # A shuffled weight through scaled_mm (or an unshuffled one through CK)
+    # silently returns garbage, so this predicate is also the load-time shuffle.
     return _use_aiter and output_size % 64 == 0
 
 
@@ -2188,7 +2217,7 @@ def apply_fp8_linear_bmm_flashinfer(
 
 
 def apply_fp8_linear(
-    input: torch.Tensor,
+    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -2210,6 +2239,12 @@ def apply_fp8_linear(
             "SGLANG_ENABLE_TORCH_COMPILE"
         )
     output_padding = 17 if pad_output else None
+
+    if _is_hip and isinstance(input, tuple):
+        # A producer fusion hands over (fp8, per-token scale); unpack it and
+        # let the prequantized path below run as if the caller had quantized.
+        input, input_scale = input
+        use_per_token_if_dynamic = True
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
@@ -2246,9 +2281,17 @@ def apply_fp8_linear(
     )
 
     if input_prequantized:
-        assert input_scale is not None and input_scale.numel() == 1
+        # Only the producer fusion above supplies a per-token [M, 1] scale.
+        per_token_prequant = (
+            _is_hip and input_scale is not None and input_scale.numel() > 1
+        )
+        assert input_scale is not None and (
+            per_token_prequant or input_scale.numel() == 1
+        )
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
+        if per_token_prequant:
+            x_scale = input_scale.view(-1, 1)
+        elif channelwise_cutlass and not native_scalar_a_scale:
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
@@ -2314,6 +2357,15 @@ def apply_fp8_linear(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
+                elif _is_hip and _k3_ptpc_scaled_mm():
+                    # ATOM's activation quant. per_token_group_quant_fp8 is a
+                    # different kernel (_per_token_group_quant_8bit).
+                    from aiter import dtypes as aiter_dtypes
+                    from aiter.ops.quant import per_token_quant_hip
+
+                    qinput, x_scale = per_token_quant_hip(
+                        input_2d, quant_dtype=aiter_dtypes.fp8
                     )
                 else:
                     qinput, x_scale = per_token_group_quant_fp8(

@@ -941,6 +941,22 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # PTPC FP8 (per-token activation, per-channel weight) for the BF16 decode
+    # projections the checkpoint leaves unquantized. The router gate stays BF16.
+    SGLANG_ROCM_K3_PTPC_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_PTPC_FP8_MAX_TOKENS = EnvInt(256)
+    SGLANG_ROCM_K3_PTPC_FP8_SHARED_DOWN = EnvBool(False)
+    SGLANG_ROCM_K3_PTPC_FP8_MIN_TOKENS = EnvInt(8)
+    # Split the fused MoE front so the 3584x7168 latent down-projection
+    # runs as PTPC FP8 while the router head stays BF16.
+    SGLANG_ROCM_K3_MOE_LATENT_FP8 = EnvBool(False)
+    SGLANG_ROCM_K3_MOE_LATENT_FP8_MIN_TOKENS = EnvInt(8)
+    # Quantize the linears an unquantized K3 checkpoint leaves dense to
+    # per-output-channel FP8 after load, so the PTPC GEMMs can serve them.
+    # Official BF16 weights; this does not require a Quark checkpoint.
+    SGLANG_ROCM_K3_ONLINE_FP8_ATTN = EnvBool(False)
+    SGLANG_ROCM_K3_ONLINE_FP8_KDA_INPROJ = EnvBool(False)
+    SGLANG_ROCM_K3_ONLINE_FP8_SHARED_EXPERTS = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

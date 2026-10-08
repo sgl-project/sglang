@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
+from sglang.srt.models.deepseek_common.utils_rocm import accepts_ptpc_fp8_tuple
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -146,6 +147,7 @@ if _use_aiter_gfx95:
     )
     from sglang.srt.layers.rocm_linear_utils import (
         fused_fp8_bmm_rope_cat_and_cache_mla,
+        fused_qk_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
     )
 
@@ -388,7 +390,12 @@ def _fused_rope_cat_and_cache(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95."""
+    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95.
+
+    NoPE layers (``rotary_emb is None``, e.g. Kimi-K3) still take this path
+    through ``fused_qk_cat_and_cache_mla``, which copies the PE halves through
+    and keeps the concat and the cache write fused.
+    """
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
@@ -406,6 +413,17 @@ def _fused_rope_cat_and_cache(
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
     out_cache_loc = out_cache_loc.contiguous()
+    if attn.rotary_emb is None:
+        return fused_qk_cat_and_cache_mla(
+            q_nope_out,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
+            out_cache_loc,
+            attn.attn_mqa.k_scale,
+            q_out_dtype=q_out_dtype,
+        )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -573,6 +591,39 @@ class DeepseekMLARocmForwardMixin:
                     )
                     if _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif (
+                _use_aiter
+                and envs.SGLANG_ROCM_K3_PTPC_FP8.get()
+                and accepts_ptpc_fp8_tuple(self.q_b_proj)
+            ):
+                from aiter import dtypes as aiter_dtypes
+                from aiter.ops.fused_qk_rmsnorm_group_quant import (
+                    fused_qk_rmsnorm_per_token_quant,
+                )
+
+                q_fp8 = torch.empty(q.shape, dtype=aiter_dtypes.fp8, device=q.device)
+                q_scale = torch.empty(
+                    (q.shape[0], 1), dtype=torch.float32, device=q.device
+                )
+                k_out = torch.empty_like(k_nope)
+                q_unq = torch.empty_like(q) if self.use_dsa else None
+                fused_qk_rmsnorm_per_token_quant(
+                    q_fp8,
+                    q_scale,
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    q_unq,
+                    k_out,
+                    None,
+                    k_nope,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
+                q = (q_fp8, q_scale)
+                k_nope = k_out
+                if self.use_dsa:
+                    q_lora = q_unq
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
@@ -1107,14 +1158,16 @@ class DeepseekMLARocmForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
 
-        A layer without a rotary_emb has nothing to fuse: that branch reads
-        rotary_emb.cos_cache, so skipping the standalone rope there ends in
-        AttributeError on None. Kimi-K3 has such layers.
+        NoPE layers (rotary_emb=None, e.g. Kimi-K3) take the same branch: there
+        is no rope for prepare to skip, and fused_qk_cat_and_cache_mla still
+        fuses the two concats, the FP8 cast and the paged write into one launch.
+        On an aiter without that op they keep the plain path.
         """
-        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
-        # fused kernel to apply; keep both prepare and core on the plain path.
         return (
             _use_aiter_gfx95
             and self.current_attention_backend == "aiter"
-            and self.rotary_emb is not None
+            and (
+                self.rotary_emb is not None
+                or fused_qk_cat_and_cache_mla is not None
+            )
         )
