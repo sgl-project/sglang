@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -322,6 +323,26 @@ class BeamMoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
         if defer_sum:
+            if (
+                envs.SGLANG_BEAM_DECODE_GEMV.get()
+                and hidden_states.shape == (1, 5120)
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_contiguous()
+                and self.tp_size == 4
+                and self.ep_size == 1
+                and self.experts.quant_method.w13_swiglu_interleaved
+                and self.experts.w13_weight.shape == (256, 1280, 5120)
+                and torch.cuda.get_device_capability() == (10, 3)
+            ):
+                from sglang.kernels.ops.moe.beam_decode_gemv import beam_decode_gemv
+
+                return beam_decode_gemv(
+                    hidden_states,
+                    self.experts.w13_weight,
+                    self.experts.w2_weight,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                )
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
                 fused_experts_impl,
             )
@@ -798,22 +819,19 @@ class BeamModel(nn.Module):
             or not self.fuse_all_reduce
         ):
             return None
-        # Require native TP reduction ownership. Keep other parallel/reduction
-        # arrangements on their existing path.
+        # Attention owns a TP reduction independently of the expert layout.
         from sglang.kernels.fused_op import get_fused_op_backend
 
         parallel = get_parallel()
-        architecture = torch.cuda.get_device_capability(hidden_states.device)[0]
+        capability = torch.cuda.get_device_capability(hidden_states.device)
+        architecture = capability[0]
         if (
             parallel.tp_size not in (2, 4, 8)
             or architecture not in (9, 10)
             or get_lora().enable_lora
             or get_forward().sp_active
-            or should_skip_post_experts_all_reduce(is_tp_path=True)
             or parallel.attn_tp_size != parallel.tp_size
             or parallel.attn_cp_size != 1
-            or parallel.moe_ep_size != 1
-            or parallel.moe_tp_size != parallel.tp_size
             or execution.deterministic.enable_deterministic_inference
             or execution.comm.disable_custom_all_reduce
             or get_fused_op_backend() is not None
@@ -826,6 +844,19 @@ class BeamModel(nn.Module):
             if architecture == 9
             else (64, 64)
         )
+        # GB300 TP4 batch64 failed the trained-model decode consistency gate.
+        # Keep its original reduction/norm until the fused norm tree is aligned.
+        if capability == (10, 3) and parallel.tp_size == 4:
+            attention_max_tokens = min(attention_max_tokens, 32)
+            moe_max_tokens = min(moe_max_tokens, 32)
+        # Deferred expert outputs currently require unsharded expert IDs and
+        # one TP reduction. EP keeps its normal expert mapping and reduction.
+        if (
+            parallel.moe_ep_size != 1
+            or parallel.moe_tp_size != parallel.tp_size
+            or should_skip_post_experts_all_reduce(is_tp_path=True)
+        ):
+            moe_max_tokens = 0
         max_tokens = max(attention_max_tokens, moe_max_tokens)
         if hidden_states.shape[0] > max_tokens:
             return None
