@@ -4253,6 +4253,120 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(self._host_avail_sizes(cache), avail0)
         cache.sanity_check()
 
+    def _drain_buffer_writes(self, cache):
+        pipeline = cache.buffer_pipeline
+        self._pump_hicache_until(
+            cache,
+            lambda: (
+                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
+            ),
+            "buffer backup pipeline did not drain",
+        )
+        self.assertFalse(pipeline.pending_write_queue)
+        self.assertFalse(pipeline._queued_span_refs)
+        self.assertEqual(pipeline.write_backlog_tokens_, 0)
+        self.assertEqual(pipeline.write_staged_tokens_, 0)
+
+    def test_buffer_only_split_intent_writes_every_piece(self):
+        """Repeated splits preserve every pool's write once, parents first."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        pipeline = cache.buffer_pipeline
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        span_hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        aux_keys = _aux_storage_key_transfers(cache, leaf)
+        _write_backup(cache, leaf)
+        expected_keys = [
+            (i.pool, key) for i in pipeline.pending_write_queue for key in i.keys
+        ]
+        # SWA may already have split the leaf at its window boundary.
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = _node_key_length(cache, node)
+            if node_len >= 3 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of three pages to split")
+        for offset in (1, 2):
+            split_at = end - node_len + offset * ps
+            self._insert(
+                cache,
+                allocator,
+                req_to_token_pool,
+                seq[:split_at] + self._make_seq(9000, 2),
+            )
+            self.assertEqual(_node_key_length(cache, node), end - split_at)
+            _write_backup(cache, _node_parent(cache, node))
+
+        pipeline._refresh_pending_backup_intents()
+        kv_order = [
+            intent.snapshot.node_id
+            for intent in pipeline.pending_write_queue
+            if intent.pool == PoolName.KV
+        ]
+        self.assertEqual(kv_order, self._path_chain(cache, leaf))
+        self.assertCountEqual(
+            [(i.pool, key) for i in pipeline.pending_write_queue for key in i.keys],
+            expected_keys,
+        )
+        self.assertEqual(pipeline.write_backlog_tokens_, len(seq))
+        self._drain_buffer_writes(cache)
+        self.assertEqual(
+            self._storage_exists_count(cache, span_hashes, aux_keys), len(span_hashes)
+        )
+        cache.sanity_check()
+
+    def test_buffer_only_finish_writes_prompt_and_output(self):
+        """The finish-path split preserves both prompt and output writes."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("only FULL-only caches split the leaf at the prompt")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        cache.tree_core.write_through_threshold = 1  # the write_through trigger
+
+        req = self._make_req(req_to_token_pool)
+        prompt = self._make_seq(1, 6)
+        output = self._make_seq(3000, 4)
+        req.origin_input_ids = array("q", prompt)
+        req.output_ids = array("q", output)
+        req.full_untruncated_fill_ids = array("q", prompt + output)
+        req.extend_end = len(prompt) + len(output)
+        kv_len = req.extend_end
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
+        req.kv.kv_allocated_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        finish_req(cache, req, kv_len)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt + output)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        self.assertEqual(
+            [_node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
+        )
+        self._drain_buffer_writes(cache)
+        hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
+        cache.sanity_check()
+
     @staticmethod
     def _writes_by_pool(write_storage, extra):
         """Key tuples of the KV writes and of the ``extra`` pool's writes
