@@ -8,10 +8,13 @@ bf16-baseline-relative threshold that GSM8K showed is quality-safe.
     python -m pytest test/registered/mem_cache/test_int8_checkpoint_store.py -v
 """
 
+import types
 import unittest
+from unittest import mock
 
 import torch
 
+import sglang.srt.mem_cache.mamba_checkpoint_pool as mamba_checkpoint_pool
 from sglang.srt.mem_cache.mamba_checkpoint_pool import (
     Int8CheckpointStore,
     MambaCheckpointPool,
@@ -179,6 +182,124 @@ class TestInt8CheckpointDecodeError(unittest.TestCase):
         o_int8 = decode(S_int8, dec)
         rel = (o_int8 - o_ref).norm() / o_ref.norm()
         self.assertLess(rel.item(), 1.5e-2, f"int8 decode err {rel} too high")
+
+
+class TestMambaCheckpointConvTransfer(unittest.TestCase):
+    """Regression for the NPU conv-layout transfer (review comments on #40140).
+
+    ``store_from_active`` / ``load_to_active`` patch the module-level ``_is_npu``
+    flag (no real NPU device is needed — the branch under test is pure tensor
+    slice/transpose) and verify:
+
+      * KDA keeps its [window, channels] layout (no flip) with a non-square conv;
+      * GDN/Mamba flips [channels, window] <-> [window, channels];
+      * the speculative-verify window extension (spec_num_draft_tokens - 1) is
+        sliced off on store and re-zeroed on load.
+    """
+
+    W, C = 3, 5  # non-square, so an unconditional transpose would break KDA
+
+    def _pool(self, conv_shapes, is_kda, spec_draft=None):
+        return MambaCheckpointPool(
+            num_layers=L,
+            num_slots=8,
+            num_heads=H,
+            head_v_dim=V,
+            head_k_dim=K,
+            conv_shapes=conv_shapes,
+            conv_dtype=torch.float32,
+            device="cpu",
+            temporal_dtype=torch.float32,
+            is_kda=is_kda,
+            spec_num_draft_tokens=spec_draft,
+        )
+
+    def _make_active(self, conv, temporal):
+        cache = types.SimpleNamespace(conv=[conv], temporal=temporal)
+        return types.SimpleNamespace(mamba_cache=cache)
+
+    def _roundtrip(self, pool, active_conv, active_slots, ckpt_slots, dst_slots):
+        """Store active_slots -> ckpt_slots, then load back into dst_slots. The
+        active conv at dst_slots must match the source at active_slots."""
+        temporal = torch.randn(L, 4, H, V, K) * 1e-2
+        active = self._make_active(active_conv, temporal)
+        pool.store_from_active(active, active_slots, ckpt_slots)
+        expected = active_conv[:, active_slots].clone()
+        pool.load_to_active(active, ckpt_slots, dst_slots)
+        return expected, active_conv[:, dst_slots]
+
+    def test_npu_kda_conv_no_transpose_non_square(self):
+        with mock.patch.object(mamba_checkpoint_pool, "_is_npu", True):
+            pool = self._pool([(self.W, self.C)], is_kda=True)
+            active_conv = torch.randn(L, 4, self.W, self.C)
+
+            expected, got = self._roundtrip(
+                pool,
+                active_conv,
+                torch.tensor([1, 2]),
+                torch.tensor([3, 4]),
+                torch.tensor([0, 1]),
+            )
+            # KDA: checkpoint == active, no (2,3) flip
+            self.assertTrue(torch.equal(got, expected))
+
+    def test_npu_gdn_conv_transpose_non_square(self):
+        with mock.patch.object(mamba_checkpoint_pool, "_is_npu", True):
+            # GDN conv_shapes read (channels, window)
+            pool = self._pool([(self.C, self.W)], is_kda=False)
+            active_conv = torch.randn(L, 4, self.W, self.C)
+
+            expected, got = self._roundtrip(
+                pool,
+                active_conv,
+                torch.tensor([1, 2]),
+                torch.tensor([3, 4]),
+                torch.tensor([0, 1]),
+            )
+            # GDN: checkpoint [C, W] == active.transpose(2,3), and the load
+            # flips back, so the round-trip is exact
+            self.assertTrue(torch.equal(got, expected))
+
+    def test_npu_spec_window_extension_sliced_and_zeroed(self):
+        num_draft = 4  # extra_conv_len = 3
+        extra = num_draft - 1
+        for is_kda, conv_shapes in ((True, [(self.W, self.C)]), (False, [(self.C, self.W)])):
+            with self.subTest(is_kda=is_kda):
+                with mock.patch.object(mamba_checkpoint_pool, "_is_npu", True):
+                    pool = self._pool(conv_shapes, is_kda, spec_draft=num_draft)
+                    active_conv = torch.randn(L, 4, self.W + extra, self.C)
+                    temporal = torch.randn(L, 4, H, V, K) * 1e-2
+                    active = self._make_active(active_conv, temporal)
+
+                    active_slots = torch.tensor([1])
+                    ckpt_slots = torch.tensor([2])
+                    pool.store_from_active(active, active_slots, ckpt_slots)
+                    # checkpoint keeps only the first W window slots
+                    self.assertTrue(
+                        torch.equal(
+                            pool.conv[0][:, [2]],
+                            active_conv[:, [1], : self.W],
+                        )
+                    )
+
+                    dst_slots = torch.tensor([0])
+                    active_conv[:, dst_slots] = torch.randn_like(
+                        active_conv[:, dst_slots]
+                    )
+                    pool.load_to_active(active, ckpt_slots, dst_slots)
+                    # restore the first W window, zero the extension
+                    self.assertTrue(
+                        torch.equal(
+                            active_conv[:, [0], : self.W],
+                            active_conv[:, [1], : self.W],
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            active_conv[:, [0], self.W :],
+                            torch.zeros_like(active_conv[:, [0], self.W :]),
+                        )
+                    )
 
 
 if __name__ == "__main__":
