@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.choices import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.utils.common import human_readable_int
@@ -512,6 +513,7 @@ class ExecGraph(msgspec.Struct):
         Arg(
             help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_backend_prefill: A[
@@ -519,6 +521,7 @@ class ExecGraph(msgspec.Struct):
         Arg(
             help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_max_bs_decode: A[

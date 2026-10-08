@@ -234,6 +234,15 @@ def cuda_graph_fully_disabled() -> bool:
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
 
 
+def parse_cuda_graph_backend_arg(raw: str) -> str:
+    """Reject the retired backend before argparse checks supported choices."""
+    if raw == "tc_piecewise":
+        raise argparse.ArgumentTypeError(
+            "tc_piecewise was removed; select breakable, full, or disabled"
+        )
+    return raw
+
+
 def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
     """argparse type for --cuda-graph-config: parse JSON dict of
     phase → settings dict. Each phase's settings dict is itself validated
@@ -261,6 +270,8 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
                 f"--cuda-graph-config['{phase}'] must be a JSON object, got "
                 f"{type(phase_settings).__name__}"
             )
+        if "backend" in phase_settings:
+            parse_cuda_graph_backend_arg(phase_settings["backend"])
         allowed = ALLOWED_KEYS_PER_PHASE[phase]
         result[phase] = {}
         for key, value in phase_settings.items():
