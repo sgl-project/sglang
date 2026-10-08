@@ -66,6 +66,7 @@ configure_environment() {
     echo "SGLANG_CI_PYTHON=${CI_PYTHON_VER} (system python ${SYS_PYTHON_VER})"
 
     UV_VENV=""
+    UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
@@ -73,12 +74,16 @@ configure_environment() {
         # Kept across jobs like the system site-packages it replaces, so installs
         # stay incremental and JIT caches keyed on package paths keep hitting.
         UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
-        if ! "$UV_VENV/bin/python3" -c "import sys; assert sys.version_info[:2] == tuple(map(int, '${CI_PYTHON_VER}'.split('.')))" 2>/dev/null; then
+        # A job cancelled mid-install leaves dist-info without its files, which later
+        # installs treat as satisfied; rebuild unless the last install ran to completion.
+        UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
+        if [ ! -f "$UV_VENV_COMPLETE_MARKER" ] || ! "$UV_VENV/bin/python3" -c "import sys; assert sys.version_info[:2] == tuple(map(int, '${CI_PYTHON_VER}'.split('.')))" 2>/dev/null; then
             rm -rf "$UV_VENV"
             # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
             uv python install "$CI_PYTHON_VER" --python-preference only-managed
             uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
         fi
+        rm -f "$UV_VENV_COMPLETE_MARKER"
     fi
 
     if [ -n "$UV_VENV" ]; then
@@ -972,6 +977,9 @@ main() {
     prepare_runner
     setup_ld_library_path
     verify_imports
+    if [ -n "$UV_VENV_COMPLETE_MARKER" ]; then
+        touch "$UV_VENV_COMPLETE_MARKER"
+    fi
 }
 
 main "$@"

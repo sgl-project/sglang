@@ -102,9 +102,11 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        # Same persistent venv ci_install_dependency.sh creates on this runner.
+        # Same persistent venv ci_install_dependency.sh creates on this runner; dropping
+        # its completion marker makes the next CI job there rebuild rather than trust it.
         run: |
           venv=/opt/sglang-ci-py3.12
+          rm -f "$venv/.install-complete"
           if [ ! -x "$venv/bin/python3" ]; then
             command -v uv >/dev/null 2>&1 || python3 -m pip install uv
             uv python install 3.12 --python-preference only-managed
