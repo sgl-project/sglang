@@ -1146,42 +1146,6 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         value, _ = self.to_v(hidden_states)
         return query, key, value
 
-    def _cross_attn_with_cache(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        crossattn_cache: CrossAttentionKVCache | None,
-    ) -> torch.Tensor:
-        attn2 = self.attn2
-        q, _ = attn2.to_q(hidden_states)
-        if attn2.tp_rmsnorm:
-            q = tensor_parallel_rms_norm(q, attn2.norm_q)
-        else:
-            q = attn2.norm_q(q)
-        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-        if crossattn_cache is not None and crossattn_cache.is_init:
-            k = crossattn_cache.k
-            v = crossattn_cache.v
-        else:
-            k, _ = attn2.to_k(encoder_hidden_states)
-            if attn2.tp_rmsnorm:
-                k = tensor_parallel_rms_norm(k, attn2.norm_k)
-            else:
-                k = attn2.norm_k(k)
-            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            v, _ = attn2.to_v(encoder_hidden_states)
-            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
-
-            if crossattn_cache is not None:
-                crossattn_cache.store(k, v)
-
-        hidden_states = attn2.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
-        hidden_states, _ = attn2.to_out(hidden_states)
-        return hidden_states
-
     def _cam_conditioner_scale_shift(
         self,
         c2ws_plucker_emb: torch.Tensor | None,

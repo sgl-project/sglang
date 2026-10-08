@@ -191,7 +191,6 @@ class SDARMoeAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -226,8 +225,7 @@ class SDARMoeAttention(nn.Module):
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
