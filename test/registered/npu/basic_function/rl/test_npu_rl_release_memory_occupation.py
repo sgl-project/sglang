@@ -25,6 +25,8 @@ from sglang.test.ascend.test_ascend_utils import (
     LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
     LLAMA_3_2_1B_WEIGHTS_PATH,
     QWEN3_5_9B_WEIGHTS_PATH,
+    QWEN3_8B_EAGLE3_WEIGHTS_PATH,
+    QWEN3_8B_WEIGHTS_PATH,
     QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH,
     QWEN3_30B_A3B_WEIGHTS_PATH,
 )
@@ -53,15 +55,18 @@ _MIN_DELTA_SMI_W_MB = 500  # npu-smi weights release (~2 GB model)
 
 
 # NPU memory
-def _npu_smi_mem_mb() -> float:
-    """Sum of HBM-Usage(MB) for chips in ASCEND_RT_VISIBLE_DEVICES.
+def _npu_soc_name() -> str:
+    """Ascend910* is the 2-die A3 layout; Ascend950* is one id per die."""
+    try:
+        import acl
 
-    Queries ``npu-smi info -t usages -i <npu_id>`` per NPU card, which
-    provides HBM Capacity(MB) and HBM Usage Rate(%).  Only sums chips
-    whose physical ID is listed in ASCEND_RT_VISIBLE_DEVICES.
+        return acl.get_soc_name() or ""
+    except Exception:
+        logger.info("acl.get_soc_name unavailable; using A3 HBM accounting")
+        return ""
 
-    Falls back to ASCEND_VISIBLE_DEVICES if ASCEND_RT_VISIBLE_DEVICES is not set.
-    """
+
+def _visible_npu_ids() -> list:
     visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
         "ASCEND_VISIBLE_DEVICES"
     )
@@ -69,26 +74,63 @@ def _npu_smi_mem_mb() -> float:
         raise RuntimeError(
             "Neither ASCEND_RT_VISIBLE_DEVICES nor ASCEND_VISIBLE_DEVICES is set"
         )
-    target_chips = set(int(x.strip()) for x in visible.split(",") if x.strip())
-    if not target_chips:
-        raise RuntimeError("No valid chip IDs found in %s" % visible)
+    npu_ids = [int(x.strip()) for x in visible.split(",") if x.strip()]
+    if not npu_ids:
+        raise RuntimeError("No valid NPU IDs found in %s" % visible)
+    return npu_ids
 
-    logger.info("Tracking chips: %s", target_chips)
 
-    # A3: Each NPU card exposes 2 chips → card_id = chip_phy_id // 2
-    npu_ids = set(ch // 2 for ch in target_chips)
+def _npu_smi_usages(npu_id: int) -> str:
+    return subprocess.check_output(
+        ["npu-smi", "info", "-t", "usages", "-i", str(npu_id)],
+        timeout=10,
+        text=True,
+    )
+
+
+def _npu_smi_mem_mb_one_die(npu_ids: list) -> float:
+    """A5: each ASCEND_RT_VISIBLE_DEVICES id is one die. Capacity is not fixed."""
+    logger.info("Tracking A5 dies: %s", npu_ids)
     total = 0.0
-
-    for npu_id in sorted(npu_ids):
-        out = subprocess.check_output(
-            ["npu-smi", "info", "-t", "usages", "-i", str(npu_id)],
-            timeout=10,
-            text=True,
-        )
-        # Per-chip metrics appear before Chip ID; buffer them, flush on Chip ID.
+    for npu_id in npu_ids:
         cap_mb = 0.0
         rate_pct = 0.0
-        for line in out.splitlines():
+        used_mb = None
+        for line in _npu_smi_usages(npu_id).splitlines():
+            m = re.match(r"^\s*HBM Capacity\(MB\)\s*:\s*(\d+)", line)
+            if m:
+                cap_mb = float(m.group(1))
+                continue
+            m = re.match(r"^\s*HBM Usage Rate\(%\)\s*:\s*(\d+)", line)
+            if m:
+                rate_pct = float(m.group(1))
+                continue
+            m = re.match(r"^\s*HBM-Usage\(MB\)\s*:\s*(\d+)", line)
+            if m:
+                used_mb = float(m.group(1))
+        if used_mb is None:
+            used_mb = cap_mb * rate_pct / 100.0
+        logger.info(
+            "A5 NPU %d: capacity=%.0f MB, used=%.0f MB (%.0f%%)",
+            npu_id,
+            cap_mb,
+            used_mb,
+            rate_pct,
+        )
+        total += used_mb
+    logger.info("A5 total HBM used: %.0f MB", total)
+    return total
+
+
+def _npu_smi_mem_mb_two_die(target_chips: set) -> float:
+    """A3: each card exposes 2 chips. card_id = chip_phy_id // 2."""
+    logger.info("Tracking A3 chips: %s", target_chips)
+    npu_ids = set(ch // 2 for ch in target_chips)
+    total = 0.0
+    for npu_id in sorted(npu_ids):
+        cap_mb = 0.0
+        rate_pct = 0.0
+        for line in _npu_smi_usages(npu_id).splitlines():
             m = re.match(r"^\s*HBM Capacity\(MB\)\s*:\s*(\d+)", line)
             if m:
                 cap_mb = float(m.group(1))
@@ -110,10 +152,24 @@ def _npu_smi_mem_mb() -> float:
                     )
                 cap_mb = 0.0
                 rate_pct = 0.0
-
         logger.info("NPU %d: %.0f MB HBM used", npu_id, total)
-
     return total
+
+
+def _npu_smi_mem_mb() -> float:
+    """Sum HBM used by ASCEND_RT_VISIBLE_DEVICES.
+
+    Ascend910* keeps the 2-die card layout. Ascend950* is one id per die, and
+    the same 950 name can be 96 GB or 128 GB, so capacity is only logged.
+    """
+    npu_ids = _visible_npu_ids()
+    soc = _npu_soc_name()
+    if soc.startswith("Ascend950"):
+        logger.info("SOC %s: one-die HBM accounting", soc)
+        return _npu_smi_mem_mb_one_die(npu_ids)
+    if soc:
+        logger.info("SOC %s: two-die HBM accounting", soc)
+    return _npu_smi_mem_mb_two_die(set(npu_ids))
 
 
 def _assert_mem_decreased(mem_before, mem_func, min_delta, tag):
@@ -179,10 +235,11 @@ class TestReleaseMemoryOccupationNPU(CustomTestCase):
         tp_size=1,
         enable_weights_cpu_backup=False,
         disable_cuda_graph=False,
+        extra_kwargs=None,
     ):
         import sglang as sgl
 
-        return sgl.Engine(
+        kwargs = dict(
             model_path=model or self._engine_model,
             random_seed=42,
             enable_memory_saver=True,
@@ -191,6 +248,9 @@ class TestReleaseMemoryOccupationNPU(CustomTestCase):
             enable_weights_cpu_backup=enable_weights_cpu_backup,
             disable_cuda_graph=disable_cuda_graph,
         )
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+        return sgl.Engine(**kwargs)
 
     def _make_hf_model(self, model_path):
         from transformers import AutoModelForCausalLM
@@ -259,15 +319,33 @@ class TestReleaseMemoryOccupationNPU(CustomTestCase):
                 engine.shutdown()
 
     def test_npu_rl_release_and_resume_occupation_with_weights_cpu_backup(self):
-        """TP=1: CPU backup preserves output after release+resume (no update)."""
+        """TP=1 EAGLE3: CPU backup restores target and draft after release+resume.
+
+        [Test Category] Parameter
+        [Test Target] --enable-memory-saver; --enable-weights-cpu-backup;
+                       --enable-draft-weights-cpu-backup
+        """
         params = self._common_test_params()
+        sampling_params = {"temperature": 0, "max_new_tokens": 32}
         engine = self._setup_engine(
-            mem_fraction_static=0.6, enable_weights_cpu_backup=True
+            model=QWEN3_8B_WEIGHTS_PATH,
+            mem_fraction_static=0.7,
+            enable_weights_cpu_backup=True,
+            disable_cuda_graph=True,
+            extra_kwargs={
+                "dtype": "float16",
+                "attention_backend": "ascend",
+                "speculative_algorithm": "EAGLE3",
+                "speculative_draft_model_path": QWEN3_8B_EAGLE3_WEIGHTS_PATH,
+                "speculative_num_steps": 1,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 2,
+                "enable_draft_weights_cpu_backup": True,
+            },
         )
         try:
-            baseline = engine.generate(params["prompt"], params["sampling_params"])[
-                "text"
-            ]
+            baseline_out = engine.generate(params["prompt"], sampling_params)
+            baseline = baseline_out["text"]
             self.assertIsNotNone(baseline)
             self.assertGreater(len(baseline), 0)
             logger.info(f"[CB] baseline: {baseline}")
@@ -290,13 +368,25 @@ class TestReleaseMemoryOccupationNPU(CustomTestCase):
                 "cb-resume",
             )
             logger.info(f"[CB] resume: {mem_release:.0f}→{mem_resume:.0f} MB")
-            result = engine.generate(params["prompt"], params["sampling_params"])[
-                "text"
-            ]
+            result_out = engine.generate(params["prompt"], sampling_params)
+            result = result_out["text"]
             self.assertEqual(
-                baseline, result, "CPU backup must preserve weights; output unchanged"
+                baseline,
+                result,
+                "CPU backup must preserve target and draft weights",
             )
             logger.info(f"[CB] after resume: {result}")
+
+            accept = result_out.get("meta_info", {}).get("spec_accept_length")
+            self.assertIsNotNone(
+                accept, f"spec metric missing; meta_info={result_out.get('meta_info')}"
+            )
+            self.assertGreater(
+                accept,
+                1.0,
+                f"draft not speculating after resume (spec_accept_length={accept})",
+            )
+            logger.info(f"[CB] spec_accept_length={accept}")
         finally:
             engine.shutdown()
 
