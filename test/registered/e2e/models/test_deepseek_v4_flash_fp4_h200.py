@@ -2,7 +2,7 @@
 
 Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
-plus a GSM8K accuracy gate.
+plus a GSM8K accuracy gate. Also covers non-EP TBO at TP8/DP2 (attention TP4).
 
 Also covers SGLANG_DSV4_FP4_DEQUANT=1 (TP=8): FP4 experts dequantized to FP8
 during loading and served through the plain FP8 MoE path.
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=722, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=1000, stage="base-c", runner_config="8-gpu-h200")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
@@ -205,6 +205,49 @@ class TestDSV4FlashFP4DequantTP8H200(
                 "900",
             ],
             env={"SGLANG_DSV4_FP4_DEQUANT": "1"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4TboH200(GSM8KMixin, CustomTestCase):
+    """Non-EP TBO with TP8/DP2 exercises attention TP4."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "8",
+                "--attn-dp-size",
+                "2",
+                "--enable-prefill-delayer",
+                "--enable-two-batch-overlap",
+                "--moe-a2a-backend",
+                "none",
+                "--moe-runner-backend",
+                "marlin",
+                "--disable-shared-experts-fusion",
+                "--disable-radix-cache",
+                "--watchdog-timeout",
+                "900",
+            ],
+            env={
+                "SGLANG_SHARED_EXPERT_TP1": "1",
+                "SGLANG_DP_USE_GATHERV": "1",
+                "SGLANG_DP_USE_REDUCE_SCATTER": "1",
+            },
         )
 
     @classmethod

@@ -370,6 +370,7 @@ _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 def _tbo_collective_sizes(
     rank_sizes: List[int], attn_tp_size: int
 ) -> Tuple[List[int], List[int]]:
+    # Collapse attention-TP replicas into DP counts and split each count into TP shards.
     if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
         raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
 
@@ -3752,18 +3753,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             ("gh", sub), global_rows, local.shape[1], local.dtype, local.device
         )
         attn_tp_size = get_parallel().attn_tp_size
-        local_shard = local.tensor_split(attn_tp_size)[
-            get_parallel().attn_tp_rank
-        ].contiguous()
+        local_shard = (
+            local
+            if attn_tp_size == 1
+            else local.tensor_split(attn_tp_size)[
+                get_parallel().attn_tp_rank
+            ].contiguous()
+        )
         tp_sizes = fb._tbo_tp_sizes
         assert local_shard.shape[0] == tp_sizes[get_parallel().tp_group.rank_in_group]
         comm = get_dp_tbo_comm_stream()
         compute = torch.cuda.current_stream()
         with torch.cuda.stream(comm):
             comm.wait_stream(compute)
-            get_parallel().tp_group.all_gatherv(
-                local_shard, sizes=tp_sizes, output=global_hidden
-            )
+            if attn_tp_size == 1:
+                dp_gather_replicate(global_hidden, local, fb)
+            else:
+                get_parallel().tp_group.all_gatherv(
+                    local_shard, sizes=tp_sizes, output=global_hidden
+                )
             state.gather_event = _tbo_event(("gather", sub))
             state.gather_event.record(comm)
         state.gather_keepalive = local_shard
