@@ -104,6 +104,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
         )
@@ -258,10 +259,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         # Both FIA and paged-attention buffers share the same physical layout.
-        # Prefer the fused K/V write for all forward modes. Keep the existing
-        # writers for older torch_npu builds and unsupported storage dtypes.
-        use_scatter_pa = hasattr(torch_npu, "npu_scatter_pa_kv_cache") and (
-            self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
+        # Opt in at pool initialization, keeping environment reads outside graph
+        # capture. Otherwise retain the original writers and their memory usage.
+        use_scatter_pa = (
+            self.use_scatter_pa_kv_cache
+            and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
+            and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
         if self.use_fia or use_scatter_pa:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]

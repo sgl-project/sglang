@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,10 +16,18 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
 class TestNPUScatterPaKVCache(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            patch.dict(os.environ, {"SGLANG_NPU_USE_SCATTER_PA_KV_CACHE": "1"})
+        )
+
     @staticmethod
     def _make_pool(*, use_fia=True, dtype=torch.bfloat16):
         pool = object.__new__(NPUMHATokenToKVPool)
         pool.use_fia = use_fia
+        pool.use_scatter_pa_kv_cache = (
+            memory_pool_npu.envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
+        )
         pool.dtype = dtype
         pool.store_dtype = dtype
         pool.start_layer = 0
@@ -42,12 +51,12 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
         cache_v = torch.arange(20, dtype=torch.float32).to(dtype).view(2, 2, 5)
         return layer, loc, cache_k, cache_v
 
-    def test_default_fia_write(self):
+    def test_enabled_fia_write(self):
         for dtype in (torch.float16, torch.bfloat16, torch.int8):
             with self.subTest(dtype=dtype):
                 self._check_default_write(use_fia=True, dtype=dtype)
 
-    def test_default_paged_write(self):
+    def test_enabled_paged_write(self):
         for dtype in (torch.float16, torch.bfloat16, torch.int8):
             with self.subTest(dtype=dtype):
                 self._check_default_write(use_fia=False, dtype=dtype)
@@ -117,6 +126,32 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                 self.assertEqual(
                     fake._npu_reshape_and_cache.call_count, 0 if use_fia else 1
                 )
+
+    def test_unset_or_disabled_flag_uses_existing_writers(self):
+        for value in (None, "0"):
+            for use_fia in (True, False):
+                with self.subTest(value=value, use_fia=use_fia):
+                    with patch.dict(os.environ):
+                        os.environ.pop("SGLANG_NPU_USE_SCATTER_PA_KV_CACHE", None)
+                        if value is not None:
+                            os.environ["SGLANG_NPU_USE_SCATTER_PA_KV_CACHE"] = value
+                        pool = self._make_pool(use_fia=use_fia)
+                    self.assertFalse(pool.use_scatter_pa_kv_cache)
+                    layer, loc, cache_k, cache_v = self._inputs()
+                    fake = SimpleNamespace(
+                        npu_scatter_pa_kv_cache=MagicMock(),
+                        npu_scatter_nd_update_=MagicMock(),
+                        _npu_reshape_and_cache=MagicMock(),
+                    )
+                    with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                        pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+                    fake.npu_scatter_pa_kv_cache.assert_not_called()
+                    self.assertEqual(
+                        fake.npu_scatter_nd_update_.call_count, 2 if use_fia else 0
+                    )
+                    self.assertEqual(
+                        fake._npu_reshape_and_cache.call_count, 0 if use_fia else 1
+                    )
 
     def test_unsupported_storage_dtype_uses_existing_writers(self):
         for use_fia in (True, False):
