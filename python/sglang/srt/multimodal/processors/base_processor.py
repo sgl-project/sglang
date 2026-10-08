@@ -212,10 +212,33 @@ def _tokenizer_of(processor):
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
-class BaseMultimodalProcessor(ABC):
-    models = []
+class MultimodalProcessorMixin:
+    """Share media loading and preprocessing resources across training and serving."""
+
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
+    auto_mm_io_worker_num = 4
+    # Processors opt out only when their preprocessing is not thread-safe. The
+    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
+    # and injects it, and the single function it runs --
+    # `process_and_combine_mm_data` -- resolves that clone instead of
+    # `self._processor`, so isolation does not depend on the subclass.
+    supports_mm_processor_concurrency = True
+
+    def shutdown(self) -> None:
+        """Stop every processor-side executor."""
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
+        if self.mm_processor_executor is not None:
+            self.mm_processor_executor.shutdown()
+
+    def _resolve_auto_mm_processor_worker_num(self) -> int:
+        """Worker count when none is requested; serving overrides this."""
+        return 1
+
+
+class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
+    models = []
     video_preprocessing_device = None
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
@@ -226,19 +249,12 @@ class BaseMultimodalProcessor(ABC):
     # model that measured its own optimum assigns a number instead. See
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
-    auto_mm_io_worker_num = 4
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
     # Artifact-based processors may keep their prompt/M-RoPE fast path even
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
-    # Processors opt out only when their preprocessing is not thread-safe. The
-    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
-    # and injects it, and the single function it runs --
-    # `process_and_combine_mm_data` -- resolves that clone instead of
-    # `self._processor`, so isolation does not depend on the subclass.
-    supports_mm_processor_concurrency = True
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -314,7 +330,6 @@ class BaseMultimodalProcessor(ABC):
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
         )
-        self.hash_executor = MultimodalHashExecutor()
         if self.mm_io_worker_num > 4:
             logger.info(
                 "Multimodal data loading enabled with %d worker threads (%s).",
@@ -399,6 +414,7 @@ class BaseMultimodalProcessor(ABC):
                 worker_cache_bytes // (1024 * 1024),
                 "trusted" if self.trust_mm_content_hashes else "verified",
             )
+        self.hash_executor = MultimodalHashExecutor()
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -517,10 +533,7 @@ class BaseMultimodalProcessor(ABC):
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
         self.hash_executor.shutdown()
-        self.io_executor.shutdown(wait=False, cancel_futures=True)
-        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
-        if self.mm_processor_executor is not None:
-            self.mm_processor_executor.shutdown()
+        super().shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         return concurrent.futures.ProcessPoolExecutor(
