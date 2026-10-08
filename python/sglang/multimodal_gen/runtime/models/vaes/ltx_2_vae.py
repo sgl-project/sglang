@@ -122,9 +122,7 @@ class LTX2VideoCausalConv3d(nn.Module):
 
     def _weight_is_channels_last_3d(self) -> bool:
         w = self.conv.weight
-        return hasattr(torch, "channels_last_3d") and _is_channels_last_3d_stride(
-            tuple(w.size()), tuple(w.stride())
-        )
+        return _is_channels_last_3d_stride(tuple(w.size()), tuple(w.stride()))
 
     def _causal_temporal_pad_channels_last(
         self,
