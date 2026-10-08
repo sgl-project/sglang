@@ -1,6 +1,7 @@
 """Unit tests for /v1/systemone on Clef checkpoints: the joint schema prompt and its
 decision layout, and answers built from the joint schema head's option logits."""
 
+import asyncio
 import json
 import math
 import unittest
@@ -8,17 +9,29 @@ from types import SimpleNamespace
 
 from transformers import AutoTokenizer
 
+from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.systemone.joint_schema import encode_joint_schema
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-from sglang.srt.layers.joint_schema_head import parse_decision_layout
-from sglang.srt.runtime_context import publish, restore_context, snapshot_context
+from sglang.srt.layers.joint_schema_head import (
+    LayoutQuestion,
+    pack_decision_layout,
+    parse_decision_layout,
+)
+from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.runtime_context import (
+    get_context,
+    publish,
+    restore_context,
+    snapshot_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 # Tokenizer files only, with the Qwen3.5 vocabulary of Clef checkpoints.
 TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
@@ -281,6 +294,40 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertIn(message, json.loads(response.body)["message"])
         self.assertEqual(manager.requests, [])
+
+
+class TestJointSchemaAdmission(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_client_decision_layouts_are_refused_at_encode_and_classify(self):
+        manager = SimpleNamespace(requests=[])
+
+        async def generate_request(obj, request):
+            manager.requests.append(obj)
+            yield {"embedding": [0.0]}
+
+        manager.generate_request = generate_request
+        self.addCleanup(
+            setattr, http_server, "_global_state", http_server.get_global_state()
+        )
+        http_server.set_global_state(SimpleNamespace(tokenizer_manager=manager))
+        layout = pack_decision_layout(16, [LayoutQuestion(0, (0, 1), ((1, 2),))])
+        responses = [
+            asyncio.run(
+                handler(
+                    EmbeddingReqInput(
+                        input_ids=list(range(16)), decision_layout=layout
+                    ),
+                    None,
+                )
+            )
+            for handler in (http_server.encode_request, http_server.classify_request)
+        ]
+        self.assertEqual(manager.requests, [])
+        self.assertEqual([response.status_code for response in responses], [400, 400])
 
 
 if __name__ == "__main__":

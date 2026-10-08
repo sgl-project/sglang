@@ -965,6 +965,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
@@ -977,12 +978,19 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
+        _refuse_decision_layout(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
+
+
+def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
+    # Only /v1/systemone builds a decision layout, from the prompt it compiles.
+    if obj.decision_layout is not None:
+        raise ValueError("decision_layout is set only by /v1/systemone")
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

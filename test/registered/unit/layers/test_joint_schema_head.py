@@ -25,7 +25,13 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 def _questions(offset=0):
     return [
         LayoutQuestion(
-            1, (10 + offset, 14 + offset), ((16 + offset, 20 + offset),) * 3
+            1,
+            (10 + offset, 14 + offset),
+            (
+                (16 + offset, 17 + offset),
+                (17 + offset, 19 + offset),
+                (19 + offset, 21 + offset),
+            ),
         ),
         LayoutQuestion(
             0,
@@ -64,10 +70,49 @@ class TestDecisionLayout(CustomTestCase):
                 pack_decision_layout(40, [LayoutQuestion(3, (5, 6), ((6, 7),))]),
                 40,
             ),
+            # The head's span sums cover one region from the first question on,
+            # which only spans in prompt order without overlap stay inside.
+            "option before its question": (
+                pack_decision_layout(40, [LayoutQuestion(0, (10, 12), ((5, 7),))]),
+                40,
+            ),
+            "overlapping options": (
+                pack_decision_layout(40, [LayoutQuestion(0, (5, 6), ((6, 8), (7, 9)))]),
+                40,
+            ),
+            "question inside earlier options": (
+                pack_decision_layout(
+                    40,
+                    [
+                        LayoutQuestion(0, (5, 6), ((6, 10),)),
+                        LayoutQuestion(0, (8, 9), ((10, 11),)),
+                    ],
+                ),
+                40,
+            ),
+            "later option before the region": ([32, 1, 1, 20, 22, 2, 24, 26, 0, 2], 32),
         }
         for name, (values, num_tokens) in invalid.items():
             with self.subTest(name), self.assertRaises(ValueError):
                 parse_decision_layout(values, num_tokens)
+
+    def test_rejects_a_layout_wider_than_one_head_pass(self):
+        def layout(num_questions, widest):
+            # One-token spans: a question of `widest` options, then one-option ones.
+            first = LayoutQuestion(
+                1, (0, 1), tuple((i, i + 1) for i in range(1, widest + 1))
+            )
+            length = widest + 2 * num_questions - 1
+            rest = [
+                LayoutQuestion(1, (start, start + 1), ((start + 1, start + 2),))
+                for start in range(widest + 1, length, 2)
+            ]
+            return pack_decision_layout(length, [first, *rest]), length
+
+        # Each question is padded to the widest, so 512 x 512 slots fill one pass.
+        self.assertEqual(len(parse_decision_layout(*layout(512, 512))), 512)
+        with self.assertRaisesRegex(ValueError, "option slots"):
+            parse_decision_layout(*layout(513, 512))
 
 
 class _RecordingHead:
