@@ -15,6 +15,11 @@ use sha2::{Digest, Sha256};
 
 #[test]
 fn fixtures_match_sglang() {
+    // The generator pins these; SGLang's defaults apply, not this machine's.
+    unsafe {
+        std::env::remove_var("SGLANG_DEFAULT_THINKING");
+        std::env::remove_var("SGLANG_DSV4_REASONING_EFFORT");
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity");
     for entry in std::fs::read_dir(dir).unwrap() {
         let fixture: Value =
@@ -25,8 +30,21 @@ fn fixtures_match_sglang() {
 
 fn check(fixture: &Value) {
     let model = fixture["model"].as_str().unwrap();
+    let revision = fixture["revision"].as_str().unwrap();
     let formatter = formatter(model, &fixture["config"]);
-    let tokenizer = cached_tokenizer(model, fixture["revision"].as_str().unwrap());
+    let tokenizer = cached_tokenizer(model, revision);
+    // The fixture records Python's DeepSeek-V4 profile; the checkpoint's encoder must agree.
+    if let (ChatFormatter::DeepSeekV4(profile), Some(_)) = (&formatter, &tokenizer) {
+        let checkpoint = select_chat_formatter(&ChatFormatterOptions {
+            tokenizer_path: model.into(),
+            revision: Some(revision.into()),
+            ..Default::default()
+        });
+        assert!(
+            matches!(checkpoint.0, Some(ChatFormatter::DeepSeekV4(p)) if p == *profile),
+            "{model}: the checkpoint resolves another DeepSeek-V4 profile"
+        );
+    }
     for case in fixture["cases"].as_array().unwrap() {
         let name = format!("{model} {}", case["name"]);
         let outcome = check_case(
@@ -109,10 +127,10 @@ fn cached_tokenizer(model: &str, revision: &str) -> Option<Tokenizer> {
 fn encode(tokenizer: &Tokenizer, prompt: &str, prefix: &str, bos: &Value) -> Vec<u32> {
     let ids = |text: &str| tokenizer.encode(text).unwrap().token_ids().to_vec();
     let mut out = ids(prompt);
-    let mut suffix = ids(prefix);
-    if suffix.first().is_some_and(|&id| *bos == id) {
-        suffix.remove(0);
+    if !prefix.is_empty() {
+        let suffix = ids(prefix);
+        let skip = usize::from(suffix.first().is_some_and(|&id| *bos == id));
+        out.extend(&suffix[skip..]);
     }
-    out.extend(suffix);
     out
 }

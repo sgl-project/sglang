@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
+use dynamo_renderer::deepseek::common::tokens;
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt};
 use serde_json::Value;
 use thiserror::Error;
@@ -87,7 +88,9 @@ impl ChatFormatter {
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
                 let (prompt, prefix) = self.render_request(&request)?;
-                Ok(RenderedPrompt::text(prompt + &prefix))
+                // SGLang tokenizes the prefix on its own and drops its leading BOS.
+                let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
+                Ok(RenderedPrompt::text(prompt + prefix))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
@@ -95,7 +98,8 @@ impl ChatFormatter {
 
     /// Render an SGLang chat request body, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
-    /// Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
+    /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
+    /// re-validated. Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
     pub fn render_request(&self, request: &Value) -> Result<(String, String), TemplateError> {
         let ChatFormatter::DeepSeekV4(profile) = self else {
             return Err(TemplateError::Renderer {

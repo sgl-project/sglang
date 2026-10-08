@@ -360,7 +360,12 @@ impl ChatPreprocessor {
             )
         })?;
         let mut request = request.clone();
-        let final_message = prepare_continuation(&mut request);
+        // DeepSeek-V4 continues the final turn as SGLang's encoder path does,
+        // null and parts content included.
+        let final_message = match formatter {
+            ChatFormatter::DeepSeekV4(_) => None,
+            _ => prepare_continuation(&mut request),
+        };
         let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);
         template_args.insert(
             "add_generation_prompt".into(),
@@ -868,5 +873,39 @@ mod tests {
                 .options
                 .require_reasoning
         );
+    }
+
+    #[test]
+    fn deepseek_v4_continues_the_final_turn_as_sglang_does() {
+        let formatter = ChatFormatter::DeepSeekV4(sglang_processor::DeepSeekV4Profile::Official);
+        let preprocessor = chat_preprocessor_with(None, None, formatter);
+        // SGLang flattens parts, blanks null and drops the continuation's leading BOS.
+        for (content, continuation) in [
+            (
+                serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]),
+                "a b",
+            ),
+            (JsonValue::Null, ""),
+            (serde_json::json!("<｜begin▁of▁sentence｜>abc"), "abc"),
+        ] {
+            let mut request = chat_request(None);
+            request.tools = None;
+            request.continue_final_message = true;
+            // Pinned so SGLANG_DEFAULT_THINKING and SGLANG_DSV4_REASONING_EFFORT don't apply.
+            request.chat_template_args = serde_json::from_value(
+                serde_json::json!({"thinking": false, "reasoning_effort": "low"}),
+            )
+            .unwrap();
+            request.messages = serde_json::from_value(serde_json::json!([
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": content}
+            ]))
+            .unwrap();
+            let prompt = preprocessor.lower_to_text(request).unwrap().prompt;
+            assert_eq!(
+                prompt.as_str(),
+                format!("<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>{continuation}")
+            );
+        }
     }
 }

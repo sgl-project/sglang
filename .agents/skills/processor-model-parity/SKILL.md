@@ -98,7 +98,7 @@ renders the model:
 - **Pydantic coercion**: typed request fields are coerced before rendering. For
   example, `strict: 1` and `defer_loading: "false"` become booleans, and
   `strict: null` is rejected. Probe the pydantic model in Python to get its exact
-  rules; don't guess them. (`tool_bool_coercion`)
+  rules; don't guess them. (`tool_bool_coercion`, `tool_strict_null`, `continuation_coerced`)
 - **Tool-call arguments**: how the encoder wants them. DeepSeek-V4 takes a compact
   JSON string; other encoders format them their own way. Keep key order
   (`serde_json` `preserve_order` is declared in `Cargo.toml`). Floats must print as
@@ -114,8 +114,9 @@ renders the model:
   a separately tokenized prefix. Check whether content is flattened before the
   split (it is for DeepSeek-V4). Run each check where Python runs it: a final
   assistant turn's tool calls are discarded, so object checks on their arguments
-  belong after the split.
-  (`final_assistant`, `continuation_parts`, `continuation_bos`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
+  belong after the split. Hosts reach the model through `render_prompt` too, so
+  check the renderer's continuation handling (`sglang-renderer` `render()`) as well.
+  (`final_assistant`, `continuation_parts`, `continuation_bos`, `continuation_only`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
 - **History**: the encoder's rules for earlier turns: reasoning kept or dropped,
@@ -125,8 +126,9 @@ renders the model:
   (`_append_assistant_prefix_to_prompt_ids`). `tests/parity.rs` does both, using the
   fixture's `bos_token_id`.
 - **Errors**: reject what Python rejects. A case Python raises on is recorded with
-  `error`, and `tests/parity.rs` then requires `render_request` to fail.
-  (`invalid_tool_arguments`) If Dynamo rejects a shape Python accepts, say in the
+  `error`, and `tests/parity.rs` then requires `render_request` to fail. That
+  includes pydantic rejections and Python crashes (a 500 is still a rejection).
+  (`invalid_tool_arguments`, `continuation_only`) If Dynamo rejects a shape Python accepts, say in the
   PR that hosts fall back to the engine for it.
 - **Known gaps**: when a mismatch is inside Dynamo and out of the processor's
   reach, fix it upstream and mark the case `known_gap` with the reason. The test
@@ -139,7 +141,8 @@ renders the model:
 spec and per-checkpoint state with SGLang's own resolvers. It then renders every
 case through the real `OpenAIServingChat._apply_jinja_template` and writes:
 - `prompt`, `token_count` and `token_sha256` for each case, or `error` when
-  Python raises (`name`, `request` and `known_gap` are kept as written);
+  Python raises (`name`, `request` and `known_gap` are kept as written). An
+  `AttributeError` aborts instead: the stub server lacks something, so extend it;
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
   resolved overrides such as the effort profile) and `bos_token_id`.
 
@@ -170,14 +173,16 @@ cargo check -p sglang-processor --no-default-features --features render,tokenize
 The token check loads the pinned commit's snapshot from the cache. When the
 snapshot is missing, the test prints `token ids not checked` (visible with
 `-- --nocapture`), so confirm that line is absent before claiming token parity.
+With the snapshot cached, the test also checks that the checkpoint resolves the
+fixture's recorded DeepSeek-V4 profile.
 
 ## Pitfalls
 
 - Dynamo version bumps change rendering silently: rerun every fixture after bumping
   `dynamo-renderer` or `dynamo-tokenizers`.
 - Env vars (`SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`) are read per
-  request, as in Python. The generator pins them so fixtures do not depend on the
-  generating machine.
+  request, as in Python. The generator pins them and `tests/parity.rs` clears them,
+  so fixtures do not depend on the machine.
 - Typed hosts (the renderer's `OAIChatLikeRequest` path) cannot carry every field,
   such as `task` and message-level `tools`. Parity is defined on `render_request`;
   report host-adapter gaps separately rather than bending the model code.

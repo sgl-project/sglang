@@ -31,12 +31,19 @@ pub(crate) fn render(
     if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant")
         && let Some(content) = last["content"].as_str().map(str::to_owned)
     {
-        if request["continue_final_message"] == true {
+        if request
+            .get("continue_final_message")
+            .map_or(Ok(false), pydantic_bool)?
+        {
             prefix = content;
             messages.pop();
         } else {
             *last = json!({"role": "user", "content": content});
         }
+    }
+    // SGLang fails on `messages[0]` here.
+    if messages.is_empty() {
+        return Err("no messages to render".into());
     }
     if let Some(task) = request.get("task").filter(|task| !task.is_null()) {
         let message = messages
@@ -71,9 +78,10 @@ pub(crate) fn render(
     } else {
         ThinkingMode::Chat
     };
-    let prompt =
-        v4::encode_messages_with_options(&messages, mode, true, true, effort(profile, request))
-            .map_err(|error| error.to_string())?;
+    let fallback = std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok();
+    let effort = effort(profile, request, fallback);
+    let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
+        .map_err(|error| error.to_string())?;
     Ok((prompt, prefix))
 }
 
@@ -111,8 +119,12 @@ pub(crate) fn thinking(request: &Value) -> bool {
 }
 
 /// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
-/// effort, `SGLANG_DSV4_REASONING_EFFORT` fills in, and other tiers add no prefix.
-fn effort(profile: DeepSeekV4Profile, request: &Value) -> Option<ReasoningEffort> {
+/// effort, `fallback` (`SGLANG_DSV4_REASONING_EFFORT`) fills in, and other tiers add no prefix.
+fn effort(
+    profile: DeepSeekV4Profile,
+    request: &Value,
+    fallback: Option<String>,
+) -> Option<ReasoningEffort> {
     let requested = [
         &request["chat_template_kwargs"]["reasoning_effort"],
         &request["reasoning"]["effort"],
@@ -122,7 +134,7 @@ fn effort(profile: DeepSeekV4Profile, request: &Value) -> Option<ReasoningEffort
     .into_iter()
     .find(|effort| !effort.is_null())
     .map(|effort| effort.as_str().map(str::to_owned))
-    .unwrap_or_else(|| std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok());
+    .unwrap_or(fallback);
     match (profile, requested.as_deref()) {
         (DeepSeekV4Profile::Official, Some("high")) | (DeepSeekV4Profile::Preview, Some("max")) => {
             Some(ReasoningEffort::High)
@@ -272,7 +284,7 @@ fn pydantic_bool(value: &Value) -> Result<bool, String> {
         },
         _ => None,
     };
-    parsed.ok_or_else(|| format!("tool flag must be a boolean, got {value}"))
+    parsed.ok_or_else(|| format!("expected a boolean, got {value}"))
 }
 
 pub(crate) fn resolve_dsv4_profile(
@@ -423,7 +435,32 @@ fn python_dict_keys(source: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeepSeekV4Profile, resolve_dsv4_profile};
+    use dynamo_renderer::deepseek::v4::ReasoningEffort::{High, Max};
+    use serde_json::json;
+
+    use super::DeepSeekV4Profile::{Official, Preview};
+    use super::{DeepSeekV4Profile, effort, resolve_dsv4_profile};
+
+    #[test]
+    fn effort_maps_profile_tiers_and_env_fills_only_a_missing_effort() {
+        for (profile, requested, fallback, expected) in [
+            (Preview, Some("max"), None, Some(High)),
+            (Preview, Some("high"), None, None),
+            (Official, Some("high"), None, Some(High)),
+            (Official, Some("max"), None, Some(Max)),
+            (Official, Some("xhigh"), None, None),
+            (Official, None, Some("max"), Some(Max)),
+            (Official, Some("low"), Some("max"), None),
+        ] {
+            let request = json!({ "reasoning_effort": requested });
+            let fallback = fallback.map(str::to_owned);
+            assert_eq!(
+                effort(profile, &request, fallback),
+                expected,
+                "{profile:?} {requested:?}"
+            );
+        }
+    }
 
     #[test]
     fn deepseek_v4_profile_resolution_uses_override_then_checkpoint_source() {

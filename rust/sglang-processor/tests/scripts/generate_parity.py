@@ -93,16 +93,18 @@ def generate(fixture_path):
     fixture["cases"] = [{k: c[k] for k in inputs if k in c} for c in fixture["cases"]]
     for case in fixture["cases"]:
         tok.texts.clear()
-        request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
-        # _convert_to_internal_request: kwargs effort replaces the request effort.
-        if request.chat_template_kwargs:
-            effort = request.chat_template_kwargs.pop("reasoning_effort", None)
-            if effort is not None:
-                request.reasoning_effort = effort
         try:
+            request = ChatCompletionRequest(**copy.deepcopy(case["request"]))
+            # _convert_to_internal_request: kwargs effort replaces the request effort.
+            if request.chat_template_kwargs:
+                effort = request.chat_template_kwargs.pop("reasoning_effort", None)
+                if effort is not None:
+                    request.reasoning_effort = effort
             ids = server._apply_jinja_template(
                 request, tools=None, is_multimodal=False
             ).prompt_ids
+        except AttributeError:
+            raise  # The stub server lacks what this model's path reads; extend it.
         except Exception as error:
             case["error"] = f"{type(error).__name__}: {error}"
             continue
