@@ -257,7 +257,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if getattr(self.draft_model, "uses_own_vocab_modules", False) and not hasattr(
             self.draft_model, "has_own_embed_tokens"
         ):
-            if self.ps.tp_rank == 0:
+            if parallel.tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
                 )
@@ -282,7 +282,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_running = get_schedule().max_running_requests
             capacity = None
             if max_running is not None:
-                capacity = max(1, max_running // self.ps.attn_dp_size)
+                capacity = max(1, max_running // parallel.attn_dp_size)
                 if self._decode_graph_allowed:
                     capacity = max(
                         capacity, max(get_exec().graph.cuda_graph_config.decode.bs)
@@ -292,7 +292,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_hf_config=self.draft_model_runner.model_config.hf_config,
                 gamma=self.gamma,
                 capacity=capacity,
-                tp_size=self.ps.tp_size,
+                tp_size=parallel.tp_size,
                 markov_topk=get_spec().speculative_dspark_markov_topk,
                 markov_bias_topk=get_spec().speculative_dspark_markov_bias_topk,
             )
