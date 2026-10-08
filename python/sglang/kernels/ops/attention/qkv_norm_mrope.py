@@ -190,7 +190,7 @@ def qkv_norm_mrope(
         or torch.cuda.current_device() != x.device.index
         or torch.cuda.get_device_capability(x.device) != (10, 3)
         or any(t.device != x.device or t.requires_grad for t in tensors)
-        or any(not t.is_contiguous() for t in tensors)
+        or any(not t.is_contiguous() for t in tensors if t is not positions)
         or any(t.data_ptr() % 8 for t in tensors)
         or x.data_ptr() % 32
         or weight.data_ptr() % 32
@@ -204,6 +204,8 @@ def qkv_norm_mrope(
         or rope.shape[1] != 128
         or tuple(positions.shape) != (3, 8)
         or positions.dtype != torch.int64
+        or positions.stride(1) != 1
+        or positions.stride(0) < 8
         or tuple(axes.shape) != (64,)
         or axes.dtype != torch.int64
         or tuple(slots.shape) != (8,)
@@ -229,8 +231,11 @@ def qkv_norm_mrope(
         end = begin + target.numel() * target.element_size()
         for other in inputs + outputs[:index]:
             other_begin = other.data_ptr()
+            other_span = 1 + sum(
+                (size - 1) * stride for size, stride in zip(other.shape, other.stride())
+            )
             if (
-                begin < other_begin + other.numel() * other.element_size()
+                begin < other_begin + other_span * other.element_size()
                 and other_begin < end
             ):
                 return None
