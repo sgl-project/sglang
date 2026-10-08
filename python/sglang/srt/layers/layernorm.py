@@ -222,12 +222,14 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
         )
+        from sglang.srt.layers.moe.utils import deferred_post_experts_all_reduce
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
@@ -259,6 +261,16 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                # The kernel declined: all-reduce over the group its workspace
+                # is built on, then add and norm into a new residual tensor, as
+                # the kernel does.
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = deferred_post_experts_all_reduce(x)
+                if post_residual_addition is None:
+                    residual = residual.clone()
+                return norm_module.forward(x, residual, None)
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
@@ -450,6 +462,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 
 
 class RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -500,6 +515,12 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
+        projection that consumes this norm's output, whenever forward_cuda can.
+        The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -507,6 +528,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -650,6 +673,11 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if not x.is_cuda:
+            # AITER kernels dereference activations as GPU pointers; a CPU
+            # input (e.g. unit tests building modules on CPU) aborts the
+            # process with HSA_STATUS_ERROR_MEMORY_FAULT instead of raising.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.

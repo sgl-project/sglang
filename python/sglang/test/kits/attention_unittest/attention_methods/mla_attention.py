@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
@@ -244,10 +243,6 @@ class MockMLAModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)
@@ -276,7 +271,6 @@ class MockMLAModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
             flashinfer_mla_disable_ragged=True,
@@ -314,7 +308,6 @@ class MockMLAModelRunner(ModelRunner):
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False

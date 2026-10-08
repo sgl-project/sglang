@@ -85,7 +85,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=640
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
 export SGLANG_SET_CPU_AFFINITY=1
@@ -303,7 +302,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160000
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
 export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
@@ -314,8 +312,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --mem-fraction-static 0.65 \
     --max-running-requests 4 \
     --reasoning-parser minimax-append-think \
@@ -414,7 +411,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
 export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
@@ -425,8 +421,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --mem-fraction-static 0.53 \
     --max-running-requests 96 \
     --disable-radix-cache \
@@ -530,8 +525,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --mem-fraction-static 0.75 \
     --max-running-requests 320 \
     --disable-radix-cache \

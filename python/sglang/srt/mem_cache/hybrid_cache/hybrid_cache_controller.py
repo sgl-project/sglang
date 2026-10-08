@@ -37,8 +37,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -47,6 +50,10 @@ from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
+
+# Pool boundaries are nonnegative; an omitted rank must dominate MIN so
+# a peer cannot establish presence of that rank's storage shard.
+_NO_POOL_VERDICT = -1
 
 
 @dataclass(frozen=True)
@@ -99,6 +106,27 @@ class PPPrefetchState:
     consumed: bool = False
 
 
+def _trailing_chain_groups(
+    prefix_keys: Optional[List[str]],
+    span_hashes: List[str],
+    transfers: list[PoolTransfer],
+) -> list[tuple[HiCacheStorageExtraInfo, list[PoolTransfer]]]:
+    """One extra_info per tail length so prefix_keys + keys stays contiguous."""
+    if prefix_keys is None:
+        return [(HiCacheStorageExtraInfo(prefix_keys=None), transfers)]
+    groups: dict[int, list[PoolTransfer]] = {}
+    for transfer in transfers:
+        covered = len(span_hashes) - len(transfer.keys or ())
+        groups.setdefault(covered, []).append(transfer)
+    return [
+        (
+            HiCacheStorageExtraInfo(prefix_keys=prefix_keys + span_hashes[:covered]),
+            group,
+        )
+        for covered, group in groups.items()
+    ]
+
+
 class StorageOperation(BaseStorageOperation):
     def __init__(
         self,
@@ -141,6 +169,11 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
+        # The hit query's verdict per pool, as the chain prefix length (in
+        # pages) up to which the pool is present; rank-reduced with the
+        # folded hit count. Empty until the query ran on this rank.
+        self.query_pool_hit_pages: dict[PoolName, int] = {}
+        self.buffer_host_occupied_units: Optional[int] = None
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
         # a controller that releases it itself must set this False.
         self.ack_releases_incomplete_host_indices = True
@@ -181,7 +214,7 @@ class HybridCacheController(BaseHiCacheController):
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        transfer_layer_num: Optional[int] = None,
+        transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
     ):
@@ -211,11 +244,14 @@ class HybridCacheController(BaseHiCacheController):
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
         )
-        # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
-        # not just the full attention layers reported by full_kv_pool.
-        if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
-            self.layer_num = transfer_layer_num
-            self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        # Hybrid transfer IDs span every component pool, including holes for
+        # uncached layers that the anchor pool alone cannot describe.
+        if (
+            transfer_layer_id_max is not None
+            and transfer_layer_id_max != self.transfer_layer_id_max
+        ):
+            self.transfer_layer_id_max = transfer_layer_id_max
+            self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
@@ -252,6 +288,11 @@ class HybridCacheController(BaseHiCacheController):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
 
+    @staticmethod
+    def supports_page_envelope_host(storage_backend: str | None) -> bool:
+        """Only opt in backends whose FULL object is the complete shared page."""
+        return storage_backend is None or storage_backend == "mori"
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -260,6 +301,14 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if isinstance(
+            self.storage_host_pool, UnifiedPageEnvelopeHostPool
+        ) and not self.supports_page_envelope_host(storage_backend):
+            # A runtime backend switch cannot replace the existing host arena.
+            raise ValueError(
+                f"Storage backend {storage_backend!r} requires separate host pools. "
+                "Restart with this backend selected to create compatible host pools."
+            )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"
             and storage_backend == "mooncake"
@@ -449,17 +498,30 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-    def write(
+    def allocate_host_transfers(
         self,
         device_indices: torch.Tensor,
-        priority: Optional[int] = None,
-        node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
-        flush: bool = True,
-    ) -> Optional[torch.Tensor]:
-        """Queue a D2H backup; flush=False leaves it queued so the caller can
-        merge several nodes into one start_writing() submit."""
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        *,
+        reclaim: Optional[Callable[[int], Any]] = None,
+    ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+        if self._uses_shared_host_domain(extra_pools):
+            allocation = self.allocate_shared_host_transfers(
+                device_indices, extra_pools
+            )
+            anchor = self.mem_pool_host.anchor_entry
+            if (
+                allocation is None
+                and reclaim is not None
+                and anchor.host_evict_fn is None
+            ):
+                reclaim(len(device_indices))
+                allocation = self.allocate_shared_host_transfers(
+                    device_indices, extra_pools
+                )
+            return allocation
+
+        host_indices = self.mem_pool_host.alloc(len(device_indices), reclaim=reclaim)
         if host_indices is None:
             return None
         pool_transfers = self.mem_pool_host.resolve_host_transfers(
@@ -470,6 +532,20 @@ class HybridCacheController(BaseHiCacheController):
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None
+        return host_indices, pool_transfers
+
+    def write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+        flush: bool = True,
+    ) -> Optional[torch.Tensor]:
+        allocation = self.allocate_host_transfers(device_indices, extra_pools)
+        if allocation is None:
+            return None
+        host_indices, pool_transfers = allocation
 
         self.write_queue.append(
             CacheOperation(
@@ -484,6 +560,267 @@ class HybridCacheController(BaseHiCacheController):
             self.start_writing()
         return host_indices
 
+    def _uses_shared_host_domain(
+        self, extra_pools: Optional[list[PoolTransfer]]
+    ) -> bool:
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        if not uses_shared_host_layout(anchor_pool):
+            return False
+        domain = anchor_pool.shared_allocation_domain
+        for transfer in extra_pools or []:
+            if (
+                transfer.indices_from_pool is not None
+                or transfer.host_indices is not None
+                or transfer.device_indices is None
+            ):
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and (
+                not uses_shared_host_layout(entry.host_pool)
+                or entry.host_pool.shared_allocation_domain is not domain
+            ):
+                return False
+        return True
+
+    def _alloc_shared_host_requests_with_reclaim(
+        self, requests: list[tuple[PoolName, int]]
+    ) -> Optional[list[torch.Tensor]]:
+        entries = [self.mem_pool_host.entry_map[name] for name, _ in requests]
+        domain = entries[0].host_pool.shared_allocation_domain
+        if domain is None or any(
+            entry.host_pool.shared_allocation_domain is not domain for entry in entries
+        ):
+            raise ValueError("Host pools do not share one allocation domain.")
+        domain_requests = [
+            (entry.host_pool.pool_label, need_size)
+            for entry, (_, need_size) in zip(entries, requests, strict=True)
+        ]
+
+        # Scheduler drains commit the same logical host allocations and frees
+        # across attention ranks. Layout compaction waits for local I/O before
+        # allocating; transfer readiness does not change the capacity decision.
+        allocated = domain.alloc_many(domain_requests)
+        if allocated is not None:
+            return allocated
+
+        pools = [entry.host_pool for entry in entries]
+        requested_bytes = sum(
+            need_size * pool.size_per_token
+            for pool, (_, need_size) in zip(pools, requests, strict=True)
+        )
+        requested_names = list(dict.fromkeys(name for name, _ in reversed(requests)))
+        candidates = [self.mem_pool_host.entry_map[name] for name in requested_names]
+        candidates.extend(
+            entry
+            for entry in self.mem_pool_host.entries
+            if entry.name not in requested_names
+            and uses_shared_host_layout(entry.host_pool)
+            and entry.host_pool.shared_allocation_domain is domain
+        )
+
+        # alloc_many compacts the shared layout before reporting failure. Reclaim
+        # only the remaining byte or per-side logical-slot shortfall, retrying
+        # after every successful eviction. The callbacks release only evictable
+        # tree entries; protected retraction backups remain safe.
+        while True:
+            made_progress = False
+            for entry in candidates:
+                if entry.host_evict_fn is None:
+                    continue
+                pool = entry.host_pool
+                shortfall_bytes = max(
+                    pool.page_size * pool.size_per_token,
+                    requested_bytes - domain.free_bytes(),
+                )
+                tokens = (
+                    (
+                        (shortfall_bytes + pool.size_per_token - 1)
+                        // pool.size_per_token
+                        + pool.page_size
+                        - 1
+                    )
+                    // pool.page_size
+                    * pool.page_size
+                )
+                evicted = entry.host_evict_fn(tokens)
+                if evicted <= 0:
+                    continue
+                made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            if not made_progress:
+                return None
+
+    def allocate_shared_host_transfers(
+        self,
+        kv_device_indices: torch.Tensor,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+        """Atomically reserve the anchor and all independent host side pools."""
+        requests = [(self.mem_pool_host.anchor_entry.name, len(kv_device_indices))]
+        request_transfers: list[PoolTransfer] = []
+        for transfer in extra_pools or []:
+            if transfer.indices_from_pool is not None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if (
+                entry is None
+                or transfer.host_indices is not None
+                or transfer.device_indices is None
+            ):
+                continue
+            requests.append((transfer.name, len(transfer.device_indices)))
+            request_transfers.append(transfer)
+
+        allocated = self._alloc_shared_host_requests_with_reclaim(requests)
+        if allocated is None:
+            return None
+        host_indices = allocated[0]
+        for transfer, indices in zip(request_transfers, allocated[1:], strict=True):
+            transfer.host_indices = indices
+
+        resolved = self.mem_pool_host.resolve_host_transfers(
+            extra_pools,
+            primary_device_indices=kv_device_indices,
+            primary_host_indices=host_indices,
+        )
+        if resolved is None and extra_pools:
+            for (name, _), indices in zip(requests, allocated, strict=True):
+                self.mem_pool_host.free(indices, pool=name)
+            for transfer in request_transfers:
+                transfer.host_indices = None
+            return None
+        return host_indices, resolved
+
+    def _shared_prefetch_requests(
+        self, operation: PrefetchOperation, need_size: int
+    ) -> tuple[list[tuple[PoolName, int]], list[PoolTransfer]]:
+        anchor = self.mem_pool_host.anchor_entry
+        pool_transfers = operation.pool_transfers or []
+        requests = [(anchor.name, need_size)]
+        sidecar_hit_pages = (
+            operation.sidecar_hit_pages
+            if operation.sidecar_hash_values is not None
+            else need_size // self.page_size
+        )
+        independent_transfers = []
+        for transfer in pool_transfers:
+            if transfer.indices_from_pool is not None:
+                continue
+            if transfer.host_indices is not None:
+                raise AssertionError(
+                    "Shared prefetch pools must be allocated atomically."
+                )
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+            num_pages = len(transfer.keys or [])
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                num_pages = min(num_pages or 1, sidecar_hit_pages)
+            requests.append((transfer.name, num_pages * entry.host_pool.page_size))
+            independent_transfers.append(transfer)
+        return requests, independent_transfers
+
+    def can_fit_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int, *, empty: bool = True
+    ) -> bool:
+        anchor = self.mem_pool_host.anchor_entry
+        if not uses_shared_host_layout(anchor.host_pool):
+            return super().can_fit_prefetch_host_buffers(operation, need_size)
+        domain = anchor.host_pool.shared_allocation_domain
+        requests, _ = self._shared_prefetch_requests(operation, need_size)
+        domain_requests = [
+            (self.mem_pool_host.entry_map[name].host_pool.pool_label, size)
+            for name, size in requests
+        ]
+        return domain.can_fit_many_then(domain_requests, (), empty=empty)
+
+    def prefetch_rate_limited(self) -> bool:
+        if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(
+            self.mem_pool_host.anchor_entry.host_pool
+        ):
+            # Shared-arena occupancy includes the Full and SWA byte footprint.
+            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
+        return super().prefetch_rate_limited()
+
+    def alloc_prefetch_host_buffers(
+        self, operation: StorageOperation, need_size: int
+    ) -> Optional[torch.Tensor]:
+        """Atomically allocate every prefetch slice from a shared arena."""
+        anchor = self.mem_pool_host.anchor_entry
+        if not uses_shared_host_layout(anchor.host_pool):
+            return super().alloc_prefetch_host_buffers(operation, need_size)
+
+        requests, independent_transfers = self._shared_prefetch_requests(
+            operation, need_size
+        )
+
+        allocated = self._alloc_shared_host_requests_with_reclaim(requests)
+        if allocated is None:
+            return None
+        self._sync_trailing_keys(
+            operation.pool_transfers or [],
+            operation.sidecar_hash_values or operation.hash_value,
+            (
+                operation.sidecar_hit_pages
+                if operation.sidecar_hash_values is not None
+                else need_size // self.page_size
+            ),
+        )
+        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
+            transfer.host_indices = indices
+        return allocated[0]
+
+    def allocate_storage_hit(
+        self,
+        operation: StorageOperation,
+        hit_tokens: int,
+        *,
+        allow_partial: bool,
+        min_tokens: int,
+        evict_host: Callable[[int], int],
+    ) -> tuple[Optional[torch.Tensor], int]:
+        host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
+        if host_indices is None and not shared:
+            evict_host(hit_tokens)
+            host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        if host_indices is not None or not allow_partial:
+            return host_indices, hit_tokens
+
+        if shared:
+            low, high = 0, hit_tokens // self.page_size
+            while low < high:
+                mid = (low + high + 1) // 2
+                if self.can_fit_prefetch_host_buffers(
+                    operation, mid * self.page_size, empty=False
+                ):
+                    low = mid
+                else:
+                    high = mid - 1
+            alloc_len = low * self.page_size
+        else:
+            available = self.mem_pool_host.available_size()
+            alloc_len = min(hit_tokens, available - available % self.page_size)
+        if alloc_len >= min_tokens:
+            host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
+        return host_indices, alloc_len
+
+    def free_prefetch_host_buffers(
+        self, operation: StorageOperation, host_indices: torch.Tensor
+    ) -> None:
+        """Roll back an unsubmitted prefetch's anchor and independent pools."""
+        pool_transfers = operation.pool_transfers or []
+        self.mem_pool_host.free(host_indices)
+        for transfer in pool_transfers:
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None:
+                entry.host_pool.free(transfer.host_indices)
+            transfer.host_indices = None
+
     def _move_op_indices(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
@@ -495,39 +832,12 @@ class HybridCacheController(BaseHiCacheController):
         host_group = self.mem_pool_host
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
-        if not getattr(host_group, "supports_per_pool_backup_indices", False):
-            if not getattr(host_group, "can_use_write_back_jit", False):
+        if not host_group.supports_per_pool_backup_indices:
+            if not host_group.can_use_write_back_jit:
                 return self.move_hybrid_indices(op)
             return op.host_indices, op.device_indices, op.pool_transfers
 
-        def move_for_pool(host_pool, host_indices, device_indices):
-            if getattr(host_pool, "can_use_write_back_jit", False):
-                if host_indices.is_cuda:
-                    host_indices = host_indices.cpu()
-                return host_indices, device_indices
-            return self.move_indices(host_indices, device_indices)
-
-        host_indices, device_indices = move_for_pool(
-            host_group.anchor_entry.host_pool,
-            op.host_indices,
-            op.device_indices,
-        )
-        pool_transfers = []
-        for transfer in op.pool_transfers or []:
-            entry = host_group.entry_map[transfer.name]
-            transfer_host_indices, transfer_device_indices = move_for_pool(
-                entry.host_pool,
-                transfer.host_indices,
-                transfer.device_indices,
-            )
-            pool_transfers.append(
-                replace(
-                    transfer,
-                    host_indices=transfer_host_indices,
-                    device_indices=transfer_device_indices,
-                )
-            )
-        return host_indices, device_indices, pool_transfers or None
+        return self.move_hybrid_indices(op, write_back_jit=True)
 
     def _l2_transfers(
         self,
@@ -582,7 +892,9 @@ class HybridCacheController(BaseHiCacheController):
             if target_transfer is None or target_transfer.layer_mapper is None:
                 continue
             for depth, draft_device_pool in enumerate(entry.packed_draft_device_pools):
-                draft_host_layer = target_transfer.layer_mapper(self.layer_num + depth)
+                draft_host_layer = target_transfer.layer_mapper(
+                    self.transfer_layer_id_max + depth
+                )
                 if draft_host_layer is None:
                     continue
 
@@ -709,7 +1021,7 @@ class HybridCacheController(BaseHiCacheController):
     def get_prefetch_submission(self, rid: str) -> Optional[PrefetchSubmission]:
         if self.pp_prefetch_command_group is None:
             return None
-        if self.pp_rank != 0:
+        if self.storage_config.pp_rank != 0:
             return PrefetchSubmission()
         with self.pp_prefetch_state_lock:
             state = self.pp_prefetch_states.get(rid)
@@ -742,7 +1054,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
             )
 
-        if self.pp_rank != 0:
+        if self.storage_config.pp_rank != 0:
             raise RuntimeError("Only PP0 can submit a PP prefetch ticket.")
 
         rid = handle.rid
@@ -772,7 +1084,8 @@ class HybridCacheController(BaseHiCacheController):
 
         storage_hit_count = len(ticket.prefetch_key.token_ids)
         try:
-            for pp_rank in range(self.tp_rank, self.pp_size, self.tp_size):
+            config = self.storage_config
+            for pp_rank in range(config.tp_rank, config.pp_size, config.tp_size):
                 _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
                 storage_hit_count = min(storage_hit_count, rank_hit_count)
         except Exception:
@@ -940,7 +1253,7 @@ class HybridCacheController(BaseHiCacheController):
         assert group is not None
         rank = torch.distributed.get_rank()
         source = torch.distributed.get_process_group_ranks(group)[0]
-        is_source = self.pp_rank == 0
+        is_source = self.storage_config.pp_rank == 0
 
         while True:
             objects = []
@@ -1043,9 +1356,11 @@ class HybridCacheController(BaseHiCacheController):
 
         if operation.assume_stored:
             # A prior hit on a suffix of this span proved it stored, and writes
-            # are prefix-covered, so re-querying only adds a round trip.
+            # are prefix-covered, so re-querying only adds a round trip. Nothing
+            # is verified now, so no pool gets a verdict to learn from.
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+            operation.query_pool_hit_pages = {}
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -1064,41 +1379,92 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        # Each pool's own boundary (the KV pool's where the backend reports
+        # it, else the folded cut); the beliefs heal pool by pool. A pool the
+        # backend did not report carries no verdict.
+        pool_hits = hit_result.extra_pool_hit_pages
+        operation.query_pool_hit_pages = {
+            PoolName.KV: pool_hits.get(PoolName.KV, kv_hit_pages)
+        }
+        for transfer in operation.pool_transfers or ():
+            if transfer.name in pool_hits:
+                operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
 
+    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+        """One MIN collective for the folded hit count and every pool's own
+        boundary, so per-pool beliefs stay rank-identical. A pool omitted
+        by any rank heals from the folded cut without learning presence."""
+        pools = list(PoolName)
+        local = operation.query_pool_hit_pages
+        packed = torch.tensor(
+            [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            dtype=torch.int,
+        )
+        self._all_reduce(
+            packed,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        reduced = packed.tolist()
+        operation.query_pool_hit_pages = {
+            pool: pages
+            for pool, pages in zip(pools, reduced[1:], strict=True)
+            if pages != _NO_POOL_VERDICT
+        }
+        return int(reduced[0])
+
+    def _move_pool_indices(
+        self, host_pool, host_indices, device_indices, *, write_back_jit: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if uses_shared_host_layout(host_pool):
+            return host_indices, device_indices
+        if write_back_jit and host_pool.can_use_write_back_jit:
+            if host_indices.is_cuda:
+                host_indices = host_indices.cpu()
+            return host_indices, device_indices
+        return self.move_indices(host_indices, device_indices)
+
     def move_hybrid_indices(
-        self, operation: CacheOperation
+        self, operation: CacheOperation, *, write_back_jit: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        host_indices, device_indices = self.move_indices(
-            operation.host_indices, operation.device_indices
+        host_indices, device_indices = self._move_pool_indices(
+            self.mem_pool_host.anchor_entry.host_pool,
+            operation.host_indices,
+            operation.device_indices,
+            write_back_jit=write_back_jit,
         )
         resolved_pool_transfers = None
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
-                transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
+                transfer_host_indices, transfer_device_indices = (
+                    self._move_pool_indices(
+                        self.mem_pool_host.entry_map[transfer.name].host_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        write_back_jit=write_back_jit,
+                    )
                 )
-                # Keep the original PoolTransfer unchanged because tree-owned
-                # transfers may still reference radix-tree host state. The
-                # controller only needs a normalized execution-time copy.
+                # Tree-owned transfers keep their original radix-tree indices.
                 resolved_pool_transfers.append(
-                    PoolTransfer(
-                        name=transfer.name,
+                    replace(
+                        transfer,
                         host_indices=transfer_host_indices,
                         device_indices=transfer_device_indices,
-                        keys=transfer.keys,
-                        hit_policy=transfer.hit_policy,
-                        indices_from_pool=transfer.indices_from_pool,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        with self.mem_pool_host.layout_lease():
+            return self._page_transfer_with_stable_layout(operation)
+
+    def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count
         kv_completed_pages = super()._page_transfer(operation)
 
@@ -1133,11 +1499,26 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_get_v2(
-                transfers_nonkv, extra_info=extra_info
-            )
-            pool_hits = count_pool_hits(results)
+            try:
+                results = {}
+                for extra_info, transfers in _trailing_chain_groups(
+                    operation.prefix_keys,
+                    sidecar_hashes,
+                    transfers_nonkv,
+                ):
+                    results.update(
+                        self.storage_backend.batch_get_v2(
+                            transfers, extra_info=extra_info
+                        )
+                    )
+                pool_hits = count_pool_hits(results)
+            except Exception:
+                if not get_memory().enable_unified_memory:
+                    raise
+                logger.exception(
+                    "HiCache sidecar prefetch failed for request %s",
+                    operation.request_id,
+                )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
@@ -1167,6 +1548,10 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_start += trim_tokens
 
     def _page_backup(self, operation):
+        with self.mem_pool_host.layout_lease():
+            return self._page_backup_with_stable_layout(operation)
+
+    def _page_backup_with_stable_layout(self, operation):
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -1178,10 +1563,13 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_set_v2(
-                backup_transfers, extra_info=extra_info
-            )
+            results = {}
+            for extra_info, transfers in _trailing_chain_groups(
+                operation.prefix_keys, operation.hash_value, backup_transfers
+            ):
+                results.update(
+                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
+                )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
@@ -1331,9 +1719,10 @@ class HybridCacheController(BaseHiCacheController):
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         derived_transfers: list[PoolTransfer] = []
+        anchor_transfers = []
 
         def rollback_allocated() -> None:
-            for prev_pool, prev_free_fn, prev_indices in newly_allocated:
+            for prev_pool, prev_free_fn, prev_indices in reversed(newly_allocated):
                 prev_free_fn(prev_indices)
                 prev_pool.device_indices = None
 
@@ -1345,6 +1734,11 @@ class HybridCacheController(BaseHiCacheController):
             if entry is None:
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
+                continue
+            if entry.device_indices_from_anchor_fn is not None:
+                # Allocate independent pools first: their allocation/eviction
+                # can compact SWA before its physical IDs are captured.
+                anchor_transfers.append((pool, entry))
                 continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
@@ -1364,11 +1758,34 @@ class HybridCacheController(BaseHiCacheController):
             pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
 
+        for pool, entry in anchor_transfers:
+            if kv_device_indices is None or not pool.anchor_index_parts:
+                rollback_allocated()
+                return None
+            anchor_indices = torch.cat(
+                [
+                    kv_device_indices[part] if isinstance(part, slice) else part
+                    for part in pool.anchor_index_parts
+                ]
+            )
+            assert len(anchor_indices) == len(pool.host_indices)
+            bind = entry.device_indices_from_anchor_fn
+            indices = bind(anchor_indices)
+            if indices is None and entry.device_evict_fn:
+                entry.device_evict_fn(len(anchor_indices))
+                indices = bind(anchor_indices)
+            if indices is None:
+                rollback_allocated()
+                return None
+            pool.device_indices = indices
+            newly_allocated.append((pool, entry.device_free_fn, anchor_indices))
+
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
                 pool.host_indices = kv_host_indices
-                pool.device_indices = kv_device_indices
+                if pool.device_indices is None:
+                    pool.device_indices = kv_device_indices
                 continue
 
             source = next(
@@ -1384,7 +1801,8 @@ class HybridCacheController(BaseHiCacheController):
                 rollback_allocated()
                 return None
             pool.host_indices = source.host_indices
-            pool.device_indices = source.device_indices
+            if pool.device_indices is None:
+                pool.device_indices = source.device_indices
         return extra_pools
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:

@@ -106,7 +106,11 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             )
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in Attention TP>1 case)
-        if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
+        if (
+            isinstance(layer, RowParallelLinear)
+            and layer.tp_group is not None
+            and layer.tp_group.rank_in_group > 0
+        ):
             quant_bias = None
         else:
             quant_bias = layer.quant_bias
