@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import argparse
+import json
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +12,7 @@ from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 from transformers import BatchFeature
 
+from sglang.multimodal_gen import registry
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
     QwenImage21DitConfig,
@@ -17,11 +21,13 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
     QwenImage21PipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _resolve_image_output_format,
 )
@@ -33,6 +39,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
 )
@@ -44,6 +53,7 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
     _unpatchify,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -52,6 +62,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21InputValidationStage,
     collapse_image_slots,
 )
+from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -118,6 +130,78 @@ def test_prompt_conditioning_uses_training_template_and_pre_norm(prompt, image_c
     for image in images:
         assert image.mode == "RGBA"
         assert image.getpixel((0, 0)) == (12, 34, 56, 0)
+
+
+class ConditioningTestEncoder(EncoderTensorParallelMixin, torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones((), device=device))
+        self.model = SimpleNamespace(
+            visual=SimpleNamespace(rotary_pos_emb=SimpleNamespace())
+        )
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        self.calls += 1
+        hidden = input_ids[..., None].float().expand(-1, -1, 4) * self.weight
+        return SimpleNamespace(hidden_states=tuple(hidden + i for i in range(32)))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA required"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_prompt_cache_skips_processor_and_weight_preparation(device):
+    def process(text, **kwargs):
+        image_value = sum(kwargs["images"][0].getpixel((0, 0)))
+        return BatchFeature(
+            data={
+                "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+            }
+        )
+
+    processor = Mock(side_effect=process)
+    processor.tokenizer.convert_tokens_to_ids.return_value = 99
+    processor.apply_chat_template.return_value = [[1]]
+    encoder = ConditioningTestEncoder(device).eval()
+    stage = QwenImage21EncodingStage(encoder, processor, None, None)
+    stage.use_declared_component = Mock(return_value=nullcontext(encoder))
+    image = Image.new("RGBA", (2, 2), (12, 34, 56, 128))
+    cache = ConditioningCache(1024)
+    with cache.scope():
+        first, slots = stage.encode_prompt("edit", [image], device)
+        expected = first.clone()
+        first.zero_()
+        slots.zero_()
+        restored, slots = stage.encode_prompt("edit", [image.copy()], device)
+        torch.testing.assert_close(restored, expected, atol=0, rtol=0)
+        assert slots.tolist() == [False, True, False]
+        assert encoder.calls == processor.call_count == 1
+        stage.use_declared_component.assert_called_once()
+        assert cache.stats()["entries"] == 1
+        assert cache.bytes == 3 * 4 * 4 + 3
+        assert cache.bypasses == 0  # no oversized duplicate of all hidden states
+        changed, _ = stage.encode_prompt("another edit", [image], device)
+        assert not torch.equal(changed, expected)
+        image.putpixel((0, 0), (12, 34, 56, 255))
+        changed_alpha, _ = stage.encode_prompt("edit", [image], device)
+        assert not torch.equal(changed_alpha, expected)
+        assert encoder.calls == 3
+        with cache.scope(refresh=True):
+            stage.encode_prompt("edit", [image], device)
+        with cache.scope(enabled=False):
+            stage.encode_prompt("edit", [image], device)
+        assert encoder.calls == processor.call_count == 5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -282,6 +366,68 @@ def test_latent_pack_decode_contract():
     )
 
 
+@pytest.mark.parametrize("gfx1151", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_vae_tiling_platform_default_and_python_override(
+    monkeypatch, gfx1151, override
+):
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: gfx1151)
+    kwargs = {} if override is None else {"vae_tiling": override}
+    config = QwenImage21PipelineConfig(**kwargs)
+    assert config.vae_tiling is (gfx1151 if override is None else override)
+    warning = Mock()
+    monkeypatch.setattr(f"{module}.logger.warning", warning)
+    config.validate_server_args(None)
+    assert warning.call_count == int(gfx1151 and not config.vae_tiling)
+
+
+@pytest.mark.parametrize("gfx1151", [False, True])
+@pytest.mark.parametrize("cli_value", [None, False, True])
+@pytest.mark.parametrize("file_value", [None, False, True])
+def test_vae_tiling_cli_overrides_config_file_and_platform_default(
+    monkeypatch, tmp_path, gfx1151, cli_value, file_value
+):
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform.is_gfx1151", lambda: gfx1151)
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(
+            pipeline_config_cls=QwenImage21PipelineConfig
+        ),
+    )
+    argv = []
+    if file_value is not None:
+        path = tmp_path / "pipeline.json"
+        path.write_text(json.dumps({"vae_tiling": file_value}))
+        argv.extend(["--pipeline-config-path", str(path)])
+    if cli_value is not None:
+        argv.extend(["--vae-tiling", str(cli_value).lower()])
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    parser = PipelineConfig.add_cli_args(argparse.ArgumentParser())
+    args, unknown = parser.parse_known_args(argv)
+    kwargs = ServerArgs.get_provided_args(args, unknown)
+    kwargs["model_path"] = "Qwen/Qwen-Image-2.1"
+    config = PipelineConfig.from_kwargs(kwargs)
+    expected = gfx1151 if file_value is None else file_value
+    assert config.vae_tiling is (expected if cli_value is None else cli_value)
+
+
+def test_vae_tiling_default_without_visible_rocm_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    properties = Mock(side_effect=AssertionError("No device should be queried"))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    module = "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21"
+    monkeypatch.setattr(f"{module}.current_platform", RocmPlatform)
+    RocmPlatform.is_gfx1151.cache_clear()
+    try:
+        assert not QwenImage21PipelineConfig().vae_tiling
+        properties.assert_not_called()
+    finally:
+        RocmPlatform.is_gfx1151.cache_clear()
+
+
 def test_default_image_output_format_preserves_rgba():
     assert QwenImage21SamplingParams.default_image_output_format() == "png"
     assert _resolve_image_output_format(None, QwenImage21SamplingParams) == "png"
@@ -315,7 +461,9 @@ def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
 
 @pytest.mark.parametrize("channels", [3, 4])
 @pytest.mark.parametrize("tiling", [False, True])
-def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
+def test_native_vae_roundtrip_shapes_and_checkpoint_names(
+    monkeypatch, channels, tiling
+):
     ac = QwenImage21VAEArchConfig(
         base_dim=4,
         decoder_base_dim=4,
@@ -325,6 +473,8 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
         temperal_downsample=(False, False, False, False),
         in_channels=channels,
         out_channels=channels,
+        latents_mean=(0.0,) * 4,
+        latents_std=(1.0,) * 4,
     )
     model = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac)).eval()
     assert not model.use_tiling
@@ -338,6 +488,30 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels, tiling):
         assert latent.shape == (1, 4, 1, 2, 4)
         output = model.decode(latent)
         assert output.shape == (1, channels, 1, 32, 64)
+        # Exercise the serving decoder on gfx1151 with an explicit tiling choice.
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.configs.pipeline_configs.qwen_image21.current_platform.is_gfx1151",
+            lambda: True,
+        )
+        args = SimpleNamespace(
+            pipeline_config=QwenImage21PipelineConfig(
+                vae_config=QwenImage21VAEConfig(arch_config=ac), vae_tiling=tiling
+            ),
+            disable_autocast=True,
+            enable_torch_compile=False,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args",
+            lambda: args,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
+            lambda: torch.device("cpu"),
+        )
+        model.use_tiling = False
+        actual = DecodingStage(model).decode(latent, args, vae_dtype=torch.float32)
+        assert model.use_tiling is tiling
+        torch.testing.assert_close(actual, (output / 2 + 0.5).clamp(0, 1))
     assert model.state_dict()["encoder.conv_in.weight"].ndim == 4
     x = torch.randn(2, 3, 1, 8, 12)
     torch.testing.assert_close(_unpatchify(_patchify(x, 2), 2), x)

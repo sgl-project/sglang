@@ -1,7 +1,7 @@
 """Unit tests for SGLANG_RADIX_FORCE_MISS.
 
 The flag is gated at the scheduler boundary, so we test the helper directly
-plus an end-to-end check of `match_prefix_for_req` driving a populated
+plus an end-to-end check of `match_kv_cache` driving a populated
 RadixCache.
 """
 
@@ -10,20 +10,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
-import unittest.mock
 from array import array
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 
 
@@ -33,7 +32,7 @@ class _StubReq:
         self.output_ids = array("q")
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = None
+        self.prefix_len = 0
         self.last_node = None
         self.last_host_node = None
         self.best_match_node = None
@@ -66,8 +65,8 @@ class TestZeroMatchResult(unittest.TestCase):
 
     def test_chunk_cache_is_passthrough(self):
         class _StubChunkCache:
-            def is_chunk_cache(self) -> bool:
-                return True
+            def supports_prefix_sharing(self) -> bool:
+                return False
 
         original = MatchResult(
             device_indices=torch.empty((0,), dtype=torch.int64),
@@ -79,7 +78,7 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertIs(zero_match_result(_StubChunkCache(), original), original)
 
 
-class TestMatchPrefixForReqForceMiss(unittest.TestCase):
+class TestMatchKvCacheForceMiss(unittest.TestCase):
     def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
         class _StubTreeCache:
             def swa_reprefill_tail_tokens(self):
@@ -98,7 +97,7 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
         req = _StubReq([1, 2, 3, 4])
         req.swa_branching_seqlen = 8
 
-        match_prefix_for_req(_StubTreeCache(), req)
+        match_kv_cache(req, _StubTreeCache())
 
         self.assertIsNone(req.swa_branching_seqlen)
 
@@ -113,15 +112,15 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
         # Sanity: without the flag, the same lookup hits.
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(False):
-            match_prefix_for_req(tree, baseline_req)
-        self.assertGreater(int(baseline_req.prefix_indices.numel()), 0)
+            match_kv_cache(baseline_req, tree)
+        self.assertGreater(baseline_req.prefix_len, 0)
         self.assertIsNot(baseline_req.last_node, tree.root_node)
 
         # With the flag, the same lookup is forced to miss.
         forced_req = _StubReq([10, 11, 12, 13, 99, 100])
         with envs.SGLANG_RADIX_FORCE_MISS.override(True):
-            match_prefix_for_req(tree, forced_req)
-        self.assertEqual(int(forced_req.prefix_indices.numel()), 0)
+            match_kv_cache(forced_req, tree)
+        self.assertEqual(forced_req.prefix_len, 0)
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
