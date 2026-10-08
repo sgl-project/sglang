@@ -203,16 +203,8 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
         __m512 x1 = vc0[row * COLS + col + 1];
         __m512 y0 = vc1[row * COLS + col + 0];
         __m512 y1 = vc1[row * COLS + col + 1];
-        const __m512 one = _mm512_set1_ps(1.0f);
-        __m512 silu0 = _mm512_mul_ps(
-            x0, _mm512_div_ps(one, _mm512_add_ps(_mm512_exp_u20_ps(_mm512_sub_ps(_mm512_setzero_ps(), x0)), one)));
-        __m512 silu1 = _mm512_mul_ps(
-            x1, _mm512_div_ps(one, _mm512_add_ps(_mm512_exp_u20_ps(_mm512_sub_ps(_mm512_setzero_ps(), x1)), one)));
-        __m512i silu_bf16 = (__m512i)_mm512_cvtne2ps_pbh(silu1, silu0);
-        silu0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(silu_bf16, 0));
-        silu1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(silu_bf16, 1));
-        x0 = _mm512_mul_ps(silu0, y0);
-        x1 = _mm512_mul_ps(silu1, y1);
+        x0 = _mm512_mul_ps(_mm512_rcp14_silu_ps(x0), y0);
+        x1 = _mm512_mul_ps(_mm512_rcp14_silu_ps(x1), y1);
 
         _mm512_storeu_si512(
             reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
