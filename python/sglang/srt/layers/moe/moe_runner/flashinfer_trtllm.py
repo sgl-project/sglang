@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Optional, cast
+from typing import TYPE_CHECKING, Any, Generator, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -1299,6 +1299,11 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
+    # Per-layer Cake warp-decode state (moe_runner/cake_warp_decode.py), armed
+    # by ModelOptNvFp4FusedMoEMethod when SGLANG_CAKE_ROUTES selects
+    # ``moe_nvfp4_warp_decode``; None keeps the TRT-LLM path unchanged.
+    cake_warp_decode: Optional[Any] = None
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -1477,6 +1482,23 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             device=hs_fp4.device,
             symmetric=hidden_pad == 0,
         )
+
+    # Cake NVFP4 warp-decode (1 <= num_tokens <= 32, calibrated geometries):
+    # consumes the same quantised activations and TRT-LLM weight view and
+    # writes the same output buffer; False means it declined (see its log).
+    cake = quant_info.cake_warp_decode
+    if (
+        cake is not None
+        and symm_output is not None
+        and cake.run(
+            hs_fp4,
+            hs_scale,
+            topk_output,
+            symm_output,
+            per_token_scale=per_token_scale,
+        )
+    ):
+        return StandardCombineInput(hidden_states=symm_output)
 
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)

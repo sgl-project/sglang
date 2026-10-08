@@ -2,6 +2,10 @@
 
 Decode and varlen prefill use a uniform 512-dim FP8 KV cache. Shared metadata
 construction preserves the base backend's CUDA-graph replay semantics.
+
+``SGLANG_CAKE_ROUTES=dsv4_sparse_mla_decode`` lets both kernel calls take the
+same FlashInfer entry with ``backend="cake"`` (see ``dsv4/cake_routes.py``);
+the stock call runs unchanged when the route is off or not admitted.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
+from sglang.srt.layers.attention.dsv4.cake_routes import CakeDsv4TrtllmRoute
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -170,6 +175,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
+        self._cake_dsv4_route = CakeDsv4TrtllmRoute()
 
     def _forward_trtllm(
         self,
@@ -351,7 +357,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        out = self._cake_dsv4_route.run(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
@@ -365,6 +371,20 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             kv_layout="HND",
             backend="trtllm-gen",
         )
+        if out is None:
+            out = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q_fp8,
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=self.trtllm_workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=attn_sink,
+                kv_layout="HND",
+            )
         if out_pad_tail is not None:
             out_pad_tail[:bs] = out.view(bs, num_heads, 512)
             return out_pad_tail
@@ -490,7 +510,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             )
             out_arg = out_padded[:sum_q]
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        out = self._cake_dsv4_route.run(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
@@ -507,6 +527,23 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
         )
+        if out is None:
+            out = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q_fp8,
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=self.trtllm_workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens,
+                out=out_arg,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=attn_sink,
+                kv_layout="HND",
+                cum_seq_lens_q=cum_seq_lens_q,
+                max_q_len=max_q_len,
+            )
         return out_padded if out_padded is not None else out
 
 

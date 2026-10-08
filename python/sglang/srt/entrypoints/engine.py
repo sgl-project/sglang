@@ -1849,6 +1849,14 @@ def _set_envs_and_config(server_args: ServerArgs):
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 
+    # Cake routes selected by SGLANG_CAKE_ROUTES may need process-wide settings
+    # that torch fixes at first use (e.g. the symmetric-memory backend); export
+    # them here so the scheduler processes inherit them. User-set values win.
+    from sglang.kernels.cake_kernels._routes import apply_route_process_env
+
+    for key, value in apply_route_process_env().items():
+        logger.info("Cake route process environment: %s=%s", key, value)
+
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
         os.environ["TRTLLM_ENABLE_PDL"] = "1"

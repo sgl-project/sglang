@@ -10,12 +10,14 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -31,6 +33,87 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FLASHINFER_GDN_ALIGNMENT = 32
+
+# ---------------------------------------------------------------------------
+# Cake (FlashInfer backend="cake_gdn") opt-in routes
+# ---------------------------------------------------------------------------
+#
+# ``SGLANG_CAKE_ROUTES=gdn_prefill,gdn_decode`` lets the two state-pool call
+# sites below take the Cake KernelSpecs registered in
+# ``sglang.kernels.ops.attention.cake_linear``.  A route is taken only when the
+# adapter's ``supports_*`` admission accepts the exact tensors the engine is
+# about to pass; otherwise (route off, admission False, or FlashInfer failing
+# closed with ``CakeGDNUnsupportedError``) the stock FlashInfer call runs
+# unchanged.  The first "taken" and the first "fallback" per route are logged
+# so an e2e run can prove which kernel actually executed.
+
+CAKE_ROUTE_PREFILL = "gdn_prefill"
+CAKE_ROUTE_DECODE = "gdn_decode"
+_CAKE_LOG_PREFIX = "[cake-route]"
+
+# (route, event) pairs already logged; keeps the per-call path free of I/O.
+_cake_route_logged: set[tuple[str, str]] = set()
+# Shape keys FlashInfer rejected with CakeGDNUnsupportedError; skipped afterwards.
+_cake_route_rejected: set[tuple] = set()
+
+
+def _log_cake_route_once(route: str, event: str, detail: str) -> None:
+    key = (route, event)
+    if key in _cake_route_logged:
+        return
+    _cake_route_logged.add(key)
+    if event == "taken":
+        logger.info("%s %s: Cake kernel selected (%s)", _CAKE_LOG_PREFIX, route, detail)
+    else:
+        logger.info(
+            "%s %s: fallback to FlashInfer default (%s)",
+            _CAKE_LOG_PREFIX,
+            route,
+            detail,
+        )
+
+
+def reset_cake_route_state_for_tests() -> None:
+    _cake_route_logged.clear()
+    _cake_route_rejected.clear()
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_gdn_prefill_kernels() -> tuple[Callable[..., bool], Callable[..., tuple]]:
+    """Lazy (admission, forwarder) pair for ``attention.gdn_chunk_gated_delta_rule``."""
+    from sglang.kernels.cake_kernels.attention_linear_gdn import (
+        supports_gdn_chunk_gated_delta_rule,
+    )
+    from sglang.kernels.ops.attention.cake_linear import (
+        cake_gdn_chunk_gated_delta_rule,
+    )
+
+    return supports_gdn_chunk_gated_delta_rule, cake_gdn_chunk_gated_delta_rule
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_gdn_decode_kernels() -> tuple[Callable[..., bool], Callable[..., tuple]]:
+    """Lazy (admission, forwarder) pair for ``attention.gdn_decode_pretranspose``."""
+    from sglang.kernels.cake_kernels.attention_linear_gdn import (
+        supports_gdn_decode_pretranspose,
+    )
+    from sglang.kernels.ops.attention.cake_linear import (
+        cake_gdn_decode_pretranspose,
+    )
+
+    return supports_gdn_decode_pretranspose, cake_gdn_decode_pretranspose
+
+
+def _tensor_summary(**tensors: Optional[torch.Tensor]) -> str:
+    parts = []
+    for name, t in tensors.items():
+        if t is None:
+            parts.append(f"{name}=None")
+        else:
+            parts.append(
+                f"{name}={tuple(t.shape)}/{str(t.dtype).removeprefix('torch.')}"
+            )
+    return " ".join(parts)
 
 
 def copy_verify_intermediate_rows(
@@ -442,19 +525,34 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             cache_indices_fi = self._prepare_dynamic_input(
                 "decode_cache_indices", cache_indices
             )
-            output_fi, _ = self._decode_fn(
-                q=query_fi,
-                k=key_fi,
-                v=value_fi,
-                state=None,
-                A_log=A_log_fi,
-                a=a_fi,
-                dt_bias=dt_bias_fi,
-                b=b_fi,
-                use_qk_l2norm=True,
-                initial_state=ssm_states,
-                initial_state_indices=cache_indices_fi,
-            )
+            output_fi = None
+            if cake_route_enabled(CAKE_ROUTE_DECODE):
+                output_fi = self._cake_decode_pretranspose(
+                    query_fi,
+                    key_fi,
+                    value_fi,
+                    a_fi,
+                    b_fi,
+                    A_log_fi=A_log_fi,
+                    dt_bias=dt_bias,
+                    dt_bias_fi=dt_bias_fi,
+                    ssm_states=ssm_states,
+                    cache_indices_fi=cache_indices_fi,
+                )
+            if output_fi is None:
+                output_fi, _ = self._decode_fn(
+                    q=query_fi,
+                    k=key_fi,
+                    v=value_fi,
+                    state=None,
+                    A_log=A_log_fi,
+                    a=a_fi,
+                    dt_bias=dt_bias_fi,
+                    b=b_fi,
+                    use_qk_l2norm=True,
+                    initial_state=ssm_states,
+                    initial_state_indices=cache_indices_fi,
+                )
         else:
             # TODO: Once FlashInfer PR#2521 is merged for SM90, gather/scatter
             # will no longer be needed here.
@@ -475,6 +573,91 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ssm_states[cache_indices] = new_state
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
+
+    def _cake_decode_pretranspose(
+        self,
+        query_fi: torch.Tensor,
+        key_fi: torch.Tensor,
+        value_fi: torch.Tensor,
+        a_fi: torch.Tensor,
+        b_fi: torch.Tensor,
+        *,
+        A_log_fi: torch.Tensor,
+        dt_bias: torch.Tensor,
+        dt_bias_fi: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices_fi: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Run the ``gdn_decode`` Cake route; ``None`` means "use the stock call".
+
+        Same contract as the state-pool ``_decode_fn`` call: rows of
+        ``ssm_states`` at ``cache_indices_fi`` are updated in place and the
+        ``[B, 1, HV, 128]`` output is returned.  The Cake pretranspose kernel
+        needs FP32 ``dt_bias`` (the stock SM100 kernel takes the source dtype),
+        so a cached FP32 copy of the parameter is used for this branch only.
+        """
+        supports, cake_decode = _cake_gdn_decode_kernels()
+        if dt_bias_fi.dtype != torch.float32:
+            dt_bias_fi = self._prepare_parameter(
+                "dt_bias", dt_bias, dtype=torch.float32
+            )
+        key = (
+            tuple(query_fi.shape),
+            tuple(value_fi.shape),
+            query_fi.dtype,
+            ssm_states.dtype,
+        )
+        if key in _cake_route_rejected:
+            return None
+        admitted = supports(
+            query_fi,
+            key_fi,
+            value_fi,
+            ssm_states,
+            cache_indices_fi,
+            A_log=A_log_fi,
+            a=a_fi,
+            dt_bias=dt_bias_fi,
+            b=b_fi,
+        )
+        detail = _tensor_summary(
+            q=query_fi,
+            v=value_fi,
+            a=a_fi,
+            dt_bias=dt_bias_fi,
+            pool=ssm_states,
+            indices=cache_indices_fi,
+        )
+        if not admitted:
+            _log_cake_route_once(
+                CAKE_ROUTE_DECODE, "fallback", f"adapter admission rejected: {detail}"
+            )
+            return None
+        try:
+            output_fi, _ = cake_decode(
+                query_fi,
+                key_fi,
+                value_fi,
+                None,
+                A_log_fi,
+                a_fi,
+                dt_bias_fi,
+                b_fi,
+                use_qk_l2norm=True,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices_fi,
+                backend="cake_gdn",
+            )
+        except NotImplementedError as error:  # CakeGDNUnsupportedError (host check)
+            _cake_route_rejected.add(key)
+            _log_cake_route_once(
+                CAKE_ROUTE_DECODE,
+                "fallback",
+                f"FlashInfer has no Cake manifest row ({error}): {detail}",
+            )
+            return None
+        _log_cake_route_once(CAKE_ROUTE_DECODE, "taken", detail)
+        return output_fi
 
     # ---- extend (prefill) ----
 
@@ -563,7 +746,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
+        prefill_kwargs = dict(
             q=q_fi,
             k=k_fi,
             v=v_fi,
@@ -580,6 +763,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
+        result = None
+        if self.use_state_pool and cake_route_enabled(CAKE_ROUTE_PREFILL):
+            result = self._cake_prefill(prefill_kwargs)
+        if result is None:
+            result = self._prefill_fn(**prefill_kwargs)
+        output_fi, output_state_fi = result
 
         # Write back state to pool
         ssm_states.index_copy_(
@@ -594,6 +783,78 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    @staticmethod
+    def _cake_prefill(prefill_kwargs: dict) -> Optional[tuple]:
+        """Run the ``gdn_prefill`` Cake route; ``None`` means "use the stock call".
+
+        ``prefill_kwargs`` are exactly the kwargs of the stock
+        ``chunk_gated_delta_rule`` call; the Cake forwarder has the same
+        signature plus ``backend="cake_gdn"`` and returns the same
+        ``(output, final_state)`` pair (``output`` / ``output_state`` /
+        ``state_checkpoints`` are written in place when provided).
+        """
+        supports, cake_prefill = _cake_gdn_prefill_kernels()
+        q, v, initial_state = (
+            prefill_kwargs["q"],
+            prefill_kwargs["v"],
+            prefill_kwargs["initial_state"],
+        )
+        key = (
+            q.shape[1],
+            prefill_kwargs["k"].shape[1],
+            v.shape[1],
+            q.dtype,
+            initial_state.dtype,
+            prefill_kwargs["checkpoint_every_n_tokens"],
+        )
+        if key in _cake_route_rejected:
+            return None
+        admitted = supports(
+            q,
+            prefill_kwargs["k"],
+            v,
+            prefill_kwargs["g"],
+            prefill_kwargs["beta"],
+            prefill_kwargs["cu_seqlens"],
+            initial_state=initial_state,
+            output=prefill_kwargs["output"],
+            output_state=prefill_kwargs["output_state"],
+            state_checkpoints=prefill_kwargs["state_checkpoints"],
+            checkpoint_cu_starts=prefill_kwargs["checkpoint_cu_starts"],
+            checkpoint_every_n_tokens=prefill_kwargs["checkpoint_every_n_tokens"],
+            use_cp="auto",
+            use_qk_l2norm_in_kernel=prefill_kwargs["use_qk_l2norm_in_kernel"],
+            output_final_state=prefill_kwargs["output_final_state"],
+            scale=prefill_kwargs["scale"],
+        )
+        detail = _tensor_summary(
+            q=q,
+            v=v,
+            g=prefill_kwargs["g"],
+            cu_seqlens=prefill_kwargs["cu_seqlens"],
+            initial_state=initial_state,
+            state_checkpoints=prefill_kwargs["state_checkpoints"],
+            checkpoint_cu_starts=prefill_kwargs["checkpoint_cu_starts"],
+        )
+        detail += f" every_n={prefill_kwargs['checkpoint_every_n_tokens']}"
+        if not admitted:
+            _log_cake_route_once(
+                CAKE_ROUTE_PREFILL, "fallback", f"adapter admission rejected: {detail}"
+            )
+            return None
+        try:
+            result = cake_prefill(**prefill_kwargs)
+        except NotImplementedError as error:  # CakeGDNUnsupportedError (host check)
+            _cake_route_rejected.add(key)
+            _log_cake_route_once(
+                CAKE_ROUTE_PREFILL,
+                "fallback",
+                f"FlashInfer has no Cake manifest row ({error}): {detail}",
+            )
+            return None
+        _log_cake_route_once(CAKE_ROUTE_PREFILL, "taken", detail)
+        return result
 
     # ---- target_verify (MTP) ----
 

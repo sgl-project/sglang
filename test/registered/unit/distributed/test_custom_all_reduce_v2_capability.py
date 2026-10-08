@@ -90,3 +90,53 @@ def test_topology_capability(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_allocate_symmetric_memory_uses_group_free_form_under_nvshmem(monkeypatch):
+    """With torch's NVSHMEM symmetric-memory backend (selected process-wide,
+    e.g. by the Cake SP all-gather matmul route) the group-scoped allocation
+    form is refused, so the slab is allocated first and rendezvoused on the
+    group; the CUDA backend keeps the group-scoped form."""
+    import sys
+    import types
+
+    import torch
+
+    calls = []
+    fake = types.SimpleNamespace(
+        backend="NVSHMEM",
+        get_backend=lambda device: fake.backend,
+        empty=lambda n, dtype, device: calls.append(("empty", n, dtype)) or "tensor",
+        rendezvous=lambda t, name: calls.append(("rendezvous", t, name)) or "handle",
+        enable_symm_mem_for_group=lambda name: calls.append(("enable", name)),
+    )
+    strided = Mock(return_value="p2p_tensor")
+    rendezvous_p2p = Mock(return_value="p2p_handle")
+    fake_c = types.SimpleNamespace(
+        _SymmetricMemory=types.SimpleNamespace(
+            empty_strided_p2p=strided, rendezvous=rendezvous_p2p
+        )
+    )
+    group = types.SimpleNamespace(group_name="tp")
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "torch.distributed._symmetric_memory", fake)
+        m.setitem(sys.modules, "torch._C._distributed_c10d", fake_c)
+        tensor, handle = custom_all_reduce_v2._allocate_symmetric_memory(
+            4096, device=torch.device("cpu"), group=group
+        )
+        assert (tensor, handle) == ("tensor", "handle")
+        assert calls == [
+            ("empty", 4096, torch.uint8),
+            ("rendezvous", "tensor", "tp"),
+        ]
+        strided.assert_not_called()
+
+        fake.backend = "CUDA"
+        calls.clear()
+        tensor, handle = custom_all_reduce_v2._allocate_symmetric_memory(
+            4096, device=torch.device("cpu"), group=group
+        )
+        assert (tensor, handle) == ("p2p_tensor", "p2p_handle")
+        strided.assert_called_once()
+        assert strided.call_args.args[4] == "tp"
+        assert not calls or calls == [("enable", "tp")]

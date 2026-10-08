@@ -106,6 +106,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_cake_projection import (
+    install_cake_kimi_k3_fp8_projections,
+)
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -2192,6 +2195,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        # State-dict prefix of this attention block; the opt-in Cake FP8
+        # projection route resolves the per-linear FP8_PB_WO predicate with it.
+        self._cake_projection_prefix = prefix
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
@@ -3453,6 +3459,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
+            # Opt-in Cake FP8_PB_WO projection GEMMs (SGLANG_CAKE_ROUTES=
+            # kimi_k3_fp8_projection); a no-op unless the route is selected.
+            install_cake_kimi_k3_fp8_projections(
+                self_attn,
+                lambda name: _uses_modelopt_fp8_pb_wo(self.quant_config, name),
+                getattr(self_attn, "_cake_projection_prefix", ""),
+            )
             if getattr(self_attn, "_kimi_split_gguf_kv_b", False):
                 if int(self_attn.k_b_qweight_type.weight_type) != 2:
                     raise ValueError("Kimi-K3 MLA K projection must remain GGUF Q4_0")

@@ -81,11 +81,19 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+    import torch.distributed._symmetric_memory as torch_symm_mem
     from torch._C._distributed_c10d import _SymmetricMemory
 
+    if str(torch_symm_mem.get_backend(device) or "").upper() == "NVSHMEM":
+        # The NVSHMEM allocator refuses the group-scoped allocation form; the
+        # process-wide backend is selected before the workers start (e.g. by a
+        # Cake route that needs it), so allocate first and rendezvous on the
+        # group. Multicast is unavailable on this backend (multicast_ptr == 0)
+        # and the caller picks the non-multicast algorithms.
+        tensor = torch_symm_mem.empty(nbytes, dtype=torch.uint8, device=device)
+        symm_mem = torch_symm_mem.rendezvous(tensor, group.group_name)
+        return tensor, symm_mem
     if torch.__version__ < "2.11.0":
-        import torch.distributed._symmetric_memory as torch_symm_mem
-
         torch_symm_mem.enable_symm_mem_for_group(group.group_name)
     tensor = _SymmetricMemory.empty_strided_p2p(
         (nbytes,),
