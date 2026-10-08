@@ -1,11 +1,4 @@
-"""Config fields of the ``model`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``model`` bag, which is what ``get_model()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``model`` namespace."""
 
 from __future__ import annotations
 
@@ -216,6 +209,17 @@ class Model(msgspec.Struct):
                 "fp4_mx_block16",
             ],
             resolvable=True,
+        ),
+    ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
         ),
     ] = "auto"
     modelopt_quant: A[
