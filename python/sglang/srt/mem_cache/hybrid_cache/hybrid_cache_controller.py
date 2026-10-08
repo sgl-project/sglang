@@ -1399,6 +1399,12 @@ class HybridCacheController(BaseHiCacheController):
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
+        if operation.all_hash_values is None:
+            # Cancellation can skip the local query. Every rank still needs
+            # the full chain to invalidate beliefs at the agreed boundary.
+            operation.all_hash_values = get_storage_hash_str(
+                operation.token_ids, operation.last_hash, page_size=self.page_size
+            )
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
         packed = torch.tensor(

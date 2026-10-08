@@ -4463,6 +4463,49 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(cache.buffer_backup_pending(leaf))
         self.assertFalse(cache.buffer_pipeline.ongoing_write_through)
 
+    def test_buffer_only_cancelled_query_invalidates_existing_beliefs(self):
+        self._skip_unsupported_hicache_test()
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("requires a FULL-only query")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        tokens = self._make_seq(1, 4)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        self._buffer_backup_and_wait(cache, leaf)
+        hashes = list(cache.tree_core.get_hash_values(leaf))
+        beliefs = cache.storage_existence_cache.pool(PoolName.KV)
+        self.assertTrue(beliefs.contains_all(hashes))
+        controller = cache.cache_controller
+        controller._stop_storage_threads()
+
+        request = CacheRequestHandle("cancel-before-query", 0)
+        cache.prefetch_from_storage(
+            request, cache.root_node_handle(), array("q", tokens)
+        )
+        operation = cache.ongoing_prefetch[request].operation
+        cache.finish(request, CacheRequestOutcome.ABORT)
+        self.assertIsNone(operation.all_hash_values)
+        self.assertTrue(beliefs.contains_all(hashes))
+
+        # The real worker skips the cancelled query but still publishes its
+        # synchronized zero-hit result. Existing beliefs must be invalidated.
+        controller.prefetch_thread_func()
+        self.assertEqual(operation.all_hash_values, hashes)
+        self.assertEqual(operation.storage_hit_count, 0)
+        self.assertEqual(operation.query_pool_hit_pages, {})
+        cache.check_hicache_events()
+        self.assertTrue(all(not beliefs.contains(h) for h in hashes))
+        cache.request_buffer_backup(leaf)
+        self.assertEqual(
+            [intent.pool for intent in cache.buffer_pipeline.pending_write_queue],
+            [PoolName.KV],
+        )
+
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
         nothing device-side, unmatchable, stable readiness, counters fed) ->
