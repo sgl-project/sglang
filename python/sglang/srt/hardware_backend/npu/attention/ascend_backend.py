@@ -1197,8 +1197,6 @@ class AscendAttnBackend(AttentionBackend):
             return
         if not forward_batch.forward_mode.is_context_parallel_extend():
             return
-        if forward_batch.forward_mode.is_target_verify():
-            return
 
         strategy = get_cp_strategy()
         if strategy is None or strategy.cp_size <= 1:
