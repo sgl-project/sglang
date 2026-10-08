@@ -458,14 +458,39 @@ def test_capacity_fallback_and_reset(factory):
         )
 
 
-def test_disabled_path_has_no_collectives(factory):
+def test_disabled_path_is_the_unsplit_path(factory, monkeypatch):
+    # Off must not even parse the split knobs, so a bad value cannot break it.
+    monkeypatch.setenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "not-a-number")
     linkers, collectives = factory(enabled=False)
-    _seed(linkers)
+    snapshots = _seed(linkers)
+    pages = {0, 1, 2, 3, 4, 7, 9}
     for linker in linkers:
-        _queue(linker, [0, 1])
+        _queue(linker, sorted(pages))
         _finish(linker)
     assert not collectives.calls
-    assert all(not linker._lookup_pages for linker in linkers)
+    for rank, linker in enumerate(linkers):
+        assert not hasattr(linker, "_split_recv")  # no staging on the device
+        assert not any(key.startswith("split_") for key in linker._stats)
+        assert not linker._lookup_pages and not linker._pending_pages
+        for name, entry in linker.pools.items():
+            wanted = set() if name == PoolName.SWA else pages
+            actual_reads = {
+                int(key.split(":")[0][1:])
+                for key, _, _ in linker.storage.reads
+                if f":{name}:" in key
+            }
+            # Every rank reads every page it needs, exactly as before the split.
+            assert actual_reads == wanted
+            span = 2 if name == PoolName.KV else 1
+            for c, component in enumerate(entry.components):
+                for layer, buffer in enumerate(component):
+                    expected = torch.full_like(buffer, 231)
+                    for page in wanted:
+                        row = ((page * 3 + rank) % 32) * span
+                        expected[row : row + span] = snapshots[rank][name][c][layer][
+                            row : row + span
+                        ]
+                    assert torch.equal(buffer, expected), (rank, name, layer)
 
 
 def test_non_replicated_pool_is_rejected(factory):

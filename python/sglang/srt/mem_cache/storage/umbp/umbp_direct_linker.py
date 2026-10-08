@@ -444,15 +444,19 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
-        # 0 disables the gate. A positive value vetoes split batches while the
-        # tier is too idle for the split to pay for itself; the opening minutes
-        # are ignored because warmup is not the steady state it calibrates to.
-        self._split_min_rate = float(os.getenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0"))
-        self._split_rate_min_seconds = float(
-            os.getenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
-        )
-        self._split_rate_start = time.monotonic()
-        self._split_loads_seen = 0
+        if self._split_load:
+            # 0 disables the gate. A positive value vetoes split batches while
+            # the tier is too idle for the split to pay for itself; the opening
+            # minutes are ignored because warmup is not the steady state it
+            # calibrates to.
+            self._split_min_rate = float(
+                os.getenv("UMBP_LOAD_SPLIT_MIN_RESTORE_RATE", "0")
+            )
+            self._split_rate_min_seconds = float(
+                os.getenv("UMBP_LOAD_SPLIT_RATE_MIN_SECONDS", "300")
+            )
+            self._split_rate_start = time.monotonic()
+            self._split_loads_seen = 0
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
         self._load_queue: Queue[
@@ -535,7 +539,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._split_min_pages = max(
             1, int(os.getenv("UMBP_LOAD_SPLIT_MIN_PAGES", "16"))
         )
-        self._split_max_rids = max(1, int(os.getenv("UMBP_LOAD_SPLIT_MAX_RIDS", "8")))
+        # A batch with more requests than this is not split at all; the
+        # agreement tensor is 1 + 4N int64, so 256 costs 8 KiB per batch.
+        self._split_max_rids = max(1, int(os.getenv("UMBP_LOAD_SPLIT_MAX_RIDS", "256")))
         capacity = int(os.getenv("UMBP_LOAD_SPLIT_STAGING_MIB", "512")) << 20
         if capacity <= 0:
             raise ValueError("UMBP_LOAD_SPLIT_STAGING_MIB must be positive.")
@@ -726,9 +732,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return self._completed_loads.get_nowait()
 
     def start_layer_wise_loading(self) -> int:
-        # Even a rank whose COMMIT discarded every transfer must vote.
-        share = self._prepare_split_share() if self._split_load else None
-        self._pending_pages.clear()
+        share = None
+        if self._split_load:
+            # Even a rank whose COMMIT discarded every transfer must vote.
+            share = self._prepare_split_share()
+            self._pending_pages.clear()
         if not self._pending:
             return -1
         self._freeze_gc_once()
@@ -896,11 +904,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     )
                     cpu_indices[source_id] = prepared_indices
                 rows = entry.prepare_locations(prepared_indices)
-                if len(rows) != len(page_keys):
-                    raise ValueError(
-                        f"UMBP pool {name} has different key and row counts."
-                    )
                 if common_locations is not None:
+                    if len(rows) != len(page_keys):
+                        raise ValueError(
+                            f"UMBP pool {name} has different key and row counts."
+                        )
                     by_key = dict(zip(page_keys, rows))
                     common_keys = share.common[request_index]
                     common_locations.extend(by_key[key] for key in common_keys)
