@@ -64,31 +64,6 @@ def _validate_flashinfer_kda_prefill(
         )
 
 
-def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
-    from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
-    from sglang.srt.configs.hybrid_arch import hybrid_kda_config
-
-    config = hybrid_kda_config(model_runner.model_config)
-    lower_bound = (
-        config.kda_lower_bound
-        if isinstance(config, BailingHybridConfig)
-        else config.linear_attn_config.get("gate_lower_bound")
-    )
-    execution = get_exec()
-    if (
-        lower_bound is not None
-        and execution.mamba.linear_attn_backend == "triton"
-        and not execution.deterministic.enable_deterministic_inference
-        and not execution.overlap.enable_two_batch_overlap
-        and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
-        and is_cuda()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-    ):
-        return "flashinfer"
-    return None
-
-
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
