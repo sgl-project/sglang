@@ -25,11 +25,19 @@ def _backend():
 
 def _forward_batch(extend_lens, prefix_lens, track_seqlens, track_mask):
     return SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: True, is_target_verify=lambda: False
+        ),
         extend_seq_lens=torch.tensor(extend_lens),
         extend_prefix_lens=torch.tensor(prefix_lens),
         mamba_track_seqlens=torch.tensor(track_seqlens),
         mamba_track_mask=torch.tensor(track_mask),
         mamba_track_indices=torch.arange(100, 100 + len(extend_lens)),
+        # Exercise the legacy GPU planner, not the CPU-metadata fast path.
+        mamba_prefill_track_mask_cpu=None,
+        mamba_track_seqlens_cpu=None,
+        extend_seq_lens_cpu=None,
+        extend_prefix_lens_cpu=None,
     )
 
 
@@ -37,8 +45,10 @@ def _split(extend_lens, prefix_lens, track_seqlens, track_mask):
     backend = _backend()
     cache_indices = torch.arange(len(extend_lens))
     (
+        _track_chunk_idx,
         h_src,
         h_dst,
+        _h_batch_src,
         _final_src,
         _final_dst,
         seq_idx,

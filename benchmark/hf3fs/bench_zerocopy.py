@@ -5,10 +5,10 @@ import torch
 from tqdm import tqdm
 
 from sglang.srt.distributed import (
-    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
@@ -17,6 +17,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.test.test_utils import publish_build_topology
 
 init_distributed_environment(
     world_size=1,
@@ -26,10 +27,8 @@ init_distributed_environment(
     backend="gloo",
 )
 
-initialize_model_parallel(
-    tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=1,
-)
+publish_build_topology()
+initialize_model_parallel()
 
 group = get_world_group().cpu_group
 

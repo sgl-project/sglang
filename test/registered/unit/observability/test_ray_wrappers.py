@@ -11,13 +11,22 @@ from __future__ import annotations
 
 import sys
 import unittest
+from functools import partial
+from types import SimpleNamespace
 
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.observability.fake_ray import (
     clear_fake_ray_modules,
     load_ray_wrappers_with_fake_ray,
     load_ray_wrappers_without_ray,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -275,6 +284,164 @@ class TestRayMissingImportError(unittest.TestCase):
 
     def test_get_replica_id_returns_none_without_ray(self):
         self.assertIsNone(self.rw._get_replica_id())
+
+
+class TestAsciiDocumentation(TestRayWrapperBase):
+    """Ray's metric backend rejects non-ASCII, so a wrapper whose constructor
+    skips ``_get_ascii_documentation`` would only crash at deploy time."""
+
+    def test_all_wrappers_fold_non_ascii_description(self):
+        for cls in (
+            self.rw.RayCounterWrapper,
+            self.rw.RayGaugeWrapper,
+            self.rw.RayHistogramWrapper,
+            self.rw.RaySummaryWrapper,
+        ):
+            with self.subTest(wrapper=cls.__name__):
+                metric = cls("sglang:x", documentation="load — seconds").metric
+                self.assertEqual(metric.description, "load - seconds")
+
+
+class _TokenizerCollectorCase(CustomTestCase):
+    _BUCKETS = [0.05, 0.1, 0.5, 1.0]
+    _LABELS = {"model_name": "m"}
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            prompt_tokens_buckets=None,
+            generation_tokens_buckets=None,
+        )
+        self.server_args = override.install()
+        self.addCleanup(override.restore)
+
+    def _build_collector(self, *, force_fallback: bool):
+        # A private registry per collector avoids duplicate ``sglang:`` names.
+        registry = CollectorRegistry()
+
+        class _Collector(TokenizerMetricsCollector):
+            _counter_cls = partial(Counter, registry=registry)
+            _gauge_cls = partial(Gauge, registry=registry)
+            _histogram_cls = partial(Histogram, registry=registry)
+
+        collector = _Collector(
+            server_args=self.server_args,
+            labels=self._LABELS,
+            bucket_time_to_first_token=[0.1, 1.0],
+            bucket_inter_token_latency=self._BUCKETS,
+            bucket_e2e_request_latency=[0.1, 1.0],
+        )
+        if not force_fallback:
+            # _histogram_cls=None routes observe to the default-backend path.
+            collector._histogram_cls = None
+        return collector
+
+
+class TestInterTokenLatencyEquivalence(_TokenizerCollectorCase):
+    """``observe_inter_token_latency`` writes histogram internals directly for
+    the default backend but replays ``observe()`` for an injected one; both must
+    record identical sums and bucket counts, or ITL diverges between the default
+    and Ray backends."""
+
+    def test_fast_and_fallback_agree(self):
+        fast = self._build_collector(force_fallback=False)
+        fallback = self._build_collector(force_fallback=True)
+
+        for collector in (fast, fallback):
+            collector.observe_inter_token_latency(self._LABELS, 0.24, 4)
+            collector.observe_inter_token_latency(self._LABELS, 6.0, 3)  # +Inf bucket
+            collector.observe_inter_token_latency(self._LABELS, 0.3, 2)
+
+        fast_h = fast.histogram_inter_token_latency.labels(**self._LABELS)
+        fb_h = fallback.histogram_inter_token_latency.labels(**self._LABELS)
+        self.assertEqual(
+            [b.get() for b in fast_h._buckets],
+            [b.get() for b in fb_h._buckets],
+        )
+        self.assertAlmostEqual(fast_h._sum.get(), fb_h._sum.get())
+
+
+class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
+    """``TokenizerManager.collect_metrics`` against the default-backend histogram
+    path, where a negative token weight lands in the buckets unchecked."""
+
+    def _run(self, role, completion_tokens, *, finish_type=None):
+        collector = self._build_collector(force_fallback=False)
+        manager = SimpleNamespace(
+            metrics_collector=collector,
+            disaggregation_mode=DisaggregationMode(role),
+            enable_priority_scheduling=False,
+            _request_has_grammar=lambda obj: False,
+        )
+        state = SimpleNamespace(
+            obj=SimpleNamespace(stream=False),
+            ttft_observed=False,
+            last_completion_tokens=1,
+            finished=False,
+            time_stats=SimpleNamespace(
+                get_first_token_latency=lambda: 0.2,
+                get_interval=lambda: 0.2,
+                get_e2e_latency=lambda: 1.0,
+                get_time_per_output_token=lambda completion_tokens: None,
+                set_last_time=lambda: None,
+            ),
+        )
+        for j, count in enumerate(completion_tokens):
+            last = j == len(completion_tokens) - 1
+            state.finished = last and finish_type is not None
+            recv = SimpleNamespace(
+                finished_reasons=[{"type": finish_type} if state.finished else None],
+                prompt_tokens=[100],
+                cached_tokens=[0],
+            )
+            if count is not None:
+                recv.completion_tokens = [count]
+            TokenizerManager.collect_metrics(manager, state, recv, 0)
+        return collector
+
+    def _itl_samples(self, collector):
+        his = collector.histogram_inter_token_latency.labels(**self._LABELS)
+        return [b.get() for b in his._buckets] + [his._sum.get()]
+
+    def _ttft_count(self, collector):
+        his = collector.histogram_time_to_first_token.labels(
+            **self._LABELS, is_streaming="false"
+        )
+        return sum(b.get() for b in his._buckets)
+
+    def test_ttft_skips_only_aborted_requests(self):
+        """Aborts must not add a TTFT sample, but embedding and zero-output
+        requests still have a first output and must."""
+        cases = [
+            ("abort_decode", "decode", [0], "abort", 0),
+            ("embedding", "null", [None], "stop", 1),
+            ("zero_output", "null", [0], "length", 1),
+        ]
+        for name, role, counts, finish_type, expected in cases:
+            with self.subTest(name):
+                collector = self._run(role, counts, finish_type=finish_type)
+                self.assertEqual(self._ttft_count(collector), expected)
+
+    def test_first_batch_abort_observes_nothing(self):
+        """An abort in the first output batch (e.g. a non-streaming request aborted
+        before its first flush) must not turn its tokens into ITL samples."""
+        collector = self._run("null", [30], finish_type="abort")
+        self.assertEqual(self._ttft_count(collector), 0)
+        self.assertEqual(self._itl_samples(collector), [0.0] * 6)
+
+    def test_prefill_never_observes_decode_intervals(self):
+        """PD prefill's 0-token first report must never become a negative ITL
+        weight, which breaks histogram_quantile and rate()."""
+        collector = self._run("prefill", [0, 1, 8, 0], finish_type="stop")
+        self.assertEqual(self._itl_samples(collector), [0.0] * 6)
+
+    def test_token_count_decrease_resets_baseline(self):
+        """A decreasing count must restart the baseline, not subtract tokens."""
+        collector = self._run("decode", [8, 0, 0, 2])
+        samples = self._itl_samples(collector)
+        self.assertTrue(all(v >= 0 for v in samples), samples)
+        self.assertEqual(sum(samples[:-1]), 2)
+        self.assertAlmostEqual(samples[-1], 0.2)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyNvfp4Config,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -103,6 +103,16 @@ def process_model_weights_after_loading(
     return processed_layers
 
 
+def _merge_comfy_quant_marker(
+    markers: dict[str, dict[str, Any]], prefix: str, marker: dict[str, Any]
+) -> None:
+    # Headers may summarize a layer whose tensor marker includes more fields.
+    previous = markers.setdefault(prefix, {})
+    if any(key in previous and previous[key] != value for key, value in marker.items()):
+        raise ValueError(f"Conflicting Comfy quantization markers for {prefix!r}")
+    previous.update(marker)
+
+
 def inspect_comfy_quant_markers(
     safetensors_list: list[str],
     param_name_mapper: Callable[[str], str] | None = None,
@@ -140,12 +150,7 @@ def inspect_comfy_quant_markers(
                         raise ValueError(
                             f"Comfy quantization metadata for {prefix!r} must be an object"
                         )
-                    previous = raw_markers.get(prefix)
-                    if previous is not None and previous != marker:
-                        raise ValueError(
-                            f"Conflicting Comfy quantization markers for {prefix!r}"
-                        )
-                    raw_markers[prefix] = marker
+                    _merge_comfy_quant_marker(raw_markers, prefix, marker)
             for key in checkpoint.keys():
                 tensor_slice = checkpoint.get_slice(key)
                 checkpoint_meta[key] = (
@@ -171,12 +176,7 @@ def inspect_comfy_quant_markers(
                         f"Comfy quantization marker {key!r} must contain a JSON object"
                     )
                 prefix = key.removesuffix(".comfy_quant")
-                previous = raw_markers.get(prefix)
-                if previous is not None and previous != marker:
-                    raise ValueError(
-                        f"Conflicting Comfy quantization markers for {prefix!r}"
-                    )
-                raw_markers[prefix] = marker
+                _merge_comfy_quant_marker(raw_markers, prefix, marker)
 
     if global_quant_formats == {"mxfp8"}:
         for prefix in marked_dtype_weight_prefixes:
@@ -395,7 +395,7 @@ def resolve_comfy_checkpoint_quantization(
         return None
     formats = sorted({str(marker.get("format")) for marker in layer_markers.values()})
     if formats == ["int8_tensorwise"]:
-        return KitchenInt8Config(layer_markers=layer_markers)
+        return ConvRotInt8Config(layer_markers=layer_markers)
     if formats == ["asym_w4a8_int8"]:
         return KitchenW4A8Config(layer_markers)
     if formats == ["asym_w4a8_int8", "int8_tensorwise"]:

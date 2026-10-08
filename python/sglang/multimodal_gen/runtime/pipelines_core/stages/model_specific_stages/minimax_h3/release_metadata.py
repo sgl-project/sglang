@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -131,7 +132,10 @@ class MiniMaxH3ReleaseMetadata:
                 f"task {task!r} is not served by MiniMax H3 partition {self.partition!r}; "
                 f"supported tasks: {list(self.tasks)!r}"
             )
-        if partition_for_task(canonical) != self.partition:
+        if (
+            self.partition != "hybrid"
+            and partition_for_task(canonical) != self.partition
+        ):
             raise ValueError(
                 f"task {task!r} resolves outside partition {self.partition!r}"
             )
@@ -148,10 +152,11 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
-        if batch.num_inference_steps < 2:
+        min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
+        if batch.num_inference_steps < min_steps:
             raise ValueError(
-                "MiniMax H3 requires num_inference_steps >= 2 because its "
-                "video/audio sigma schedules include both interval endpoints"
+                f"MiniMax H3 requires num_inference_steps >= {min_steps} because "
+                "its video/audio sigma schedules include both interval endpoints"
             )
         gpu_plans = envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
         if (

@@ -44,7 +44,7 @@ class TestBatchingFDFOJointThreshold(CustomTestCase):
             "flashinfer",
             "--dllm-algorithm",
             "JointThreshold",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "1",
         ]
         # FDFO is the default; the sync arm must opt out explicitly.

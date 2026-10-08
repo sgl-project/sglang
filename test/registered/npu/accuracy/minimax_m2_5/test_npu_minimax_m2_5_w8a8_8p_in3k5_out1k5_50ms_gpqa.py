@@ -34,8 +34,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
 MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "--tp-size",
     16,
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     16,
     "--mem-fraction-static",
     0.75,
@@ -53,7 +52,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     196608,
     "--max-prefill-token",
     8192,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

@@ -61,7 +61,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -71,7 +71,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -82,7 +82,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -106,7 +106,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -116,7 +116,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -127,7 +127,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -286,7 +286,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -300,7 +300,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="4ad99832823dde2315b361cbd3b54b1c5c12acd5"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -398,7 +398,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="7c51d18fda59457cc9238ed262bd93c8cad906c9"
+ARG MORI_COMMIT="879983bdbd8c65c52e9f79ad836a61cbffef98b6"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -568,13 +568,24 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
+# cherry pick ROCm/aiter#6042 to unpeel the 64-bit sparse MLA loop below Triton 3.8, may be removed in next aiter upgrade
+# apply the DSV4.1 TP2 fp8/fp4 FMoE tuning CSVs from ROCm/aiter#5967, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
+# The #6042 and #5967 patches are written against the gfx942/gfx950 AITER pin and
+# do not apply to the older gfx1250 one (a conflict in pa_decode_sparse.py, and
+# the dsv41 CSVs do not exist there yet), so gfx1250 skips them.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
- && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && if [ "${GPU_ARCH_LIST}" != "gfx1250" ]; then \
+    git fetch origin pull/6042/head \
+    && git cherry-pick --no-commit 042a289183e5b47e193df6c10160915a6e8b69f5 \
+    && git fetch origin pull/5967/head \
+    && git diff -U0 89a47b84ac4b576339a50047e290c383c2377389 2bd147293d887c91fd10da10b1dbbf4690844270 -- \
+         aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv \
+         aiter/configs/model_configs/dsv41_fp4_untuned_fmoe.csv \
+       | git apply --unidiff-zero; \
+ fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -586,24 +597,11 @@ RUN git clone ${AITER_REPO} \
     git revert --no-edit --no-commit e708f6c15; \
  fi
 
-# The pinned AITER revision uses std::optional in topk_per_row_kernels.cu without
-# including <optional>: ROCm/aiter#4702 removed the torch headers that previously
-# supplied it transitively. ROCm 7.0 therefore fails module_top_k_per_row, while
-# ROCm 7.2 toolchains still obtain <optional> from another header.
-# GPU_ARCH keeps the full selected stage name; only unsuffixed gfx942/gfx950
-# denote ROCm 7.0, while newer flavors carry a -rocm... suffix. Remove this
-# backport once AITER_COMMIT contains the upstream fix from ROCm/aiter#4853.
-RUN python3 <<'PY'
-import os
-from pathlib import Path
-
-p = Path("/sgl-workspace/aiter/csrc/kernels/topk_per_row_kernels.cu")
-anchor = "#include <type_traits>\n"
-if os.environ["GPU_ARCH"] in {"gfx942", "gfx950"} and p.exists():
-    s = p.read_text()
-    if "std::optional" in s and "#include <optional>" not in s and anchor in s:
-        p.write_text(s.replace(anchor, "#include <optional>\n" + anchor, 1))
-PY
+# ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
+# tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
+COPY --from=local_src \
+     /src/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
+     /sgl-workspace/aiter/hsa/gfx950/mla_v4/
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
@@ -737,9 +735,9 @@ RUN cd sglang \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
-            echo 'transformers==5.12.1' >> /tmp/constraints.txt ; \
-            echo 'tokenizers==0.22.2' >> /tmp/constraints.txt ; \
-            echo 'huggingface_hub==1.27.0' >> /tmp/constraints.txt ; \
+            echo 'transformers==5.19.0' >> /tmp/constraints.txt ; \
+            echo 'tokenizers==0.23.2' >> /tmp/constraints.txt ; \
+            echo 'huggingface_hub==1.33.0' >> /tmp/constraints.txt ; \
             ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
@@ -787,7 +785,7 @@ RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
 
 RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[TileLang] Building TileLang for ${GPU_ARCH}"; \
-  # System dependencies (NO llvm-dev to avoid llvm-config-16 shadowing)
+  # System dependencies
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential git wget curl ca-certificates gnupg \
       libgtest-dev libgmock-dev \
@@ -816,30 +814,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
-  # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
-  LLVM_CONFIG_PATH=""; \
-  for p in /opt/rocm/llvm/bin/llvm-config /opt/rocm/llvm-*/bin/llvm-config /opt/rocm-*/llvm*/bin/llvm-config; do \
-    if [ -x "$p" ]; then LLVM_CONFIG_PATH="$p"; break; fi; \
-  done; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
-    echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends llvm-18; \
-    rm -rf /var/lib/apt/lists/*; \
-    LLVM_CONFIG_PATH="$(command -v llvm-config-18)"; \
-    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: llvm-config-18 not found after install"; exit 1; fi; \
-  fi; \
-  echo "[TileLang] Using LLVM_CONFIG at: $LLVM_CONFIG_PATH"; \
-  export PATH="$(dirname "$LLVM_CONFIG_PATH"):/usr/local/bin:${PATH}"; \
-  export LLVM_CONFIG="$LLVM_CONFIG_PATH"; \
-  \
-  # Optional shim for tools that expect llvm-config-16
-  mkdir -p /usr/local/bin && \
-  printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
-  chmod +x /usr/local/bin/llvm-config-16; \
-  \
   # TVM Python bits need Cython + z3 before configure.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
   "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
@@ -855,7 +829,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   else \
     export ROCM_PATH=/opt/rocm; \
   fi; \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_PATH} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
@@ -1119,10 +1093,6 @@ RUN cd /tmp/whl \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
         ;; \
     esac
-
-# transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
-# (transformers#46618, not yet released).
-RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_utils as m; p=Path(m.__file__); t=p.read_text(); p.write_text(t.replace('Path(resolved_module_file).resolve()','Path(resolved_module_file)').replace('Path(source_file).resolve()','Path(source_file)'))"
 
 # -----------------------
 # Install AMD's ROCm Triton, replacing the base image's. The local version is
