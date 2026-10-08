@@ -519,7 +519,6 @@ def _get_tbo_comm_stream(group, tbo_enabled: bool, async_finish: bool):
     return CommStreamPool.get_stream_from_pool(group, priority)
 
 
-@lru_cache(maxsize=4)
 def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
     from mori.cco import Communicator
 
@@ -603,7 +602,9 @@ def _epv2_dispatch_torch_dtype(dispatch_dtype: DispatchDtype) -> torch.dtype:
     return fp8_dtype
 
 
-@lru_cache(maxsize=4)
+# One op (and its own cco window, sized for its arena) per distinct config;
+# never evicted, since MoE layers keep using the op they were built with.
+@lru_cache(maxsize=None)
 def init_mori_epv2_op(
     group,
     router_topk: int,
