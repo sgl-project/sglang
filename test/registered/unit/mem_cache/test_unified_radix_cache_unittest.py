@@ -1596,7 +1596,7 @@ class UnifiedRadixCacheSuite:
         return req
 
     def _apply_match_to_req(self, req, match):
-        req.prefix_indices = match.device_indices
+        req.prefix_len = len(match.device_indices)
         req.last_node = match.last_device_node
         req.last_host_node = match.last_host_node
         req.best_match_node = match.best_match_node
@@ -1853,9 +1853,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -1901,10 +1899,8 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", prompt_ids)
         req.output_ids = array("q", output_ids)
         req.full_untruncated_fill_ids = array("q", prompt_ids + output_ids)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
-        kv_len = req.extend_range.end
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_len = req.extend_end
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
@@ -1976,9 +1972,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
 
         avail_before = allocator.available_size()
         release_kv_cache(req, cache, checkpoint=False)
@@ -1996,9 +1990,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -2010,10 +2002,9 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
-        self.assertGreater(len(req.prefix_indices), 0)
-        self.assertEqual(req.kv.cache_protected_len, len(req.prefix_indices))
+        self.assertGreater(req.kv.cache_protected_len, 0)
         self.assertIsNotNone(req.last_node)
         self.assertFalse(req.lock.swa_released)
 
@@ -2033,7 +2024,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, len(tokens))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
@@ -2045,7 +2036,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         (first,) = _node_children(cache, cache.root_node_handle())
         self.assertEqual(_node_key_length(cache, first), evicted_len)
@@ -2143,9 +2134,7 @@ class UnifiedRadixCacheSuite:
         req.lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids)
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -2256,7 +2245,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_len = len(tokens)
         fresh_value = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), fresh_value)
@@ -2269,7 +2258,7 @@ class UnifiedRadixCacheSuite:
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
             allocator.full_attn_allocator.available_size(),
@@ -2943,7 +2932,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
@@ -2955,7 +2944,7 @@ class UnifiedRadixCacheSuite:
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
@@ -3029,7 +3018,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv.kv_committed_len = pre_len
@@ -3039,7 +3028,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA),
@@ -3446,7 +3435,6 @@ class UnifiedRadixCacheSuite:
         cache,
         req_id,
         prefix_len=None,
-        prefix_indices=None,
         timeout: float = 10.0,
         *,
         extra_key=None,
@@ -3470,18 +3458,7 @@ class UnifiedRadixCacheSuite:
         req.cache_request_handle = req_id
         req.extra_key = extra_key
         req.cache_salt = cache_salt
-        if prefix_indices is not None:
-            # Spliceable mid-anchor consumption publishes value=cat(prefix,
-            # fill) — the real device prefix is required (zeros would insert
-            # bogus slots into the tree).
-            assert len(prefix_indices) == prefix_len
-            req.prefix_indices = prefix_indices
-        else:
-            req.prefix_indices = torch.zeros(
-                prefix_len,
-                dtype=torch.int64,
-                device=cache.tree_core.empty_match_result.device_indices.device,
-            )
+        req.prefix_len = prefix_len
         req.last_node = cache.root_node_handle() if last_node is None else last_node
         joint = cache.match_prefix(
             MatchPrefixParams(
@@ -3490,7 +3467,7 @@ class UnifiedRadixCacheSuite:
                 )
             )
         )
-        req.prefix_indices = joint.device_indices
+        req.prefix_len = len(joint.device_indices)
         joint_covers_span = len(joint.device_indices) >= len(f.key_tokens)
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.tree_cache = cache
@@ -4508,11 +4485,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced, _last = cons.init_load_back(
             InitLoadBackParams(
@@ -4697,7 +4670,6 @@ class UnifiedRadixCacheSuite:
             cons2,
             anchored_req,
             prefix_len=len(prefix),
-            prefix_indices=prefix_match.device_indices,
             extra_key=extra_key,
             cache_salt=cache_salt,
             last_node=anchor,
@@ -4879,7 +4851,7 @@ class UnifiedRadixCacheSuite:
         req = SimpleNamespace(
             rid=req_id.rid,
             cache_request_handle=req_id,
-            prefix_indices=cons.tree_core.empty_match_result.device_indices,
+            prefix_len=len(cons.tree_core.empty_match_result.device_indices),
             kv=SimpleNamespace(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
@@ -4900,11 +4872,7 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
-        req.prefix_indices = torch.zeros(
-            held.matched_len,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         spliced, last_node = cons.init_load_back(
             InitLoadBackParams(
@@ -5129,7 +5097,7 @@ class UnifiedRadixCacheSuite:
             return_req=True,
         )
         self.assertEqual(int(spliced.numel()), 0)
-        self.assertEqual(len(req.prefix_indices), len(seq), "FULL rematch was lost")
+        self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
         self.assertEqual(len(dispatched["device"]), window_tokens)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0)
         k, v = self._snapshot_full_kv(cons_alloc, masked_full)
@@ -5207,7 +5175,7 @@ class UnifiedRadixCacheSuite:
         spliced, req = self._consume_staged_prefetch(
             cons, req_id, prefix_len=0, return_req=True
         )
-        self.assertEqual(len(req.prefix_indices), split_at)
+        self.assertEqual(req.prefix_len, split_at)
         self.assertEqual(int(spliced.numel()), page_size)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0 - page_size)
         k, v = self._snapshot_full_kv(cons_alloc, head_full)
@@ -5339,11 +5307,7 @@ class UnifiedRadixCacheSuite:
         req.cache_request_handle = req_id
         req.extra_key = None
         req.cache_salt = None
-        req.prefix_indices = torch.zeros(
-            0,
-            dtype=torch.int64,
-            device=cons.tree_core.empty_match_result.device_indices.device,
-        )
+        req.prefix_len = 0
         req.last_node = cons.root_node_handle()
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         with mock.patch.object(cons.cache_controller, "load", adversarial_load):
@@ -5432,16 +5396,14 @@ class UnifiedRadixCacheSuite:
         req = SimpleNamespace(
             rid=req_id.rid,
             cache_request_handle=req_id,
-            prefix_indices=sib.device_indices,
+            prefix_len=len(sib.device_indices),
             kv=SimpleNamespace(cache_protected_len=len(sib.device_indices)),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual(req.host_hit_length, len(seq) - len(head))
         self.assertTrue(cons.buffer_pipeline.has_staged(req_id))
 
-        spliced = self._consume_staged_prefetch(
-            cons, req_id, prefix_len=len(head), prefix_indices=sib.device_indices
-        )
+        spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=len(head))
         self.assertEqual(int(spliced.numel()), len(seq) - len(head))
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -5499,7 +5461,7 @@ class UnifiedRadixCacheSuite:
         req = mock.Mock(
             rid=req_id.rid,
             cache_request_handle=req_id,
-            prefix_indices=live.device_indices,
+            prefix_len=len(live.device_indices),
             last_node=live.last_device_node,
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
@@ -5656,7 +5618,6 @@ class UnifiedRadixCacheSuite:
             spliced = self._consume_staged_prefetch(
                 cons2,
                 CacheRequestHandle("window-req", 0),
-                prefix_indices=m.device_indices,
             )
             self.assertEqual(int(spliced.numel()), len(seq_ab) - len(seq_a))
             self.assertEqual(
@@ -7463,7 +7424,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, forward_len)
+        req.extend_end = forward_len
         req.kv.cache_protected_len = branching_seqlen
 
         kv_indices = self._alloc(allocator, forward_len)
@@ -7671,7 +7632,7 @@ class UnifiedRadixCacheSuite:
         )
 
         self.assertEqual(new_node, leaf)
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertEqual(req.prefix_len + len(new_indices), len(tokens))
         self.assertIsNotNone(_device_value(cache, leaf, ComponentType.MAMBA))
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
@@ -7713,7 +7674,7 @@ class UnifiedRadixCacheSuite:
 
         self.assertEqual(new_node, leaf)
         self.assertEqual(new_indices.tolist(), leaf_full.tolist())
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertEqual(req.prefix_len + len(new_indices), len(tokens))
         self.assertEqual(
             _device_value(cache, leaf, ComponentType.FULL).tolist(),
             leaf_full.tolist(),
@@ -8001,7 +7962,7 @@ class UnifiedRadixCacheSuite:
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         req.init_next_round_input(cache)
-        self.assertEqual((len(req.prefix_indices), req.host_hit_length), (0, 0))
+        self.assertEqual((req.prefix_len, req.host_hit_length), (0, 0))
         self.assertEqual(req.mamba_host_hit_length, 1)
         adder = PrefillAdder(
             page_size=1,
@@ -8018,7 +7979,7 @@ class UnifiedRadixCacheSuite:
         # 18-token demand would reject and scheduler cleanup would free the CoW
         # destination even though the queued H2D still targets it.
         self.assertEqual(adder.can_run_list, [req])
-        self.assertEqual(len(req.prefix_indices), 12)
+        self.assertEqual(req.prefix_len, 12)
         self.assertEqual(req.kv.cache_protected_len, 12)
         slot = req.kv.mamba_pool_idx.unsqueeze(0)
         other_slots = pool.mamba_allocator.alloc(pool.mamba_allocator.available_size())
@@ -10889,7 +10850,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        req.extend_end = len(req.full_untruncated_fill_ids)
         kv_indices = self._alloc_paged(allocator, seq_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
         req.kv.kv_committed_len = seq_len
@@ -10899,7 +10860,7 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(
