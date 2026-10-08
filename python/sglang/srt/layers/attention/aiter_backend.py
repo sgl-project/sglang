@@ -590,8 +590,24 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
+            self.use_mla_a8w8_asm = (
+                envs.SGLANG_AITER_MLA_A8W8_ASM.get()
+                and self.head_pad_mode == "zero"
+                and self.kv_cache_dtype == fp8_dtype
+                and self.dcp_world_size <= 1
+            )
+            if self.use_mla_a8w8_asm:
+                # Persistent kernel, fast_mode metadata without intra-batch
+                # splitting (see make_mla_meta_data).
+                _use_mla_ps_kernel = True
+                fast_mode = True
+                intra_batch_mode = False
+                logger.info(
+                    "aiter mla: decode/verify use the fp8-Q asm kernel "
+                    "(SGLANG_AITER_MLA_A8W8_ASM=1) instead of gluon"
+                )
             # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
-            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+            elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
                 if prefer_mla_gluon_decode(
@@ -779,6 +795,12 @@ class AiterAttnBackend(AttentionBackend):
         nhead_kv = 1
         page_size = self.page_size
         dtype = self.kv_cache_dtype
+        is_causal = False
+        if self.use_mla_a8w8_asm:
+            # Causal, and no per-batch split cap so long single requests can
+            # spread over all CUs.
+            is_causal = True
+            max_split_per_batch = -1
 
         meta = get_mla_metadata_v1(
             qo_indptr,
@@ -786,7 +808,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len,
             self.mla_kernel_num_head_padded // nhead_kv,
             nhead_kv,
-            False,
+            is_causal,
             work_metadata,
             work_info_set,
             work_indptr,
@@ -1299,6 +1321,8 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        if self.use_mla_a8w8_asm:
+            return self._mla_decode_fwd_a8w8(q, k_buffer_flat, layer, **kwargs)
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
@@ -1327,6 +1351,35 @@ class AiterAttnBackend(AttentionBackend):
         )
         mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
         return o
+
+    def _mla_decode_fwd_a8w8(self, q, k_buffer_flat, layer, **kwargs):
+        """fp8-Q persistent asm MLA decode/verify for 12 heads.
+
+        Q is quantized per-tensor with q_scale, the same scale the kernel is
+        given to dequantize it, then zero-padded 12 -> 16 heads. aiter picks
+        mla_a8w8_qh16_qseqlen1_*_ps for qlen 1 and folds qlen > 4 into
+        mla_a8w8_qh32_qseqlen4_gqaratio32_ps.
+        """
+        num_head = layer.tp_q_head_num
+        q = q.reshape(-1, num_head, layer.qk_head_dim)
+        num_tokens = q.shape[0]
+        if kwargs.get("q_scale") is None:
+            kwargs["q_scale"] = self.k_scale
+        q_fp8, _ = scaled_fp8_quant(q.reshape(num_tokens, -1), kwargs["q_scale"])
+        q_in = q_fp8.new_zeros((num_tokens, self.num_head_padded, layer.qk_head_dim))
+        q_in[:, :num_head, :] = q_fp8.view(num_tokens, num_head, layer.qk_head_dim)
+        o = q.new_empty(
+            (num_tokens, self.num_head_padded, layer.v_head_dim),
+            dtype=self.input_dtype,
+        )
+        # Leave the split count to aiter.
+        kwargs["num_kv_splits"] = None
+        # The asm kernel loads KV row 0 for masked positions and weights it by
+        # p = 0, so a NaN there turns every request NaN. Row 0 is the reserved
+        # write target of CUDA-graph padding tokens, whose K/V can be NaN.
+        k_buffer_flat[0].zero_()
+        mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
+        return o[:, :num_head, :]
 
     def _zero_pad_mla_q_heads(
         self, q: torch.Tensor, layer: RadixAttention
@@ -1376,7 +1429,7 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
-        if prefer_mla_gluon_decode(
+        if not self.use_mla_a8w8_asm and prefer_mla_gluon_decode(
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
@@ -3525,7 +3578,7 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                if prefer_mla_gluon_decode(
+                if not self.use_mla_a8w8_asm and prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
