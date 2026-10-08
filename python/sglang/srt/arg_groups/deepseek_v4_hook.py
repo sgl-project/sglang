@@ -297,7 +297,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or getattr(cfg, "enable_prefill_cp", False)
+            or cfg.enable_prefill_cp
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
