@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import NamedTuple
@@ -546,9 +546,18 @@ def is_shared_experts_fusion_disabled() -> bool:
 
 @contextmanager
 def draft_model_build_scope():
-    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
-    fusion decision on the speculative leaf as well, and the target's ACTIVE
-    value returns on exit.
+    """Brackets a draft model's CONSTRUCTION with the draft's construction-time
+    settings; every value below returns to the target's on exit, including on
+    error.
+
+    - Shared-experts fusion: the gates the draft runs also record their
+      decision on the speculative leaf; the target's ACTIVE
+      ``disable_shared_experts_fusion`` is restored.
+    - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
+      Boundaries built here keep the resolved value after exit.
+    - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
+      when set, else inherited. ``FusedMoE`` layers built here keep the
+      draft's MegaMoE MMA type after exit.
 
     Deliberately does not touch ``runner_backend`` — swapping that is
     ``speculative_moe_backend_context``'s job and has to bracket the draft's
@@ -561,13 +570,25 @@ def draft_model_build_scope():
         moe.in_speculative_scope = True
         # Boundaries capture this resolved preference while the draft builds.
         # Restoring it cannot change an already constructed target plan.
-        with get_exec().comm.override(
-            boundary_reduction=get_spec().speculative_boundary_reduction
+        with (
+            get_exec().comm.override(
+                boundary_reduction=get_spec().speculative_boundary_reduction
+            ),
+            _draft_w4a4_mxfp4_megamoe_override(),
         ):
             yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
+
+
+def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
+    # FusedMoE pins its MegaMoE MMA type at construction, so the draft's layers
+    # keep this value after the scope exits.
+    draft_w4a4 = get_spec().speculative_enable_w4a4_mxfp4_megamoe
+    if draft_w4a4 is None:
+        return nullcontext()
+    return get_exec().moe.override(enable_w4a4_mxfp4_megamoe=draft_w4a4)
 
 
 def install_shared_experts_fusion_decision(
