@@ -336,11 +336,11 @@ class TestFusedExperts:
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
-    @pytest.mark.parametrize("M", [2, 33])
-    @pytest.mark.parametrize("N", [128])
-    @pytest.mark.parametrize("K", [256])
-    @pytest.mark.parametrize("E", [4])
-    @pytest.mark.parametrize("topk", [2])
+    @pytest.mark.parametrize("M", [2, 129])
+    @pytest.mark.parametrize("N", [352, 512])
+    @pytest.mark.parametrize("K", [256, 320])
+    @pytest.mark.parametrize("E", [8])
+    @pytest.mark.parametrize("topk", [4])
     @pytest.mark.parametrize("activation", ["silu", "gelu"])
     def test_fp8_moe_per_tensor_scale(self, M, N, K, E, topk, activation):
         a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
