@@ -12,6 +12,9 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+    MiniMaxH3Adapter,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
@@ -219,6 +222,7 @@ class _Executor(SGLDiffusionExecutor):
         req = _Req()
         self.adapter.fill_req(req, packed)
         req.extra = {
+            **(req.extra or {}),
             "comfyui_session_id": self.sid,
             "comfyui_cond_key": packed.extra_req["comfyui_cond_key"],
         }
@@ -282,6 +286,76 @@ def test_cond_key_repeat_still_uses_cache() -> None:
     assert repeat.prompt_embeds == []
     assert torch.equal(restored.prompt_embeds[1], ctx)
     release_comfyui_session(ex.sid)
+
+
+def _h3_packed(text, payload):
+    return PackedForward(
+        latents=torch.zeros(1, 4, 2, 2),
+        timesteps=torch.tensor([500.0]),
+        prompt_embeds=[text],
+        prompt_seq_lens=[[int(text.shape[0])]],
+        height=2,
+        width=2,
+        extra_req={
+            "h3_payload": payload,
+            "h3_context": text,
+            "comfyui_cache_fp": {"spatial": (1, 2, 2)},
+        },
+    )
+
+
+def test_h3_cache_hit_restores_own_extras() -> None:
+    ex = _Executor(MiniMaxH3Adapter())
+    pos, neg = torch.ones(3, 4), torch.zeros(3, 4)
+    pos_payload, neg_payload = {"text_token_tags": [1, 2]}, {"text_token_tags": [3]}
+    ex.send(_h3_packed(pos, pos_payload))
+    ex.send(_h3_packed(neg, neg_payload))
+    later_pos = _h3_packed(pos.clone(), dict(pos_payload))
+    restored = ex.send(later_pos)
+    assert "h3_context" not in later_pos.extra_req  # cache hit, extras dropped
+    assert torch.equal(restored.extra["h3_context"], pos)
+    assert restored.extra["h3_payload"] == pos_payload
+    release_comfyui_session(ex.sid)
+
+
+def test_h3_same_text_different_payload_not_conflated() -> None:
+    ex = _Executor(MiniMaxH3Adapter())
+    text = torch.ones(3, 4)
+    ex.send(_h3_packed(text, {"refs": [torch.zeros(2, 2)]}))
+    second = ex.send(_h3_packed(text.clone(), {"refs": [torch.ones(2, 2)]}))
+    assert torch.equal(second.extra["h3_payload"]["refs"][0], torch.ones(2, 2))
+    release_comfyui_session(ex.sid)
+
+
+def test_cond_key_hashes_large_tensors_inside_lists() -> None:
+    ex = _Executor(MiniMaxH3Adapter())
+    text = torch.ones(3, 4)
+    latent_a = torch.zeros(4096)
+    latent_b = latent_a.clone()
+    latent_b[2048] = 1.0  # outside what repr() would print
+    key_a = ex._cond_key(_h3_packed(text, {"cond_video_latents": [latent_a]}))
+    key_b = ex._cond_key(_h3_packed(text, {"cond_video_latents": [latent_b]}))
+    assert key_a != key_b
+
+
+def test_extras_cached_per_cond_key() -> None:
+    sid = "exec4:1"
+    pos_ctx, neg_ctx = torch.ones(2, 4), torch.zeros(2, 4)
+    for key, ctx in (("pos", pos_ctx), ("neg", neg_ctx)):
+        req = _Req()
+        req.extra = {
+            "comfyui_session_id": sid,
+            "comfyui_cond_key": key,
+            "h3_context": ctx,
+        }
+        req.prompt_embeds = [ctx]
+        bind_comfyui_session(req)
+
+    later_pos = _Req()
+    later_pos.extra = {"comfyui_session_id": sid, "comfyui_cond_key": "pos"}
+    bind_comfyui_session(later_pos)
+    assert torch.equal(later_pos.extra["h3_context"], pos_ctx)
+    release_comfyui_session(sid)
 
 
 class _FakePipeline:

@@ -17,12 +17,24 @@ except ImportError:
 
 
 def _hash_value(digest, value) -> None:
-    if not torch.is_tensor(value):
-        digest.update(repr(value).encode())
-        return
-    tensor = value.detach().contiguous().cpu()
-    digest.update(f"{tensor.dtype}{tuple(tensor.shape)}".encode())
-    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    """Hash ``value`` into ``digest``, framing each item so values cannot merge."""
+    if torch.is_tensor(value):
+        tensor = value.detach().contiguous().cpu()
+        digest.update(f"T{tensor.dtype}{tuple(tensor.shape)}".encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, dict):
+        digest.update(f"D{len(value)}".encode())
+        for key, item in value.items():
+            _hash_value(digest, key)
+            _hash_value(digest, item)
+    elif isinstance(value, (list, tuple)):
+        digest.update(f"L{len(value)}".encode())
+        for item in value:
+            _hash_value(digest, item)
+    else:
+        text = repr(value).encode()
+        digest.update(f"V{len(text)}:".encode())
+        digest.update(text)
 
 
 class SGLDiffusionExecutor(torch.nn.Module):
@@ -99,13 +111,18 @@ class SGLDiffusionExecutor(torch.nn.Module):
         # Hash everything drop_cached_fields removes: a hit means the worker
         # restores all of it, so a partial key would revive another cond.
         digest = hashlib.blake2b(digest_size=16)
-        for value in (
-            *embeds,
-            *(packed.pooled_embeds or ()),
-            packed.extra_req.get("image_latent"),
-        ):
-            _hash_value(digest, value)
-        digest.update(repr(packed.prompt_seq_lens).encode())
+        _hash_value(
+            digest,
+            (
+                embeds,
+                packed.pooled_embeds,
+                packed.prompt_seq_lens,
+                {
+                    key: packed.extra_req.get(key)
+                    for key in self.adapter.cached_extra_keys
+                },
+            ),
+        )
         return digest.hexdigest()
 
     def _mark_and_maybe_drop(self, packed) -> None:
