@@ -5,7 +5,7 @@ import base64
 import contextlib
 import os
 import time
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -40,10 +40,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
@@ -56,31 +57,6 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
-
-
-def _get_extra_field(request, field_name):
-    return request_extra_value(request, field_name)
-
-
-def _get_request_field_or_extra(request, field_name):
-    value = getattr(request, field_name, None)
-    if value is not None:
-        return value
-    return _get_extra_field(request, field_name)
-
-
-def _image_request_model_kwargs(
-    request: ImageGenerationsRequest,
-    sampling_params_cls: type[SamplingParams],
-) -> dict[str, Any]:
-    """Extract fields owned and declared by the active model contract."""
-
-    kwargs = {}
-    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "image"):
-        value = _get_extra_field(request, field_name)
-        if value is not None:
-            kwargs[field_name] = value
-    return kwargs
 
 
 def _runtime_sampling_quality(quality: str | None) -> str | None:
@@ -280,7 +256,7 @@ async def generations(
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
-    model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
+    model_kwargs = request_model_kwargs(request, sampling_params_cls, "image")
     output_format = _resolve_image_output_format(
         request.output_format, sampling_params_cls
     )
@@ -308,24 +284,16 @@ async def generations(
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
-            max_sequence_length=(
-                request.max_sequence_length
-                if request.max_sequence_length is not None
-                else _get_extra_field(request, "max_sequence_length")
-            ),
-            flow_shift=(
-                request.flow_shift
-                if request.flow_shift is not None
-                else _get_extra_field(request, "flow_shift")
-            ),
+            max_sequence_length=request_field_value(request, "max_sequence_length"),
+            flow_shift=request_field_value(request, "flow_shift"),
             enable_teacache=request.enable_teacache,
-            enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
-            cache_dit_params=_get_extra_field(request, "cache_dit_params"),
-            cfg_gate_step=_get_extra_field(request, "cfg_gate_step"),
-            attention_backend_override=_get_extra_field(
+            enable_cache_dit=request_extra_value(request, "enable_cache_dit"),
+            cache_dit_params=request_extra_value(request, "cache_dit_params"),
+            cfg_gate_step=request_extra_value(request, "cfg_gate_step"),
+            attention_backend_override=request_extra_value(
                 request, "attention_backend_override"
             ),
-            skip_softmax_params=_get_extra_field(request, "skip_softmax_params"),
+            skip_softmax_params=request_extra_value(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -334,11 +302,9 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
-            progressive_levels=_get_request_field_or_extra(
-                request, "progressive_levels"
-            ),
-            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            progressive_mode=request_field_value(request, "progressive_mode"),
+            progressive_levels=request_field_value(request, "progressive_levels"),
+            progressive_delta=request_field_value(request, "progressive_delta"),
             **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
