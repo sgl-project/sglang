@@ -13,11 +13,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.layers.quantization  # noqa: F401 -- initialize quantization registry first
 import torch
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from safetensors.torch import load_file
+
+import sglang.srt.layers.quantization  # noqa: F401 -- initialize quantization registry first
 from sglang.kernels.ops.gemm.sm120_bf16_moe_union import bf16_moe_union
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (

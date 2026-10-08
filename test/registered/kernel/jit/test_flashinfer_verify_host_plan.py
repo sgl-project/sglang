@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import flashinfer
 import torch
 from flashinfer.quantization import segment_packbits
+
 from sglang.kernels.ops.speculative.pack_verify_mask import pack_verify_mask_into
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterPrefill,

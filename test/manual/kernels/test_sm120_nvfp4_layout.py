@@ -11,10 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.layers.quantization  # noqa: F401
 import torch
 from flashinfer.autotuner import AutoTuner
 from safetensors.torch import load_file
+
+import sglang.srt.layers.quantization  # noqa: F401
 from sglang.kernels.ops.gemm import sm120_nvfp4_moe_mtp_mma as op
 from sglang.kernels.ops.gemm.sm120_nvfp4_layout import Nvfp4LayoutCycle
 from sglang.kernels.ops.gemm.sm120_nvfp4_moe_mtp_mma import nvfp4_moe_mtp_mma

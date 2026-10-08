@@ -14,12 +14,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.layers.quantization  # noqa: F401
 import torch
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import cutlass_fused_moe
 from flashinfer.fused_moe.core import ActivationType
 from safetensors.torch import load_file
+
+import sglang.srt.layers.quantization  # noqa: F401
 from sglang.kernels.jit.utils import load_jit
 from sglang.kernels.ops.gemm import sm120_nvfp4_moe_mtp_mma as op
 from sglang.srt.environ import envs

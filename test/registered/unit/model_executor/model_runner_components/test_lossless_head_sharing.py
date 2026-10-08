@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.models.nemotron_h_mtp import NemotronHForCausalLMMTP
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci

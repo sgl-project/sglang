@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+
 from sglang.kernels.ops.moe import moe_fused_gate as gate
 from sglang.kernels.ops.moe import sm120_topk_gate_small_m as small
 from sglang.test.ci.ci_register import register_cuda_ci

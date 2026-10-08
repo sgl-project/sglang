@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+
 from sglang.kernels.ops.mamba.triton_ops import mamba_ssm as ssm
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase

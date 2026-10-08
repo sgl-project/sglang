@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+
 from sglang.kernels.ops.mamba.triton_ops import (
     ssd_chunk_scan,
     ssd_chunk_state,
