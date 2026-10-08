@@ -360,6 +360,12 @@ class RuntimeHandle:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
 
+    def shutdown(self):
+        """Initiate the configured SIGTERM procedure on the manager event loop."""
+        manager = self.tokenizer_manager
+        handler = manager.signal_handler_class(manager)
+        self._tm_loop.call_soon_threadsafe(handler.sigterm_handler)
+
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
     # so a few seconds is generous; if we time out, log and drop — the client
