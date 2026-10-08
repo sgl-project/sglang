@@ -41,9 +41,6 @@ class SiluAndMul(CustomOp):
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
