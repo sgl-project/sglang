@@ -939,6 +939,46 @@ class TestAnthropicServing(unittest.TestCase):
             ):
                 self._anthropic_request(output_config={"format": output_format})
 
+    def test_count_tokens_renders_output_config_like_messages(self):
+        """count_tokens must count the prompt Messages renders, so output_config
+        reaches the Chat request on both routes."""
+        rendered = []
+
+        class _CountingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self):
+                super().__init__()
+                self.tokenizer_manager.model_config = SimpleNamespace(
+                    is_multimodal=False
+                )
+
+            def _process_messages(self, chat_request, is_multimodal):
+                rendered.append(chat_request)
+                return SimpleNamespace(prompt_ids=[1])
+
+        output_config = {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": {"type": "object"}},
+        }
+        serving = AnthropicServing(_CountingOpenAI())
+        asyncio.run(
+            serving.handle_count_tokens(
+                AnthropicCountTokensRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    output_config=output_config,
+                ),
+                object(),
+            )
+        )
+        messages = serving._convert_to_chat_completion_request(
+            self._anthropic_request(output_config=output_config)
+        )
+        self.assertIsNotNone(messages.response_format)
+        self.assertEqual(
+            (rendered[0].response_format, rendered[0].reasoning_effort),
+            (messages.response_format, messages.reasoning_effort),
+        )
+
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
         import logging
