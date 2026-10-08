@@ -12,11 +12,8 @@
 //! a `PyObject`.
 
 mod api_server;
-mod frontend;
-mod grpc;
 mod message;
 mod multi_modality;
-mod native_generation;
 mod tokenizer_manager;
 mod utils;
 
@@ -25,7 +22,7 @@ pub use message::config::{
     RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::MmItem;
-pub use message::request::{MmData, ProcessorExtensions};
+pub use message::request::MmData;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,

@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -156,6 +156,8 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
                     manager.session_failures = defaultdict(int)
+                    manager.state_layout_rejections = {}
+                    manager.state_strides_validated = set()
                     manager.failure_records = {}
                     manager._staging_outstanding = defaultdict(int)
                     manager.request_status = {
@@ -280,6 +282,256 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertFalse(manager.transfer_infos)
                     self.assertFalse(manager.req_to_decode_prefix_len)
 
+    def test_mooncake_short_decode_item_lens_is_a_verdict_not_an_index_error(self):
+        """A decode publishing fewer item lengths than entries used to raise
+        IndexError out of the stride check and take the transfer thread down;
+        it must come back as a rejection reason on both pairing paths."""
+        for layer_ids in ([], [3, 4]):
+            with self.subTest(layer_ids=layer_ids):
+                manager = object.__new__(MooncakeKVManager)
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None, prefill_start_layer=0
+                )
+                reason = manager._state_stride_mismatch(
+                    src_data_ptrs=[0x1000, 0x1100],
+                    dst_data_ptrs=[0x2000, 0x2100],
+                    item_lens=[32, 32],
+                    dst_item_lens=[32],
+                    state_type=StateType.SWA,
+                    src_layer_ids=layer_ids,
+                    dst_layer_ids=layer_ids,
+                )
+                self.assertIsNotNone(reason)
+                self.assertIn("item lengths", reason)
+
+    def test_mooncake_validates_peer_state_layout_at_registration(self):
+        """The verdict is reachable at registration, not just at transfer time."""
+        for layer_ids in ([], [7]):
+            for dst_item_len in (32, 64):
+                with self.subTest(layer_ids=layer_ids, dst_item_len=dst_item_len):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.kv_args = SimpleNamespace(
+                        state_types=[StateType.SWA, StateType.MAMBA],
+                        state_data_ptrs=[[0x1000], [0x3000]],
+                        state_item_lens=[[32], [16]],
+                        state_layer_ids=[layer_ids, layer_ids],
+                    )
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.pp_size = 1
+                    registration_info = SimpleNamespace(
+                        mooncake_session_id="decode",
+                        dst_state_data_ptrs=[[0x2000], [0x4000]],
+                        # Mamba disagrees too, but ships on its own path.
+                        dst_state_item_lens=[[dst_item_len], [999]],
+                        dst_state_layer_ids=[layer_ids, layer_ids],
+                    )
+                    with get_context().override_server_args(
+                        enable_unified_memory=False
+                    ):
+                        fully_checked, reason = manager._validate_peer_state_layout(
+                            registration_info
+                        )
+                    if dst_item_len == 32:
+                        self.assertTrue(fully_checked)
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertFalse(fully_checked)
+                        self.assertEqual(
+                            reason,
+                            f"{StateType.SWA} item length mismatch for "
+                            + (
+                                "paired entries src[0]=32 dst[0]=64"
+                                if layer_ids
+                                else "positional entry 0: prefill=32 decode=64"
+                            ),
+                        )
+
+    def test_mooncake_registration_replaces_the_previous_layout_verdict(self):
+        """Re-registering re-derives the verdict, and publishes the layout last."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.SWA],
+            state_data_ptrs=[[0x1000]],
+            state_item_lens=[[32]],
+            state_layer_ids=[[]],
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 1
+        manager.session_lock = threading.Lock()
+        manager.failed_sessions = {"decode"}
+        manager.session_failures = defaultdict(int, {"decode": 2})
+        manager.state_layout_rejections = {}
+        manager.state_strides_validated = set()
+        manager.decode_kv_args_table = {}
+
+        def register(dst_item_len):
+            info = SimpleNamespace(
+                mooncake_session_id="decode",
+                dst_state_data_ptrs=[[0x2000]],
+                dst_state_item_lens=[[dst_item_len]],
+                dst_state_layer_ids=[[]],
+            )
+            with get_context().override_server_args(enable_unified_memory=False):
+                return info, manager._publish_peer_registration("decode", info)
+
+        good, mismatch = register(32)
+        self.assertIsNone(mismatch)
+        self.assertEqual(manager.state_strides_validated, {"decode"})
+        self.assertFalse(manager.state_layout_rejections)
+        self.assertIs(manager.decode_kv_args_table["decode"], good)
+        # A transport blacklist is cleared by registering, as before.
+        self.assertFalse(manager.failed_sessions)
+        self.assertFalse(manager.session_failures)
+
+        bad, mismatch = register(64)
+        self.assertIn("item length mismatch", mismatch)
+        # The stale clearance is gone before the new layout is reachable.
+        self.assertFalse(manager.state_strides_validated)
+        self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
+        self.assertIs(manager.decode_kv_args_table["decode"], bad)
+
+    def test_mooncake_unpublished_state_metadata_keeps_the_transfer_check(self):
+        """An unpublished component cannot be judged; keep the transfer check."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.SWA],
+            state_data_ptrs=[[0x1000]],
+            state_item_lens=[[32]],
+            state_layer_ids=[[]],
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 1
+        registration_info = SimpleNamespace(
+            mooncake_session_id="decode",
+            dst_state_data_ptrs=[[0x2000]],
+            dst_state_item_lens=[],
+            dst_state_layer_ids=[[]],
+        )
+        with get_context().override_server_args(enable_unified_memory=False):
+            fully_checked, reason = manager._validate_peer_state_layout(
+                registration_info
+            )
+        self.assertFalse(fully_checked)
+        self.assertIsNone(reason)
+
+    def test_mooncake_validated_session_skips_the_per_transfer_check(self):
+        """A cleared session pays nothing per request.
+
+        Driven with sizes that would be rejected, so the transfer going through
+        proves the check was skipped rather than merely passing.
+        """
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[])
+        manager.is_mla_backend = True
+        manager.pp_size = 1
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.state_strides_validated = {"decode"}
+        manager._transfer_data = Mock(return_value=0)
+        manager._state_stride_mismatch = Mock(
+            side_effect=AssertionError("must not re-check a validated session")
+        )
+        rc = manager._send_kvcache_generic(
+            mooncake_session_id="decode",
+            executor=None,
+            src_data_ptrs=[0x1000],
+            dst_data_ptrs=[0x2000],
+            item_lens=[32],
+            dst_item_lens=[64],
+            prefill_data_indices=np.array([2], dtype=np.int32),
+            dst_data_indices=np.array([5], dtype=np.int32),
+            state_type=StateType.SWA,
+            bootstrap_room=42,
+        )
+        self.assertEqual(rc, 0)
+        manager._state_stride_mismatch.assert_not_called()
+        manager._transfer_data.assert_called_once_with(
+            "decode", [(0x1000 + 2 * 32, 0x2000 + 5 * 32, 32)]
+        )
+
+    def test_mooncake_layout_rejected_session_fails_requests_without_writing(self):
+        """A rejected peer fails every request and stays off the probe-clearable
+        transport blacklist."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[], state_types=[StateType.SWA])
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = manager.attn_cp_size = manager.pp_size = 1
+        manager.attn_tp_rank = manager.attn_cp_rank = manager.pp_rank = 0
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.enable_trace = manager.enable_staging = False
+        manager.bootstrap_port = 1234
+        manager.session_lock = threading.Lock()
+        manager.failure_lock = threading.Lock()
+        manager.failed_sessions = set()
+        manager.session_failures = defaultdict(int)
+        manager.failure_records = {}
+        manager._staging_outstanding = defaultdict(int)
+        manager.request_status = {42: KVPoll.Transferring}
+        manager.req_to_decode_prefix_len = {42: 0}
+        reason = f"{StateType.SWA} item length mismatch for positional entry 0"
+        manager.state_layout_rejections = {"decode:42": reason}
+        manager.state_strides_validated = set()
+        req = TransferInfo(
+            room=42,
+            endpoint="127.0.0.1",
+            dst_port=1234,
+            mooncake_session_id="decode:42",
+            dst_kv_indices=np.array([], dtype=np.int32),
+            dst_aux_index=5,
+            dst_state_indices=[[5]],
+            required_dst_info_num=1,
+            is_dummy=False,
+        )
+        manager.transfer_infos = {42: {"decode:42": req}}
+        manager.decode_kv_args_table = {}
+        manager._send_multipart_locked = Mock()
+        manager._transfer_data = Mock(return_value=0)
+        queue = FastQueue()
+        queue.put(
+            TransferKVChunk(
+                room=42,
+                prefill_kv_indices=np.array([], dtype=np.int32),
+                index_slice=slice(0, 0),
+                is_last_chunk=True,
+                prefill_aux_index=2,
+                state_indices=[[2]],
+            )
+        )
+        queue.put(None)
+        manager.transfer_worker(queue, executor=None)
+
+        self.assertEqual(manager.request_status[42], KVPoll.Failed)
+        self.assertEqual(manager.failure_records[42], reason)
+        manager._transfer_data.assert_not_called()
+        # Not a transport fault, so the probe loop must not clear it.
+        self.assertFalse(manager.failed_sessions)
+        self.assertFalse(manager.session_failures)
+        self.assertEqual(manager.state_layout_rejections, {"decode:42": reason})
+
+    def test_mooncake_probe_recovery_keeps_a_layout_rejection(self):
+        """A probe clears the transport blacklist but not a layout rejection."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.session_lock = threading.Lock()
+        manager.failed_sessions = {"decode"}
+        manager.session_failures = defaultdict(int, {"decode": 1})
+        reason = f"{StateType.SWA} item length mismatch for positional entry 0"
+        manager.state_layout_rejections = {"decode": reason}
+        manager.engine = SimpleNamespace(send_probe=Mock(return_value=0))
+
+        manager._run_one_probe_pass()
+
+        self.assertFalse(manager.failed_sessions)
+        self.assertFalse(manager.session_failures)
+        self.assertEqual(manager.state_layout_rejections, {"decode": reason})
+
     def test_mooncake_state_stride_matches_pp_slice(self):
         cases = [
             ([], [64, 128], [32, 64, 128, 256], [1, 2]),
@@ -301,6 +553,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 )
                 manager.is_mla_backend = True
                 manager.pp_size = 2
+                manager.state_strides_validated = set()
                 manager.enable_custom_mem_pool = False
                 manager.max_transfer_batch_indices = 0
                 manager._transfer_data = Mock(return_value=0)
@@ -333,20 +586,21 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
                 manager.request_status = {42: KVPoll.Failed}
-                manager._staging_outstanding = {42: outstanding}
-                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
-                manager._deferred_ack_fanout_snapshots = {}
+                manager.req_to_decode_prefix_len = {}
                 manager.transfer_infos = {}
+                manager._staging_outstanding = {42: outstanding}
+                manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
                 with patch.object(manager, "_send_abort_ack") as ack:
                     sender.clear()
                     if outstanding:
                         ack.assert_not_called()
                         manager._staging_outstanding[42] = 0
                         manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
+                    ack.assert_called_once_with(42, target)
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
 
@@ -411,8 +665,8 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
             kv=ReqKvInfo(req_pool_idx=0),
-            prefix_indices=[0, 1],
-            extend_range=SimpleNamespace(length=3),
+            prefix_len=2,
+            extend_len=3,
             origin_input_ids=[0, 1, 2, 3, 4],
             output_ids=[],
             retracted_stain=True,
@@ -726,13 +980,84 @@ class TestQwen4StateWire(unittest.TestCase):
         regions = mgr._registerable_regions()
         self.assertEqual(regions, [(100, 4096), (103, 4096), (105, 4096)])
 
-    def test_elided_dsa_entries_drop_out_of_transfer_blocks(self):
-        """Entries with item_len 0 carry no bytes and must not be transferred."""
-        layers_params = [(100, 200, 132), (101, 201, 0), (102, 202, 132)]
-        self.assertEqual(
-            [p for p in layers_params if p[2] != 0],
-            [(100, 200, 132), (102, 202, 132)],
-        )
+    def test_stride_check_accepts_one_sided_elided_dsa_entry(self):
+        """A prefill that elides a shared-topk layer's index-K must still pair
+        with a dense decode (and the reverse): the registration-time stride
+        check used to reject the decode with "prefill=0 decode=64", failing
+        every request to it. A real stride disagreement is still rejected."""
+        for layer_ids in ([], [3, 4]):
+            for src_lens, dst_lens, expect_ok in (
+                ([0, 132], [64, 132], True),
+                ([64, 132], [0, 132], True),
+                ([132, 132], [64, 132], False),
+            ):
+                with self.subTest(
+                    layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
+                ):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.pp_size = 1
+                    manager.kv_args = SimpleNamespace(
+                        mla_compression_ratios=None, prefill_start_layer=0
+                    )
+                    reason = manager._state_stride_mismatch(
+                        src_data_ptrs=[0x1000, 0x1100],
+                        dst_data_ptrs=[0x2000, 0x2100],
+                        item_lens=src_lens,
+                        dst_item_lens=dst_lens,
+                        state_type=StateType.DSA,
+                        src_layer_ids=layer_ids,
+                        dst_layer_ids=layer_ids,
+                    )
+                    if expect_ok:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn("item length mismatch", reason)
+
+    def test_send_drops_entry_elided_by_either_peer(self):
+        """An entry elided on either side must not be sent. A dense prefill
+        against an elided decode used to keep the entry (the filter only looked
+        at the prefill length), writing index-K into a decode buffer that has no
+        memory and was never registered."""
+        for layer_ids in ([], [3, 4, 5]):
+            for src_lens, dst_lens in (
+                ([132, 132, 132], [0, 132, 132]),
+                ([0, 132, 132], [132, 132, 132]),
+            ):
+                with self.subTest(
+                    layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
+                ):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.is_mla_backend = True
+                    manager.is_hybrid_mla_backend = False
+                    manager.pp_size = 1
+                    manager.kv_args = SimpleNamespace(
+                        mla_compression_ratios=None, prefill_start_layer=0
+                    )
+                    manager.state_strides_validated = set()
+                    manager.enable_custom_mem_pool = False
+                    manager.max_transfer_batch_indices = 0
+                    manager._transfer_data = Mock(return_value=0)
+
+                    ret = manager._send_kvcache_generic(
+                        "decode",
+                        [0x1000, 0x1100, 0x1200],
+                        [0x2000, 0x2100, 0x2200],
+                        src_lens,
+                        np.array([0], dtype=np.int32),
+                        np.array([0], dtype=np.int32),
+                        executor=None,
+                        state_type=StateType.DSA,
+                        src_layer_ids=layer_ids,
+                        dst_layer_ids=layer_ids,
+                        dst_item_lens=dst_lens,
+                    )
+
+                    self.assertEqual(ret, 0)
+                    manager._transfer_data.assert_called_once_with(
+                        "decode", [(0x1100, 0x2100, 132), (0x1200, 0x2200, 132)]
+                    )
 
     def test_dense_shape_keeps_positional_pairing_intact(self):
         """Both peers still publish one entry per layer, so pairing is unchanged.

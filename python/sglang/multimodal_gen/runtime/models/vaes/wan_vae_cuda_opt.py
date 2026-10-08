@@ -4,9 +4,9 @@ Qwen-Image VAE, which is the Wan 2.1 VAE under other class names).
 
 Fuses every decoder ``WanRMS_norm -> SiLU`` chain into one Triton kernel on
 the channels_last_3d layout. Wrappers are installed once at VAE load and
-dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"``
+dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="lossless"``
 and ``quality="high"`` run the fused kernel (not bitwise-identical to aten,
-hence gated). The ``"lossless"`` path preserves aten's normalization reduction
+hence gated). The ``"exact"`` path preserves aten's normalization reduction
 and fuses its FP32 post-ops after first-sight exactness verification.
 Install is all-or-nothing and fail-closed.
 """
@@ -76,7 +76,9 @@ class FusedWanRMSNormSiLU(nn.Module):
             )
             and (isinstance(self.bias, torch.Tensor) or self.bias == 0.0)
         ):
-            sig = (x.device, x.dtype, x.shape, x.stride(), self.gamma.dtype)
+            # Every element takes the same ops whatever the sizes, so exactness
+            # depends only on the dtypes and on which layout the kernel runs.
+            sig = (x.device, x.dtype, x.is_contiguous(), self.gamma.dtype)
             verified = self._post_gate.is_verified(sig)
             if verified or not torch.cuda.is_current_stream_capturing():
                 # Keep this outside the custom op: CUDA autocast promotes the
@@ -158,7 +160,7 @@ class GatedChannelsLastUpsample(nn.Module):
         # The predicate admits exactly the inputs on which aten itself would
         # run its NHWC kernel and return a dense channels_last tensor, so the
         # Triton gather is a layout- and value-identical replacement: it runs
-        # on the lossless path too (the gate only controls the stride
+        # on the exact path too (the gate only controls the stride
         # canonicalisation above).
         if up.size is None and can_use_nearest_upsample_nhwc(
             x, up.scale_factor, up.mode

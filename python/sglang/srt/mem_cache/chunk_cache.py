@@ -51,8 +51,8 @@ class ChunkCache(BasePrefixCache):
 
         self.protected_size_ = 0
 
-    def is_chunk_cache(self) -> bool:
-        return True
+    def supports_prefix_sharing(self) -> bool:
+        return False
 
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
@@ -66,20 +66,21 @@ class ChunkCache(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         return MatchResult(
-            device_indices=torch.empty((0,), dtype=torch.int64),
+            device_prefix_len=0,
             last_device_node=None,
             last_host_node=None,
             best_match_node=None,
         )
 
+    def path_device_indices(self, node: Any) -> torch.Tensor:
+        return torch.empty((0,), dtype=torch.int64)
+
     def insert(self, params: InsertParams) -> InsertResult:
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def insert_req(self, req: Req, *, up_to: int):
-        kv_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :up_to]
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+    def checkpoint(self, req: Req, *, up_to: int):
+        pass
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
