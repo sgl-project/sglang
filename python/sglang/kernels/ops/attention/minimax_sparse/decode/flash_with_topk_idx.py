@@ -18,8 +18,9 @@ from ..common.utils import (
     unit_scale,
 )
 
-# Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
-_JIT_TOPK_MAX_NUM_BLOCKS = 16384 if torch.version.hip else 4096
+# Largest row the single-stage top-k takes: kMaxNumBlocks of sgl-kernel-xpu's own
+# kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
 
 
 def _prune_decode_configs(configs, named_args, **kwargs):

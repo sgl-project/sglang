@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -48,6 +49,25 @@ class TestBlockVerificationArgs(unittest.TestCase):
                         args.speculative_use_rejection_sampling, use_rejection_sampling
                     )
 
+    def test_dflash_family(self):
+        """DFLASH/DSPARK sampled drafts publish their own proposal distribution,
+        so block verification must not switch on EAGLE's rejection sampling."""
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._args(speculative_algorithm=algorithm)
+                # The per-algorithm handlers need a real draft checkpoint.
+                with (
+                    mock.patch("sglang.srt.arg_groups.speculative_hook._handle_dflash"),
+                    mock.patch("sglang.srt.arg_groups.speculative_hook._handle_dspark"),
+                ):
+                    handle_speculative_decoding(args)
+                self.assertTrue(
+                    resolution_result(args, "speculative_use_block_verification")
+                )
+                self.assertFalse(
+                    resolution_result(args, "speculative_use_rejection_sampling")
+                )
+
     def test_other_verification_modes_unchanged(self):
         for use_rejection_sampling in (False, True):
             with self.subTest(use_rejection_sampling=use_rejection_sampling):
@@ -69,9 +89,18 @@ class TestBlockVerificationArgs(unittest.TestCase):
         cases = [
             ({"speculative_algorithm": None}, "only supports EAGLE"),
             ({"speculative_algorithm": "STANDALONE"}, "only supports EAGLE"),
-            ({"speculative_algorithm": "DFLASH"}, "only supports EAGLE"),
+            ({"speculative_algorithm": "NGRAM"}, "only supports EAGLE"),
             ({"device": "cpu"}, "only supports CUDA or ROCm"),
             ({"device": "npu"}, "only supports CUDA or ROCm"),
+            # DFLASH/DSPARK serve on NPU, whose chain sampler has no block mode.
+            (
+                {"speculative_algorithm": "DFLASH", "device": "npu"},
+                "only supports CUDA or ROCm",
+            ),
+            (
+                {"speculative_algorithm": "DSPARK", "device": "npu"},
+                "only supports CUDA or ROCm",
+            ),
             ({"speculative_eagle_topk": 2}, "requires --speculative-eagle-topk=1"),
             ({"speculative_accept_threshold_single": 0.5}, "incompatible"),
             ({"speculative_accept_threshold_acc": 0.5}, "incompatible"),
