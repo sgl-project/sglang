@@ -117,7 +117,6 @@ class PiGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
-        self.cond_dim = cond_dim
         if cond_dim is None:
             self.weight = nn.Parameter(torch.zeros(dim))
             self.dense = None

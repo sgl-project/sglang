@@ -509,7 +509,6 @@ class T5Stack(nn.Module):
     ):
         super().__init__()
         self.embed_tokens = embed_tokens
-        self.is_umt5 = is_umt5
         if is_umt5:
             self.block = nn.ModuleList(
                 [
