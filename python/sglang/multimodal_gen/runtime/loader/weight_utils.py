@@ -452,6 +452,36 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
     return name
 
 
+def load_llm_encoder_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    stacked_params_mapping: Iterable[tuple[str, str, str | int]],
+    *,
+    strip_prefix: str = "",
+) -> set[str]:
+    """Load Llama/Qwen-style encoder weights, excluding rotary cache tensors."""
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        if strip_prefix and name.startswith(strip_prefix):
+            name = name[len(strip_prefix) :]
+        if (
+            "rotary_emb.inv_freq" in name
+            or "rotary_emb.cos_cached" in name
+            or "rotary_emb.sin_cached" in name
+        ):
+            continue
+        if "scale" in name:
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+        name = load_stacked_weight(
+            name, loaded_weight, params_dict, stacked_params_mapping
+        )
+        if name is not None:
+            loaded_params.add(name)
+    return loaded_params
+
+
 def compute_weights_checksum(
     named_params: Iterable[tuple[str, torch.Tensor]],
 ) -> str:

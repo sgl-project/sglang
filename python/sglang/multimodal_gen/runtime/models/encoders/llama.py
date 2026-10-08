@@ -51,8 +51,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    load_stacked_weight,
-    maybe_remap_kv_scale_name,
+    load_llm_encoder_weights,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
@@ -385,32 +384,11 @@ class LlamaModel(TextEncoder):
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if "scale" in name:
-                # Remapping the name of FP8 kv-scale.
-                kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
-                if kv_scale_name is None:
-                    continue
-                else:
-                    name = kv_scale_name
-            name = load_stacked_weight(
-                name,
-                loaded_weight,
-                params_dict,
-                self.config.arch_config.stacked_params_mapping,
-            )
-            if name is not None:
-                loaded_params.add(name)
-        return loaded_params
+        return load_llm_encoder_weights(
+            weights,
+            dict(self.named_parameters()),
+            self.config.arch_config.stacked_params_mapping,
+        )
 
 
 EntryClass = LlamaModel
