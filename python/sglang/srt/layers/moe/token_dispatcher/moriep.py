@@ -1473,6 +1473,11 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
     @property
     def mori_op(self):
         if self._mori_op is None:
+            logger.warning_once(
+                "MORI EPv2 op is built lazily because set_quant_config was not "
+                "called: dtype env overrides are ignored and its CCO window is "
+                "allocated after KV cache sizing."
+            )
             self._initialize_op()
         return self._mori_op
 

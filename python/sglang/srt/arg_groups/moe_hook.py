@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
 from typing import Any
@@ -732,8 +731,6 @@ def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
         return "SGLANG_USE_AITER=0 (EPv2 experts run on the aiter MoE runner)"
     if get_bool_env_var("MORI_ENABLE_SDMA", "false"):
         return "MORI_ENABLE_SDMA=1 (SDMA is EPv1-only)"
-    if not _mori_epv2_installed():
-        return "this MORI build (no mori.cco / mori.ops.dispatch_combine_v2)"
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return "a model loaded through an instance connector (cannot validate it)"
     model_config = model_config_of(server_args)
@@ -743,17 +740,6 @@ def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
         architecture = (model_config.hf_config.architectures or [None])[0]
         return f"{architecture} (EPv2 is validated on DeepSeek-V4 only)"
     return None
-
-
-def _mori_epv2_installed() -> bool:
-    # Locate the package without importing mori or its native extensions.
-    spec = importlib.util.find_spec("mori")
-    if spec is None or spec.submodule_search_locations is None:
-        return False
-    package_dir = list(spec.submodule_search_locations)[0]
-    return os.path.isdir(os.path.join(package_dir, "cco")) and os.path.exists(
-        os.path.join(package_dir, "ops", "dispatch_combine_v2")
-    )
 
 
 def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
