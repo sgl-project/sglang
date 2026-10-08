@@ -10,7 +10,6 @@ from types import MappingProxyType
 from typing import Mapping, Optional
 
 import msgspec
-
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_exit_rows,
@@ -365,7 +364,10 @@ def _resolve_stage(stage, variant, following=None):
             dense_tp_size=stage.dense_tp_size,
         )
         if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
-            returned = attention
+            # "Attention rows" means the active variant's attention input:
+            # full attention rows normally, or the local TP row shard while
+            # LayerNorm SP owns the token axis.
+            returned = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
         return declaration, residual, returned
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED

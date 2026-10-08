@@ -35,10 +35,10 @@ nothing in this module executes.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
-
+import torch.distributed as dist
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -50,18 +50,25 @@ from sglang.srt.utils.common import ceil_align
 # layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
-SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+SP_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "Qwen3ForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
 
 
 def initialize_layernorm_sp(*, model_config) -> None:
     """Materialize ``flags.sp.enabled``; runs once per worker after distributed
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
-    get_flags().sp.enabled = bool(
+    architecture = architectures[0] if architectures else None
+    enabled = bool(
         get_parallel().enable_layernorm_sp
-        and architectures
-        and architectures[0] in SP_SUPPORTED_ARCHITECTURES
+        and architecture in SP_SUPPORTED_ARCHITECTURES
     )
+    get_flags().sp.enabled = enabled
 
 
 def layernorm_sp_enabled() -> bool:
@@ -102,6 +109,78 @@ def sp_num_tokens() -> int:
     return _sp_state.num_tokens
 
 
+def _group_size_rank(group) -> tuple[int, int]:
+    if hasattr(group, "world_size"):
+        return int(group.world_size), int(group.rank_in_group)
+    return dist.get_world_size(group), dist.get_rank(group)
+
+
+def shard_token_rows(tensor: torch.Tensor, *, group=None) -> torch.Tensor:
+    """Pad and locally select this TP rank's contiguous token-row shard."""
+    group = group or get_parallel().tp_group
+    world_size, rank = _group_size_rank(group)
+    padded_rows = ceil_align(tensor.shape[0], world_size)
+    if padded_rows != tensor.shape[0]:
+        tensor = torch.nn.functional.pad(
+            tensor, (0, 0, 0, padded_rows - tensor.shape[0])
+        )
+    return tensor.tensor_split(world_size, dim=0)[rank].contiguous()
+
+
+def all_gather_token_rows(
+    local_rows: torch.Tensor, *, total_rows: Optional[int] = None, group=None
+) -> torch.Tensor:
+    """Gather equal token-row shards and optionally trim collective padding."""
+    group = group or get_parallel().tp_group
+    world_size, _ = _group_size_rank(group)
+    output = local_rows.new_empty(
+        (local_rows.shape[0] * world_size, *local_rows.shape[1:])
+    )
+    local_rows = local_rows.contiguous()
+    if hasattr(group, "all_gather_into_tensor"):
+        group.all_gather_into_tensor(output, local_rows)
+    else:
+        dist.all_gather_into_tensor(output, local_rows, group=group)
+    return output if total_rows is None else output[:total_rows]
+
+
+def reduce_scatter_token_rows(
+    full_partial: torch.Tensor, *, group=None
+) -> torch.Tensor:
+    """Pad, sum and scatter token rows across a TP group."""
+    group = group or get_parallel().tp_group
+    world_size, _ = _group_size_rank(group)
+    padded_rows = ceil_align(full_partial.shape[0], world_size)
+    if padded_rows != full_partial.shape[0]:
+        full_partial = torch.nn.functional.pad(
+            full_partial, (0, 0, 0, padded_rows - full_partial.shape[0])
+        )
+    output = full_partial.new_empty(
+        (padded_rows // world_size, *full_partial.shape[1:])
+    )
+    full_partial = full_partial.contiguous()
+    if hasattr(group, "reduce_scatter_tensor"):
+        group.reduce_scatter_tensor(output, full_partial)
+    else:
+        dist.reduce_scatter_tensor(output, full_partial, group=group)
+    return output
+
+
+def run_replicated_token_rows(
+    hidden_states: torch.Tensor,
+    compute: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    total_rows: Optional[int] = None,
+    group=None,
+) -> torch.Tensor:
+    """Run a full-row-only operation while the surrounding region stays SP."""
+    group = group or get_parallel().tp_group
+    full_rows = all_gather_token_rows(hidden_states, total_rows=total_rows, group=group)
+    with get_forward().scoped(sp_active=False):
+        full_partial = compute(full_rows)
+    return reduce_scatter_token_rows(full_partial, group=group)
+
+
 # --- entry scatter / exit gather (once per forward, at the boundary) ----------
 def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """Shard the replicated ``[M, h]`` hidden states along the token dim.
@@ -111,31 +190,23 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """
     num_tokens = hidden_states.shape[0]
     set_sp_num_tokens(num_tokens)
-    tp_group = get_parallel().tp_group
-    tp_size = tp_group.world_size
-    if tp_size == 1:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
         return hidden_states
-    padded = ceil_align(num_tokens, tp_size)
-    if padded != num_tokens:
-        hidden_states = torch.nn.functional.pad(
-            hidden_states, (0, 0, 0, padded - num_tokens)
-        )
-    return hidden_states.tensor_split(tp_size)[tp_group.rank_in_group].contiguous()
+    return shard_token_rows(hidden_states, group=group)
 
 
 def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """g: all-gather the per-rank shards back to the full sequence along dim 0,
     then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
-    tp_group = get_parallel().tp_group
-    tp_size = tp_group.world_size
-    if tp_size == 1:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
         return hidden_states[:num_tokens]
-    hidden_states = hidden_states.contiguous()
-    output = hidden_states.new_empty(
-        (hidden_states.shape[0] * tp_size, *hidden_states.shape[1:])
+    return all_gather_token_rows(
+        hidden_states,
+        total_rows=num_tokens,
+        group=group,
     )
-    tp_group.all_gather_into_tensor(output, hidden_states)
-    return output[:num_tokens]
 
 
 def maybe_exit_gather(
