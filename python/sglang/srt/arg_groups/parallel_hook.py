@@ -345,26 +345,33 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+    if _decode_graph_may_capture_collectives(server_args):
         _disable_nccl_graph_buffer_registration(
-            "the graph-captured TP LM-head all-to-all can deadlock with "
-            "registered buffers"
-        )
-    if _graph_pool_is_pausable(server_args):
-        _disable_nccl_graph_buffer_registration(
-            "graph replay can hang once torch_memory_saver resume remaps the "
-            "graph pool, leaving the capture-time registrations on released pages"
+            "graph-captured collectives run on graph-pool temporaries whose "
+            "addresses the pool also hands to other tensors"
         )
 
 
-def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether CUDA graphs are captured into torch_memory_saver memory, which
-    release/resume of the `cuda_graph` tag remaps to new physical pages at the
-    same virtual addresses."""
-    return bool(
-        resolving_view(server_args).enable_memory_saver
-        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-    )
+def _decode_graph_may_capture_collectives(server_args: Any) -> bool:
+    """Whether a decode CUDA graph can capture a cross-rank collective.
+
+    Capture binds a collective's send/recv buffers to graph-pool temporaries,
+    and the pool hands those same addresses to other tensors. Which collective
+    got captured, and whether the pool is later remapped by torch_memory_saver,
+    only change how that aliasing is reached - not whether it exists - so the
+    guard tracks the hazard rather than the feature flags that expose it.
+
+    Errs toward True. Later passes can still narrow cuda_graph_config, and
+    turning the registration off has no measured throughput cost, so a false
+    positive is cheaper than a missed deployment shape.
+    """
+    view = resolving_view(server_args)
+    if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
+        return False
+    config = getattr(view, "cuda_graph_config", None)
+    if config is not None and config[Phase.DECODE].backend == Backend.DISABLED:
+        return False
+    return True
 
 
 def _disable_nccl_graph_buffer_registration(reason: str) -> None:
