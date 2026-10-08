@@ -12,13 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Pure index math for DSA token sharding inside the attention-TP group.
-
-Attention-TP splits heads; this splits tokens over the same ranks, so a rank
-computes every head for its slice of the batch. Compute is unchanged, but the
-sparse operator is bound by the top-k KV it reads and every MLA head of a query
-reads the same latent row, so slicing tokens divides that traffic by
-``tp_size`` where slicing heads does not.
+"""Pure index math for splitting an extend batch's tokens across the
+attention-TP group: each rank takes one contiguous, equal-sized slice of the
+batch's positions. The NPU DSA indexer uses it to score only its slice of the
+queries.
 
 No tensors and nothing device-specific, so the clamp arithmetic -- where a
 ragged batch goes wrong silently -- is testable on CPU. The scheme is
@@ -33,7 +30,7 @@ class DsaTokenShardPlan(NamedTuple):
     """One attention-TP rank's token slice of an extend batch.
 
     ``rows`` is ``ceil(num_tokens / tp_size)`` on every rank, which keeps the
-    all-to-alls regular; ``local_end`` stops at the real tokens and
+    all-gather regular; ``local_end`` stops at the real tokens and
     ``local_end_with_pad`` does not.
 
     ``key_lens[i]`` is the KV length the LAST of request i's tokens in this slice
@@ -107,7 +104,5 @@ def plan_dsa_token_shard(
 
 
 def cumulative(lens: Sequence[int]) -> List[int]:
-    """Running sum. Under the non-paged TND layout the operator takes BOTH query
-    and KV lengths cumulative -- measured by p6_prefill_nonpaged_sfa_probe.py:
-    the other three of the four conventions return plausible garbage."""
+    """Running sum: the TND query layout takes cumulative query lengths."""
     return list(accumulate(int(n) for n in lens))

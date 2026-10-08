@@ -32,18 +32,6 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
 @lru_cache(maxsize=1)
-def _shard_indexer_queries() -> bool:
-    """Cached, not read at import, so tests can set it; see
-    ``reset_indexer_shard_flag``."""
-    return envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
-
-
-def reset_indexer_shard_flag() -> None:
-    """Re-read the flag. For tests; never call this while serving."""
-    _shard_indexer_queries.cache_clear()
-
-
-@lru_cache(maxsize=1)
 def _create_hadamard_128_cpu() -> torch.Tensor:
     matrix = [[1.0]]
     while len(matrix) < 128:
@@ -255,7 +243,7 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
-        # A rank that scores only its own rows projects only those (W3): wq_b is
+        # A rank that scores only its own rows projects only those: wq_b is
         # 25.2 MFLOP per token. k stays full width -- every rank writes the whole
         # index-K, which is what lets any of them score a subset. Neox only: the
         # other branch rotates q and k in one call. Prefill CP is excluded: its
@@ -265,7 +253,9 @@ class DSANPUIndexerMixin:
         )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill and _shard_indexer_queries() and not uses_prefill_cp
+            if is_prefill
+            and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
+            and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
