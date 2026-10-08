@@ -181,3 +181,7 @@ def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():
     )
 
     assert guarded_import is not None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
