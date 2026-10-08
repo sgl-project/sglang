@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -33,7 +34,10 @@ def _make_backend():
         model_runner=SimpleNamespace(tp_group=SimpleNamespace(barrier=mock.Mock())),
         enable_torch_compile=False,
     )
-    with mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None):
+    with (
+        get_parallel().override(tp_group=runner.model_runner.tp_group),
+        mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
+    ):
         return mod.NPUCudaGraphBackend(runner), runner
 
 
