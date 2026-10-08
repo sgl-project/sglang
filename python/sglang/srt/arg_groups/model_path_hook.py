@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.utils.common import is_remote_url
+from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
@@ -347,10 +347,25 @@ def is_mistral_native_format(server_args: Any) -> bool:
             ),
         )
 
+    snapshot_dir = find_local_repo_dir(cfg.model_path, revision=cfg.revision)
+    if snapshot_dir is not None:
+        # A cache may hold only some files, so trust it only when what it has decides.
+        has_params = os.path.exists(os.path.join(snapshot_dir, "params.json"))
+        has_hf_weights = bool(
+            glob.glob(os.path.join(snapshot_dir, "model*.safetensors"))
+        )
+        if has_params and name_matches:
+            return True
+        if has_hf_weights and not name_matches:
+            return False
+
     try:
         from huggingface_hub import HfApi
 
-        files = {s.rfilename for s in HfApi().model_info(cfg.model_path).siblings}
+        files = {
+            s.rfilename
+            for s in HfApi().model_info(cfg.model_path, revision=cfg.revision).siblings
+        }
         return _check_format(
             has_params="params.json" in files,
             has_consolidated=any(

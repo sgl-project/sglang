@@ -457,6 +457,8 @@ def resolve_hf_gguf_reference(
 
     if len(parts) != 2:
         return None
+    if _cached_file_exists(model, filename="config.json", revision=revision):
+        return None
 
     from huggingface_hub import HfApi
 

@@ -3941,12 +3941,22 @@ def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
             from huggingface_hub import HfFileSystem
 
             fs = HfFileSystem()
+            snapshot_dir = find_local_repo_dir(model_path)
+
+            def _cached(name):
+                if snapshot_dir is None:
+                    return None
+                path = os.path.join(snapshot_dir, name)
+                return path if os.path.exists(path) else None
 
             def _open(name):
-                return fs.open(f"{model_path}/{name}", "rb")
+                path = _cached(name)
+                return (
+                    open(path, "rb") if path else fs.open(f"{model_path}/{name}", "rb")
+                )
 
             def _exists(name):
-                return fs.exists(f"{model_path}/{name}")
+                return _cached(name) is not None or fs.exists(f"{model_path}/{name}")
 
         if _exists("model.safetensors.index.json"):
             with _open("model.safetensors.index.json") as f:
