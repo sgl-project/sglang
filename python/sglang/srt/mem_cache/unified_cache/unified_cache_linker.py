@@ -240,6 +240,8 @@ class UnifiedCacheLinkerWrapper:
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
+        # Loaded tails stay outside the tree until their forward completes.
+        self.private_load_indices: dict[str, torch.Tensor] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
@@ -433,6 +435,7 @@ class UnifiedCacheLinkerWrapper:
             and req.swa_branching_seqlen <= prefix_len
         ):
             req.swa_branching_seqlen = None
+        self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
         return full_transfer.device_indices, req.last_node
 
@@ -546,6 +549,8 @@ class UnifiedCacheLinkerWrapper:
             dtype=torch.int,
         )
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        for rid in rids:
+            self.private_load_indices.pop(rid, None)
         if landed.item():
             return []
         logger.error(
@@ -559,6 +564,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
+        self.private_load_indices.clear()
         self.inflight_load_index = -1
         self._release_pending_offloads()
 
@@ -576,8 +582,10 @@ class UnifiedCacheLinkerWrapper:
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
+            self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
         self.cache_linker.close()
         self.inflight_load_rids.clear()
+        self.private_load_indices.clear()
         self._release_pending_offloads()

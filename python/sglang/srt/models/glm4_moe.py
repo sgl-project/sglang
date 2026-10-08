@@ -52,6 +52,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -164,11 +165,11 @@ class Glm4MoeMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -176,8 +177,7 @@ class Glm4MoeMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -186,8 +186,7 @@ class Glm4MoeMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -200,7 +199,7 @@ class Glm4MoeMLP(nn.Module):
         x,
         forward_batch=None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
@@ -233,7 +232,6 @@ class Glm4MoeAttention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -264,8 +262,7 @@ class Glm4MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -274,8 +271,7 @@ class Glm4MoeAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -482,18 +478,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_nixl()
-                    or get_moe_a2a_backend().is_mori()
-                    or get_moe_a2a_backend().is_ascend_fuseep()
-                    or get_moe_a2a_backend().is_flashinfer()
-                    or get_moe_a2a_backend().is_flashinfer_megamoe()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
-                ),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                else "tp",
             )
             is_packed_weight = (
                 hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
@@ -752,18 +746,14 @@ class Glm4MoeDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            if is_dense_ffn_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm4MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
 

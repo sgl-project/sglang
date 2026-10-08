@@ -323,15 +323,17 @@ class _TreeCoreBackendTestMixin:
 class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
-        prefix = torch.cat([req.prefix_indices.to(torch.int64), loaded])
+        req.kv.cache_protected_len = req.prefix_len
+        req.prefix_len += len(loaded)
+        prefix = cache.prefix_device_indices(req)
+        self.assertTrue(torch.equal(prefix[-len(loaded) :], loaded))
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(prefix))), prefix)
         req.origin_input_ids, req.output_ids = array("q", tokens), array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.set_extend_range(len(prefix), len(tokens))
-        req.kv.cache_protected_len = len(req.prefix_indices)
+        req.extend_end = len(tokens)
         req.kv.kv_committed_len = len(prefix)
         req.kv.kv_allocated_len = len(prefix)
-        req.prefix_indices, req.extra_key = prefix, None
+        req.extra_key = None
         req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
 
     def test_full_offload_load_round_trip_and_dedup(self):
@@ -412,9 +414,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(torch.equal(kv_load.device_indices, loaded))
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
-        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
-        consumer.insert_req(req, up_to=req.extend_range.end)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.insert_req(req, up_to=req.extend_end)
         consumer.dec_lock_ref(req.last_node, req.lock_receipt)
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
@@ -616,7 +618,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens[:4], loaded)
         if load_landed:
             self.assertEqual(consumer.finish_external_linker_loads([req]), [])
-            consumer.insert_req(req, up_to=req.extend_range.end)
+            consumer.insert_req(req, up_to=req.extend_end)
             consumer.dec_lock_ref(req.last_node, req.lock_receipt)
             final = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
@@ -900,18 +902,69 @@ def test_finish_loads_adopts_a_peer_rank_failure():
     reduce.assert_called_once()
 
 
+@pytest.mark.parametrize("device_len", [0, 2])
+@pytest.mark.parametrize("tail_len", [0, 4])
+def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len):
+    path = torch.arange(device_len, dtype=torch.int64)
+    tail = torch.arange(10, 10 + tail_len, dtype=torch.int64)
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(
+        root_node_handle=lambda extra_key: 0,
+        collect_full_device_indices=lambda node, root: path,
+    )
+    cache.linker = SimpleNamespace(
+        private_load_indices={"rid": tail} if tail_len else {}
+    )
+    req = SimpleNamespace(
+        rid="rid", extra_key=None, last_node=1, prefix_len=device_len + tail_len
+    )
+
+    expected = torch.cat([path, tail])
+    assert torch.equal(cache.prefix_device_indices(req), expected)
+    assert torch.equal(cache.prefix_device_indices(req), expected)
+    assert len(path) == device_len
+
+
+@pytest.mark.parametrize("landed", [True, False])
+def test_finish_loads_releases_private_index_references(landed, caplog):
+    backend = _FakeLinker()
+    backend.load_landed = landed
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=lambda value, op: None), backend
+    )
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.start_layer_wise_loading()
+
+    assert wrapper.finish_loads() == ([] if landed else ["rid"])
+    assert wrapper.private_load_indices == {}
+    assert ("External linker load failed" in caplog.text) is (not landed)
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_linker_lifecycle_releases_private_index_references(operation):
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
+    wrapper.private_load_indices["rid"] = torch.arange(4)
+
+    getattr(wrapper, operation)()
+
+    assert wrapper.private_load_indices == {}
+
+
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
     wrapper.hit_markers["rid"] = object()
     wrapper.inflight_load_rids = ["rid"]
     linker.queued_loads["rid"] = [object()]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
 
     wrapper.release_request("rid")
 
     assert wrapper.hit_markers == {}
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
+    assert wrapper.private_load_indices == {}
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -1281,7 +1334,7 @@ def test_linker_load_preserves_swa_boundaries(
     req = SimpleNamespace(
         rid="rid",
         kv=kv,
-        prefix_indices=torch.empty(0, dtype=torch.int64),
+        prefix_len=0,
         last_node=0,
         priority=0,
         swa_branching_seqlen=2,  # inside the loaded tail
@@ -1293,11 +1346,13 @@ def test_linker_load_preserves_swa_boundaries(
         # Refused before PREPARE: allocations undone, request untouched, recompute.
         assert restored.numel() == 0 and req.kv is kv
         assert wrapper.inflight_load_rids == []
+        assert wrapper.private_load_indices == {}
         phases = [c.args[0] for c in swa.update_external_linker_load.call_args_list]
         assert phases == ([ExternalLinkerLoadPhase.ABORT] if participates else [])
         return
     assert restored.tolist() == list(range(4))
     assert wrapper.inflight_load_rids == ["rid"]
+    assert torch.equal(wrapper.private_load_indices["rid"], restored)
     assert req.swa_branching_seqlen is None
     assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)

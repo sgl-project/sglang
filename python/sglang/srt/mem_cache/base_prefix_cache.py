@@ -528,6 +528,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if lock is not None:
             self.dec_lock_ref(lock.node, lock.receipt)
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        """KV indices of req's matched prefix, read off the path to its locked
+        match node; valid from match until allocation writes them into the row."""
+        raise NotImplementedError
+
     def maybe_hand_to_session(self, req: Req) -> None:
         """A cache that keeps records across requests (a streaming session) takes
         the just-allocated row and the request's tree lock; the request borrows it."""
