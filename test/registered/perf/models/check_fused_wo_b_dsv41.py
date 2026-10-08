@@ -106,7 +106,10 @@ def main():
 
     init_distributed_environment(local_rank=local_rank)
     rank, world = dist.get_rank(), dist.get_world_size()
-    initialize_model_parallel(tensor_model_parallel_size=world)
+    from sglang.test.test_utils import publish_build_topology
+
+    publish_build_topology(tp_size=world, ep_size=1, pp_size=1)
+    initialize_model_parallel()
 
     # _window_m_max sizes the symmetric window from chunked_prefill_size, so the
     # helper needs server args published. Without them it raises ValueError, and
@@ -115,7 +118,7 @@ def main():
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", chunked_prefill_size=max(
+        ServerArgs(model_path="dummy", tp_size=world, chunked_prefill_size=max(
             int(v) for v in args.m.split(",")
         ))
     )

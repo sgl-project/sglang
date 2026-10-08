@@ -41,10 +41,9 @@ class _Layer:
     see in the server.
     """
 
-    def __init__(self, weight, weight_scale_mx_e8m0, weight_bf16):
+    def __init__(self, weight, weight_scale_mx_e8m0):
         self.weight = weight
         self.weight_scale_mx_e8m0 = weight_scale_mx_e8m0
-        self.weight_bf16 = weight_bf16
         self.mxfp8_native_ready = True
 
 
@@ -64,8 +63,8 @@ def build(rank, n, k, seed=1234):
         dtype=torch.int32,
     )
     wsf = torch.exp2(eb.float() - 127.0)
-    shuffled, scale_e8m0, weight_bf16 = prepare_mxfp8_native_weight(w, wsf, (32, 32))
-    return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16)
+    shuffled, scale_e8m0 = prepare_mxfp8_native_weight(w, wsf, (32, 32))
+    return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0)
 
 
 def median_us(fn, warmup=5, iters=21):
@@ -128,13 +127,16 @@ def main():
 
     init_distributed_environment(local_rank=local_rank)
     rank, world = dist.get_rank(), dist.get_world_size()
-    initialize_model_parallel(tensor_model_parallel_size=world)
+    from sglang.test.test_utils import publish_build_topology
+
+    publish_build_topology(tp_size=world, ep_size=1, pp_size=1)
+    initialize_model_parallel()
 
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
     ms = [int(v) for v in args.m.split(",")]
     set_global_server_args_for_scheduler(
-        ServerArgs(model_path="dummy", chunked_prefill_size=max(ms))
+        ServerArgs(model_path="dummy", chunked_prefill_size=max(ms), tp_size=world)
     )
 
     import sglang.srt.layers.mori_gemm_ar as mori_wo_b
@@ -165,7 +167,6 @@ def main():
                         x,
                         layer.weight.view(torch.uint8),
                         layer.weight_scale_mx_e8m0,
-                        weight_bf16=layer.weight_bf16,
                     )
                     return tensor_model_parallel_all_reduce(out)
 

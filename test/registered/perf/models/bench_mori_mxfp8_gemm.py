@@ -56,10 +56,9 @@ SHAPES = {
 
 
 class _Layer:
-    def __init__(self, weight, weight_scale_mx_e8m0, weight_bf16):
+    def __init__(self, weight, weight_scale_mx_e8m0):
         self.weight = weight
         self.weight_scale_mx_e8m0 = weight_scale_mx_e8m0
-        self.weight_bf16 = weight_bf16
         self.mxfp8_native_ready = True
 
 
@@ -78,10 +77,10 @@ def build(n, k, seed=1234):
         device="cuda",
         dtype=torch.int32,
     )
-    shuffled, scale_e8m0, weight_bf16 = prepare_mxfp8_native_weight(
+    shuffled, scale_e8m0 = prepare_mxfp8_native_weight(
         w, torch.exp2(eb.float() - 127.0), (32, 32)
     )
-    return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0, weight_bf16)
+    return _Layer(shuffled.view(torch.float8_e4m3fn), scale_e8m0)
 
 
 def _timing():
@@ -123,7 +122,6 @@ def main():
     import sglang.srt.layers.mori_mxfp8_gemm as mori_gemm
     from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
         mxfp8_native_blockscaled_linear,
-        native_route_plan,
     )
     from sglang.srt.environ import envs
 
@@ -138,7 +136,6 @@ def main():
             x,
             layer.weight.view(torch.uint8),
             layer.weight_scale_mx_e8m0,
-            weight_bf16=layer.weight_bf16,
         )
 
     timing = _timing()
@@ -174,9 +171,7 @@ def main():
                 "k": k,
                 "m": m,
                 "served": served,
-                "ref_route": native_route_plan(
-                    m, n, k, layer.weight_bf16 is not None, False
-                ),
+                "ref_route": None,
                 "base": t_base,
                 "mori": t_mori,
                 "vram_before": vram_before,

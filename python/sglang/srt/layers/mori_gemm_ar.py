@@ -357,6 +357,12 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     # is the bf16 tensor.
     if isinstance(x, Fp8GridActivation):
         x = x.x
+    # wo_a's MXFP8 epilogue (SGLANG_HIP_WO_A_MXFP8) instead hands over fp8 plus
+    # a ue8m0 scale, with no bf16 left to quantise, and the op does its own
+    # quantisation. Only decode reaches that form, which _eligible declines on
+    # M anyway, so declining here costs no fusing.
+    if not isinstance(x, torch.Tensor):
+        return None
 
     m, k = x.shape
     if not hasattr(layer, "weight_scale_mx_e8m0"):
