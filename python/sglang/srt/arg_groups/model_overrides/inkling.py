@@ -1,7 +1,4 @@
-"""Config-time override declarations for inkling.
-
-Architectures: InklingForConditionalGeneration, InklingForConditionalGenerationMTP.
-"""
+"""Config-time override declarations for inkling."""
 
 import logging
 from typing import Any, Dict

@@ -1,14 +1,8 @@
-"""Config fields of the ``spec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``spec`` bag, which is what ``get_spec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``spec`` namespace."""
 
 from __future__ import annotations
 
+import argparse
 from typing import (
     Literal,
     Optional,
@@ -46,6 +40,10 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_boundary_reduction: A[
+        Literal["ar", "rs", "rsv", "rs+rsv"],
+        Arg(no_cli=True, resolvable=True),
+    ] = "rs+rsv"
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -118,6 +116,11 @@ class Spec(msgspec.Struct):
     ] = 1.0
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
+    ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "
+        "(requires topk=1).",
     ] = False
     speculative_token_map: A[
         Optional[str],
@@ -192,6 +195,21 @@ class Spec(msgspec.Struct):
                 "ascend_tp",
             ],
             resolvable=True,
+        ),
+    ] = None
+    speculative_enable_w4a4_mxfp4_megamoe: A[
+        Optional[bool],
+        Arg(
+            help="Whether the draft model's MXFP4 MegaMoE layers use the W4A4 "
+            "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
+            "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
+            "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
+            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
+            "MegaMoE with a different MMA type from the target may allocate an "
+            "additional MegaMoE symmetric buffer after the KV pool is sized; "
+            "lower --mem-fraction-static if CUDA-graph capture runs out of "
+            "memory.",
+            action=argparse.BooleanOptionalAction,
         ),
     ] = None
     speculative_draft_model_quantization: A[
