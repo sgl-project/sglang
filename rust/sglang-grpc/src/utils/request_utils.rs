@@ -329,8 +329,14 @@ pub(crate) fn build_generate_dict(
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
-    if !req.image_data.is_empty() {
-        d.insert("image_data".into(), serde_json::json!(req.image_data));
+    for (name, sources) in [
+        ("image_data", &req.image_data),
+        ("video_data", &req.video_data),
+        ("audio_data", &req.audio_data),
+    ] {
+        if !sources.is_empty() {
+            d.insert(name.into(), serde_json::json!(sources));
+        }
     }
     d.insert(
         "sampling_params".into(),
@@ -658,6 +664,8 @@ mod tests {
                 "https://example.com/image.png".to_string(),
                 "data:image/png;base64,aW1hZ2U=".to_string(),
             ],
+            video_data: vec!["https://example.com/clip.mp4".to_string()],
+            audio_data: vec!["data:audio/wav;base64,UklGRg==".to_string()],
             sampling_params: Some(proto::SamplingParams {
                 temperature: Some(0.5),
                 max_new_tokens: Some(64),
@@ -682,6 +690,14 @@ mod tests {
             ])
         );
         assert_eq!(
+            mapped["video_data"],
+            serde_json::json!(["https://example.com/clip.mp4"])
+        );
+        assert_eq!(
+            mapped["audio_data"],
+            serde_json::json!(["data:audio/wav;base64,UklGRg=="])
+        );
+        assert_eq!(
             mapped["sampling_params"],
             serde_json::json!({"temperature": 0.5, "max_new_tokens": 64})
         );
@@ -691,10 +707,12 @@ mod tests {
     }
 
     #[test]
-    fn tokenized_request_omits_empty_image_data() {
+    fn tokenized_request_omits_empty_media_data() {
         let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
 
-        assert!(!mapped.contains_key("image_data"));
+        for key in ["image_data", "video_data", "audio_data"] {
+            assert!(!mapped.contains_key(key));
+        }
     }
 
     #[test]
