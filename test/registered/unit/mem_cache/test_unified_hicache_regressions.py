@@ -219,7 +219,8 @@ class TestTransferStreamOrdering(unittest.TestCase):
 
         host = SimpleNamespace(
             layer_num=1,
-            load_to_device_per_layer=lambda pool, h, d, layer, backend, **kw: (
+            prepare_transfer_indices=lambda host, device, backend: (host, device),
+            load_to_device_per_layer_physical=lambda pool, h, d, layer, backend, **kw: (
                 output.copy_(d)
             ),
         )

@@ -58,6 +58,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -72,6 +73,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -88,6 +90,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
+    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -100,6 +103,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -111,6 +115,8 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
+from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -172,6 +178,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    build_server_info,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -323,6 +330,9 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
     )
+    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
+        fast_api_app.state.openai_serving_chat
+    )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
@@ -341,6 +351,11 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
+        fast_api_app.state.openai_serving_chat
+    )
+
+    # Initialize System One compatible decision handler
+    fast_api_app.state.systemone_serving = SystemOneServing(
         fast_api_app.state.openai_serving_chat
     )
 
@@ -489,7 +504,6 @@ app.include_router(v1_loads_router)
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
     get_disagg,
     get_exec,
     get_lora,
@@ -603,14 +617,28 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
-    use the legacy ErrorResponse shape.
+    never reach the client. For /v1/responses, keep OpenAI-style. For
+    /v1/systemone, keep the 422 detail list that the System One API documents.
+    Otherwise use the legacy ErrorResponse shape.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
+        )
+
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path == "/v1/systemone":
+        # The System One API documents FastAPI's default 422 detail list. The
+        # optional input echo is left out, since it can be any client value.
+        detail = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return ORJSONResponse(
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
+            content={"detail": jsonable_encoder(detail)},
         )
 
     exc_str = str(exc)
@@ -832,17 +860,11 @@ async def server_info():
 
     return msgspec_to_builtins(
         {
-            **server_args.resolved_dict(),
-            "launch_command": server_args.launch_command,
-            **_global_state.scheduler_info,
+            **build_server_info(server_args, _global_state.scheduler_info),
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
             "frontend": "python",
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
         }
     )
 
@@ -887,6 +909,11 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # Starlette caches the parsed body, so this is the schema check, not a
+    # second decode.
+    contract_error = generate_contract_error(await request.json())
+    if contract_error is not None:
+        return ORJSONResponse(status_code=400, content={"error": contract_error})
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
@@ -1157,6 +1184,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/set_trace_level", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 def set_trace_level(level: int = Query(..., ge=0)):
     set_global_trace_level(level)
 
@@ -1576,6 +1604,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -1933,6 +1962,14 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
+async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
+        request, raw_request
+    )
+
+
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
@@ -2043,6 +2080,15 @@ async def anthropic_v1_count_tokens(
 ):
     """Anthropic-compatible token counting endpoint."""
     return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+        request, raw_request
+    )
+
+
+## System One compatible decision API
+@app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
+async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
+    """System One compatible decisions, answered by candidate scoring without generation."""
+    return await raw_request.app.state.systemone_serving.handle_request(
         request, raw_request
     )
 
@@ -2205,7 +2251,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
+                for dp_rank in range(get_parallel().num_dp_ranks)
             )
         )
 
@@ -2269,9 +2315,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if get_serving().skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [
+            [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
+        ]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2315,9 +2363,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = [
+            "The capital city of France is"
+        ] * get_parallel().num_dp_ranks
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().num_dp_ranks == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2358,7 +2408,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+                    get_parallel().num_dp_ranks,
                 )
                 logger.info("End of disaggregation warmup")
             else:
@@ -2861,6 +2911,10 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+
+    if get_parallel().node_rank >= 1:
+        # _launch_subprocesses already blocked until the schedulers exited.
+        return
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the

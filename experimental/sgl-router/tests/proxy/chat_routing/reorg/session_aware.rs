@@ -79,6 +79,7 @@ async fn rejected_session_binding_advances_buckets_without_reassignment_or_dispa
             Bucket::new(
                 "a-primary",
                 BucketGroups::Plain(EngineGroup {
+                    worker_services: None,
                     worker_ids: Some([WorkerId("primary".into())].into_iter().collect()),
                     policy: Arc::new(rejected),
                 }),
@@ -86,6 +87,7 @@ async fn rejected_session_binding_advances_buckets_without_reassignment_or_dispa
             Bucket::new(
                 "b-backup",
                 BucketGroups::Plain(EngineGroup {
+                    worker_services: None,
                     worker_ids: Some([WorkerId("backup".into())].into_iter().collect()),
                     policy: Arc::new(accepted),
                 }),

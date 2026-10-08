@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.allocation import alloc_req_slots, mamba_slots_needed
+from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,6 +23,9 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 def _pool(*, extra_buffer=True, lazy=False, overlap=True):
     return SimpleNamespace(
+        mamba_initial_tracking_slots=get_mamba_tracking_slots(
+            extra_buffer=extra_buffer, overlap=overlap, lazy=lazy
+        ),
         enable_mamba_extra_buffer=extra_buffer,
         enable_mamba_extra_buffer_lazy=lazy,
         mamba_ping_pong_track_buffer_size=2 if overlap else 1,
@@ -69,6 +73,7 @@ def _hybrid_pool(available: int):
     pool.enable_mamba_extra_buffer = True
     pool.enable_mamba_extra_buffer_lazy = False
     pool.mamba_ping_pong_track_buffer_size = 2
+    pool.mamba_initial_tracking_slots = 2
     pool.mamba_allocator = SimpleNamespace(schedulable_available_size=lambda: available)
     pool.alloc = lambda reqs: list(range(1, len(reqs) + 1))
     return pool

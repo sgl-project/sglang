@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
+    FLUX3_ACTION_HF_PATHS,
+    is_flux3_action_package,
+)
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_MODEL_IDS,
     is_sensenova_u1_adapter_only_model,
@@ -169,13 +173,15 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
-    "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
+    "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
+    "flux-3-action": "Flux3ActionPipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
@@ -407,6 +413,10 @@ def _get_config_info(
         for registered_hf_id in all_model_hf_paths:
             if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
                 return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+
+    # Local FLUX 3 Action exports are identified by their manifest, not their name.
+    if is_flux3_action_package(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_ACTION_HF_PATHS[0]])
 
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
@@ -692,6 +702,8 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
+    if is_flux3_action_package(model_path):
+        return "Flux3ActionPipeline"
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)
