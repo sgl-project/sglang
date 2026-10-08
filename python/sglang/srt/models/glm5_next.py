@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     is_shared_experts_fusion_disabled,
+    is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -771,16 +772,20 @@ class Glm5NextDecoderLayer(nn.Module):
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
         residual = PLAIN_RESIDUAL_OPS
         if self.config.mhc:
+            fuse_boundaries = is_cross_layer_mhc_fusion_enabled()
+            defers_ffn_post = (
+                fuse_boundaries
+                and get_parallel().pp_size == 1
+                and not is_tbo_enabled()
+                and not get_parallel().enable_attn_tp_input_scattered
+            )
             residual = MHCState(
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
-                hc_ffn_post_pre=(
-                    self.hc_ffn_post_pre
-                    if is_cross_layer_mhc_fusion_enabled()
-                    else None
-                ),
+                hc_ffn_post_pre=self.hc_ffn_post_pre if fuse_boundaries else None,
+                hc_attn_post_pre=self.hc_attn_post_pre if defers_ffn_post else None,
                 is_last_layer=terminal,
             ).residual_ops()
         self.attn_boundary, self.ffn_boundary = append_stages(
@@ -842,12 +847,22 @@ class Glm5NextDecoderLayer(nn.Module):
             out_norm_eps,
         )
 
-    def hc_ffn_post_pre(
-        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    def _hc_post_pre(
+        self,
+        *,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
     ):
         # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
         # still launches separately, so this is two launches instead of three.
-        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        assert self.config.mhc, "_hc_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
             return None
@@ -857,9 +872,9 @@ class Glm5NextDecoderLayer(nn.Module):
             residual=residual.view(num_tokens, hc_mult, hidden_size),
             post=h_post.view(num_tokens, hc_mult),
             comb=h_res.view(num_tokens, hc_mult, hc_mult),
-            hc_fn=self.hc_ffn_fn,
-            hc_scale=self.hc_ffn_scale,
-            hc_base=self.hc_ffn_base,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
             hc_mult=hc_mult,
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
@@ -867,8 +882,8 @@ class Glm5NextDecoderLayer(nn.Module):
             sinkhorn_iters=self.config.hc_sinkhorn_iters,
             norm_weight=out_norm_weight,
             norm_eps=out_norm_eps,
-            # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
-            # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
+            # hc_attn_fn and hc_ffn_fn are both [mix_hc, hc_dim];
+            # the Triton tier takes hc_fn_t, so both boundaries pass it transposed.
             fn_transpose=True,
         )
         if fused is None:
@@ -880,6 +895,36 @@ class Glm5NextDecoderLayer(nn.Module):
             comb.reshape(num_tokens, hc_mult * hc_mult),
             post.reshape(num_tokens, hc_mult),
             norm_fused,
+        )
+
+    def hc_ffn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        return self._hc_post_pre(
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hidden_states=hidden_states,
+            residual=residual,
+            h_res=h_res,
+            h_post=h_post,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+        )
+
+    def hc_attn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        return self._hc_post_pre(
+            hc_fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            hidden_states=hidden_states,
+            residual=residual,
+            h_res=h_res,
+            h_post=h_post,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
