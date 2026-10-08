@@ -7,6 +7,7 @@ from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -131,6 +133,9 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
 # Inherited from the LPM/HRRN fallback bound in _determine_active_policy;
 # not a measured optimum.
 WAITING_PREFIX_REFRESH_MAX_QUEUE = 128
+# A refresh only has to keep waiting prefixes newer than idle ones, so it need not
+# run every round; bounds the per-second walk cost under a long queue.
+WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -199,6 +204,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        self._last_waiting_prefix_refresh = float("-inf")
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -221,23 +227,13 @@ class SchedulePolicy:
             if self.tree_cache.supports_fast_match_prefix():
                 for r in waiting_queue:
                     match_kv_cache(r, self.tree_cache)
-            # Otherwise keep waiting requests' prefixes resident, or the LRU evicts
-            # them while they wait. Head last, so it carries the newest timestamp.
-            elif (
-                envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
-                and self.tree_cache.supports_prefix_sharing()
-            ):
-                for r in reversed(waiting_queue[:WAITING_PREFIX_REFRESH_MAX_QUEUE]):
-                    refresh_waiting_prefix(self.tree_cache, r)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return
-
-        if isinstance(policy, CacheAwarePolicy):
+        elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -280,6 +276,33 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+
+        self._refresh_waiting_prefixes(policy, waiting_queue)
+
+    def _refresh_waiting_prefixes(
+        self, policy: Policy, waiting_queue: List[Req]
+    ) -> None:
+        # Under LRU, a waiting request's prefix ages while it waits and is evicted
+        # before idle prefixes. Refresh in admission order, head last, so eviction
+        # takes the prefix needed latest. Cache-aware policies already refresh as
+        # they match; other eviction strategies rank by other keys, and MRU would
+        # evict the refreshed prefixes first.
+        if (
+            isinstance(policy, CacheAwarePolicy)
+            or not waiting_queue
+            or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+            or get_disagg().disaggregation_mode == "decode"
+            or get_memory().radix_eviction_policy.lower() != "lru"
+            or self.tree_cache.supports_fast_match_prefix()
+            or not self.tree_cache.supports_prefix_sharing()
+        ):
+            return
+        now = time.monotonic()
+        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
+            return
+        self._last_waiting_prefix_refresh = now
+        for r in reversed(waiting_queue[:WAITING_PREFIX_REFRESH_MAX_QUEUE]):
+            refresh_waiting_prefix(self.tree_cache, r)
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (

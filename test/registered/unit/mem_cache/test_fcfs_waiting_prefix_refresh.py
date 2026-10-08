@@ -7,8 +7,10 @@ from dataclasses import replace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers import schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
+    WAITING_PREFIX_REFRESH_INTERVAL_S,
     WAITING_PREFIX_REFRESH_MAX_QUEUE,
     SchedulePolicy,
 )
@@ -36,10 +38,7 @@ OLDER_PREFIX = [1, 2, 3, 4]
 NEWER_PREFIX = [5, 6, 7, 8]
 
 
-class TestFcfsWaitingPrefixRefresh(CustomTestCase):
-    """Under FCFS an LRU eviction must not take the cached prefix of a request that
-    is waiting in the queue while a prefix no pending request needs is available."""
-
+class _WaitingPrefixFixture(CustomTestCase):
     def _make_cache(self, params):
         return RadixCache(params)
 
@@ -85,17 +84,19 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         time.sleep(0.005)
         self.waiting = self._make_req(1, OLDER_PREFIX + [9])
 
-    def _make_policy(self, cache):
+    def _make_policy(self, cache, policy="fcfs"):
         return SchedulePolicy(
-            policy="fcfs",
+            policy=policy,
             tree_cache=cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
 
-    def _make_req(self, rid, tokens):
-        return Req(rid, "", array("q", tokens), SamplingParams())
+    def _make_req(self, rid, tokens, max_new_tokens=128):
+        return Req(
+            rid, "", array("q", tokens), SamplingParams(max_new_tokens=max_new_tokens)
+        )
 
     def _insert(self, tokens, slots):
         self.cache.insert(
@@ -116,14 +117,66 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         self.assertEqual(self._matched_len(OLDER_PREFIX), len(OLDER_PREFIX))
         self.assertEqual(self._matched_len(NEWER_PREFIX), 0)
 
-    def test_refresh_keeps_the_waiting_request_prefix_resident(self):
-        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(True):
-            self.policy.calc_priority([self.waiting])
-        self._assert_older_prefix_survives_one_eviction()
 
-    def test_refresh_disabled_restores_plain_lru(self):
+class TestFcfsWaitingPrefixRefresh(_WaitingPrefixFixture):
+    """Under FCFS an LRU eviction must not take the cached prefix of a request that
+    is waiting in the queue while a prefix no pending request needs is available."""
+
+    def _calc_priority_with_refresh_spy(self, policy, queue):
+        with unittest.mock.patch.object(
+            type(self.cache),
+            "refresh_device_prefix",
+            autospec=True,
+            side_effect=type(self.cache).refresh_device_prefix,
+        ) as refresh:
+            policy.calc_priority(queue)
+        return refresh.call_count
+
+    def test_refresh_skipped_when_disabled_or_not_lru(self):
+        # Every configuration outside FCFS-like policies on LRU must keep main's
+        # eviction order; MRU would evict the refreshed prefixes first.
         with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(False):
-            self.policy.calc_priority([self.waiting])
+            self.assertEqual(
+                self._calc_priority_with_refresh_spy(self.policy, [self.waiting]), 0
+            )
+        for eviction_policy in ("mru", "fifo", "lfu"):
+            with self.subTest(eviction_policy=eviction_policy):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy", radix_eviction_policy=eviction_policy
+                    ),
+                    role="test",
+                )
+                policy = self._make_policy(self.cache)
+                self.assertEqual(
+                    self._calc_priority_with_refresh_spy(policy, [self.waiting]), 0
+                )
+
+    def test_refresh_is_throttled(self):
+        clock = [1000.0]
+        with unittest.mock.patch.object(
+            schedule_policy.time, "monotonic", lambda: clock[0]
+        ):
+            self.assertEqual(
+                self._calc_priority_with_refresh_spy(self.policy, [self.waiting]), 1
+            )
+            clock[0] += WAITING_PREFIX_REFRESH_INTERVAL_S / 2
+            self.assertEqual(
+                self._calc_priority_with_refresh_spy(self.policy, [self.waiting]), 0
+            )
+            clock[0] += WAITING_PREFIX_REFRESH_INTERVAL_S
+            self.assertEqual(
+                self._calc_priority_with_refresh_spy(self.policy, [self.waiting]), 1
+            )
+
+    def test_refresh_follows_the_sorted_order(self):
+        # LOF admits the longest output first, so after sorting it is the head and
+        # its prefix must be evicted last, whatever the arrival order.
+        short_output = self._make_req(2, OLDER_PREFIX + [9], max_new_tokens=8)
+        long_output = self._make_req(3, NEWER_PREFIX + [9], max_new_tokens=512)
+        policy = self._make_policy(self.cache, policy="lof")
+        policy.calc_priority([short_output, long_output])
         self.cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         self.assertEqual(self._matched_len(OLDER_PREFIX), 0)
         self.assertEqual(self._matched_len(NEWER_PREFIX), len(NEWER_PREFIX))
@@ -163,6 +216,15 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         self.assertEqual(calls, [])
         self._assert_older_prefix_survives_one_eviction()
 
+
+class TestFcfsWaitingPrefixRefreshUnified(TestFcfsWaitingPrefixRefresh):
+    """The same contract on UnifiedRadixCache, the default prefix cache."""
+
+    def _make_cache(self, params):
+        return UnifiedRadixCache(replace(params, tree_components=(ComponentType.FULL,)))
+
+
+class TestChunkCacheSkipsWaitingPrefixRefresh(_WaitingPrefixFixture):
     def test_chunk_cache_skips_the_refresh(self):
         # --disable-radix-cache deployments have no tree or LRU state to refresh; the
         # scheduler hot path must not build keys or match for every waiting request.
@@ -185,13 +247,6 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             policy.calc_priority([self.waiting])
         match_prefix.assert_not_called()
         refresh.assert_not_called()
-
-
-class TestFcfsWaitingPrefixRefreshUnified(TestFcfsWaitingPrefixRefresh):
-    """The same contract on UnifiedRadixCache, the default prefix cache."""
-
-    def _make_cache(self, params):
-        return UnifiedRadixCache(replace(params, tree_components=(ComponentType.FULL,)))
 
 
 if __name__ == "__main__":

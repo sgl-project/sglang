@@ -599,13 +599,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
-    def refresh_device_prefix(self, key: RadixKey) -> int:
+    def refresh_device_prefix(self, key: RadixKey) -> None:
         # The walk and its actions only; no session shortcut, finalizers or linker.
         if self.disable:
-            return 0
+            return
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
         self._apply_cache_actions(result.cache_actions)
-        return len(result.device_indices)
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
