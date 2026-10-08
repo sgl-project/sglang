@@ -408,7 +408,6 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                     decoded_frames[
                         0, :, -request_state.inputs.num_frames_conditioning :
                     ]
-                    .clone()
                     .detach()
                     .to(torch.bfloat16)
                 )
