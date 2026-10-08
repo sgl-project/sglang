@@ -288,6 +288,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     _use_draft_input_embeds = False
     _backend_can_run_prefill_cuda_graph = None
+    _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
     def __init__(self, model_runner: ModelRunner):
