@@ -421,18 +421,6 @@ def get_hf_config(
     return config
 
 
-def get_config(
-    model: str,
-    trust_remote_code: bool,
-    revision: Optional[str] = None,
-    model_override_args: Optional[dict] = None,
-    **kwargs,
-):
-    return AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
-
-
 def load_dict(file_path):
     if not os.path.exists(file_path):
         return {}

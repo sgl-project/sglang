@@ -733,7 +733,7 @@ def _canonicalize_modulation_exclude(module_name: str) -> str:
     return module_name
 
 
-def _build_nvfp4_config_from_safetensors_files(
+def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
@@ -945,17 +945,3 @@ def _build_nvfp4_config_from_safetensors_files(
             e,
         )
         return None
-
-
-def build_nvfp4_config_from_safetensors_list(
-    file_paths: list[str],
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    return _build_nvfp4_config_from_safetensors_files(
-        file_paths,
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )
