@@ -634,7 +634,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             is_sharded_weight = getattr(param, "is_sharded_weight", False)
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow
-            is_sharded_weight = is_sharded_weight
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = tp_rank * shard_size
@@ -1032,7 +1031,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             is_sharded_weight = getattr(param, "is_sharded_weight", False)
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow
-            is_sharded_weight = is_sharded_weight
 
             shard_idx = 0
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)

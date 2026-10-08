@@ -183,7 +183,6 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         device: torch.device,
         **kwargs: dict[str, Any],
     ) -> VideoSparseAttentionMetadata:
-        patch_size = patch_size
         dit_seq_shape = (
             raw_latent_shape[0] // patch_size[0],
             raw_latent_shape[1] // patch_size[1],
