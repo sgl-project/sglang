@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -27,7 +28,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -37,11 +37,19 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
 )
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearParallelGroup,
+    RowParallelLinear,
+    resolve_linear_parallel_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -108,23 +116,16 @@ _is_cpu = is_cpu()
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
-def _resolve_vision_tp(
+def _resolve_vision_parallel_group(
     *,
     use_data_parallel: bool,
-    tp_size: Optional[int],
-    tp_rank: Optional[int],
-) -> tuple[int, int]:
+    parallel_group: Optional[LinearParallelGroup],
+) -> LinearParallelGroup:
     if use_data_parallel:
-        if tp_size is not None or tp_rank is not None:
+        if parallel_group is not None:
             raise ValueError("Explicit vision TP cannot be combined with data parallel")
-        return 1, 0
-    if (tp_size is None) != (tp_rank is None):
-        raise ValueError("Vision tp_size and tp_rank must be set together")
-    if tp_size is None:
-        parallel = get_parallel()
-        return parallel.attn_tp_size, parallel.attn_tp_rank
-    assert tp_rank is not None
-    return tp_size, tp_rank
+        return "replicated"
+    return "attn_tp" if parallel_group is None else parallel_group
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -137,14 +138,22 @@ class Qwen3_VisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ):
         super().__init__()
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+        parallel_group = _resolve_vision_parallel_group(
+            use_data_parallel=use_data_parallel, parallel_group=parallel_group
+        )
+        _, tp_size = resolve_linear_parallel_group(parallel_group)
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
         )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
@@ -152,17 +161,16 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
+        self.tp_group = self.linear_fc1.tp_group
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
             in_features,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
@@ -293,45 +301,55 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        tp_size: Optional[int] = None,
-        tp_rank: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
+        disable_merger_proj: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.disable_merger_proj = disable_merger_proj
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.padded_context_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = RowParallelLinear(
-            self.padded_context_dim,
-            dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
-        )
+        if not disable_merger_proj:
+            parallel_group = _resolve_vision_parallel_group(
+                use_data_parallel=use_data_parallel, parallel_group=parallel_group
+            )
+            _, tp_size = resolve_linear_parallel_group(parallel_group)
+            # TODO: this layer shards over attention TP but reduces over the full TP
+            # group without attention DP; reduce over the attention-TP group so
+            # attention CP narrower than TP can run it.
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=tp_size,
+                reduces_over_attn_tp=is_dp_attention_enabled(),
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
+            )
+            self.linear_fc1 = ColumnParallelLinear(
+                self.hidden_size,
+                self.padded_context_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc1", prefix),
+                parallel_group=parallel_group,
+            )
+            self.tp_group = self.linear_fc1.tp_group
+            self.act_fn = nn.GELU()
+            self.linear_fc2 = RowParallelLinear(
+                self.padded_context_dim,
+                dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc2", prefix),
+                parallel_group=parallel_group,
+                use_dp_attention_reduce=is_dp_attention_enabled(),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_postshuffle_norm:
@@ -339,10 +357,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
-        x_parallel, _ = self.linear_fc1(x)
-        x_parallel = self.act_fn(x_parallel)
-        out, _ = self.linear_fc2(x_parallel)
-        return out
+        if not self.disable_merger_proj:
+            x_parallel, _ = self.linear_fc1(x)
+            x_parallel = self.act_fn(x_parallel)
+            x, _ = self.linear_fc2(x_parallel)
+        return x
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
@@ -355,7 +374,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -369,9 +388,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_hidden_size = vision_config.out_hidden_size * (
-            1 + len(self.deepstack_visual_indexes)
+        self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
+        merger_out_dim = (
+            self.hidden_size * self.spatial_merge_unit
+            if self.disable_merger_proj
+            else vision_config.out_hidden_size
         )
+        self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
@@ -441,6 +464,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            disable_merger_proj=self.disable_merger_proj,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -455,6 +479,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    disable_merger_proj=self.disable_merger_proj,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -1194,21 +1219,23 @@ class Qwen3LLMModel(Qwen3Model):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            capture_output = (
+                aux_hidden_states.capture
+                if layer_idx in self.layers_to_capture
+                else None
+            )
 
             if self.use_hf_deepstack_order:
                 # HF-order path (RL on-policy / FSDP). SGLang applies residual at the START of the
@@ -1217,29 +1244,31 @@ class Qwen3LLMModel(Qwen3Model):
                 deepstack_embeds = self.get_deepstack_embeds(
                     layer_idx - 1, input_deepstack_embeds
                 )
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
                     post_residual_addition=deepstack_embeds,
+                    capture_output=capture_output,
                 )
             else:
                 # Inference path: add deepstack directly to hidden_states at the end of the layer
                 # (original, grounding-correct order).
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
+                    capture_output=capture_output,
                 )
                 if (
                     input_deepstack_embeds is not None
                     and layer_idx in self.deepstack_embed_to_decoder_layer
                 ):
                     sep = self.hidden_size * layer_idx
-                    hidden_states.add_(
-                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    hidden_states = residual_batch.add_to_output(
+                        hidden_states,
+                        forward_batch,
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size],
                     )
 
         # Handle deepstack for the last processed layer (HF-order path only).
@@ -1250,20 +1279,14 @@ class Qwen3LLMModel(Qwen3Model):
         )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(
-                        hidden_states, residual, post_residual_addition=last_deepstack
-                    )
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self.norm,
+            post_residual_addition=last_deepstack,
+            skip_empty=True,
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1297,7 +1320,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -1411,7 +1434,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -1753,17 +1776,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]  # Specific layers for EAGLE3 support
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 def _require_vision(model) -> None:
