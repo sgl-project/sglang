@@ -169,7 +169,7 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 
 #### Request quality
 
-`quality` selects a cumulative request-level optimization tier: `lossless` keeps the selected deployment's reference path and all unconditional bit-exact replacements; `extra-high` additionally enables only request-gated DiT/VAE kernel fusions; `high` includes the full `extra-high` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
+`quality` selects a cumulative request-level optimization tier: `exact` keeps the selected deployment's reference path and all unconditional bit-exact replacements, so output is bit-identical to it in the same environment; `lossless` additionally enables the request-gated DiT/VAE fusions that keep the reference math and every operand's precision and only move the rounding; `high` includes the full `lossless` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. `extra-high` is accepted as the former name of `lossless`. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
 
 **Python Example (b64_json response):**
 

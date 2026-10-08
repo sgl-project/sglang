@@ -635,7 +635,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if (
                 capture_decode_cuda_graph
                 and current_platform.is_out_of_tree()
-                and not current_platform.support_cuda_graph()
+                and not current_platform.capabilities.graph_capture
             ):
                 capture_decode_cuda_graph = False
                 logger.warning(

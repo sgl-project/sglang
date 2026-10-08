@@ -167,13 +167,13 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
-        self.prefix_indices = torch.empty(0, dtype=torch.long)
+        self.prefix_len = 0
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
-        # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
+        # MlxTpModelWorker._chunk_needs_logits: extend_end=None means
         # "not truncated" (final chunk / plain prefill).
-        self.extend_range = None
+        self.extend_end = None
         self.full_untruncated_fill_ids = self.fill_ids
 
     def get_fill_ids(self):
@@ -267,18 +267,18 @@ class TestMlxExtendRouting(CustomTestCase):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
-        # Untruncated (extend_range None) => final chunk => logits required.
+        # Untruncated (extend_end None) => final chunk => logits required.
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
 
     def test_sync_non_final_chunk_skips_logits(self):
-        """Head-skip derivation: a scheduler-truncated chunk (extend_range.end
+        """Head-skip derivation: a scheduler-truncated chunk (extend_end
         below the request's full untruncated length) reaches the runner with
         needs_logits=False; its next-token output is popped as the stale
         intermediate token, so computing the vocab head for it is pure waste.
         Everything else about routing is unchanged."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)  # 4 < 8: non-final
+        req.extend_end = 4  # 4 < 8: non-final
         runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
@@ -314,7 +314,7 @@ class TestMlxExtendRouting(CustomTestCase):
         """Async twin of the head-skip derivation guard."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)
+        req.extend_end = 4
         runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
