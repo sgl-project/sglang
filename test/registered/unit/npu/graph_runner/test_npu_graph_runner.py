@@ -49,6 +49,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner.is_dllm = False
     runner.if_use_v2 = False
     runner.use_fias_v2_bsnd = False
+    runner.mla_dcp_graph = False
     runner.capture_forward_mode = SimpleNamespace(is_target_verify=lambda: False)
     runner._init_arch_map()
 

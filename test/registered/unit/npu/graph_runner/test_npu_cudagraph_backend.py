@@ -27,13 +27,21 @@ def _make_backend():
         current_device=mock.Mock(return_value=3),
         synchronize=mock.Mock(),
         set_device=mock.Mock(),
+        Event=mock.Mock(),
     )
     runner = SimpleNamespace(
         device_module=device_module,
         model_runner=SimpleNamespace(tp_group=SimpleNamespace(barrier=mock.Mock())),
         enable_torch_compile=False,
     )
-    with mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None):
+    with (
+        mock.patch.object(
+            mod,
+            "get_parallel",
+            return_value=SimpleNamespace(tp_group=runner.model_runner.tp_group),
+        ),
+        mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
+    ):
         return mod.NPUCudaGraphBackend(runner), runner
 
 
@@ -102,6 +110,7 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         self.assertEqual(set(update_input[0]), {"seq_lens"})
         self.assertEqual(update_input[0]["seq_lens"].dtype, torch.int32)
         self.assertTrue(torch.equal(update_input[0]["seq_lens"], torch.tensor([7, 9])))
+        runner.device_module.Event.return_value.record.assert_called_once_with()
         self.assertEqual(output, "output")
 
     def test_capture_session_reuses_pool_and_resets_stream(self):
