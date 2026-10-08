@@ -10,11 +10,11 @@ instead of the whole log.
 Usage:
     python3 scripts/analyze_dsv4_cmpidx.py /tmp/run.log
 
-Probe the run first, e.g.:
-    DSV4_DUMP_CMPIDX=all DSV4_DUMP_IDXK=0 DSV4_DUMP_C4KV=0 DSV4_DUMP_OSHAPE=all \
-        DSV4_DUMP_MIN_POS=17522 DSV4_DUMP_MAX_POS=17650 \
-        bash start_test.sh 2>&1 | tee /tmp/run.log
-    bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh
+Notes on [CMPIDX]: the whole-tensor md5 is only comparable when the row count
+(ntok) matches. The prefill rows have different ntok between a full-prefill miss
+(e.g. 17523) and a suffix-prefill hit (e.g. 1139), so for those we compare the
+LAST-row ``tail`` (same absolute query token on both sides). Decode rows
+(ntok=1) are same-shape and compared by md5.
 """
 import re
 import sys
@@ -24,6 +24,7 @@ TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|OSHAPE)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
+OSHAPE_KEYS = ("ratio", "ori_page", "ori_bt", "s2Size", "cmp_page", "cmp_bt")
 
 
 def _int(d, k, default=-1):
@@ -37,8 +38,7 @@ def parse(path):
     """Parse probe lines into field-dicts per tag.
 
     Rows produced before c85e85c lack ``lastpos`` on [IDXK]/[C4KV]; infer it
-    from the most recent [CMPIDX] line (same forward step), so old logs still
-    align.
+    from the most recent [CMPIDX] line (same forward step), so old logs align.
     """
     recs = defaultdict(list)
     cur_lp = None
@@ -58,10 +58,7 @@ def parse(path):
 
 
 def segment(rows):
-    """Split rows into requests (new request when lastpos decreases).
-
-    Returns [{'steps': {lastpos: {layer: row}}, 'ntok0': first ntok or None}].
-    """
+    """Split rows into requests (new request when lastpos decreases)."""
     reqs = []
     for r in rows:
         lp = _int(r, "lastpos")
@@ -75,25 +72,31 @@ def segment(rows):
     return reqs
 
 
-def sig(tag, rec):
-    if tag == "OSHAPE":
-        return "|".join(
-            rec.get(k, "?")
-            for k in ("ratio", "ori_page", "ori_bt", "s2Size",
-                      "cmp_page", "cmp_bt", "sparseK")
-        )
-    return rec.get("md5")
+def oshape_sig(rec):
+    return "|".join(rec.get(k, "?") for k in OSHAPE_KEYS)
 
 
 def compare(tag, a_steps, b_steps):
-    diffs = []
-    common = sorted(set(a_steps) & set(b_steps))
-    for lp in common:
+    """Return (n_lastpos, same_shape_diffs, prefill_diffs, n_prefill_rows)."""
+    same_shape, prefill, n_lp, n_pre = [], [], 0, 0
+    for lp in sorted(set(a_steps) & set(b_steps)):
+        n_lp += 1
         for ly in set(a_steps[lp]) & set(b_steps[lp]):
-            a, b = sig(tag, a_steps[lp][ly]), sig(tag, b_steps[lp][ly])
-            if a != b:
-                diffs.append((lp, ly, a, b))
-    return len(common), diffs
+            a, b = a_steps[lp][ly], b_steps[lp][ly]
+            if tag == "OSHAPE":
+                ea, eb = oshape_sig(a), oshape_sig(b)
+                if ea != eb:
+                    same_shape.append((lp, ly, ea, eb))
+            elif a.get("ntok") == b.get("ntok"):
+                ma, mb = a.get("md5"), b.get("md5")
+                if ma != mb:
+                    same_shape.append((lp, ly, ma, mb))
+            else:  # prefill: row counts differ -> compare the last-row tail
+                n_pre += 1
+                ta, tb = a.get("tail", "?"), b.get("tail", "?")
+                if ta != tb:
+                    prefill.append((lp, ly, ta, tb))
+    return n_lp, same_shape, prefill, n_pre
 
 
 def main(path):
@@ -113,7 +116,6 @@ def main(path):
               f"  steps={len(rq['steps'])}")
     if len(cmp_reqs) > MAX_REQ_SHOWN:
         print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
-    miss = cmp_reqs[miss_i]
     print(f"\nMISS = req{miss_i} (largest prefill ntok); each HIT compared to it.")
 
     for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE"):
@@ -125,21 +127,22 @@ def main(path):
         if tag != "CMPIDX" and len(reqs) != len(cmp_reqs):
             print(f"  note: {len(reqs)} requests here vs {len(cmp_reqs)} in "
                   "[CMPIDX]; aligning by index")
+        if miss_i >= len(reqs):
+            print(f"  req{miss_i} missing for [{tag}]; cannot compare")
+            continue
         for i, rq in enumerate(reqs):
             if i == miss_i or i >= len(cmp_reqs):
                 continue
-            if miss_i >= len(reqs):
-                print(f"  req{miss_i} missing for [{tag}]; cannot compare")
-                continue
-            n, diffs = compare(tag, reqs[miss_i]["steps"], rq["steps"])
-            print(f"  MISS(req{miss_i}) vs HIT(req{i}):"
-                  f" common(lastpos,layer)={n}  differing={len(diffs)}")
-            for (lp, ly, a, b) in diffs[:MAX_DIFF_SHOWN]:
+            n, same, pre, n_pre = compare(tag, reqs[miss_i]["steps"], rq["steps"])
+            print(f"  MISS(req{miss_i}) vs HIT(req{i}): lastpos={n}"
+                  f"  SAME-SHAPE differing={len(same)} (real)"
+                  f"  PREFILL rows={n_pre} differing={len(pre)} (tail-only)")
+            for (lp, ly, a, b) in (same + pre)[:MAX_DIFF_SHOWN]:
                 print(f"     lastpos={lp} layer={ly}"
                       f"\n        miss={a}\n        hit ={b}")
-            if len(diffs) > MAX_DIFF_SHOWN:
-                print(f"     ... {len(diffs) - MAX_DIFF_SHOWN} more")
-            if not diffs:
+            if len(same) + len(pre) > MAX_DIFF_SHOWN:
+                print(f"     ... {len(same) + len(pre) - MAX_DIFF_SHOWN} more")
+            if not same and not pre:
                 print("     IDENTICAL")
 
 
