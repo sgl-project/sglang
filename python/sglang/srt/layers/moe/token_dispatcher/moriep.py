@@ -140,9 +140,9 @@ def _aiter_supports_mxfp8_dispatch() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def _mori_fp8_direct_cast_saturates() -> bool:
-    # Older MORI fp8_direct_cast combine (EPv1 and EPv2) emits NaN past the fp8 max;
-    # the fix added this EPv2 helper. Drop once the minimum MORI carries the fix.
+def _mori_epv2_fp8_direct_cast_saturates() -> bool:
+    # Older MORI EPv2 fp8_direct_cast combine emits NaN past the fp8 max; the fix
+    # added this helper. Drop once the minimum MORI carries the fix.
     try:
         from mori.ops.dispatch_combine_v2 import intranode_kernels
     except ImportError:
@@ -884,7 +884,6 @@ class _MoriEPDispatcherImplBase:
         # Combine overrides read the final dispatch dtype, so apply dispatch first.
         self._apply_dispatch_dtype_override()
         self._apply_combine_dtype_override()
-        self._fall_back_from_nan_direct_cast()
 
     def _default_combine_dtype(self, weight_dtype) -> CombineDtype:
         raise NotImplementedError
@@ -923,19 +922,6 @@ class _MoriEPDispatcherImplBase:
 
     def _apply_combine_dtype_override(self):
         raise NotImplementedError
-
-    def _fall_back_from_nan_direct_cast(self):
-        if (
-            self.combine_dtype == CombineDtype.fp8_direct_cast
-            and not _mori_fp8_direct_cast_saturates()
-        ):
-            logger.warning_once(
-                "This MORI build's fp8_direct_cast combine emits NaN instead of "
-                "saturating values past the fp8 max, which corrupts models with "
-                "large expert outputs such as DeepSeek-V4; falling back to fp8 "
-                "(blockwise) combine. Upgrade MORI to use fp8_direct_cast."
-            )
-            self.combine_dtype = CombineDtype.fp8
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -1439,6 +1425,17 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
                 f"got {self.dispatch_dtype}; falling back to bf16 combine."
             )
             self.combine_dtype = CombineDtype.bf16
+        if (
+            self.combine_dtype == CombineDtype.fp8_direct_cast
+            and not _mori_epv2_fp8_direct_cast_saturates()
+        ):
+            logger.warning_once(
+                "This MORI build's EPv2 fp8_direct_cast combine emits NaN instead "
+                "of saturating values past the fp8 max, which corrupts models with "
+                "large expert outputs such as DeepSeek-V4; falling back to fp8 "
+                "(blockwise) combine. Upgrade MORI to use fp8_direct_cast."
+            )
+            self.combine_dtype = CombineDtype.fp8
 
     def _initialize_op(self):
         # set_quant_config runs during model loading, before CUDA graph capture,
