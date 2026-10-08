@@ -3461,7 +3461,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The gather ships the whole padded chunk and the MoE runs on it, but
             # graph replay never refreshes pad rows, so they hold stale pool
             # memory (bf16-max scale) that overflows the MoE and the combine.
-            _mask_dp_pad_rows(local_hidden_states, forward_batch)
+            if _is_hip:
+                _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -4128,7 +4129,8 @@ class DeepseekV4Model(nn.Module):
         late_dp_counts = None
         saved_dp = None
         if (
-            self.late_layer_start is not None
+            _is_hip
+            and self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
         ):

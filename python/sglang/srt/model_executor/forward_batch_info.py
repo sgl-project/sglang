@@ -2116,7 +2116,8 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
     return (
-        get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
+        _is_hip
+        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
         and get_parallel().attn_dp_size > 1
         and get_moe_a2a_backend().is_none()
     )
