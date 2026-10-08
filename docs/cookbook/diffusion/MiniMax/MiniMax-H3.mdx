@@ -847,68 +847,71 @@ The nine sigma grid points give eight denoiser evaluations. These settings
 must match the fused heads; the server rejects a different step count or
 shift. Use `quality: "lossless"` in requests.
 
-## 6. FastH3: 4-step distilled preview
+## 6. FastH3: 8-step distilled
 
-[FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree)
-is a 4-step DMD2 distillation of MiniMax-H3, trained data-free with Video
-Sparse Attention (VSA) at 0.9 sparsity and 64-token tiles. Only the T2VA
-capability was distilled: requests must use `task: "t2va"`, and `fl2va` /
-`ref2va` requests are rejected. The checkpoint inherits the MiniMax-H3
-Community License.
+[FastVideo/FastVideo-FastH3-8-Step-V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
+is an 8-step DMD2 distillation of MiniMax-H3, trained data-free with Video
+Sparse Attention (VSA) at 0.8 sparsity and 64-token tiles, with video / audio
+scheduler shifts 10 / 3. Only the T2VA capability was distilled: requests must
+use `task: "t2va"`, and `fl2va` / `ref2va` requests are rejected. The
+checkpoint inherits the MiniMax-H3 Community License.
 
 Pass the repository directly to `--model-path`. The flat native-Diffusers
 upload is materialized into the base-H3 layout through a registered model
 overlay; the only non-symlink step is a one-time re-serialization of the
 roughly 10 GB video VAE on first launch.
 
-```bash 4×B300 VSA-H3
+```bash 4×GB300 VSA-H3
 sglang serve \
-  --model-path FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
+  --model-path FastVideo/FastVideo-FastH3-8-Step-V2 \
   --num-gpus 4 \
-  --attention-backend video_sparse_attn_h3 \
-  --attention-backend-config '{"VSA_sparsity": 0.9}' \
+  --component-attention-backends transformer=video_sparse_attn_h3 \
   --port 30010
 ```
 
 Requests use the same asynchronous video endpoint as the base model, with
 `task: "t2va"`, `conditions: []`, and a target such as
 `{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}`. The
-request default is `num_inference_steps: 5`: five points on the standard
-shift-12/shift-3 sigma grid, i.e. the four distilled DiT evaluations. Any
-other step count is rejected.
+request default is `num_inference_steps: 9`: nine sigma grid points, i.e. the
+eight distilled DiT evaluations on the checkpoint's trained rungs
+`[999, 874, 749, 624, 500, 375, 250, 125]` (unshifted timesteps over 1000,
+shifted once per modality, as FastVideo runs them). Any other step count is
+rejected. The trained sparsity 0.8 is the default; `--attention-backend-config
+'{"VSA_sparsity": ...}'` overrides it. FastH3 requests default to
+`quality: "lossless"`, which fuses the VAE decoder's per-head QK RMSNorm and
+RoPE and runs its attention on cuDNN SDPA; `quality: "exact"` keeps the
+reference decoder kernels. At every quality level FastH3 decodes each GPU's
+spatial VAE tiles as one batch rather than one at a time, which changes GEMM
+shapes and so the output at rounding level; base MiniMax-H3 decodes tile by
+tile.
 
-`video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
-Triton block-sparse kernel (SM90 / SM100 / SM103) over segment-pure prefix
-tiles and (4, 4, 4) video tiles, driven by the checkpoint's trained
-`to_gate_compress` compression branch. Only the DiT runs sparse; the token
-refiner, text encoder, and VAEs keep their dense defaults. Ulysses sequence
-parallelism is supported. See
+`video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: in-tree
+block-sparse kernels (FastVideo's native tcgen05 forward on SM100 / SM103, a
+Triton tile-64 kernel on SM90) over segment-pure prefix tiles and (4, 4, 4)
+video tiles, driven by the checkpoint's trained
+`to_gate_compress` compression branch. Select it for the transformer only, as
+with cube sparse attention: the packed DiT blocks run sparse while the token
+refiner falls back to dense FA inside the backend, and the text encoder and
+VAEs keep their own backends. Ulysses sequence parallelism is supported. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for
 `VSA_sparsity`, `vsa_mode`, `vsa_dense_first_n_steps`, and
 `vsa_dense_layers`. Every dense backend that runs on base H3 (`fa`,
 `torch_sdpa`, ...) also runs on the FastH3 weights without VSA flags, and
 `sglang generate` takes the same flags as `sglang serve`.
 
-Measured latencies for the 4× B300 recipe are in
-[FastH3 on B300](#fasth3-on-b300).
+Measured latencies for the 4× GB300 recipe are in
+[FastH3 on GB300](#fasth3-on-gb300).
 
-FastH3 rejects deployment options that do not apply to the distilled preview
-instead of silently ignoring them: `--model-variant`, `quality: "high"`,
-`fl2va` / `ref2va` requests, and, with VSA-H3, `--ring-degree` greater than 1,
-`torch.compile`, and breakable CUDA graph execution.
-
-<Warning>
-The sibling `FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA` adapters carry
-full-rank `.diff` / `.diff_b` deltas and `set_weight` gate tensors beyond the
-LoRA contract; `--lora-path` rejects them with an explicit error. Serve the
-merged VSA-DataFree checkpoint above instead.
-</Warning>
+FastH3 rejects deployment options that do not apply to the distilled
+checkpoint instead of silently ignoring them: `--model-variant`,
+`quality: "high"`, `fl2va` / `ref2va` requests, and, with VSA-H3,
+`--ring-degree` greater than 1, `torch.compile`, and breakable CUDA graph
+execution.
 
 <Note>
-Upstream labels this checkpoint a preview. Quality gaps versus base H3 on hard
-motion and fine detail are properties of the released distillation, not of the
-SGLang port. Use base MiniMax-H3 when output quality matters more than
-latency.
+Quality gaps versus base H3 on hard motion and fine detail are properties of
+the released distillation, not of the SGLang port. Use base MiniMax-H3 when
+output quality matters more than latency.
 </Note>
 
 ## 7. VDN-H3: hybrid attention, 8-step distill
@@ -1008,18 +1011,20 @@ done
 `quality` is a cumulative request-scoped optimization parameter with three
 levels:
 
-- `"exact"` (default): the exact reference path. Output is bit-exact
+- `"exact"`: the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
-- `"lossless"`: includes the global fusion-only tier but does not enable
-  Cache-DiT or another approximate optimization. MiniMax-H3 currently has no
-  request-gated fusion site, so its denoise path is the same as `exact`.
+- `"lossless"` (default): includes the global fusion-only tier but does not enable
+  Cache-DiT or another approximate optimization. The denoise path is the same
+  as `exact`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
+  RoPE into one launch and runs its attention on cuDNN SDPA (rounding-level
+  differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `lossless`), but output is no longer bit-identical to the reference.
+  `exact`), but output is no longer bit-identical to the reference.
 
 One resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
-`quality: "lossless"` or `quality: "lossless"` request removes the hooks
+`quality: "exact"` or `quality: "lossless"` request removes the hooks
 before denoising.
 
 Start the validated server once:
@@ -1044,23 +1049,25 @@ Then choose a request level:
 
 <Tabs>
 
-<Tab title="lossless (default)">
+<Tab title="exact">
 
-Native denoising with no feature-cache approximation. This is the default;
-omitting the field is equivalent.
+Native denoising and VAE decode with no feature-cache approximation or
+quality-gated VAE fusions.
 
 ```json Request field
 {
-  "quality": "lossless"
+  "quality": "exact"
 }
 ```
 
 </Tab>
 
-<Tab title="lossless">
+<Tab title="lossless (default)">
 
 The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-currently follows the same H3 denoise path as `exact`.
+follows the same H3 denoise path as `exact`; only the VAE decoder's fused
+QK RMSNorm + RoPE and cuDNN SDPA attention differ.
+Omitting the field selects this level.
 
 ```json Request field
 {
@@ -1073,7 +1080,7 @@ currently follows the same H3 denoise path as `exact`.
 <Tab title="high">
 
 The audited accelerated path. Use it when you can trade bit-exactness for
-latency while keeping output closest to the same-seed lossless trajectory.
+latency while keeping output closest to the same-seed exact trajectory.
 
 ```json Request field
 {
@@ -1087,10 +1094,10 @@ latency while keeping output closest to the same-seed lossless trajectory.
 
 The measured trade-off is:
 
-| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
+| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />exact | PSNR vs <br />exact | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `exact` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; no H3-specific request-gated site yet |
+| `lossless` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
@@ -1608,29 +1615,32 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 | Ref2VA | FP8 | fold | 112.0 s | 34.44 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | replicate | 116.0 s | 33.42 s | **27.12 s** | 93,396 MB |
 
-### FastH3 on B300
+### FastH3 on GB300
 
-The same 4× B300 host served [FastH3](#6-fasth3-4-step-distilled-preview)
-with the VSA-H3 recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
-`num_inference_steps: 5`, seed 1000, eager BF16, Ulysses4, `VSA_sparsity` 0.9).
-E2E is the client wall clock of a `/v1/videos` request including decode,
-muxing, and file output, median of three requests after one warm request;
-the stage columns are the server timings of the same request. H3 aligns the
-requested durations to 124, 243, and 362 frames. Client RTF is E2E divided by
-the video duration:
+A 4× GB300 host served [FastH3](#6-fasth3-8-step-distilled) with the VSA-H3
+recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
+`num_inference_steps: 9`, the default `quality: "extra-high"` and sparsity 0.8,
+eager BF16, Ulysses4, `NCCL_NVLS_ENABLE=0`), measured with the MP4 encoded
+while the VAE decodes
+([sgl-project/sglang#41819](https://github.com/sgl-project/sglang/pull/41819)).
+The workload is 72 requests at
+concurrency 1 after one warm request per shape: six scene families, 1,000- and
+10,000-token prompts, 5 / 10 / 15 s, two seeds, every prompt unique so no
+conditioning cache hits. E2E is the client wall clock from submission to the
+last byte of the MP4; the stage columns are the server timings of the same
+requests. Each cell is the median of the 12 requests of that shape:
 
-| Requested / aligned | Encoder | Denoise (4 forwards) | Decode | Transport + MP4 | E2E | Client RTF | Peak/GPU |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 5 s / 124 | 0.07 s | 2.18 s | 0.87 s | 0.9 s | **4.1 s** | 0.79 | 95,744 MB |
-| 10 s / 243 | 0.07 s | 4.83 s | 1.71 s | 1.3 s | **8.0 s** | 0.79 | 102,666 MB |
-| 15 s / 362 | 0.07 s | 8.80 s | 2.56 s | 1.8 s | **13.3 s** | 0.88 | 110,774 MB |
+| Prompt / requested / aligned | Text encoder | Denoise (8 forwards) | Decode (video + audio) | E2E | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1K / 5 s / 124 | 0.10 s | 3.84 s | 0.56 s | **5.20 s** | 94,468 MB |
+| 1K / 10 s / 243 | 0.10 s | 8.45 s | 1.12 s | **10.74 s** | 97,628 MB |
+| 1K / 15 s / 362 | 0.10 s | 14.85 s | 1.72 s | **18.24 s** | 100,246 MB |
+| 10K / 5 s / 124 | 0.18 s | 6.31 s | 0.55 s | **7.90 s** | 94,510 MB |
+| 10K / 10 s / 243 | 0.18 s | 12.35 s | 1.12 s | **14.98 s** | 98,128 MB |
+| 10K / 15 s / 362 | 0.18 s | 20.28 s | 1.67 s | **24.01 s** | 100,408 MB |
 
-All three requests finish faster than playback. Dense FA on the same weights
-and topology takes 3.77 / 9.84 / 18.45 s (`sglang generate`, stage sum): it is
-competitive at 5 s, and VSA-H3 pulls ahead from 10 s on. At 5 s,
-TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
-online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
-peak memory.
+Over all 72 requests the E2E p50 / p90 / p95 is 12.94 / 23.94 / 24.08 s, and
+every MP4 carries 1344×768 H.264 at 24 fps with a 32 kHz stereo AAC track.
 
 ### VDN-H3 on B200
 

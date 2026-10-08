@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -303,6 +304,14 @@ def _use_nvfp4_dispatch() -> bool:
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 
 
+@lru_cache(maxsize=8192)
+def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
+    # Large checkpoints exceed regex's 500-entry cache. Keep compiled patterns
+    # across layer checks without changing the regex module's global cache.
+    # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*").
+    return re.compile(pattern.replace(".", r"\.").replace("*", r".*"))
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -391,16 +400,15 @@ class ModelOptQuantConfig(QuantizationConfig):
         fused_patterns = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
 
         for pattern in self.exclude_modules:
-            # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*")
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+            compiled_pattern = _compile_exclusion_pattern(pattern)
 
             for pfx in prefixes_to_check:
-                if re.fullmatch(regex_str, pfx):
+                if compiled_pattern.fullmatch(pfx):
                     return True
                 # Part-by-part check: handles wildcards like "mtp*" matching
                 pfx_parts = pfx.split(".")
                 for part in pfx_parts:
-                    if re.fullmatch(regex_str, part):
+                    if compiled_pattern.fullmatch(part):
                         return True
 
             # Check fused patterns: if the last segment of the exclude pattern
