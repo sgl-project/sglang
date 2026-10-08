@@ -153,6 +153,7 @@ class PiGemmaRMSNorm(nn.Module):
 class PiGemmaMLP(nn.Module):
     def __init__(self, config: GemmaConfig, *, tensor_parallel: bool = False):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.tensor_parallel = tensor_parallel
@@ -186,7 +187,10 @@ class PiGemmaMLP(nn.Module):
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        return self.gate_up_proj.weight.dtype
+        dtype = self.gate_up_proj.weight.dtype
+        if dtype == torch.float8_e4m3fn:
+            return config_compute_dtype(self.config) or torch.bfloat16
+        return dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = linear_forward(self.gate_up_proj, x)
@@ -338,7 +342,10 @@ class PiGemmaAttention(nn.Module):
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        return self.qkv_proj.weight.dtype
+        dtype = self.qkv_proj.weight.dtype
+        if dtype == torch.float8_e4m3fn:
+            return config_compute_dtype(self.config) or torch.bfloat16
+        return dtype
 
     def project_qkv(
         self,
