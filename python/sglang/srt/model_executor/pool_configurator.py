@@ -372,8 +372,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if is_deepseek_dsa(model_config.hf_config):
                 # The index-K buffer is replicated under DCP while the latent KV
                 # shards, so this term is short by dcp_size without the scale.
-                # Must stay in step with index_size in kv_cache_configurator;
-                # test_dcp_index_buf_budget pins that they agree.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,

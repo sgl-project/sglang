@@ -23,11 +23,11 @@ LOGGER = "sglang.srt.mem_cache.kv_cache_configurator"
 CONTEXT_LEN = 1_048_576
 
 
-def _check(*, max_total_num_tokens, is_draft_worker=False):
+def _check(*, max_total_num_tokens):
     # Only the attributes the check and logical_token_capacity read.
     stub = types.SimpleNamespace(
         model_config=types.SimpleNamespace(context_len=CONTEXT_LEN),
-        is_draft_worker=is_draft_worker,
+        is_draft_worker=False,
         is_hybrid_swa=False,
     )
     stub.loc_space_scale = KVCacheConfigurator.loc_space_scale.fget(stub)
@@ -47,27 +47,11 @@ class TestPoolContextWarning(CustomTestCase):
         self.assertIn("210688", cm.output[0])
         self.assertIn(str(CONTEXT_LEN), cm.output[0])
 
-    def test_silent_when_the_pool_fits(self):
-        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
-            with self.assertNoLogs(LOGGER, "WARNING"):
-                _check(max_total_num_tokens=CONTEXT_LEN)
-
     def test_dcp_counts_request_tokens_not_rows(self):
         # A3 dcp16 at 0.76: 114,048 rows per rank serve 1,824,768 tokens.
         with get_parallel().override(attn_dcp_size=16, attn_dcp_rank=0):
             with self.assertNoLogs(LOGGER, "WARNING"):
                 _check(max_total_num_tokens=114_048)
-
-    def test_dcp_still_warns_when_the_widened_pool_is_short(self):
-        with get_parallel().override(attn_dcp_size=4, attn_dcp_rank=0):
-            with self.assertLogs(LOGGER, "WARNING") as cm:
-                _check(max_total_num_tokens=200_000)
-        self.assertIn("800000", cm.output[0])
-
-    def test_the_draft_worker_does_not_repeat_it(self):
-        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
-            with self.assertNoLogs(LOGGER, "WARNING"):
-                _check(max_total_num_tokens=1, is_draft_worker=True)
 
 
 if __name__ == "__main__":

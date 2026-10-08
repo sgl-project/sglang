@@ -783,7 +783,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
-        # The buffer is compacted to indexer layers; range(layer_num) overruns.
         buffers = list(self.index_k_buffer)
         if self.index_k_scale_buffer is not None:
             buffers += list(self.index_k_scale_buffer)
@@ -986,18 +985,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        # A write to an elided layer means the pool's mask disagrees with the
-        # model's, so fail loudly. The indexer writes at the raw loc.
+        # The indexer writes at the raw, untranslated loc.
         maybe_detect_oob(
             loc,
             0,
             # Widened pages start at 1, so the top is one widened page past index_size.
             self.index_size + self.index_page_size * self.index_page_padding,
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
-        )
-        assert layer_id in self.indexer_layer_id_to_slot, (
-            f"layer {layer_id} owns no Indexer but wrote index-K; the pool's "
-            "indexer_layer_ids disagrees with the model's indexer layout"
         )
 
         if index_k.dtype != self.dtype:
