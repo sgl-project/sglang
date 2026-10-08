@@ -356,33 +356,45 @@ def build_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    mma_type = _mega_moe_mma_type()
+    from sglang.srt.afd.afd_config import requires_afd_mega_moe_weights
+
+    mma_type = "fp8xfp4" if requires_afd_mega_moe_weights() else _mega_moe_mma_type()
     w13 = experts.w13_weight.data
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
     w2_sf_fp32 = experts.w2_weight_scale_inv.data
 
-    num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
-    _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
+    if w13.dtype == torch.float8_e4m3fn:
+        w13_sf, w2_sf = w13_sf_fp32, w2_sf_fp32
+        if experts.quant_method.quant_config.weight_block_size != [128, 128] or any(
+            scale.dtype != torch.int32 for scale in (w13_sf, w2_sf)
+        ):
+            raise RuntimeError(
+                "AFD MegaMoE FP8 requires 128x128 block weights "
+                "prepared with DeepGEMM UE8M0 scales"
+            )
+    else:
+        num_groups, n1, half_k1 = w13.shape
+        k1 = half_k1 * 2
+        _, n2, half_k2 = w2.shape
+        k2 = half_k2 * 2
 
-    w13_sf = transform_sf_into_required_layout(
-        w13_sf_fp32,
-        mn=n1,
-        k=k1,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
-    w2_sf = transform_sf_into_required_layout(
-        w2_sf_fp32,
-        mn=n2,
-        k=k2,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
+        w13_sf = transform_sf_into_required_layout(
+            w13_sf_fp32,
+            mn=n1,
+            k=k1,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        w2_sf = transform_sf_into_required_layout(
+            w2_sf_fp32,
+            mn=n2,
+            k=k2,
+            recipe=(1, 32),
+            num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
 
     # Build the interleaved L1 weight + scale once; share the weight buffer
     # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
@@ -393,8 +405,10 @@ def build_mega_moe_experts_weights(experts) -> None:
     w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
         (w13, w13_sf), mma_type
     )
-    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(
+        _mega_moe_kernel_scale(w13, w13_sf_interleaved)
+    )
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(_mega_moe_kernel_scale(w2, w2_sf))
 
     experts.w13_weight.data = w13_interleaved
     experts.w13_weight_scale_inv.data = w13_sf_interleaved
@@ -406,3 +420,14 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True
+
+
+def _mega_moe_kernel_scale(weight: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    if weight.dtype != torch.float8_e4m3fn:
+        return sf
+    # Repeat each K128 exponent for four K32 groups without requantizing weights.
+    k = weight.shape[-1]
+    exponents = sf.contiguous().view(-1).view(torch.uint8).view(*sf.shape[:-1], -1)
+    exponents = exponents[..., : k // 128]
+    packed = exponents.repeat_interleave(4, dim=-1).view(torch.int32)
+    return packed.mT.contiguous().mT

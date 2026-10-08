@@ -527,11 +527,10 @@ struct SiluAndMulContigPostQuantKernel {
           .verify(output_scale);
     } else {
       RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
-      RuntimeCheck(num_groups % 4 == 0, "transposed layout requires num_groups % 4 == 0");
-      auto G_ = SymbolicSize{"G // 4"};
-      G_.set_value(num_groups / 4);
+      auto G_ = SymbolicSize{"ceil(G / 4)"};
+      G_.set_value((num_groups + 3) / 4);
       auto M_pad = SymbolicSize{"M padded"};
-      TensorMatcher({M, G_})                  // `.transpose(-1,-2)[:M,:]` view of (G//4_pad, M_pad) int32
+      TensorMatcher({M, G_})                  // `.transpose(-1,-2)[:M,:]` view of (ceil(G/4), M_pad) int32
           .with_strides({int64_t{1}, M_pad})  // col-major transposed
           .with_dtype<int32_t>()
           .with_device(device)
@@ -551,8 +550,8 @@ struct SiluAndMulContigPostQuantKernel {
         .scale_row_stride_int32 = scale_row_stride_int32,
     };
 
+    // Each K128 group uses a half warp; an odd group count leaves a partial warp.
     const auto num_threads = hidden_dim / 8;
-    RuntimeCheck(num_threads % device::kWarpThreads == 0);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);

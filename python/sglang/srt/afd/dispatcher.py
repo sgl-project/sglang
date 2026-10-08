@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.afd.comm.base import AFDCommBackend
 from sglang.srt.afd.direct_deepep import AFDDirectDeepEPDispatchOutput
+from sglang.srt.afd.direct_megamoe import AFDDirectMegaMoEDispatchOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
         AFDDirectDeepEPAdapter,
         AFDDirectDeepEPCombineOutput,
     )
+    from sglang.srt.afd.direct_megamoe import AFDDirectMegaMoEAdapter
     from sglang.srt.afd.layers import AFDMoELayer
 
 logger = logging.getLogger(__name__)
@@ -125,7 +127,9 @@ class AFDWorkHandle:
     request_tensors: Optional[tuple[torch.Tensor, ...]] = None
 
 
-AFDDispatchWorkHandle = AFDWorkHandle | AFDDirectDeepEPDispatchOutput
+AFDDispatchWorkHandle = (
+    AFDWorkHandle | AFDDirectDeepEPDispatchOutput | AFDDirectMegaMoEDispatchOutput
+)
 
 
 @dataclass
@@ -349,6 +353,7 @@ class AFDDispatcher:
         scattered: bool,
         num_slots: int = 1,
         direct_deepep_lanes: Sequence[AFDDirectDeepEPAdapter] = (),
+        direct_megamoe: AFDDirectMegaMoEAdapter | None = None,
         compute_num_sms: int | None = None,
     ):
         self._comm = comm
@@ -358,6 +363,7 @@ class AFDDispatcher:
         self._device = device
         self._scattered = scattered
         self._direct_deepep_lanes = tuple(direct_deepep_lanes)
+        self._direct_megamoe = direct_megamoe
         self._ffn_global_ranks = tuple(
             comm.config.ffn_global_rank(rank)
             for rank in comm.config.ffn_ranks_for_attn(
@@ -370,7 +376,7 @@ class AFDDispatcher:
         self._compute_num_sms = compute_num_sms
         self._pool = (
             None
-            if self._direct_deepep_lanes
+            if self._direct_deepep_lanes or self._direct_megamoe is not None
             else AFDFixedBufferPool(
                 layers=self._layers,
                 token_buckets=token_buckets,
@@ -409,7 +415,7 @@ class AFDDispatcher:
     @property
     def needs_empty_decode_dispatch(self) -> bool:
         if (
-            (self._direct_deepep_lanes)
+            (self._direct_deepep_lanes or self._direct_megamoe is not None)
             and self._forward_mode is not None
             and is_afd_fixed_shape_mode(self._forward_mode)
         ):
@@ -431,9 +437,13 @@ class AFDDispatcher:
 
     @property
     def compute_num_sms(self) -> int | None:
+        if self._direct_megamoe is not None:
+            return self._direct_megamoe.compute_num_sms_by_ag_lanes[self._num_slots - 1]
         return self._compute_num_sms
 
     def shared_expert_compute_num_sms(self, num_lanes: int) -> int | None:
+        if self._direct_megamoe is not None:
+            return self._direct_megamoe.compute_num_sms_by_ag_lanes[num_lanes]
         if (
             self._direct_deepep_lanes
             and num_lanes > 1
@@ -473,6 +483,8 @@ class AFDDispatcher:
     ) -> None:
         if self._direct_deepep_lanes:
             self._direct_deepep_lanes[0].arm_capture_start_barrier()
+        elif self._direct_megamoe is not None:
+            self._direct_megamoe.arm_capture_start_barrier()
         normalized = self._enable_parent_graph_variants(variants, paired=True)
         self._communication_graph_capacities = frozenset(
             variant.child_wire_capacities[0]
@@ -744,6 +756,15 @@ class AFDDispatcher:
             raise RuntimeError(f"AFD has no MoE layer {layer_id}")
         self._validate_request(layer, hidden_states, topk_ids, topk_weights)
 
+        if self._direct_megamoe is not None:
+            return self._direct_megamoe.dispatch(
+                layer_id,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                lane_id=0,
+                num_max_dispatch_tokens_per_rank=capacity,
+            )
         if self._direct_deepep_lanes:
             return self._direct_deepep_lanes[0].dispatch(
                 layer_id,
@@ -791,6 +812,9 @@ class AFDDispatcher:
         layer_id: int,
         work: AFDDispatchWorkHandle,
     ) -> torch.Tensor:
+        if isinstance(work, AFDDirectMegaMoEDispatchOutput):
+            assert self._direct_megamoe is not None
+            return self._direct_megamoe.combine(work)
         if not isinstance(work, AFDWorkHandle):
             return self._direct_deepep_lanes[work.lane_id].combine_attn(work).wait()
 
@@ -915,6 +939,18 @@ class AFDDispatcher:
                     f"child={child_index}, capacity={capacity}, "
                     f"input={input_tokens}"
                 )
+            if self._direct_megamoe is not None:
+                handle = self._direct_megamoe.dispatch(
+                    layer_id,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    lane_id=child_index,
+                    num_max_dispatch_tokens_per_rank=capacity,
+                )
+                self._active_handles.append(handle)
+                self._next_dispatch_index += 1
+                return handle
             if self._direct_deepep_lanes:
                 async_with_compute_stream = num_children > 1
                 handle = self._direct_deepep_lanes[child_index].dispatch(
@@ -1032,6 +1068,12 @@ class AFDDispatcher:
                 f"required={required_dispatches}"
             )
 
+        if isinstance(handle, AFDDirectMegaMoEDispatchOutput):
+            assert self._direct_megamoe is not None
+            output = self._direct_megamoe.combine(handle)
+            self._active_handles.popleft()
+            self._next_combine_index += 1
+            return output
         if not isinstance(handle, AFDWorkHandle):
             if num_children > 1:
                 if not self._pending_direct_combines:

@@ -17,6 +17,7 @@ from sglang.kernels.ops.quantization import per_token_group_quant
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.afd.afd_config import requires_afd_mega_moe_weights
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -319,8 +320,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # SM120's contiguous GEMM only consumes standard-layout activations, so
         # it opts out of swizzle regardless of the a2a backend.
         self.use_swizzle = (
-            get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
-        )
+            get_moe_a2a_backend().is_megamoe() or requires_afd_mega_moe_weights()
+        ) and deep_gemm_sm120.use_swizzle()
 
     def run(
         self,

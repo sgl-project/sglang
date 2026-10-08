@@ -157,6 +157,10 @@ def build_local_handshake_info(
             from sglang.srt.layers import deep_gemm_wrapper
 
             direct_deepep_fp8_scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    elif get_disagg().afd_backend == "direct_megamoe":
+        from sglang.srt.afd.direct_megamoe import get_direct_megamoe_version
+
+        direct_backend_version = get_direct_megamoe_version()
 
     return AFDHandshakeInfo(
         role=role.value,

@@ -86,6 +86,24 @@ class NCCLCommBackend(AFDCommBackend):
     def startup_barrier(self) -> None:
         self._pg.barrier()
 
+    def create_process_group(
+        self,
+        *,
+        rank: int,
+        group_name: str,
+    ) -> torch.distributed.ProcessGroup:
+        """Create a torch ProcessGroup over the existing joint-world store."""
+        from sglang.srt.utils.common import init_custom_process_group
+
+        return init_custom_process_group(
+            backend="nccl",
+            store=self._pg.store,
+            world_size=self.config.world_size,
+            rank=rank,
+            group_name=group_name,
+            device_id=torch.device(self.config.device),
+        )
+
     def _transfer(
         self,
         tensors: Sequence[torch.Tensor],

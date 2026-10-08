@@ -86,6 +86,8 @@ class AFDFFNExecutor:
         self._num_ranks = self._comm.config.num_ffn_ranks
         self._scattered = get_disagg().afd_ffn_moe_backend == "deepep"
         direct_deepep = handshake.local.afd_backend == "direct_deepep"
+        direct_megamoe = handshake.local.afd_backend == "direct_megamoe"
+        direct_backend = direct_deepep or direct_megamoe
         self._attn_ranks = self._comm.config.attn_ranks_for_ffn(
             self._rank,
             scattered=self._scattered,
@@ -94,7 +96,7 @@ class AFDFFNExecutor:
         self._decode_num_microbatches = handshake.peer.decode_num_microbatches
         self._cohort_graph_child_plans: frozenset[tuple[int, ...]] = frozenset()
         self._max_scattered_source_count = 0
-        staged_overlap = self._decode_num_microbatches > 1 and not direct_deepep
+        staged_overlap = self._decode_num_microbatches > 1 and not direct_backend
         self._communication_stream = (
             torch.cuda.Stream(device=self._device) if staged_overlap else None
         )
@@ -132,6 +134,7 @@ class AFDFFNExecutor:
             )
 
         self._direct_deepep_lanes = ()
+        self._direct_megamoe = None
         if direct_deepep:
             from sglang.srt.afd.direct_deepep import (
                 build_afd_direct_deepep_adapters,
@@ -150,8 +153,22 @@ class AFDFFNExecutor:
                 expert_alignment=handshake.local.direct_deepep_expert_alignment,
                 allow_hybrid_mode=handshake.local.direct_deepep_allow_hybrid,
             )
+        elif direct_megamoe:
+            from sglang.srt.afd.direct_megamoe import (
+                build_afd_direct_megamoe_adapter,
+            )
 
-        if self._decode_num_microbatches > 1:
+            self._direct_megamoe = build_afd_direct_megamoe_adapter(
+                comm=comm,
+                layers=self._layers,
+                token_buckets=handshake.peer.decode_token_buckets,
+                num_lanes=self._decode_num_microbatches,
+                dtype=self._dtype,
+                comm_sm_budget=handshake.local.afd_comm_sm_budget,
+                nvfp4_input_scales=handshake.local.direct_nvfp4_input_scales,
+            )
+
+        if self._decode_num_microbatches > 1 and not direct_megamoe:
             overlap_sm_budget = handshake.local.afd_comm_sm_budget
             assert overlap_sm_budget is not None
             total_num_sms = torch.cuda.get_device_properties(
@@ -203,7 +220,7 @@ class AFDFFNExecutor:
             decode_pool_transport = None
         self._decode_pool = (
             None
-            if self._direct_deepep_lanes
+            if self._direct_deepep_lanes or self._direct_megamoe is not None
             else AFDFixedBufferPool(
                 layers=self._layers,
                 token_buckets=decode_pool_token_buckets,
@@ -237,6 +254,9 @@ class AFDFFNExecutor:
             tuple(variant.child_wire_capacities) for variant in plan.attn_graph_variants
         )
         if not plan.enabled:
+            return
+        if self._direct_megamoe is not None:
+            self._capture_direct_megamoe_graphs(plan)
             return
         if self._direct_deepep_lanes:
             self._capture_direct_deepep_graphs(plan)
@@ -355,6 +375,34 @@ class AFDFFNExecutor:
         if self._rank == 0:
             logger.info(
                 "AFD Direct DeepEP graphs ready: full_steps=%d",
+                len(variants),
+            )
+
+    def _capture_direct_megamoe_graphs(
+        self,
+        plan: AFDGraphCapturePlan,
+    ) -> None:
+        variants = [
+            (variant.child_wire_capacities, ()) for variant in plan.attn_graph_variants
+        ]
+        if self._rank == 0:
+            logger.info(
+                "Capture AFD Direct MegaMoE graphs begin: wire_capacities=%s",
+                [wire_capacities for wire_capacities, _ in variants],
+            )
+        self._decode_step_graph = _AFDFFNDecodeStepGraph(
+            self._compute,
+            self._run_direct_megamoe_graph_step,
+            direct_data_plane=True,
+        )
+        self._comm.startup_barrier()
+        # A joins here at the first routed layer after local graph warmup.
+        self._comm.startup_barrier()
+        self._capture_variants(variants)
+        self._comm.startup_barrier()
+        if self._rank == 0:
+            logger.info(
+                "AFD Direct MegaMoE graphs ready: full_steps=%d",
                 len(variants),
             )
 
@@ -672,6 +720,33 @@ class AFDFFNExecutor:
         if msg.child_wire_capacities and not fixed_shape:
             raise RuntimeError("AFD child plan requires DECODE")
 
+        if self._direct_megamoe is not None and fixed_shape:
+            child_wire_capacities = msg.effective_child_wire_capacities
+            if msg.child_wire_capacities and (
+                len(child_wire_capacities) != self._decode_num_microbatches
+                or sum(child_wire_capacities) != msg.wire_capacity
+            ):
+                raise RuntimeError(
+                    "AFD Direct MegaMoE child plan does not match the "
+                    f"configured parent: children={child_wire_capacities}, "
+                    f"configured={self._decode_num_microbatches}, "
+                    f"parent={msg.wire_capacity}"
+                )
+            with torch.inference_mode():
+                if (
+                    msg.communication_graph
+                    and self._decode_step_graph is not None
+                    and self._decode_step_graph.replay(child_wire_capacities)
+                ):
+                    return
+                if msg.communication_graph:
+                    raise RuntimeError(
+                        "AFD ffn has no Direct MegaMoE graph for wire capacity "
+                        f"{msg.wire_capacity}"
+                    )
+                self._run_direct_megamoe_step(child_wire_capacities)
+            return
+
         if self._direct_deepep_lanes and fixed_shape:
             child_wire_capacities = msg.effective_child_wire_capacities
             if msg.child_wire_capacities:
@@ -787,6 +862,21 @@ class AFDFFNExecutor:
                 forward_mode,
                 source_segments,
             )
+
+    def _run_direct_megamoe_graph_step(
+        self,
+        wire_capacities: tuple[int, ...],
+        _compute_capacities: tuple[int, ...],
+    ) -> None:
+        self._run_direct_megamoe_step(wire_capacities)
+
+    def _run_direct_megamoe_step(
+        self,
+        wire_capacities: tuple[int, ...],
+    ) -> None:
+        set_is_extend_in_batch(False)
+        assert self._direct_megamoe is not None
+        self._direct_megamoe.run_eg(wire_capacities)
 
     def _run_direct_deepep_graph_step(
         self,

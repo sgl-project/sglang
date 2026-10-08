@@ -18,6 +18,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.afd.afd_config import requires_afd_mega_moe_weights
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -1731,7 +1732,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if get_moe_a2a_backend().is_megamoe():
+                if (
+                    get_moe_a2a_backend().is_megamoe()
+                    or requires_afd_mega_moe_weights()
+                ):
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
                     )
@@ -1782,6 +1786,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
                     )
+
+                if requires_afd_mega_moe_weights():
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    build_mega_moe_experts_weights(layer)
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (

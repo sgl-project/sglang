@@ -74,6 +74,7 @@ def _init_afd_attn_dispatcher(
         scheduler.tp_worker.model_runner.model, AFDRole.ATTN
     )
     direct_deepep_lanes = ()
+    direct_megamoe = None
     if handshake.local.afd_backend == "direct_deepep":
         from sglang.srt.afd.direct_deepep import (
             build_afd_direct_deepep_adapters,
@@ -91,6 +92,20 @@ def _init_afd_attn_dispatcher(
             fp8_scale_ue8m0=handshake.peer.direct_deepep_fp8_scale_ue8m0,
             expert_alignment=handshake.peer.direct_deepep_expert_alignment,
             allow_hybrid_mode=handshake.peer.direct_deepep_allow_hybrid,
+        )
+    elif handshake.local.afd_backend == "direct_megamoe":
+        from sglang.srt.afd.direct_megamoe import (
+            build_afd_direct_megamoe_adapter,
+        )
+
+        direct_megamoe = build_afd_direct_megamoe_adapter(
+            comm=backend,
+            layers=layers,
+            token_buckets=handshake.local.decode_token_buckets,
+            num_lanes=handshake.local.decode_num_microbatches,
+            dtype=scheduler.tp_worker.model_runner.dtype,
+            comm_sm_budget=handshake.peer.afd_comm_sm_budget,
+            nvfp4_input_scales=handshake.peer.direct_nvfp4_input_scales,
         )
 
     compute_num_sms = None
@@ -126,6 +141,7 @@ def _init_afd_attn_dispatcher(
         scattered=handshake.local.afd_ffn_moe_backend == "deepep",
         num_slots=handshake.local.decode_num_microbatches,
         direct_deepep_lanes=direct_deepep_lanes,
+        direct_megamoe=direct_megamoe,
         compute_num_sms=compute_num_sms,
     )
     set_afd_dispatcher(dispatcher)

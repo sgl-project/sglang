@@ -26,9 +26,10 @@ _DEFAULT_COMM_SM_BUDGETS = {
     "nccl": 8,
     "nvshmem": 2,
     "direct_deepep": 24,
+    "direct_megamoe": 24,
 }
 
-_DIRECT_AFD_BACKENDS = frozenset({"direct_deepep"})
+_DIRECT_AFD_BACKENDS = frozenset({"direct_deepep", "direct_megamoe"})
 
 
 class AFDRole(Enum):
@@ -50,6 +51,18 @@ def afd_role_from_args(server_args: ServerArgs) -> Optional[AFDRole]:
 
 def is_direct_afd_backend(backend: str) -> bool:
     return backend in _DIRECT_AFD_BACKENDS
+
+
+def requires_afd_mega_moe_weights() -> bool:
+    from sglang.srt.runtime_context import get_disagg
+
+    server_args = get_disagg()
+    role = afd_role_from_args(server_args)
+    return (
+        role is not None
+        and role.is_ffn()
+        and server_args.afd_backend == "direct_megamoe"
+    )
 
 
 def resolve_overlap_sm_partition(
@@ -335,6 +348,11 @@ def _check_direct_args(server_args: ServerArgs, role: AFDRole) -> None:
     cfg = resolving_view(server_args)
     if not is_direct_afd_backend(cfg.afd_backend):
         return
+    if cfg.afd_backend == "direct_megamoe":
+        if cfg.ep_num_redundant_experts != 0:
+            raise ValueError("AFD Direct MegaMoE does not support redundant experts")
+        if cfg.init_expert_location != "trivial":
+            raise ValueError("AFD Direct MegaMoE requires trivial expert placement")
     if role.is_ffn():
         supported_runners = ("deep_gemm", "flashinfer_cutedsl")
         if cfg.moe_runner_backend not in supported_runners:

@@ -286,7 +286,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
 
     def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
         for transport, (num_attn, num_ffn, backend, num_sessions) in product(
-            ("nccl", "nvshmem", "direct_deepep"),
+            ("nccl", "nvshmem", "direct_deepep", "direct_megamoe"),
             (
                 (1, 1, "none", 1),
                 (3, 2, "none", 1),
@@ -296,7 +296,8 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 (2, 3, "deepep", 2),
             ),
         ):
-            if transport == "direct_deepep" and backend != "deepep":
+            is_direct = transport in ("direct_deepep", "direct_megamoe")
+            if is_direct and backend != "deepep":
                 continue
             with self.subTest(
                 transport=transport,
@@ -309,7 +310,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 ffn_info = _handshake_info("ffn")
                 attn_info = _handshake_info("attn")
                 ffn_info.afd_backend = attn_info.afd_backend = transport
-                if transport == "direct_deepep":
+                if is_direct:
                     ffn_info.direct_backend_version = (
                         attn_info.direct_backend_version
                     ) = "test-version"
@@ -372,9 +373,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                     self.assertEqual(result.sync_port, port + 1 + 2 * session_id)
                     self.assertEqual(
                         result.dist_port,
-                        port
-                        + 2
-                        + (0 if transport == "direct_deepep" else 2 * session_id),
+                        port + 2 + (0 if is_direct else 2 * session_id),
                     )
                     if transport != "nccl":
                         self.assertEqual(
@@ -386,7 +385,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                         self.assertEqual(result.attn_members[session_id], result.local)
                     self.assertEqual(result.sync_port, peer_result.sync_port)
                     self.assertEqual(result.dist_port, peer_result.dist_port)
-                    if transport == "direct_deepep":
+                    if is_direct:
                         self.assertEqual(
                             result.peer.direct_backend_version, "test-version"
                         )

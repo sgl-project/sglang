@@ -11,6 +11,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.afd.afd_config import requires_afd_mega_moe_weights
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -2671,6 +2672,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             assert weight_scale.dtype == torch.float8_e4m3fn, (
                 f"{name} Weight Blockscale must be represented as FP8-E4M3"
             )
+
+        if requires_afd_mega_moe_weights():
+            from sglang.srt.afd.direct_megamoe import prepare_nvfp4_megamoe_weights
+
+            prepare_nvfp4_megamoe_weights(layer)
 
         # Weight processing based on strategy
         if (

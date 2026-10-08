@@ -3309,12 +3309,13 @@ class ServerArgs:
         NS("disagg"),
     ] = None
     afd_backend: A[
-        Literal["nccl", "nvshmem", "direct_deepep"],
+        Literal["nccl", "nvshmem", "direct_deepep", "direct_megamoe"],
         "The AFD data-plane backend. 'nccl' uses staged NCCL transfers, "
         "'nvshmem' uses a symmetric arena for decode and NCCL exact-size "
         "transfers for prefill, and 'direct_deepep' dispatches decode tokens "
-        "directly from attention ranks to expert-owning ffn ranks, retaining "
-        "staged NCCL transfers for prefill.",
+        "directly from attention ranks to expert-owning ffn ranks. "
+        "'direct_megamoe' uses the fused M2N MoE decode path. Both direct "
+        "backends retain staged NCCL transfers for prefill.",
         NS("disagg"),
     ] = "nccl"
     afd_decode_num_microbatches: A[
@@ -3334,11 +3335,15 @@ class ServerArgs:
         Optional[int],
         Arg(
             help="F-authoritative SM budget for AFD decode communication. "
-            "Defaults to 8 for NCCL, 2 for NVSHMEM, and 24 for Direct DeepEP. "
+            "Defaults to 8 for NCCL, 2 for NVSHMEM, and 24 for direct backends. "
             "Set it only on the ffn instance. Its exact use is data-plane "
             "specific: staged backends reserve F compute capacity only during "
             "overlap; Direct DeepEP uses the full budget for serial communication "
-            "and divides it across overlapping decode lanes.",
+            "and divides it across overlapping decode lanes; "
+            "Direct MegaMoE also divides it across configured lanes for its "
+            "A-side AG grids and "
+            "reserves matching compute capacity: N-1 lanes during attention, "
+            "N lanes during shared experts.",
             resolvable=True,
         ),
         NS("disagg"),
@@ -3347,7 +3352,7 @@ class ServerArgs:
         int,
         "Number of attn instances served by this ffn instance (ffn-side "
         "arg). The ffn instance accepts this many handshakes before "
-        "serving. NVSHMEM and Direct DeepEP form one static joint world, "
+        "serving. NVSHMEM and direct backends form one static joint world, "
         "so every instance must be up before serving starts. Staged backends "
         "automatically batch compatible ready steps across multiple instances.",
         NS("disagg"),
