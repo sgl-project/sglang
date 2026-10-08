@@ -175,8 +175,6 @@ class Activation1d(nn.Module):
         down_kernel_size: int = 12,
     ):
         super().__init__()
-        self.up_ratio = up_ratio
-        self.down_ratio = down_ratio
         self.act = activation
         self.upsample = UpSample1d(up_ratio, up_kernel_size)
         self.downsample = DownSample1d(down_ratio, down_kernel_size)

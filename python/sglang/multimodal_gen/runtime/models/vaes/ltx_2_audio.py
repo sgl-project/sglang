@@ -349,7 +349,6 @@ class LTX2AudioAudioPatchifier:
     ):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
-        self.audio_latent_downsample_factor = audio_latent_downsample_factor
         self.is_causal = is_causal
         self._patch_size = (1, patch_size, patch_size)
 
