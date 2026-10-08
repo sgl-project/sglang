@@ -12,6 +12,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
+    try_cake_fused_decode,
+    try_cake_packed_decode,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -670,6 +672,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 and onorm_gate is not None
                 and mixed_qkv.shape[0] == cache_indices.shape[0]
                 and b.ndim == 3
+            ):
+                # Opt-in Cake fused decode (SGLANG_CAKE_ROUTES=kda_decode); None
+                # when the route is off or the adapter does not admit the call.
+                core_attn_out = try_cake_fused_decode(
+                    layer,
+                    fused_static,
+                    mixed_qkv,
+                    a,
+                    b,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    onorm_gate,
+                )
+                if core_attn_out is not None:
+                    layer._k3_onorm_consumed = True
+                    self._track_mamba_state_decode(
+                        forward_batch,
+                        conv_states,
+                        ssm_states,
+                        cache_indices,
+                        layer.layer_id,
+                    )
+                    return core_attn_out
+            if (
+                fused_static is not None
+                and onorm_gate is not None
+                and mixed_qkv.shape[0] == cache_indices.shape[0]
+                and b.ndim == 3
                 and kda_fused_decode.covered(
                     mixed_qkv,
                     a,
@@ -736,6 +767,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
             activation="silu",
             conv_state_indices=cache_indices,
         )
+
+        # Opt-in Cake packed decode for the Kimi-K3 safe-gate shape (H=12,
+        # lower_bound=-5, BF16 pool); the engine packed kernel below only
+        # serves lower_bound=None, so the two never overlap.
+        if replayssm_d is None and qkv.shape[0] == cache_indices.shape[0]:
+            core_attn_out = try_cake_packed_decode(
+                layer, qkv, a, b, ssm_states, cache_indices
+            )
+            if core_attn_out is not None:
+                self._track_mamba_state_decode(
+                    forward_batch,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    layer.layer_id,
+                )
+                return core_attn_out
 
         # The packed kernel assumes one token per request.
         if (

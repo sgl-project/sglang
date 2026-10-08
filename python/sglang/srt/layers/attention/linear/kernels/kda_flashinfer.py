@@ -9,20 +9,295 @@ Contract with the Triton KDA reference:
   - beta ``b`` is a logit, so this wrapper passes ``sigmoid(b)``;
   - q/k are L2-normalized in-kernel;
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
+
+Cake route (``SGLANG_CAKE_ROUTES=kda_decode``): the same FlashInfer symbols
+with ``backend="cake"`` through ``sglang.kernels.cake_kernels.attention_linear_kda``.
+Three call sites can take it, each behind the adapter's ``supports_*`` admission
+and falling back to the path below when admission fails:
+  - ``FlashInferKDAKernel.decode`` (T=1 recurrent decode, ``[B, 1, H, 128]`` view
+    of the ``[1, B, H, 128]`` inputs, 1-D ``ssm_state_indices``, no ``cu_seqlens``;
+    equal-head unbounded gate only, so Kimi-Linear-style ``lower_bound=None``);
+  - :func:`try_cake_fused_decode` (Kimi-K3 conv + recurrence + gated RMSNorm,
+    H=12 / TP8, ``lower_bound=-5``), called from ``KDAAttnBackend.forward_decode``
+    ahead of ``kda_fused_decode.covered``;
+  - :func:`try_cake_packed_decode` (Kimi-K3 packed T=1 decode, H=12, BF16 pool,
+    ``lower_bound=-5``), called after the conv update when the fused handoff is
+    not available.
+``target_verify`` (T=2..6) never takes Cake: its frozen spec-decode routes need
+precomputed log gates or the (T=3, H=16, lower_bound<0) family, neither of
+which the in-kernel-gated SGLang verify contract produces.
 """
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+CAKE_ROUTE = "kda_decode"
+_CAKE_HEAD_DIM = 128
+_CAKE_PACKED_HEADS = 12
+_CAKE_PACKED_LOWER_BOUND = -5.0
+# SGLang's mamba pools reserve slot 0 for padded rows and mark CUDA-graph
+# padding rows with -1 (hybrid_linear_attn_backend); live slots are unique per
+# request. That is exactly FlashInfer's ``unique_or_null`` assertion for the
+# Cake fused decode (non-positive index -> null row, no state update).
+_CAKE_FUSED_STATE_INDICES_MODE = "unique_or_null"
+_cake_logged: set = set()
+
+
+def _cake_kda_decode_enabled() -> bool:
+    return cake_route_enabled(CAKE_ROUTE)
+
+
+def _cake_kda_adapter():
+    from sglang.kernels.cake_kernels import attention_linear_kda
+
+    return attention_linear_kda
+
+
+def _cake_log_once(key: str, msg: str) -> None:
+    if key in _cake_logged:
+        return
+    _cake_logged.add(key)
+    logger.info(msg)
+
+
+def _cake_int32_indices(indices: torch.Tensor) -> torch.Tensor:
+    if indices.dtype == torch.int32 and indices.is_contiguous():
+        return indices
+    return indices.to(torch.int32).contiguous()
+
+
+def try_cake_fused_decode(
+    layer: Any,
+    fused_static: tuple,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    onorm_gate: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Kimi-K3 fused decode through ``fused_kda_decode(backend="cake")``.
+
+    Takes the engine's ``_k3_fused_decode_args`` stash (per-projection
+    transposed fp32 conv weights ``[4, seg]`` x3, conv bias, ``A_log [H]``,
+    fp32 o_norm weight, eps) and re-expresses it in the FlashInfer contract:
+    conv weight ``[3, 4, H*128]`` (stacked once per layer), conv state as the
+    ``[slots, 3*H*128, 3]`` transposed view of the engine's ``[slots, 3, 3*H*128]``
+    pool, raw gate ``[1, B, H, 128]``, raw beta ``[1, B, H]``, output gate
+    ``[B, H, 128]``. Returns the ``[1, B, H, 128]`` BF16 output or ``None`` when
+    the route is off / not admitted (caller keeps its own fused kernel).
+    Cake has no conv bias input, so layers with a conv bias are never admitted.
+    In-place updates of ``conv_states`` / ``ssm_states`` follow the engine
+    kernel's semantics (padding rows leave the pools untouched).
+    """
+    if not _cake_kda_decode_enabled() or getattr(
+        layer, "_cake_fused_decode_disabled", False
+    ):
+        return None
+    if getattr(layer, "bias", None) is not None:
+        layer._cake_fused_decode_disabled = True
+        _cake_log_once(
+            f"fused-bias-{id(layer)}",
+            "Cake KDA fused decode skipped: the conv1d has a bias, which the "
+            "Cake fused_kda_decode contract does not carry.",
+        )
+        return None
+    rows = int(mixed_qkv.shape[0])
+    if ssm_states.ndim != 4 or int(ssm_states.shape[-1]) != _CAKE_HEAD_DIM:
+        return None
+    num_heads = int(ssm_states.shape[-3])
+    seg = num_heads * _CAKE_HEAD_DIM
+    if (
+        a.ndim != 2
+        or tuple(a.shape) != (rows, seg)
+        or not a.is_contiguous()
+        or b.ndim != 3
+        or tuple(b.shape) != (1, rows, num_heads)
+        or onorm_gate.ndim != 2
+        or tuple(onorm_gate.shape) != (rows, seg)
+        or onorm_gate.stride(1) != 1
+        or conv_states.ndim != 3
+    ):
+        return None
+    w_q_t, w_k_t, w_v_t, _conv_bias, a_log, onorm_w, onorm_eps = fused_static
+    weight = getattr(layer, "_cake_fused_conv_weight", None)
+    if weight is None:
+        # [3, 4, seg] fp32: projection-major, then the four conv taps.
+        weight = torch.stack((w_q_t, w_k_t, w_v_t)).contiguous()
+        layer._cake_fused_conv_weight = weight
+    conv_state = conv_states.transpose(-1, -2)
+    raw_gate = a.view(1, rows, num_heads, _CAKE_HEAD_DIM)
+    output_gate = onorm_gate.unflatten(-1, (num_heads, _CAKE_HEAD_DIM))
+    indices = _cake_int32_indices(cache_indices)
+    dt_bias = layer.dt_bias
+    lower_bound = getattr(layer, "lower_bound", None)
+    adapter = _cake_kda_adapter()
+    admission = getattr(layer, "_cake_fused_admission", None)
+    if admission is None:
+        admission = layer._cake_fused_admission = {}
+    key = (
+        rows,
+        id(ssm_states),
+        ssm_states.dtype,
+        ssm_states.stride(0),
+        id(conv_states),
+        conv_states.stride(0),
+        a.dtype,
+        b.dtype,
+        b.stride(2),
+        onorm_gate.dtype,
+        onorm_gate.stride(0),
+    )
+    admitted = admission.get(key)
+    if admitted is None:
+        admitted = adapter.supports_kda_fused_decode(
+            mixed_qkv,
+            weight,
+            conv_state,
+            raw_gate,
+            b,
+            a_log,
+            dt_bias,
+            indices,
+            ssm_states,
+            output_gate,
+            onorm_w,
+            lower_bound=lower_bound,
+            norm_eps=onorm_eps,
+            state_indices_mode=_CAKE_FUSED_STATE_INDICES_MODE,
+        )
+        admission[key] = admitted
+        _cake_log_once(
+            f"fused-{id(layer)}-{rows}-{admitted}",
+            f"Cake KDA fused decode {'taken' if admitted else 'rejected by admission'}: "
+            f"rows={rows} heads={num_heads} state={ssm_states.dtype} "
+            f"lower_bound={lower_bound}",
+        )
+    if not admitted:
+        return None
+    try:
+        return adapter.fused_kda_decode(
+            mixed_qkv,
+            weight,
+            conv_state,
+            raw_gate,
+            b,
+            a_log,
+            dt_bias,
+            indices,
+            ssm_states,
+            output_gate,
+            onorm_w,
+            lower_bound=lower_bound,
+            norm_eps=onorm_eps,
+            state_indices_mode=_CAKE_FUSED_STATE_INDICES_MODE,
+        )
+    except RuntimeError as exc:
+        # FlashInfer fails closed on the host (no frozen variant for this
+        # layout) before any launch; keep this layer on the engine kernel.
+        layer._cake_fused_decode_disabled = True
+        logger.warning(
+            "Cake KDA fused decode disabled for layer %s after FlashInfer "
+            "rejected the layout (rows=%d, heads=%d): %s",
+            getattr(layer, "layer_id", "?"),
+            rows,
+            num_heads,
+            exc,
+        )
+        return None
+
+
+def try_cake_packed_decode(
+    layer: Any,
+    qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Kimi-K3 packed T=1 decode through ``packed_kda_decode`` (Cake-only entry).
+
+    The Cake kernel is locked to H=HV=12, K=V=128, ``lower_bound=-5`` and a
+    BF16 state pool, i.e. the K3 TP8 shape with ``--mamba-ssm-dtype bfloat16``.
+    ``qkv`` is the post-conv ``[B, 3*1536]`` BF16 activation, ``a`` the raw gate
+    ``[B, 1536]``, ``b`` the raw beta logits ``[1, B, 12]`` (or ``[B, 12]``).
+    Returns the ``[1, B, 12, 128]`` BF16 output or ``None`` (caller continues
+    with its own packed / unpacked decode). The pool is updated in place; rows
+    with ``cache_indices == -1`` are inactive.
+    """
+    if not _cake_kda_decode_enabled():
+        return None
+    lower_bound = getattr(layer, "lower_bound", None)
+    if lower_bound is None or float(lower_bound) != _CAKE_PACKED_LOWER_BOUND:
+        return None
+    if (
+        getattr(layer, "num_v_heads", None) != _CAKE_PACKED_HEADS
+        or getattr(layer, "head_v_dim", None) != _CAKE_HEAD_DIM
+        or getattr(layer, "head_k_dim", None) != _CAKE_HEAD_DIM
+    ):
+        return None
+    rows = int(qkv.shape[0])
+    width = _CAKE_PACKED_HEADS * _CAKE_HEAD_DIM
+    if (
+        qkv.ndim != 2
+        or int(qkv.shape[1]) != 3 * width
+        or a.ndim != 2
+        or tuple(a.shape) != (rows, width)
+        or b.numel() != rows * _CAKE_PACKED_HEADS
+    ):
+        return None
+    raw_beta = b.reshape(rows, _CAKE_PACKED_HEADS)
+    a_log = getattr(layer, "_cake_packed_a_log", None)
+    if a_log is None:
+        a_log = layer.A_log.detach().reshape(-1).float().contiguous()
+        layer._cake_packed_a_log = a_log
+    indices = _cake_int32_indices(cache_indices)
+    adapter = _cake_kda_adapter()
+    admission = getattr(layer, "_cake_packed_admission", None)
+    if admission is None:
+        admission = layer._cake_packed_admission = {}
+    key = (
+        rows,
+        id(ssm_states),
+        ssm_states.dtype,
+        ssm_states.stride(0),
+        qkv.dtype,
+        qkv.stride(0),
+        a.dtype,
+        a.stride(0),
+        raw_beta.dtype,
+        raw_beta.stride(0),
+    )
+    admitted = admission.get(key)
+    if admitted is None:
+        admitted = adapter.supports_kda_packed_decode(
+            qkv, a, raw_beta, a_log, layer.dt_bias, ssm_states, indices
+        )
+        admission[key] = admitted
+        _cake_log_once(
+            f"packed-{id(layer)}-{rows}-{admitted}",
+            f"Cake KDA packed decode {'taken' if admitted else 'rejected by admission'}: "
+            f"rows={rows} state={ssm_states.dtype} lower_bound={lower_bound}",
+        )
+    if not admitted:
+        return None
+    out = adapter.packed_kda_decode(
+        qkv, a, raw_beta, a_log, layer.dt_bias, ssm_states, indices
+    )
+    return out.view(1, rows, _CAKE_PACKED_HEADS, _CAKE_HEAD_DIM)
+
 
 # ---------------------------------------------------------------------------
 # Lazy import for the FlashInfer KDA kernel
@@ -109,6 +384,10 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # recurrent_kda contract (per-layer views are pool-stable, so id() is
         # a stable key — same lifetime argument as _gate_cache).
         self._state_contract_ok: set = set()
+        # Cake T=1 decode admission per (batch, heads, pool) key; the per-call
+        # inputs are reshaped views of the same buffers so the predicate's
+        # answer is a function of this key.
+        self._cake_decode_admission: dict = {}
         logger.info("Using FlashInfer KDA kernel")
 
     def _check_state_stride_contract(self, ssm_states: torch.Tensor) -> None:
@@ -220,6 +499,21 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
 
         A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
 
+        if lower_bound is None and _cake_kda_decode_enabled():
+            output_cake = self._cake_decode(
+                query_fi,
+                key_fi,
+                value_fi,
+                g_fi,
+                beta_fi,
+                A_log_fi,
+                dt_bias_fi,
+                ssm_states,
+                cache_indices,
+            )
+            if output_cake is not None:
+                return output_cake
+
         # Gate contract matches the Triton decode path (safe gate when
         # lower_bound set); in-place state update, no rollback for decode.
         output_fi, _ = self._recurrent_kda(
@@ -241,6 +535,99 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         )
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
+
+    def _cake_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """T=1 decode through ``recurrent_kda(backend="cake")``.
+
+        The Cake decode contract is ``[B, 1, H, 128]`` inputs with a 1-D int32
+        ``ssm_state_indices`` and no ``cu_seqlens`` (FlashInfer rejects an
+        explicit T=1 ``cu_seqlens`` for Cake), so the ``[1, B, H, D]`` inputs are
+        re-viewed with the batch outermost -- a free view since the leading
+        dimension is 1. The committed pool is updated in place through the
+        indices, exactly like the ``cu_seqlens`` CuTe path below. Returns
+        ``None`` when the adapter does not admit the call (GQA, non-BF16 pool,
+        head_dim != 128, lower_bound set, unsupported device/FlashInfer build).
+        """
+        batch_size = q.shape[1]
+        num_heads, head_dim = q.shape[2], q.shape[3]
+        num_v_heads = v.shape[2]
+        if head_dim != _CAKE_HEAD_DIM or v.shape[3] != _CAKE_HEAD_DIM:
+            return None
+        q_c = q.view(batch_size, 1, num_heads, head_dim)
+        k_c = k.view(batch_size, 1, num_heads, head_dim)
+        v_c = v.view(batch_size, 1, num_v_heads, head_dim)
+        g_c = g.view(batch_size, 1, num_v_heads, head_dim)
+        beta_c = beta.view(batch_size, 1, num_v_heads)
+        indices = _cake_int32_indices(cache_indices)
+        key = (
+            batch_size,
+            num_heads,
+            num_v_heads,
+            id(ssm_states),
+            ssm_states.dtype,
+            ssm_states.stride(0),
+            q.stride(1),
+            v.stride(1),
+            g.stride(1),
+        )
+        admitted = self._cake_decode_admission.get(key)
+        adapter = _cake_kda_adapter()
+        if admitted is None:
+            admitted = adapter.supports_kda_recurrent_decode(
+                q_c,
+                k_c,
+                v_c,
+                g_c,
+                beta_c,
+                ssm_states,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=None,
+                ssm_state_indices=indices,
+                cu_seqlens=None,
+                num_spec_tokens=None,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                beta_is_logit=False,
+                disable_state_update=False,
+                scale=None,
+            )
+            self._cake_decode_admission[key] = admitted
+            _cake_log_once(
+                f"recurrent-{batch_size}-{num_heads}-{num_v_heads}-{admitted}",
+                f"Cake KDA recurrent decode {'taken' if admitted else 'rejected by admission'}: "
+                f"B={batch_size} H={num_heads} HV={num_v_heads} state={ssm_states.dtype}",
+            )
+        if not admitted:
+            return None
+        output, _ = adapter.recurrent_kda(
+            q_c,
+            k_c,
+            v_c,
+            g_c,
+            beta_c,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=None,
+            initial_state=ssm_states,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            lower_bound=None,
+            ssm_state_indices=indices,
+        )
+        return output.view(1, batch_size, num_v_heads, head_dim)
 
     # ---- target_verify (MTP, topk=1) ----
 

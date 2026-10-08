@@ -23,3 +23,6 @@ register_kernel(
         target="sglang.kernels.ops.mm.process.image:_normalize_and_patchify_torch",
     )
 )
+
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.mm import cake as _cake  # noqa: E402, F401
