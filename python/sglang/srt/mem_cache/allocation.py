@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_EMPTY_PREFIX = torch.empty((0,), dtype=torch.int64)
+
 
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
@@ -348,6 +350,17 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
+    # A request holding its row (a later chunk, a borrowed session record)
+    # already has its prefix there; a new one reads its match off the tree.
+    if req.kv.holds_kv:
+        row = batch.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        return row[: req.prefix_len].to(torch.int64)
+    if req.prefix_len == 0:
+        return _EMPTY_PREFIX
+    return batch.tree_cache.prefix_device_indices(req)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -361,7 +374,7 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
 
     reuse_kv = None
     if batch.is_dllm():
@@ -393,6 +406,7 @@ def alloc_for_extend(
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
+            prefix_tensors,
             req_pool_indices_cpu,
             prefix_lens_cpu,
             extend_lens_cpu,
@@ -462,6 +476,7 @@ def alloc_for_extend(
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
     reuse_kv: list[bool],
+    prefix_tensors: list[torch.Tensor],
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     extend_lens_cpu: torch.Tensor,
@@ -505,7 +520,7 @@ def _alloc_extend_loc_with_kv_reuse(
             )
             last_loc = [
                 (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
-                for t in (r.prefix_indices for r in batch.reqs)
+                for t in prefix_tensors
             ]
             fresh_slots = alloc_paged_token_slots_extend(
                 tree_cache=batch.tree_cache,
@@ -592,7 +607,7 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
@@ -693,6 +708,17 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
+
+
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    return ALLOC_FOR_DECODE_FUNCS[_device_type(batch)](batch, token_per_req)
+
+
+def _device_type(batch: ScheduleBatch) -> str:
+    return torch.device(batch.device).type
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -756,10 +782,7 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+            out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
                 tree_cache,
                 cur_kv_lens,
                 cur_kv_lens_cpu,

@@ -1088,10 +1088,6 @@ class UnifiedRadixCache(BasePrefixCache):
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : len(token_ids)
-            ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             if is_finished:
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
@@ -1143,7 +1139,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
-            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
@@ -1170,7 +1165,6 @@ class UnifiedRadixCache(BasePrefixCache):
             # declined before its walk, so nothing was freed underneath us. The
             # release_kv_cache releases everything past the protected
             # prefix.
-            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
@@ -1238,12 +1232,6 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        if len(new_indices) < len(kv_indices_orig):
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices_orig[len(new_indices) :]]
-            )
-        else:
-            req.prefix_indices = new_indices
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
 
@@ -1268,9 +1256,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
         token_ids = req.get_fill_ids()
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
-        ]
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,
@@ -1297,7 +1282,6 @@ class UnifiedRadixCache(BasePrefixCache):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=False, insert_params=insert_params
@@ -3816,6 +3800,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.tree_core.node_by_id(node_handle)
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
