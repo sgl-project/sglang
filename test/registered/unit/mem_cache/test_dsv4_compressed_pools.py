@@ -9,6 +9,10 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    SparsePrefillChunkCache,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -16,6 +20,8 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
 )
+from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -448,7 +454,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_window_target_without_paged_allocator_has_no_mapping(self):
+    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
         pool = DeepSeekV4TokenToKVPool(
             max_num_reqs=2,
             num_req_slots=3,
@@ -474,6 +480,50 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         self.assertIsNotNone(pool.request_window)
         self.assertFalse(pool.needs_paged_swa_allocator)
         self.assertIsNone(pool.full_to_swa_index_mapping)
+
+        # A 300-token cold prefill of request slot 1 on the sparse-prefill path.
+        rows = 300
+        layout = window_layout(
+            torch.ones(rows, dtype=torch.int64),
+            torch.arange(rows),
+            capacity=pool.request_window.capacity,
+            num_groups=1,
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.token_to_kv_pool = pool
+        backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([rows]),
+            seq_lens_cpu=torch.tensor([rows]),
+            extend_seq_lens=torch.tensor([rows], dtype=torch.int32),
+            extend_seq_lens_cpu=[rows],
+            req_pool_indices=torch.tensor([1]),
+        )
+        core = SimpleNamespace(
+            request_window_layout=layout, seq_lens_casual=torch.arange(1, rows + 1)
+        )
+        build = SparsePrefillChunkCache.build
+        empty = torch.empty(0, dtype=torch.int32)
+        with (
+            patch.object(SparsePrefillChunkCache, "build", wraps=build) as spy,
+            # The combine is a Triton kernel; the request-window inputs are the contract.
+            patch(
+                "sglang.srt.layers.attention.dsv4.sparse_prefill_utils."
+                "combine_topk_swa_indices",
+                return_value=(empty, empty),
+            ) as combine,
+        ):
+            cache = backend._build_sparse_prefill_chunk_cache(
+                forward_batch, core, num_qo_tokens=rows
+            )
+
+        self.assertIsNone(spy.call_args.kwargs["full_to_swa"])
+        self.assertIs(cache.swa_indices, layout.indices)
+        self.assertIs(cache.swa_lengths, layout.lengths)
+        self.assertIs(combine.call_args.kwargs["swa_indices"], layout.indices)
+        torch.testing.assert_close(cache.query_pos, layout.pos.to(torch.int32))
 
 
 if __name__ == "__main__":
