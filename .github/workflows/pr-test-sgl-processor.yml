@@ -1,0 +1,173 @@
+name: PR Test (sglang-processor)
+
+# Keep path and label decisions visible in the gate job, as in pr-test-sgl-router.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # Unrelated label events must not cancel an active test run.
+  group: sglang-processor-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.run_id || 'checks' }}
+  cancel-in-progress: true
+
+jobs:
+  sgl-processor-gate:
+    name: gate
+    if: github.event.action != 'labeled' || github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect processor path changes
+        id: paths
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          # Compare a main push with its previous tip, including multi-commit pushes.
+          base: ${{ github.event.before || github.event.repository.default_branch }}
+          filters: |
+            processor:
+              - 'rust/sglang-processor/**'
+              # Workspace members share dependency resolution and the toolchain.
+              - 'rust/**/Cargo.toml'
+              - 'rust/Cargo.lock'
+              - 'rust/rust-toolchain.toml'
+              - 'rust/.cargo/**'
+              - '.cargo/**'
+              - 'rust/rustfmt.toml'
+              - 'rust/.rustfmt.toml'
+              - 'rustfmt.toml'
+              - '.rustfmt.toml'
+              - '.github/workflows/pr-test-sgl-processor.yml'
+              # Python behavior mirrored by the processor's compatibility code.
+              - 'python/sglang/srt/parser/**'
+              - 'python/sglang/srt/function_call/**'
+              - 'python/sglang/srt/entrypoints/openai/chat_encoding.py'
+              - 'python/sglang/srt/tokenizer/**'
+              - 'python/sglang/srt/utils/hf_transformers/tokenizer.py'
+              - 'python/sglang/srt/utils/hf_transformers_utils.py'
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PATHS_CHANGED: ${{ steps.paths.outputs.processor }}
+          HAS_RUN_CI: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch; running processor checks."
+          elif [[ "$PATHS_CHANGED" != "true" ]]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "No processor-related changes; skipping checks."
+          elif [[ "$EVENT_NAME" == "pull_request" && "$HAS_RUN_CI" != "true" ]]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "PR is missing the run-ci label; skipping checks."
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Processor-related changes detected; running checks."
+          fi
+
+  sgl-processor-lint:
+    name: tier-1 — lint
+    needs: sgl-processor-gate
+    if: needs.sgl-processor-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install workspace Rust toolchain
+        # rustup reads rust/rust-toolchain.toml, including clippy and rustfmt.
+        run: rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: sglang-processor
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt -p sglang-processor -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked -p sglang-processor --all-targets --all-features -- -D warnings
+
+  sgl-processor-test:
+    name: tier-2 — build + test
+    needs: [sgl-processor-gate, sgl-processor-lint]
+    if: needs.sgl-processor-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install workspace Rust toolchain
+        run: rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: sglang-processor
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # cargo test builds the library and runs unit, integration, and doc tests.
+      # These tests use local fixtures; no GPU or model downloads are needed.
+      - name: Test default features
+        run: cargo test --locked -p sglang-processor
+
+      - name: Test without optional features
+        run: cargo test --locked -p sglang-processor --no-default-features
+
+      - name: Test individual features and the render/tokenizer host configuration
+        run: |
+          for features in parser render tokenizer render,tokenizer; do
+            cargo test --locked -p sglang-processor --no-default-features --features "$features"
+          done
+
+  sgl-processor-finish:
+    needs: [sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
+    if: always() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required results
+        env:
+          GATE_RESULT: ${{ needs.sgl-processor-gate.result }}
+          SHOULD_RUN: ${{ needs.sgl-processor-gate.outputs.should_run }}
+          LINT_RESULT: ${{ needs.sgl-processor-lint.result }}
+          TEST_RESULT: ${{ needs.sgl-processor-test.result }}
+        run: |
+          if [[ "$GATE_RESULT" != "success" ]]; then
+            echo "::error::Processor gate did not succeed ($GATE_RESULT)."
+            exit 1
+          fi
+          if [[ "$SHOULD_RUN" == "true" && "$LINT_RESULT" == "success" && "$TEST_RESULT" == "success" ]]; then
+            echo "All processor checks passed."
+          elif [[ "$SHOULD_RUN" == "false" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
+            echo "Processor checks skipped by the path/label gate."
+          else
+            echo "::error::Unexpected processor results: should_run=$SHOULD_RUN, lint=$LINT_RESULT, test=$TEST_RESULT."
+            exit 1
+          fi
