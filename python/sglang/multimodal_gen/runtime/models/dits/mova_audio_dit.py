@@ -110,7 +110,6 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         eps = config.eps
         patch_size = config.patch_size
         num_heads = config.num_heads
-        has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
@@ -126,8 +125,6 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.vae_type = vae_type
-        # self.patch_embedding = nn.Conv3d(
-        #     in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.patch_embedding = Conv1dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
@@ -135,10 +132,8 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
-        self.img_pos_emb = None
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
         self.hidden_size = dim
         self.num_attention_heads = num_heads

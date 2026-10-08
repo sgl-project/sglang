@@ -466,7 +466,6 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         eps = config.eps
         patch_size = config.patch_size
         num_heads = config.num_heads
-        has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
@@ -491,7 +490,6 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
         self.hidden_size = dim
         self.num_attention_heads = num_heads
