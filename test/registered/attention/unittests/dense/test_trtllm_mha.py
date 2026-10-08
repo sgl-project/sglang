@@ -248,15 +248,21 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         "fmha_v2 prefill runs only on SM90/SM120",
     )
     def test_fmha_v2_extend_cases(self):
-        for case in self.FMHA_V2_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dense_attention_case(
-                    self,
-                    case,
-                    head_dim=self.FMHA_V2_HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                    max_context_len=128,
-                )
+        for hnd in (False, True):
+            for case in self.FMHA_V2_EXTEND_CASES:
+                with (
+                    self.subTest(case=case.name, hnd=hnd),
+                    envs.SGLANG_USE_HND_KVCACHE.override(hnd),
+                    # The HND pool writes K/V by index assignment, which autograd rejects.
+                    torch.no_grad(),
+                ):
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.FMHA_V2_HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        max_context_len=128,
+                    )
 
     @unittest.skipUnless(
         is_sm90_supported() or is_sm120_supported(),

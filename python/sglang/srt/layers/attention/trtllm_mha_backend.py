@@ -1686,6 +1686,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
+            elif k_cache_raw.dim() == 4:
+                # HND pool buffers are already contiguous [pages, heads, page, dim].
+                k_cache, v_cache = k_cache_raw, v_cache_raw
             else:
                 k_cache = paged_kv_view(
                     k_cache_raw, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -1793,7 +1796,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 qkv,
-                input_layout="Q_PAGED_KV_NHD",
+                input_layout=(
+                    "Q_PAGED_KV_HND" if k_cache_raw.dim() == 4 else "Q_PAGED_KV_NHD"
+                ),
                 workspace_buffer=self._fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
