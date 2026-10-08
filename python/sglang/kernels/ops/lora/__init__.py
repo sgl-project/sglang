@@ -46,6 +46,43 @@ _ENGINE_TRITON_KERNELS = [
         "embedding_lora_a_tokens_fwd",
         "embedding_lora_a_tokens_fwd",
     ),
+    ("moe.activation_delta", "act_delta_masked", "act_delta_masked"),
+    ("moe.activation_delta", "act_delta_contiguous", "act_delta_contiguous"),
+    ("moe.align_rows", "pair_to_row_map", "pair_to_row_map"),
+    ("moe.align_rows", "moe_align_single_token", "moe_align_single_token"),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_layout_contiguous",
+        "dispatch_layout_contiguous",
+    ),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_fill_rows_contiguous_bf16",
+        "dispatch_fill_rows_contiguous_bf16",
+    ),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_fill_rows_contiguous_fp8",
+        "dispatch_fill_rows_contiguous_fp8",
+    ),
+    ("moe.dispatch_masked", "dispatch_fill_masked_bf16", "dispatch_fill_masked_bf16"),
+    ("moe.dispatch_masked", "dispatch_fill_masked_fp8", "dispatch_fill_masked_fp8"),
+    (
+        "moe.finalize",
+        "invoke_shared_token_delta_reduce",
+        "invoke_shared_token_delta_reduce",
+    ),
+    (
+        "moe.finalize",
+        "invoke_shared_token_delta_tail",
+        "invoke_shared_token_delta_tail",
+    ),
+    ("moe.finalize", "invoke_shared_one_pass", "invoke_shared_one_pass"),
+    ("moe.finalize", "invoke_small_finalize", "invoke_small_finalize"),
+    ("moe.fused_act", "fused_b_act_masked", "fused_b_act_masked"),
+    ("moe.fused_act", "fused_b_act_contiguous", "fused_b_act_contiguous"),
+    ("moe.lora_b", "grouped_lora_b", "moe_grouped_lora_b"),
+    ("moe.lora_b", "invoke_down_b_into_base", "invoke_down_b_into_base"),
 ]
 for _mod, _fn, _op in _ENGINE_TRITON_KERNELS:
     register_kernel(
