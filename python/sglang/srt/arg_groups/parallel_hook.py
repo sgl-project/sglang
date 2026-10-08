@@ -314,9 +314,6 @@ def handle_data_parallelism(server_args: Any):
 
 
 def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether CUDA graphs are captured into torch_memory_saver memory, which
-    release/resume of the `cuda_graph` tag remaps to new physical pages at the
-    same virtual addresses."""
     return bool(
         resolving_view(server_args).enable_memory_saver
         and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
