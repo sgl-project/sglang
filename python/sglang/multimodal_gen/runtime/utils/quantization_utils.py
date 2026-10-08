@@ -947,21 +947,6 @@ def _build_nvfp4_config_from_safetensors_files(
         return None
 
 
-def build_nvfp4_config_from_safetensors(
-    file_path: str,
-    param_names_mapping_dict: Optional[dict] = None,
-    reverse_param_names_mapping_dict: Optional[dict] = None,
-    fallback_group_size: Optional[int] = None,
-) -> Optional[QuantizationConfig]:
-    """Backward-compatible wrapper for a single safetensors file."""
-    return _build_nvfp4_config_from_safetensors_files(
-        [file_path],
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-        fallback_group_size,
-    )
-
-
 def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,

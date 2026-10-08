@@ -5,7 +5,6 @@
 """Utilities for downloading, loading, initializing and verifying model weights."""
 
 import hashlib
-import json
 import os
 import tempfile
 from collections import defaultdict
@@ -137,38 +136,6 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
-
-
-# For models like Mistral-7B-v0.3, there are both sharded
-# safetensors files and a consolidated safetensors file.
-# Passing both of these to the weight loader functionality breaks.
-# So, we use the index_file to
-# look up which safetensors files should be used.
-def filter_duplicate_safetensors_files(
-    hf_weights_files: list[str],
-    hf_folder: str,
-    index_file: str,
-    key_filter: Callable[[str], bool] | None = None,
-) -> list[str]:
-    # model.safetensors.index.json is a mapping from keys in the
-    # torch state_dict to safetensors file holding that weight.
-    index_file_name = os.path.join(hf_folder, index_file)
-    if not os.path.isfile(index_file_name):
-        return hf_weights_files
-
-    # Iterate through the weight_map (weight_name: safetensors files)
-    # to identify weights that we should use.
-    with open(index_file_name) as f:
-        weight_map = json.load(f)["weight_map"]
-    weight_files_in_index = set()
-    for weight_name in weight_map:
-        # remove only shards whose indexed tensors are all filtered
-        if key_filter is not None and not key_filter(weight_name):
-            continue
-        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
-    # Filter out any fields that are not found in the index file.
-    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
-    return hf_weights_files
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
