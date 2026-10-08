@@ -5,7 +5,7 @@ at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
-the donated alloc asserts; ratio 3 (pool = 3N) has headroom. Once decode's
+the donated alloc is skipped; ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
@@ -227,10 +227,10 @@ class TestDecSwaLockSkip(unittest.TestCase):
 
 class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
-        # pool = 2N, all N prefixes admission-locked: no evictable victim.
+        # pool = 2N, all N prefixes admission-locked: no evictable victim, so
+        # the optional donation alloc returns None instead of asserting.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
-        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
-            component._alloc_mamba_slot()
+        self.assertIsNone(component._alloc_mamba_slot())
         self.assertEqual(
             cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
         )

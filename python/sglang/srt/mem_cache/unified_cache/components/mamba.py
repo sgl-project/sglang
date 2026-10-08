@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
+from sglang.srt.utils.common import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -502,13 +503,19 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one mamba pool slot for an optional donation, evicting if
+        necessary. Returns None when every cached state is locked; the caller
+        then skips caching this chunk instead of failing the engine."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                print_warning_once(
+                    "Mamba pool exhausted with no evictable state; skipping "
+                    "prefix caching for the current chunk."
+                )
         return slot
 
     @property
@@ -610,6 +617,8 @@ class MambaComponent(TreeComponent):
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
                     new_slot = self._alloc_mamba_slot()
+                    if new_slot is None:
+                        return 0
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -623,6 +632,8 @@ class MambaComponent(TreeComponent):
                     )
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._alloc_mamba_slot()
+                if new_slot is None:
+                    return 0
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
@@ -630,6 +641,8 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
+                if mamba_value_donated is None:
+                    return 0
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices

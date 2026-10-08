@@ -9326,6 +9326,90 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                 cache.sanity_check()
 
 
+class TestMambaDonationOnLockedFullPool(CustomTestCase):
+    """A mid-flight checkpoint donates a fresh ping-pong slot. With the pool
+    full and every cached state locked, eviction reclaims nothing; the
+    checkpoint must skip caching instead of asserting."""
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+        mamba_cache_size=8,
+    )
+
+    def _running_req(self, allocator, pool, tokens):
+        req = Req(
+            rid="running",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([req])
+        req.output_ids = array("q")
+        req.extra_key = None
+        req.refresh_fill_ids()
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), allocator.alloc(len(tokens))
+        )
+        return req
+
+    def test_checkpoint_skips_donation_when_no_slot_is_evictable(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        prefix = list(range(100, 108))
+        seed = Req(
+            rid="seed",
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        pool.alloc([seed])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=allocator.alloc(len(prefix)),
+                mamba_value=seed.kv.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        prefix_node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+        prefix_lock = cache.lock(prefix_node)
+
+        tokens = list(range(1, 9))
+        req = self._running_req(allocator, pool, tokens)
+        req.last_node = cache.root_node_handle()
+        req.lock = None
+        held = []
+        while (slot := pool.mamba_allocator.alloc(1)) is not None:
+            held.append(slot)
+        ping_pong = req.kv.mamba_ping_pong_track_buffer.clone()
+
+        cache.checkpoint(req, up_to=len(tokens))
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(match.device_prefix_len, 0)
+        self.assertTrue(torch.equal(req.kv.mamba_ping_pong_track_buffer, ping_pong))
+        self.assertIsNone(pool.mamba_allocator.alloc(1))
+        cache.sanity_check()
+
+        # Once a slot frees up, the next checkpoint donates as usual.
+        pool.mamba_allocator.free(held.pop())
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        cache.checkpoint(req, up_to=len(tokens))
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(match.device_prefix_len, len(tokens))
+        cache.unlock(req.lock)
+        cache.unlock(prefix_lock)
+        cache.sanity_check()
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.MAMBA),
