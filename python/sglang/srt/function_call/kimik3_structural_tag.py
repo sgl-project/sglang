@@ -267,12 +267,32 @@ def _restrict_schema_type(
     return _with_root_definitions(result, root_schema)
 
 
+_STRING_SHAPE_KEYWORDS = _STRING_KEYWORDS | {
+    "$ref",
+    "allOf",
+    "anyOf",
+    "const",
+    "enum",
+    "not",
+    "oneOf",
+}
+
+
+def _is_free_text(schema: Union[bool, Dict[str, Any]]) -> bool:
+    """A string schema that constrains nothing about the text itself."""
+    return schema is True or not _STRING_SHAPE_KEYWORDS.intersection(schema)
+
+
 def _value_format(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
     loose_string: bool = False,
 ) -> Format:
-    if loose_string and json_type == "string":
+    if json_type == "string" and (loose_string or _is_free_text(schema)):
+        # AnyTextFormat stops at the enclosing tag's end marker. A qwen_xml
+        # string schema does not: the value could contain
+        # "<|close|>argument<|sep|>" and smuggle in further arguments that the
+        # detector then splits off, bypassing the strict argument schema.
         return AnyTextFormat()
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
