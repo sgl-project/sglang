@@ -18,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
+from fixture_json import dump
+
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/tool_parity"
 
 
@@ -34,7 +36,9 @@ def parse(parser_name, tools, chunks):
             end_normal, end_found = streaming.parse_stream_end()
             normal, found = (normal or "") + end_normal, list(found) + end_found
         steps.append([normal or "", calls(found)])
-    normal, found = FunctionCallParser(tools, parser_name).parse_non_stream("".join(chunks))
+    normal, found = FunctionCallParser(tools, parser_name).parse_non_stream(
+        "".join(chunks)
+    )
     return {"steps": steps, "unary": [normal, calls(found)]}
 
 
@@ -45,4 +49,4 @@ for path in sorted(FIXTURES.glob("*.json")):
         {"chunks": chunks, **parse(fixture["parser"], tools, chunks)}
         for chunks in fixture["inputs"]
     ]
-    path.write_text(json.dumps(fixture, indent=1, ensure_ascii=False) + "\n")
+    path.write_text(dump(fixture))
