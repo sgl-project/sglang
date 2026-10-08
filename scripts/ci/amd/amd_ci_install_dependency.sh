@@ -420,6 +420,75 @@ if old in s:
 PY
     fi
 
+    # Gate AITER's gfx950 Gluon quant kernels on the Triton actually installed.
+    # They call gl.amd.cdna4.scaled_downcast, which landed on Triton main
+    # (3.9.0) in triton-lang/triton#11377 and is in no 3.7 or 3.8 release, so on
+    # every CI image the kernel dies at JIT compile time with
+    #   AttributeError: module '...gluon.language.amd.cdna4'
+    #   has no attribute 'scaled_downcast'
+    # and takes the whole model load down with it. Mirrors the _HAS_SCALED_UPCAST
+    # probe AITER already uses in ops/triton/attention/pa_decode_sparse.py.
+    # Drop this once ROCm/aiter carries the guard itself.
+    docker exec -i ci_sglang python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/sgl-workspace/aiter/aiter/ops/triton/quant/quant.py")
+if not p.exists():
+    raise SystemExit(0)
+s = p.read_text()
+if "_HAS_SCALED_DOWNCAST" in s:
+    print("[CI-AITER-CHECK] scaled_downcast guard already present")
+    raise SystemExit(0)
+
+probe_anchor = "from aiter.ops.triton.utils.types import e4m3_dtype\n"
+probe = probe_anchor + """
+# gl.amd.cdna4.scaled_downcast is Triton-main only; fall back to the Triton
+# kernels when the installed Triton does not provide it.
+try:
+    from triton.experimental.gluon.language.amd import cdna4 as _cdna4
+
+    _HAS_SCALED_DOWNCAST = hasattr(_cdna4, "scaled_downcast")
+except ImportError:
+    _HAS_SCALED_DOWNCAST = False
+"""
+
+edits = [
+    (probe_anchor, probe),
+    (
+        '        arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16 and not use_sr,\n'
+        '        "gfx950, bf16 input and use_sr=False",\n',
+        "        _HAS_SCALED_DOWNCAST\n"
+        '        and arch_info.get_arch() == "gfx950"\n'
+        "        and x.dtype == torch.bfloat16\n"
+        "        and not use_sr,\n"
+        '        "gfx950, bf16 input, use_sr=False and a Triton providing "\n'
+        '        "gl.amd.cdna4.scaled_downcast",\n',
+    ),
+    (
+        '        arch_info.get_arch() == "gfx950"\n'
+        "        and x.dtype == torch.bfloat16\n"
+        "        and quant_dtype == torch.float8_e4m3fn,\n"
+        '        "gfx950, bf16 input and quant_dtype=torch.float8_e4m3fn",\n',
+        "        _HAS_SCALED_DOWNCAST\n"
+        '        and arch_info.get_arch() == "gfx950"\n'
+        "        and x.dtype == torch.bfloat16\n"
+        "        and quant_dtype == torch.float8_e4m3fn,\n"
+        '        "gfx950, bf16 input, quant_dtype=torch.float8_e4m3fn and a Triton "\n'
+        '        "providing gl.amd.cdna4.scaled_downcast",\n',
+    ),
+]
+
+for old, new in edits:
+    if old not in s:
+        # AITER predates the Gluon quant kernels; nothing to guard.
+        print("[CI-AITER-CHECK] scaled_downcast guard not applicable, skipping")
+        raise SystemExit(0)
+    s = s.replace(old, new, 1)
+
+p.write_text(s)
+print("[CI-AITER-CHECK] applied scaled_downcast capability guard to aiter quant.py")
+PY
+
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
         GPU_ARCH_LIST="gfx950"
     else
