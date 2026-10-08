@@ -7,6 +7,9 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+    resolve_cp_tp_group_sharing,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
@@ -134,6 +137,7 @@ def handle_context_parallelism(server_args: Any):
                     "MiMo V2 prefill CP only supports text inference; add "
                     "--language-only."
                 )
+        resolve_cp_tp_group_sharing(server_args, model_config)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
