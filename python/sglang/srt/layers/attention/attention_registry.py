@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
@@ -252,6 +253,10 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
+    if "DiffusionGemmaForBlockDiffusion" in runner.model_config.hf_config.architectures:
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        return TritonAttnBackend(runner, dllm_fa4=True)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
@@ -434,7 +439,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 if get_platform().is_sm120:
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
-                    allowed = {"triton", "trtllm_mha", "fa4"}
+                    # FlashInfer paged prefill is also valid for SM100 hybrid
+                    # GDN models. In particular, quantized KV recipes use it
+                    # to expose an FP8 dequant workspace while a different
+                    # backend (for example TRT-LLM GenMHA) owns decode.
+                    allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
@@ -518,8 +527,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
-                spec, _ = spec_result
-                cfg = runner.model_config
+                spec, cfg = spec_result
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
                 if spec.hybrid_backend_class_name is not None:

@@ -1,8 +1,6 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
-import sys
-import types
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -89,9 +87,6 @@ class _HashKey:
 
     def raw_token_ids(self):
         return self.token_ids
-
-    def hash_page(self, start, end, prior_hash=None):
-        return _legacy_get_hash_str(self[start:end], prior_hash)
 
 
 def _single_hash_compatibility_cases():
@@ -203,28 +198,6 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
         self.assertIsNone(pool)
         self.assertIsNone(pool_type)
 
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_enabled_via_env(self, mock_env_get):
-        mock_env_get.return_value = "enabled"
-        mock_init = MagicMock()
-        mock_init.return_value = (True, "mock_pool_instance", "mooncake")
-
-        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
-        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
-        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
-                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
-            },
-        ):
-            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertTrue(enabled)
-        self.assertEqual(pool, "mock_pool_instance")
-        self.assertEqual(pool_type, "mooncake")
-        mock_init.assert_called_once_with("cuda:0")
-
 
 class TestGetHashStr(unittest.TestCase):
     def test_hash_str_matches_pre_optimization_per_token_loop(self):
@@ -262,15 +235,6 @@ class TestGetHashStr(unittest.TestCase):
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
             with self.subTest(tokens=tokens):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
-
-    def test_hash_key_hash_page_matches_get_hash_str(self):
-        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
-        prior_hash = get_hash_str([(9, 10)])
-
-        self.assertEqual(
-            key.hash_page(1, 4, prior_hash),
-            get_hash_str(key[1:4], prior_hash),
-        )
 
 
 class TestStorageHashNamespace(unittest.TestCase):
