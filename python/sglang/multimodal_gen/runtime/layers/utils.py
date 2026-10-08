@@ -10,8 +10,8 @@ from typing import Any, Callable, List, Optional
 import torch
 from torch.library import Library
 
+import sglang.multimodal_gen.runtime.platforms as platforms
 from sglang.kernels.kernel_api_logging import debug_torch_op
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def get_group_size(group) -> int:
@@ -32,23 +32,6 @@ def get_group_rank(group) -> int:
         raise ValueError(f"Unsupported group type: {type(group)}")
 
 
-def get_token_bin_counts_and_mask(
-    tokens: torch.Tensor,
-    vocab_size: int,
-    num_seqs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Compute the bin counts for the tokens.
-    # vocab_size + 1 for padding.
-    bin_counts = torch.zeros(
-        (num_seqs, vocab_size + 1), dtype=torch.long, device=tokens.device
-    )
-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
-    bin_counts = bin_counts[:, :vocab_size]
-    mask = bin_counts > 0
-
-    return bin_counts, mask
-
-
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 
 
@@ -62,7 +45,7 @@ def direct_register_custom_op(
     """
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
-    directly registers a custom op and dispatches it to the CUDA backend.
+    directly registers a custom op for the active platform's dispatch key.
     See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
     for more details.
 
@@ -107,7 +90,9 @@ def direct_register_custom_op(
     try:
         my_lib.define(op_name + schema_str)
         my_lib.impl(
-            op_name, op_func, "CUDA" if not current_platform.is_npu() else "PrivateUse1"
+            op_name,
+            op_func,
+            platforms.current_platform.get_torch_library_dispatch_key(),
         )
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)

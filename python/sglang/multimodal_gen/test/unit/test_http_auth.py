@@ -20,6 +20,7 @@ def _server_args(api_key=None, admin_api_key=None):
     return SimpleNamespace(
         api_key=api_key,
         admin_api_key=admin_api_key,
+        enable_metrics=False,
         pipeline_config=pipeline_config,
     )
 

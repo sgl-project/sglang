@@ -211,6 +211,7 @@ class MambaMixer2(torch.nn.Module):
         activation: str = "silu",
         use_rms_norm: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -230,9 +231,11 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         if is_dp_attention_enabled():
+            parallel_group = "attn_tp"
             self.tp_size = get_parallel().attn_tp_size
             self.tp_rank = get_parallel().attn_tp_rank
         else:
+            parallel_group = "tp"
             self.tp_size = get_parallel().tp_size
             self.tp_rank = get_parallel().tp_rank
 
@@ -283,8 +286,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = MergedColumnParallelLinear(
@@ -299,8 +301,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             # This is the n_groups == 1 case,
@@ -312,8 +313,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = ColumnParallelLinear(
@@ -322,8 +322,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             # - because in_proj is a concatenation of 3 weights, we
@@ -414,22 +413,32 @@ class MambaMixer2(torch.nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
         self.use_rms_norm = use_rms_norm
 
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.D,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
         a_weight_loader = composed_weight_loader(
-            sharded_weight_loader(0), lambda x: -torch.exp(x.float())
+            sharded_weight_loader(0, parallel_group=parallel_group),
+            lambda x: -torch.exp(x.float()),
         )
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
 
+        # By default the stage boundary reduces the output under DP attention.
+        if reduce_results is None:
+            reduce_results = not is_dp_attention_enabled()
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            reduce_results=not is_dp_attention_enabled(),
+            parallel_group=parallel_group,
+            reduce_results=reduce_results,
+            use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
@@ -461,6 +470,7 @@ class MambaMixer2(torch.nn.Module):
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
         intermediate_states = None
+        track_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -544,6 +554,9 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Rows past the batch's tokens are DP padding; keep them finite.
+        if num_actual_tokens < preallocated_ssm_out.shape[0]:
+            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,
@@ -600,7 +613,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, local_num_heads, self.head_dim
                 ),
@@ -619,7 +632,9 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
-                return_intermediate_states=True,
+                return_track_states=True,
+                track_seq_idx=metadata.track_ssm_seq_idx,
+                track_end_locs=metadata.track_ssm_end_locs,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(
@@ -763,7 +778,7 @@ class MambaMixer2(torch.nn.Module):
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 
-        return mixer_out, intermediate_states
+        return mixer_out, intermediate_states, track_states
 
     @property
     def mamba_type(self) -> str:
