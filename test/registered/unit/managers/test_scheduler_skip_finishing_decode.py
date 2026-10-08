@@ -38,7 +38,6 @@ class TestSkipFinishingDecode(CustomTestCase):
         self.addCleanup(reset_context)
         self.scheduler = Scheduler.__new__(Scheduler)
         self.scheduler.enable_skip_finishing_decode = True
-        self.scheduler.reqs_finishing_in_flight = []
         self.scheduler.result_queue = deque()
 
     def _req(self, rid="r", max_new_tokens=2, output_ids=(), input_len=1):

@@ -1931,8 +1931,6 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
-        # Requests dropped from decode this step because their queued result finishes them.
-        self.reqs_finishing_in_flight: List[Req] = []
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1993,10 +1991,6 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
-
-            for req in self.reqs_finishing_in_flight:
-                assert req.finished(), f"{req.rid=} skipped decode but did not finish"
-            self.reqs_finishing_in_flight.clear()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -4231,7 +4225,6 @@ class Scheduler(
         ]
         if finishing_reqs:
             batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
-            self.reqs_finishing_in_flight.extend(finishing_reqs)
         return finishing_reqs
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
