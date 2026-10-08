@@ -1205,19 +1205,19 @@ class SchedulerBatchResultProcessor:
                 reqs[batch_index].sampling_logprobs_mode == "support"
             )
             rows = range(slot * stride, (slot + 1) * stride)
-            status = max(int(statuses[row]) for row in rows)
+            status = max(statuses[row] for row in rows)
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                mask_rows = [token_ids[row, : lengths[row]] for row in rows]
+                masks[batch_index] = [token_ids[row, : lengths[row]] for row in rows]
                 if returns_support_logprobs:
-                    logprob_rows = [
+                    logprobs[batch_index] = [
                         support_logprobs[support_row + position, : lengths[row]]
                         for position, row in enumerate(rows)
                     ]
                 else:
-                    logprob_rows = [selected_logprobs[row : row + 1] for row in rows]
-                masks[batch_index] = mask_rows
-                logprobs[batch_index] = logprob_rows
+                    logprobs[batch_index] = [
+                        selected_logprobs[row : row + 1] for row in rows
+                    ]
             if returns_support_logprobs:
                 support_row += stride
 

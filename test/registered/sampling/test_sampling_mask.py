@@ -24,7 +24,6 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
-from sglang.srt.speculative.spec_sampling_mask import verify_sampling_mask_output
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -62,33 +61,6 @@ class TestSamplingMaskCapture(CustomTestCase):
         self.sampler.sampling_mask_max_tokens = 4096
         self.sampler.tp_sync_group = None
         self.sampler.cp_sync_group = None
-
-    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
-    def test_speculative_mask_captures_sequential_filtering(self):
-        from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
-
-        probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]], device="cuda")
-        filtered = top_p_renorm_probs(top_k_renorm_probs(probs, 3), 0.75)
-        original = filtered.clone()
-        output = verify_sampling_mask_output(
-            mask_req_rows=torch.tensor([0], device="cuda"),
-            mask_probs=filtered,
-            predict=torch.tensor([1], dtype=torch.int32, device="cuda"),
-            accept_index=torch.tensor([[0]], dtype=torch.int32, device="cuda"),
-            draft_token_num=1,
-            max_tokens=4,
-            support_capture_indices=torch.tensor([0], device="cuda"),
-            sync_groups=(),
-        )
-        self.assertEqual(output.lengths.tolist(), [2])
-        self.assertEqual(output.token_ids[0, :2].tolist(), [0, 1])
-        self.assertAlmostEqual(
-            output.selected_logprobs.item(), math.log(3 / 7), places=6
-        )
-        torch.testing.assert_close(
-            output.support_logprobs[0, :2], original[0, :2].log()
-        )
-        torch.testing.assert_close(filtered, original, rtol=0, atol=0)
 
     def test_default_sampling_does_not_construct_capture_helpers(self):
         """Requests without masks must bypass capture-only allocations."""

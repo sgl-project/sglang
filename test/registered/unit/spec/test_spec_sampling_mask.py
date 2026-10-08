@@ -83,34 +83,27 @@ class TestSpecSamplingMask(CustomTestCase):
             + [SamplingMaskStatus.INVALID, SamplingMaskStatus.OK],
         )
 
-    def test_materialize_one_support_per_position(self):
-        mask = SimpleNamespace(
-            support_logprobs=None,
-            token_ids=torch.tensor([[5, 6], [7, 0], [8, 0], [0, 0]], dtype=torch.int32),
-            lengths=torch.tensor([2, 1, 1, 0]),
-            selected_logprobs=torch.tensor([-0.5, 0.0, -0.25, 0.0]),
-            statuses=torch.tensor([0, 0, 0, SamplingMaskStatus.OVERFLOW]),
-        )
-        output = SimpleNamespace(sampling_mask_output=mask)
+        output = SimpleNamespace(sampling_mask_output=out)
         reqs = [
             SimpleNamespace(return_sampling_mask=x, sampling_logprobs_mode="selected")
             for x in (True, False, True)
         ]
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(reqs, output)
         self.assertEqual(
-            [
-                [row.tolist() for row in output.next_token_sampling_mask_idx[0]],
-                *output.next_token_sampling_mask_idx[1:],
-            ],
-            [[[5, 6], [7]], None, None],
+            [row.tolist() for row in output.next_token_sampling_mask_idx[0]],
+            [[1, 2, 3], [0]],
         )
-        self.assertEqual(
-            [row.tolist() for row in output.next_token_sampling_logprobs[0]],
-            [[-0.5], [0.0]],
+        self.assertEqual(output.next_token_sampling_mask_idx[1:], [None, None])
+        self.assertEqual(output.next_token_sampling_logprobs[1:], [None, None])
+        torch.testing.assert_close(
+            torch.tensor(
+                [row.tolist() for row in output.next_token_sampling_logprobs[0]]
+            ),
+            torch.tensor([[math.log(0.3)], [0.0]]),
         )
         self.assertEqual(
             output.next_token_sampling_mask_status,
-            [SamplingMaskStatus.OK, None, SamplingMaskStatus.OVERFLOW],
+            [SamplingMaskStatus.OK, None, SamplingMaskStatus.INVALID],
         )
 
     def test_mixed_selected_and_support_modes_follow_verify_positions(self):
