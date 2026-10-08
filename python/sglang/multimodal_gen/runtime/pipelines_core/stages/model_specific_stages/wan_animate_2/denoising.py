@@ -248,7 +248,7 @@ class WanAnimate2DenoisingStage(DenoisingStage):
         # One record per step across every clip, like the shared loop: the perf dump and the
         # CI harness read avg/median denoise-step time from them.
         for step_index, t in enumerate(self.scheduler.timesteps):
-            timestep = torch.stack([t])  # [1]
+            timestep = t.unsqueeze(0)  # [1], a view of the scheduler timestep
             with StageProfiler(
                 f"denoising_step_{clip_index}_{step_index}",
                 logger=logger,

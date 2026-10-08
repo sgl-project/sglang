@@ -222,7 +222,7 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         # caller; None when the gathered sequence has no padding.
         reference_video_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Cache this block's pre-RoPE reference-video K/V, then run the reference-video self-attention
+        """Cache this block's rotated reference-video K and V, then run the reference-video self-attention
         (reference-video RoPE, pad keys masked) and return the updated reference-video stream."""
         orig_dtype = hidden_states.dtype
         shift, scale, gate, c_shift, c_scale, c_gate = self._modulate(
@@ -237,10 +237,6 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         sp_size = get_sp_world_size()
         if sp_size > 1:
             query, key, value = _sp_gather_qkv(query, key, value)
-
-        # Cached pre-RoPE; forward_gen applies reference-video RoPE each step.
-        k_cache[index] = key
-        v_cache[index] = value
 
         # Reference-video self-attention. Under SP, S_reference_video is the gathered
         # (tail-padded) length: RoPE the valid slice and mask the pad keys. Without padding the
@@ -276,6 +272,10 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
                     num_valid=reference_video_num_tokens,
                     device=hidden_states.device,
                 )
+        # Reference positions are invariant within a clip. Keep the rotated key in the
+        # original cache storage; SP's value can share the gathered QKV allocation.
+        k_cache[index] = key.copy_(k_roped)
+        v_cache[index] = value
         if sp_size > 1:
             # q/k/v are already gathered: skip USPAttention's own a2a, then scatter back.
             attn_output = self.attn1(
@@ -309,8 +309,6 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         timestep_modulation: torch.Tensor,  # [B, 6, C]
         gen_cos: torch.Tensor,  # gen-RoPE cos [generation_video_num_tokens, D//2]
         gen_sin: torch.Tensor,
-        reference_video_rope_cos: torch.Tensor,  # reference-video RoPE cos [reference_video_num_tokens, D//2]
-        reference_video_rope_sin: torch.Tensor,
         block_mask: BlockMask,  # per full-length clip grid
         layout: _InContextLayout,
         index: int,
@@ -335,43 +333,28 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
 
         # gen-RoPE on the valid gen tokens only (padding kept unrotated).
         num_generation_tokens = layout.generation_video_num_tokens
-        query = torch.cat(
-            [
-                _apply_rope_interleaved(
-                    query[:, :num_generation_tokens], gen_cos, gen_sin
-                ),
-                query[:, num_generation_tokens:],
-            ],
-            dim=1,
+        q_roped = _apply_rope_interleaved(
+            query[:, :num_generation_tokens], gen_cos, gen_sin
         )
-        key = torch.cat(
-            [
-                _apply_rope_interleaved(
-                    key[:, :num_generation_tokens], gen_cos, gen_sin
-                ),
-                key[:, num_generation_tokens:],
-            ],
-            dim=1,
+        k_roped = _apply_rope_interleaved(
+            key[:, :num_generation_tokens], gen_cos, gen_sin
         )
+        if query.shape[1] != num_generation_tokens:
+            q_roped = torch.cat([q_roped, query[:, num_generation_tokens:]], dim=1)
+            k_roped = torch.cat([k_roped, key[:, num_generation_tokens:]], dim=1)
 
-        # cached reference-video K/V (pre-RoPE); apply reference-video RoPE to the valid reference-video K slice now.
+        # Reference-video K is already rotated by forward_ref, including SP tail padding.
         reference_video_k = k_cache[index]
         reference_video_v = v_cache[index]
-        reference_video_num_tokens = layout.reference_video_num_tokens
-        reference_video_k = torch.cat(
-            [
-                _apply_rope_interleaved(
-                    reference_video_k[:, :reference_video_num_tokens],
-                    reference_video_rope_cos,
-                    reference_video_rope_sin,
-                ),
-                reference_video_k[:, reference_video_num_tokens:],
-            ],
-            dim=1,
-        )
 
         attn_output = self._in_context_attention(
-            query, key, value, reference_video_k, reference_video_v, block_mask, layout
+            q_roped,
+            k_roped,
+            value,
+            reference_video_k,
+            reference_video_v,
+            block_mask,
+            layout,
         )
         if sp_size > 1:
             # scatter the sequence back / gather heads.
@@ -409,7 +392,7 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         padded_generation_video_len = layout.padded_generation_video_len
         padded_kv_len = layout.padded_kv_len
 
-        q_padding = q[:, layout.generation_video_num_tokens :].clone()
+        q_padding = q[:, layout.generation_video_num_tokens :]
 
         q_padded = torch.zeros(
             batch_size,

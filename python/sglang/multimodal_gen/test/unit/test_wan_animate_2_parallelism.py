@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
+    _apply_rope_interleaved,
     _InContextLayout,
     _make_score_mod,
     _sp_gather_qkv,
@@ -295,10 +296,19 @@ def _reference_pass_stub(captured: list) -> SimpleNamespace:
 
 
 def _run_reference_pass(
-    stub, *, seq_len: int, num_valid: int, sp_size: int, key_mask=None
+    stub,
+    *,
+    seq_len: int,
+    num_valid: int,
+    sp_size: int,
+    key_mask=None,
+    k_cache=None,
+    v_cache=None,
+    cos=None,
+    sin=None,
 ):
-    cos = torch.ones(num_valid, 2)
-    sin = torch.zeros(num_valid, 2)
+    cos = torch.ones(num_valid, 2) if cos is None else cos
+    sin = torch.zeros(num_valid, 2) if sin is None else sin
     with (
         patch(f"{_BLOCK}.get_sp_world_size", return_value=sp_size),
         patch(f"{_BLOCK}._sp_gather_qkv", side_effect=lambda q, k, v: (q, k, v)),
@@ -315,10 +325,53 @@ def _run_reference_pass(
             reference_video_rope_sin=sin,
             reference_video_num_tokens=num_valid,
             index=0,
-            k_cache={},
-            v_cache={},
+            k_cache={} if k_cache is None else k_cache,
+            v_cache={} if v_cache is None else v_cache,
             reference_video_key_mask=key_mask,
         )
+
+
+@pytest.mark.parametrize("seq_len,sp_size", [(6, 1), (8, 2)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_reference_cache_reuses_rotated_key_and_preserves_padding(
+    seq_len, sp_size, dtype
+):
+    captured, keys, values = [], {}, {}
+    angles = torch.arange(12, dtype=torch.float32).view(6, 2) / 7
+    stub = _reference_pass_stub(captured)
+    qkv = stub._qkv
+    raw_keys = []
+
+    def project(x, n):
+        projected = tuple(t.to(dtype) for t in qkv(x, n))
+        raw_keys.append(projected[1])
+        return projected
+
+    stub._qkv = project
+    _run_reference_pass(
+        stub,
+        seq_len=seq_len,
+        num_valid=6,
+        sp_size=sp_size,
+        k_cache=keys,
+        v_cache=values,
+        cos=angles.cos(),
+        sin=angles.sin(),
+    )
+    raw = torch.arange(seq_len * 8, dtype=torch.float32).view(1, seq_len, 2, 4)
+    expected = torch.cat(
+        [
+            _apply_rope_interleaved(
+                (raw[:, :6] + 1).to(dtype), angles.cos(), angles.sin()
+            ),
+            (raw[:, 6:] + 1).to(dtype),
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(keys[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(values[0], (raw + 2).to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(keys[0], captured[0]["k"], rtol=0, atol=0)
+    assert keys[0].data_ptr() == raw_keys[0].data_ptr()
 
 
 def test_reference_pass_passes_no_key_mask_when_the_sequence_has_no_padding():
@@ -332,6 +385,55 @@ def test_reference_pass_passes_no_key_mask_when_the_sequence_has_no_padding():
     assert len(captured) == 1
     assert captured[0]["attn_mask"] is None
     assert captured[0]["q"].shape == (1, 6, 2, 4)
+
+
+@pytest.mark.parametrize("seq_len,sp_size", [(4, 1), (6, 2)])
+def test_generation_reuses_reference_cache_without_rotating_it(seq_len, sp_size):
+    stub = _reference_pass_stub([])
+    captured = []
+
+    def attend(q, k, v, ref_k, ref_v, *rest):
+        captured.append((q, k, ref_k, ref_v))
+        return q
+
+    stub._in_context_attention = attend
+    keys = {0: torch.randn(1, 2, 2, 4)}
+    values = {0: torch.randn_like(keys[0])}
+    saved_key = keys[0].clone()
+    angles = torch.arange(8, dtype=torch.float32).view(4, 2) / 7
+    hidden = torch.arange(seq_len * 8, dtype=torch.float32).view(1, seq_len, 8)
+    with (
+        patch(f"{_BLOCK}.get_sp_world_size", return_value=sp_size),
+        patch(f"{_BLOCK}._sp_gather_qkv", side_effect=lambda q, k, v: (q, k, v)),
+        patch(f"{_BLOCK}._sp_scatter_out", side_effect=lambda x: x),
+    ):
+        for _ in range(2):
+            WanAnimate2TransformerBlock.forward_gen(
+                stub,
+                hidden_states=hidden,
+                encoder_hidden_states=torch.zeros(1, 4, 8),
+                timestep_modulation=torch.zeros(1, 6, 8),
+                gen_cos=angles.cos(),
+                gen_sin=angles.sin(),
+                block_mask=None,
+                layout=_SHORT_CLIP_LAYOUT,
+                index=0,
+                k_cache=keys,
+                v_cache=values,
+            )
+    raw = hidden.view(1, seq_len, 2, 4)
+    for q, k, ref_k, ref_v in captured:
+        for actual, source in ((q, raw), (k, raw + 1)):
+            expected = torch.cat(
+                [
+                    _apply_rope_interleaved(source[:, :4], angles.cos(), angles.sin()),
+                    source[:, 4:],
+                ],
+                dim=1,
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert ref_k is keys[0] and ref_v is values[0]
+    torch.testing.assert_close(keys[0], saved_key, rtol=0, atol=0)
 
 
 def test_reference_pass_masks_the_sp_tail_padding_with_the_per_clip_mask():

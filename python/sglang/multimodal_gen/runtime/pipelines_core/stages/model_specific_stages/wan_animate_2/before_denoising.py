@@ -578,9 +578,16 @@ class WanAnimate2BeforeDenoisingStage(PipelineStage):
         target_len = get_padding_len(num_reference_video_frames, inputs.clip_len)
         reference_video_frames = zigzag_padding(reference_video_frames, target_len)
 
-        schedule = build_schedule(
-            reference_video_frames, inputs.clip_len, inputs.num_frames_conditioning
-        )
+        # Keep the official padding and geometry of every needed clip, but do not
+        # denoise clips whose entire output would be discarded by the final trim.
+        schedule = [
+            clip
+            for clip in build_schedule(
+                reference_video_frames, inputs.clip_len, inputs.num_frames_conditioning
+            )
+            if clip.frame_start_index + clip.num_frames_conditioning_for_clip
+            < num_reference_video_frames
+        ]
 
         # reference-image encodings (constant across clips)
         reference_image_height, reference_image_width = (

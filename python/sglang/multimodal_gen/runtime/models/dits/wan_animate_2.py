@@ -2,7 +2,7 @@
 #
 # Wan-Animate-2 DiT. Subclasses WanTransformer3DModel so TP / Ulysses SP shard it
 # unchanged; only the per-block self-attention is swapped for the in-context mechanism
-# (build_reference_kv runs forward_ref once per clip and returns each block's pre-RoPE reference-video
+# (build_reference_kv runs forward_ref once per clip and returns each block's rotated reference-video
 # K/V, forward_gen attends over [gen tokens, then that reference-video K/V]). No extra parameters.
 # Names kept from the reference implementation: the forward_ref / forward_gen methods and the
 # kv_cache_mode values "ref" / "gen"; there "ref" means the reference video (the motion source), not the reference image.
@@ -249,7 +249,7 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
     def build_reference_kv(
         self, *, clip_cond: WanAnimate2ClipConditioning
     ) -> WanAnimate2ReferenceKV:
-        """One forward_ref pass over the clip's reference video, returning every block's pre-RoPE K/V.
+        """One forward_ref pass over the clip's reference video, returning every block's rotated K and V.
 
         Text- and timestep-independent, so one result serves every step and CFG branch of the
         clip; the caller owns it and the DiT keeps no copy. Attention goes through USPAttention,
@@ -420,12 +420,6 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
                 layout.generation_video_w,
             )
         )
-        reference_video_rope_cos, reference_video_rope_sin = self._reference_video_rope(
-            layout.reference_video_f,
-            layout.reference_video_h,
-            layout.reference_video_w,
-            generation_video_w=layout.generation_video_w,
-        )
         block_mask = self._get_block_mask_from_layout(layout)
 
         # Call via __call__ (not forward_gen) so the layerwise-offload hooks fire.
@@ -441,8 +435,6 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
                 timestep_modulation=timestep_modulation,
                 gen_cos=generation_video_rope_cos,
                 gen_sin=generation_video_rope_sin,
-                reference_video_rope_cos=reference_video_rope_cos,
-                reference_video_rope_sin=reference_video_rope_sin,
                 block_mask=block_mask,
                 layout=layout,
                 index=idx,

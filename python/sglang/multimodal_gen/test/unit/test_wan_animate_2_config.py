@@ -1564,19 +1564,34 @@ def test_write_reference_video_names_the_shared_writer_when_it_fails(tmp_path):
     assert isinstance(excinfo.value.__cause__, OSError)
 
 
-def test_before_denoising_stage_populates_the_standard_denoising_inputs(tmp_path):
+@pytest.mark.parametrize("clip_len", [17, 37])
+def test_before_denoising_stage_populates_the_standard_denoising_inputs(
+    tmp_path, clip_len
+):
     """After the before-denoising stage the Req must carry the fields the shared denoising
     contract requires, consistent with what the clip loop will use: clip 0's initial noise
     (the seed's first draw, which the loop consumes instead of drawing again) and the
     official sigma grid."""
     server_args = _server_args(str(tmp_path))
     (req,) = _build_server_warmup_reqs(server_args)
+    req.clip_len = clip_len
     stage = _before_denoising_stage(server_args.pipeline_config)
 
-    with patch(f"{_BEFORE_DENOISING}.get_sp_world_size", return_value=1):
+    with (
+        patch(f"{_BEFORE_DENOISING}.get_sp_world_size", return_value=1),
+        patch(
+            f"{_BEFORE_DENOISING}.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ),
+    ):
         batch = stage(req, server_args)
 
     request_state = request_state_from_batch(batch)
+    assert all(
+        clip.frame_start_index + clip.num_frames_conditioning_for_clip
+        < request_state.num_reference_video_frames
+        for clip in request_state.schedule
+    )
     assert batch.generator is request_state.generator
     assert batch.prompt_embeds == [request_state.prompt_embeddings]
     assert batch.negative_prompt_embeds == [request_state.negative_prompt_embeddings]

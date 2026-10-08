@@ -86,6 +86,14 @@ offline, a form field or `extra_body` entry online) for a silent output. If the
 track cannot be decoded, the output is silent and the server logs one warning per
 process; a reference video without an audio track also gives a silent output.
 
+**Lossless conditioning reuse.** Reference-video keys are rotated once and cached per clip, then reused by all
+denoising steps and both CFG branches. This removes repeated RoPE computation
+without changing the attention mask, precision, or sampling schedule. The cache
+uses the existing key storage and is released after the clip; it is not an
+approximate timestep-skipping cache.
+Clips containing only padding that would be removed from the final video are not
+denoised. The padding and conditioning of every retained clip are unchanged.
+
 ## 2. SGLang-diffusion Installation
 
 SGLang-diffusion offers multiple installation methods. You can choose the most

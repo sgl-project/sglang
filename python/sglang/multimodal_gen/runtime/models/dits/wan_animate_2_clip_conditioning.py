@@ -55,7 +55,7 @@ class WanAnimate2ClipConditioning(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class WanAnimate2ReferenceKV(msgspec.Struct, frozen=True):
-    """One clip's pre-RoPE reference-video K/V, one entry per DiT block, keyed by block index.
+    """One clip's post-RoPE reference-video K and V, keyed by DiT block index.
 
     Returned by ``WanAnimate2Transformer3DModel.build_reference_kv`` and owned by the caller
     for that clip only; the DiT keeps no copy between calls.
