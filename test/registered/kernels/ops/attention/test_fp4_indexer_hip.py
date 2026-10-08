@@ -51,8 +51,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
     prepare_fp4_rowgroup_decode_workspace,
+    prepare_fp4_rowgroup_prefill_workspace,
     read_fp4_index_k_split,
     rowgroup_paged_mqa_logits,
+    rowgroup_prefill_query_start_loc,
     store_fp4_index_k_cache_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
@@ -945,6 +947,74 @@ def test_page8_full_scoring_matches_page64(
             case["ref_logits_fp4"][row, :ctx],
             rtol=2.0e-3,
             atol=2.0e-3,
+        )
+
+
+def test_rowgroup_prefill_workspace_scores_ragged_requests() -> None:
+    """A page8 prefill workspace scores consecutive requests' rows (one request empty) as the
+    page-64 pool scores every row alone, and reuses a row range's query_start_loc."""
+    torch.manual_seed(13)
+    lens = [4, 0, 6]
+    case = _build_logits_case(3, 512, ctx_lens=[512, 300, 77], shuffle_pages=True)
+    case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+    counts = torch.tensor(lens, device=get_device())
+    starts = torch.tensor([0, 4, 4], device=get_device())
+    local = torch.arange(sum(lens), device=get_device()) - starts.repeat_interleave(
+        counts
+    )
+    row_ends = (
+        case["context"].repeat_interleave(counts)
+        - (counts.repeat_interleave(counts) - 1 - local)
+    ).clamp_min(0)
+    row_ends = row_ends.to(torch.int32).contiguous()
+
+    def rep(t):
+        return t.repeat_interleave(counts, dim=0).contiguous()
+
+    q_fp4 = rep(case["q_fp4"].view(torch.uint8)).view(case["q_fp4"].dtype)
+    q_scale, weights = rep(case["q_scale"]), rep(case["weights"])
+    page_table = rep(case["page_table"])
+    rows = slice(0, sum(lens))
+
+    workspace = prepare_fp4_rowgroup_prefill_workspace(page_table, lens)
+    query_start_loc = rowgroup_prefill_query_start_loc(workspace, rows, lens)
+    assert rowgroup_prefill_query_start_loc(workspace, rows, lens) is query_start_loc
+    assert query_start_loc.tolist() == [0, 4, 4, 10]
+    common = dict(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        weights=weights,
+        weight_scale=case["weight_scale"],
+        row_ends=row_ends,
+        is_decode=False,
+    )
+    got = rowgroup_paged_mqa_logits(
+        k_payload=case["payload8"],
+        k_scale=case["scale8"],
+        block_tables=workspace.request_page_table,
+        query_start_loc=query_start_loc,
+        max_query_len=max(lens),
+        max_seq_len=workspace.max_seq_len,
+        page8=True,
+        pages_per_block=8,
+        **common,
+    )
+    per_row_table, max_seq_len = _guard_page_table(page_table)
+    ref = rowgroup_paged_mqa_logits(
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        block_tables=per_row_table,
+        query_start_loc=torch.arange(
+            sum(lens) + 1, dtype=torch.int32, device=get_device()
+        ),
+        max_query_len=1,
+        max_seq_len=max_seq_len,
+        page8=False,
+        **common,
+    )
+    for row, end in enumerate(row_ends.tolist()):
+        torch.testing.assert_close(
+            got[row, :end], ref[row, :end], rtol=1e-5, atol=1e-6, msg=f"row {row}"
         )
 
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import triton
@@ -91,6 +92,16 @@ class FP4PrefillWorkspace(NamedTuple):
     # cta_info kernel reads. Pinned with the workspace so a refresh allocates
     # nothing and the buffers never return to the graph memory pool.
     schedule_buffers: Optional[PrefillScheduleBuffers] = None
+
+
+class FP4RowgroupPrefillWorkspace(NamedTuple):
+    """Prefill workspace of the row-group kernel, no schedule: each request's padded
+    page-table row, and per scored row range the sequences' query_start_loc, built on first
+    use and shared by the step's layers."""
+
+    request_page_table: torch.Tensor
+    max_seq_len: int
+    query_start_locs: Dict[Tuple[int, int], torch.Tensor]
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -281,6 +292,46 @@ def prepare_fp4_rowgroup_decode_workspace(
     return FP4RowgroupDecodeWorkspace(
         guarded, max_seq_len, query_start_loc, rows_per_seq
     )
+
+
+def _pinned_int32(values: List[int], device: torch.device) -> torch.Tensor:
+    return (
+        torch.tensor(values, dtype=torch.int32)
+        .pin_memory()
+        .to(device, non_blocking=True)
+    )
+
+
+def prepare_fp4_rowgroup_prefill_workspace(
+    page_table: torch.Tensor,
+    extend_lens: List[int],
+    page_table_bucket: int = 4,
+) -> FP4RowgroupPrefillWorkspace:
+    """The row-group prefill workspace of a step whose requests own extend_lens consecutive
+    page-table rows each."""
+    num_rows = page_table.shape[0]
+    starts = itertools.accumulate([0, *extend_lens[:-1]])
+    first_rows = [min(s, num_rows - 1) for s in starts]
+    request_page_table, max_seq_len = _guard_page_table(
+        page_table.index_select(0, _pinned_int32(first_rows, page_table.device)),
+        page_table_bucket=page_table_bucket,
+    )
+    return FP4RowgroupPrefillWorkspace(request_page_table, max_seq_len, {})
+
+
+def rowgroup_prefill_query_start_loc(
+    workspace: FP4RowgroupPrefillWorkspace, rows: slice, rows_per_request: List[int]
+) -> torch.Tensor:
+    """query_start_loc of the consecutive requests rows_per_request scored as rows."""
+    key = (rows.start, rows.stop)
+    query_start_loc = workspace.query_start_locs.get(key)
+    if query_start_loc is None:
+        query_start_loc = _pinned_int32(
+            [0, *itertools.accumulate(rows_per_request)],
+            workspace.request_page_table.device,
+        )
+        workspace.query_start_locs[key] = query_start_loc
+    return query_start_loc
 
 
 def prepare_fp4_prefill_workspace(

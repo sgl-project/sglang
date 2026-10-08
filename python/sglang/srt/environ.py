@@ -1617,6 +1617,9 @@ class Envs:
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
     SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+    # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
+    # 64-slot page), so a candidate consumer layer scores only its published blocks.
+    SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
