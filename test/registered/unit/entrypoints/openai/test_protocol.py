@@ -26,11 +26,16 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
     ChatMessage,
     CompletionRequest,
+    DeltaMessage,
     Function,
+    FunctionResponse,
     ModelCard,
     Tool,
+    ToolCall,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -578,6 +583,52 @@ class TestAudioContentParts(unittest.TestCase):
 
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""
+
+    def _chat_payloads(self, tool_calls):
+        response = ChatCompletionResponse(
+            id="chatcmpl-test",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant", content="Hello", tool_calls=tool_calls
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        stream_response = ChatCompletionStreamResponse(
+            id="chatcmpl-test",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=0,
+                    delta=DeltaMessage(content="Hello", tool_calls=tool_calls),
+                )
+            ],
+        )
+        return (
+            json.loads(response.model_dump_json())["choices"][0]["message"],
+            json.loads(stream_response.model_dump_json())["choices"][0]["delta"],
+        )
+
+    def test_absent_tool_calls_are_omitted(self):
+        """Chat responses omit absent tool calls instead of emitting null."""
+        for payload in self._chat_payloads(None):
+            self.assertNotIn("tool_calls", payload)
+
+    def test_present_tool_calls_are_preserved(self):
+        tool_call = ToolCall(
+            id="call-1",
+            function=FunctionResponse(name="get_weather", arguments="{}"),
+        )
+        for tool_calls in ([], [tool_call]):
+            expected = [tool.model_dump() for tool in tool_calls]
+            with self.subTest(tool_calls=expected):
+                for payload in self._chat_payloads(tool_calls):
+                    self.assertEqual(payload["tool_calls"], expected)
 
     def test_hidden_states_excluded_when_none(self):
         """Test that None hidden_states are excluded with exclude_none=True"""
