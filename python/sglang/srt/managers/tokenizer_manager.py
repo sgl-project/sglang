@@ -1407,10 +1407,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
         if self.model_config.joint_head_config is None:
-            if isinstance(obj, EmbeddingReqInput) and obj.decision_layout is not None:
-                raise ValueError(
-                    "decision_layout needs a checkpoint with a joint schema head"
-                )
             return
         if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
             # Health checks only need a response, which is an empty embedding.
