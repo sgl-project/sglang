@@ -1055,6 +1055,28 @@ class GptOssDetector(BaseReasoningFormatDetector):
             reasoning_text=reasoning_text,
         )
 
+    def finish(self) -> StreamingParseResult:
+        """Flush normal text held while checking for a post-call filler."""
+        base_result = super().finish()
+        events = self.parser.finish()
+        normal_parts = [base_result.normal_text] if base_result.normal_text else []
+        reasoning_parts = (
+            [base_result.reasoning_text] if base_result.reasoning_text else []
+        )
+
+        for event in events:
+            if event.event_type == "normal":
+                normal_parts.append(event.content)
+            elif event.event_type == "reasoning":
+                reasoning_parts.append(event.content)
+            elif event.event_type == "tool_call":
+                normal_parts.append(event.raw_text if event.raw_text else event.content)
+
+        return StreamingParseResult(
+            normal_text="".join(normal_parts) or None,
+            reasoning_text="".join(reasoning_parts) or None,
+        )
+
 
 class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """

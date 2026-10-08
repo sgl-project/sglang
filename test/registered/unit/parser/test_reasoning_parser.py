@@ -1294,6 +1294,30 @@ class TestGptOssDetector(CustomTestCase):
         self.assertIn("reasoning part", all_reasoning)
         self.assertIn("answer", all_normal)
 
+    def test_streamed_answer_prefix_after_tool_call_is_preserved(self):
+        head = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+            "<|start|>assistant<|channel|>final<|message|>"
+        )
+        all_normal = ""
+        for chunk in [head, "Co", "mpare prices.", "<|return|>"]:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_normal += result.normal_text or ""
+        self.assertTrue(all_normal.endswith("Compare prices."), all_normal)
+
+    def test_finish_flushes_unresolved_post_tool_prefix(self):
+        tool_call = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+        )
+        self.detector.parse_streaming_increment(tool_call)
+        pending = self.detector.parse_streaming_increment("Co")
+        self.assertEqual(pending.normal_text or "", "")
+
+        finished = self.detector.finish()
+        self.assertEqual(finished.normal_text, "Co")
+
 
 class TestMiniMaxAppendThinkDetector(CustomTestCase):
     """Test cases for MiniMaxAppendThinkDetector."""
