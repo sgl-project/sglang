@@ -1,11 +1,13 @@
 """Unit tests for model configuration."""
 
+import json
+import os
 import unittest
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import GenerationConfig, LlamaConfig
+from transformers import GenerationConfig, LlamaConfig, Qwen3_5Config
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
@@ -13,6 +15,7 @@ from sglang.srt.configs.model_config import (
     get_hybrid_layer_ids,
     is_embedding_gemma,
     is_multimodal_model,
+    load_decision_config,
     register_model_config_factory,
     resolve_spec_hidden_size,
 )
@@ -244,6 +247,39 @@ class TestExternalModelConfig(CustomTestCase):
         self.assertFalse(ordinary.is_multimodal_breakable_cuda_graph_supported)
         self.assertIs(type(external), ExternalConfig)
         self.assertTrue(external.is_multimodal_breakable_cuda_graph_supported)
+
+
+class TestDecisionCheckpointConfig(CustomTestCase):
+    def _checkpoint(self, directory, **decision):
+        Qwen3_5Config(architectures=["Qwen3_5Model"]).save_pretrained(directory)
+        decision = {"format_version": 1, "codes": ["A"], "token_ids": [32], **decision}
+        with open(os.path.join(directory, "decision_config.json"), "w") as f:
+            json.dump(decision, f)
+
+    def test_attention_mode_reaches_the_text_config(self):
+        """A noncausal decision checkpoint must not be served with causal full attention."""
+        for decision, causal in (
+            ({}, True),
+            ({"attention_mode": "noncausal_full_attention"}, False),
+        ):
+            with self.subTest(decision=decision), TemporaryDirectory() as checkpoint:
+                self._checkpoint(checkpoint, **decision)
+                config = ModelConfig(model_path=checkpoint)
+                self.assertEqual(
+                    config.hf_config.architectures, ["Qwen3_5ForConditionalGeneration"]
+                )
+                if causal:
+                    self.assertFalse(hasattr(config.hf_text_config, "is_causal"))
+                else:
+                    self.assertIs(config.hf_text_config.is_causal, False)
+
+    def test_unsupported_decision_fields_are_refused(self):
+        """An attention mode or pooling the server does not honor must not be served."""
+        for decision in ({"attention_mode": "bidirectional"}, {"pooling": "mean"}):
+            with self.subTest(decision=decision), TemporaryDirectory() as checkpoint:
+                self._checkpoint(checkpoint, **decision)
+                with self.assertRaisesRegex(ValueError, "is not supported"):
+                    load_decision_config(checkpoint, None)
 
 
 if __name__ == "__main__":

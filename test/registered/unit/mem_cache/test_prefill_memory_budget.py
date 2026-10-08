@@ -66,7 +66,7 @@ def _cache():
         sliding_window_size=8,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
-        is_chunk_cache=lambda: False,
+        supports_prefix_sharing=lambda: True,
     )
 
 
@@ -186,7 +186,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
-            is_chunk_cache=lambda: True,
+            supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
         adder = PrefillAdder(
@@ -204,13 +204,12 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         for page_size in (4, 64):
             with self.subTest(page_size=page_size):
                 allocator, req, adder = self._new_admission(page_size, pool_pages=6)
-                req.prefix_indices = allocator.alloc(page_size)
-                self.assertIsNotNone(req.prefix_indices)
+                req.prefix_len = len(allocator.alloc(page_size))
                 self.assertTrue(allocator.can_reserve(page_size + 2, page_size + 2))
 
                 self.assertIsNone(adder.add_chunked_req(req))
                 self.assertEqual(adder.can_run_list, [req])
-                self.assertEqual(req.extend_range.length, 1)
+                self.assertEqual(req.extend_len, 1)
 
     def test_unaligned_ignore_eos_enters_empty_pool(self):
         for page_size in (4, 64):
@@ -218,7 +217,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 allocator, req, adder = self._new_admission(
                     page_size, pool_pages=5, ignore_eos=True
                 )
-                self.assertEqual(len(req.prefix_indices), 0)
+                self.assertEqual(req.prefix_len, 0)
                 self.assertTrue(allocator.can_reserve(2 * page_size + 2, 2 * page_size))
 
                 adder.add_one_req(
