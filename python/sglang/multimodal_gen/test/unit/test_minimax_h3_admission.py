@@ -248,7 +248,7 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
     stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
     for task in ("t2va", "fl2va", "ref2va"):
         batch = SimpleNamespace(
-            sampling_params=SimpleNamespace(task=task, quality="lossless"),
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
             num_inference_steps=50,
         )
         assert (
@@ -440,7 +440,7 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
     server_args = _quality_server_args()
     server_args.minimax_h3_adaln_online = True
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        sampling_params=SimpleNamespace(task="t2va", quality="exact"),
         num_inference_steps=50,
         is_warmup=False,
     )
@@ -454,15 +454,15 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
         assert stage.forward(batch, server_args) is batch
 
 
-def test_extra_high_quality_does_not_enable_h3_cache_dit():
+def test_lossless_quality_does_not_enable_h3_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
     stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
-    stage._minimax_h3_quality = "lossless"
+    stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="extra-high",
+            quality="lossless",
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
@@ -475,7 +475,7 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_quality == "lossless"
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
 
@@ -534,7 +534,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
-    batch.sampling_params.quality = "extra-high"
+    batch.sampling_params.quality = "lossless"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"

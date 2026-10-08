@@ -809,7 +809,7 @@ class TestPrefillResultPolling(CustomTestCase):
         ):
             _run_loop(scheduler)
 
-        release_kv.assert_called_once_with(prior, scheduler.tree_cache)
+        release_kv.assert_called_once_with(prior, scheduler.tree_cache, checkpoint=True)
         self.assertEqual(prior.metadata_buffer_index, -1)
         self.assertEqual(second.reqs[0].metadata_buffer_index, 0)
         self.assertIn((6, "launch", 2), scheduler.actions)
@@ -1256,7 +1256,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 class ChunkScheduler(_Scheduler):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
-                        req.extend_range = SimpleNamespace(end=end)
+                        req.extend_end = end
                         self.chunked_req = req if end < 12 else None
                         batch.chunked_req = self.chunked_req
                         if self.chunked_req is not None:
@@ -1264,7 +1264,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
-                        checkpoint_ends.append(req.extend_range.end)
+                        checkpoint_ends.append(req.extend_end)
                         super().checkpoint_disagg_prefill(req)
 
                 if pause_at == 1:
@@ -1335,7 +1335,7 @@ class TestPrefillResultPolling(CustomTestCase):
 
                     def run_batch(self, batch):
                         if req in batch.reqs:
-                            req.extend_range = SimpleNamespace(end=batch.forward_iter)
+                            req.extend_end = batch.forward_iter
                             self.chunked_req = batch.chunked_req = req
                             req.inflight_middle_chunks += 1
                         return super().run_batch(batch)
@@ -1366,7 +1366,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
 
-                def release(req, tree_cache, is_insert):
+                def release(req, tree_cache, checkpoint):
                     self.assertEqual(req.inflight_middle_chunks, 0)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
@@ -1382,7 +1382,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     _run_loop(scheduler, optimistic_prefill_attempts=2)
 
                 release_kv.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
+                    req, scheduler.tree_cache, checkpoint=False
                 )
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
