@@ -49,8 +49,9 @@ pytestmark = pytest.mark.skipif(
 # 3 per rank: DWDP needs the count divisible by the world size, and a rank with
 # 3 experts keeps an interior one while both of its edges belong to a peer
 _NUM_EXPERTS = 3 * int(os.environ.get("WORLD_SIZE", 2))
-# more than two layers so a third layer reuses the first layer's buffer slot
-_NUM_LAYERS = 3
+# more layers than the 3 slots a remapping backend uses, so on every backend a
+# later layer reuses an earlier layer's buffer slot
+_NUM_LAYERS = 4
 _HIDDEN = 128
 # expert_bytes is 512 * _INTERMEDIATE for w13 and 256 * _INTERMEDIATE for w2, so
 # 6145 puts both a few pages apart and off any power-of-two page boundary; the
@@ -175,8 +176,9 @@ def test_local_shard_lands_at_the_layout_offset(dwdp: _DwdpFixture) -> None:
 def test_prefetch_reconstructs_every_expert(dwdp: _DwdpFixture) -> None:
     """The payoff property: after the prefetch for a layer completes, that layer's
     tensor holds all _NUM_EXPERTS experts even though the rank stores only its own
-    shard. Snapshots are taken inside each layer's window because two layers share
-    a buffer slot -- reading layer 0 after layer 2 prefetched would see layer 2."""
+    shard. Snapshots are taken inside each layer's window because layers share
+    buffer slots -- reading layer 0 after a later layer took its slot would see
+    that layer."""
     manager = dwdp.manager
     manager.prefetch_first_layers()
 

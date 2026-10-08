@@ -45,9 +45,9 @@ class TestDwdpGptOss20B(CustomTestCase):
                 # moe_a2a_backend=none and disable_cuda_graph on its own.
                 "--dwdp-size",
                 str(DWDP_SIZE),
-                # DWDP's two staging slots cost 2x the per-layer expert bytes on
-                # top of the owned shard; the TP control fits under 0.75, this
-                # arm does not.
+                # DWDP's staging slots (2 on CUDA, 3 on XPU) cost 2-3x the
+                # per-layer expert bytes on top of the owned shard; the TP
+                # control fits under 0.75, this arm does not.
                 "--mem-fraction-static",
                 "0.85",
             ],

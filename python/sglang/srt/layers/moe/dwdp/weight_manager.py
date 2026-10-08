@@ -45,8 +45,9 @@ class DWDPWeightManager:
         self._copy_stream = create_device_stream(self._device)
 
         event_type = self._device_module.Event
-        self._prefetch_events = [event_type() for _ in range(2)]
-        self._consume_events = [event_type() for _ in range(2)]
+        num_slots = weight_buffer.num_slots
+        self._prefetch_events = [event_type() for _ in range(num_slots)]
+        self._consume_events = [event_type() for _ in range(num_slots)]
 
         # pre-record consume events so the first prefetch doesn't stall
         current = self._device_module.current_stream(self._device)
@@ -124,7 +125,8 @@ class DWDPWeightManager:
 
         self._consume_events[buf_idx].record(compute_stream)
 
-        # prefetch the layer 2 ahead — it reuses the same buffer slot
+        # prefetch the layer 2 ahead; with 2 slots it reuses this layer's slot,
+        # with 3 the slot of the layer before, so the host wait does not block
         next_layer = self.next_moe_layer(layer_idx)
         if next_layer is not None:
             next_next = self.next_moe_layer(next_layer)

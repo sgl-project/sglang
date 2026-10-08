@@ -48,9 +48,13 @@ class WeightBuffer:
         self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
-        # double buffered: consecutive MoE layers alternate slots
+        self._rebinds_pool_pages = not self._backend.supports_aliased_mappings()
+        # Prefetch runs two layers ahead. A remapping backend gets a third slot so
+        # the slot it evicts belongs to a layer the device already finished, and
+        # the host-side remap overlaps compute instead of stalling the launch path.
+        self._num_slots = 3 if self._rebinds_pool_pages else 2
         self._layer_slots = {
-            li: pos % 2 for pos, li in enumerate(self._moe_layer_indices)
+            li: pos % self._num_slots for pos, li in enumerate(self._moe_layer_indices)
         }
         self._layouts: Dict[int, Dict[str, PageAlignedLayout]] = {}
         self._tensors: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -60,7 +64,6 @@ class WeightBuffer:
         self._reservations: Dict[int, List[Reservation]] = {}
         self._pool_bindings: Dict[int, List[PoolBinding]] = {}
         self._bound_layers: Set[int] = set()
-        self._rebinds_pool_pages = not self._backend.supports_aliased_mappings()
         self._released = False
 
     @classmethod
@@ -90,7 +93,9 @@ class WeightBuffer:
                 )
 
         assignments = {li: buf.buffer_index_for_layer(li) for li in layer_weight_specs}
-        slot_sizes = compute_slot_sizes(buf._layouts, assignments)
+        slot_sizes = compute_slot_sizes(
+            buf._layouts, assignments, num_slots=buf._num_slots
+        )
         buf._page_pool = PagePool.create(
             slot_sizes, device_id, page_size=buf._pool_page_size
         )
@@ -202,6 +207,10 @@ class WeightBuffer:
         for binding in self._pool_bindings[layer_idx]:
             self._page_pool.unmap_binding(binding)
         self._bound_layers.discard(layer_idx)
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
 
     @property
     def rebinds_pool_pages(self) -> bool:

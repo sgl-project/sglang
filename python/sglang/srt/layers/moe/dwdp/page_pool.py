@@ -120,10 +120,12 @@ class PagePool:
 def compute_slot_sizes(
     layouts: Dict[int, Dict[str, PageAlignedLayout]],  # noqa: F821
     buffer_slot_assignments: Dict[int, int],
+    *,
+    num_slots: int,
 ) -> List[int]:
-    slot_sizes = [0, 0]
+    slot_sizes = [0] * num_slots
     for layer_idx, weight_layouts in layouts.items():
-        slot = buffer_slot_assignments.get(layer_idx, layer_idx % 2)
+        slot = buffer_slot_assignments[layer_idx]
         total = sum(lo.pre_size + lo.post_size for lo in weight_layouts.values())
         slot_sizes[slot] = max(slot_sizes[slot], total)
     return slot_sizes
