@@ -85,11 +85,9 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         SchedulePolicy("fcfs", cache, False, False, False).calc_priority(queue)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
-            len(
-                cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
-                ).device_indices
-            )
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).device_prefix_len
             for tokens in (OLDER_PREFIX, NEWER_PREFIX)
         ]
 
