@@ -223,7 +223,7 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
-    req.prefix_len = len(match_result.device_indices)
+    req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,
         req.last_host_node,
