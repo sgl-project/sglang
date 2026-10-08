@@ -24,7 +24,6 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
-use itertools::izip;
 use serde::Deserialize;
 
 use super::completions::completion_usage;
@@ -178,20 +177,16 @@ async fn chat_completions(
     };
 
     let stream = request.stream.unwrap_or(false);
-    let n = request.n.unwrap_or(1) as usize;
-    let routing = match routing.into_normalized(1, n) {
+    let prompt_count = 1;
+    let choices_per_prompt = request.n.unwrap_or(1) as usize;
+    let routing = match routing.into_normalized(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
-    // Chat has one prompt. Normalization rejects longer routing lists, so
-    // consume the single row and reuse its metadata for each choice.
-    let (bootstrap_host, bootstrap_port, bootstrap_room) = izip!(
-        routing.bootstrap.bootstrap_hosts,
-        routing.bootstrap.bootstrap_ports,
-        routing.bootstrap.bootstrap_rooms,
-    )
-    .next()
-    .expect("routing normalized for one chat prompt");
+    // Chat normalizes one prompt, so each bootstrap column has one entry.
+    let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
+    let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
+    let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -204,7 +199,7 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut submitted = Vec::with_capacity(n);
+    let mut submitted = Vec::with_capacity(choices_per_prompt);
 
     // V4 prefills <think>, so the generated stream has no opening marker.
     let starts_in_reasoning = matches!(
@@ -212,9 +207,9 @@ async fn chat_completions(
         Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
     ) && prompt.ends_with("<think>");
     let mut prompt = Some(prompt);
-    for index in 0..n {
+    for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == n {
+        let choice_prompt = if index + 1 == choices_per_prompt {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
             prompt

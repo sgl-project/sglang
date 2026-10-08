@@ -19,7 +19,6 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
-use itertools::izip;
 use serde::Deserialize;
 
 use super::routing::PDRoutingFields;
@@ -138,8 +137,9 @@ async fn completions(
         return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
 
-    let n = request.n.unwrap_or(1) as usize;
-    let choice_count = match prompts.len().checked_mul(n) {
+    let prompt_count = prompts.len();
+    let choices_per_prompt = request.n.unwrap_or(1) as usize;
+    let choice_count = match prompt_count.checked_mul(choices_per_prompt) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
             return openai_error(
@@ -149,7 +149,7 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.into_normalized(prompts.len(), n) {
+    let routing = match routing.into_normalized(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
@@ -157,16 +157,11 @@ async fn completions(
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
 
-    // Normalization makes each routing column match the prompt count. Pair
-    // each prompt with its metadata before expanding it into n choices.
-    for (prompt_index, (prompt, bootstrap_host, bootstrap_port, bootstrap_room)) in izip!(
-        prompts,
-        routing.bootstrap.bootstrap_hosts,
-        routing.bootstrap.bootstrap_ports,
-        routing.bootstrap.bootstrap_rooms,
-    )
-    .enumerate()
-    {
+    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
+        // Normalized routing is indexed by prompt, not by choice.
+        let bootstrap_host = &routing.bootstrap.bootstrap_hosts[prompt_index];
+        let bootstrap_port = routing.bootstrap.bootstrap_ports[prompt_index];
+        let bootstrap_room = routing.bootstrap.bootstrap_rooms[prompt_index];
         let (text, input_ids, mut prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
@@ -174,8 +169,8 @@ async fn completions(
             }
             PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
         };
-        for sample_index in 0..n {
-            let index = prompt_index * n + sample_index;
+        for sample_index in 0..choices_per_prompt {
+            let index = prompt_index * choices_per_prompt + sample_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
             if echo
                 && sample_index == 0
