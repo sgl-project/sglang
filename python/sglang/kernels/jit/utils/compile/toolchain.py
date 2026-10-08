@@ -83,7 +83,7 @@ def musa_home() -> str:
 
 @cache_once
 def device_compiler_path() -> str:
-    """The nvcc/hipcc that JIT builds actually invoke.
+    """The nvcc/hipcc/mcc that JIT builds actually invoke.
 
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
@@ -138,7 +138,7 @@ def gpu_arch_name() -> str:
 
 @cache_once
 def toolkit_home() -> pathlib.Path:
-    """The CUDA/ROCm root, derived from the compiler already resolved."""
+    """The CUDA/ROCm/MUSA root, derived from the compiler already resolved."""
     return pathlib.Path(device_compiler_path()).parent.parent
 
 

@@ -114,6 +114,22 @@ def test_musa_toolchain_flags(monkeypatch):
     ]
 
 
+def test_musa_home_prefers_explicit_environment(monkeypatch):
+    monkeypatch.setenv("MUSA_HOME", "/opt/musa-home")
+    monkeypatch.setenv("MUSA_PATH", "/opt/musa-path")
+    monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/usr/bin/mcc")
+
+    assert toolchain.musa_home.__wrapped__() == "/opt/musa-home"
+
+
+def test_musa_home_uses_mcc_path_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("MUSA_HOME", raising=False)
+    monkeypatch.delenv("MUSA_PATH", raising=False)
+    monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/opt/musa/bin/mcc")
+
+    assert toolchain.musa_home.__wrapped__() == "/opt/musa"
+
+
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:
     """Create a leaf the way commit_build would: name derived from its own list."""
     entries = _entries(paths)
