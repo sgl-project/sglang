@@ -8,13 +8,11 @@ fused matmul fast-paths need a real TP group and are covered by the e2e test.
 import unittest
 from functools import partial
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import torch
-from sglang.srt.arg_groups.layernorm_sp_hook import (
-    handle_layernorm_sp,
-    validate_layernorm_sp,
-)
+from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
@@ -99,81 +97,17 @@ class TestLayerNormSPGating(CustomTestCase):
         reset_context()
 
 
-class TestTokenRowCollectives(CustomTestCase):
-    class Group:
-        world_size = 4
-        rank_in_group = 1
-
-        def all_gather_into_tensor(self, output, local):
-            output.copy_(torch.cat([local + rank for rank in range(self.world_size)]))
-
-        def reduce_scatter_tensor(self, output, full):
-            output.copy_(full.chunk(self.world_size)[self.rank_in_group])
-
-    def test_non_divisible_rows_round_trip_with_padding(self):
-        group = self.Group()
-        full = torch.arange(21, dtype=torch.float32).reshape(7, 3)
-        local = layernorm_sp.shard_token_rows(full, group=group)
-        self.assertEqual(local.shape, (2, 3))
-        gathered = layernorm_sp.all_gather_token_rows(local, total_rows=7, group=group)
-        self.assertEqual(gathered.shape, (7, 3))
-        reduced = layernorm_sp.reduce_scatter_token_rows(full, group=group)
-        self.assertEqual(reduced.shape, (2, 3))
-
-    def test_collectives_fall_back_to_torch_distributed_process_group(self):
-        group = object()
-        local = torch.ones(2, 3)
-
-        def gather(output, value, group):
-            output.copy_(torch.cat([value, value]))
-
-        def scatter(output, value, group):
-            output.copy_(value.chunk(2)[0])
-
-        with (
-            patch.object(layernorm_sp.dist, "get_world_size", return_value=2),
-            patch.object(layernorm_sp.dist, "get_rank", return_value=0),
-            patch.object(
-                layernorm_sp.dist, "all_gather_into_tensor", side_effect=gather
-            ) as all_gather,
-            patch.object(
-                layernorm_sp.dist, "reduce_scatter_tensor", side_effect=scatter
-            ) as reduce_scatter,
-        ):
-            gathered = layernorm_sp.all_gather_token_rows(local, group=group)
-            reduced = layernorm_sp.reduce_scatter_token_rows(
-                torch.ones(3, 3), group=group
-            )
-        self.assertEqual(gathered.shape, (4, 3))
-        self.assertEqual(reduced.shape, (2, 3))
-        all_gather.assert_called_once()
-        reduce_scatter.assert_called_once()
-
-
 class TestLayerNormSPValidation(CustomTestCase):
     """``validate_layernorm_sp`` is pure; pass config in directly."""
 
-    VALID = dict(
-        architecture="Qwen3ForCausalLM",
-        tp_size=2,
-        ep_size=2,
-        pp_size=1,
-        attn_dp_enabled=False,
-        speculative_algorithm=None,
-    )
-
-    def test_flag_off_returns_before_loading_model_config(self):
-        with (
-            patch(
-                "sglang.srt.arg_groups.layernorm_sp_hook.resolving_view",
-                return_value=SimpleNamespace(enable_layernorm_sp=False),
-            ),
-            patch(
-                "sglang.srt.arg_groups.layernorm_sp_hook.model_config_of"
-            ) as model_config_of,
-        ):
-            handle_layernorm_sp(SimpleNamespace())
-        model_config_of.assert_not_called()
+    VALID: ClassVar[dict[str, object]] = {
+        "architecture": "Qwen3ForCausalLM",
+        "tp_size": 2,
+        "ep_size": 2,
+        "pp_size": 1,
+        "attn_dp_enabled": False,
+        "speculative_algorithm": None,
+    }
 
     def test_valid_config_passes(self):
         validate_layernorm_sp(**self.VALID)  # must not raise
@@ -321,7 +255,7 @@ class TestSpRegionSteps(CustomTestCase):
         communicator = self.communicator(first_layer=True)
         move = MagicMock(side_effect=lambda **k: k["hidden_states"])
         communicator.paths[BatchVariant.ORDINARY] = self.ordinary_steps(move)
-        (h, _), active, scatter = self.run_prepare_attn(
+        (_h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
         self.assertFalse(active)

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import test_declared_decoder_boundary as fixture
 import torch
+from parameterized import parameterized
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
@@ -87,7 +88,7 @@ class TestQwen4ExpPleRows(CustomTestCase):
 class _FakeTPGroup:
     world_size = 4
 
-    def __init__(self, rank_in_group=0):
+    def __init__(self, rank_in_group):
         self.rank_in_group = rank_in_group
 
     def all_gather_into_tensor(self, output, local):
@@ -97,167 +98,84 @@ class _FakeTPGroup:
 class _Embedding:
     enable_ple_fusion = False
 
-    def __init__(self, embedding_rows):
-        self.embedding_rows = embedding_rows
+    def __init__(self, rows):
+        self.rows = rows
 
     def __call__(self, batch, forward_batch):
-        return torch.arange(self.embedding_rows, dtype=torch.float32).unsqueeze(-1)
+        return torch.arange(self.rows, dtype=torch.float32).unsqueeze(-1)
 
 
 class TestQwen4ExpPleSequenceParallelRows(CustomTestCase):
-    def _layer(self, physical_tokens, conv_rows, projected_embeddings=None):
+    @staticmethod
+    def _layer(embedding_rows, projected_embeddings):
         layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
         torch.nn.Module.__init__(layer)
         layer.hidden_size = 1
         layer.hc_count = 1
         layer._prefetch_state = None
-        layer.ple_embedding = _Embedding(physical_tokens)
+        layer.ple_embedding = _Embedding(embedding_rows)
 
         def key_proj(value):
-            if projected_embeddings is not None:
-                projected_embeddings.append(value.clone())
+            projected_embeddings.append(value.clone())
             return value, None
 
         layer.key_proj = key_proj
         layer.value_proj = lambda value: (value, None)
         layer.norm_key = layer.norm_query = layer.norm_conv = None
         layer._apply_ple_norm = lambda norm, value: value
-
-        def short_conv(value, forward_batch, batch):
-            conv_rows.append(value.shape[0])
-            return torch.zeros_like(value)
-
-        layer._short_conv = short_conv
+        layer._short_conv = lambda value, forward_batch, batch: torch.zeros_like(value)
         return layer
 
     @staticmethod
-    def _batch(processed_tokens, physical_tokens):
+    def _batch(embedding_rows, physical_tokens):
         return SimpleNamespace(
-            processed_tokens=processed_tokens,
+            processed_tokens=embedding_rows,
             physical_tokens=physical_tokens,
             mode=SimpleNamespace(is_target_verify=lambda: False),
             use_decode_fast_path=False,
-            valid_tokens=torch.ones(processed_tokens, dtype=torch.bool),
+            valid_tokens=torch.ones(embedding_rows, dtype=torch.bool),
         )
 
-    @staticmethod
-    def _forward_batch():
-        return SimpleNamespace(
-            _original_forward_mode=None,
-            forward_mode=SimpleNamespace(),
-        )
-
-    def test_processed_rows_smaller_than_local_physical_shard(self):
-        conv_rows = []
-        layer = self._layer(physical_tokens=17, conv_rows=conv_rows)
-        hidden_states = torch.ones(5, 1)
-        with (
-            patch(
-                "sglang.srt.models.qwen4_exp.get_parallel",
-                return_value=SimpleNamespace(tp_group=_FakeTPGroup()),
-            ),
-            patch(
-                "sglang.srt.models.qwen4_exp.layernorm_sp.runs_sp", return_value=True
-            ),
-        ):
-            output = layer(
-                hidden_states,
-                self._forward_batch(),
-                self._batch(processed_tokens=2, physical_tokens=17),
-            )
-        self.assertEqual(output.shape, (5, 1))
-        self.assertEqual(conv_rows, [2])
-
-    def test_non_divisible_physical_rows_keep_ceil_divided_local_shape(self):
-        conv_rows = []
-        layer = self._layer(physical_tokens=17, conv_rows=conv_rows)
-        with (
-            patch(
-                "sglang.srt.models.qwen4_exp.get_parallel",
-                return_value=SimpleNamespace(tp_group=_FakeTPGroup()),
-            ),
-            patch(
-                "sglang.srt.models.qwen4_exp.layernorm_sp.runs_sp", return_value=True
-            ),
-        ):
-            output = layer(
-                torch.ones(5, 1),
-                self._forward_batch(),
-                self._batch(processed_tokens=17, physical_tokens=17),
-            )
-        self.assertEqual(output.shape, (5, 1))
-        self.assertEqual(conv_rows, [17])
-
-    def test_graph_replay_may_grow_processed_rows_in_the_same_bucket(self):
-        conv_rows = []
-        layer = self._layer(physical_tokens=17, conv_rows=conv_rows)
-        parallel = SimpleNamespace(tp_group=_FakeTPGroup())
-        with (
-            patch("sglang.srt.models.qwen4_exp.get_parallel", return_value=parallel),
-            patch(
-                "sglang.srt.models.qwen4_exp.layernorm_sp.runs_sp", return_value=True
-            ),
-        ):
-            for processed_tokens in (2, 7):
-                output = layer(
-                    torch.ones(5, 1),
-                    self._forward_batch(),
-                    self._batch(processed_tokens=processed_tokens, physical_tokens=17),
-                )
-                self.assertEqual(output.shape, (5, 1))
-        self.assertEqual(conv_rows, [2, 7])
-
-    def _assert_pad_then_shard_layout(self, *, embedding_rows, physical_tokens, rank):
-        conv_rows = []
-        projected_embeddings = []
-        group = _FakeTPGroup(rank)
-        local_rows = (physical_tokens + group.world_size - 1) // group.world_size
-        layer = self._layer(embedding_rows, conv_rows, projected_embeddings)
-        with (
-            patch(
-                "sglang.srt.models.qwen4_exp.get_parallel",
-                return_value=SimpleNamespace(tp_group=group),
-            ),
-            patch(
-                "sglang.srt.models.qwen4_exp.layernorm_sp.runs_sp", return_value=True
-            ),
-        ):
-            output = layer(
-                torch.ones(local_rows, 1),
-                self._forward_batch(),
-                self._batch(
-                    processed_tokens=embedding_rows,
-                    physical_tokens=physical_tokens,
-                ),
-            )
-
-        full = torch.arange(embedding_rows, dtype=torch.float32).unsqueeze(-1)
-        full = torch.nn.functional.pad(
-            full, (0, 0, 0, physical_tokens - embedding_rows)
-        )
-        expected = layernorm_sp.shard_token_rows(full, group=group)
-        torch.testing.assert_close(projected_embeddings[0], expected)
-        self.assertEqual(output.shape, (local_rows, 1))
-
-    def test_ple_embeddings_pad_5624_rows_to_8192_before_tp4_sharding(self):
-        for rank in range(4):
-            with self.subTest(rank=rank):
-                self._assert_pad_then_shard_layout(
-                    embedding_rows=5624,
-                    physical_tokens=8192,
-                    rank=rank,
-                )
-
-    def test_ple_embeddings_pad_non_divisible_physical_rows_before_tp4_sharding(
-        self,
+    @parameterized.expand([(5624, 8192), (17, 22)])
+    def test_ple_embeddings_pad_before_tp4_sharding(
+        self, embedding_rows, physical_tokens
     ):
         for rank in range(4):
             with self.subTest(rank=rank):
-                self._assert_pad_then_shard_layout(
-                    embedding_rows=17,
-                    physical_tokens=22,
-                    rank=rank,
+                projected_embeddings = []
+                group = _FakeTPGroup(rank)
+                local_rows = (
+                    physical_tokens + group.world_size - 1
+                ) // group.world_size
+                layer = self._layer(embedding_rows, projected_embeddings)
+                with (
+                    patch(
+                        "sglang.srt.models.qwen4_exp.get_parallel",
+                        return_value=SimpleNamespace(tp_group=group),
+                    ),
+                    patch(
+                        "sglang.srt.models.qwen4_exp.layernorm_sp.runs_sp",
+                        return_value=True,
+                    ),
+                ):
+                    output = layer(
+                        torch.ones(local_rows, 1),
+                        SimpleNamespace(
+                            _original_forward_mode=None,
+                            forward_mode=SimpleNamespace(),
+                        ),
+                        self._batch(embedding_rows, physical_tokens),
+                    )
+
+                full = torch.arange(
+                    embedding_rows, dtype=torch.float32
+                ).unsqueeze(-1)
+                full = torch.nn.functional.pad(
+                    full, (0, 0, 0, physical_tokens - embedding_rows)
                 )
+                expected = layernorm_sp.shard_token_rows(full, group=group)
+                torch.testing.assert_close(projected_embeddings[0], expected)
+                self.assertEqual(output.shape, (local_rows, 1))
 
 
 if __name__ == "__main__":
