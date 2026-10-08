@@ -5,7 +5,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class _FakeDBCacheConfig:
@@ -20,6 +20,7 @@ class _FakeDBCacheConfig:
 class _FakeForwardPattern:
     # A class (not a SimpleNamespace instance) so it is a valid type in
     # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_0 = "Pattern_0"
     Pattern_2 = "Pattern_2"
     Pattern_3 = "Pattern_3"
 
@@ -165,8 +166,10 @@ def _install_torch_stub():
     torch_nn.Module = _FakeModule
     torch_dist.ProcessGroup = _FakeProcessGroup
     torch_dist.ReduceOp = _FakeReduceOp
+    torch_dist.is_initialized = lambda: False
     torch.distributed = torch_dist
     torch.nn = torch_nn
+    torch.Tensor = object
 
     return {
         "torch": torch,
@@ -228,6 +231,30 @@ def _import_module_with_legacy_stub():
     return module, stub_modules
 
 
+class TestCacheDitSimilarityGroups(unittest.TestCase):
+    def test_independent_cfg_or_dp_peers_do_not_reduce_over_world(self):
+        for group in (None, "singleton-sp"):
+            with self.subTest(group=group):
+                module = _import_module_with_stub()
+                original = Mock(return_value=True)
+                manager_type = type(
+                    "CachedContextManager", (), {"similarity": original}
+                )
+                contexts = types.ModuleType("cache_dit.caching.cache_contexts")
+                contexts.cache_manager = types.SimpleNamespace(
+                    CachedContextManager=manager_type
+                )
+                module.dist.get_world_size = Mock(return_value=1)
+                with patch.dict(sys.modules, {contexts.__name__: contexts}):
+                    module._patch_cache_dit_similarity()
+                manager = manager_type()
+                manager._sglang_sp_group = group
+                manager.similarity(
+                    "previous", "current", threshold=0.1, parallelized=True
+                )
+                self.assertFalse(original.call_args.kwargs["parallelized"])
+
+
 class TestCacheDitRefreshContext(unittest.TestCase):
     def test_cache_dit_env_defaults_read_all_dbcache_knobs(self):
         module = _import_module_with_stub()
@@ -240,6 +267,25 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "max_warmup_steps": 4,
                 "residual_diff_threshold": 0.24,
                 "max_continuous_cached_steps": 3,
+            },
+        )
+
+    def test_refresh_preserves_explicit_scm_mask_and_policy(self):
+        module = _import_module_with_stub()
+        module.refresh_context_on_transformer(
+            "transformer",
+            4,
+            scm_preset="fast",
+            steps_computation_mask=[1, 0, 1, 0],
+            steps_computation_policy="static",
+        )
+        self.assertEqual(module.cache_dit.steps_mask_calls, [])
+        self.assertEqual(
+            module.cache_dit.refresh_calls[0]["cache_config"],
+            {
+                "num_inference_steps": 4,
+                "steps_computation_mask": [1, 0, 1, 0],
+                "steps_computation_policy": "static",
             },
         )
 
@@ -382,18 +428,69 @@ def _make_transformer(class_name, layers=None, module_name=None):
 
 
 class TestBuildCustomBlockAdapter(unittest.TestCase):
+    def test_fsdp_subclass_preserves_native_adapter(self):
+        module = _import_module_with_stub()
+        for name, attr, multimodal, pattern in (
+            (
+                "Kandinsky6Transformer3DModel",
+                "visual_transformer_blocks",
+                True,
+                "Pattern_0",
+            ),
+            (
+                "Kandinsky6Transformer3DModel",
+                "visual_transformer_blocks",
+                False,
+                "Pattern_2",
+            ),
+            ("AnimaTransformer3DModel", "transformer_blocks", False, "Pattern_3"),
+        ):
+            with self.subTest(name=name, multimodal=multimodal):
+                blocks = ["block_0", "block_1"]
+                native = type(name, (), {attr: blocks})
+                fsdp_mixin = type("FSDPModule", (), {})
+                transformer = type(f"FSDP{name}", (fsdp_mixin, native), {})()
+                transformer.config = types.SimpleNamespace(is_multimodal=multimodal)
+                adapter = module._build_custom_block_adapter(
+                    transformer, has_separate_cfg=True
+                )
+                self.assertIs(adapter.transformer, transformer)
+                self.assertIs(adapter.blocks, blocks)
+                self.assertEqual(adapter.forward_pattern, pattern)
+                self.assertTrue(adapter.has_separate_cfg)
+
+    def test_kandinsky6_caches_both_joint_streams(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("Kandinsky6Transformer3DModel")
+        transformer.visual_transformer_blocks = ["joint_block"]
+        for multimodal, pattern in ((True, "Pattern_0"), (False, "Pattern_2")):
+            with self.subTest(multimodal=multimodal):
+                transformer.config = types.SimpleNamespace(is_multimodal=multimodal)
+                adapter = module._build_custom_block_adapter(
+                    transformer, has_separate_cfg=True
+                )
+                self.assertIs(adapter.blocks, transformer.visual_transformer_blocks)
+                self.assertEqual(adapter.forward_pattern, pattern)
+                self.assertTrue(adapter.has_separate_cfg)
+
     def test_builds_adapter_for_registered_class(self):
         module = _import_module_with_stub()
         blocks = ["block_0", "block_1"]
-        transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
-
-        adapter = module._build_custom_block_adapter(transformer, has_separate_cfg=True)
-
-        self.assertIsNotNone(adapter)
-        self.assertEqual(adapter.blocks, blocks)
-        self.assertEqual(adapter.blocks_name, "layers")
-        self.assertEqual(adapter.forward_pattern, "Pattern_3")
-        self.assertTrue(adapter.has_separate_cfg)
+        for class_name, blocks_attr in (
+            ("ErnieImageTransformer2DModel", "layers"),
+            ("MingImageTransformer2DModel", "layers"),
+            ("AnimaTransformer3DModel", "transformer_blocks"),
+        ):
+            with self.subTest(class_name=class_name):
+                transformer = type(class_name, (), {blocks_attr: blocks})()
+                adapter = module._build_custom_block_adapter(
+                    transformer, has_separate_cfg=True
+                )
+                self.assertIsNotNone(adapter)
+                self.assertIs(adapter.transformer, transformer)
+                self.assertIs(adapter.blocks, blocks)
+                self.assertEqual(adapter.forward_pattern, "Pattern_3")
+                self.assertTrue(adapter.has_separate_cfg)
 
     def test_returns_none_for_unknown_class(self):
         module = _import_module_with_stub()

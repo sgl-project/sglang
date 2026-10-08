@@ -657,5 +657,139 @@ def test_flash_mla_fp8(
     cal_diff(lse_flash, lse_torch, "lse")
 
 
+def _sparse_decode_inputs(b: int, s_q: int, h_q: int, s_k: int, topk: int, d: int):
+    block_size = 64
+    num_blocks_per_seq = cdiv(s_k, block_size)
+    block_table = torch.randperm(
+        b * num_blocks_per_seq, dtype=torch.int32, device="cuda"
+    ).view(b, num_blocks_per_seq)
+    cache_seqlens = torch.full((b,), s_k, dtype=torch.int32, device="cuda")
+    q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device="cuda").clamp_(-1, 1)
+    blocked_k = (
+        (torch.randn(b * num_blocks_per_seq, block_size, 1, d, device="cuda") / 10)
+        .clamp_(-1, 1)
+        .to(torch.bfloat16)
+    )
+    abs_indices = torch.stack(
+        [torch.randperm(s_k, device="cuda")[:topk] for _ in range(b * s_q)]
+    ).view(b, s_q, topk)
+    abs_indices[torch.rand(abs_indices.shape, device="cuda") < 0.05] = -1
+    block_ids = torch.gather(
+        block_table, 1, (abs_indices.clamp(min=0) // block_size).view(b, -1)
+    ).view(b, s_q, topk)
+    indices_in_kvcache = block_ids * block_size + abs_indices.clamp(min=0) % block_size
+    indices_in_kvcache[abs_indices < 0] = -1
+    return (
+        q,
+        blocked_k,
+        block_table,
+        cache_seqlens,
+        abs_indices.int(),
+        indices_in_kvcache.int(),
+    )
+
+
+def _quantize_v41_k_cache(k: torch.Tensor) -> torch.Tensor:
+    """(num_blocks, block_size, 1, 512) bf16 -> V4.1 pages: fp8 data rows, then ue8m0 per-32 scale rows."""
+    num_blocks, block_size = k.shape[:2]
+    x = k.view(num_blocks, block_size, 16, 32).float()
+    exponent = torch.ceil(torch.log2(x.abs().amax(dim=-1).clamp(min=1e-10) / 448.0))
+    data = (x / torch.exp2(exponent).unsqueeze(-1)).to(torch.float8_e4m3fn)
+    pages = torch.empty(
+        num_blocks, block_size * 528, dtype=torch.uint8, device=k.device
+    )
+    pages[:, : block_size * 512] = data.view(torch.uint8).view(num_blocks, -1)
+    pages[:, block_size * 512 :] = (exponent + 127).to(torch.uint8).view(num_blocks, -1)
+    return pages.view(num_blocks, block_size, 1, 528)
+
+
+def _dequantize_v41_k_cache(pages: torch.Tensor) -> torch.Tensor:
+    num_blocks, block_size = pages.shape[:2]
+    flat = pages.view(num_blocks, block_size * 528)
+    data = flat[:, : block_size * 512].view(torch.float8_e4m3fn).float()
+    exponent = flat[:, block_size * 512 :].float() - 127
+    x = data.view(num_blocks, block_size, 16, 32) * torch.exp2(
+        exponent.view(num_blocks, block_size, 16, 1)
+    )
+    return x.to(torch.bfloat16).view(num_blocks, block_size, 1, 512)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="FlashMLA sparse decode needs SM90 or SM100",
+)
+@pytest.mark.parametrize("h_q", [64, 128])
+def test_sparse_decode_tensor_metadata_zero_rope_cache(h_q: int):
+    """A 528 B/token zero-RoPE cache through tensor metadata without kv_format must decode as V3.2 without RoPE, not V4.1."""
+    torch.manual_seed(h_q)
+    b, s_q, s_k, topk, d = 2, 1, 4096, 2048, 512
+    q, blocked_k, block_table, cache_seqlens, abs_indices, indices = (
+        _sparse_decode_inputs(b, s_q, h_q, s_k, topk, d)
+    )
+    k_cache = quantize_k_cache(blocked_k, d)
+    tile_scheduler_metadata, num_splits = get_mla_metadata(
+        cache_seqlens, s_q * h_q, 1, h_q, True, topk
+    )
+    out, lse = flash_mla_with_kvcache(
+        q,
+        k_cache,
+        block_table,
+        cache_seqlens,
+        d,
+        tile_scheduler_metadata,
+        num_splits,
+        is_fp8_kvcache=True,
+        indices=indices,
+    )
+    out_ref, lse_ref = reference_torch_decode(
+        cache_seqlens,
+        block_table,
+        q,
+        dequantize_k_cache(k_cache, dv=d, d=d),
+        d,
+        False,
+        abs_indices,
+    )
+    torch.testing.assert_close(out, out_ref, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-6, rtol=8.01 / 65536)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 10,
+    reason="FlashMLA V4.1 KV cache formats need SM100",
+)
+@pytest.mark.parametrize("h_q", [64, 128])
+def test_sparse_decode_sched_meta_v41_cache(h_q: int):
+    """A 528 B/token V4.1 cache through FlashMLASchedMeta without kv_format must decode as V4.1, not V3.2 without RoPE."""
+    torch.manual_seed(h_q)
+    b, s_q, s_k, topk, d = 2, 1, 4096, 2048, 512
+    q, blocked_k, block_table, cache_seqlens, abs_indices, indices = (
+        _sparse_decode_inputs(b, s_q, h_q, s_k, topk, d)
+    )
+    k_cache = _quantize_v41_k_cache(blocked_k)
+    sched_meta, _ = get_mla_metadata()
+    out, lse = flash_mla_with_kvcache(
+        q,
+        k_cache,
+        None,
+        None,
+        d,
+        sched_meta,
+        is_fp8_kvcache=True,
+        indices=indices,
+    )
+    out_ref, lse_ref = reference_torch_decode(
+        cache_seqlens,
+        block_table,
+        q,
+        _dequantize_v41_k_cache(k_cache),
+        d,
+        False,
+        abs_indices,
+    )
+    torch.testing.assert_close(out, out_ref, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-6, rtol=8.01 / 65536)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

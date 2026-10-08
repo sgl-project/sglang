@@ -27,7 +27,7 @@ dynamo-tokenizers = "=1.8.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=5.1.2"
+dynamo-renderer = "=5.2.0"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 
@@ -70,6 +70,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
+# Gzips the /internal/kv_snapshot body once per build and inflates a peer's (see `fetch_body` in state/kv_events/bootstrap/fetch.rs).
+flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"
@@ -94,6 +96,7 @@ url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [dev-dependencies]
+base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).

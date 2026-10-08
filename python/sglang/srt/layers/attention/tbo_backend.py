@@ -32,6 +32,10 @@ class TboAttnBackend(AttentionBackend):
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
+    @property
+    def dllm_attention(self):
+        return self.primary.dllm_attention
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(
@@ -167,6 +171,10 @@ class TboAttnBackend(AttentionBackend):
             return
         for child in self.children:
             child.on_after_cuda_graph_warmup()
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        for backend in (self.primary, *self.children):
+            backend.validate_elastic_cuda_graph_recapture()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()

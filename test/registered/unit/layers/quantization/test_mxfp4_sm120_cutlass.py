@@ -19,12 +19,7 @@ register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 @pytest.fixture
 def stated_tp_group():
-    """A TP group for a test that runs in a process without one.
-
-    The production call passes the group *into* `use_symmetric_memory`, so
-    stubbing that context manager does not stop the read -- the argument is
-    evaluated first. Stating it on the context answers every spelling.
-    """
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):
@@ -347,6 +342,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
         gemm1_alpha=1.702,
         gemm1_clamp_limit=7.0,
     )
+    # The fused func reads the layer's MoE placement off the config.
+    config.layer = layer
     method.moe_runner_config = config
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
     method._process_weights_for_sm120_cutlass(layer)
