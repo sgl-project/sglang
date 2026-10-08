@@ -2,7 +2,7 @@
 
 The fused JIT kernel is bit-exact with the local eager ``add + GELU`` chain for
 eligible ModelOpt FP4 linears. It still changes the model's kernel schedule, so
-keep the default ``quality="lossless"`` path unchanged and mount this fast path
+keep the default ``quality="exact"`` path unchanged and mount this fast path
 only for the existing ``quality="high"`` contract.
 """
 

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -41,7 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -160,6 +161,15 @@ class UnifiedCacheLinkerWrapper:
 
         self.cache = cache
         self.cache_linker = cache_linker
+        swa = cache.components.get(ComponentType.SWA)
+        self._skip_swa = swa is not None and is_swa_req_ring(
+            cache.token_to_kv_pool_allocator
+        )
+        self._components = tuple(
+            component
+            for component in cache._components_tuple
+            if not (self._skip_swa and component is swa)
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
@@ -192,7 +202,7 @@ class UnifiedCacheLinkerWrapper:
             return result
 
         lookup_transfers = []
-        for component in cache._components_tuple:
+        for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
@@ -269,7 +279,7 @@ class UnifiedCacheLinkerWrapper:
         tail_len = (len(key) - device_hit_len) // page * page
         if tail_len == 0:
             return []
-        return get_hash_str(
+        return get_storage_hash_str(
             key[device_hit_len : device_hit_len + tail_len],
             last_hash,
             page_size=page,
@@ -290,7 +300,7 @@ class UnifiedCacheLinkerWrapper:
 
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
+        for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
@@ -313,9 +323,22 @@ class UnifiedCacheLinkerWrapper:
             prefix_len,
         )
 
+        # Components omitted from the linker do not run their PREPARE hook.
+        # Keep a non-restorable SWA range as tombstones instead of rebuilding
+        # it from an uninitialized FULL-to-SWA mapping during cache.insert().
+        if self._skip_swa:
+            if req.kv is None:
+                from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+            )
+
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
+            [cache.prefix_device_indices(req), full_transfer.device_indices]
         )
         mamba_transfer = next(
             (
@@ -335,11 +358,13 @@ class UnifiedCacheLinkerWrapper:
                     else None
                 ),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
+                component_evicted_seqlens=(
+                    req.kv.component_evicted_seqlens.copy()
+                    if req.kv is not None
+                    else {}
                 ),
-                chunked=True,
-                priority=getattr(req, "priority", 0) or 0,
+                inserted_len=len(hit.prefix_key),
+                priority=req.priority or 0,
                 track_adopted_ranges=True,
             )
         )
@@ -484,6 +509,8 @@ class UnifiedCacheLinkerWrapper:
                 node_id
             )
             if transfers is not None:
+                if self._skip_swa:
+                    transfers = [t for t in transfers if t.name != PoolName.SWA]
                 self._offload_node(node_id, transfers)
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:

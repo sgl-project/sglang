@@ -14,6 +14,7 @@ class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
     model = MODEL
     kl_div_thres = 0.02  # it was 0.002
     kl_div_decode_max_new_tokens = 2048
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
     other_args = [
         "--tp-size",
         "1",
