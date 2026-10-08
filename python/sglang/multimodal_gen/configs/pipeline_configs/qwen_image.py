@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import (
     QwenImageEditPlus_2511_DitConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -295,16 +298,9 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        vae_arch_config = self.vae_config.arch_config
-        scaling_factor = 1.0 / torch.tensor(
-            vae_arch_config.latents_std, device=device
-        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
-        shift_factor = (
-            torch.tensor(vae_arch_config.latents_mean)
-            .view(1, vae_arch_config.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-        return scaling_factor, shift_factor
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
