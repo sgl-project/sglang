@@ -25,6 +25,7 @@ HW_MAPPING = {
     "mlx": HWBackend.MLX,
     "mps": HWBackend.MPS,
     "ppu": HWBackend.PPU,
+    "mlu": HWBackend.MLU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -139,6 +140,10 @@ PER_COMMIT_SUITES = {
     # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
     # rejects any register_ppu_ci() outright.
     HWBackend.PPU: [],
+    HWBackend.MLU: [
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -217,6 +222,9 @@ NIGHTLY_SUITES = {
         "nightly-xpu-4-gpu",
         "nightly-xpu-8-gpu",
     ],
+    HWBackend.MLU: [
+        "nightly-test-2-mlu",
+    ],
 }
 
 
@@ -249,6 +257,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MLX,
     HWBackend.MPS,
     HWBackend.PPU,
+    HWBackend.MLU,
 }
 
 

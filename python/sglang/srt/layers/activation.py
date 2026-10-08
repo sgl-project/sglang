@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_xpu,
@@ -123,6 +124,8 @@ if _use_aiter:
 
 if is_npu():
     import torch_npu
+if is_mlu():
+    import torch_mlu_ops
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +169,9 @@ class SiluAndMul(BaseFusedOp):
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         out = torch_npu.npu_swiglu(x)
         return out
+
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -305,6 +311,9 @@ class QuickGELU(BaseFusedOp):
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_fast_gelu(x)
+
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        return torch_mlu_ops.active(input=x, act_mode="quick_gelu", is_gated=False)
 
 
 class XIELU(BaseFusedOp):

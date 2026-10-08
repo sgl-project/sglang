@@ -2523,6 +2523,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    @property
+    def mix_decode_bs(self) -> Optional[int]:
+        """Number of decode requests appended to this MIXED batch."""
+        if (
+            self.forward_mode != ForwardMode.MIXED
+            or self.mix_running_indices_cpu is None
+        ):
+            return None
+        return self.mix_running_indices_cpu.numel()
+
     @classmethod
     def init_new(
         cls,
