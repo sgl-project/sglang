@@ -13,6 +13,7 @@ import sys
 
 import msgspec
 import pytest
+
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -84,6 +85,33 @@ def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
     assert "--offload-arch=mp_31" in build_file
     assert "-x musa" in build_file
     assert "nvcc =" not in build_file
+
+
+def test_musa_toolchain_flags(monkeypatch):
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
+    monkeypatch.setattr(toolchain, "gpu_arch_name", lambda: "mp_31")
+    monkeypatch.setattr(
+        toolchain,
+        "tvm_ffi_paths",
+        lambda: (("/opt/tvm/include",), "/opt/tvm/lib", "tvm_ffi"),
+    )
+
+    assert toolchain.device_compiler_path.__wrapped__() == "/opt/musa/bin/mcc"
+    assert toolchain.target_flags() == ["--offload-arch=mp_31"]
+    assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
+    assert toolchain.base_include_paths() == [
+        "/opt/tvm/include",
+        "/opt/musa/include",
+    ]
+    assert toolchain.base_link_flags(with_device=True) == [
+        "-shared",
+        "-L/opt/tvm/lib",
+        "-ltvm_ffi",
+        "-L/opt/musa/lib",
+        "-lmusa",
+        "-lmusart",
+    ]
 
 
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:

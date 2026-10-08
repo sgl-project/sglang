@@ -428,8 +428,8 @@ struct L1Carveout {
 /// (PDL secondaries inherit the primary's carveout). Per device, sticky for the process; panics
 /// when no carveout restores occupancy. ROCm has no such attribute and reports pct -1.
 template <typename T>
-inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0)
-    -> L1Carveout {
+inline auto
+prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0) -> L1Carveout {
   const auto blocks_per_sm = [&] {
     int blocks = 0;
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
@@ -460,8 +460,8 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
 /// Callers must keep the block size and dynamic shared memory fixed for each (kernel, device), and
 /// must not change the kernel's carveout attribute after configuration.
 template <typename T>
-inline auto ensure_prefer_l1(T kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0)
-    -> L1Carveout {
+inline auto
+ensure_prefer_l1(T kernel, int device_id, uint32_t block_threads, std::size_t dyn_smem_bytes = 0) -> L1Carveout {
   static std::mutex mutex;
   static std::map<std::pair<const void*, int>, L1Carveout> settled;
   const std::lock_guard<std::mutex> lock(mutex);
@@ -639,9 +639,9 @@ struct LaunchKernel {
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
 #if defined(USE_MUSA) || defined(__MUSACC__)
-#define CHECK_CUDA(COND)                                                \
-  if (const auto error = (COND); error == ::musaSuccess) [[likely]] {   \
-  } else                                                                \
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::musaSuccess) [[likely]] { \
+  } else                                                              \
     host::Error() << "MUSA error: " << ::musaGetErrorString(error) << ". "
 #else
 #define CHECK_CUDA(COND)                                              \

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -132,7 +133,11 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
+#if defined(USE_MUSA) || defined(__MUSACC__)
   constexpr auto max_type = static_cast<std::size_t>(DLDeviceType::kDLTrn);
+#else
+  constexpr auto max_type = stdr::max(map | stdv::keys);
+#endif
   auto result = std::array<std::string_view, max_type + 1>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
@@ -314,7 +319,11 @@ struct SymbolicDType {
 
  private:
   auto m_check(DLDataType value) const -> bool {
+#if defined(USE_MUSA) || defined(__MUSACC__)
     return m_options.empty() || (std::find(m_options.begin(), m_options.end(), value) != m_options.end());
+#else
+    return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
+#endif
   }
 
   std::span<const DLDataType> m_options;
@@ -381,7 +390,11 @@ struct SymbolicDevice {
 
  private:
   auto m_check(DLDevice value) const -> bool {
+#if defined(USE_MUSA) || defined(__MUSACC__)
     return m_options.empty() || (std::any_of(m_options.begin(), m_options.end(), [value](const DLDevice& opt) {
+#else
+    return stdr::empty(m_options) || (stdr::any_of(m_options, [value](const DLDevice& opt) {
+#endif
              // device type must exactly match
              if (opt.device_type != value.device_type) return false;
              // device id can be wildcarded
