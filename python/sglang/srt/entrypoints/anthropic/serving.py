@@ -773,8 +773,6 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
-        # The shared Chat pipeline raises ValueError for requests it rejects,
-        # which Chat itself answers with 400.
         except ValueError as e:
             return self._error_response(
                 status_code=400,
