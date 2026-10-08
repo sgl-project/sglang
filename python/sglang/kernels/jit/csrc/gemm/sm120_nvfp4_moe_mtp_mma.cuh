@@ -110,6 +110,26 @@ prefetch(uint8_t* shared, const uint8_t* weights, uint32_t tile, uint32_t step, 
   }
   asm volatile("cp.async.commit_group;" ::: "memory");
 }
+// The activation values are exact FP4 zeros, including signed zero.
+// Zero-fill their weight bytes while retaining every MMA and expert contribution.
+template <uint32_t K>
+__device__ __forceinline__ void
+prefetch_zero(uint8_t* shared, const uint8_t* weights, uint32_t tile, uint32_t step, uint32_t lane, const uint32_t* z) {
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    uint32_t row = lane / 8 + 4 * j, col = (lane % 8) * 16;
+    uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(shared + row * 144 + col));
+    uint32_t source_col = step * 128 + col;
+    uint32_t bytes = source_col < K / 2 ? 16 : 0;
+    if (bytes) {
+      uint4 q = *reinterpret_cast<const uint4*>(z + source_col / 4);
+      if (((q.x | q.y | q.z | q.w) & 0x77777777u) == 0) bytes = 0;
+    }
+    const uint8_t* src = weights + (tile + row) * (K / 2) + (bytes ? source_col : 0);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(bytes) : "memory");
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
 __device__ __forceinline__ void
 load_a(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, const uint8_t* shared, uint32_t lane) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(shared + (lane % 16) * 144 + (lane / 16) * 16));
@@ -190,7 +210,7 @@ __global__ __launch_bounds__(128) void fc1(
   }
 }
 
-template <uint32_t N, uint32_t K, uint32_t TopK, bool PDL>
+template <uint32_t N, uint32_t K, uint32_t TopK, bool PDL, bool ZeroLoad = false>
 __global__ __launch_bounds__(128) void fc2(
     const uint32_t* __restrict__ z,
     const uint8_t* __restrict__ zs,
@@ -214,7 +234,10 @@ __global__ __launch_bounds__(128) void fc2(
   float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
 #pragma unroll
   for (uint32_t stage = 0; stage < 2; ++stage)
-    prefetch<K>(ws[warp][stage], weights, tile, stage, lane);
+    if constexpr (ZeroLoad)
+      prefetch_zero<K>(ws[warp][stage], weights, tile, stage, lane, z);
+    else
+      prefetch<K>(ws[warp][stage], weights, tile, stage, lane);
 #pragma unroll 1
   for (uint32_t base = 0; base < K; base += 256) {
     asm volatile("cp.async.wait_group 1;" ::: "memory");
@@ -231,7 +254,10 @@ __global__ __launch_bounds__(128) void fc2(
       mma(d0, d1, d2, d3, a0, a1, a2, a3, z[k / 8 + lane % 4], z[k / 8 + lane % 4 + 4], sa, sb);
     }
     __syncwarp();
-    prefetch<K>(ws[warp][(base / 256) % 2], weights, tile, base / 256 + 2, lane);
+    if constexpr (ZeroLoad)
+      prefetch_zero<K>(ws[warp][(base / 256) % 2], weights, tile, base / 256 + 2, lane, z);
+    else
+      prefetch<K>(ws[warp][(base / 256) % 2], weights, tile, base / 256 + 2, lane);
   }
   asm volatile("cp.async.wait_group 0;" ::: "memory");
   if (lane % 4 == 0) {
@@ -255,7 +281,7 @@ __global__ void reduce(const bf16_t* __restrict__ partial, bf16_t* __restrict__ 
 }
 }  // namespace nvfp4_mtp_mma
 
-template <uint32_t N1, uint32_t K1, uint32_t N2, uint32_t K2, uint32_t TopK, bool PDL>
+template <uint32_t N1, uint32_t K1, uint32_t N2, uint32_t K2, uint32_t TopK, bool PDL, bool ZeroLoad = false>
 struct Sm120Nvfp4MoeMtpMma {
   static_assert(N1 == 2688 && K1 == 1024 && N2 == 1024 && K2 == 2688 && TopK == 22);
   /// Run 1 to 4 token rows with BF16 epilogues and deterministic reduction.
@@ -309,7 +335,7 @@ struct Sm120Nvfp4MoeMtpMma {
             static_cast<uint8_t*>(zs.data_ptr()));
     LaunchKernel({N2 / 64, TopK, M}, 128, dev.unwrap())
         .enable_pdl(PDL)(
-            nvfp4_mtp_mma::fc2<N2, K2, TopK, PDL>,
+            nvfp4_mtp_mma::fc2<N2, K2, TopK, PDL, ZeroLoad>,
             static_cast<const uint32_t*>(z.data_ptr()),
             static_cast<const uint8_t*>(zs.data_ptr()),
             static_cast<const uint8_t*>(w2.data_ptr()),

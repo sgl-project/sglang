@@ -1128,6 +1128,7 @@ class Envs:
     SGLANG_SM120_MAMBA_PREFILL_TILES = EnvBool(False)
     SGLANG_SM120_LOSSLESS_BF16_MOE = EnvBool(False)
     SGLANG_SM120_BF16_MOE_UNION = EnvBool(False)
+    SGLANG_SM120_NVFP4_ZERO_LOAD = EnvBool(False)
     SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
