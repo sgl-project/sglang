@@ -1034,10 +1034,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         return self._empty_match_result
 
-    @property
-    def empty_device_indices(self) -> torch.Tensor:
-        return self._empty_device_indices
-
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
         """Whether the node's FULL device value has been evicted."""
         return self.node_by_id(node_id).evicted

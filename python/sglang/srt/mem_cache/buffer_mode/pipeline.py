@@ -1375,7 +1375,7 @@ class BufferModePipeline:
 
     def init_load_back(
         self, params: InitLoadBackParams
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
+    ) -> Optional[tuple[int, NodeId]]:
         """Materialize a selected prefill under the caller's prefix lock.
 
         The caller has finished selecting its prefill shape and must acquire
@@ -1391,8 +1391,7 @@ class BufferModePipeline:
         req = params.req
         assert req is not None
         request = req.cache_request_handle
-        empty = cache.tree_core.empty_device_indices
-        unchanged = (empty, req.last_node)
+        unchanged = (0, req.last_node)
         f = self.staged_prefetches.get(request)
         if f is None:
             self.release_anchor_lock(request)
@@ -1650,9 +1649,7 @@ class BufferModePipeline:
                 f"span_end={span_end} splice_base={splice_base}; "
                 f"in-flight H2D targets freed slots"
             )
-        # Canonical ownership: return the post-insert tree slice, never the
-        # raw cc.load allocation (torch.equal here; the tree slice is truth).
-        return canonical, match.last_device_node
+        return len(canonical), match.last_device_node
 
     def try_finish_load_back(self, ack_id: int) -> bool:
         """Fill ack: free the host bounce and return True when the ack id is

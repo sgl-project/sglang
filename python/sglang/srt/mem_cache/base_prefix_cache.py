@@ -586,10 +586,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[Tuple[torch.Tensor, Any]]:
+    ) -> Optional[Tuple[int, Any]]:
         """
-        Prepare host-to-device loading. None means retry admission; an empty
-        tensor can be a successful auxiliary-only load or a recompute fallback.
+        Prepare host-to-device loading; returns (loaded FULL tokens, new last
+        node). None means retry admission; zero can be a successful
+        auxiliary-only load or a recompute fallback.
         """
         raise NotImplementedError()
 
