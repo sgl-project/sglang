@@ -675,3 +675,27 @@ def _lse_weighted_combine_cpu(
 
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined
+
+
+@triton.jit
+def pack_dcp_verify_rows(
+    table_ptr,
+    lens_ptr,
+    indptr_ptr,
+    out_ptr,
+    stride_row,
+    BLOCK: tl.constexpr,
+):
+    """Pack each verify row's valid prefix tokens into a flat kv_indices buffer.
+
+    Row ``r`` occupies ``out[indptr[r] : indptr[r] + lens[r]]``. ``indptr`` is
+    exclusive and must already be the cumsum of ``lens``.
+    """
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    length = tl.load(lens_ptr + row)
+    dest = tl.load(indptr_ptr + row)
+    idx = block * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < length
+    vals = tl.load(table_ptr + row * stride_row + idx, mask=mask, other=0)
+    tl.store(out_ptr + dest + idx, vals, mask=mask)

@@ -392,6 +392,52 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         be.dcp_world_size = 8
         self.assertFalse(be._use_mla_decode_persist_metadata())
 
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.get_parallel")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_gluon_decode")
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.mla_decode_fwd", create=True)
+    @mock.patch("sglang.srt.layers.attention.aiter_backend.scaled_fp8_quant")
+    def test_verify_prefix_uses_asm_qlen1(
+        self, mock_quant, mock_mla, mock_gluon, mock_parallel
+    ):
+        """DCP verify prefix is q_len=1 ASM. The window stays on gluon."""
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+        mock_parallel.return_value.attn_dcp_rank = 1
+        n_rows = 8
+        be = self._make_backend()
+        be.max_split_per_batch = 64
+        be.forward_metadata.max_q_len = 4
+        be.forward_metadata.local_kv_lens = torch.ones(n_rows, dtype=torch.int32)
+        be.token_to_kv_pool = mock.Mock()
+        be.token_to_kv_pool.get_key_buffer.return_value = torch.zeros(4, 576)
+        be._verify_asm_qo = torch.arange(n_rows + 1, dtype=torch.int32)
+        be._verify_asm_kv_indptr = torch.arange(n_rows + 1, dtype=torch.int32)
+        be._verify_asm_kv_indices = torch.zeros(4, dtype=torch.int32)
+        be._verify_asm_kv_last = torch.ones(n_rows, dtype=torch.int32)
+        be._verify_asm_work_metadata = torch.empty(1, dtype=torch.int32)
+        be._verify_asm_work_indptr = torch.empty(1, dtype=torch.int32)
+        be._verify_asm_work_info_set = torch.empty(1, dtype=torch.int32)
+        be._verify_asm_reduce_indptr = torch.empty(1, dtype=torch.int32)
+        be._verify_asm_reduce_final_map = torch.empty(1, dtype=torch.int32)
+        be._verify_asm_reduce_partial_map = torch.empty(1, dtype=torch.int32)
+        q_fp8 = torch.zeros(n_rows, 96 * 576, dtype=fp8_dtype)
+        q_scale = torch.tensor([0.25], dtype=torch.float32)
+        lse = torch.zeros(n_rows, 96, dtype=torch.float32)
+        mock_quant.return_value = (q_fp8, q_scale)
+        mock_mla.return_value = (None, lse)
+
+        out, actual_lse = be._forward_verify_dcp(
+            torch.zeros(n_rows, 96, 576, dtype=torch.bfloat16),
+            torch.zeros(1),
+            self._make_layer(),
+            k_descale=1.0,
+        )
+
+        mock_gluon.assert_not_called()
+        self.assertEqual(mock_mla.call_args.args[7], 1)
+        self.assertEqual(out.shape, (n_rows, 96, 512))
+        self.assertTrue(torch.equal(actual_lse, lse))
+
 
 if __name__ == "__main__":
     unittest.main()
