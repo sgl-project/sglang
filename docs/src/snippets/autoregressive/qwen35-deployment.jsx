@@ -1,4 +1,4 @@
-export const Qwen35Deployment = () => {
+export const Qwen35Deployment = ({ AgenticCommands, agenticRecipes }) => {
   // Qwen3.5 Configuration Generator
   //
   // MoE models (Gated Delta Networks + sparse MoE, hybrid architecture):
@@ -38,6 +38,14 @@ export const Qwen35Deployment = () => {
   };
 
   const options = {
+    deployment: {
+      name: 'deployment',
+      title: 'Deployment',
+      items: [
+        { id: 'aggregated', label: 'Aggregated', default: true },
+        { id: 'agentic', label: 'Agentic aggregated + router (B300 NVFP4)', default: false }
+      ]
+    },
     model: {
       name: 'model',
       title: 'Model Variant',
@@ -318,6 +326,14 @@ export const Qwen35Deployment = () => {
       }
 
       const next = { ...prev, [optionName]: value };
+      if (optionName === 'deployment' && value === 'agentic') {
+        next.model = '397b';
+        next.hardware = 'b300';
+        next.quantization = 'fp4';
+      }
+      if (optionName === 'deployment' && value === 'aggregated' && prev.deployment !== 'aggregated') {
+        next.quantization = 'fp8';
+      }
       if (optionName === 'hardware' && value === 'arc_b' && !['35b', '9b', '4b'].includes(next.model)) {
         next.model = '35b';
       }
@@ -653,6 +669,7 @@ export const Qwen35Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (values.deployment !== 'aggregated' && !['deployment', 'model', 'hardware', 'quantization'].includes(key)) return null;
         if (typeof option.condition === 'function' && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
@@ -665,12 +682,13 @@ export const Qwen35Deployment = () => {
                   values.hardware === 'arc_b' &&
                   option.name === 'model' &&
                   !['35b', '9b', '4b'].includes(item.id);
-                const isDisabled = !!item.disabled || isArcBModelLocked;
+                const isRecipeLocked = values.deployment !== 'aggregated' && key !== 'deployment';
+                const isDisabled = !!item.disabled || isArcBModelLocked || isRecipeLocked;
                 return (
                   <label
                     key={item.id}
-                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
-                    title={item.disabledReason || ''}
+                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}), ...(isRecipeLocked && isChecked ? { opacity: 0.85 } : {}) }}
+                    title={isRecipeLocked ? 'This recipe uses Qwen3.5-397B NVFP4 on B300' : item.disabledReason || ''}
                   >
                     <input
                       type="radio"
@@ -690,10 +708,12 @@ export const Qwen35Deployment = () => {
           </div>
         );
       })}
-      <div style={cardStyle}>
+      {values.deployment === 'agentic' ? (
+        <AgenticCommands recipes={agenticRecipes} isDark={isDark} />
+      ) : <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
-      </div>
+      </div>}
     </div>
   );
 };
