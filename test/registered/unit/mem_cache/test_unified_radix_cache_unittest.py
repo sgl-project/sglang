@@ -814,21 +814,19 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
         for session in _session_radix_cache_test_values():
             for pinned in (False, True):
                 with self.subTest(session=session, pinned=pinned):
-                    # This exercises the Rust backup barrier, independently of
-                    # the shared suite's default backend.
+                    # Rust independently of the shared suite's default backend;
+                    # session caches fall back to the Python TreeCore.
                     with mock.patch(f"{__name__}._TREE_CORE_TEST_BACKEND", "rust"):
                         cache, first, second, leaf = self._build_internal_chain(
                             ct, session
                         )
                     cache.tree_core.is_write_back = True
                     cache.tree_core.has_swa_host_pool = True
-                    cache.tree_core.enable_swa_write_back_eviction_barrier()
-                    if session:
-                        # Session caches use main's Python fallback, whose
-                        # component backup is gated by the HiCache attachment.
-                        cache.tree_core.enable_hicache = True
-                        cache.host_pool_group = mock.Mock()
-                        cache.host_pool_group.get_pool.return_value = None
+                    # Both cores gate the internal SWA component backup on the
+                    # HiCache attachment.
+                    cache.tree_core.set_hicache_enabled()
+                    cache.host_pool_group = mock.Mock()
+                    cache.host_pool_group.get_pool.return_value = None
                     if pinned:
                         receipt = cache.inc_host_lock_ref(first).to_dec_params()
                     tracker = {ComponentType.FULL: 0, ct: 0}
