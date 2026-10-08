@@ -16,6 +16,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE as _FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -26,6 +27,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsWNA16,
@@ -127,6 +129,10 @@ SELECTION_CASES = [
     ("linear", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": False}),
     ("linear", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
     ("linear", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
+    # Likewise for MXFP4 MoE.
+    ("moe", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": False, "group_size": 32}),
+    ("moe", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
+    ("moe", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
     # Neighbours of the fp4 predicates. The int4 type check keeps fp4 out of
     # WNA16; a weight-only MoE config has no input_activations, which the w8a8
     # predicates used to dereference.
@@ -172,6 +178,43 @@ class TestFp4SchemeSelection(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "NVFP4"):
             _get_scheme("linear", config, SM90)
 
+    def test_fused_layout_model_still_bypasses_to_mxfp4_moe_method(self):
+        """The split-expert MXFP4 scheme is reached only through FusedMoE's
+        serves_fused_mxfp4 opt-out: GraniteMoe and Kimi-K3 ship indistinguishable
+        configs, so a model keeping the default must still get Mxfp4MoEMethod."""
+
+        class RealFusedMoE(_FusedMoE):
+            # get_quant_method checks isinstance(layer, FusedMoE); skip the
+            # distributed __init__ and set only the field the gate reads.
+            def __init__(self, serves_fused_mxfp4):
+                torch.nn.Module.__init__(self)
+                self.serves_fused_mxfp4 = serves_fused_mxfp4
+
+        for variant in ("mxfp4a16", "mxfp4"):
+            for serves_fused in (True, False):
+                with self.subTest(variant=variant, serves_fused=serves_fused):
+                    layer = RealFusedMoE(serves_fused)
+                    quant_config = CompressedTensorsConfig.from_config(
+                        _make_config(variant)
+                    )
+                    with (
+                        mock.patch(
+                            "torch.cuda.get_device_capability", return_value=SM90
+                        ),
+                        mock.patch("torch.cuda.is_available", return_value=True),
+                        mock.patch(
+                            "sglang.srt.layers.quantization.mxfp4.Mxfp4MoEMethod"
+                        ) as fused_method,
+                    ):
+                        fused_method.return_value = "fused"
+                        method = quant_config.get_quant_method(layer, prefix=MOE_LAYER)
+                    if serves_fused:
+                        self.assertEqual(method, "fused")
+                    else:
+                        self.assertIsInstance(
+                            layer.scheme, CompressedTensorsW4A16Mxfp4MoE
+                        )
+
 
 def _noop_loader(*args, **kwargs):
     pass
@@ -213,6 +256,7 @@ LINEAR_FORMATS = [
 ]
 MOE_FORMATS = [
     ("nvfp4", CompressedTensorsW4A16Nvfp4MoE, 16, torch.float8_e4m3fn, True),
+    ("mxfp4", CompressedTensorsW4A16Mxfp4MoE, 32, torch.uint8, False),
 ]
 
 
