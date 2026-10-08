@@ -330,12 +330,7 @@ class TestVerifySharedKV(CustomTestCase):
 
         def gate(config, *, target=None, topk=1, use_mla=False, splitkv=True):
             return _should_use_verify_shared_kv(
-                model_config=config,
-                is_draft_runner=target is not None,
-                target_hf_config=(target or config).hf_config,
-                topk=topk,
-                use_mla=use_mla,
-                use_verify_splitkv=splitkv,
+                config, topk, use_mla, splitkv, (target or config).hf_config
             )
 
         qwen = model_config("Qwen3_5MoeForCausalLM")

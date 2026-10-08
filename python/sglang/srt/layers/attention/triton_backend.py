@@ -93,29 +93,18 @@ def _mla_decode_kv_splits_cap(
 
 
 def _should_use_verify_shared_kv(
-    *,
-    model_config,
-    is_draft_runner,
-    target_hf_config,
-    topk,
-    use_mla,
-    use_verify_splitkv,
+    model_config, topk, use_mla, use_verify_splitkv, target_hf_config
 ):
     if not is_gfx95_supported() or topk != 1:
         return False
-    hf_config = model_config.hf_config
     if use_mla:
-        return is_kimi_k3(hf_config)
-    if is_dspark_draft(hf_config):
+        return is_kimi_k3(model_config.hf_config)
+    if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
-    if is_draft_runner:
-        # an EAGLE draft mirrors its target's attention shape; validated for M3's draft only
-        tuned = is_minimax_sparse(target_hf_config)
-    else:
-        tuned = is_qwen3_5(hf_config) or is_minimax_sparse(hf_config)
     return (
-        tuned
-        and use_verify_splitkv
+        use_verify_splitkv
+        # M3's EAGLE3 draft has its target's attention shape, so it follows the target
+        and (is_qwen3_5(model_config.hf_config) or is_minimax_sparse(target_hf_config))
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -262,12 +251,11 @@ class TritonAttnBackend(AttentionBackend):
             else model_runner.model_config.hf_config
         )
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
-            model_config=model_runner.model_config,
-            is_draft_runner=model_runner.is_draft_worker,
-            target_hf_config=target_hf_config,
-            topk=self.topk,
-            use_mla=self.use_mla,
-            use_verify_splitkv=self.use_verify_splitkv,
+            model_runner.model_config,
+            self.topk,
+            self.use_mla,
+            self.use_verify_splitkv,
+            target_hf_config,
         )
         # M3's EAGLE3 draft also runs draft extend and draft decode through the verify kernel
         self.use_shared_kv_for_draft_steps = (
