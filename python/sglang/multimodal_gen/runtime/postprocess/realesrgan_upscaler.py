@@ -77,12 +77,7 @@ class SRVGGNetCompact(nn.Module):
         act_type: str = "prelu",
     ):
         super().__init__()
-        self.num_in_ch = num_in_ch
-        self.num_out_ch = num_out_ch
-        self.num_feat = num_feat
-        self.num_conv = num_conv
         self.upscale = upscale
-        self.act_type = act_type
 
         self.body = nn.ModuleList()
         # first conv
