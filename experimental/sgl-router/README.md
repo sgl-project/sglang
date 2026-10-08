@@ -260,8 +260,11 @@ the prefill rank.
 a request that fails before any response reaches the client be sent again to a
 worker it has not tried yet. A failure is a transport error, an open circuit
 breaker, a 5xx, a 429, or a timeout: `--request-timeout-secs` bounds a whole
-non-streaming response, and a streaming one until its headers arrive. Once a streaming response's 2xx status has been sent,
-it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
+non-streaming response, and a streaming one until its headers arrive. SGLang's
+chat endpoint sends those headers with the first token, so for streaming chat
+the same flag bounds time to first token, queueing included; raise it for
+long-context or deeply queued fleets. Once a streaming response's 2xx status
+has been sent, it is never retried, and neither is any other 2xx or 4xx. In PD mode the failed
 side is excluded, or both sides when the caller set `rid`, which an engine still
 running it would refuse; a new pair gets a new bootstrap room. Retries share the
 request's `--stale-request-timeout-secs` deadline, and none starts after it. When

@@ -11,6 +11,10 @@ validation, transport and runtime.
 Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer` and
 `dynamo_tokenizers` so their Dynamo versions match the processor's.
 
+The `render`, `tokenizer` and `parser` features (all default) gate each
+component and its Dynamo crate, so a host that only renders and tokenizes
+skips `dynamo-parsers`.
+
 ```text
 src/
   model_files.rs   find files in a model dir or the HF cache
@@ -67,10 +71,10 @@ native formatters.
 | Everything else | `load_chat_formatter` |
 
 `load_chat_formatter` (`loader.rs`) follows Python's `template_manager.py`
-order: a built-in name, then a legacy template inferred from the model path,
-then the tokenizer config's Jinja template, then a `--chat-template` file
-(`.jinja` or JSON). On a missing template, the error string is returned so the
-host can report it per request.
+order: a built-in name first; with no `--chat-template`, a legacy template
+inferred from the model path, then the tokenizer config's Jinja template; with a
+`--chat-template` file (`.jinja` or JSON), that file. On a missing template, the
+error string is returned so the host can report it per request.
 
 `render_prompt` is pass-through to `OAIPromptFormatter::render_prompt` for
 Jinja and native formatters. It keeps Dynamo's segments so Kimi K3 can encode

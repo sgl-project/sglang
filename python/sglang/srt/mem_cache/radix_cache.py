@@ -513,7 +513,7 @@ class RadixCache(BasePrefixCache):
         key_limit = (
             ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
         )
-        radix_key, kv_indices, _ = self._insert_cache(
+        radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True
         )
 
@@ -532,23 +532,13 @@ class RadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        # With page_size > 1 the partial page sits in req.prefix_indices but not
+        # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
         # checkpoint or release_kv_cache frees the rest.
         req.kv.cache_protected_len = len(new_indices)
 
         self.unlock(req.lock)
         req.lock = self.lock(new_last_node)
-
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        # - page_size != 1: there is a partial page at the end, keep the full kv_indices
-        # - eagle case: bigram keys will only cache len - 1 kv indices
-        if len(new_indices) < len(kv_indices):
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
-            )
-        else:
-            req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -643,6 +633,17 @@ class RadixCache(BasePrefixCache):
         return torch.cat(values)
 
     ##### Internal Helper Functions #####
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        values = []
+        node = req.last_node
+        while node is not self.root_node:
+            values.append(node.value)
+            node = node.parent
+        values.reverse()
+        path = torch.cat(values)
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()

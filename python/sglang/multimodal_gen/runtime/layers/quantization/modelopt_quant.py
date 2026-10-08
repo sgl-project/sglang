@@ -194,9 +194,6 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
         if hf_quant_config is None:

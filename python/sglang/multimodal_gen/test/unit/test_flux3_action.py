@@ -513,20 +513,6 @@ def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
 
 
 # ---------------------------------------------------------------- DiT
-def _init_single_process_parallel() -> None:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        maybe_init_distributed_environment_and_model_parallel,
-        model_parallel_is_initialized,
-    )
-    from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-        ensure_distributed_env_defaults,
-    )
-
-    if not model_parallel_is_initialized():
-        ensure_distributed_env_defaults()
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
 def _tiny_arch() -> Flux3ArchConfig:
     return Flux3ArchConfig(
         hidden_size=64,
@@ -542,12 +528,12 @@ def _tiny_arch() -> Flux3ArchConfig:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs the CUDA parallel runtime"
 )
-def test_dit_loads_released_checkpoint_names():
+def test_dit_loads_released_checkpoint_names(request):
     """Released checkpoints load by name; a renamed module or mapping breaks them."""
     from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     params = set(model.state_dict())
@@ -594,14 +580,14 @@ def test_dit_loads_released_checkpoint_names():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA attention")
-def test_dit_cached_streams_match_full_forward():
+def test_dit_cached_streams_match_full_forward(request):
     """The pipeline's per-caption / per-request caching must not change predictions."""
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     torch.manual_seed(0)
     model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
     for p in model.parameters():
@@ -648,7 +634,7 @@ def test_dit_cached_streams_match_full_forward():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
-def test_cuda_graph_replays_match_eager_denoise_steps():
+def test_cuda_graph_replays_match_eager_denoise_steps(request):
     """Replays with fresh inputs must match eager steps bit for bit."""
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
@@ -656,7 +642,7 @@ def test_cuda_graph_replays_match_eager_denoise_steps():
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
     from sglang.multimodal_gen.runtime.vla.cuda_graph import VLATensorGraphRunner
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     torch.manual_seed(0)
     model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
     for p in model.parameters():
@@ -734,7 +720,7 @@ def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="needs FP8 scaled_mm",
 )
-def test_fp8r_checkpoint_loads_fused_rowwise_linears():
+def test_fp8r_checkpoint_loads_fused_rowwise_linears(request):
     """Native FP8r payloads (E4M3 + per-row scales) must fuse and dequantize consistently."""
     from sglang.multimodal_gen.runtime.models.dits.flux3 import (
         Flux3Fp8RowwiseLinear,
@@ -743,7 +729,7 @@ def test_fp8r_checkpoint_loads_fused_rowwise_linears():
         quantize_fp8_rowwise,
     )
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     reference = {}
