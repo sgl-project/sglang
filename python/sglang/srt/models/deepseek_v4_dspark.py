@@ -794,6 +794,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
+    # The draft reads the target checkpoint, Engram files included.
+    host_resident_weight_patterns = DeepseekV4ForCausalLM.host_resident_weight_patterns
 
     @classmethod
     def shared_experts_fusion_disable_reason(

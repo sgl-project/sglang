@@ -25,7 +25,11 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -335,9 +339,11 @@ class ModelRunner:
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
+        load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
+        self.load_group = load_group
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
@@ -1226,6 +1232,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            load_group=self.load_group,
         )
 
         maybe_enable_ipc_weight_cache(
