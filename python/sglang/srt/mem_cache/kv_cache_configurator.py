@@ -2270,18 +2270,23 @@ class KVCacheConfigurator:
         )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
+            qsa_dense_fallback,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
             resolve_qsa_indexer_dtype,
         )
 
-        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        qsa_profile = (
+            None
+            if qsa_dense_fallback()
+            else parse_qsa_profile(self.model_config.hf_config)
+        )
         qsa_indexer_dtype = get_model().qsa_indexer_dtype
         if qsa_indexer_dtype != "auto" and qsa_profile is None:
             raise ValueError(
                 f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
-                "compressed QSA indexer (Qwen4-Exp); this model has none"
+                "active compressed QSA indexer (Qwen4-Exp); it is absent or disabled"
             )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
