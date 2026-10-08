@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
+from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,7 +13,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.layer_split.layer_split_config import StagingBufferConfig
 from sglang.srt.mem_cache.layer_split.layer_split_engine import (
     LayerSplitTransferEngine,
@@ -28,6 +34,7 @@ from sglang.srt.mem_cache.layer_split.layer_split_utils import (
     WindowJob,
     owned_layer_range,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
@@ -550,6 +557,103 @@ def _payload(view, layer_start, page, component):
     return result
 
 
+def _native_prefetch_ack_round_trip(engine, keys, indices, views, start, outcome):
+    """Run the native worker/ACK pipeline over real Gloo and in-memory L3."""
+    ack_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=20))
+    cc = HybridCacheController.__new__(HybridCacheController)
+    cc.storage_stop_event = threading.Event()
+    cc.prefetch_buffer = Queue()
+    cc.prefetch_sync_queue = Queue()
+    cc.ack_prefetch_queue = Queue()
+    cc.prefetch_hit_queue = Queue()
+    cc.ack_backup_queue = Queue()
+    cc.host_mem_release_queue = Queue()
+    cc.extra_host_mem_release_queues = {}
+    cc.prefetch_completion_sync_groups = [ack_group]
+    cc.mem_pool_host = SimpleNamespace(page_size=2, entry_map={})
+    cc._page_transfer = engine.prefetch
+    previous_controller = engine._controller
+    engine._controller = cc
+    op = PrefetchOperation(
+        CacheRequestHandle(f"native-ack-{outcome}", 0),
+        [1] * len(indices),
+        pool_transfers=[PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV)],
+    )
+    op.hash_value = keys
+    op.host_indices = indices
+    op.storage_hit_count = len(indices)
+    engine.prepare_prefetch(op)
+    if outcome == "cancelled" and engine.rank == 0:
+        op.mark_terminate()
+    engine.storage_backend.fail_get = outcome == "failed_get" and engine.rank == 0
+    for component, view in views.items():
+        for page in range(len(keys)):
+            sentinel = torch.full_like(_payload(view, start, page, component), 0xED)
+            view.write_page(int(indices[2 * page]), sentinel)
+    workers = [
+        threading.Thread(target=cc.prefetch_io_aux_func, daemon=True),
+        threading.Thread(target=cc.prefetch_sync_thread_func, daemon=True),
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        cc.prefetch_buffer.put(op)
+        acks = [cc.ack_prefetch_queue.get(timeout=25) for _ in range(2)]
+        copied_pages = (
+            0
+            if outcome == "failed_get"
+            else engine.staging_buffer_config.pages_per_window
+            if outcome == "cancelled"
+            else len(keys)
+        )
+        assert acks[0].completed_tokens == copied_pages * 2
+        assert acks[0].pool_hits == {pool.value: 0 for pool in PoolName}
+        assert acks[1].completed_req is True
+        assert acks[1].completed_tokens is None
+        assert cc.ack_prefetch_queue.empty()
+        assert op.completed_tokens == 0 and not op.pool_transfers_done
+        assert not engine.stages[PREFETCH].active
+        for component, view in views.items():
+            for page in range(len(keys)):
+                expected = _payload(view, start, page, component)
+                if page >= copied_pages:
+                    expected.fill_(0xED)
+                actual = torch.empty_like(expected)
+                view.read_page(int(indices[2 * page]), actual)
+                assert torch.equal(actual, expected)
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = cc
+        cache.tree_core = SimpleNamespace(page_size=2)
+        cache.host_memory_mode = "cache"
+        cache.ongoing_prefetch = (
+            {} if outcome == "cancelled" else {op.handle: SimpleNamespace(operation=op)}
+        )
+        cache._handle_prefetch_result = mock.Mock()
+        for ack in acks:
+            cc.ack_prefetch_queue.put(ack)
+        cache._drain_storage_control_queues_impl(0, 2, 0, 0, {}, False)
+        if outcome == "cancelled":
+            assert op.completed_tokens == 0
+            cache._handle_prefetch_result.assert_not_called()
+        else:
+            assert op.completed_tokens == copied_pages * 2 and op.pool_transfers_done
+            # KV-derived sidecars are part of the KV progress, not extra pool hits.
+            assert cache._check_hybrid_prefetch_result(op.handle, op, keys, indices)
+            cache._handle_prefetch_result.assert_called_once_with(op)
+        released_pages = list(cc.host_mem_release_queue.queue)
+        released = torch.cat(released_pages) if released_pages else indices[:0]
+        assert torch.equal(released, indices[op.completed_tokens :])
+    finally:
+        cc.storage_stop_event.set()
+        cc.prefetch_buffer.put(None)
+        cc.prefetch_sync_queue.put(None)
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+        engine._controller = previous_controller
+        dist.destroy_process_group(ack_group)
+
+
 def _worker(rank, rendezvous, objects, shards, layers, pages, indexer_layers):
     torch.set_num_threads(1)
     signal_patch = mock.patch("psutil.Process.send_signal")
@@ -704,6 +808,10 @@ def _worker(rank, rendezvous, objects, shards, layers, pages, indexer_layers):
         assert _prefetch(engine, build(8, []), indices).is_finished
         assert _backup(engine, build(9, []), indices).written_pages == 0
         assert len(selected) == before
+        for outcome in ("complete", "failed_get", "cancelled"):
+            _native_prefetch_ack_round_trip(
+                engine, keys, indices + pages * 2, views, start, outcome
+            )
         for lane, stage in engine.stages.items():
             assert not stage.active and not stage.works and stage.io is None
             assert {
