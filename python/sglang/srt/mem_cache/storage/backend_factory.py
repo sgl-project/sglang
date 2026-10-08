@@ -165,6 +165,9 @@ class StorageBackendFactory:
         elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
+        elif backend_name == "npu_memcache":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -189,6 +192,10 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "seaweedfs":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "tensorcast":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -212,6 +219,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "npu_memcache",
+    "sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store",
+    "NpuMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(
@@ -248,4 +261,16 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
+)
+
+StorageBackendFactory.register_backend(
+    "tensorcast",
+    "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store",
+    "TensorcastStore",
+)
+
+StorageBackendFactory.register_backend(
+    "seaweedfs",
+    "sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store",
+    "SeaweedFSStore",
 )

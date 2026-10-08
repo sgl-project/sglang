@@ -41,6 +41,20 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 
+def drop_a2a_staging_buffers() -> None:
+    """Release the cached all-to-all staging buffers on this rank.
+
+    The cache only ever grows to the largest message seen, so a warmup probe
+    at the full serving shape leaves buffers sized for it behind; the caller
+    releases them at a point every rank reaches together.
+    """
+    if not _A2A_STAGING_BUFFERS:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _A2A_STAGING_BUFFERS.clear()
+
+
 def _a2a_staging_buffer(
     role: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -93,6 +107,20 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
+
+
+def _usp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``x`` from every Ulysses rank along dim 0, rank order."""
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x = x.contiguous()
+    output = torch.empty(
+        (get_ulysses_parallel_world_size() * x.shape[0], *x.shape[1:]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    dist.all_gather_into_tensor(output, x, group=ulysses_pg)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
@@ -312,9 +340,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -488,9 +516,9 @@ def _usp_input_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -504,12 +532,12 @@ def _usp_input_all_to_all_varlen(
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        s_local == seq_lens[rank]
-    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert s_local == seq_lens[rank], (
+        f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    )
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local = h_global // world_size
 
@@ -578,9 +606,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
-    assert (
-        s_global % world_size == 0
-    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    assert s_global % world_size == 0, (
+        f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    )
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
@@ -632,9 +660,9 @@ def _usp_output_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -648,9 +676,9 @@ def _usp_output_all_to_all_varlen(
         # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
         permute_order = (2, 0, 1, 3)
 
-    assert s_global == sum(
-        seq_lens
-    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    assert s_global == sum(seq_lens), (
+        f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    )
 
     s_local = seq_lens[rank]
 
@@ -809,12 +837,12 @@ def _ring_merge_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Online-softmax combine of one more ring step's partial attention.
 
-    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
-    layout `[H, T]`. Both are already self-normalized over their own KV
+    `step_out` is `[T, H, D]` or `[B, T, H, D]`; `step_lse` is
+    `[H, T]` or `[B, H, T]`. Both are already self-normalized over their own KV
     chunk, so combining chunks is the standard two-term logsumexp merge
     (exact up to float rounding); done in fp32 for stability.
     """
-    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_lse = step_lse.transpose(-2, -1).unsqueeze(-1).to(torch.float32)
     step_out = step_out.to(torch.float32)
     if out_acc is None:
         return step_out, step_lse
@@ -836,7 +864,8 @@ def _ring_attention_varlen(
 ) -> torch.Tensor:
     """Ring-rotated varlen attention over one rank's local packed chunk.
 
-    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    `q, k, v` are `[T, H, D]` or `[B, T, H, D]`, with equal lengths per batch.
+    They contain this rank's full local ring chunk (`ring_chunk_len` rows,
     real rows followed by however many of this chunk's rows are padding).
     KV is P2P-rotated around the ring one hop per step (send this step's
     buffer to the next rank, receive the following step's buffer from the
@@ -850,7 +879,7 @@ def _ring_attention_varlen(
     """
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
-    ring_chunk_len = q.shape[0]
+    ring_chunk_len = q.shape[-3]
     _, ring_rank = get_ring_ctx()
 
     # `isend`/`irecv` (unlike collectives) address peers by global rank even
@@ -899,11 +928,14 @@ def _ring_attention_varlen(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
         if remote_used > 0:
-            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
-                q,
-                kv_bufs[cur][0, :remote_used],
-                kv_bufs[cur][1, :remote_used],
-            )
+            key = kv_bufs[cur][0, ..., :remote_used, :, :]
+            value = kv_bufs[cur][1, ..., :remote_used, :, :]
+            if q.ndim == 3:
+                step_out, step_lse = attn_impl.forward_ring_kv_chunk(q, key, value)
+            else:
+                step_out, step_lse, *_ = attn_impl.forward(
+                    q, key, value, attn_metadata=None, return_softmax_lse=True
+                )
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse
             )

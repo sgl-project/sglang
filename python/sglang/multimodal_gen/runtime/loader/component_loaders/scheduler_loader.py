@@ -50,9 +50,9 @@ class SchedulerLoader(ComponentLoader):
             getattr(server_args.pipeline_config, "scheduler_class_override", None)
             or checkpoint_class_name
         )
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         if checkpoint_class_name is not None and class_name != checkpoint_class_name:
             logger.info(

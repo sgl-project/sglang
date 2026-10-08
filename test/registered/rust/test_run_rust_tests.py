@@ -1,4 +1,4 @@
-"""Run the `rust/` Cargo workspace's unit tests from the CPU CI suite."""
+"""Run the repository's native Rust unit tests from the CPU CI suite."""
 
 import shutil
 import subprocess
@@ -11,18 +11,37 @@ from sglang.test.test_utils import CustomTestCase
 
 BUILD_AND_RUN_TIMEOUT_S = 900
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
-
-register_cpu_ci(est_time=900, suite="base-a-test-cpu")
+GRPC_TYPES_PACKAGE = "sglang-api-types"
+register_cpu_ci(est_time=170, suite="base-a-test-cpu")
 
 
 # Exported by _pr-test-stage-cpu.yml as the negation of the check-changes
 # rust_workspace paths filter; it defaults to false, so only a CI run that
-# positively detected no rust/ changes skips the cargo build.
+# positively detected no Rust workspace input changes skips the cargo build.
 @unittest.skipIf(
     envs.SGLANG_SKIP_RUST_TESTS.get(),
-    "SGLANG_SKIP_RUST_TESTS is set (no rust/ workspace changes per CI check-changes)",
+    "SGLANG_SKIP_RUST_TESTS is set "
+    "(no Rust workspace input changes per CI check-changes)",
 )
 class TestCargoWorkspace(CustomTestCase):
+    def _run_cargo(self, args: list[str], *, cwd: Path, env: dict | None = None):
+        proc = subprocess.run(
+            ["cargo", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=BUILD_AND_RUN_TIMEOUT_S,
+        )
+        # Print unconditionally so a green run still shows which tests ran.
+        print(proc.stdout)
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"`cargo {' '.join(args)}` failed in {cwd}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
+        )
+
     def test_cargo_test_workspace(self):
         # Not skipUnless: cargo is a hard dependency of the editable install
         # (setuptools-rust builds sglang-grpc), so a missing toolchain is a
@@ -37,20 +56,18 @@ class TestCargoWorkspace(CustomTestCase):
             f"rust workspace manifest not found at {RUST_WORKSPACE}",
         )
 
-        proc = subprocess.run(
-            ["cargo", "test", "--workspace"],
+        self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
+        # Verify that the public crate builds with only its packaged inputs.
+        self._run_cargo(
+            [
+                "package",
+                "-p",
+                GRPC_TYPES_PACKAGE,
+                "--locked",
+                "--allow-dirty",
+                "--offline",
+            ],
             cwd=RUST_WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=BUILD_AND_RUN_TIMEOUT_S,
-        )
-        # Print unconditionally so a green run still shows which tests ran.
-        print(proc.stdout)
-        self.assertEqual(
-            proc.returncode,
-            0,
-            f"`cargo test --workspace` failed in {RUST_WORKSPACE}\n"
-            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
         )
 
 

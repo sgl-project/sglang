@@ -26,7 +26,6 @@ logger = init_logger(__name__)
 
 
 class VMOBAAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -89,7 +88,6 @@ def pad_input(hidden_states, indices, batch, seqlen):
 
 
 class VideoMobaAttentionMetadataBuilder(AttentionMetadataBuilder):
-
     def __init__(self):
         pass
 
@@ -124,7 +122,9 @@ class VideoMobaAttentionMetadataBuilder(AttentionMetadataBuilder):
             raw_latent_shape[0] % patch_size[0] == 0
             and raw_latent_shape[1] % patch_size[1] == 0
             and raw_latent_shape[2] % patch_size[2] == 0
-        ), f"spatial patch_resolution {raw_latent_shape} should be divisible by patch_size {patch_size}"
+        ), (
+            f"spatial patch_resolution {raw_latent_shape} should be divisible by patch_size {patch_size}"
+        )
         patch_resolution = [
             t // pt for t, pt in zip(raw_latent_shape, patch_size, strict=False)
         ]
@@ -150,7 +150,6 @@ class VideoMobaAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class VMOBAAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads,

@@ -5,11 +5,16 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
+
+
+def pp_spec_stable_rows_enabled() -> bool:
+    return envs.SGLANG_ENABLE_PP_SPEC.get()
 
 
 class LinearAttnKernelBackend(Enum):
@@ -103,9 +108,21 @@ def resolve_linear_attn_backends(
     return backends
 
 
-def build_verify_intermediate_state_indices(
-    pool_size: int, server_args: ServerArgs, device
+def select_verify_intermediate_state_indices(
+    default_indices, req_pool_indices, valid, pool_size: int
 ):
+    if not pp_spec_stable_rows_enabled():
+        return default_indices
+
+    import torch
+
+    req_rows = req_pool_indices[: valid.shape[0]]
+    return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
+        torch.int32
+    )
+
+
+def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
     target_verify path: request slot i owns scratch row i.
@@ -123,7 +140,7 @@ def build_verify_intermediate_state_indices(
 
     from sglang.srt.utils.common import get_eager_max_batch_size
 
-    padded_bs = max(get_eager_max_batch_size(server_args, pool_size), pool_size)
+    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

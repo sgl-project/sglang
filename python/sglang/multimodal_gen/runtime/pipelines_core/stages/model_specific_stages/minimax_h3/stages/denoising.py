@@ -5,7 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -15,6 +15,10 @@ import torch
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionMetadata,
+    CubeSparseAttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
@@ -35,7 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -335,6 +342,46 @@ def _resolve_denoise_model(
     return model.to(device).eval()
 
 
+def _build_cube_attn_metadata(
+    server_args: ServerArgs,
+    *,
+    packed: dict[str, Any],
+    num_steps: int,
+    device: torch.device,
+) -> CubeSparseAttentionMetadata | None:
+    """Build cube sparse attention metadata when that backend is selected."""
+    transformer_backend = (server_args.component_attention_backends or {}).get(
+        "transformer", server_args.attention_backend
+    )
+    if str(transformer_backend).lower() != "cube_sparse_attn":
+        return None
+
+    config = server_args.attention_backend_config or {}
+    local_cube_size = config.get("local_cube_size")
+    topk_ratio_list = config.get("topk_ratio_list")
+    if not local_cube_size or not topk_ratio_list:
+        raise ValueError(
+            "cube_sparse_attn requires --attention-backend-config with "
+            "local_cube_size and topk_ratio_list"
+        )
+    metadata = CubeSparseAttentionMetadataBuilder().build(
+        packed=packed,
+        local_cube_size=local_cube_size,
+        topk_ratio_list=topk_ratio_list,
+        num_steps=num_steps,
+        device=device,
+    )
+    logger.debug(
+        "cube sparse attention enabled: local_cube_size=%s "
+        "topk_ratio_list(len=%d, min=%.4f, max=%.4f)",
+        list(local_cube_size),
+        len(metadata.topk_ratio_list),
+        min(metadata.topk_ratio_list),
+        max(metadata.topk_ratio_list),
+    )
+    return metadata
+
+
 def _precompute_refined_prompt_embeds(
     model: Any,
     positive: Any,
@@ -396,13 +443,19 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # one denoise per sigma interval: steps - 1
+        return max(1, num_inference_steps - 1)
+
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
         )
-        self._minimax_h3_quality = "lossless"
+        self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
@@ -410,7 +463,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
     def _cache_dit_requested(self) -> bool:
         return (
-            getattr(self, "_minimax_h3_quality", "lossless") == "high"
+            getattr(self, "_minimax_h3_quality", "exact") == "high"
             or super()._cache_dit_requested()
         )
 
@@ -428,6 +481,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         generic_requested = generic_enabled and "quality" not in explicit_fields
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif batch.sampling_params.enable_spectrum:
+            # Spectrum skips the block stack; Cache-DiT wraps those blocks.
             desired_mode = None
         elif quality == "high":
             desired_mode = "high"
@@ -536,7 +592,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
-        if getattr(self, "_minimax_h3_quality", "lossless") == "high":
+        if getattr(self, "_minimax_h3_quality", "exact") == "high":
             return "none", "dynamic", None, None
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
@@ -548,7 +604,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
-        if secondary or getattr(self, "_minimax_h3_quality", "lossless") != "high":
+        if secondary or getattr(self, "_minimax_h3_quality", "exact") != "high":
             return super()._build_cache_dit_config(
                 num_inference_steps,
                 steps_computation_mask,
@@ -623,11 +679,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
+            or current_platform.is_hip()
+            or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()
+            or current_platform.is_xpu()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, or Ascend NPU"
             )
 
         device = current_platform.get_local_torch_device()
@@ -671,6 +730,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
         )
+        attn_metadata = _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=len(sigmas_video) - 1,
+            device=device,
+        )
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -681,6 +746,25 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
+                model=model,
+                packed=packed,
+                ctx=ctx,
+                server_args=server_args,
+                device=device,
+            )
+            if build_vsa_h3_step_metadata is None:
+                from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
+                    prepare_hybrid_attention_metadata,
+                )
+
+                build_vsa_h3_step_metadata = prepare_hybrid_attention_metadata(
+                    model=model,
+                    packed=packed,
+                    latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+                    server_args=server_args,
+                    device=device,
+                )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
@@ -700,6 +784,44 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            rollout_ctx = None
+            if getattr(batch, "rollout", False):
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+                    MiniMaxH3RolloutCollector,
+                    MiniMaxH3RolloutCtx,
+                )
+                from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+                    RolloutTrajectoryData,
+                )
+
+                task = str(getattr(batch.sampling_params, "task", "") or "t2va").lower()
+                if task not in ("t2va",):
+                    raise ValueError(
+                        f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
+                    )
+                generator = torch.Generator(device=device)
+                seed = getattr(batch.sampling_params, "seed", 0)
+                if isinstance(seed, list):
+                    seed = seed[0]
+                generator.manual_seed(int(seed))
+                collector = MiniMaxH3RolloutCollector(sigmas_video=sigmas_video)
+                packed_cpu = {
+                    k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in packed.items()
+                }
+                collector.pos_cond_kwargs = {
+                    "encoder_hidden_states": emb["hidden_states"].detach().cpu(),
+                    "h3_packed_layout": packed_cpu,
+                    "h3_token_tags": tags.detach().cpu(),
+                    "h3_video_target_start": positive.video_target_start,
+                }
+                rollout_ctx = MiniMaxH3RolloutCtx(
+                    batch=batch,
+                    generator=generator,
+                    sigmas_video=sigmas_video,
+                    collector=collector,
+                )
+                batch.rollout_trajectory_data = RolloutTrajectoryData()
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -716,7 +838,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(self._forward_dit, batch=batch),
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        attn_metadata=attn_metadata,
+                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                    ),
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -727,12 +854,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
+                    attn_metadata=attn_metadata,
                     on_step=on_step,
                     step_profiler=partial(
                         self._profile_denoising_step,
                         batch=batch,
                     ),
+                    rollout_ctx=rollout_ctx,
                 )
+                if rollout_ctx is not None:
+                    batch.rollout_trajectory_data = (
+                        rollout_ctx.collector.build_trajectory_data()
+                    )
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
@@ -767,6 +900,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -776,7 +911,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=None,
+            attn_metadata=(
+                build_vsa_h3_step_metadata(step_index)
+                if build_vsa_h3_step_metadata is not None
+                else attn_metadata
+            ),
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
@@ -906,6 +1045,76 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         raw_indices = ctx.keyframe.get("semantic_frame_indices")
         ctx.keyframe_frame_indices = [int(v) for v in raw_indices]
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
+
+
+def _maybe_prepare_vsa_h3_step_metadata(
+    *,
+    model: Any,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Per-step VSA-H3 metadata builder over the request-static packed layout,
+    or None off the VSA path."""
+    model._resolve_attention_backend_once()
+    if (
+        model._resolved_attention_backend
+        is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+    ):
+        return None
+    if ctx.is_ref2va:
+        raise NotImplementedError(
+            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
+            "reference-block layout is not tiled yet. Use --attention-backend "
+            "fa for ref2va."
+        )
+
+    config = server_args.attention_backend_config or {}
+    tile_size = int(config.get("vsa_tile_size", 64))
+    if tile_size != 64:
+        raise ValueError(
+            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
+            f"geometry; got vsa_tile_size={tile_size}."
+        )
+    default_sparsity = server_args.pipeline_config.vsa_sparsity
+    sparsity = float(
+        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
+    )
+    if not 0.0 <= sparsity < 1.0:
+        raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
+    mode = str(config.get("vsa_mode", "exempt"))
+    if mode not in ("exempt", "compete"):
+        raise ValueError(f"vsa_mode must be 'exempt' or 'compete', got {mode!r}")
+    dense_first_n_steps = int(config.get("vsa_dense_first_n_steps", 0))
+    dense_layers = tuple(int(layer) for layer in config.get("vsa_dense_layers", ()))
+
+    text_len = int(packed["text_pos"].numel())
+    video_rows = int(packed["update_mask"].sum())
+    cond_rows = int(packed["img_pos"].numel()) - video_rows
+    audio_rows = int(packed["audio_pos"].numel())
+    patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+        VideoSparseAttentionH3MetadataBuilder,
+    )
+
+    builder = VideoSparseAttentionH3MetadataBuilder()
+
+    def build(step_index: int):
+        return builder.build(
+            current_timestep=step_index,
+            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            patch_size=patch_size,
+            VSA_sparsity=sparsity,
+            prefix_segments=(text_len, cond_rows, audio_rows),
+            device=device,
+            exempt=mode == "exempt",
+            dense_layers=dense_layers,
+            dense_first_n_steps=dense_first_n_steps,
+        )
+
+    return build
 
 
 def _build_packed_layout(

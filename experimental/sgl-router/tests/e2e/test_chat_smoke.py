@@ -16,9 +16,9 @@ def test_models(router: str) -> None:
     assert resp.status_code == 200, resp.text
     data = resp.json()
     ids = [m["id"] for m in data.get("data", [])]
-    assert any(
-        MODEL in mid for mid in ids
-    ), f"Model {MODEL!r} not found in /v1/models response: {ids}"
+    assert any(MODEL in mid for mid in ids), (
+        f"Model {MODEL!r} not found in /v1/models response: {ids}"
+    )
 
 
 def test_chat_non_streaming(router: str) -> None:
@@ -59,6 +59,6 @@ def test_chat_streaming(router: str) -> None:
                 chunks.append(line)
 
     assert len(chunks) >= 2, f"Expected >=2 SSE chunks, got {len(chunks)}: {chunks}"
-    assert any(
-        "[DONE]" in c for c in chunks
-    ), f"No [DONE] chunk found in SSE stream: {chunks}"
+    assert any("[DONE]" in c for c in chunks), (
+        f"No [DONE] chunk found in SSE stream: {chunks}"
+    )

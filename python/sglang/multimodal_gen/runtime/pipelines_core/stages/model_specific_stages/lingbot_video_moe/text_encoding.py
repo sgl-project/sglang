@@ -2,7 +2,13 @@
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -34,6 +40,8 @@ VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
     """Qwen3-VL prompt/negative encoding for LingBot-Video MoE (T2V, base)."""
+
+    deduplicated_output_fields = ()
 
     def __init__(self, text_encoders, tokenizers, transformer):
         super().__init__(text_encoders, tokenizers)
@@ -106,10 +114,39 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
             )
 
         inputs = self._build_prompt_inputs(prompt)
+        cache_group = (
+            text_encoder._encoder_tp_group
+            if isinstance(text_encoder, TextEncoder)
+            else None
+        )
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+        return cached_encoder_call(
+            text_encoder,
+            (dict(inputs),),
+            {
+                "device": str(device),
+                "dtype": dtype,
+                "skip_layer": self.hidden_state_skip_layer,
+                "crop_start": self._compute_crop_start(),
+            },
+            lambda: self._encode_inputs(inputs, device, dtype),
+            cache_group,
+            namespace=self,
+            nested=False,
+            share_in_group=True,
+        )
+
+    def _encode_inputs(self, inputs, device, dtype):
+        self._begin_text_encoder_use(0)
+        text_encoder = self.text_encoders[0]
         inputs = inputs.to(device)
-        outputs = text_encoder(
-            **inputs,
-            output_hidden_states=self.hidden_state_skip_layer is not None,
+        outputs = self._forward_text_encoder(
+            text_encoder,
+            {
+                **inputs,
+                "output_hidden_states": self.hidden_state_skip_layer is not None,
+            },
         )
         if self.hidden_state_skip_layer is not None:
             prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]

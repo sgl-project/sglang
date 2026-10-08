@@ -22,15 +22,11 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=447, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
 )
-
-# The unified radix tree is what merges the three components into one tree, so
-# it is a precondition rather than a tuning knob here.
-ENV = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
 
 # Shared with the single-server Inkling recipe; TP is per role.
 COMMON_ARGS = [
@@ -97,13 +93,13 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             *COMMON_ARGS,
             "--enable-hierarchical-cache",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        # COMMON_ARGS carries --tp 2, so each side spans two GPUs.
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env={**os.environ, **ENV},
         )
 
     @classmethod
@@ -118,13 +114,12 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
             "--base-gpu-id",
             "2",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 4))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env={**os.environ, **ENV},
         )
 
 

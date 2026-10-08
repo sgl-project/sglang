@@ -82,7 +82,7 @@ class MlxTpModelWorker(TpModelWorker):
             MlxModelRunnerStub,
         )
 
-        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+        MlxModelRunnerStub.validate_startup_weight_load_mode()
 
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
@@ -108,7 +108,6 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -172,7 +171,7 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
-            req.mamba_last_track_seqlen = None
+            req.kv.mamba_last_track_seqlen = None
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -206,9 +205,9 @@ class MlxTpModelWorker(TpModelWorker):
         discarded (the runner pops it as the stale intermediate token), so
         the runner may skip the logit head for it.
         """
-        if req.extend_range is None:
+        if req.extend_end is None:
             return True
-        return req.extend_range.end >= len(req.full_untruncated_fill_ids)
+        return req.extend_end >= len(req.full_untruncated_fill_ids)
 
     @staticmethod
     def _sampling_active(batch: ScheduleBatch) -> bool:
@@ -493,7 +492,14 @@ class MlxTpModelWorker(TpModelWorker):
             elif route == "decode":
                 mixed_decode_rids.append(req.rid)
             else:  # "prefill"
-                prefix_slot_ids = req.prefix_indices.tolist()
+                # The allocation wrote the matched prefix into the request's row.
+                prefix_slot_ids = (
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, : req.prefix_len
+                    ].tolist()
+                    if req.prefix_len
+                    else []
+                )
                 full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
@@ -502,7 +508,7 @@ class MlxTpModelWorker(TpModelWorker):
                         full_token_ids=full_token_ids,
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
-                        req_pool_idx=req.req_pool_idx,
+                        req_pool_idx=req.kv.req_pool_idx,
                         req=req,
                         needs_logits=self._chunk_needs_logits(req),
                         logit_edit_row=edit_rows[req.rid] if edit_rows else None,

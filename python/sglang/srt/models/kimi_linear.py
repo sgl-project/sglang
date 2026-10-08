@@ -12,11 +12,15 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -49,22 +53,25 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_layers
+from sglang.srt.utils import is_xpu, make_pp_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
     if num_heads % tp_size != 0:
         raise ValueError(
-            f"KDA num_heads ({num_heads}) must be divisible by global tp_size ({tp_size})"
+            f"KDA num_heads ({num_heads}) must be divisible by shard tp_size ({tp_size})"
         )
     return num_heads // tp_size
 
 
-def _materialize_residual_stream(
-    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-) -> torch.Tensor:
-    return hidden_states if residual is None else hidden_states + residual
+def _is_sparse_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
+    return (
+        config.is_moe
+        and config.num_experts is not None
+        and layer_idx >= config.first_k_dense_replace
+        and layer_idx % config.moe_layer_freq == 0
+    )
 
 
 class KimiMoE(nn.Module):
@@ -121,6 +128,7 @@ class KimiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -176,9 +184,6 @@ class KimiMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -191,11 +196,40 @@ class KimiDeltaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
+        no_kda_lora: bool = False,
+        safe_gate: bool = False,
+        lower_bound: Optional[float] = None,
+        reduce_results: bool = True,
+        shard_on_attn_tp: bool = False,
+        v_head_dim: Optional[int] = None,
         **kwargs,
     ) -> None:
+        """Kimi Delta Attention.
+
+        The keyword arguments after ``prefix`` exist so hybrid models (Ling-V3 /
+        BailingMoeV3) can reuse this module; every default reproduces the plain
+        Kimi-Linear behaviour exactly:
+
+        no_kda_lora: fold the f/g low-rank (LoRA) projections away and fuse
+            q/k/v/beta/f/g into one column-parallel GEMM.
+        safe_gate / lower_bound: clamp the forget gate from below. ``lower_bound``
+            is ignored unless ``safe_gate`` is set.
+        reduce_results: forwarded to ``o_proj``; set False when the caller does
+            its own all-reduce (e.g. a fused MoE/attention boundary).
+        shard_on_attn_tp: shard on the attention-TP group instead of the global
+            TP group. Required under DP attention, where attn_tp_size < tp_size.
+        v_head_dim: asymmetric value head dim; defaults to the key head dim.
+        """
         super().__init__()
         self.tp_size = get_parallel().tp_size
         self.attn_tp_size = get_parallel().attn_tp_size
+        # Group the weights are sharded over. Defaults to the global TP group,
+        # which is what plain Kimi-Linear has always used.
+        parallel_group = "attn_tp" if shard_on_attn_tp else "tp"
+        if shard_on_attn_tp:
+            self.shard_tp_size = self.attn_tp_size
+        else:
+            self.shard_tp_size = self.tp_size
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -203,18 +237,65 @@ class KimiDeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.linear_attn_config["head_dim"]
+        self.head_v_dim = (
+            v_head_dim
+            if v_head_dim is not None
+            else config.linear_attn_config["head_dim"]
+        )
         self.layer_idx = layer_idx
         self.prefix = prefix
-        self.local_num_heads = _get_kda_local_num_heads(self.num_heads, self.tp_size)
+        self.safe_gate = safe_gate
+        self.lower_bound = lower_bound if safe_gate else None
+        self.local_num_heads = _get_kda_local_num_heads(
+            self.num_heads, self.shard_tp_size
+        )
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
+        self.no_kda_lora = no_kda_lora
 
         # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = quant_config is None
+        self.do_fuse_qkvbfg = self.no_kda_lora or quant_config is None
+        # Beta joins the fused GEMM only when nothing is quantized.
+        self.fuse_no_lora_beta = self.no_kda_lora and quant_config is None
 
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_qkvbfg and self.no_kda_lora:
+            # No LoRA: f/g are full-rank, so q, k, v, (beta,) f, g all fuse into
+            # one column-parallel GEMM and the f_a/g_a/f_b/g_b pairs disappear.
+            self.qkvbfg_sizes = [
+                projection_size,
+                projection_size,
+                projection_size,
+                *([self.num_heads] if self.fuse_no_lora_beta else []),
+                projection_size,
+                projection_size,
+            ]
+            self.fused_qkvbfg_proj = MergedColumnParallelLinear(
+                self.hidden_size,
+                self.qkvbfg_sizes,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkvbfg_proj",
+                parallel_group=parallel_group,
+            )
+            self.split_sizes = [3 * projection_size // self.shard_tp_size]
+            if self.fuse_no_lora_beta:
+                self.split_sizes.append(self.num_heads // self.shard_tp_size)
+            self.split_sizes.extend(
+                [
+                    projection_size // self.shard_tp_size,
+                    projection_size // self.shard_tp_size,
+                ]
+            )
+            if not self.fuse_no_lora_beta:
+                self.b_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_heads,
+                    bias=False,
+                    prefix=f"{prefix}.b_proj",
+                    parallel_group=parallel_group,
+                )
+        elif self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
             self.qkvb_sizes = [
                 projection_size,
@@ -226,22 +307,26 @@ class KimiDeltaAttention(nn.Module):
 
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
-                self.qkvb_sizes,  # Column parallel
-                self.fg_sizes,  # Replicated: f_a, g_a
+                self.qkvb_sizes,
+                self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                parallel_group=parallel_group,
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,  # qkv
-                self.num_heads // self.tp_size,  # beta
-                2 * self.head_dim,  # f_a, g_a
+                3 * projection_size // self.shard_tp_size,
+                self.num_heads // self.shard_tp_size,
+                2 * self.head_dim,
             ]
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=config.dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=config.dtype,
+                parallel_group=parallel_group,
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            attn_tp_rank = get_parallel().attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -249,8 +334,7 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -269,6 +353,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_b_proj",
+                parallel_group=parallel_group,
             )
 
             self.b_proj = ColumnParallelLinear(
@@ -277,6 +362,7 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.b_proj",
+                parallel_group=parallel_group,
             )
 
             self.g_a_proj = ReplicatedLinear(
@@ -292,13 +378,19 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_b_proj",
+                parallel_group=parallel_group,
             )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+            torch.empty(
+                divide(projection_size, self.shard_tp_size), dtype=torch.float32
+            )
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -306,6 +398,7 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
+            parallel_group=parallel_group,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -316,7 +409,10 @@ class KimiDeltaAttention(nn.Module):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(2, parallel_group=parallel_group)},
+        )
 
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=rms_norm_eps, activation="sigmoid"
@@ -327,6 +423,8 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            parallel_group=parallel_group,
+            reduce_results=reduce_results,
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -334,9 +432,9 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
-            num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
-            num_v_heads=_get_kda_local_num_heads(self.num_v_heads, self.tp_size),
+            num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.shard_tp_size),
+            num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.shard_tp_size),
+            num_v_heads=_get_kda_local_num_heads(self.num_v_heads, self.shard_tp_size),
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -344,12 +442,12 @@ class KimiDeltaAttention(nn.Module):
             bias=bias,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
+            lower_bound=self.lower_bound,
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # Compute beta, forget_gate, and g_proj_states
         beta = self.b_proj(hidden_states)[0]
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
@@ -362,7 +460,23 @@ class KimiDeltaAttention(nn.Module):
         )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        # Single fused projection for all: qkv + beta + f_a + g_a
+        if self.no_kda_lora:
+            # Full-rank f/g: everything comes out of one GEMM, no batched
+            # second-stage matmul.
+            fused_states, _ = self.fused_qkvbfg_proj(hidden_states)
+            split_states = torch.split(fused_states, self.split_sizes, dim=-1)
+            if self.fuse_no_lora_beta:
+                qkv, beta, forget_gate, g_proj_states = split_states
+            else:
+                qkv, forget_gate, g_proj_states = split_states
+                beta = self.b_proj(hidden_states)[0]
+            return (
+                qkv,
+                beta,
+                forget_gate,
+                g_proj_states,
+            )
+
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(
@@ -453,6 +567,7 @@ class KimiDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                reduce_results=False,
             )
         else:
             self.self_attn = KimiMLAAttention(
@@ -468,14 +583,11 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 skip_rope=True,
+                reduce_results=False,
             )
 
-        if (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+        sparse = _is_sparse_layer(config, layer_idx)
+        if sparse:
             self.block_sparse_moe = KimiMoE(
                 config=config,
                 quant_config=quant_config,
@@ -491,10 +603,21 @@ class KimiDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+        next_sparse = layer_idx + 1 < config.num_hidden_layers and _is_sparse_layer(
+            config, layer_idx + 1
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -502,16 +625,10 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -520,9 +637,10 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class KimiLinearModel(nn.Module):
@@ -538,7 +656,7 @@ class KimiLinearModel(nn.Module):
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
@@ -552,7 +670,7 @@ class KimiLinearModel(nn.Module):
 
         self.alt_stream = None if is_xpu() else get_stream("alt")
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiDecoderLayer(
                 layer_idx=idx,
@@ -561,8 +679,6 @@ class KimiLinearModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -572,9 +688,9 @@ class KimiLinearModel(nn.Module):
             self.norm = PPMissingLayer()
 
         world_size = get_parallel().tp_size
-        assert (
-            config.num_attention_heads % world_size == 0
-        ), "num_attention_heads must be divisible by world_size"
+        assert config.num_attention_heads % world_size == 0, (
+            "num_attention_heads must be divisible by world_size"
+        )
 
     def forward(
         self,
@@ -584,16 +700,17 @@ class KimiLinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
@@ -603,15 +720,19 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         aux_hidden_states = []
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+        ):
+            aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
-                layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=residual,
                     zero_allocator=zero_allocator,
                 )
             if (
@@ -619,22 +740,19 @@ class KimiLinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
             ):
                 aux_hidden_states.append(
-                    _materialize_residual_stream(hidden_states, residual)
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+            proxy = residual_batch.to_pp(hidden_states, forward_batch)
+            if aux_hidden_states:
+                proxy.tensors["dspark_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return proxy
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
@@ -656,7 +774,7 @@ class KimiLinearForCausalLM(nn.Module):
         )
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -673,11 +791,13 @@ class KimiLinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer for layer in layers
+        )
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

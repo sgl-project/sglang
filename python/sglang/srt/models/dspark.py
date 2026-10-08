@@ -7,10 +7,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    MarkovGreedyStep,
+)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -52,7 +56,8 @@ def run_markov_block(
     first_prev_tokens: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    collect_corrected: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
@@ -70,16 +75,16 @@ def run_markov_block(
         )
         next_tokens = sampler(step_logits, step_idx)
         sampled_tokens.append(next_tokens)
-        corrected_logits.append(step_logits.unsqueeze(1))
+        if collect_corrected:
+            corrected_logits.append(step_logits.unsqueeze(1))
         prev_tokens = next_tokens
     return (
         torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1),
+        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
     )
 
 
 class VanillaMarkov(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -134,14 +139,50 @@ class VanillaMarkov(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
+
+    def sample_block_greedy_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Greedy-only draft-block sampling via the fused per-step
+        [bias-dot + add + argmax] kernel (see MarkovGreedyStep) — one pass over
+        markov_w2 per step instead of GEMV + add + two-pass argmax, and no
+        full-vocab bias/step-logits materialization.
+
+        Only valid for the vanilla step bias (bias = w2 @ w1[prev]); subclasses
+        whose step bias depends on hidden state override this to return None so
+        the caller falls back to sample_block.
+        """
+        if not base_logits.is_cuda:
+            return None
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len == 0:
+            return torch.empty(
+                batch_size, 0, dtype=torch.long, device=base_logits.device
+            )
+        sampled_tokens = []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            prev_embeds = self.get_prev_embeddings(prev_tokens)
+            prev_tokens = MarkovGreedyStep.execute(
+                base_logits=base_logits[:, step_idx, :],
+                prev_embeds=prev_embeds,
+                w2_weight=self.markov_w2.weight,
+            )
+            sampled_tokens.append(prev_tokens)
+        return torch.stack(sampled_tokens, dim=1)
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -178,7 +219,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-
     markov_head_type = "gated"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -207,9 +247,18 @@ class GatedMarkovHead(VanillaMarkov):
         )
         return self.project_bias(gate * prev_embeddings)
 
+    def sample_block_greedy_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        # The gated step bias depends on hidden state; the fused vanilla
+        # kernel does not apply.
+        return None
+
 
 class RNNHead(VanillaMarkov):
-
     markov_head_type = "rnn"
 
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -277,7 +326,8 @@ class RNNHead(VanillaMarkov):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
         batch_size, proposal_len = base_logits.shape[:2]
@@ -302,12 +352,23 @@ class RNNHead(VanillaMarkov):
             step_logits = base_logits[:, step_idx, :] + bias
             next_tokens = sampler(step_logits, step_idx)
             sampled_tokens.append(next_tokens)
-            corrected_logits.append(step_logits.unsqueeze(1))
+            if collect_corrected:
+                corrected_logits.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
         return (
             torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1),
+            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
         )
+
+    def sample_block_greedy_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        # The recurrent step bias depends on hidden state; the fused vanilla
+        # kernel does not apply.
+        return None
 
 
 def build_markov_head(config) -> Optional[nn.Module]:
@@ -350,7 +411,6 @@ def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Modul
 
 
 class DSparkConfidenceHead(nn.Module):
-
     def __init__(
         self,
         *,
@@ -420,6 +480,7 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
 class DSparkDraftMixin:
+    supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
@@ -441,6 +502,15 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        # Expose the draft's own layer count so the draft ModelRunner sizes the
+        # draft KV pool correctly. Some DSpark draft checkpoints inherit the
+        # target's ``num_nextn_predict_layers`` (>0) on the config; without this
+        # attribute the runner's MTP heuristic (model_runner.py) would size the
+        # pool to ``num_nextn_predict_layers`` instead of the real draft depth and
+        # the per-layer ``set_kv_buffer`` in ``write_target_hidden_kv`` would go
+        # out of range. DSv4 (MoE) drafts expose this via ``num_stages``; mirror
+        # that convention for dense DSpark drafts.
+        self.num_stages = int(config.num_hidden_layers)
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
@@ -569,8 +639,6 @@ class DSparkDraftMixin:
         rotary = attn0.rotary_emb
         if type(rotary).__name__ != "RotaryEmbedding":
             return None
-        if not getattr(rotary, "is_neox_style", False):
-            return None
         if getattr(rotary, "rotary_dim", None) != head_dim:
             return None
         eps = attn0.k_norm.variance_epsilon
@@ -589,6 +657,8 @@ class DSparkDraftMixin:
             if attn.rotary_emb is not rotary and not torch.equal(
                 attn.rotary_emb.cos_sin_cache, rotary.cos_sin_cache
             ):
+                return None
+            if attn.rotary_emb.is_neox_style != rotary.is_neox_style:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
@@ -665,8 +735,13 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
-        ctx_hidden = self.project_target_hidden(target_hidden)
+        ctx_hidden = (
+            target_hidden
+            if target_hidden_is_projected
+            else self.project_target_hidden(target_hidden)
+        )
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
@@ -697,6 +772,7 @@ class DSparkDraftMixin:
                 eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
+                is_neox_style=self.layers[0].self_attn.rotary_emb.is_neox_style,
             )
             return
 
@@ -727,9 +803,11 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
                 pool.set_kv_buffer(
                     attn.attn,
-                    cache_loc,
+                    KVWriteLoc(cache_loc, physical=True),
                     k,
                     v,
                     attn.attn.k_scale,
@@ -752,7 +830,6 @@ class DSparkDraftMixin:
 
         kv_all = F.linear(ctx_hidden, stacked["weight"], stacked["bias"])
         kv_all = kv_all.view(tokens, num_layers, 2, kv_size)
-        # Batched per-head k-norm across layers (fp32 variance + weight, cast back).
         k32 = (
             kv_all[:, :, 0, :]
             .reshape(tokens, num_layers, num_kv_heads, head_dim)
@@ -762,11 +839,9 @@ class DSparkDraftMixin:
         k32 = k32 * torch.rsqrt(variance + stacked["eps"])
         k32 = k32 * stacked["k_norm_weight"].view(1, num_layers, 1, head_dim)
         k_all = k32.to(ctx_hidden.dtype)
-        # One RoPE over all layers' heads (shared rotary params + positions).
         k_flat = k_all.reshape(tokens, num_layers * kv_size)
         dummy_q = k_flat.new_empty(k_flat.shape)
         _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
-        # [layers, tokens, heads, dim]: per-layer slices are contiguous views.
         k_all = (
             k_flat.view(tokens, num_layers, num_kv_heads, head_dim)
             .permute(1, 0, 2, 3)
@@ -782,7 +857,6 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
@@ -796,4 +870,18 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, DSparkDraftModel]
+class LingDSparkModel(DSparkDraftModel):
+    """Qwen3-shaped DSpark draft for Ling / Bailing-MoE target families.
+
+    The DeepSpec Ling draft (``deepspec.modeling.dspark.ling``) is byte-for-byte a
+    Qwen3DSparkModel — a short stack of Qwen3 draft layers sharing the target
+    embedding / lm_head. The architecture tag ``LingDSparkModel`` on the draft
+    checkpoint only distinguishes the target family for resume / error messages
+    (see ``deepspec/modeling/dspark/ling/modeling.py``); the checkpoint weights
+    line up exactly with ``Qwen3DSparkModel``, so we reuse the same backbone.
+    """
+
+    pass
+
+
+EntryClass = [Qwen3DSparkModel, LingDSparkModel, DSparkDraftModel]

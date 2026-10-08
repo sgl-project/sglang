@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -101,6 +102,56 @@ def _project_candidate_logits(
     return logits
 
 
+def candidate_topk(
+    hidden: torch.Tensor,
+    lm_head: nn.Module,
+    k: int,
+    *,
+    with_partition: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
+
+    Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
+    the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
+    O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
+    """
+    # The worker screens the head before capture, but the eager fallbacks attach
+    # whatever the target has.
+    weight = getattr(lm_head, "weight", None)
+    quant_method = getattr(lm_head, "quant_method", None)
+    use_quant_head = should_apply_lm_head_quant_method(lm_head, quant_method)
+    if not use_quant_head and not is_dense_head_weight(weight):
+        raise RuntimeError(
+            "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
+            "or a supported lm_head.quant_method."
+        )
+    tp = get_parallel().tp_size == 1
+    num_org = (
+        int(lm_head.org_vocab_size)
+        if tp
+        else int(lm_head.shard_indices.num_org_elements)
+    )
+    logits = _project_candidate_logits(
+        hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
+    )
+    lse = None
+    if with_partition:
+        vals, ids, lse = lilicorr_topk_lse(logits, k)
+    else:
+        vals, ids = _radix_topk(logits, k)
+    if tp:
+        return ids.long(), vals, lse
+    global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
+    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+    if lse is not None:
+        lse = torch.logsumexp(
+            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
+        )
+    return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+
+
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
     """Honor explicit causality while preserving legacy layer defaults."""
     text_config = config.get_text_config()
@@ -134,8 +185,7 @@ def _get_dflash_layer_attention_params(
             config, default=AttentionType.DECODER
         )
     raise ValueError(
-        "Unsupported DFLASH draft layer type. "
-        f"layer_types[{layer_id}]={layer_type!r}."
+        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
     )
 
 
@@ -213,6 +263,7 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
@@ -226,6 +277,8 @@ class DFlashAttention(nn.Module):
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+        self.v_scale: Optional[float] = draft_cfg.attention_value_scale
         self.attention_sink_bias = None
         if is_nemotron_35_draft_config(config) and bool(
             getattr(config, "attention_sink_bias", False)
@@ -242,7 +295,18 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0)},
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
+            )
+        elif draft_cfg.attention_sink_bias:
+            # Per-head sink bias; each TP rank owns its slice of the
+            # all-heads checkpoint tensor.
+            self.attention_sink_bias = nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32 if _is_npu else None),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -252,6 +316,7 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             sliding_window_size=self.sliding_window_size,
             attn_type=self.attn_type,
+            quant_config=quant_config,
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
@@ -302,6 +367,8 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)
         else:
@@ -335,11 +402,14 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            return k, v
-
-        # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
-        qkv, _ = self.qkv_proj(hidden_states)
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
+            qkv, _ = self.qkv_proj(hidden_states)
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Keep V scaling consistent with forward() so ctx and self-generated V
+        # align in the draft cache.
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -404,7 +474,8 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
         position = position % block_size
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+        shifted = torch.where((position >= tap).view(-1, 1, 1), shifted, 0)
+        out = out + coefficients[:, tap] * shifted
     return out.flatten(-2)
 
 
@@ -553,6 +624,8 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
+    supports_quantization = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -561,12 +634,15 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.rms_norm_eps = rms_norm_eps
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
+        self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
+        self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -597,7 +673,7 @@ class DFlashDraftModel(nn.Module):
                     quant_config=quant_config,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.is_nemotron_35_draft
+                        if self.quantizable
                         else ""
                     ),
                 )
@@ -621,7 +697,7 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.is_nemotron_35_draft:
+        if self.quantizable:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
                 self.num_context_features * hidden_size,
@@ -635,6 +711,35 @@ class DFlashDraftModel(nn.Module):
                 self.num_context_features * hidden_size, hidden_size, bias=False
             )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+
+        # The model loader calls load_weights() before set_block_size(). Build
+        # Domino projector modules here so their parameters are present while
+        # checkpoint weights are loaded.
+        self.projector_type = draft_config.projector_type
+        self.shift_label = draft_config.shift_label
+        self.prefix_gru: Optional[nn.GRU] = None
+        self.embed_proj: Optional[nn.Sequential] = None
+        if draft_config.is_domino:
+            assert draft_config.gru_hidden_dim is not None
+            assert draft_config.emb_dim is not None
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(draft_config.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(
+                    hidden_size + int(draft_config.gru_hidden_dim),
+                    int(draft_config.emb_dim),
+                    bias=False,
+                ),
+                nn.SiLU(),
+                nn.Linear(
+                    int(draft_config.emb_dim), int(config.vocab_size), bias=False
+                ),
+            )
 
     def set_block_size(self, block_size: int) -> None:
         """Adopt the block size the worker resolved.
@@ -662,9 +767,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(
-            self.fc.input_size if self.is_nemotron_35_draft else self.fc.in_features
-        )
+        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -675,7 +778,7 @@ class DFlashDraftModel(nn.Module):
                 "the draft checkpoint/config expects."
             )
         projected = self.fc(target_hidden)
-        if self.is_nemotron_35_draft:
+        if self.quantizable:
             projected = projected[0]
         return self.hidden_norm(projected)
 
@@ -729,6 +832,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -753,6 +857,14 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            unprefixed_name = name.removeprefix("model.")
+            if self.projector_type != "domino" and unprefixed_name.startswith(
+                ("prefix_gru.", "embed_proj.")
+            ):
+                raise ValueError(
+                    "DFLASH checkpoint contains Domino projector weights but "
+                    f"projector_type={self.projector_type!r}."
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -763,6 +875,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -797,8 +910,31 @@ class DFlashDraftModel(nn.Module):
                             f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
                             f"but got {loaded_shape} for weight '{name}'."
                         )
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
+                    loaded_weight.shape
+                ) != tuple(param.shape):
+                    raise ValueError(
+                        "DFLASH Domino projector weight shape mismatch: "
+                        f"expected {resolved_name}{tuple(param.shape)}, got "
+                        f"{tuple(loaded_weight.shape)} from {name!r}."
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(resolved_name)
+
+        if self.projector_type == "domino":
+            required = {
+                "prefix_gru.weight_ih_l0",
+                "prefix_gru.weight_hh_l0",
+                "embed_proj.0.weight",
+                "embed_proj.2.weight",
+            }
+            missing = required - loaded_params
+            if missing:
+                raise ValueError(
+                    "DFLASH Domino checkpoint is missing required projector weights: "
+                    f"{sorted(missing)}."
+                )
 
 
 class DFlashLagunaAttention(DFlashAttention):
@@ -1096,47 +1232,12 @@ class DFlash2DraftModel(DFlashDraftModel):
         self, hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
-        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
-        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
-        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
+        candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        k = self.candidate_selector.top_k
-        # The worker screens the head before capture, but its eager fallback
-        # (_propose_selector_block) attaches whatever the target has.
-        weight = getattr(self.lm_head, "weight", None)
-        quant_method = getattr(self.lm_head, "quant_method", None)
-        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
-        if not use_quant_head and not is_dense_head_weight(weight):
-            raise RuntimeError(
-                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
-                "or a supported lm_head.quant_method."
-            )
-        if get_parallel().tp_size == 1:
-            org = int(self.lm_head.org_vocab_size)
-            vals, ids = _radix_topk(
-                _project_candidate_logits(
-                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
-                ),
-                k,
-            )
-            return ids.long(), self._transform_unary_logits(vals)
-        shard = self.lm_head.shard_indices
-        vals, ids = _radix_topk(
-            _project_candidate_logits(
-                hidden,
-                self.lm_head,
-                num_org=int(shard.num_org_elements),
-                use_quant_head=use_quant_head,
-            ),
-            k,
+        ids, vals, _ = candidate_topk(
+            hidden, self.lm_head, self.candidate_selector.top_k
         )
-        global_ids = ids.long() + int(shard.org_vocab_start_index)
-        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
-        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
-        return torch.gather(gathered_ids, -1, sel).long(), self._transform_unary_logits(
-            top_vals
-        )
+        return ids, self._transform_unary_logits(vals)
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):
