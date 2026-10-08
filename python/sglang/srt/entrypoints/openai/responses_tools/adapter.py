@@ -55,16 +55,15 @@ class ResponseToolAdapter:
         """Return the model's template options without changing the API request."""
         return request.chat_template_kwargs
 
-    def template_kwargs(self, request):
-        return request.chat_template_kwargs
+    def render(self, request):
+        """Return template kwargs and tools to render; None keeps request.tools."""
+        return request.chat_template_kwargs, None
 
     def choice(self):
         return self.public_choice
 
     def input_item(self, item):
-        kind = (
-            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
-        )
+        kind = item.get("type") if isinstance(item, dict) else item.type
         if kind in ("shell_call", "shell_call_output"):
             raise ValueError("Shell replay is not supported by this model")
         return item

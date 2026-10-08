@@ -164,6 +164,10 @@ def _should_emit_normal_text_as_message(
 
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
+_OUTPUT_ITEM_EVENTS = (
+    openai_responses_types.ResponseOutputItemAddedEvent,
+    openai_responses_types.ResponseOutputItemDoneEvent,
+)
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -770,8 +774,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
+        render_tools = None
         if tool_adapter is not None:
-            chat_request.chat_template_kwargs = tool_adapter.template_kwargs(
+            chat_request.chat_template_kwargs, render_tools = tool_adapter.render(
                 chat_request
             )
 
@@ -784,6 +789,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_request,
             is_multimodal,
             output_constrained=request.has_json_schema_constraint(),
+            render_tools=render_tools,
         )
         # ``_process_messages`` merges server defaults into the temporary Chat
         # request before rendering. Response parsing happens later from the
@@ -2045,7 +2051,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         sequence_number = 0
         async for event in events:
             payload = event.model_dump()
-            if isinstance(getattr(event, "item", None), ResponseOutputMessage):
+            if isinstance(event, _OUTPUT_ITEM_EVENTS) and isinstance(
+                event.item, ResponseOutputMessage
+            ):
                 payload["item"] = event.item.model_dump()
             if tool_adapter is not None:
                 payload = tool_adapter.event(payload)
@@ -2088,7 +2096,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 yield event
                 continue
             event_type = event.type
-            item_type = getattr(getattr(event, "item", None), "type", None)
+            item_type = (
+                event.item.type if isinstance(event, _OUTPUT_ITEM_EVENTS) else None
+            )
             opens_item = event_type == "response.output_item.added"
             if pending or (opens_item and item_type == "message"):
                 pending.append(event)
@@ -2104,9 +2114,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if tool_follows or terminal:
                     phase = "commentary" if tool_follows else "final_answer"
                     for buffered in pending:
-                        item = getattr(buffered, "item", None)
-                        if isinstance(item, ResponseOutputMessage):
-                            item.phase = phase
+                        if isinstance(buffered, _OUTPUT_ITEM_EVENTS) and isinstance(
+                            buffered.item, ResponseOutputMessage
+                        ):
+                            buffered.item.phase = phase
                         yield buffered
                     pending.clear()
             else:

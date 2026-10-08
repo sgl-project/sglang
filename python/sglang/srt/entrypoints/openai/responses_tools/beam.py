@@ -6,7 +6,7 @@ from typing import Union
 
 from openai.types.responses import ResponseFunctionShellToolCall
 from openai.types.responses.response_input_item_param import ShellCall, ShellCallOutput
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from sglang.srt.entrypoints.openai.responses_tools.adapter import ResponseToolAdapter
 
@@ -53,10 +53,10 @@ class BeamToolAdapter(ResponseToolAdapter):
                 )
         return request.chat_template_kwargs
 
-    def template_kwargs(self, request):
+    def render(self, request):
         """Pass built-ins separately for the template's system tool block."""
         if not self.builtins:
-            return request.chat_template_kwargs
+            return request.chat_template_kwargs, None
         tools = request.tools or []
         if request.tool_choice == "none":
             tools = []
@@ -73,10 +73,9 @@ class BeamToolAdapter(ResponseToolAdapter):
                 functions.append(definition)
         kwargs = dict(request.chat_template_kwargs or {})
         for key, value in (("tools", functions), ("builtin_tools", builtins)):
-            if key in kwargs and kwargs[key] != value:
+            if kwargs.pop(key, value) != value:
                 raise ValueError(f"{key} is managed by Responses built-in tools")
-            kwargs[key] = value
-        return kwargs
+        return {**kwargs, "builtin_tools": builtins}, functions
 
     def _builtin(self, name, kind, description, parameters):
         self._add(
@@ -114,7 +113,7 @@ class BeamToolAdapter(ResponseToolAdapter):
         return self.public_choice
 
     def input_item(self, item):
-        if hasattr(item, "model_dump"):
+        if isinstance(item, BaseModel):
             item = item.model_dump(exclude_none=True)
         if not isinstance(item, dict):
             return item

@@ -26,14 +26,16 @@ def shell_serving(monkeypatch):
     serving.enable_response_store = True
     serving.reasoning_parser = serving.tool_call_parser = "beam"
     serving._reasoning_detector = BeamReasoningDetector()
+    serving.template_manager.chat_template_name = None
     tokenizer = serving.tokenizer_manager.tokenizer
     tokenizer.response_template = None
     tokenizer.init_kwargs = {}
     tokenizer.decode.return_value = "<|start|>assistant"
-    requests = []
+    requests, rendered = [], []
 
-    def render(request, is_multimodal):
+    def render(request, tools, is_multimodal):
         requests.append(request)
+        rendered.append(tools)
         return MessageProcessingResult(
             prompt="<|start|>assistant",
             prompt_ids=[1, 2, 3],
@@ -44,8 +46,8 @@ def shell_serving(monkeypatch):
             stop=[],
         )
 
-    monkeypatch.setattr(serving, "_apply_conversation_template", render)
-    return serving, requests
+    monkeypatch.setattr(serving, "_apply_jinja_template", render)
+    return serving, requests, rendered
 
 
 def registry(tools=None):
@@ -131,7 +133,7 @@ def test_beam_shell_call_and_client_result_continuation(
     shell_serving, mode, outcome, choice
 ):
     stream = mode == "stream"
-    serving, seen = shell_serving
+    serving, seen, rendered = shell_serving
     command = "printf '%s\\n' 'space preserving' | cat; echo \"$HOME\""
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
@@ -210,9 +212,9 @@ def test_beam_shell_call_and_client_result_continuation(
         assert [
             t["function"]["name"] for t in seen[0].chat_template_kwargs["builtin_tools"]
         ] == ["bash"]
-        assert [
-            t["function"]["name"] for t in seen[0].chat_template_kwargs["tools"]
-        ] == ([] if isinstance(choice, dict) else ["other"])
+        assert [t["function"]["name"] for t in rendered[0]] == (
+            [] if isinstance(choice, dict) else ["other"]
+        )
         output = {
             "type": "shell_call_output",
             "call_id": call["call_id"],
@@ -340,7 +342,7 @@ def test_invalid_shell_terminal_event_matches_failed_response():
 def test_concurrent_shell_and_function_requests_keep_separate_translation(
     shell_serving, stream
 ):
-    serving, _ = shell_serving
+    serving, _, _ = shell_serving
     raw = (
         "<|channel|>analysis<|message|>Run it.<|end|>"
         "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
@@ -410,7 +412,7 @@ def test_concurrent_shell_and_function_requests_keep_separate_translation(
 @pytest.mark.parametrize("stream", [False, True])
 def test_truncated_shell_history_can_be_continued(shell_serving, stream):
     """An empty cutoff call must not make the server reject its own history."""
-    serving, seen = shell_serving
+    serving, seen, _ = shell_serving
     raw = (
         "<|channel|>analysis<|message|>Run.<|end|>"
         "<|start|>assistant to=bash<|channel|>analysis <|constrain|>xml<|message|>"
@@ -454,7 +456,7 @@ def test_truncated_shell_history_can_be_continued(shell_serving, stream):
 def test_native_shell_and_client_function_use_separate_declarations(
     shell_serving, choice
 ):
-    serving, seen = shell_serving
+    serving, seen, rendered = shell_serving
     client = {
         "type": "function",
         "name": "run_command",
@@ -488,12 +490,12 @@ def test_native_shell_and_client_function_use_separate_declarations(
     kwargs = seen[0].chat_template_kwargs
     if choice == "none":
         assert [i["type"] for i in calls] == ["message"]
-        assert kwargs["tools"] == kwargs["builtin_tools"] == []
+        assert rendered[0] == kwargs["builtin_tools"] == []
     else:
         assert (
             calls[-1]["type"] == "function_call" and calls[-1]["name"] == "run_command"
         )
-        assert [t["function"]["name"] for t in kwargs["tools"]] == ["run_command"]
+        assert [t["function"]["name"] for t in rendered[0]] == ["run_command"]
         if choice == "auto":
             assert calls[0]["type"] == "shell_call"
             assert [t["function"]["name"] for t in kwargs["builtin_tools"]] == ["bash"]
@@ -506,7 +508,7 @@ def test_native_shell_and_client_function_use_separate_declarations(
 def test_native_shell_rejects_conflicting_template_tool_definitions(
     shell_serving, kwargs
 ):
-    serving, _ = shell_serving
+    serving, _, _ = shell_serving
     response = asyncio.run(
         serving.create_responses(
             ResponsesRequest(

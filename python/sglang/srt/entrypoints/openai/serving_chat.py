@@ -1572,6 +1572,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         is_multimodal: bool,
         output_constrained: bool = False,
+        *,
+        render_tools: list[dict] | None = None,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         if self.default_chat_template_kwargs:
@@ -1728,6 +1730,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
+            # A model adapter may render fewer tools than parsing uses; [] renders none.
+            if render_tools is not None:
+                tools = render_tools
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -2105,11 +2110,6 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
     ) -> tuple[List[int], Optional[str]]:
-        # Model adapters may render built-ins separately from function tools,
-        # while retaining all tool schemas for parsing and constrained decoding.
-        template_kwargs = dict(template_kwargs)
-        tools = template_kwargs.pop("tools", tools)
-
         cache_key = None
         if use_cache:
             try:
