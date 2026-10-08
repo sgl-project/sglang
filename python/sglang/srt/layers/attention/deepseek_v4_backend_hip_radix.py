@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
+    _as_int_list,
     _tail_rows,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -119,6 +120,8 @@ if TYPE_CHECKING:
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
         FP4PrefillWorkspace,
+        FP4RowgroupDecodeWorkspace,
+        FP4RowgroupPrefillWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -659,12 +662,12 @@ class DSV4Metadata:
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
-    fp4_low_ratio_decode_workspaces: Dict[int, FP4DecodeWorkspace] = field(
-        default_factory=dict, repr=False
-    )
-    fp4_low_ratio_prefill_workspaces: Dict[int, FP4PrefillWorkspace] = field(
-        default_factory=dict, repr=False
-    )
+    fp4_low_ratio_decode_workspaces: Dict[
+        int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = field(default_factory=dict, repr=False)
+    fp4_low_ratio_prefill_workspaces: Dict[
+        int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]
+    ] = field(default_factory=dict, repr=False)
     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
     # so addresses stay pinned across replays (the builders refresh contents).
     fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
@@ -1689,7 +1692,10 @@ class DeepseekV4HipRadixBackend(
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
                         )
-                    }
+                    },
+                    max_context_len=self.max_context_len,
+                    num_requests=forward_batch.batch_size,
+                    page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )
 
@@ -1736,6 +1742,13 @@ class DeepseekV4HipRadixBackend(
                 refresh_low_ratio_prefill_workspaces(
                     metadata.low_ratio_indexer_metadata_by_ratio(),
                     metadata.fp4_low_ratio_prefill_workspaces,
+                    extend_lens=(
+                        metadata.late_layer_tail.extend_seq_lens_cpu
+                        if metadata.late_layer_tail is not None
+                        else _as_int_list(forward_batch.extend_seq_lens_cpu)
+                    ),
+                    max_context_len=self.max_context_len,
+                    page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )
         if not self._fp4_workspaces_enabled(metadata):

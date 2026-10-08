@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    FrozenSet,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -543,6 +552,10 @@ class DeepSeekV4IndexerPool(KVCache):
         self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
         # Low-ratio pools round to nearest even; c4 keeps threshold rounding.
         self.index_k_rne = False
+        # aiter's row-group page-8 layout inside each page (pack_kv_cache): page size and shapes
+        # are unchanged but the bytes are not, so PD peers must use the same layout and a
+        # persisted cache written under the other one must be cleared before switching
+        self.index_k_page8 = False
 
         self._create_buffer()
 
@@ -688,6 +701,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 loc,
                 page_size=self.page_size,
                 rne=self.index_k_rne,
+                page8=self.index_k_page8,
             )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
@@ -1511,6 +1525,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
                 force_fp4=True,
+                # only the candidate consumers (ratio 1) score a subset of blocks
+                index_k_page8=(
+                    ratio == 1 and _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
+                ),
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.
@@ -1568,6 +1586,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_memory_saver: bool,
         force_fp4: bool = False,
         global_page_size: Optional[int] = None,
+        index_k_page8: bool = False,
     ) -> DeepSeekV4IndexerPool:
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
@@ -1588,6 +1607,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).
             pool.index_k_rne = True
+            pool.index_k_page8 = index_k_page8
             return pool
         return DeepSeekV4IndexerPool(
             size,
@@ -1949,6 +1969,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         FlyDSL layout (ROCm) rather than one fused [.., 68]-byte row."""
         compress_ratio, _, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
+
+    def low_ratio_index_k_page8(self, layer_id: int) -> bool:
+        """Whether the layer's split index-K pool lays each page out as row-group 8-slot pages."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).index_k_page8
+
+    def low_ratio_index_k_page8_ratios(self) -> FrozenSet[int]:
+        """The compression ratios whose index-K pool is in the page-8 layout."""
+        return frozenset(
+            ratio for ratio, pool in self.index_pools.items() if pool.index_k_page8
+        )
 
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
