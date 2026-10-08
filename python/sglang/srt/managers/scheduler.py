@@ -3757,7 +3757,10 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                finishing_reqs = self._filter_reqs_finishing_in_flight(running_batch)
+                finishing_reqs = self._reqs_finishing_in_flight(running_batch)
+                if finishing_reqs:
+                    running_batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
+                    running_batch.batch_is_full = False
                 if (
                     finishing_reqs
                     and not running_batch.is_empty()
@@ -3765,7 +3768,6 @@ class Scheduler(
                 ):
                     # The queued result frees the finishing requests' KV at the end of
                     # this step; decode the rest next step instead of retracting them.
-                    running_batch.batch_is_full = False
                     ret = None
                 else:
                     running_batch = self.update_running_batch(running_batch)
@@ -4155,8 +4157,9 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
-            if self._filter_reqs_finishing_in_flight(running_batch):
+            finishing_reqs = self._reqs_finishing_in_flight(running_batch)
+            running_batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
+            if finishing_reqs:
                 running_batch.batch_is_full = False
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
@@ -4209,23 +4212,20 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _filter_reqs_finishing_in_flight(self, batch: ScheduleBatch) -> List[Req]:
-        """Drop requests whose queued result commits their last output by length."""
+    def _reqs_finishing_in_flight(self, batch: ScheduleBatch) -> List[Req]:
+        """Requests whose queued result commits their last output by length."""
         if not self.enable_skip_finishing_decode or not self.result_queue:
             return []
         # At scheduling time the overlap loop has processed every result but the last.
         assert len(self.result_queue) == 1
         queued_reqs = set(self.result_queue[0][0].reqs)
-        finishing_reqs = [
+        return [
             req
             for req in batch.reqs
             if req in queued_reqs
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
-        if finishing_reqs:
-            batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
-        return finishing_reqs
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
