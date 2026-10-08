@@ -288,6 +288,45 @@ def test_cond_key_repeat_still_uses_cache() -> None:
     release_comfyui_session(ex.sid)
 
 
+class _RefAdapter(ComfyUIModelAdapter):
+    """Qwen-Image-Edit shaped: text context plus a per-row reference latent."""
+
+    def pack(self, x, timestep, context, ref_latents=None, **kwargs):
+        return PackedForward(
+            latents=x,
+            timesteps=timestep,
+            prompt_embeds=[context[0]],
+            prompt_seq_lens=[[int(context.shape[1])]],
+            height=8,
+            width=8,
+            extra_req={"image_latent": ref_latents[0]},
+        )
+
+
+class _SendingExecutor(_Executor):
+    """Batched forward goes through the real cache path, one row at a time."""
+
+    def __init__(self, adapter):
+        super().__init__(adapter)
+        self.seen = []
+
+    def _execute_packed(self, packed, x, timestep):
+        req = self.send(packed)
+        self.seen.append(req.image_latent)
+        return x
+
+
+def test_batched_rows_with_same_text_keep_their_own_reference() -> None:
+    ex = _SendingExecutor(_RefAdapter())
+    context = torch.ones(1, 3, 8).expand(2, 3, 8)
+    refs = torch.stack([torch.zeros(4, 8), torch.ones(4, 8)])
+    ex(torch.zeros(2, 4, 8), torch.tensor([0.5, 0.5]), context, ref_latents=[refs])
+    assert len(ex.seen) == 2
+    assert torch.equal(ex.seen[0], refs[0:1])
+    assert torch.equal(ex.seen[1], refs[1:2])
+    release_comfyui_session(ex.sid)
+
+
 def _h3_packed(text, payload):
     return PackedForward(
         latents=torch.zeros(1, 4, 2, 2),
