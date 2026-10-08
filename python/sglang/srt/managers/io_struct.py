@@ -181,6 +181,10 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # Session that spawned this one, when the caller is a subagent. Consumed
+    # only by --allow-subagent-keepalive, which refreshes the parent session's
+    # prefix-cache LRU while the parent is blocked on this request.
+    parent_session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -944,6 +948,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            parent_session_id=self.parent_session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -2317,6 +2322,13 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
+    session_id: str
+
+
+class SubagentKeepaliveReqInput(BaseReq, kw_only=True):
+    """Keep a parent session's KV hot while its subagent runs;
+    sent to every attention-DP rank, since any of them may hold the parent's KV."""
+
     session_id: str
 
 

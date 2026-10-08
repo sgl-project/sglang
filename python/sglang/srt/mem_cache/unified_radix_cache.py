@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -133,6 +134,36 @@ def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) 
     return num_pages
 
 
+def _rebase_anchor_index_parts(
+    comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    *,
+    loaded_full: dict[NodeId, torch.Tensor],
+    last_step: PoolTransfer,
+) -> dict[ComponentType, list[PoolTransfer]]:
+    """Re-point anchor slices from one whole-chain Full load to per-node loads.
+
+    Earlier nodes already hold their device rows; the last node's rows are the
+    whole of the final load.
+    """
+    rows: dict[NodeId, torch.Tensor | slice] = dict(loaded_full)
+    if last_step.nodes_to_load:
+        (last_id,) = last_step.nodes_to_load
+        rows[last_id] = slice(0, len(last_step.host_indices))
+
+    def rebase(xfer: PoolTransfer) -> PoolTransfer:
+        if not xfer.anchor_index_parts:
+            return xfer
+        parts = zip(xfer.nodes_to_load, xfer.anchor_index_parts, strict=True)
+        return replace(
+            xfer,
+            anchor_index_parts=[
+                rows[nid] if isinstance(part, slice) else part for nid, part in parts
+            ],
+        )
+
+    return {ct: [rebase(x) for x in xfers] for ct, xfers in comp_xfers.items()}
+
+
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
@@ -141,6 +172,14 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# Cap on --allow-subagent-keepalive's session -> tail-node map. Sized well above
+# any plausible live conversation count so eviction only ever drops sessions that
+# have been silent for a long time; a dropped entry costs one missed keepalive.
+_SESSION_TAIL_LIMIT = 65536
+
+# How often bump_session_keepalive reports its cumulative hit rate.
+_KEEPALIVE_LOG_INTERVAL = 256
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -248,6 +287,15 @@ class UnifiedRadixCache(BasePrefixCache):
             enable_session_radix_cache=self.enable_session_radix_cache,
         )
 
+        # Subagent keepalive (--allow-subagent-keepalive): session id -> the
+        # NodeId that session's last completed turn ended on. Bounded LRU; a
+        # dropped entry only costs a missed keepalive. NodeIds come from a
+        # monotonic counter and are never reused, so a stale id can only miss.
+        self.allow_subagent_keepalive = params.allow_subagent_keepalive
+        self._session_tail_node: OrderedDict[str, NodeId] = OrderedDict()
+        self._keepalive_hits = 0
+        self._keepalive_misses = 0
+
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
         # Always on; the try_* entries short-circuit on non-streaming reqs.
@@ -282,6 +330,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # --hicache-serialize-load-back; resolved in init_hicache.
+        self.serialize_load_back = False
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -539,6 +589,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     pool=PoolName.KV.value,
                 )
         self.load_back_threshold = 10
+        # --hicache-serialize-load-back: submit and complete each request's H2D
+        # inside its own admission instead of after the batch is formed.
+        # Meaningless in buffer mode, which stages load-backs through its own
+        # pipeline rather than through ongoing_load_back.
+        self.serialize_load_back = (
+            params.hicache_serialize_load_back
+            and self.cache_controller is not None
+            and self.buffer_pipeline is None
+        )
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
@@ -1252,6 +1311,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, leaf=result.last_device_node
                 )
 
+        if self.allow_subagent_keepalive and is_finished:
+            self._record_session_tail(req, leaf=result.last_device_node)
+
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
@@ -1809,6 +1871,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
+        if self.serialize_load_back:
+            return self._load_back_per_node(
+                anchor_id=node_id,
+                kv_xfer=kv_xfer,
+                comp_xfers=comp_xfers,
+                sidecar_xfers=sidecar_xfers,
+                ancestor_lock_params=ancestor_lock_params,
+                host_anchor_params=host_anchor_params,
+            )
+
         avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
             needed = kv_tokens - avail
@@ -1846,6 +1918,93 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return True
+
+    def _load_back_per_node(
+        self,
+        *,
+        anchor_id: NodeId,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        sidecar_xfers: list[PoolTransfer],
+        ancestor_lock_params: DecLockRefParams,
+        host_anchor_params: DecLockRefParams,
+    ) -> bool:
+        """Load root-first, acknowledging each node before the next eviction."""
+        # KV-derived sidecars resolve indices from each step's KV operation.
+        aux_sidecars = [x for x in sidecar_xfers if x.indices_from_pool != PoolName.KV]
+        # Preserve an aux-only load as a single step.
+        steps = self.tree_core.split_full_load_back_spec(kv_xfer) or [kv_xfer]
+
+        loaded_full: dict[NodeId, torch.Tensor] = {}
+        loaded_locks: list[tuple[NodeId, DecLockRefParams]] = []
+        try:
+            for i, step_xfer in enumerate(steps):
+                is_last = i == len(steps) - 1
+                step_tokens = len(step_xfer.host_indices)
+                if step_tokens and not self._evict_for_load_back(step_tokens):
+                    return False
+
+                step_id = anchor_id if is_last else step_xfer.nodes_to_load[0]
+                host_step_params = self.inc_host_lock_ref(step_id).to_dec_params()
+                step_pools = self._build_sidecar_transfers(
+                    CacheTransferPhase.LOAD_BACK, step_xfer, {}
+                )
+                step_comp_xfers = {}
+                if is_last:
+                    step_comp_xfers = _rebase_anchor_index_parts(
+                        comp_xfers, loaded_full=loaded_full, last_step=step_xfer
+                    )
+                    aux_xfers = [x for xs in step_comp_xfers.values() for x in xs]
+                    step_pools = aux_xfers + aux_sidecars + step_pools
+                device_indices = self.cache_controller.load(
+                    host_indices=step_xfer.host_indices,
+                    node_id=step_id,
+                    extra_pools=step_pools or None,
+                )
+                if device_indices is None:
+                    self.dec_host_lock_ref(step_id, host_step_params)
+                    return False
+
+                self._apply_cache_actions(
+                    self.tree_core.commit_load_back(
+                        step_id, device_indices, step_xfer, step_comp_xfers
+                    )
+                )
+                if not is_last:
+                    loaded_full[step_id] = device_indices
+                self.ongoing_load_back[step_id] = _OngoingLoadBack(
+                    step_id,
+                    self.inc_lock_ref(step_id).to_dec_params(),
+                    host_step_params,
+                )
+                # Outlives the ack that drops the lock above: the next step's
+                # eviction must not reclaim what this one just brought in.
+                loaded_locks.append(
+                    (step_id, self.inc_lock_ref(step_id).to_dec_params())
+                )
+                self._drain_serialized_load_back()
+            return True
+        finally:
+            for nid, params in loaded_locks:
+                self.dec_lock_ref(nid, params)
+            self.dec_lock_ref(anchor_id, ancestor_lock_params)
+            self.dec_host_lock_ref(anchor_id, host_anchor_params)
+
+    def _evict_for_load_back(self, num_tokens: int) -> bool:
+        avail = self._component_available_size(ComponentType.FULL)
+        if avail >= num_tokens:
+            return True
+        self.evict_for_alloc(EvictParams(num_tokens=num_tokens - avail))
+        return self._component_available_size(ComponentType.FULL) >= num_tokens
+
+    def _drain_serialized_load_back(self) -> None:
+        """Drain one H2D step so its host duplicate is reclaimable by the next."""
+        producer_id = self.cache_controller.start_loading()
+        if producer_id < 0:
+            return
+        # Exactly one ack is outstanding in this mode, so skip the cross-rank
+        # count consensus in loading_check(None) -- each rank drains its own.
+        self.loading_check(finish_count=1)
 
     def _build_sidecar_transfers(
         self,
@@ -3636,6 +3795,56 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
+
+    # ---- Subagent keepalive API (--allow-subagent-keepalive) ----
+
+    def _record_session_tail(self, req: Req, leaf: Optional[NodeId]) -> None:
+        """Remember the leaf a session's last completed turn's insert ended on."""
+        session_id = req.session_id
+        if not session_id or leaf is None:
+            return
+        if self.tree_core.is_root(leaf):
+            # Nothing of this turn survived in the tree; a keepalive on the root
+            # would refresh the whole cache, so forget the session instead.
+            self._session_tail_node.pop(session_id, None)
+            return
+        self._session_tail_node[session_id] = leaf
+        self._session_tail_node.move_to_end(session_id)
+        while len(self._session_tail_node) > _SESSION_TAIL_LIMIT:
+            self._session_tail_node.popitem(last=False)
+
+    def bump_session_keepalive(self, session_id: str) -> bool:
+        """Re-age the session's last cached path; False on a miss."""
+        if not self.allow_subagent_keepalive or not session_id:
+            return False
+        node_id = self._session_tail_node.get(session_id)
+        if node_id is not None and self.tree_core.refresh_lru_to_root(node_id):
+            self._session_tail_node.move_to_end(session_id)
+            self._keepalive_hits += 1
+            self._maybe_log_keepalive_rate()
+            return True
+
+        if node_id is not None:
+            # Path already reclaimed -- drop it so the map does not grow a tail
+            # of dead sessions.
+            self._session_tail_node.pop(session_id, None)
+        self._keepalive_misses += 1
+        self._maybe_log_keepalive_rate()
+        return False
+
+    def _maybe_log_keepalive_rate(self) -> None:
+        """Log the cumulative keepalive hit rate every ``_KEEPALIVE_LOG_INTERVAL``."""
+        total = self._keepalive_hits + self._keepalive_misses
+        # Always log the first one: on a short run the interval alone can leave the
+        # feature with no evidence that it ran at all.
+        if total != 1 and total % _KEEPALIVE_LOG_INTERVAL:
+            return
+        logger.info(
+            "subagent keepalive: %d/%d refreshed a live parent path (%d sessions tracked)",
+            self._keepalive_hits,
+            total,
+            len(self._session_tail_node),
+        )
 
     # ---- Streaming session API (delegates to self.session) ----
 

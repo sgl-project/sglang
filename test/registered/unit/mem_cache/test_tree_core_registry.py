@@ -488,6 +488,14 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         params.tree_components = (ComponentType.FULL, ComponentType.C128)
         self.assertEqual(select_tree_core_backend(params), "python")
 
+    def test_serialized_load_back_and_subagent_keepalive_keep_rust(self):
+        for field in ("hicache_serialize_load_back", "allow_subagent_keepalive"):
+            with self.subTest(field=field):
+                self.assertEqual(
+                    select_tree_core_backend(_cache_init_params(**{field: True})),
+                    "rust",
+                )
+
     def test_unsupported_platform_and_torch_use_python(self):
         for platform in ("darwin", "win32"):
             with (
