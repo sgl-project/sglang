@@ -274,13 +274,12 @@ class TestMambaCheckpointConvTransfer(unittest.TestCase):
                     active_slots = torch.tensor([1])
                     ckpt_slots = torch.tensor([2])
                     pool.store_from_active(active, active_slots, ckpt_slots)
-                    # checkpoint keeps only the first W window slots
-                    self.assertTrue(
-                        torch.equal(
-                            pool.conv[0][:, [2]],
-                            active_conv[:, [1], : self.W],
-                        )
-                    )
+                    # checkpoint keeps only the first W window slots; GDN/Mamba
+                    # flips them to [C, W], KDA keeps [W, C]
+                    expected = active_conv[:, [1], : self.W]
+                    if not is_kda:
+                        expected = expected.transpose(2, 3)
+                    self.assertTrue(torch.equal(pool.conv[0][:, [2]], expected))
 
                     dst_slots = torch.tensor([0])
                     active_conv[:, dst_slots] = torch.randn_like(
