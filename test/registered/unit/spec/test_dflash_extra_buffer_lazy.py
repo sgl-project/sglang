@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -139,7 +139,8 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
         return calls, batch
 
     def test_hook_runs_before_init_new_on_verify(self):
-        calls, batch = self._run(ForwardMode.DECODE)
+        with get_parallel().override(enable_dp_attention=True):
+            calls, batch = self._run(ForwardMode.DECODE)
         self.assertEqual(
             calls,
             [("hook", ForwardMode.TARGET_VERIFY), "init_new", "init_forward_metadata"],
@@ -150,6 +151,41 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
         calls, batch = self._run(ForwardMode.IDLE)
         self.assertEqual(calls, ["init_new"])
         self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+
+    def test_dp_verify_defers_planning_until_after_padding(self):
+        for graph_eligible in (False, True):
+            with self.subTest(graph_eligible=graph_eligible):
+                forward_batch = SimpleNamespace(batch_size=1, planned_batch_size=None)
+
+                def plan(batch):
+                    batch.planned_batch_size = batch.batch_size
+
+                runner = SimpleNamespace(
+                    decode_cuda_graph_runner=SimpleNamespace(
+                        can_run_graph=lambda batch, eligible=graph_eligible: eligible,
+                        load_batch=plan,
+                    ),
+                    attn_backend=SimpleNamespace(init_forward_metadata=plan),
+                )
+                with (
+                    get_parallel().override(enable_dp_attention=True),
+                    mock.patch.object(dflash_info, "_is_npu", False),
+                    mock.patch(
+                        "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify"
+                    ),
+                    mock.patch.object(
+                        dflash_info.ForwardBatch, "init_new", return_value=forward_batch
+                    ),
+                ):
+                    out, _ = self._spec_input().prepare_for_verify(
+                        SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                        SimpleNamespace(model_runner=runner),
+                        defer_metadata_init=True,
+                    )
+                out.batch_size = 2
+                if out.planned_batch_size is None:
+                    runner.attn_backend.init_forward_metadata(out)
+                self.assertEqual(out.planned_batch_size, out.batch_size)
 
 
 if __name__ == "__main__":

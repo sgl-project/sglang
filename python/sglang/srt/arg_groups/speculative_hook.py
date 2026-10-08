@@ -270,12 +270,19 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
-        )
+    if cfg.enable_dp_attention and cfg.device != "npu":
+        if not cfg.device.startswith("cuda"):
+            raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
+        if not cfg.enable_dp_lm_head:
+            raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
+        if cfg.attn_cp_size != 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel."
+            )
+        if cfg.moe_a2a_backend != "none":
+            raise ValueError(
+                "DFLASH with dp attention requires moe_a2a_backend 'none'."
+            )
 
     if cfg.pp_size != 1:
         raise ValueError(

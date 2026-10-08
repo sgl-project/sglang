@@ -443,6 +443,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
+        if (
+            is_cuda()
+            and self.draft_owns_attention
+            and (self._is_domino or self.lilicorr is not None)
+        ):
+            raise ValueError(
+                "CUDA DFLASH with dp attention supports plain DFlash and DFlash2; "
+                "Domino and LiLiCorr heads are not supported."
+            )
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -1309,13 +1318,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().enable_dp_attention:
             return
 
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
         target_model = self._target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
+        tp_group = (
+            get_parallel().attn_tp_group
+            if getattr(embed_module, "use_attn_tp_group", False)
+            else get_parallel().tp_group
+        )
+        tp_size = int(tp_group.world_size)
+        if tp_size <= 1:
+            self._full_embed_gpu = embed_module.weight
+            return
+
         local_w = embed_module.weight.data
         shard = getattr(embed_module, "shard_indices", None)
         num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
@@ -2358,7 +2372,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                    batch, self._target_worker, defer_metadata_init=True
                 )
                 # Force eager: the active ranks run eager verify when any DP
                 # rank is idle (see the idle-guard below); a graph-replaying
@@ -2369,7 +2383,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True,
+                    skip_attn_backend_init=None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -2739,7 +2753,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch,
+            self.target_worker,
+            defer_metadata_init=get_parallel().enable_dp_attention,
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -2765,7 +2781,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+            skip_attn_backend_init=(
+                None if _is_npu or get_parallel().enable_dp_attention else True
+            ),
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
