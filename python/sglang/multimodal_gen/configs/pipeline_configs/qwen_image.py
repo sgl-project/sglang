@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     maybe_unpad_latents,
+    pack_latents_2x2,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
@@ -142,19 +143,6 @@ def _shard_qwen_edit_freqs_cis_for_sp(freqs_cis, noisy_img_seq_len, device):
         ),
         (txt_cos, txt_sin),
     )
-
-
-# Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
-def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(
-        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-    )
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(
-        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-    )
-
-    return latents
 
 
 @dataclass
@@ -295,7 +283,9 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         width = 2 * (batch.width // (vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         return get_channelwise_decode_scale_and_shift(
@@ -590,7 +580,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             image_latents = latent_condition
         image_latent_height, image_latent_width = image_latents.shape[3:]
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        image_latents = _pack_latents(
+        image_latents = pack_latents_2x2(
             image_latents,
             batch_size,
             num_channels_latents,
