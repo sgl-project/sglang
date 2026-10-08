@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import requests
@@ -68,9 +69,56 @@ class TestNpuReturnInputIds(CustomTestCase):
         self.assertGreater(len(input_ids), 0)
         self.assertTrue(all(isinstance(i, int) for i in input_ids))
 
-        # The returned input ids must decode back to the original user message.
-        decoded = self.tokenizer.decode(input_ids)
-        self.assertIn("The capital of France is", decoded)
+        # The returned input ids must exactly match the prompt token ids.
+        self.assertEqual(input_ids, self._expected_input_ids(messages))
+
+    def _expected_input_ids(self, messages):
+        expected = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if not isinstance(expected, list):
+            expected = expected["input_ids"]
+        if hasattr(expected, "tolist"):
+            expected = expected.tolist()
+        return expected
+
+    def test_chat_completion_stream_returns_input_ids_in_sglext(self):
+        messages = [{"role": "user", "content": "The capital of France is"}]
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0,
+                "max_tokens": 16,
+                "stream": True,
+            },
+            stream=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        input_ids = None
+        for raw_line in response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8")
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if payload == "[DONE]":
+                continue
+            chunk = json.loads(payload)
+            sglext = chunk.get("sglext")
+            if sglext and sglext.get("input_ids") is not None:
+                input_ids = sglext["input_ids"]
+
+        self.assertIsNotNone(input_ids, "streaming response missing sglext.input_ids")
+        self.assertIsInstance(input_ids, list)
+        self.assertGreater(len(input_ids), 0)
+        self.assertTrue(all(isinstance(i, int) for i in input_ids))
+        self.assertEqual(input_ids, self._expected_input_ids(messages))
 
 
 if __name__ == "__main__":
