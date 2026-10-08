@@ -587,11 +587,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self,
         params: InitLoadBackParams,
     ) -> Optional[Tuple[int, Any]]:
-        """
-        Prepare host-to-device loading; returns (loaded FULL tokens, new last
+        """Prepare host-to-device loading; returns (loaded FULL tokens, new last
         node). None means retry admission; zero can be a successful
-        auxiliary-only load or a recompute fallback.
-        """
+        auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(

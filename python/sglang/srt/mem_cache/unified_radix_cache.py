@@ -3445,9 +3445,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Prepare KV cache loading from host to device.
-        Returns (loaded_len, last_node), or None when buffer-mode
-        admission must retry without committing a load."""
+        """Only buffer mode returns None: its admission retries without
+        committing a load."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
