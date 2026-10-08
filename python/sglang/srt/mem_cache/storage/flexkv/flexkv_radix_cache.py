@@ -279,7 +279,7 @@ class FlexKVRadixCache(RadixCache):
     def init_load_back(  # type: ignore[override]
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
+    ) -> Tuple[int, Optional[TreeNode]]:
         """MP RETRIEVE. Allocates uncached slots and fires the FlexKV
         load; inserts the resulting TreeNode."""
         req = params.req
@@ -290,10 +290,7 @@ class FlexKVRadixCache(RadixCache):
             # scheduler still called us. Release any held task and
             # return an empty load.
             self.flexkv_connector.release_pending(req.cache_request_handle)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return 0, last_node
 
         result = self._allocate_and_load(
             key=marker.key,
@@ -310,11 +307,9 @@ class FlexKVRadixCache(RadixCache):
             # is idempotent for the case where allocation failed before
             # we even popped the held task.
             self.flexkv_connector.release_pending(req.cache_request_handle)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
-        return result
+            return 0, last_node
+        new_slots, new_node = result
+        return len(new_slots), new_node
 
     def _allocate_and_load(
         self,

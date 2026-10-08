@@ -353,22 +353,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow.retire_requested = True
         self._request_session_finish(rid)
 
-    def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
+    def init_load_back(self, params: InitLoadBackParams) -> tuple[int, NodeId]:
         req = params.req
         if req is None:
-            return (
-                self.tree_core.empty_device_indices,
-                params.best_match_node,
-            )
+            return 0, params.best_match_node
         flow = self._external_flows.get(req.rid)
         if flow is None or flow.total_hit is None or flow.load is not None:
-            return (
-                self.tree_core.empty_device_indices,
-                params.best_match_node,
-            )
+            return 0, params.best_match_node
 
-        device_indices = self._start_external_load(flow, req)
-        if device_indices is None:
+        loaded_len = self._start_external_load(flow, req)
+        if loaded_len is None:
             req.storage_hit_length = 0
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
@@ -379,11 +373,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             # Retire the unloaded flow to release its lookup locks.
             self._retire_loaded_flow(req.rid)
-            return (
-                self.tree_core.empty_device_indices,
-                params.best_match_node,
-            )
-        return device_indices, params.best_match_node
+            return 0, params.best_match_node
+        return loaded_len, params.best_match_node
 
     def ready_to_load_host_cache(self) -> int:
         # H2D is submitted in init_load_back to preserve prefill fallback.
@@ -530,14 +521,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _start_external_load(
         self, flow: LMCacheExternalFlow, req: Req
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[int]:
         assert flow.total_hit is not None
         assert flow.local_hit_tokens is not None
         local_hit = flow.local_hit_tokens
         latest = super().match_prefix(MatchPrefixParams(key=flow.key[:local_hit]))
         total_hit = min(flow.total_hit, len(flow.key))
         if total_hit <= local_hit:
-            return self.tree_core.empty_device_indices
+            return 0
 
         # Pin the common L1 boundary before allocation can trigger eviction.
         flow.anchor_node = latest.last_device_node
@@ -642,7 +633,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             flow.load = None
             return None
-        return device_indices[flow.loaded_skip_tokens :]
+        return len(device_indices) - flow.loaded_skip_tokens
 
     def _release_flow_anchor(self, flow: LMCacheExternalFlow) -> None:
         assert (flow.anchor_node is None) == (flow.anchor_lock is None), (

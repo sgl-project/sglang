@@ -3,20 +3,16 @@
 //! pre-bound listener until shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::{
-    Router,
-    extract::{Request, State},
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
+use axum::Router;
 
 use super::{info, native_api, openai};
 use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
+use crate::utils::environ;
 
 /// HTTP adapter state: the shared core capability, immutable server
 /// configuration needed for HTTP request preparation, and the chat formatter.
@@ -31,28 +27,29 @@ pub(super) struct AppState {
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
 }
 
-/// Private marker attached by the main process to its startup warmup request.
-/// The middleware flips readiness only after that request returns successfully.
-const STARTUP_WARMUP_HEADER: &str = "x-sglang-startup-warmup";
-
-async fn mark_startup_ready(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let is_startup_warmup = req.headers().contains_key(STARTUP_WARMUP_HEADER)
-        && matches!(
-            req.uri().path(),
-            "/generate" | "/encode" | "/v1/chat/completions"
-        );
-    let response = next.run(req).await;
-    record_startup_warmup_status(&state.core, is_startup_warmup, response.status());
-    response
-}
-
-fn record_startup_warmup_status(core: &CoreHandle, is_startup_warmup: bool, status: StatusCode) {
-    if is_startup_warmup && status.is_success() {
-        core.mark_ready();
+/// Every listener warms its own rank; health stays 503 until it succeeds,
+/// and a failed or timed-out warmup leaves the listener unready.
+async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
+    if core.is_ready() {
+        return;
+    }
+    let timeout = match environ::env_i64("SGLANG_WARMUP_TIMEOUT", -1) {
+        t if t > 0 => t as u64,
+        _ if server_args.is_disaggregation() => 1800,
+        _ => 600,
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(timeout),
+        core.warm_up(server_args.skip_tokenizer_init),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            core.mark_ready();
+            tracing::info!("The server is fired up and ready to roll!");
+        }
+        Ok(Err(e)) => tracing::error!(error = %e, "startup warmup failed"),
+        Err(_) => tracing::error!(timeout_secs = timeout, "startup warmup timed out"),
     }
 }
 
@@ -72,6 +69,9 @@ pub async fn serve(
         server_args: server_args.clone(),
         chat_formatter,
     });
+    // Cancelled with the api runtime on shutdown.
+    tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
+
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(info::routes())
@@ -85,10 +85,6 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            mark_startup_ready,
-        ))
         .with_state(state);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
@@ -128,39 +124,5 @@ pub async fn serve(
         _ = shutdown.recv_async() => {
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn core_handle() -> CoreHandle {
-        CoreHandle::new(
-            flume::unbounded().0,
-            flume::unbounded().0,
-            crate::api_server::core::CoreConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: false,
-                is_disaggregation: false,
-                mm_limits: Default::default(),
-                metadata: crate::api_server::core::CoreMetadata::default(),
-            },
-        )
-    }
-
-    #[test]
-    fn only_a_successful_recognized_warmup_marks_frontend_ready() {
-        let core = core_handle();
-
-        record_startup_warmup_status(&core, false, StatusCode::OK);
-        assert!(!core.is_ready());
-
-        record_startup_warmup_status(&core, true, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!core.is_ready());
-
-        record_startup_warmup_status(&core, true, StatusCode::OK);
-        assert!(core.is_ready());
     }
 }

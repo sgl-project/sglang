@@ -1370,8 +1370,7 @@ class PrefillAdder:
                     )
                 if loaded is None:
                     return AddReqResult.OTHER
-                new_indices, req.last_node = loaded
-                req.host_loaded_length = len(new_indices)
+                req.host_loaded_length, req.last_node = loaded
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "
@@ -1410,7 +1409,7 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
-                req.prefix_len += len(new_indices)
+                req.prefix_len += req.host_loaded_length
                 req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.

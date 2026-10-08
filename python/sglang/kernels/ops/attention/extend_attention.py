@@ -698,10 +698,18 @@ def _fwd_kernel(
             final_mask &= mask_non_causal
 
         if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
+            if not IS_CAUSAL:
+                window_mask = (
+                    (cur_block_m * BLOCK_M + offs_m[:, None])
+                    <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+                ) & (
+                    (start_n + offs_n[None, :])
+                    <= (cur_block_m * BLOCK_M + offs_m[:, None] + SLIDING_WINDOW_SIZE)
+                )
+            else:
+                window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                    start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+                )
             final_mask &= window_mask
 
         SKIP_TILE = False
@@ -1312,6 +1320,8 @@ def _fwd_kernel_unified(
 
             # Sliding window: query can attend to keys within window_size
             window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
+            if not IS_CAUSAL:
+                window_mask &= k_abs_pos <= (q_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
 
         # Check if we can skip this tile
