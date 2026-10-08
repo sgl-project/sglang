@@ -33,11 +33,12 @@ async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
     if core.is_ready() {
         return;
     }
-    let timeout = Duration::from_secs(match environ::env_i64("SGLANG_WARMUP_TIMEOUT", -1) {
+    let timeout = match environ::env_i64("SGLANG_WARMUP_TIMEOUT", -1) {
         t if t > 0 => t as u64,
         _ if server_args.is_disaggregation() => 1800,
         _ => 600,
-    });
+    };
+    let timeout = Duration::from_secs(timeout);
     match core.warm_up(server_args.skip_tokenizer_init, timeout).await {
         Ok(()) => {
             core.mark_ready();
