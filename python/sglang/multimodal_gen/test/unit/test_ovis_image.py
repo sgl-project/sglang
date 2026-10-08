@@ -349,6 +349,193 @@ class TestOvisImageNumerics(CustomTestCase):
                 )
 
     @torch.no_grad()
+    def test_tp_row_projection_rounds_once_like_dense_linear(self):
+        """FP32 partial products reduce before one rounding with the bias."""
+        from unittest.mock import patch
+
+        import torch.nn.functional as F
+
+        import sglang.multimodal_gen.runtime.models.dits.ovis_image as ovis_module
+        from sglang.multimodal_gen.runtime.models.dits.ovis_image import (
+            OvisImageRowParallelLinear,
+        )
+
+        dtype = torch.bfloat16
+        with set_default_torch_dtype(dtype):
+            projection = OvisImageRowParallelLinear(
+                3072, 3072, bias=True, input_is_parallel=True
+            ).cuda()
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        projection.weight.copy_(
+            torch.randn(3072, 3072, device="cuda", generator=generator) * 0.02
+        )
+        projection.bias.copy_(torch.randn(3072, device="cuda", generator=generator))
+        inputs = torch.randn(
+            1, 1029, 3072, device="cuda", dtype=dtype, generator=generator
+        )
+        # One rank holding the whole contraction must reproduce the dense
+        # BF16 linear, which also accumulates in FP32 and rounds once.
+        with (
+            patch.object(projection, "tp_size", 2),
+            patch.object(
+                ovis_module,
+                "tensor_model_parallel_all_reduce",
+                lambda tensor, tp_group: tensor,
+            ),
+        ):
+            actual, bias = projection(inputs)
+        self.assertIsNone(bias)
+        expected = F.linear(inputs, projection.weight, projection.bias)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_sharded_heads_keep_full_model_flash_kernel(self):
+        """Head shards of a short sequence match the full-head flash output."""
+        import torch.nn.functional as F
+
+        from sglang.multimodal_gen.runtime.models.dits.ovis_image import (
+            OvisImageSDPAImpl,
+        )
+
+        heads, head_dim = 24, 128
+        for seq_len in (1025, 4224):
+            generator = torch.Generator(device="cuda").manual_seed(seq_len)
+            query, key, value = (
+                torch.randn(
+                    1,
+                    seq_len,
+                    heads,
+                    head_dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=generator,
+                )
+                for _ in range(3)
+            )
+            expected = F.scaled_dot_product_attention(
+                *(x.transpose(1, 2) for x in (query, key, value))
+            ).transpose(1, 2)
+            for local_heads in (24, 12, 6, 3):
+                with self.subTest(seq_len=seq_len, local_heads=local_heads):
+                    impl = OvisImageSDPAImpl(
+                        num_heads=local_heads,
+                        head_size=head_dim,
+                        causal=False,
+                        softmax_scale=head_dim**-0.5,
+                    )
+                    impl.global_heads = heads
+                    actual = torch.cat(
+                        [
+                            impl.forward(q, k, v, None)
+                            for q, k, v in zip(
+                                query.split(local_heads, dim=2),
+                                key.split(local_heads, dim=2),
+                                value.split(local_heads, dim=2),
+                            )
+                        ],
+                        dim=2,
+                    )
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_ulysses_tail_pad_attention_matches_unpadded_attention(self):
+        """Tail-padded Ulysses SDPA trims the pad instead of masking it."""
+        from unittest.mock import patch
+
+        import torch.nn.functional as F
+
+        import sglang.multimodal_gen.runtime.models.dits.ovis_image as ovis_module
+        from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+        from sglang.multimodal_gen.runtime.models.dits.ovis_image import (
+            OvisImageAttention as NativeAttention,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.ovis_image import (
+            OvisImageSDPAImpl,
+            OvisImageUSPAttention,
+        )
+
+        heads, head_dim = 6, 128
+        for dtype in (torch.bfloat16, torch.float32):
+            with set_default_torch_dtype(dtype):
+                native = NativeAttention(
+                    query_dim=heads * head_dim,
+                    num_heads=heads,
+                    dim_head=head_dim,
+                    out_dim=heads * head_dim,
+                    pre_only=True,
+                ).cuda()
+            attention = native.attn
+            self.assertIsInstance(attention, OvisImageUSPAttention)
+            self.assertIsInstance(attention.attn_impl, OvisImageSDPAImpl)
+            for batch, valid, pad in ((1, 1025, 1), (4, 20, 2), (1, 16, 0)):
+                with self.subTest(dtype=dtype, batch=batch, valid=valid, pad=pad):
+                    generator = torch.Generator(device="cuda").manual_seed(valid)
+                    q, k, v = (
+                        torch.randn(
+                            batch,
+                            valid + pad,
+                            heads,
+                            head_dim,
+                            device="cuda",
+                            dtype=dtype,
+                            generator=generator,
+                        )
+                        for _ in range(3)
+                    )
+                    meta = {"pad_start": valid, "pad_end": valid + pad} if pad else None
+                    expected = F.scaled_dot_product_attention(
+                        *(x[:, :valid].transpose(1, 2) for x in (q, k, v))
+                    ).transpose(1, 2)
+                    with (
+                        patch.object(
+                            ovis_module, "get_sequence_parallel_world_size", lambda: 2
+                        ),
+                        patch.object(
+                            ovis_module, "get_ulysses_parallel_world_size", lambda: 2
+                        ),
+                        patch.object(
+                            ovis_module, "_ipc_input_a2a_qkv", lambda q, k, v: None
+                        ),
+                        patch.object(
+                            ovis_module,
+                            "_usp_input_all_to_all_qkv",
+                            lambda q, k, v: (q, k, v),
+                        ),
+                        patch.object(
+                            ovis_module,
+                            "_usp_output_all_to_all",
+                            lambda x, head_dim: x,
+                        ),
+                        patch.object(
+                            USPAttention, "forward", side_effect=AssertionError
+                        ) as parent,
+                        set_forward_context(current_timestep=0, attn_metadata=None),
+                    ):
+                        if not pad:
+                            parent.side_effect = None
+                            attention(q, k, v, attn_mask_meta=meta)
+                            parent.assert_called_once()
+                            continue
+                        actual = attention(q, k, v, attn_mask_meta=meta)
+                        # Explicit masks, replicated text and Ring keep the
+                        # shared path.
+                        parent.side_effect = None
+                        mask = torch.ones(
+                            batch, valid + pad, dtype=torch.bool, device="cuda"
+                        )
+                        attention(q, k, v, attn_mask=mask, attn_mask_meta=meta)
+                        attention(q, k, v, attn_mask_meta=meta, num_replicated_prefix=1)
+                        with patch.object(
+                            ovis_module, "get_ulysses_parallel_world_size", lambda: 1
+                        ):
+                            attention(q, k, v, attn_mask_meta=meta)
+                        self.assertEqual(parent.call_count, 3)
+                    torch.testing.assert_close(
+                        actual[:, :valid], expected, atol=0, rtol=0
+                    )
+                    self.assertTrue(torch.all(actual[:, valid:] == 0))
+
+    @torch.no_grad()
     def test_blocks_and_full_transformer(self):
         for dtype in (torch.float32, torch.bfloat16):
             for batch_size, text_len, image_len in ((1, 5, 15), (4, 7, 25)):

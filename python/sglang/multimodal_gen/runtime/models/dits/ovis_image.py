@@ -4,6 +4,8 @@
 # commit c6df88a511a98740646ee55577b590c9852650ce.
 """Native Ovis-Image transformer with tensor and sequence parallelism."""
 
+import functools
+import math
 from collections.abc import Iterable
 
 import torch
@@ -21,9 +23,12 @@ from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
+    get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
@@ -35,15 +40,24 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     split_seqs,
     tail_attn_meta,
 )
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb_complex,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _ipc_input_a2a_qkv,
+    _usp_input_all_to_all_qkv,
+    _usp_output_all_to_all,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -54,12 +68,154 @@ from sglang.multimodal_gen.runtime.models.dits.flux import (
     FluxPosEmbed,
     _rope_complex_freqs,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _is_ovis_image_block(name, module):
     return is_module_list_entry_in(
         name, ("transformer_blocks", "single_transformer_blocks")
     )
+
+
+class OvisImageRowParallelLinear(RowParallelLinear):
+    """Reduce tensor-parallel partial products in FP32 and round once.
+
+    The dense reference accumulates the whole contraction in FP32 and rounds
+    once together with the bias. Rounding each rank's partial product to the
+    activation dtype before the all-reduce adds a second rounding that the
+    denoising loop amplifies past the reference tolerance.
+    """
+
+    def forward(self, input_):
+        if (
+            self.tp_size == 1
+            or not self.reduce_results
+            or not self.input_is_parallel
+            or self.skip_bias_add
+            or input_.dtype not in (torch.float16, torch.bfloat16)
+            or not isinstance(self.quant_method, UnquantizedLinearMethod)
+        ):
+            return super().forward(input_)
+        output = torch.mm(
+            input_.reshape(-1, input_.shape[-1]),
+            self.weight.t(),
+            out_dtype=torch.float32,
+        )
+        output = tensor_model_parallel_all_reduce(output, tp_group=self.tp_group)
+        if self.bias is not None:
+            output = output + self.bias.float()
+        return output.to(input_.dtype).unflatten(0, input_.shape[:-1]), None
+
+
+@functools.cache
+def _multi_processor_count(device_index):
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+class OvisImageSDPAImpl(SDPAImpl):
+    """Keep sharded heads on the unsplit flash kernel of the full model.
+
+    PyTorch's flash forward splits the keys across thread blocks when
+    batch * heads * ceil(query_len / 128) is below 80% of the SMs, and the
+    split reorders the softmax sums. Tensor and Ulysses parallelism shrink the
+    local heads, so short sequences take the split kernel while the full-head
+    reference does not. Padded query rows attend independently, so extending
+    the queries past that threshold restores the reference kernel without
+    changing the real rows. Validated for head_dim 128.
+    """
+
+    global_heads = None
+
+    def _unsplit_query_len(self, query):
+        batch, query_len, heads, head_dim = query.shape
+        if (
+            self.causal
+            or self.global_heads is None
+            or heads >= self.global_heads
+            or head_dim != 128
+            or not query.is_cuda
+            or query.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return query_len
+        threshold = 0.8 * _multi_processor_count(query.device.index)
+        blocks = math.ceil(query_len / 128)
+        if (
+            batch * heads * blocks >= threshold
+            or batch * self.global_heads * blocks < threshold
+        ):
+            return query_len
+        return math.ceil(threshold / (batch * heads)) * 128
+
+    def forward(self, query, key, value, attn_metadata):
+        query_len = query.shape[1]
+        padded_len = self._unsplit_query_len(query)
+        if padded_len == query_len:
+            return super().forward(query, key, value, attn_metadata)
+        query = torch.cat(
+            [
+                query,
+                query.new_zeros(
+                    query.shape[0], padded_len - query_len, *query.shape[2:]
+                ),
+            ],
+            dim=1,
+        )
+        return super().forward(query, key, value, attn_metadata)[:, :query_len]
+
+
+class OvisImageUSPAttention(USPAttention):
+    """Run Ulysses tail-padded SDPA over the valid prefix without a mask.
+
+    The shared SDPA fallback attends over the padded sequence with an additive
+    key mask, which selects the memory-efficient kernel instead of the
+    reference's flash kernel. Drop the tail padding after the input all-to-all
+    and run the same unmasked local attention as a single GPU. Padded query
+    rows read as zeros, as on the varlen FA path.
+    """
+
+    def _can_trim_tail(self, attn_mask, attn_mask_meta, kwargs):
+        if (
+            attn_mask is not None
+            or not attn_mask_meta
+            or self.backend != AttentionBackendEnum.TORCH_SDPA
+            or self.causal
+            or self.skip_sequence_parallel
+            or self.sp_attention_mode != "ulysses"
+            or get_sequence_parallel_world_size() <= 1
+            or get_ulysses_parallel_world_size() != get_sequence_parallel_world_size()
+            or kwargs.get("num_replicated_prefix", 0)
+            or kwargs.get("num_replicated_suffix", 0)
+            or kwargs.get("num_replicated_kv_prefix", 0)
+            or kwargs.get("skip_sequence_parallel_override", False)
+            or kwargs.get("seq_lens") is not None
+            or kwargs.get("q_prefix") is not None
+        ):
+            return False
+        pad_start = attn_mask_meta.get("pad_start")
+        pad_end = attn_mask_meta.get("pad_end")
+        return pad_start is not None and pad_end is not None and pad_end > pad_start
+
+    def forward(self, q, k, v, attn_mask=None, *args, attn_mask_meta=None, **kwargs):
+        if args or not self._can_trim_tail(attn_mask, attn_mask_meta, kwargs):
+            return super().forward(
+                q, k, v, attn_mask, *args, attn_mask_meta=attn_mask_meta, **kwargs
+            )
+        if not kwargs.get("qkv_pre_all_to_all", False):
+            qkv = _ipc_input_a2a_qkv(q, k, v)
+            q, k, v = qkv if qkv is not None else _usp_input_all_to_all_qkv(q, k, v)
+        pad_start = attn_mask_meta["pad_start"]
+        assert attn_mask_meta["pad_end"] == q.shape[1], "expected tail padding"
+        out = self.attn_impl.forward(
+            q[:, :pad_start],
+            k[:, :pad_start],
+            v[:, :pad_start],
+            get_forward_context().attn_metadata,
+        )
+        out = torch.cat(
+            [out, out.new_zeros(out.shape[0], q.shape[1] - pad_start, *out.shape[2:])],
+            dim=1,
+        )
+        return _usp_output_all_to_all(out, head_dim=2)
 
 
 class OvisImageAttention(FluxAttention):
@@ -70,6 +226,20 @@ class OvisImageAttention(FluxAttention):
         # before its FP32 RoPE. Keep that boundary in the fused CUDA path.
         kwargs["round_norm_before_rope"] = True
         super().__init__(*args, **kwargs)
+        # Swap in the Ovis numerics for the parent's modules; module state
+        # and weight loading are unchanged.
+        to_out = getattr(self, "to_out", None)
+        for projection in (
+            to_out[0] if to_out else None,
+            getattr(self, "to_add_out", None),
+        ):
+            if type(projection) is RowParallelLinear:
+                projection.__class__ = OvisImageRowParallelLinear
+        if type(self.attn) is USPAttention:
+            self.attn.__class__ = OvisImageUSPAttention
+        if type(getattr(self.attn, "attn_impl", None)) is SDPAImpl:
+            self.attn.attn_impl.__class__ = OvisImageSDPAImpl
+            self.attn.attn_impl.global_heads = self.heads
 
     def forward(
         self,
@@ -271,7 +441,7 @@ class OvisImageFeedForward(nn.Module):
             [
                 OvisImageSwiGLU(dim, inner_dim, f"{prefix}.net.0"),
                 nn.Dropout(0.0),
-                RowParallelLinear(
+                OvisImageRowParallelLinear(
                     inner_dim,
                     dim,
                     bias=True,
@@ -374,7 +544,7 @@ class OvisImageSingleTransformerBlock(nn.Module):
             pre_only=True,
             prefix=f"{prefix}.attn",
         )
-        self.proj_out = RowParallelLinear(
+        self.proj_out = OvisImageRowParallelLinear(
             dim + self.mlp_hidden_dim,
             dim,
             bias=True,
