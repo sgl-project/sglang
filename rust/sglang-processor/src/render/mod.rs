@@ -4,20 +4,25 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt};
+use dynamo_renderer::deepseek::common::tokens;
+use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, RenderedPrompt, RenderedSegment};
 use serde_json::Value;
 use thiserror::Error;
 
 mod legacy;
 mod loader;
 mod models;
+mod reasoning;
 mod selection;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
-use self::models::{deep_sort, dynamo_reasoning_effort, encode_tools_to_typescript};
+use self::models::{
+    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, render_deepseek_v4,
+};
+pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
 
@@ -40,11 +45,7 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
-    DeepSeekV4 {
-        formatter: PromptFormatter,
-        profile: DeepSeekV4Profile,
-        environment_effort: Option<String>,
-    },
+    DeepSeekV4(DeepSeekV4Profile),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -80,25 +81,48 @@ impl ChatFormatter {
                 }
                 render_oai(formatter, &TemplateArgsRequest { request, args })
             }
-            ChatFormatter::DeepSeekV4 {
-                formatter,
-                profile,
-                environment_effort,
-            } => {
-                let mut args = request.chat_template_args().cloned().unwrap_or_default();
-                let requested = args
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .or(environment_effort.as_deref());
-                let mapped = dynamo_reasoning_effort(*profile, requested);
-                let thinking =
-                    dynamo_renderer::thinking_bool_from_args(Some(&args)).unwrap_or(false);
-                args.insert("thinking".into(), Value::Bool(thinking));
-                args.insert("reasoning_effort".into(), Value::String(mapped.into()));
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+            ChatFormatter::DeepSeekV4(_) => {
+                // Typed messages serialize straight to JSON, skipping minijinja.
+                let messages = match request.typed_messages() {
+                    Some(messages) => serde_json::to_value(messages),
+                    None => serde_json::to_value(request.messages()),
+                }
+                .map_err(|error| TemplateError::Renderer {
+                    message: format!("failed to serialize messages: {error}"),
+                })?;
+                let mut body = serde_json::json!({
+                    "tools": request.tools(),
+                    "reasoning_effort": request.reasoning_effort(),
+                    "chat_template_kwargs": request.chat_template_args(),
+                    "continue_final_message": !request.should_add_generation_prompt(),
+                });
+                body["messages"] = messages;
+                let (prompt, prefix) = self.render_request(body)?;
+                // SGLang tokenizes the prefix on its own and drops its leading BOS.
+                let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
+                if prefix.is_empty() {
+                    return Ok(RenderedPrompt::text(prompt));
+                }
+                Ok(RenderedPrompt::segmented(vec![
+                    RenderedSegment::new(prompt, true),
+                    RenderedSegment::new(prefix, true),
+                ]))
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
+    }
+
+    /// Render an SGLang chat request body, returning the prompt and the
+    /// `continue_final_message` prefix SGLang tokenizes separately.
+    /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
+    /// re-validated. Only DeepSeek-V4 renders this way; others use [`Self::render_prompt`].
+    pub fn render_request(&self, request: Value) -> Result<(String, String), TemplateError> {
+        let ChatFormatter::DeepSeekV4(profile) = self else {
+            return Err(TemplateError::Renderer {
+                message: "this formatter renders through render_prompt".into(),
+            });
+        };
+        render_deepseek_v4(*profile, request).map_err(|message| TemplateError::Renderer { message })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -109,7 +133,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
-            | ChatFormatter::DeepSeekV4 { .. } => None,
+            | ChatFormatter::DeepSeekV4(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -127,9 +151,9 @@ impl ChatFormatter {
             | ChatFormatter::KimiK25 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4 { .. } => {
+            ChatFormatter::DeepSeekV4(_) => {
                 let enabled =
-                    dynamo_renderer::thinking_bool_from_args(args.as_ref()).unwrap_or(false);
+                    deepseek_v4_thinking(&serde_json::json!({ "chat_template_kwargs": args }));
                 args.get_or_insert_default()
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)

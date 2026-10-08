@@ -15,7 +15,8 @@ tokenizer = ["dep:dynamo-tokenizers"]
 async-stream = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# Prompt parity: SGLang serializes tool schemas in their request order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -27,3 +28,6 @@ minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = 
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
 dynamo-tokenizers = { version = "1.7.0", optional = true }
+
+[dev-dependencies]
+sha2 = "0.10"
