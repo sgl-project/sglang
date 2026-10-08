@@ -1,8 +1,9 @@
 """Per-step scheduling traces of scripted runs, and a diff of two trace dirs.
 
 With SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR set, every executed script writes
-one JSONL file there: a ``schedule`` record each time the scheduler picks the
-next batch and a ``result`` record each time a batch result is processed.
+one JSONL file there: a ``header`` record with the server config the trace
+ran under, then a ``schedule`` record each time the scheduler picks the next
+batch and a ``result`` record each time a batch result is processed.
 Records hold only what two runs of one commit reproduce: rids are relabeled
 r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
 
@@ -13,7 +14,8 @@ different trace dir, then:
 
 SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS (a JSON object such as
 '{"disable_overlap_schedule": true}' or '{"enable_mixed_chunk": true}') runs
-the same tests under another server config.
+the same tests under another server config. Traces whose headers differ are
+reported as a config mismatch and not compared.
 """
 
 from __future__ import annotations
@@ -33,25 +35,53 @@ if TYPE_CHECKING:
 
 DIFF_CONTEXT_RECORDS: int = 3
 
+# Server args that decide scheduling, recorded in each trace's header.
+HEADER_SERVER_ARGS = (
+    "model_path",
+    "disable_overlap_schedule",
+    "enable_mixed_chunk",
+    "chunked_prefill_size",
+    "page_size",
+    "max_running_requests",
+    "schedule_policy",
+)
+
+# Test-only env vars that change scheduling, recorded in each trace's header.
+HEADER_ENVS = (
+    "SGLANG_TEST_RETRACT",
+    "SGLANG_TEST_RETRACT_INTERVAL",
+    "SGLANG_TEST_RETRACT_NO_PREFILL_BS",
+)
+
 
 class SchedulingTraceWriter:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, header: Dict[str, Any]) -> None:
         # Line-buffered: each record is on disk once written, also when the
         # server dies mid-script.
         self._file = path.open("w", buffering=1)
         self._step = 0
         self._rid_labels: Dict[str, str] = {}
         self._retraction_counts: Dict[str, int] = {}
+        self._write({"kind": "header", **header})
 
     @classmethod
     def maybe_open(
-        cls, fn_path: str, args: Sequence[Any]
+        cls, scheduler: Scheduler, fn_path: str, args: Sequence[Any]
     ) -> Optional[SchedulingTraceWriter]:
         trace_dir = envs.SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR.get()
         if not trace_dir:
             return None
         Path(trace_dir).mkdir(parents=True, exist_ok=True)
-        return cls(Path(trace_dir) / trace_file_name(fn_path, args))
+        extra_kwargs = envs.SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS.get()
+        header = {
+            "extra_engine_kwargs": json.loads(extra_kwargs) if extra_kwargs else {},
+            "server_args": {
+                name: getattr(scheduler.server_args, name)
+                for name in HEADER_SERVER_ARGS
+            },
+            "envs": {name: getattr(envs, name).get() for name in HEADER_ENVS},
+        }
+        return cls(Path(trace_dir) / trace_file_name(fn_path, args), header)
 
     def close(self) -> None:
         self._file.close()
@@ -152,6 +182,12 @@ def first_divergence(
     return None
 
 
+def _header(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if records and records[0].get("kind") == "header":
+        return records[0]
+    return None
+
+
 def _strip(record: Dict[str, Any], ignore: set) -> Dict[str, Any]:
     return {k: v for k, v in record.items() if k not in ignore}
 
@@ -172,6 +208,13 @@ def diff_trace_dirs(
             continue
         old = load_trace(old_dir / name)
         new = load_trace(new_dir / name)
+        old_header, new_header = _header(old), _header(new)
+        if old_header is None or old_header != new_header:
+            num_differ += 1
+            print(f"CONFIG       {name} headers differ, not compared", file=out)
+            print(f"  - old {json.dumps(old_header)}", file=out)
+            print(f"  + new {json.dumps(new_header)}", file=out)
+            continue
         idx = first_divergence(old, new, ignore)
         if idx is None:
             print(f"IDENTICAL    {name} ({len(old)} records)", file=out)

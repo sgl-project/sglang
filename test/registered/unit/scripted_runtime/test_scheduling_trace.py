@@ -21,6 +21,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+_HEADER = {"kind": "header", "extra_engine_kwargs": {}}
+
+
 def _schedule(step, **fields):
     return {"kind": "schedule", "step": step, "rids": ["r0"], **fields}
 
@@ -48,7 +51,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "t.jsonl")
-            writer = SchedulingTraceWriter(path)
+            writer = SchedulingTraceWriter(path, {})
             writer.record_schedule(scheduler, plan)
             req.retraction_count = 1
             writer.record_schedule(scheduler, plan)
@@ -56,7 +59,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
             writer.close()
             records = load_trace(path)
 
-        self.assertEqual([r["retracted"] for r in records], [[], ["r0"], []])
+        self.assertEqual([r["retracted"] for r in records[1:]], [[], ["r0"], []])
 
 
 class TestFirstDivergence(CustomTestCase):
@@ -87,10 +90,15 @@ class TestDiffTraceDirs(CustomTestCase):
             old_dir, new_dir = Path(tmp, "old"), Path(tmp, "new")
             old_dir.mkdir()
             new_dir.mkdir()
+            other_header = {**_HEADER, "extra_engine_kwargs": {"x": 1}}
             traces = {
-                "same.jsonl": ([_schedule(1)], [_schedule(1)]),
-                "differs.jsonl": ([_schedule(1)], [_schedule(1, mode="decode")]),
-                "only_old.jsonl": ([_schedule(1)], None),
+                "same.jsonl": ([_HEADER, _schedule(1)], [_HEADER, _schedule(1)]),
+                "differs.jsonl": (
+                    [_HEADER, _schedule(1)],
+                    [_HEADER, _schedule(1, mode="decode")],
+                ),
+                "config.jsonl": ([_HEADER, _schedule(1)], [other_header, _schedule(1)]),
+                "only_old.jsonl": ([_HEADER, _schedule(1)], None),
             }
             for name, (old, new) in traces.items():
                 _write(old_dir / name, old)
@@ -100,9 +108,10 @@ class TestDiffTraceDirs(CustomTestCase):
             out = io.StringIO()
             num_differ = diff_trace_dirs(old_dir, new_dir, out=out)
 
-        self.assertEqual(num_differ, 2)
+        self.assertEqual(num_differ, 3)
         self.assertIn("IDENTICAL    same.jsonl", out.getvalue())
-        self.assertIn("DIFFERS      differs.jsonl at record 0", out.getvalue())
+        self.assertIn("DIFFERS      differs.jsonl at record 1", out.getvalue())
+        self.assertIn("CONFIG       config.jsonl", out.getvalue())
         self.assertIn("fields: mode", out.getvalue())
         self.assertIn("ONLY IN OLD  only_old.jsonl", out.getvalue())
 

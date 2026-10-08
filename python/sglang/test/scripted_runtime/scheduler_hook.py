@@ -168,7 +168,9 @@ class ScriptedSchedulerHook:
                         ctx = self._context
                         yield from _reset_engine_state(ctx)
                         self._batch_log.clear()
-                        self._trace = SchedulingTraceWriter.maybe_open(fn_path, args)
+                        self._trace = SchedulingTraceWriter.maybe_open(
+                            self.scheduler, fn_path, args
+                        )
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
