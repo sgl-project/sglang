@@ -347,6 +347,11 @@ class TestBeamNumerics(CustomTestCase):
                                 q.float() * compute_ssmax_scale(positions)[:, None]
                             ).to(q.dtype)
                         attention.gate_bias.zero_()
+
+                        def project_output(x, *, skip_all_reduce=False):
+                            self.assertFalse(skip_all_reduce)
+                            return x, None
+
                         with (
                             ExitStack() as projection_patches,
                             patch.object(
@@ -357,7 +362,7 @@ class TestBeamNumerics(CustomTestCase):
                             patch.object(
                                 attention.o_proj,
                                 "forward",
-                                side_effect=lambda x: (x, None),
+                                side_effect=project_output,
                             ),
                             patch(
                                 "sglang.srt.models.beam.fused_inplace_qknorm_rope",
