@@ -20,6 +20,12 @@ pub fn env_i64(name: &str, default: i64) -> i64 {
     read(name, default, |raw| raw.parse().ok())
 }
 
+/// Python `EnvFloat.parse`. Accepts the `f64::from_str` grammar (including
+/// `1e3` and `inf`), while invalid values warn and use the default.
+pub fn env_f64(name: &str, default: f64) -> f64 {
+    read(name, default, |raw| raw.parse().ok())
+}
+
 /// Shared read-or-default: unset → default; a set-but-unparsable value warns
 /// and falls back to the default (mirrors `EnvField.get`'s `warnings.warn`).
 fn read<T: Copy + std::fmt::Debug>(name: &str, default: T, parse: impl Fn(&str) -> Option<T>) -> T {
@@ -94,5 +100,30 @@ mod tests {
             assert_eq!(env_i64(&name, 20), want, "value {raw:?}");
         }
         assert_eq!(env_i64("SGLANG_TEST_ENV_I64_UNSET", 20), 20);
+    }
+
+    /// `env_f64`: strict `f64::from_str` grammar; everything else falls back
+    /// to the default.
+    #[test]
+    fn env_f64_parses_or_defaults() {
+        for (i, (raw, want)) in [
+            ("45", 45.0),
+            ("900.5", 900.5),
+            ("-1", -1.0),
+            ("1e3", 1000.0),
+            ("inf", f64::INFINITY),
+            // Invalid → default.
+            ("20s", 20.0),
+            ("", 20.0),
+            (" 45 ", 20.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("SGLANG_TEST_ENV_F64_{i}");
+            unsafe { std::env::set_var(&name, raw) };
+            assert_eq!(env_f64(&name, 20.0), want, "value {raw:?}");
+        }
+        assert_eq!(env_f64("SGLANG_TEST_ENV_F64_UNSET", 20.0), 20.0);
     }
 }
