@@ -162,15 +162,6 @@ class NPUCompressStatePool(CompressStatePool):
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor
     ) -> torch.Tensor:
-        # A c4 decode reads a window of coff*cmpRatio + 1 positions, so the page
-        # ring has to supply one row per position and spans two windows on A5;
-        # at ring == window the window's first and last position share a row.
-        if self.ratio == 4 and is_npu_arch35():
-            span = 2 * self.ring_size
-            state_loc = (swa_loc // self.swa_page_size) * span + (swa_loc % span)
-            return self._replace_invalid_with_dummy(
-                state_loc.masked_fill_(swa_loc < 0, -1)
-            )
         return self._replace_invalid_with_dummy(
             super().translate_from_swa_loc_to_state_loc(swa_loc)
         )
