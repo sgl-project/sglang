@@ -1054,17 +1054,19 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, True)
                 pages = int(buf.shape[0])
-                rng = os.environ.get("DSV4_DUMP_IDXK_PAGES")  # e.g. "0:8" (deep prefix) or "120:128" (boundary)
-                if rng:
-                    lo_s, hi_s = rng.split(":")
+                pre_hi = min(pages, 8)            # deep prefix: written once at prefill, never rewritten
+                tail_lo = max(0, pages - 16)      # recent tail: added/rewritten during decode
+                parts = (
+                    f"prehi={pre_hi} pre={_md5(buf[0:pre_hi])} "
+                    f"taillo={tail_lo} tail={_md5(buf[tail_lo:pages])}"
+                )
+                win = os.environ.get("DSV4_DUMP_IDXK_PAGES")  # optional extra window, e.g. "120:128"
+                if win:
+                    lo_s, hi_s = win.split(":")
                     lo, hi = max(0, int(lo_s)), min(pages, int(hi_s))
-                elif os.environ.get("DSV4_DUMP_IDXK_WHOLE"):
-                    lo, hi = 0, pages
-                else:
-                    lo, hi = max(0, pages - 16), pages  # tail (most recent) by default
+                    parts += f" winlo={lo} winhi={hi} win={_md5(buf[lo:hi])}"
                 print(
-                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} "
-                    f"win={lo}:{hi} shape={tuple(buf.shape)} md5={_md5(buf[lo:hi])}",
+                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} {parts}",
                     flush=True,
                 )
             except Exception as exc:

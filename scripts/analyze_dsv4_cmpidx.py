@@ -76,6 +76,15 @@ def oshape_sig(rec):
     return "|".join(rec.get(k, "?") for k in OSHAPE_KEYS)
 
 
+def tag_sig(tag, rec):
+    if tag == "OSHAPE":
+        return oshape_sig(rec)
+    if tag == "IDXK":
+        # [IDXK] carries two windows: deep prefix (written once) + tail (rewritten)
+        return f"pre={rec.get('pre')}|tail={rec.get('tail')}"
+    return rec.get("md5")
+
+
 def compare(tag, a_steps, b_steps):
     """Return (n_lastpos, same_shape_diffs, prefill_diffs, n_prefill_rows)."""
     same_shape, prefill, n_lp, n_pre = [], [], 0, 0
@@ -83,19 +92,16 @@ def compare(tag, a_steps, b_steps):
         n_lp += 1
         for ly in set(a_steps[lp]) & set(b_steps[lp]):
             a, b = a_steps[lp][ly], b_steps[lp][ly]
-            if tag == "OSHAPE":
-                ea, eb = oshape_sig(a), oshape_sig(b)
-                if ea != eb:
-                    same_shape.append((lp, ly, ea, eb))
-            elif a.get("ntok") == b.get("ntok"):
-                ma, mb = a.get("md5"), b.get("md5")
-                if ma != mb:
-                    same_shape.append((lp, ly, ma, mb))
-            else:  # prefill: row counts differ -> compare the last-row tail
+            if tag == "CMPIDX" and a.get("ntok") != b.get("ntok"):
+                # prefill: whole-tensor md5 not comparable -> compare last-row tail
                 n_pre += 1
                 ta, tb = a.get("tail", "?"), b.get("tail", "?")
                 if ta != tb:
                     prefill.append((lp, ly, ta, tb))
+                continue
+            ea, eb = tag_sig(tag, a), tag_sig(tag, b)
+            if ea != eb:
+                same_shape.append((lp, ly, ea, eb))
     return n_lp, same_shape, prefill, n_pre
 
 
