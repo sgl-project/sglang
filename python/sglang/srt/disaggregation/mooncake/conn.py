@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    filter_kv_indices_for_shard_rank,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -1082,6 +1083,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if state_type == StateType.DSA and getattr(self, "kv_shard_size", 1) > 1:
+            # Skip-topk layers retain zero-size indexer entries to keep target
+            # and draft layer numbering aligned. Layout checking above still
+            # compares both peers; only omit their empty RDMA descriptors.
+            layers_params = [entry for entry in layers_params if entry[2] > 0]
+            if not layers_params:
+                return 0
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1784,8 +1792,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Prefill CP all-gathers before writing the pool, so every CP rank holds
         # the full state regardless of whether the pool is hybrid. We assume no
         # structure about the state rows, so we don't split them across CP ranks
-        # -- just let rank 0 send the whole thing (unless layer split already
-        # shards it per rank).
+        # -- just let rank 0 send the whole thing. Layer-split and page-sharded
+        # DSA pools are exceptions: every owner must send its distinct state.
         if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
 
@@ -2015,6 +2023,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DSA and getattr(self, "kv_shard_size", 1) > 1:
+                    # Target and draft indexer buffers share the latent KV page
+                    # allocator. Pair logical source pages with destinations
+                    # BEFORE converting owned sources to rank-local page IDs.
+                    # Truncating a mismatched list would silently shift tokens.
+                    if len(src_indices) != len(dst_indices_local):
+                        raise RuntimeError(
+                            "Sharded DSA state page count mismatch: "
+                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                        )
+                    src_indices, positions = filter_kv_indices_for_shard_rank(
+                        self,
+                        np.asarray(src_indices, dtype=np.int32),
+                        slice(0, len(src_indices)),
+                    )
+                    dst_indices_local = np.asarray(dst_indices_local, dtype=np.int32)[
+                        positions
+                    ]
+                    if len(src_indices) == 0:
+                        continue
                 if (
                     st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
@@ -3061,7 +3089,33 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
             )
-        self._record_transfer_indices(kv_indices, state_indices)
+        # Nonzero CP ranks still enqueue the final chunk so their completion
+        # notification is emitted, but the worker suppresses replicated state
+        # from those ranks. Keep the transfer metric aligned with the bytes
+        # that are actually sent.
+        metric_state_indices = (
+            None
+            if self.kv_mgr._should_skip_cp_replicated_state_transfer()
+            else state_indices
+        )
+        if metric_state_indices and self.kv_mgr.kv_shard_size > 1:
+            # The queued state remains logical and is filtered by the worker.
+            # Account only for this sender's pages, including all target/draft
+            # indexer buffers represented by the DSA component's item lengths.
+            state_types = getattr(
+                getattr(self.kv_mgr, "kv_args", None), "state_types", []
+            )
+            metric_state_indices = list(metric_state_indices)
+            for i, st in enumerate(state_types):
+                if st == StateType.DSA and i < len(metric_state_indices):
+                    indices = metric_state_indices[i]
+                    if indices is not None:
+                        metric_state_indices[i], _ = filter_kv_indices_for_shard_rank(
+                            self.kv_mgr,
+                            np.asarray(indices, dtype=np.int32),
+                            slice(0, len(indices)),
+                        )
+        self._record_transfer_indices(kv_indices, metric_state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

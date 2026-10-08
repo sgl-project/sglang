@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -1007,6 +1008,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
         if (
             not _is_fp8_fnuz
+            and get_kv_shard_pool(pool) is None
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -1520,7 +1522,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
-            block_tables,
+            # Sharded IndexKeyCache translates logical pages itself. Raw
+            # paged-MQA reads above use the already-translated scratch table.
+            (
+                metadata.get_batched_indexer_page_table()
+                if not (_is_hip and not _use_aiter_preshuffle)
+                else block_tables
+            ),
             seq_len_sum,
             max_seq_len,
         )
@@ -1804,6 +1812,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if (
             _is_cuda
+            and get_kv_shard_pool(pool) is None
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,

@@ -43,6 +43,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,11 @@ class PageShardSpec(msgspec.Struct, frozen=True):
 
     @property
     def logical_page_size(self) -> int:
-        """The N*page_size span of one logical page. It bounds the assembly
-        scratch and rounds chunked_prefill_size; the allocator and the tree
-        both keep drawing and matching at the physical ``page_size``."""
+        """The N*page_size span used to align prefix-gather scratch.
+
+        Allocation, prefix matching, and chunk boundaries use the physical
+        ``page_size``.
+        """
         return self.shard_size * self.page_size
 
 
@@ -125,11 +128,48 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
     return cp_group
 
 
+def get_shared_kv_shard_pool(
+    kvc: KVCacheConfigurator,
+) -> Optional[PageInterleaveKVPoolMixin]:
+    """Find a draft's sharded target through their shared logical allocator."""
+    if not kvc.is_draft_worker:
+        return None
+
+    from sglang.srt.mem_cache.allocator.page_interleave import (
+        PageInterleavePoolAllocator,
+    )
+
+    allocator = kvc.token_to_kv_pool_allocator
+    if not isinstance(allocator, PageInterleavePoolAllocator):
+        return None
+
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+
+    pool = allocator.get_kvcache()
+    if not isinstance(pool, PageInterleaveKVPoolMixin):
+        raise ValueError("A sharded MTP draft requires the target's sharded KV pool.")
+    if (
+        allocator.shard_spec != pool.shard_spec
+        or allocator.shard_size != pool.shard_spec.shard_size
+        or allocator.page_size != pool.page_size
+        or allocator.size != pool.size * allocator.shard_size
+    ):
+        raise ValueError(
+            "The shared allocator and target KV pool have different shard layouts."
+        )
+    return pool
+
+
 def get_kv_shard_group_info(
     kvc: KVCacheConfigurator,
 ) -> Tuple[Optional[int], int]:
     """``(shard_rank, shard_size)`` for the KV pool; ``(None, 1)`` disables."""
-    if kvc.is_draft_worker or not get_parallel().enable_kv_cache_sharding:
+    if kvc.is_draft_worker:
+        pool = get_shared_kv_shard_pool(kvc)
+        if pool is None:
+            return None, 1
+        return pool.shard_spec.shard_rank, pool.shard_spec.shard_size
+    if not get_parallel().enable_kv_cache_sharding:
         return None, 1
     group = get_kv_shard_group(kvc.use_mla_backend)
     if group.world_size <= 1:
@@ -141,6 +181,23 @@ def _page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
     model_config = kvc.model_config
     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
     if kvc.use_mla_backend:
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_head_dim,
+            is_deepseek_dsa,
+        )
+
+        if is_deepseek_dsa(model_config.hf_config):
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
+
+            kv_dim = calculate_mla_kv_cache_dim(
+                model_config=model_config, kv_cache_dtype=kvc.kv_cache_dtype
+            )
+            index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+            # FP8 index K plus one FP32 scale per 128 elements. The scratch
+            # indexer exists even when some persistent layers skip top-k.
+            return kv_dim * kv_size + index_head_dim + index_head_dim // 128 * 4
         return (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * kv_size
     return (
         model_config.get_num_kv_heads(get_parallel().attn_tp_size)
@@ -161,7 +218,14 @@ def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
     or chunk size. Both scratch slots are charged against HBM before sizing
     persistent KV; large model contexts therefore reduce persistent capacity.
     Admission still checks the actual batch's padded prefix and chunk spans.
+
+    MTP drafts inherit the target's exact bounds: both pools serve the same
+    scheduled batch and logical locations, even if their model configs differ
+    in context length.
     """
+    if kvc.is_draft_worker:
+        pool = get_shared_kv_shard_pool(kvc)
+        return pool.shard_spec if pool is not None else None
     shard_rank, shard_size = get_kv_shard_group_info(kvc)
     if shard_rank is None:
         return None
@@ -179,11 +243,34 @@ def make_page_shard_spec(kvc: KVCacheConfigurator) -> Optional[PageShardSpec]:
     )
 
 
-def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
+def compute_page_shard_scratch_bytes(
+    kvc: KVCacheConfigurator, *, include_mtp: bool = False
+) -> int:
     """Fixed HBM cost of the double-buffered assembly scratch, charged against
     the KV budget before pool sizing. Use the same spec as the pool builders:
-    two slots, each holding ONE layer's ``[prefix | chunk | trash page]``."""
+    two slots, each holding ONE layer's ``[prefix | chunk | trash page]``.
+
+    ``include_mtp`` additionally budgets a target's single EAGLE MTP runner
+    at the same KV geometry, as required by the draft pool builder. Its two
+    scratch slots are reused across draft layers. Target sizing integration
+    can opt into this estimate without changing the per-pool default.
+    """
     spec = make_page_shard_spec(kvc)
     if spec is None:
         return 0
-    return 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
+    scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
+    if include_mtp:
+        from sglang.srt.runtime_context import get_spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if (
+            kvc.is_draft_worker
+            or kvc.spec_algorithm != SpeculativeAlgorithm.EAGLE
+            or (kvc.spec_aux_config.eagle_draft_num_layers or 0) <= 0
+            or get_spec().enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "MTP scratch budgeting requires a target with one EAGLE MTP runner."
+            )
+        scratch_bytes *= 2
+    return scratch_bytes

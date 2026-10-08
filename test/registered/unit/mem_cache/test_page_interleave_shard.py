@@ -13,8 +13,8 @@
 # ==============================================================================
 """Tests for logical-page KV cache sharding.
 
-Two sections. The first (CPU only, what the CPU CI job runs) pins the pure
-arithmetic that rotated owner-classed allocation hangs on:
+The CPU tests pin the pure arithmetic that rotated owner-classed
+allocation hangs on:
 
 1. The placement bijection ``loc = Q*(N*ps) + r*ps + o`` — owner / local-row
    round-trip, disjoint equal partition across ranks.
@@ -31,26 +31,36 @@ arithmetic that rotated owner-classed allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
+6. The value-derived P/D ownership send filter
+   ``filter_kv_indices_for_shard_rank``.
+7. MTP draft pool construction, shared allocator/layout validation, and scratch
+   sizing for separate target and draft pools.
 
-The second section (``TestPageInterleaveGatherMultiGpu``, at the bottom) drives
-real pools over a real 2-rank process group. It is the only check that the plan
-the CPU stub validates actually addresses the bytes NCCL delivers, so it is
-skipped rather than dropped when fewer than 2 CUDA devices are visible — which
-is every run of the CPU suite this file is registered to.
+The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
+on 2 ranks (``TestPageInterleaveGatherMultiGpu``), and byte-exact DSA indexer
+keys, scales, and latent KV on 2 and 4 ranks (``TestPageInterleaveIndexer``),
+including dequantized MLA reads from packed FP8 scratch. MTP cases cover exact
+KV bytes, separate target/draft storage and scratch plans, fragmented and partial
+pages, both MLA write APIs, and local/nonzero draft layer IDs across batches.
+GPU tests skip when too few CUDA devices are visible, so the same file runs
+in both CPU and CUDA CI suites.
 """
 
 import os
 import shutil
+import tempfile
 import unittest
 import unittest.mock
 from array import array
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from parameterized import parameterized_class
 
+from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -70,12 +80,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
     compute_page_shard_scratch_bytes,
     get_kv_shard_group,
+    get_kv_shard_group_info,
+    get_shared_kv_shard_pool,
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
@@ -86,14 +99,22 @@ from sglang.srt.mem_cache.page_interleave_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_spec,
+    publish,
+)
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import ceil_div
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
 N = 4  # shard size
 PS = 16  # physical page size
@@ -134,10 +155,12 @@ class TestPageShardScratchSizing(CustomTestCase):
         )
         kvc = SimpleNamespace(
             is_draft_worker=draft,
+            token_to_kv_pool_allocator=None,
             use_mla_backend=use_mla,
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
             model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
                 context_len=context_len,
                 kv_lora_rank=16,
                 qk_rope_head_dim=8,
@@ -239,6 +262,278 @@ class TestPageShardScratchSizing(CustomTestCase):
                     for tensor in tensors.values()
                 )
                 self.assertEqual(estimated, actual)
+
+    def test_target_with_mtp_budgets_one_extra_scratch_pair(self):
+        with (
+            self._fixture(context_len=100, chunk_tokens=64, shard_size=2) as kvc,
+            get_context().override_server_args(enable_multi_layer_eagle=False),
+        ):
+            kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            # Target configs can omit next-N layers; use the resolved draft count.
+            kvc.model_config.num_nextn_predict_layers = None
+            kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
+            expected = 2 * (8 * 128 + 64 + 16) * (16 + 8) * 2
+            for layers in (1, 3):
+                with self.subTest(layers=layers):
+                    kvc.spec_aux_config.eagle_draft_num_layers = layers
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), expected)
+                    self.assertEqual(
+                        compute_page_shard_scratch_bytes(kvc, include_mtp=True),
+                        2 * expected,
+                    )
+            kvc.spec_aux_config.eagle_draft_num_layers = None
+            with self.assertRaisesRegex(ValueError, "EAGLE MTP"):
+                compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
+
+def _make_mtp_configurator(use_mla=True):
+    # Keep real pool/allocator types for validation; allocate only CPU metadata.
+    pool_class = (
+        PageInterleaveMLATokenToKVPool if use_mla else PageInterleaveMHATokenToKVPool
+    )
+    target = pool_class.__new__(pool_class)
+    target.shard_spec = PageShardSpec(1, 2, 16, 128, 64)
+    target.shard_group = SimpleNamespace(rank_in_group=1, world_size=2)
+    target.size, target.page_size, target.dtype = 128, 16, torch.bfloat16
+    target.kv_lora_rank, target.qk_rope_head_dim = 8, 4
+    target.head_num, target.head_dim, target.v_head_dim = 2, 4, 6
+    kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+    kvc.token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+        size=target.size,
+        physical_page_size=target.page_size,
+        shard_size=target.shard_spec.shard_size,
+        dtype=target.dtype,
+        device="cpu",
+        kvcache=target,
+        need_sort=False,
+        shard_spec=target.shard_spec,
+    )
+    kvc.device = "cpu"
+    kvc.is_draft_worker = True
+    kvc.page_size = target.page_size
+    kvc.use_mla_backend = use_mla
+    kvc.kv_cache_dtype = target.dtype
+    kvc.kv_cache_dtype_str = "bfloat16"
+    kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    kvc.model_config = SimpleNamespace(
+        num_nextn_predict_layers=1,
+        context_len=9999,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        head_dim=4,
+        v_head_dim=6,
+        get_num_kv_heads=lambda tp: 4 // tp,
+        hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+    )
+    kvc.layer_info = SimpleNamespace(start_layer=5, end_layer=6, num_effective_layers=1)
+    kvc.is_hybrid_swa = False
+    kvc.sliding_window_size = None
+    kvc.mambaish_config = None
+    kvc.post_capture_kv_active = False
+    return kvc, target
+
+
+def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+    return kvc._build_token_to_kv_pool(
+        sizes=SimpleNamespace(max_total_num_tokens=capacity),
+        is_dsa_model=is_dsa_model,
+        is_dsv4_model=is_dsv4_model,
+        req_to_token_pool=None,
+    )
+
+
+class TestMTPKVShardConfig(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            get_context().override_server_args(
+                page_size=16, chunked_prefill_size=1024, enable_multi_layer_eagle=False
+            )
+        )
+        stack.enter_context(
+            get_parallel().override(
+                tp_size=2, attn_tp_size=2, moe_tp_size=2, attn_dcp_size=1
+            )
+        )
+
+    def test_draft_shares_target_layout_but_has_its_own_pool(self):
+        for use_mla in (True, False):
+            with self.subTest(use_mla=use_mla):
+                kvc, target = _make_mtp_configurator(use_mla)
+                pool_class = type(target)
+                # Mock allocation only; preserve real types and distinct instances.
+                with (
+                    unittest.mock.patch.object(
+                        pool_class, "__init__", return_value=None
+                    ) as init,
+                    unittest.mock.patch.object(
+                        page_interleave,
+                        "get_kv_shard_group",
+                        side_effect=AssertionError,
+                    ),
+                ):
+                    self.assertIs(get_shared_kv_shard_pool(kvc), target)
+                    self.assertEqual(get_kv_shard_group_info(kvc), (1, 2))
+                    self.assertIs(make_page_shard_spec(kvc), target.shard_spec)
+                    pool = _build_mtp_pool(kvc)
+                self.assertIsInstance(pool, pool_class)
+                self.assertIsNot(pool, target)
+                kwargs = init.call_args.kwargs
+                self.assertIs(kwargs["shard_spec"], target.shard_spec)
+                self.assertIs(kwargs["shard_group"], target.shard_group)
+                for name, expected in dict(
+                    size=128,
+                    page_size=16,
+                    dtype=torch.bfloat16,
+                    layer_num=1,
+                    start_layer=5,
+                    end_layer=6,
+                ).items():
+                    self.assertEqual(kwargs[name], expected, name)
+                allocator = kvc.token_to_kv_pool_allocator
+                self.assertIs(
+                    kvc._build_token_to_kv_pool_allocator(
+                        sizes=SimpleNamespace(max_total_num_tokens=128),
+                        token_to_kv_pool=pool,
+                        is_dsv4_model=False,
+                        req_to_token_pool=None,
+                        token_to_kv_pool_allocator=allocator,
+                    ),
+                    allocator,
+                )
+                # Scratch uses inherited bounds despite different draft context/chunk sizes.
+                row_bytes = (8 + 4) * 2 if use_mla else 2 * (4 + 6) * 2
+                self.assertEqual(
+                    compute_page_shard_scratch_bytes(kvc),
+                    2 * (128 + 64 + 16) * row_bytes,
+                )
+                with self.assertRaisesRegex(ValueError, "target"):
+                    compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
+    def test_without_shared_allocator_keeps_existing_pool(self):
+        for draft, allocator in ((True, None), (True, object()), (False, None)):
+            with self.subTest(draft=draft, allocator=allocator):
+                kvc, _ = _make_mtp_configurator()
+                kvc.is_draft_worker = draft
+                kvc.token_to_kv_pool_allocator = allocator
+                self.assertIsNone(get_shared_kv_shard_pool(kvc))
+                if draft:
+                    self.assertEqual(get_kv_shard_group_info(kvc), (None, 1))
+                    self.assertIsNone(make_page_shard_spec(kvc))
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
+                with unittest.mock.patch.object(
+                    KVCacheConfigurator, "_build_mla_kv_pool"
+                ) as build:
+                    self.assertIs(_build_mtp_pool(kvc), build.return_value)
+                build.assert_called_once_with(max_total_num_tokens=128)
+
+    def test_rejects_invalid_shared_allocator(self):
+        kvc, _ = _make_mtp_configurator()
+        for name, value, message in (
+            ("_kvcache", object(), "target's sharded KV pool"),
+            ("shard_spec", PageShardSpec(0, 2, 16, 128, 64), "different shard layouts"),
+            ("shard_size", 4, "different shard layouts"),
+            ("page_size", 32, "different shard layouts"),
+            ("size", 128, "different shard layouts"),
+        ):
+            with (
+                self.subTest(attribute=name),
+                unittest.mock.patch.object(kvc.token_to_kv_pool_allocator, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                get_shared_kv_shard_pool(kvc)
+
+    def test_rejects_incompatible_pool_geometry(self):
+        for use_mla in (True, False):
+            kvc, _ = _make_mtp_configurator(use_mla)
+            geometry = (
+                ("kv_lora_rank", "qk_rope_head_dim")
+                if use_mla
+                else ("head_dim", "v_head_dim")
+            )
+            cases = [
+                (kvc, "page_size", 32, "physical page size"),
+                (kvc, "kv_cache_dtype", torch.float16, "geometry and dtype"),
+                (kvc, "use_mla_backend", not use_mla, "attention geometry"),
+                *(
+                    (kvc.model_config, field, 16, "geometry and dtype")
+                    for field in geometry
+                ),
+            ]
+            if not use_mla:
+                cases.append(
+                    (
+                        kvc.model_config,
+                        "get_num_kv_heads",
+                        lambda tp: 4,
+                        "geometry and dtype",
+                    )
+                )
+            for obj, name, value, message in cases:
+                with (
+                    self.subTest(use_mla=use_mla, attribute=name),
+                    unittest.mock.patch.object(obj, name, value),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    _build_mtp_pool(kvc)
+            for capacity in (64, 256):
+                with (
+                    self.subTest(use_mla=use_mla, capacity=capacity),
+                    self.assertRaisesRegex(ValueError, "same per-rank capacity"),
+                ):
+                    _build_mtp_pool(kvc, capacity=capacity)
+
+    def test_rejects_unsupported_draft_config(self):
+        kvc, _ = _make_mtp_configurator()
+        cases = [
+            (kvc, "spec_algorithm", algorithm, "EAGLE MTP")
+            for algorithm in (
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+                SpeculativeAlgorithm.FROZEN_KV_MTP,
+            )
+        ] + [
+            (kvc.model_config, "num_nextn_predict_layers", None, "EAGLE MTP"),
+            (kvc.model_config, "num_nextn_predict_layers", 0, "EAGLE MTP"),
+            (kvc, "is_hybrid_swa", True, "MLA, DSA and MHA"),
+            (kvc, "mambaish_config", object(), "MLA, DSA and MHA"),
+            (kvc, "sliding_window_size", 128, "MLA, DSA and MHA"),
+            (kvc, "post_capture_kv_active", True, "plain per-layer KV layout"),
+            (kvc, "kv_cache_dtype_str", "mxfp8", "plain per-layer KV layout"),
+        ]
+        for obj, name, value, message in cases:
+            with (
+                self.subTest(attribute=name, value=value),
+                unittest.mock.patch.object(obj, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
+        for options, message in (
+            ({"is_dsa_model": True}, "same DSA indexer layout"),
+            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc, **options)
+        for context, options, message in (
+            (get_spec(), {"enable_multi_layer_eagle": True}, "EAGLE MTP"),
+            (get_parallel(), {"attn_dcp_size": 2}, "incompatible with DCP"),
+            (
+                get_memory(),
+                {"enable_page_major_kv_layout": True},
+                "plain per-layer KV layout",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                context.override(**options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1343,6 +1638,58 @@ class TestWritePlan(CustomTestCase):
         self.assertEqual(local_rows.numel(), 0)
 
 
+class TestShardSendFilter(CustomTestCase):
+    """Value-derived P/D ownership partition: owner = logical page % N, wire
+    value = logical page // N — independent of positions, so it stays
+    correct under any placement policy."""
+
+    def test_partition_and_positional_pairing(self):
+        mgr = SimpleNamespace(kv_shard_rank=0, kv_shard_size=N)
+        # A base-2 rotated chain: owners are NOT position-congruent.
+        logical_pages = np.array(_chain_pages(base=2, n_pages=9), dtype=np.int64)
+        sl = slice(0, 9)
+        got = {}
+        for r in range(N):
+            mgr.kv_shard_rank = r
+            wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, sl)
+            got[r] = (wire, pos)
+            # Ownership by VALUE (l % N == r), wire id = owner's local page.
+            np.testing.assert_array_equal(logical_pages[pos] % N, r)
+            np.testing.assert_array_equal(wire, logical_pages[pos] // N)
+        # Disjoint cover of all positions.
+        all_pos = np.sort(np.concatenate([got[r][1] for r in range(N)]))
+        np.testing.assert_array_equal(all_pos, np.arange(9))
+
+    def test_wire_value_is_the_owner_local_page(self):
+        """The wire byte contract: l // N == loc // (N * ps) — the owner-local
+        page id, so the decode side needs no change."""
+        mgr = SimpleNamespace(kv_shard_rank=1, kv_shard_size=N)
+        logical_pages = np.array(_chain_pages(base=0, n_pages=8), dtype=np.int64)
+        locs = logical_pages * PS  # page-head loc of each entry
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, slice(0, 8))
+        np.testing.assert_array_equal(wire, locs[pos] // (N * PS))
+
+    def test_mid_request_chunk_positions_canonical(self):
+        mgr = SimpleNamespace(kv_shard_rank=2, kv_shard_size=N)
+        logical_pages = np.array(
+            _chain_pages(base=1, n_pages=32)[20:32], dtype=np.int64
+        )
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, slice(20, 32))
+        # Positions are canonical (chunk-global), values from this chunk.
+        self.assertTrue(((pos >= 20) & (pos < 32)).all())
+        np.testing.assert_array_equal(logical_pages[pos - 20] % N, 2)
+        np.testing.assert_array_equal(wire, logical_pages[pos - 20] // N)
+
+    def test_rank_owning_nothing_in_chunk(self):
+        """A short chunk can leave a rank with zero pages; the filter must
+        return empty arrays, not error."""
+        mgr = SimpleNamespace(kv_shard_rank=3, kv_shard_size=N)
+        pages = np.array(_chain_pages(base=0, n_pages=2), dtype=np.int64)  # owners 0,1
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, pages, slice(0, 2))
+        self.assertEqual(len(wire), 0)
+        self.assertEqual(len(pos), 0)
+
+
 # =============================================================================
 # Multi-GPU: the real NCCL layer-ahead gather (2 GPUs).
 #
@@ -1375,6 +1722,8 @@ _GATHER_QK_ROPE = 32
 _GATHER_HEAD_NUM = 2
 _GATHER_HEAD_DIM = 32
 _GATHER_DTYPE = torch.bfloat16
+_MTP_SIZE = 32 * _GATHER_PAGE_SIZE  # Physical token capacity per rank.
+_MTP_UNWRITTEN = -256
 
 
 def _mla_value(loc, dim):
@@ -1667,6 +2016,294 @@ def _run_mha(rank, world, port):
         print("PASS: MHA page-interleave shard (attn-CP axis)")
 
 
+def _mtp_make_pool(rank, group, kind, start_layer, layer_num):
+    kwargs = dict(
+        size=_MTP_SIZE,
+        page_size=_GATHER_PAGE_SIZE,
+        dtype=_GATHER_DTYPE,
+        layer_num=layer_num,
+        device=f"cuda:{rank}",
+        enable_memory_saver=False,
+        start_layer=start_layer,
+        end_layer=start_layer + layer_num - 1,
+        shard_spec=PageShardSpec(
+            shard_rank=group.rank_in_group,
+            shard_size=_GATHER_WORLD,
+            page_size=_GATHER_PAGE_SIZE,
+            max_prefix_tokens=16 * _GATHER_WORLD * _GATHER_PAGE_SIZE,
+            chunk_tokens=4 * _GATHER_PAGE_SIZE,
+        ),
+        shard_group=group,
+    )
+    if kind == "mla":
+        pool = PageInterleaveMLATokenToKVPool(
+            **kwargs,
+            kv_lora_rank=_GATHER_KV_LORA_RANK,
+            qk_rope_head_dim=_GATHER_QK_ROPE,
+        )
+    else:
+        pool = PageInterleaveMHATokenToKVPool(
+            **kwargs,
+            head_num=_GATHER_HEAD_NUM,
+            head_dim=_GATHER_HEAD_DIM,
+            enable_alt_stream=False,
+        )
+    for local_layer in range(layer_num):
+        for buffer in _mtp_buffers(pool, kind, local_layer):
+            buffer.fill_(_MTP_UNWRITTEN)
+    return pool
+
+
+def _mtp_buffers(pool, kind, local_layer):
+    if kind == "mla":
+        return (pool.kv_buffer[local_layer],)
+    return (pool.k_buffer[local_layer], pool.v_buffer[local_layer])
+
+
+def _mtp_make_draft_pool(target, allocator, kind, start_layer):
+    # Skip model loading while using the production pool dispatch and sharing
+    # the target allocator. A replicated draft pool must fail this test.
+    kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+    kvc.device = target.device
+    kvc.is_draft_worker = True
+    kvc.page_size = _GATHER_PAGE_SIZE
+    kvc.use_mla_backend = kind == "mla"
+    kvc.kv_cache_dtype = _GATHER_DTYPE
+    kvc.kv_cache_dtype_str = "bfloat16"
+    kvc.post_capture_kv_active = False
+    kvc.is_hybrid_swa = False
+    kvc.sliding_window_size = None
+    kvc.mambaish_config = None
+    kvc.token_to_kv_pool_allocator = allocator
+    kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    kvc.model_config = SimpleNamespace(
+        num_nextn_predict_layers=1,
+        hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        kv_lora_rank=_GATHER_KV_LORA_RANK,
+        qk_rope_head_dim=_GATHER_QK_ROPE,
+        head_dim=_GATHER_HEAD_DIM,
+        v_head_dim=_GATHER_HEAD_DIM,
+        get_num_kv_heads=lambda *_args: _GATHER_HEAD_NUM,
+    )
+    kvc.layer_info = SimpleNamespace(
+        start_layer=start_layer, end_layer=start_layer + 1, num_effective_layers=1
+    )
+    with get_context().override_server_args(
+        page_size=_GATHER_PAGE_SIZE,
+        tp_size=_GATHER_WORLD,
+        attn_cp_size=_GATHER_WORLD if kind == "mha" else 1,
+        speculative_algorithm="EAGLE",
+        enable_multi_layer_eagle=False,
+    ):
+        pool = _build_mtp_pool(kvc, capacity=target.size)
+    assert pool.shard_spec is target.shard_spec
+    assert pool.shard_group is target.shard_group
+    for buffer in _mtp_buffers(pool, kind, 0):
+        buffer.fill_(_MTP_UNWRITTEN)
+    return pool
+
+
+def _mtp_values(locs, width, tag, local_layer, is_v=False):
+    """Each location, feature, layer, and pool has distinguishable BF16 bytes.
+
+    Small integers survive BF16 exactly; high-valued logical slot IDs plus tiny
+    feature offsets would round away the differences this test must detect.
+    The first two columns encode the full logical slot, avoiding hash aliases.
+    """
+    features = torch.arange(width, device=locs.device)
+    values = (
+        locs[:, None] * 37
+        + features[None, :] * 17
+        + tag * 73
+        + local_layer * 11
+        + int(is_v) * 97
+    ) % 251 - 125
+    values[:, 0] = locs % 128
+    values[:, 1] = locs // 128
+    values[:, 2] = tag
+    values[:, 3] = local_layer
+    values[:, 4] = int(is_v)
+    return values.to(_GATHER_DTYPE)
+
+
+def _mtp_canonical(kind, locs, tag, local_layer):
+    if kind == "mla":
+        return (
+            _mtp_values(
+                locs, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE, tag, local_layer
+            ).unsqueeze(1),
+        )
+    return tuple(
+        _mtp_values(
+            locs, _GATHER_HEAD_NUM * _GATHER_HEAD_DIM, tag, local_layer, is_v
+        ).reshape(-1, _GATHER_HEAD_NUM, _GATHER_HEAD_DIM)
+        for is_v in (False, True)
+    )
+
+
+def _mtp_assert_bytes(got, expected, label):
+    assert got.shape == expected.shape, label
+    assert got.dtype == expected.dtype == _GATHER_DTYPE, label
+    assert torch.equal(
+        got.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    ), f"{label}: KV bytes differ"
+
+
+def _mtp_logical_chain(device):
+    # Owners alternate from rank 1, while local pages run out of order. Some
+    # logical slots exceed the physical pool size, catching a replicated draft
+    # indexing them raw.
+    local_pages = torch.tensor([25, 3, 20, 6, 28, 4, 30, 8, 22], device=device)
+    owners = (1 + torch.arange(local_pages.numel(), device=device)) % _GATHER_WORLD
+    pages = local_pages * _GATHER_WORLD + owners
+    return (
+        pages[:, None] * _GATHER_PAGE_SIZE
+        + torch.arange(_GATHER_PAGE_SIZE, device=device)
+    ).reshape(-1)
+
+
+def _mtp_write(pool, kind, locs, tag, local_layer, epoch):
+    layer = SimpleNamespace(layer_id=pool.start_layer + local_layer)
+    values = _mtp_canonical(kind, locs, tag, local_layer)
+    if kind == "mha":
+        pool.set_kv_buffer(layer, locs, *values)
+    elif epoch % 2:
+        # Both MLA write entry points must owner-filter and stage MTP rows.
+        pool.set_mla_kv_buffer(
+            layer,
+            locs,
+            values[0][..., :_GATHER_KV_LORA_RANK],
+            values[0][..., _GATHER_KV_LORA_RANK:],
+        )
+    else:
+        pool.set_kv_buffer(
+            layer, locs, values[0], values[0][..., :_GATHER_KV_LORA_RANK]
+        )
+
+
+def _mtp_check_persisted(pool, kind, locs, tag, rank):
+    owned_locs = locs[(locs // _GATHER_PAGE_SIZE) % _GATHER_WORLD == rank]
+    local_rows = (
+        owned_locs // (_GATHER_WORLD * _GATHER_PAGE_SIZE) * _GATHER_PAGE_SIZE
+        + owned_locs % _GATHER_PAGE_SIZE
+    )
+    for local_layer in range(pool.layer_num):
+        canonical = _mtp_canonical(kind, owned_locs, tag, local_layer)
+        for buffer, values in zip(_mtp_buffers(pool, kind, local_layer), canonical):
+            expected = torch.full_like(buffer, _MTP_UNWRITTEN)
+            expected[local_rows] = values
+            _mtp_assert_bytes(
+                buffer, expected, f"{kind} pool {tag} owned layer {local_layer}"
+            )
+
+
+def _mtp_check_scratch(pool, kind, locs, prefix_len, tag, local_layer):
+    layer_id = pool.start_layer + local_layer
+    rows = pool.translate_loc_to_scratch(locs)
+    expected = _mtp_canonical(kind, locs, tag, local_layer)
+    _mtp_assert_bytes(
+        pool.get_key_buffer(layer_id)[rows], expected[0], f"{kind} pool {tag} key"
+    )
+    _mtp_assert_bytes(
+        pool.get_value_buffer(layer_id)[rows],
+        expected[0][..., :_GATHER_KV_LORA_RANK] if kind == "mla" else expected[1],
+        f"{kind} pool {tag} value",
+    )
+    if kind == "mla" and prefix_len:
+        # Arbitrary prefix indices also exercise the chunked MLA consumer.
+        subset = locs[3:prefix_len:7].clone()
+        k_nope, k_rope = pool.get_mla_kv_buffer(
+            SimpleNamespace(layer_id=layer_id), subset, _GATHER_DTYPE
+        )
+        reference = _mtp_canonical(kind, subset, tag, local_layer)[0]
+        _mtp_assert_bytes(
+            k_nope, reference[..., :_GATHER_KV_LORA_RANK], f"pool {tag} latent"
+        )
+        _mtp_assert_bytes(
+            k_rope, reference[..., _GATHER_KV_LORA_RANK:], f"pool {tag} rope"
+        )
+
+
+def _run_mtp(rank, port, kind):
+    """Check exact KV bytes and independent target/draft state across batches."""
+    _dist_init(
+        rank, _GATHER_WORLD, port, attn_cp_size=_GATHER_WORLD if kind == "mha" else 1
+    )
+    group = get_kv_shard_group(use_mla_backend=kind == "mla")
+    assert group.world_size == _GATHER_WORLD
+    target = _mtp_make_pool(
+        rank, group, kind, start_layer=0, layer_num=_GATHER_LAYER_NUM
+    )
+    allocator = PageInterleavePoolAllocator(
+        size=target.size,
+        physical_page_size=_GATHER_PAGE_SIZE,
+        shard_size=_GATHER_WORLD,
+        dtype=_GATHER_DTYPE,
+        device=target.device,
+        kvcache=target,
+        need_sort=False,
+        shard_spec=target.shard_spec,
+    )
+    # DeepSeek's NextN uses local layer 0. Also cover an absolute/offset layer ID
+    # so the one-layer gather terminates correctly on either scratch-slot parity.
+    drafts = [
+        _mtp_make_draft_pool(target, allocator, kind, start_layer=start)
+        for start in (0, 61)
+    ]
+    pools = [target, *drafts]
+    for other in drafts:
+        assert other._page_pos.data_ptr() != target._page_pos.data_ptr()
+        assert other.kv_gather_comm is not target.kv_gather_comm
+        for slot, target_slot in zip(other._slots, target._slots):
+            for name in slot.tensors:
+                assert (
+                    slot.tensors[name].data_ptr()
+                    != target_slot.tensors[name].data_ptr()
+                )
+
+    locs = _mtp_logical_chain(target.device)
+    req_to_token = locs.to(torch.int32).unsqueeze(0)
+    req_indices = torch.tensor([0], dtype=torch.int64, device=locs.device)
+    # Each cached prefix is page aligned. The third batch writes only five
+    # tokens of its tail page; the fourth recomputes and completes that page.
+    batches = [(0, 48), (48, 96), (96, 133), (128, 144)]
+    for epoch, (prefix_len, seq_len) in enumerate(batches, start=1):
+        active_locs = locs[:seq_len]
+        chunk_locs = locs[prefix_len:seq_len]
+        target_epoch = target._epoch
+        for tag, pool in enumerate(pools, start=1):
+            pool.begin_shard_extend(req_to_token, req_indices, [prefix_len], [seq_len])
+            assert pool._epoch == epoch
+            for local_layer in range(pool.layer_num):
+                _mtp_write(pool, kind, chunk_locs, tag, local_layer, epoch)
+                _mtp_check_scratch(
+                    pool, kind, active_locs, prefix_len, tag, local_layer
+                )
+            _mtp_check_persisted(pool, kind, active_locs, tag, rank)
+            # MTP metadata/writes/reads must leave the target's last resident
+            # layer and gather plan usable, despite identical logical locations.
+            assert target._epoch == target_epoch + 1
+            _mtp_check_scratch(
+                target, kind, active_locs, prefix_len, 1, _GATHER_LAYER_NUM - 1
+            )
+            if pool.layer_num == 1 and prefix_len:
+                resident = pool._slots[pool.start_layer % 2]
+                assert resident.resident_key == (pool.start_layer, epoch)
+                assert pool._slots[(pool.start_layer + 1) % 2].resident_key is None
+        if rank == 0:
+            print(f"PASS: {kind.upper()} target/MTP prefix={prefix_len}, seq={seq_len}")
+
+    # Deactivating one draft's plan must not deactivate the other pools.
+    drafts[0].end_shard_extend()
+    assert not drafts[0]._shard_extend_active
+    assert target._shard_extend_active and drafts[1]._shard_extend_active
+    _mtp_check_scratch(drafts[1], kind, locs, 128, 3, 0)
+    _mtp_check_scratch(target, kind, locs, 128, 1, _GATHER_LAYER_NUM - 1)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
 )
@@ -1682,6 +2319,537 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
+
+    def test_mtp_mla_shard_over_attention_tp(self):
+        mp.spawn(_run_mtp, args=(29813, "mla"), nprocs=_GATHER_WORLD, join=True)
+
+    def test_mtp_mha_shard_over_attention_cp(self):
+        mp.spawn(_run_mtp, args=(29814, "mha"), nprocs=_GATHER_WORLD, join=True)
+
+
+# =============================================================================
+# Indexer: packed FP8 keys and FP32 scales over real NCCL (2 and 4 GPUs).
+# =============================================================================
+
+_INDEXER_PAGE_SIZE = 64
+_INDEXER_SIZE = _INDEXER_PAGE_SIZE * 32
+_INDEXER_HEAD_DIM = 128
+_INDEXER_KV_LORA_RANK = 512
+_INDEXER_QK_ROPE = 64
+_INDEXER_START_LAYER = 3
+_INDEXER_SKIP_TOPK = [False, True, False, False, False]
+
+
+def _assert_bytes(got, expected, label):
+    got = got.contiguous().view(torch.uint8)
+    expected = expected.contiguous().view(torch.uint8)
+    assert got.shape == expected.shape, label
+    assert torch.equal(got, expected), f"{label}: cache bytes differ"
+
+
+def _index_values(locs, layer_id, generation):
+    dims = torch.arange(_INDEXER_HEAD_DIM, device=locs.device)
+    keys = (
+        (locs[:, None] * 7 + dims * 3 + layer_id * 11 + generation * 13) % 31 - 15
+    ).to(torch.float8_e4m3fn)
+    scales = (
+        (locs % 29 + layer_id * 31 + generation * 17 + 1).float() / 128
+    ).unsqueeze(1)
+    return keys, scales
+
+
+def _latent_values(locs, layer_id, generation):
+    dims = torch.arange(_INDEXER_KV_LORA_RANK + _INDEXER_QK_ROPE, device=locs.device)
+    values = ((locs[:, None] * 3 + dims + layer_id * 5 + generation * 7) % 113 - 56).to(
+        torch.bfloat16
+    ) / 16
+    # Vary the quantization scale across tokens and 128-value NoPE groups.
+    amplitude = torch.exp2(
+        ((locs[:, None] + dims // 128 + layer_id + generation) % 5).float() - 2
+    ).to(torch.bfloat16)
+    return (values * amplitude).unsqueeze(1)
+
+
+def _locs(pages, seq_len, device):
+    return (
+        torch.tensor(pages, dtype=torch.int64, device=device)[:, None]
+        * _INDEXER_PAGE_SIZE
+        + torch.arange(_INDEXER_PAGE_SIZE, device=device)
+    ).flatten()[:seq_len]
+
+
+def _unpack_index(buf, pages, seq_len):
+    """Independent unpacking of [page FP8 keys | page FP32 scales]."""
+    selected = buf[pages.long()]
+    split = _INDEXER_PAGE_SIZE * _INDEXER_HEAD_DIM
+    keys = selected[:, :split].reshape(-1, _INDEXER_HEAD_DIM)[:seq_len]
+    scales = selected[:, split:].reshape(-1, 4)[:seq_len]
+    return keys, scales
+
+
+def _unpack_latent(buf, locs, packed):
+    """Decode reference rows independently of the production DSA kernels."""
+    selected = buf[locs]
+    if not packed:
+        return (
+            selected[..., :_INDEXER_KV_LORA_RANK],
+            selected[..., _INDEXER_KV_LORA_RANK:],
+        )
+    raw = selected.contiguous().view(torch.uint8)
+    scale_end = _INDEXER_KV_LORA_RANK + _INDEXER_KV_LORA_RANK // 128 * 4
+    values = raw[..., :_INDEXER_KV_LORA_RANK].view(torch.float8_e4m3fn).float()
+    scales = (
+        raw[..., _INDEXER_KV_LORA_RANK:scale_end]
+        .contiguous()
+        .view(torch.float32)
+        .repeat_interleave(128, dim=-1)
+    )
+    return (
+        (values * scales).to(torch.bfloat16),
+        raw[..., scale_end:].contiguous().view(torch.bfloat16),
+    )
+
+
+class _IndexerCacheCheck:
+    def __init__(self, group, packed):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang.srt.mem_cache.page_interleave import PageShardSpec
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveDSATokenToKVPool,
+        )
+
+        self.group = group
+        self.world = group.world_size
+        self.rank = group.rank_in_group
+        self.device = group.device
+        self.packed = packed
+        self.kwargs = kwargs = dict(
+            page_size=_INDEXER_PAGE_SIZE,
+            kv_lora_rank=_INDEXER_KV_LORA_RANK,
+            dtype=torch.float8_e4m3fn if packed else torch.bfloat16,
+            qk_rope_head_dim=_INDEXER_QK_ROPE,
+            layer_num=len(_INDEXER_SKIP_TOPK),
+            device=str(self.device),
+            index_head_dim=_INDEXER_HEAD_DIM,
+            enable_memory_saver=False,
+            kv_cache_dim=656 if packed else _INDEXER_KV_LORA_RANK + _INDEXER_QK_ROPE,
+            start_layer=_INDEXER_START_LAYER,
+            end_layer=_INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK) - 1,
+            skip_topk_layers=_INDEXER_SKIP_TOPK,
+        )
+        self.pool = PageInterleaveDSATokenToKVPool(
+            _INDEXER_SIZE,
+            **kwargs,
+            shard_spec=PageShardSpec(
+                shard_rank=self.rank,
+                shard_size=self.world,
+                page_size=_INDEXER_PAGE_SIZE,
+                max_prefix_tokens=8 * self.world * _INDEXER_PAGE_SIZE,
+                chunk_tokens=8 * _INDEXER_PAGE_SIZE,
+            ),
+            shard_group=group,
+        )
+        # Include each rank's reserved/padded physical page in the reference.
+        self.reference = DSATokenToKVPool(
+            (_INDEXER_SIZE + _INDEXER_PAGE_SIZE) * self.world, **kwargs
+        )
+
+    def rejects_kpool(self):
+        from sglang.srt.mem_cache.page_interleave import PageShardSpec
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveDSATokenToKVPool,
+        )
+
+        # A 128-token page with index_kpool=2 holds 64 indexer slots, so the
+        # token-unit location translation would address the wrong rows.
+        page_size = 2 * _INDEXER_PAGE_SIZE
+        with unittest.TestCase().assertRaisesRegex(
+            AssertionError, "does not support index_kpool=2"
+        ):
+            PageInterleaveDSATokenToKVPool(
+                _INDEXER_SIZE,
+                **{**self.kwargs, "page_size": page_size, "index_kpool": 2},
+                shard_spec=PageShardSpec(
+                    shard_rank=self.rank,
+                    shard_size=self.world,
+                    page_size=page_size,
+                    max_prefix_tokens=8 * self.world * page_size,
+                    chunk_tokens=8 * page_size,
+                ),
+                shard_group=self.group,
+            )
+
+    def store(self, locs, layer_id, generation):
+        values = _latent_values(locs, layer_id, generation)
+        for pool in (self.pool, self.reference):
+            pool.set_mla_kv_buffer(
+                SimpleNamespace(layer_id=layer_id),
+                locs,
+                values[..., :_INDEXER_KV_LORA_RANK].contiguous(),
+                values[..., _INDEXER_KV_LORA_RANK:].contiguous(),
+            )
+        if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
+            return
+        keys, scales = _index_values(locs, layer_id, generation)
+        write_scales = scales[:, 0] if generation % 2 else scales
+        for pool in (self.pool, self.reference):
+            pool.set_index_k_scale_buffer(layer_id, locs, keys, write_scales)
+
+        # Check the reference's packing independently, including both scales
+        # shapes accepted by SetKAndS and every valid token in partial pages.
+        buf = self.reference.index_key_cache.get_local_buffer(layer_id)
+        pages, offsets = locs // _INDEXER_PAGE_SIZE, locs % _INDEXER_PAGE_SIZE
+        unpacked_keys = buf[:, : _INDEXER_PAGE_SIZE * _INDEXER_HEAD_DIM].reshape(
+            -1, _INDEXER_PAGE_SIZE, _INDEXER_HEAD_DIM
+        )
+        unpacked_scales = buf[:, _INDEXER_PAGE_SIZE * _INDEXER_HEAD_DIM :].reshape(
+            -1, _INDEXER_PAGE_SIZE, 4
+        )
+        _assert_bytes(unpacked_keys[pages, offsets], keys, "reference FP8 keys")
+        _assert_bytes(unpacked_scales[pages, offsets], scales, "reference FP32 scales")
+
+    def assert_owned(self, layer_id):
+        local_layer = layer_id - _INDEXER_START_LAYER
+        owned = self.pool.index_key_cache.get_local_buffer(layer_id)
+        assert (
+            owned.data_ptr()
+            == self.pool.index_k_with_scale_buffer[local_layer].data_ptr()
+        )
+        if _INDEXER_SKIP_TOPK[local_layer]:
+            assert owned.shape[0] == 0
+            return
+        logical_pages = (
+            torch.arange(owned.shape[0], device=self.device) * self.world + self.rank
+        )
+        expected = self.reference.index_k_with_scale_buffer[local_layer][logical_pages]
+        # Comparing the whole allocation catches writes to foreign pages and
+        # overwrites of untouched bytes in a partially filled page.
+        _assert_bytes(owned, expected, f"owned index layer {layer_id}")
+
+    def seed(self, pages, generation):
+        self.pool.end_shard_extend()
+        locs = _locs(pages, len(pages) * _INDEXER_PAGE_SIZE, self.device)
+        for layer_id in range(
+            _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
+        ):
+            self.store(locs, layer_id, generation)
+            self.assert_owned(layer_id)
+
+    def assert_latent_reads(self, layer_id, rows):
+        # Cover every gathered prefix/chunk row in reverse order, repeated
+        # locations, partial pages, and a noncontiguous logical-location tensor.
+        all_locs = torch.cat(rows)
+        selected = torch.cat((all_locs.flip(0), all_locs[1:2].expand(2)))
+        storage = torch.empty(
+            selected.numel() * 2, dtype=selected.dtype, device=self.device
+        )
+        read_locs = storage[::2]
+        read_locs.copy_(selected)
+        reference = self.reference.kv_buffer[layer_id - _INDEXER_START_LAYER]
+        layer = SimpleNamespace(layer_id=layer_id)
+        for locs in (read_locs, read_locs[:0]):
+            expected = _unpack_latent(reference, locs, self.packed)
+            for dtype in (None, torch.bfloat16, torch.float16, torch.float32):
+                actual = self.pool.get_mla_kv_buffer(layer, locs, dst_dtype=dtype)
+                expected_dtype = dtype or torch.bfloat16
+                for got, value in zip(actual, expected):
+                    assert got.shape == value.shape
+                    assert got.dtype == expected_dtype
+                    assert got.is_contiguous()
+                    _assert_bytes(got, value.to(expected_dtype), "decoded latent KV")
+
+    def read_index(self, layer_id, pages, seq_len):
+        """Gather one request's keys and scales by logical page IDs."""
+        lengths = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
+        return self.pool.get_index_k_scale_buffer(
+            layer_id, lengths, pages[None], seq_len, seq_len
+        )
+
+    def batch(self, requests, generation):
+        """requests contains (logical pages, prefix token count, sequence length)."""
+        seq_lens = [seq_len for _, _, seq_len in requests]
+        prefix_lens = [prefix_len for _, prefix_len, _ in requests]
+        rows = [_locs(pages, seq_len, self.device) for pages, _, seq_len in requests]
+        # Nonconsecutive request IDs ensure the plan indexes req_pool_indices.
+        req_ids = torch.arange(len(rows), device=self.device) * 2 + 1
+        req_to_token = torch.zeros(
+            (2 * len(rows) + 1, max(seq_lens)), dtype=torch.int64, device=self.device
+        )
+        page_table = torch.zeros(
+            (len(rows), max(len(pages) for pages, _, _ in requests)),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for i, ((pages, _, seq_len), row) in enumerate(zip(requests, rows)):
+            req_to_token[req_ids[i], :seq_len] = row
+            page_table[i, : len(pages)] = torch.tensor(pages, device=self.device)
+        chunk_locs = torch.cat([row[p:] for row, p in zip(rows, prefix_lens)])
+        self.pool.begin_shard_extend(req_to_token, req_ids, prefix_lens, seq_lens)
+
+        for layer_id in range(
+            _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
+        ):
+            if chunk_locs.numel():
+                self.store(chunk_locs, layer_id, generation)
+            # Read before the raw-key accessor so MLA reads must themselves
+            # wait for the prefix allgather and include the locally staged chunk.
+            self.assert_latent_reads(layer_id, rows)
+            if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
+                assert self.pool.get_index_k_with_scale_buffer(layer_id).shape[0] == 0
+            # Every layer advances prefetch, including layers reusing top-k.
+            latent = self.pool.get_key_buffer(layer_id)
+            for row in rows:
+                scratch_rows = self.pool.translate_loc_to_scratch(row)
+                expected = self.reference.kv_buffer[layer_id - _INDEXER_START_LAYER][
+                    row
+                ]
+                _assert_bytes(latent[scratch_rows], expected, "latent KV")
+
+            self.assert_owned(layer_id)
+            if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
+                with unittest.TestCase().assertRaisesRegex(AssertionError, "skip-topk"):
+                    self.read_index(layer_id, page_table[0], 1)
+                continue
+
+            # Repeated public reads must preserve the resident layer while
+            # the next layer's NCCL allgather is in flight on the other slot.
+            for _ in range(2):
+                for i, (_, _, seq_len) in enumerate(requests):
+                    pages = page_table[i].contiguous()
+                    reference_buf = self.reference.get_index_k_with_scale_buffer(
+                        layer_id
+                    )
+                    expected_k, expected_s = _unpack_index(
+                        reference_buf, pages, seq_len
+                    )
+                    got_k, got_s = self.read_index(layer_id, pages, seq_len)
+                    _assert_bytes(got_k, expected_k, "per-request FP8 keys")
+                    _assert_bytes(got_s, expected_s, "per-request FP32 scales")
+                    scratch_pages = (
+                        self.pool.translate_loc_to_scratch(
+                            pages.long() * _INDEXER_PAGE_SIZE
+                        )
+                        // _INDEXER_PAGE_SIZE
+                    )
+                    raw = self.pool.get_index_k_with_scale_buffer(layer_id)
+                    raw_k, raw_s = _unpack_index(raw, scratch_pages, seq_len)
+                    _assert_bytes(raw_k, expected_k, "raw scratch FP8 keys")
+                    _assert_bytes(raw_s, expected_s, "raw scratch FP32 scales")
+
+                lengths = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+                got = self.pool.get_index_k_scale_buffer(
+                    layer_id, lengths, page_table, sum(seq_lens), max(seq_lens)
+                )
+                expected = self.reference.get_index_k_scale_buffer(
+                    layer_id, lengths, page_table, sum(seq_lens), max(seq_lens)
+                )
+                for actual, reference in zip(got, expected):
+                    _assert_bytes(actual, reference, "batched index gather")
+
+        self.pool.end_shard_extend()
+        for layer_id in range(
+            _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
+        ):
+            assert self.pool.get_index_k_with_scale_buffer(layer_id).data_ptr() == (
+                self.pool.index_key_cache.get_local_buffer(layer_id).data_ptr()
+            )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    def mutated_index_locations(self):
+        # Indexer callers may reuse the same storage with new logical locations;
+        # a write plan cached only by pointer/length must not survive that change.
+        mutable_loc = torch.empty(1, dtype=torch.int64, device=self.device)
+        for active in (False, True):
+            pages = torch.tensor(
+                [28 * self.world + 1, 29 * self.world], device=self.device
+            )
+            if active:
+                self.pool.begin_shard_extend(
+                    pages[:, None] * _INDEXER_PAGE_SIZE,
+                    torch.arange(2, device=self.device),
+                    [0, 0],
+                    [1, 1],
+                )
+            else:
+                with unittest.TestCase().assertRaisesRegex(
+                    AssertionError, "begin_shard_extend"
+                ):
+                    self.read_index(_INDEXER_START_LAYER, pages[:1], 1)
+
+            for layer_id in range(
+                _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
+            ):
+                # An empty store must also be harmless on a skip-topk layer.
+                empty_loc = mutable_loc[:0]
+                empty_k, empty_s = _index_values(empty_loc, layer_id, 1)
+                self.pool.set_index_k_scale_buffer(
+                    layer_id, empty_loc, empty_k, empty_s
+                )
+                if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
+                    continue
+
+                for i in range(2):
+                    mutable_loc.copy_(pages[i : i + 1] * _INDEXER_PAGE_SIZE)
+                    # Both an in-place mutation and another tensor object
+                    # aliasing the old allocation retain the same data pointer.
+                    loc = mutable_loc if i == 0 else mutable_loc.view_as(mutable_loc)
+                    keys, scales = _index_values(loc, layer_id, 7 + i + int(active))
+                    for pool in (self.pool, self.reference):
+                        pool.set_index_k_scale_buffer(layer_id, loc, keys, scales)
+                    self.assert_owned(layer_id)
+
+                if active:
+                    for i in range(2):
+                        expected_k, expected_s = _index_values(
+                            pages[i : i + 1] * _INDEXER_PAGE_SIZE, layer_id, 8 + i
+                        )
+                        got_k, got_s = self.read_index(layer_id, pages[i : i + 1], 1)
+                        _assert_bytes(got_k, expected_k, "mutated location FP8 keys")
+                        _assert_bytes(got_s, expected_s, "mutated location FP32 scales")
+            self.pool.end_shard_extend()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    def async_prefix(self, pages):
+        """Queue all layers' reads before synchronizing to exercise slot reuse."""
+        locs = _locs(pages, len(pages) * _INDEXER_PAGE_SIZE, self.device)
+        page_ids = torch.tensor(pages, dtype=torch.int32, device=self.device)
+        self.pool.begin_shard_extend(
+            locs[None, :],
+            torch.tensor([0], device=self.device),
+            [locs.numel()],
+            [locs.numel()],
+        )
+        scratch_pages = (
+            self.pool.translate_loc_to_scratch(page_ids.long() * _INDEXER_PAGE_SIZE)
+            // _INDEXER_PAGE_SIZE
+        )
+        snapshots = []
+        for layer_id in range(
+            _INDEXER_START_LAYER, _INDEXER_START_LAYER + len(_INDEXER_SKIP_TOPK)
+        ):
+            decoded = self.pool.get_mla_kv_buffer(
+                SimpleNamespace(layer_id=layer_id), locs
+            )
+            expected_latent = _unpack_latent(
+                self.reference.kv_buffer[layer_id - _INDEXER_START_LAYER],
+                locs,
+                self.packed,
+            )
+            snapshots.extend(zip(decoded, expected_latent))
+            raw = self.pool.get_index_k_with_scale_buffer(layer_id)
+            if _INDEXER_SKIP_TOPK[layer_id - _INDEXER_START_LAYER]:
+                assert raw.shape[0] == 0
+                continue
+            reference = self.reference.get_index_k_with_scale_buffer(layer_id)
+            snapshots.append((raw[scratch_pages].clone(), reference[page_ids]))
+            expected_k, expected_s = _unpack_index(reference, page_ids, locs.numel())
+            got_k, got_s = self.read_index(layer_id, page_ids, locs.numel())
+            snapshots.extend(((got_k, expected_k), (got_s, expected_s)))
+        torch.cuda.synchronize()
+        for actual, expected in snapshots:
+            _assert_bytes(actual, expected, "asynchronous layer pipeline")
+        self.pool.end_shard_extend()
+        torch.distributed.barrier()
+
+
+def _run_indexer(rank, world, init_method):
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+    )
+    os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+    os.environ["SGLANG_DEBUG_MEMORY_POOL"] = "1"
+    torch.cuda.set_device(rank)
+    from sglang.srt.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from sglang.srt.runtime_context import get_parallel
+
+    init_distributed_environment(
+        world_size=world,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=init_method,
+        backend="nccl",
+    )
+    publish_build_topology(tp_size=world, attn_cp_size=world, world_rank=rank)
+    initialize_model_parallel()
+    with get_parallel().override(attn_cp_size=world):
+        group = get_parallel().attn_cp_group
+        for packed in (False, True):
+            check = _IndexerCacheCheck(group, packed)
+            check.rejects_kpool()
+            # Fragmented physical pages with a rotated cyclic ownership run.
+            prefix = [
+                physical * world + (i + 1) % world
+                for i, physical in enumerate([5, 2, 9, 4, 7][: world + 1])
+            ]
+            check.seed(prefix, generation=1)
+            chunk = [12 * world + (world + 2) % world, 11 * world + (world + 3) % world]
+            check.batch(
+                [
+                    (
+                        prefix + chunk,
+                        len(prefix) * _INDEXER_PAGE_SIZE,
+                        (len(prefix) + 1) * _INDEXER_PAGE_SIZE + 13,
+                    ),
+                    (
+                        [prefix[0], 16 * world + 2 % world],
+                        _INDEXER_PAGE_SIZE,
+                        _INDEXER_PAGE_SIZE + 7,
+                    ),
+                ],
+                generation=2,
+            )
+            # Prefix-only batch: exactly one rank owns a page, all peers send
+            # padding. Also checks double-buffer epoch invalidation.
+            check.batch(
+                [([prefix[0]], _INDEXER_PAGE_SIZE, _INDEXER_PAGE_SIZE)], generation=3
+            )
+            fresh = [20 * world + world - 1, 21 * world]
+            check.batch([(fresh, 0, _INDEXER_PAGE_SIZE + 9)], generation=4)
+            # Same logical prefix and layer IDs, new bytes after page reuse.
+            check.seed([prefix[0]], generation=5)
+            check.batch(
+                [
+                    (
+                        [prefix[0], 23 * world + 2 % world],
+                        _INDEXER_PAGE_SIZE,
+                        _INDEXER_PAGE_SIZE + 19,
+                    )
+                ],
+                generation=6,
+            )
+            check.async_prefix(prefix)
+            check.mutated_index_locations()
+            print(f"rank {rank}: {'packed FP8' if packed else 'BF16'} DSA cache OK")
+            del check
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+class TestPageInterleaveIndexer(CustomTestCase):
+    def _test_world(self, world):
+        if torch.cuda.device_count() < world:
+            self.skipTest(f"indexer KV sharding test requires {world} GPUs")
+        with tempfile.TemporaryDirectory(prefix="sglang-indexer-shard-") as tmp:
+            mp.spawn(
+                _run_indexer,
+                args=(world, f"file://{tmp}/rendezvous"),
+                nprocs=world,
+                join=True,
+            )
+
+    def test_two_gpu(self):
+        self._test_world(2)
+
+    def test_four_gpu(self):
+        self._test_world(4)
 
 
 if __name__ == "__main__":

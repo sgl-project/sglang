@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
 
 class BaseIndexerMetadata(ABC):
+    def get_batched_indexer_page_table(self) -> torch.Tensor:
+        """Pages for the pool's batched gather (logical under KV sharding)."""
+        return self.get_page_table_64()
+
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
         """
@@ -104,6 +108,10 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
+
+    def get_batched_indexer_page_table(self) -> torch.Tensor:
+        logical = self.attn_metadata.logical_indexer_page_table
+        return logical if logical is not None else self.get_page_table_64()
 
     def get_page_table_1(self) -> torch.Tensor:
         return self.attn_metadata.page_table_1
