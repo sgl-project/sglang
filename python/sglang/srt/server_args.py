@@ -3324,7 +3324,8 @@ class ServerArgs:
         NS("disagg"),
         "Number of attention instances served by this FFN instance (FFN-side "
         "argument). All instances must complete their startup handshakes "
-        "before the FFN instance starts serving.",
+        "before the FFN instance starts serving. Staged backends automatically "
+        "batch compatible ready steps across multiple instances.",
     ] = 1
     afd_comm_sm_budget: A[
         Optional[int],

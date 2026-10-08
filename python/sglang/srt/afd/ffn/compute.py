@@ -144,13 +144,14 @@ class AFDFFNCompute:
                     )
         self._deepep_dispatch_limit = dispatch_limit
 
-    def configure_staged_capacity(
-        self,
-        plan: AFDFFNCapacityPlan,
-    ) -> None:
+    def configure_staged_capacity(self, plan: AFDFFNCapacityPlan) -> None:
         graph_buckets = list(plan.graph_token_buckets)
         self._max_graph_capacity = graph_buckets[-1] if graph_buckets else 0
-        self._graph_buckets = graph_buckets if not self._scattered else []
+        self._graph_buckets = (
+            graph_buckets
+            if not self._scattered or get_disagg().afd_attn_instances > 1
+            else []
+        )
 
         if self._uses_deepep_low_latency:
             self.configure_native_deepep_dispatch_limit(plan.deepep_dispatch_limit)
@@ -168,8 +169,6 @@ class AFDFFNCompute:
         self._allocate_graph_buffers(max_tokens)
 
     def capture_compute_graphs(self) -> None:
-        # Idempotent: with multiple attn sessions the shared compute graphs
-        # are captured once, on the first session that needs them.
         if not self._graph_buckets or self._graph_backend is not None:
             return
         self._prepare_graph_capture(self._graph_buckets[-1])

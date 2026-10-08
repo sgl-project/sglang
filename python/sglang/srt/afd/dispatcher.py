@@ -388,6 +388,7 @@ class AFDDispatcher:
         self._prepared_parent_graph_variant: Optional[AFDGraphCaptureVariant] = None
         self._current_batch_uses_paired_communication_graph = False
         self._capturing_parent_graph = False
+        self._use_eager_parent_graph_breaks = False
 
     @property
     def needs_empty_decode_dispatch(self) -> bool:
@@ -396,6 +397,24 @@ class AFDDispatcher:
             and self._forward_mode is not None
             and is_afd_fixed_shape_mode(self._forward_mode)
             and self._wire_capacity > 0
+        )
+
+    @property
+    def use_eager_parent_graph_breaks(self) -> bool:
+        return self._use_eager_parent_graph_breaks
+
+    def enable_local_parent_graph_variants(
+        self, variants: Sequence[AFDGraphCaptureVariant]
+    ) -> None:
+        self._enable_parent_graph_variants(variants, paired=False)
+        self._use_eager_parent_graph_breaks = True
+
+    def select_parent_graph_variant(self, can_run_graph: bool) -> bool:
+        variant = self._prepared_parent_graph_variant
+        return (
+            can_run_graph
+            and variant is not None
+            and len(variant.child_wire_capacities) > 1
         )
 
     def enable_communication_graph_variants(
@@ -821,6 +840,10 @@ class AFDDispatcher:
         self._active_handles.popleft()
         self._next_combine_index += 1
         return output
+
+    @property
+    def num_layers(self) -> int:
+        return len(self._layers)
 
     @property
     def current_num_children(self) -> int:

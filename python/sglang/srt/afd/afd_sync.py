@@ -14,15 +14,30 @@ logger = logging.getLogger(__name__)
 
 
 class AFDSyncMsg(msgspec.Struct, tag="sync", forbid_unknown_fields=True):
-    """Per-step metadata and the final paired communication graph decision."""
+    """Per-step forward metadata, sent immediately before the attn forward.
+
+    ``child_wire_capacities`` describes the ordered children of an opt-in
+    microbatch-overlap parent. It is empty for the existing serial path.
+    """
 
     step_id: int
+    # Effective token slots per attn DP rank after native DP padding.
     tokens_per_rank: List[int]
-    forward_mode: int
+    forward_mode: int  # ForwardMode value (extend/decode/idle/...)
+    # Common decode bucket. Eager SCATTERED prefill derives each pair's exact
+    # first dimension from tokens_per_rank instead.
     wire_capacity: int
-    # NCCL peers must both replay paired graphs or both execute eagerly.
+    # Final A-side graph decision. NCCL requires both peers to either replay
+    # their paired graphs or execute eagerly for a given step.
     communication_graph: bool = False
+    # Ordered child wire capacities for the opt-in decode-overlap parent. Empty
+    # keeps the existing single-work path.
     child_wire_capacities: tuple[int, ...] = ()
+
+    @property
+    def effective_child_wire_capacities(self) -> tuple[int, ...]:
+        """Ordered child capacities, including serial work as one child."""
+        return self.child_wire_capacities or (self.wire_capacity,)
 
 
 _sync_decoder = msgspec.msgpack.Decoder(AFDSyncMsg)

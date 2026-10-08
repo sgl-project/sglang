@@ -294,9 +294,10 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                         if backend == "deepep"
                         else 1
                     )
+                    buckets = result.peer.decode_graph_token_buckets
+                    self.assertIn(graph_capacity * fan_in, buckets)
                     self.assertEqual(
-                        result.peer.decode_graph_token_buckets,
-                        [graph_capacity * fan_in],
+                        buckets[-1], graph_capacity * fan_in * num_sessions
                     )
 
     def test_handshake_rejects_invalid_model_or_graph_capacity_on_both_peers(self):

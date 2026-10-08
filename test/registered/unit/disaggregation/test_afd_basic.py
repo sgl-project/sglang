@@ -27,6 +27,7 @@ from sglang.srt.afd.comm.base import AFDCommConfig
 from sglang.srt.afd.dispatcher import AFDDispatcher
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
+from sglang.srt.afd.ffn.scheduler import _AFDFFNCohortSelector
 from sglang.srt.afd.layers import AFDMoELayer
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
@@ -486,9 +487,7 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
         ffn = AFDHandshakeInfo("ffn", "model", 2, [], "nccl", "deepep", "float32", [])
         attn.decode_graph_token_buckets = [32, 64]
         ffn.decode_graph_token_buckets = [1]
-        plan = build_afd_ffn_capacity_plan(
-            ffn, (attn, attn), use_deepep_low_latency=True
-        )
+        plan = build_afd_ffn_capacity_plan(ffn, (attn,), use_deepep_low_latency=True)
         self.assertEqual(plan.graph_token_buckets, (64, 128))
         self.assertEqual(plan.deepep_dispatch_limit, 192)
         inners = [
@@ -518,7 +517,8 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             )
         attn.decode_token_buckets = [32, 64, 512]
         self.assertEqual(
-            build_afd_ffn_capacity_plan(ffn, (attn,), True).deepep_dispatch_limit, 1024
+            build_afd_ffn_capacity_plan(ffn, (attn,), True).deepep_dispatch_limit,
+            1024,
         )
         attn.decode_token_buckets = [32, 64, 513]
         with self.assertRaisesRegex(RuntimeError, "required=1026"):
@@ -528,7 +528,8 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
         )
         attn.decode_graph_token_buckets = []
         self.assertEqual(
-            build_afd_ffn_capacity_plan(ffn, (attn,), False).graph_token_buckets, ()
+            build_afd_ffn_capacity_plan(ffn, (attn,), False).graph_token_buckets,
+            (),
         )
 
     def test_staged_fixed_buffer_padding_reuse_and_prefill_exact_size(self):
@@ -734,7 +735,7 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                     step_id, [capacity], ForwardMode.DECODE, capacity
                 )
                 self.assertEqual(transport.return_value.send.call_count, step_id)
-                decision = _decide_afd_attn_graph(can_run_graph, dispatcher)
+                decision = _decide_afd_attn_graph(can_run_graph, dispatcher, False)
                 self.assertEqual(decision.use_local_model_graph, expected)
                 sender.send_prepared(decision.use_paired_communication_graph)
                 self.assertEqual(
@@ -797,6 +798,144 @@ class TestAFDSchedulerRouting(unittest.TestCase):
         self.assertIs(actual, result)
         scheduler._run_batch_prebuilt.assert_called_once_with(batch)
         scheduler._afd_pre_run_batch.assert_not_called()
+
+
+class TestAFDCohortSelection(unittest.TestCase):
+    @staticmethod
+    def _msg(step_id: int, wire_capacity: int = 1) -> AFDSyncMsg:
+        return AFDSyncMsg(
+            step_id=step_id,
+            tokens_per_rank=[1],
+            forward_mode=int(ForwardMode.DECODE),
+            wire_capacity=wire_capacity,
+        )
+
+    def test_step_boundary_policy(self):
+        selector = _AFDFFNCohortSelector(join_timeout_us=10)
+
+        def can_cohort(_session_id, _msg):
+            return True
+
+        def cohort_cost(_session_id, msg):
+            return (msg.wire_capacity,)
+
+        def select(now_ns, *, capacity=None):
+            return selector.select(
+                now_ns,
+                can_cohort=can_cohort,
+                cohort_cost=cohort_cost,
+                cohort_capacity=capacity,
+            )
+
+        selector.add(0, self._msg(0))
+        self.assertTrue(selector.has_pending_session(0))
+        self.assertFalse(selector.has_pending_session(1))
+        self.assertIsNone(select(0))
+        action = select(10_000)
+        self.assertEqual([session_id for session_id, _ in action], [0])
+        self.assertFalse(selector.has_pending_session(0))
+
+        selector.add(0, self._msg(1))
+        action = select(10_001)
+        self.assertEqual([session_id for session_id, _ in action], [0])
+
+        selector.add(1, self._msg(0))
+        self.assertIsNone(select(10_002))
+        selector.add(0, self._msg(2))
+        action = select(10_003)
+        self.assertEqual([session_id for session_id, _ in action], [1, 0])
+
+        selector.add(1, self._msg(1))
+        self.assertIsNone(select(10_004))
+        self.assertIsNone(select(20_003))
+        action = select(20_004)
+        self.assertEqual([session_id for session_id, _ in action], [1])
+
+        selector.add(0, self._msg(3))
+        selector.add(1, self._msg(2))
+        selector.add(2, self._msg(0))
+        action = select(20_005)
+        self.assertEqual([session_id for session_id, _ in action], [0, 1, 2])
+
+        selector.add(0, self._msg(4, wire_capacity=2))
+        selector.add(1, self._msg(3, wire_capacity=2))
+        selector.add(2, self._msg(1, wire_capacity=1))
+        action = select(20_006, capacity=3)
+        self.assertEqual([session_id for session_id, _ in action], [0, 2])
+
+        self.assertIsNone(select(30_005, capacity=3))
+        action = select(30_006, capacity=3)
+        self.assertEqual([session_id for session_id, _ in action], [1])
+
+
+def _handshake_info(
+    role: str,
+    num_ranks: int = 2,
+    backend: str = "nccl",
+    decode_token_buckets=None,
+    decode_graph_token_buckets=None,
+    afd_ffn_moe_backend: str = "none",
+    decode_num_microbatches: int = 1,
+):
+    return AFDHandshakeInfo(
+        role=role,
+        model_identity="m:abc",
+        num_ranks=num_ranks,
+        rank_node_ids=["node-0"] * num_ranks,
+        afd_backend=backend,
+        afd_ffn_moe_backend=afd_ffn_moe_backend,
+        wire_dtype="bfloat16",
+        moe_layers=[],
+        decode_token_buckets=(
+            [] if decode_token_buckets is None else decode_token_buckets
+        ),
+        decode_graph_token_buckets=(
+            [] if decode_graph_token_buckets is None else decode_graph_token_buckets
+        ),
+        decode_num_microbatches=decode_num_microbatches,
+    )
+
+
+class TestAFDHandshake(unittest.TestCase):
+    def test_staged_ffn_capacity_uses_graph_children_and_transport_max(self):
+        ffn = _handshake_info(
+            "ffn",
+            num_ranks=2,
+            afd_ffn_moe_backend="deepep",
+            decode_graph_token_buckets=[1],
+        )
+        attn0 = _handshake_info(
+            "attn",
+            num_ranks=4,
+            afd_ffn_moe_backend="deepep",
+            decode_token_buckets=[32, 64, 96],
+            decode_graph_token_buckets=[64],
+            decode_num_microbatches=2,
+        )
+        attn1 = _handshake_info(
+            "attn",
+            num_ranks=2,
+            afd_ffn_moe_backend="deepep",
+            decode_token_buckets=[16, 32, 64],
+            decode_graph_token_buckets=[32],
+            decode_num_microbatches=2,
+        )
+
+        single = build_afd_ffn_capacity_plan(ffn, (attn0,), True)
+        self.assertEqual(single.graph_token_buckets, (64,))
+        self.assertEqual(single.deepep_dispatch_limit, 192)
+
+        cohort = build_afd_ffn_capacity_plan(ffn, (attn0, attn1), True)
+        self.assertEqual(cohort.graph_token_buckets, (16, 64, 72, 80))
+        self.assertEqual(cohort.deepep_dispatch_limit, 256)
+
+        ffn.disable_cuda_graph_padding = True
+        exact = build_afd_ffn_capacity_plan(ffn, (attn0, attn1), True)
+        self.assertEqual(exact.graph_token_buckets, (16, 64, 80))
+
+        attn0.decode_token_buckets[-1] = 2048
+        normal = build_afd_ffn_capacity_plan(ffn, (attn0,), False)
+        self.assertIsNone(normal.deepep_dispatch_limit)
 
 
 if __name__ == "__main__":

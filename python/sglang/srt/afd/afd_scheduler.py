@@ -13,6 +13,7 @@ from sglang.srt.afd.afd_handshake import (
     AFDGraphCapturePlan,
     AFDGraphCaptureVariant,
     AFDHandshakeResult,
+    build_afd_attn_local_graph_variants,
     build_afd_graph_capture_plan,
     run_handshake_attn,
 )
@@ -33,9 +34,9 @@ from sglang.srt.afd.scheduler_common import (
     should_log_step,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_disagg, get_exec, get_parallel
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:
@@ -171,12 +172,25 @@ class AFDSyncSender:
 def _decide_afd_attn_graph(
     can_run_graph: bool,
     dispatcher: AFDDispatcher,
+    force_eager_communication: bool,
 ) -> AFDAttnGraphDecision:
     use_paired_communication_graph = dispatcher.select_paired_communication_graph(
-        can_run_graph
+        False if force_eager_communication else can_run_graph
     )
+    if dispatcher.current_num_children > 1:
+        use_local_model_graph = dispatcher.select_parent_graph_variant(
+            can_run_graph
+            if force_eager_communication
+            else use_paired_communication_graph
+        )
+    else:
+        use_local_model_graph = (
+            can_run_graph
+            if force_eager_communication
+            else use_paired_communication_graph
+        )
     return AFDAttnGraphDecision(
-        use_local_model_graph=use_paired_communication_graph,
+        use_local_model_graph=use_local_model_graph,
         use_paired_communication_graph=use_paired_communication_graph,
     )
 
@@ -369,6 +383,22 @@ def init_afd_attn(
             [], rank, get_parallel().tp_group.cpu_group, src=0
         )
 
+    force_eager_communication = handshake.requires_eager_decode_communication
+    decode_config = get_exec().graph.cuda_graph_config.decode
+    if force_eager_communication and decode_config.backend == Backend.FULL:
+        logger.info(
+            "AFD NCCL cohort: switching the attn decode CUDA graph backend "
+            "from full to breakable for eager remote-expert communication"
+        )
+        get_context().override(
+            "afd_cohort_decode_graph",
+            cuda_graph_config=with_phase(
+                get_exec().graph.cuda_graph_config,
+                Phase.DECODE,
+                backend=Backend.BREAKABLE,
+            ),
+        )
+
     plan = build_afd_graph_capture_plan(handshake)
     backend = init_afd_comm_backend(scheduler, AFDRole.ATTN, handshake)
     model_runner = scheduler.tp_worker.model_runner
@@ -382,6 +412,13 @@ def init_afd_attn(
         num_slots=handshake.local.decode_num_microbatches,
     )
     set_afd_dispatcher(dispatcher)
+    local_graph_variants = build_afd_attn_local_graph_variants(handshake)
+    if local_graph_variants:
+        dispatcher.enable_local_parent_graph_variants(local_graph_variants)
+        logger.info(
+            "AFD attn local microbatch-overlap Breakable Graph enabled: variants=%d",
+            len(local_graph_variants),
+        )
     _capture_afd_attn_communication_graphs(
         scheduler,
         backend,
@@ -391,7 +428,9 @@ def init_afd_attn(
     sender = AFDSyncSender(handshake) if rank == 0 else None
 
     def select_local_model_graph(can_run_graph: bool) -> bool:
-        decision = _decide_afd_attn_graph(can_run_graph, dispatcher)
+        decision = _decide_afd_attn_graph(
+            can_run_graph, dispatcher, force_eager_communication
+        )
         if sender is not None:
             sender.send_prepared(decision.use_paired_communication_graph)
         return decision.use_local_model_graph

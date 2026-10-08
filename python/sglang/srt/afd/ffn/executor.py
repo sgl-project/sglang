@@ -91,6 +91,8 @@ class AFDFFNExecutor:
         )
         self._decode_step_graph: _AFDFFNDecodeStepGraph | None = None
         self._decode_num_microbatches = handshake.peer.decode_num_microbatches
+        self._cohort_graph_child_plans: frozenset[tuple[int, ...]] = frozenset()
+        self._max_scattered_source_count = 0
         staged_overlap = self._decode_num_microbatches > 1
         self._communication_stream = (
             torch.cuda.Stream(device=self._device) if staged_overlap else None
@@ -158,6 +160,10 @@ class AFDFFNExecutor:
             decode_token_buckets = [
                 capacity * source_count for capacity in decode_token_buckets
             ]
+            self._max_scattered_source_count = (
+                self._comm.config.num_attn_ranks + self._num_ranks - 1
+            ) // self._num_ranks
+        self._decode_token_buckets = tuple(decode_token_buckets)
         decode_pool_token_buckets = decode_token_buckets
         if self._decode_transport is None:
             decode_pool_token_buckets = sorted(
@@ -195,6 +201,9 @@ class AFDFFNExecutor:
         self,
         plan: AFDGraphCapturePlan,
     ) -> None:
+        self._cohort_graph_child_plans = frozenset(
+            tuple(variant.child_wire_capacities) for variant in plan.attn_graph_variants
+        )
         if not plan.enabled:
             return
 
@@ -330,6 +339,80 @@ class AFDFFNExecutor:
             hidden_states[rows].copy_(views.hidden_states)
             topk_ids[rows].copy_(views.topk_ids)
             topk_weights[rows].copy_(views.topk_weights)
+
+    def _can_run_cohort(self, msg: AFDSyncMsg) -> bool:
+        if not is_afd_fixed_shape_mode(ForwardMode(msg.forward_mode)) or not sum(
+            msg.tokens_per_rank
+        ):
+            return False
+        if msg.communication_graph and self._decode_transport is None:
+            return False
+        if not msg.child_wire_capacities:
+            return True
+        return (
+            self._decode_num_microbatches > 1
+            and len(msg.child_wire_capacities) == self._decode_num_microbatches
+        )
+
+    def _recv_decode_child(
+        self,
+        layer_id: int,
+        child: _PreparedDecodeChild,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        capture_transport: bool = False,
+    ) -> None:
+        transport = self._decode_transport
+        if transport is not None:
+            if capture_transport or child.slot_id != 0:
+                transport.launch_wait_request(slot_id=child.slot_id)
+            else:
+                transport.wait_request()
+            self._copy_decode_inputs(
+                layer_id,
+                child.source_segments,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                slot_id=child.slot_id,
+            )
+            return
+
+        self._recv_source_inputs(
+            child.source_segments, hidden_states, topk_ids, topk_weights
+        )
+
+    def _send_decode_child(
+        self,
+        layer_id: int,
+        child: _PreparedDecodeChild,
+        output: torch.Tensor,
+    ) -> None:
+        transport = self._decode_transport
+        if transport is not None:
+            for peer_global_rank, capacity, rows in child.source_segments:
+                views = transport.decode_views(
+                    layer_id,
+                    capacity,
+                    slot_id=child.slot_id,
+                    peer_global_rank=peer_global_rank,
+                )
+                views.output.copy_(output[rows])
+                transport.put_response(
+                    layer_id,
+                    capacity,
+                    slot_id=child.slot_id,
+                    peer_global_rank=peer_global_rank,
+                )
+            return
+
+        for peer_global_rank, capacity, rows in child.source_segments:
+            self._comm.send_to(
+                [output[rows].contiguous()],
+                peer_global_rank,
+            )
 
     def _run_integrated_graph_step(
         self,

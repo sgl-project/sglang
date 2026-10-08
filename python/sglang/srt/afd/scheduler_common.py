@@ -135,6 +135,11 @@ def build_local_handshake_info(
         decode_num_microbatches=(
             get_disagg().afd_decode_num_microbatches if role.is_attn() else 1
         ),
+        requires_eager_decode_communication=(
+            role.is_ffn()
+            and get_disagg().afd_backend == "nccl"
+            and get_disagg().afd_attn_instances > 1
+        ),
         afd_comm_sm_budget=get_disagg().afd_comm_sm_budget,
         moe_layers=[
             {

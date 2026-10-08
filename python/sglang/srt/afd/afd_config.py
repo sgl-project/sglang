@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -262,6 +263,13 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
         )
     if cfg.afd_attn_instances < 1:
         raise ValueError("--afd-attn-instances must be at least 1")
+    if (
+        cfg.afd_attn_instances > 1
+        and envs.SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US.get() < 0
+    ):
+        raise ValueError(
+            "SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US must be non-negative"
+        )
     if cfg.moe_a2a_backend not in ("none", "deepep"):
         raise ValueError(
             "AFD ffn instance supports --moe-a2a-backend none or deepep; "

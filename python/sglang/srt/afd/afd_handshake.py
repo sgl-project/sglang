@@ -46,6 +46,8 @@ class AFDHandshakeInfo:
     decode_graph_token_buckets: list[int] = field(default_factory=list, repr=False)
     disable_cuda_graph_padding: bool = False
     decode_num_microbatches: int = 1
+    # F-authoritative graph policy negotiated before A captures decode graphs.
+    requires_eager_decode_communication: bool = False
     afd_comm_sm_budget: int | None = None
     rank_nvshmem_fabric_keys: list[tuple[bytes, int] | None] = field(
         default_factory=list, repr=False
@@ -86,6 +88,11 @@ class AFDHandshakeResult:
     nvshmem_uid: bytes | None = None
     session_id: int = 0
     attn_members: tuple[AFDHandshakeInfo, ...] | None = None
+
+    @property
+    def requires_eager_decode_communication(self) -> bool:
+        ffn = self.local if self.local.role == "ffn" else self.peer
+        return ffn.requires_eager_decode_communication
 
 
 def select_nvshmem_remote_transport(
@@ -206,6 +213,7 @@ def build_afd_ffn_capacity_plan(
     graph_enabled = bool(ffn.decode_graph_token_buckets)
     scattered = ffn.afd_ffn_moe_backend == "deepep"
     graph_capacities: set[int] = set()
+    graph_capacities_by_session: list[set[int]] = []
     graph_maxima: list[int] = []
     dispatch_maxima: list[int] = []
 
@@ -219,11 +227,12 @@ def build_afd_ffn_capacity_plan(
             for child_wire_capacity in child_wire_capacities
         }
         graph_capacities.update(session_graph_capacities)
+        graph_capacities_by_session.append(session_graph_capacities)
         graph_maxima.append(max(session_graph_capacities, default=0))
         if scattered and use_deepep_low_latency and attn.decode_token_buckets:
             dispatch_maxima.append(max(attn.decode_token_buckets) * fan_in)
 
-    graph_max_capacity = max(graph_maxima, default=0)
+    graph_max_capacity = sum(graph_maxima)
     deepep_dispatch_limit = None
     if scattered and dispatch_maxima:
         max_single_session = max(dispatch_maxima)
@@ -233,7 +242,7 @@ def build_afd_ffn_capacity_plan(
                 "per rank for one attn session; "
                 f"required={max_single_session}"
             )
-        deepep_dispatch_limit = max_single_session
+        deepep_dispatch_limit = min(sum(dispatch_maxima), 1024)
         # Preserve native DeepEP's default capacity for small admission limits;
         # shrinking its expert buffers can produce incorrect masked-GEMM results.
         deepep_dispatch_limit = max(
@@ -250,7 +259,14 @@ def build_afd_ffn_capacity_plan(
     if not graph_enabled or not graph_max_capacity:
         graph_buckets: tuple[int, ...] = ()
     elif ffn.disable_cuda_graph_padding:
-        exact_capacities = set(graph_capacities)
+        exact_capacities = {0}
+        for session_capacities in graph_capacities_by_session:
+            exact_capacities |= {
+                base + capacity
+                for base in tuple(exact_capacities)
+                for capacity in session_capacities
+                if base + capacity <= graph_max_capacity
+            }
         graph_buckets = tuple(
             sorted(
                 capacity
@@ -273,9 +289,40 @@ def build_afd_ffn_capacity_plan(
     )
 
 
+def build_afd_attn_local_graph_variants(
+    handshake: AFDHandshakeResult,
+) -> tuple[AFDGraphCaptureVariant, ...]:
+    if not handshake.requires_eager_decode_communication:
+        return ()
+    attn = handshake.local if handshake.local.role == "attn" else handshake.peer
+    if attn.decode_num_microbatches <= 1:
+        return ()
+    return tuple(
+        AFDGraphCaptureVariant(
+            attn_batch_size=attn_batch_size,
+            attn_wire_capacity=attn_wire_capacity,
+            child_wire_capacities=child_wire_capacities,
+            child_compute_capacities=(None,) * len(child_wire_capacities),
+        )
+        for attn_batch_size, attn_wire_capacity, child_wire_capacities in (
+            _build_attn_graph_shapes(attn)
+        )
+        if len(child_wire_capacities) == attn.decode_num_microbatches
+    )
+
+
 def build_afd_graph_capture_plan(
     handshake: AFDHandshakeResult,
 ) -> AFDGraphCapturePlan:
+
+    if handshake.requires_eager_decode_communication:
+        # F chooses singleton/cohort membership only after receiving A's
+        # control message. Keep NCCL outside the A model graph so that this
+        # late decision does not require paired multi-session graph replay.
+        return AFDGraphCapturePlan(
+            attn_graph_variants=(),
+            ffn_graph_variants=(),
+        )
 
     attn = handshake.local if handshake.local.role == "attn" else handshake.peer
     ffn = handshake.local if handshake.local.role == "ffn" else handshake.peer

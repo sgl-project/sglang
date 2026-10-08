@@ -20,7 +20,9 @@ from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -36,6 +38,15 @@ class AFDMoELayer:
     routed_scaling_factor: Optional[float]
 
 
+@dataclass
+class _AFDGraphBreakHandle:
+    input_tokens: int
+    hidden_size: int
+    dtype: torch.dtype
+    device: torch.device
+    handle: Optional[AFDWorkHandle] = None
+
+
 @dataclass(frozen=True)
 class _AFDCommunicationGraphHandle:
     handle: AFDWorkHandle
@@ -45,7 +56,7 @@ class _AFDCommunicationGraphHandle:
         return self.handle.input_tokens
 
 
-AFDDispatchHandle = AFDWorkHandle | _AFDCommunicationGraphHandle
+AFDDispatchHandle = AFDWorkHandle | _AFDGraphBreakHandle | _AFDCommunicationGraphHandle
 
 
 @eager_on_graph(True)
@@ -55,12 +66,56 @@ def _run_remote_experts(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    if get_is_capture_mode():
+    # Breakable replay is also reported by get_is_capture_mode(); only
+    # capture warmup should skip the actual remote-expert call.
+    if capture_mode.is_capture_mode:
         return torch.zeros_like(hidden_states)
 
     dispatcher = get_afd_dispatcher()
     handle = dispatcher.dispatch(layer_id, hidden_states, topk_ids, topk_weights)
     return dispatcher.combine(handle)
+
+
+@eager_on_graph(True)
+def _dispatch_overlap_remote_experts(
+    bridge: _AFDGraphBreakHandle,
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    if bridge.handle is not None:
+        raise RuntimeError("AFD overlap dispatch bridge is still active")
+    dispatcher = get_afd_dispatcher()
+    if capture_mode.is_capture_mode:
+        return
+
+    bridge.handle = dispatcher.dispatch(
+        layer_id,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+    )
+
+
+@eager_on_graph(True)
+def _combine_overlap_remote_experts(
+    bridge: _AFDGraphBreakHandle,
+) -> torch.Tensor:
+    dispatcher = get_afd_dispatcher()
+    if capture_mode.is_capture_mode:
+        return torch.zeros(
+            (bridge.input_tokens, bridge.hidden_size),
+            dtype=bridge.dtype,
+            device=bridge.device,
+        )
+    handle = bridge.handle
+    if handle is None:
+        raise RuntimeError("AFD overlap combine has no active dispatch handle")
+    try:
+        return dispatcher.combine(handle)
+    finally:
+        bridge.handle = None
 
 
 class AFDAttnMoE(nn.Module):
@@ -133,9 +188,29 @@ class AFDAttnMoE(nn.Module):
                     topk_output.topk_weights,
                 ),
             )
-        return dispatcher.dispatch(
-            self.layer_id, hidden_states, topk_output.topk_ids, topk_output.topk_weights
+        if not (
+            dispatcher.use_eager_parent_graph_breaks and is_in_breakable_cuda_graph()
+        ):
+            return dispatcher.dispatch(
+                self.layer_id,
+                hidden_states,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+            )
+        bridge = _AFDGraphBreakHandle(
+            input_tokens=hidden_states.shape[0],
+            hidden_size=hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
+        _dispatch_overlap_remote_experts(
+            bridge,
+            self.layer_id,
+            hidden_states,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+        )
+        return bridge
 
     def combine_afd(
         self,
@@ -146,6 +221,8 @@ class AFDAttnMoE(nn.Module):
                 self.layer_id,
                 handle.handle,
             )
+        if isinstance(handle, _AFDGraphBreakHandle):
+            return _combine_overlap_remote_experts(handle)
         return get_afd_dispatcher().combine(handle)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):

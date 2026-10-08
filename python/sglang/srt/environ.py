@@ -684,6 +684,8 @@ class Envs:
     # AFD (Attention-FFN Disaggregation)
     SGLANG_AFD_HANDSHAKE_TIMEOUT_S = EnvInt(600)
     SGLANG_AFD_LOG_INTERVAL = EnvInt(100)
+    # F-side staged multi-A join window; zero only batches already-ready work.
+    SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US = EnvInt(0)
 
     # ===================================================================
     # Distributed and model-parallel runtime
