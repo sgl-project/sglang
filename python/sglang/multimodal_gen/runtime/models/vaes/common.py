@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_world_size,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
     model_parallel_is_initialized,
@@ -82,6 +83,8 @@ def should_run_spatial_shard_parallel_decode(
 
 class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     layerwise_offload_dit_group_enabled = False
+    # decode(z, on_frames=...) hands out finished frames while it decodes
+    supports_decode_on_frames = False
     layer_names = [
         "encoder.down_blocks",
         "decoder.up_blocks",
@@ -286,7 +289,8 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
         """
-        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
+        sp_group = get_sp_group()
+        world_size, rank = sp_group.world_size, sp_group.rank_in_group
         _, _, T, H, W = z.shape
 
         tile_latent_min_height = (
@@ -361,7 +365,7 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             torch.zeros(1, device=results.device, dtype=torch.int64)
             for _ in range(world_size)
         ]
-        dist.all_gather(all_sizes, local_size)
+        dist.all_gather(all_sizes, local_size, group=sp_group.device_group)
         max_size = max(size.item() for size in all_sizes)
 
         padded_results = torch.zeros(
@@ -375,8 +379,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
         )
-        all_gather_single(gathered_results, padded_results)
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
+        all_gather_single(
+            gathered_results.view(-1), padded_results, group=sp_group.device_group
+        )
+        dist.all_gather_object(
+            gathered_dim_metadata, local_dim_metadata, group=sp_group.cpu_group
+        )
         gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
 
         data: list = [

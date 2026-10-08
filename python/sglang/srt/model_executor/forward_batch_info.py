@@ -556,6 +556,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    dllm_input_preparation_state: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None

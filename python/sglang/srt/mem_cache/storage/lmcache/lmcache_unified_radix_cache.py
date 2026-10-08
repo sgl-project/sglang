@@ -87,6 +87,20 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        # match_prefix may append loaded slots not yet published to the tree,
+        # so the path alone can be shorter than the prefix.
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        indices = path[: req.prefix_len]
+        missing = req.prefix_len - len(indices)
+        if missing > 0:
+            load = self._external_flows[req.rid].load
+            skip = max(len(indices) - load.local_hit_tokens, 0)
+            indices = torch.cat([indices, load.device_indices[skip : skip + missing]])
+        assert len(indices) == req.prefix_len, (req.rid, len(indices), req.prefix_len)
+        return indices
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Report LMCache hits through host fields until GPU slots are ready."""
         requested_key_len = len(params.key)
@@ -832,19 +846,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
         # Move the request lock to the published boundary.
-        if req.last_node is not None:
-            self._dec_req_lock(req)
-        lock_result = self.inc_lock_ref(matched.last_device_node)
-        if total_hit < token_ids_len:
-            req.prefix_indices = torch.cat(
-                [canonical, kv_indices[total_hit:].to(dtype=torch.int64, copy=True)]
-            )
-        else:
-            req.prefix_indices = canonical
+        self.unlock(req.lock)
+        req.lock = self.lock(matched.last_device_node)
         req.kv.cache_protected_len = total_hit
         req.last_node = matched.last_device_node
-        req.lock_receipt = lock_result.to_dec_params()
-        req.swa_prefix_lock_released = False
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None
