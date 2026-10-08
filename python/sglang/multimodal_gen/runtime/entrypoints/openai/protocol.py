@@ -100,12 +100,13 @@ class VideoResponse(BaseModel):
     seconds: str = "4"
     quality: str = "standard"
     url: Optional[str] = None
+    urls: Optional[List[Optional[str]]] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
-    file_paths: Optional[List[str]] = None
+    file_paths: Optional[List[Optional[str]]] = None
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
