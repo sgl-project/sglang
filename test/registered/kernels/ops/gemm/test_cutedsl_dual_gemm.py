@@ -312,20 +312,33 @@ class TestCuteDSLDualGemm(CustomTestCase):
     def test_can_use_dual_gemm(self):
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import can_use_dual_gemm
 
-        self.assertTrue(can_use_dual_gemm(1, 4096, 14336))
-        self.assertTrue(can_use_dual_gemm(4, 4096, 14336))
-        self.assertTrue(can_use_dual_gemm(8, 4096, 14336))
-        self.assertTrue(can_use_dual_gemm(16, 4096, 14336))
-        self.assertTrue(can_use_dual_gemm(1, 3584, 18944))
-        self.assertFalse(can_use_dual_gemm(1, 8192, 28672))
-        self.assertFalse(can_use_dual_gemm(17, 4096, 14336))
-        self.assertFalse(can_use_dual_gemm(1, 4095, 14336))
-        self.assertFalse(can_use_dual_gemm(1, 4096, 14335))
+        static_mode = DualGemmQuantMode.STATIC_PER_TENSOR
+        dynamic_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
+        self.assertTrue(can_use_dual_gemm(1, 4096, 14336, dynamic_mode))
+        self.assertTrue(can_use_dual_gemm(4, 4096, 14336, dynamic_mode))
+        self.assertTrue(can_use_dual_gemm(8, 4096, 14336, dynamic_mode))
+        self.assertTrue(can_use_dual_gemm(16, 4096, 14336, dynamic_mode))
+        self.assertTrue(can_use_dual_gemm(1, 3584, 18944, static_mode))
+        self.assertTrue(can_use_dual_gemm(1, 8192, 28672, static_mode))
+        self.assertFalse(can_use_dual_gemm(1, 8192, 28672, dynamic_mode))
+        self.assertFalse(can_use_dual_gemm(17, 4096, 14336, static_mode))
+        self.assertFalse(can_use_dual_gemm(1, 4095, 14336, static_mode))
+        self.assertFalse(can_use_dual_gemm(1, 4096, 14335, static_mode))
+
+        with patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=type("Properties", (), {"multi_processor_count": 132})(),
+        ):
+            self.assertFalse(can_use_dual_gemm(1, 3584, 18944, dynamic_mode))
+            self.assertFalse(can_use_dual_gemm(16, 3584, 18944, dynamic_mode))
+            self.assertTrue(can_use_dual_gemm(1, 3584, 18944, static_mode))
+
         with patch(
             "sglang.kernels.ops.gemm.cutedsl_dual_gemm.is_sm100_supported",
             return_value=False,
         ):
-            self.assertFalse(can_use_dual_gemm(1, 4096, 14336))
+            self.assertFalse(can_use_dual_gemm(1, 4096, 14336, static_mode))
 
     def test_tactic_selection(self):
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (

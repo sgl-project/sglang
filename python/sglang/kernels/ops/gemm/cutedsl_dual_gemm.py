@@ -49,7 +49,6 @@ _THREADS = 256
 _FP8_MAX = 448.0
 _NARROW_CTA_SMEM_BYTES = 112 * 1024
 MAX_DUAL_GEMM_DECODE_TOKENS = 16
-MAX_DUAL_GEMM_INTERMEDIATE_SIZE = 18944
 
 
 class DualGemmQuantMode(IntEnum):
@@ -108,6 +107,17 @@ def _resolve_tactic(
     if tactic < 0 or tactic >= len(tactics):
         raise ValueError(f"dual GEMM tactic {tactic} out of range [0, {len(tactics)})")
     return tactics[tactic]
+
+
+def _has_full_grid_residency(
+    intermediate_size: int,
+    cta_features: int,
+    use_2cta: bool,
+    multiprocessor_count: int,
+) -> bool:
+    resident_ctas_per_sm = 2 if cta_features == 64 and not use_2cta else 1
+    feature_tiles = intermediate_size // cta_features
+    return feature_tiles <= resident_ctas_per_sm * multiprocessor_count
 
 
 def _pick_fp8_tactic(
@@ -1350,7 +1360,12 @@ def _dual_gemm_swiglu_fp8_run(
     resident_ctas_per_sm = 2 if cta_features == 64 and not use_2cta else 1
     feature_tiles = intermediate_size // cta_features
 
-    if dynamic_quant and feature_tiles > resident_ctas_per_sm * multiprocessor_count:
+    if dynamic_quant and not _has_full_grid_residency(
+        intermediate_size,
+        cta_features,
+        use_2cta,
+        multiprocessor_count,
+    ):
         raise ValueError(
             "dynamic dual GEMM grid exceeds its guaranteed residency: "
             f"got {feature_tiles} CTAs for {multiprocessor_count} SMs at "
@@ -1588,19 +1603,46 @@ def can_use_dual_gemm(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
+    quant_mode: DualGemmQuantMode,
 ) -> bool:
     """Return whether dimensions fit the small-batch dual GEMM contract.
 
     The modeling layer owns quantization-policy gating; this predicate checks
-    both the SM100 requirement and the fused kernel's shape contract.
+    both the SM100 requirement and the fused kernel's shape contract. Dynamic
+    output quantization additionally requires every feature CTA to be resident
+    because its grid-wide reduction contains a software barrier.
     """
-    return (
+    shape_supported = (
         1 <= num_tokens <= MAX_DUAL_GEMM_DECODE_TOKENS
         and hidden_size > 0
-        and 0 < intermediate_size <= MAX_DUAL_GEMM_INTERMEDIATE_SIZE
+        and intermediate_size > 0
         and hidden_size % 128 == 0
         and intermediate_size % 128 == 0
         and is_sm100_supported()
+    )
+    if not shape_supported:
+        return False
+
+    quant_mode = DualGemmQuantMode(quant_mode)
+    if not quant_mode.is_dynamic:
+        return True
+
+    multiprocessor_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    tactic = _pick_fp8_tactic(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        multiprocessor_count,
+        quant_mode,
+    )
+    cta_features, _, _, _, use_2cta = _resolve_tactic(tactic, True)
+    return _has_full_grid_residency(
+        intermediate_size,
+        cta_features,
+        use_2cta,
+        multiprocessor_count,
     )
 
 

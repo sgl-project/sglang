@@ -1,6 +1,5 @@
 """Integration tests for the reusable dual GEMM model layer."""
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +13,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
 
 _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048
@@ -50,15 +49,13 @@ def _make_llama_mlp(quant_config=None, dtype=torch.bfloat16):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        with patch.dict(os.environ, {"SGLANG_ENABLE_DUAL_GEMM": "1"}):
+        with get_parallel().override(tp_rank=0, tp_size=1):
             mlp = LlamaMLP(
                 _HIDDEN_SIZE,
                 _INTERMEDIATE_SIZE,
                 "silu",
                 quant_config=quant_config,
                 reduce_results=False,
-                tp_rank=0,
-                tp_size=1,
             ).cuda()
     finally:
         torch.set_default_dtype(original_dtype)
@@ -71,10 +68,7 @@ def _make_qwen2_mlp(dtype=torch.bfloat16):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
-        with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_DUAL_GEMM": "1"}),
-            get_parallel().override(tp_rank=0, tp_size=1),
-        ):
+        with get_parallel().override(tp_rank=0, tp_size=1):
             mlp = Qwen2MLP(
                 _HIDDEN_SIZE,
                 _INTERMEDIATE_SIZE,
