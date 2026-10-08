@@ -135,7 +135,6 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self._log_cache_stats = envs.SGLANG_NPU_LOG_SPARSE_KV_CACHE_STATS.get()
         self._probation_age = envs.SGLANG_NPU_SPARSE_KV_PROBATION_AGE.get()
 
         # Hit and miss copies overlap on independent 24-AIV streams. Metadata
@@ -320,15 +319,6 @@ class SparseKVCacheManager:
         self._pd_room_to_req_pool_idx: dict[int, int] = {}
         self._pd_room_to_input_len: dict[int, int] = {}
         self._pd_req_pool_idx_to_room: dict[int, int] = {}
-
-        # Keep hit/miss counters on device so NPU graph capture/replay does not
-        # need a host synchronization. The dimensions are [layer, request, 2],
-        # where the last dimension stores hit and miss counts respectively.
-        self._cache_stats = torch.zeros(
-            (self.layer_num, self.size, 2),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
         self._install_req_lifecycle_hooks(req_to_token_pool)
 
@@ -614,7 +604,6 @@ class SparseKVCacheManager:
                     ).contiguous(),
                 )
                 self.device_lru_slot_stamps[layer_idx].index_fill_(0, req_ids_tensor, 0)
-        self._cache_stats.index_fill_(1, req_ids_tensor, 0)
 
     def _install_req_lifecycle_hooks(self, req_to_token_pool: ReqToTokenPool) -> None:
         original_alloc = getattr(
@@ -645,20 +634,11 @@ class SparseKVCacheManager:
                     self.record_pd_request_metadata(req)
             return req_pool_indices
 
-        def free_with_sparse_stats(req: Req) -> None:
+        def free_with_sparse_clear(req: Req) -> None:
             req_pool_idx = req.kv.req_pool_idx
             try:
                 if req_pool_idx is not None:
-                    if req.finished() and self._log_cache_stats:
-                        self._report_request_cache_stats(req, req_pool_idx)
-                    else:
-                        self.reset_requests([req_pool_idx])
-            except Exception:
-                # Statistics must never prevent the request slot from being freed.
-                logger.exception(
-                    "Failed to report sparse KV cache stats for request rid=%s",
-                    getattr(req, "rid", "unknown"),
-                )
+                    self.reset_requests([req_pool_idx])
             finally:
                 self.clear_pd_request_metadata(req_pool_idx=req_pool_idx)
                 original_free(req)
@@ -668,38 +648,8 @@ class SparseKVCacheManager:
             return original_clear()
 
         setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
-        setattr(req_to_token_pool, "free", free_with_sparse_stats)
+        setattr(req_to_token_pool, "free", free_with_sparse_clear)
         setattr(req_to_token_pool, "clear", clear_with_sparse_clear)
-
-    def _report_request_cache_stats(self, req: Req, req_pool_idx: int) -> None:
-        stats = self._cache_stats[:, req_pool_idx, :].cpu().tolist()
-        layer_stats = []
-        total_hits = 0
-        total_misses = 0
-        for layer_idx, (hit_count, miss_count) in enumerate(stats):
-            total_count = hit_count + miss_count
-            hit_rate = hit_count / total_count if total_count else 0.0
-            total_hits += hit_count
-            total_misses += miss_count
-            layer_stats.append(
-                f"  layer {self.start_layer + layer_idx}: "
-                f"hit={hit_count}, miss={miss_count}, hit_rate={hit_rate:.2%}"
-            )
-
-        total_count = total_hits + total_misses
-        overall_hit_rate = total_hits / total_count if total_count else 0.0
-        layer_stats.append(
-            f"  overall: hit={total_hits}, miss={total_misses}, "
-            f"hit_rate={overall_hit_rate:.2%}"
-        )
-
-        logger.info(
-            "Sparse KV cache stats for request rid=%s, req_pool_idx=%d:\n%s",
-            getattr(req, "rid", "unknown"),
-            req_pool_idx,
-            "\n".join(layer_stats),
-        )
-        self.reset_requests([req_pool_idx])
 
     def offload(
         self,
@@ -1323,14 +1273,7 @@ class SparseKVCacheManager:
                 selected_kv_copy_indices,
             )
 
-            # Accumulate on-device counters as part of graph capture/replay.
-            hit_counts = token_on_device.sum(dim=1, dtype=torch.int32)
-            host_miss_counts = host_miss_mask.sum(dim=1, dtype=torch.int32)
-            valid_topk_counts = hit_counts + host_miss_counts
-            request_stats = torch.stack((hit_counts, host_miss_counts), dim=1)
-            self._cache_stats[layer_idx].index_add_(
-                0, device_cache_row_indices, request_stats
-            )
+            valid_topk_counts = valid_topk_mask.sum(dim=1, dtype=torch.int32)
 
             refill_src_index = selected_kv_copy_indices
             refill_valid_mask = (

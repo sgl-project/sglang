@@ -96,7 +96,6 @@ class TestSparseKVCacheManager(unittest.TestCase):
                 {
                     "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": str(int(enable_lru)),
                     "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": str(factor),
-                    "SGLANG_NPU_LOG_SPARSE_KV_CACHE_STATS": "0",
                 },
             ),
             patch.dict(sys.modules, self.kernel_modules),
@@ -186,41 +185,34 @@ class TestSparseKVCacheManager(unittest.TestCase):
             kv=_RequestKV(),
             bootstrap_room=42,
             origin_input_ids=[1, 2, 3],
-            finished=lambda: True,
-            rid="test",
         )
         row = pool.alloc([req])[0]
         self.assertEqual(manager.get_pd_copy_metadata(42), (row, 3))
         manager.device_slot_map[0][row, 1] = 7
         manager.device_slot_tokens[0][row, 7] = 1
         manager.device_lru_slot_stamps[0][row].fill_(9)
-        manager._cache_stats[:, row].fill_(10)
         pool.free(req)
         self.assertEqual(pool.available_size(), 2)
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertTrue((manager.device_slot_map[0][row] == -1).all())
         self.assertTrue((manager.device_slot_tokens[0][row] == -1).all())
         self.assertEqual(manager.device_lru_slot_stamps[0][row].sum().item(), 0)
-        self.assertEqual(manager._cache_stats[:, row].sum().item(), 0)
         with self.assertRaisesRegex(RuntimeError, "not recorded"):
             manager.get_pd_copy_metadata(42)
         pool.alloc([req])
         pool.clear()
         self.assertEqual(manager._pd_room_to_req_pool_idx, {})
 
-    def test_stats_failure_still_frees_request_and_pd_metadata(self):
+    def test_reset_failure_still_frees_request_and_pd_metadata(self):
         manager, pool = self.make_manager()
         req = SimpleNamespace(
             kv=_RequestKV(),
             bootstrap_room=42,
             origin_input_ids=[1],
-            finished=lambda: True,
-            rid="test",
         )
         pool.alloc([req])
-        manager._log_cache_stats = True
-        manager._report_request_cache_stats = Mock(side_effect=RuntimeError("stats"))
-        with self.assertLogs(self.module.logger, level="ERROR"):
+        manager.reset_requests = Mock(side_effect=RuntimeError("reset failed"))
+        with self.assertRaisesRegex(RuntimeError, "reset failed"):
             pool.free(req)
         self.assertEqual(pool.available_size(), 2)
         self.assertEqual(manager._pd_room_to_req_pool_idx, {})
