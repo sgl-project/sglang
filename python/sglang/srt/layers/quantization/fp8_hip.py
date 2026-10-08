@@ -129,6 +129,15 @@ def _apply_native(
     """The native route (mxfp8_native_amd_gfx95); a layer whose shape the native
     kernels do not tile keeps the bf16-dequant route."""
     if layer.mxfp8_native_ready:
+        # ROCm gfx950 TP-only: mori's mxfp8 GEMM, which is the same multiply
+        # ~30% faster. Returns None whenever it does not apply -- a grid too
+        # small to be worth it, a bf16 activation at decode, an unsupported
+        # shape -- and disables itself for the process on any failure.
+        from sglang.srt.layers.mori_mxfp8_gemm import mori_mxfp8_linear
+
+        mori_out = mori_mxfp8_linear(layer, x, bias, input_scale, input_on_fp8_grid)
+        if mori_out is not None:
+            return mori_out
         # an fp8-grid bf16 input re-encodes exactly, so it needs no flag here
         return method.w8a8_mxfp8_linear(
             input=x,

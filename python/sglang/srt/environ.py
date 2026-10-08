@@ -1656,6 +1656,14 @@ class Envs:
     SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
     # Debug: run both the fused and the unfused wo_b and log their relative L2.
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
+    # ROCm gfx950: run mori's mxfp8 GEMM in place of the native mxfp8 linear,
+    # with no collective attached -- so it serves wq_b, which is column-parallel
+    # and has nothing to fuse with, as well as any wo_b call the fused path
+    # declines. Independent of SGLANG_OPT_FUSED_WO_B_AR on purpose: the two are
+    # separate optimisations and have to be A/B-able separately.
+    SGLANG_OPT_MORI_MXFP8_GEMM = EnvBool(False)
+    # Debug: cross-check every mori GEMM against the native linear and log relL2.
+    SGLANG_DEBUG_MORI_MXFP8_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
