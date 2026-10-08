@@ -837,6 +837,40 @@ def handle_model_capability_adjustments(server_args: Any):
             "Embedding architecture detected: enabling embedding mode automatically."
         )
 
+    if embedding_model_spec is not None:
+        # Bidirectional encoders compute every token from the whole sequence, so
+        # a cached prefix (whose hidden states were produced without the tokens
+        # that follow it) and a split prefill are both semantically invalid --
+        # not merely slower. A spec that declares them unsafe must actually
+        # switch them off; otherwise a request whose prefix happens to be cached
+        # silently reaches the model as a suffix-only batch.
+        if (
+            embedding_model_spec.safe_disable_radix_cache
+            and not cfg.disable_radix_cache
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                disable_radix_cache=True,
+            )
+            logger.info(
+                "Embedding architecture requires full-prompt attention: "
+                "disabling the radix (prefix) cache."
+            )
+        if (
+            embedding_model_spec.safe_disable_chunked_prefill
+            and cfg.chunked_prefill_size != -1
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                chunked_prefill_size=-1,
+            )
+            logger.info(
+                "Embedding architecture requires full-prompt attention: "
+                "disabling chunked prefill."
+            )
+
     is_embedding_gemma = (
         embedding_model_spec is not None
         and embedding_model_spec.bcg_prefill_policy == BCGPrefillPolicy.FULL_ENCODER

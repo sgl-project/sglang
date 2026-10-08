@@ -168,7 +168,39 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma_spec().as_dict(),
         }
     )
+    rows.append({"architecture": "LayaForDecision", **_laya_spec().as_dict()})
     return rows
+
+
+def _laya_spec() -> EmbeddingModelSpec:
+    """Laya: ModernBERT encoder + decision head, served as a decision model.
+
+    The model returns its own calibrated answer distribution followed by the two
+    act-head outputs, so the vector must be handed out as-is: no normalisation
+    and no extra softmax (``/v1/classify`` would apply both, hence
+    ``/v1/embeddings``).
+    """
+    return EmbeddingModelSpec(
+        family="laya",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MODEL_DEFINED,
+        normalize=False,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        # Bidirectional attention over the whole prompt: reusing a cached prefix
+        # or splitting the prefill would feed the encoder a partial sequence.
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+    )
 
 
 def _embedding_gemma_spec() -> EmbeddingModelSpec:
@@ -278,6 +310,9 @@ def resolve_embedding_model_spec(
 
     if is_embedding_gemma:
         return _embedding_gemma_spec()
+
+    if "LayaForDecision" in architecture_set:
+        return _laya_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(
