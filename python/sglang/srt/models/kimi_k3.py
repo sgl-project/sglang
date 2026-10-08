@@ -9,6 +9,7 @@
 import logging
 import os
 import re
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -22,7 +23,6 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_shared_experts_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -30,14 +30,14 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import (
-    k3_ar_fusion,
-    k3_gemm_ar,
-    k3_sp_collective,
-    zero_copy_context,
-)
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
+from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -51,6 +51,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -124,7 +125,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -225,6 +226,15 @@ def _k3_bf16_gemm(
 # chain + o_norm here.
 
 
+def _is_unquantized_mergeable(weights: list[torch.Tensor]) -> bool:
+    """Return whether these weights may be concatenated into one fused buffer.
+
+    _merge_weights_as_views cats .weight alone, so anything carrying a separate
+    scale tensor (per-channel FP8, packed MXFP4) must stay unfused."""
+    dtypes = {weight.dtype for weight in weights}
+    return len(dtypes) == 1 and dtypes.pop() in (torch.bfloat16, torch.float16)
+
+
 def _merge_weights_as_views(
     mods: list, pad_rows_to: int = 1
 ) -> tuple[torch.Tensor, list[int]]:
@@ -247,15 +257,14 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
-# input_layernorm / post_attention_layernorm, which the communicator expects
-# to own. Instead the MLP/MoE modules gather/scatter around their own body:
+# K3 manages its own boundaries: the attn-res aggregation kernels replace
+# input_layernorm / post_attention_layernorm, and the MLP/MoE modules
+# gather/scatter around their own body:
 # attention and the attn-res buffers stay in local (per-DP-rank) token space,
 # the MLP/MoE runs on the DP-gathered global batch, and the delayed prefix_sum
 # add stays local, applied after the scatter back.
 def _dp_local_buffer_group():
-    """Symmetric-memory group for the local DP buffer (mirrors
-    CommunicateSummableTensorPairFn._scatter_hidden_states)."""
+    """Symmetric-memory group holding this DP rank's local token buffer."""
     parallel = get_parallel()
     if parallel.tp_size == parallel.attn_dp_size:
         return get_parallel().tp_group
@@ -297,8 +306,7 @@ class KimiK3MLP(nn.Module):
         prefix: str = "",
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: Optional[LinearParallelGroup] = None,
     ) -> None:
         super().__init__()
         # The Ascend path shards the dense MLP inside each attention-TP
@@ -309,22 +317,17 @@ class KimiK3MLP(nn.Module):
         self._dense_attn_tp = (
             get_parallel().enable_dense_mlp_attn_tp
             and is_dp_attention_enabled()
-            and tp_rank is None
-            and tp_size is None
+            and parallel_group is None
         )
-        if self._dense_attn_tp:
-            tp_rank = get_parallel().attn_tp_rank
-            tp_size = get_parallel().attn_tp_size
-        _tp_kwargs = (
-            dict(tp_rank=tp_rank, tp_size=tp_size) if tp_size is not None else {}
-        )
+        if parallel_group is None:
+            parallel_group = "attn_tp" if self._dense_attn_tp else "tp"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            **_tp_kwargs,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -334,7 +337,7 @@ class KimiK3MLP(nn.Module):
             reduce_results=reduce_results,
             use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
-            **_tp_kwargs,
+            parallel_group=parallel_group,
         )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
@@ -494,6 +497,7 @@ class KimiK3MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
@@ -577,19 +581,19 @@ class KimiK3MoE(nn.Module):
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
         self._shared_experts_tp_group = None
-        shared_experts_tp_kwargs = {}
+        shared_experts_parallel_group = None
         if self._shared_experts_tp1:
-            shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
+            shared_experts_parallel_group = "replicated"
         elif self._shared_experts_tp_comm:
             group = (
-                get_shared_experts_tp_group()
+                parallel.shared_experts_tp_group
                 if requested_shared_tp is not None
                 else parallel.attn_tp_group
             )
             assert group.world_size == shared_tp
             self._shared_experts_tp_group = group
-            shared_experts_tp_kwargs = dict(
-                tp_rank=group.rank_in_group, tp_size=group.world_size
+            shared_experts_parallel_group = (
+                "shared_experts_tp" if requested_shared_tp is not None else "attn_tp"
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -607,7 +611,7 @@ class KimiK3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
-                **shared_experts_tp_kwargs,
+                parallel_group=shared_experts_parallel_group,
             )
         else:
             self.shared_experts = None
@@ -695,11 +699,11 @@ class KimiK3MoE(nn.Module):
         """
         if not self.use_latent_moe:
             return
-        # These merged layouts feed CUDA-only fused front kernels. Keeping the
+        # These merged layouts feed CUDA and ROCm fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
         # during post-load processing and leaves their native kernels in
         # control of weight layout.
-        if _is_npu:
+        if not (get_platform().is_cuda or get_platform().is_hip):
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -774,11 +778,12 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
         )
         from sglang.srt.runtime_context import get_parallel
 
@@ -804,6 +809,7 @@ class KimiK3MoE(nn.Module):
             num_topk=self._mega_top_k,
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
         )
 
         if num_tokens > 0:
@@ -1545,7 +1551,7 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
-        # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
+        # using attention-TP placement, so it also supports DP attention.
         # The low-rank fused path still uses full-TP-only projection helpers.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
@@ -1568,8 +1574,7 @@ class KimiK3DeltaAttention(nn.Module):
                 ],
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
@@ -1581,8 +1586,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.b_proj",
                 # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
                 skip_block_quant_check=self._bfa_uses_block_fp8,
@@ -1599,8 +1603,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
             # Merged [f_a | b] weight, built after weight loading by
@@ -1646,7 +1649,6 @@ class KimiK3DeltaAttention(nn.Module):
                 2, self.head_dim, projection_size, dtype=_dtype
             )
         else:
-            attn_tp_rank = self.attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -1654,8 +1656,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -1672,8 +1673,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
             self.b_proj = ColumnParallelLinear(
@@ -1681,8 +1681,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.b_proj",
             )
 
@@ -1692,8 +1691,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    tp_rank=attn_tp_rank,
-                    tp_size=self.attn_tp_size,
+                    parallel_group="attn_tp",
                     prefix=f"{prefix}.g_proj",
                 )
             else:
@@ -1709,23 +1707,24 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    tp_rank=attn_tp_rank,
-                    tp_size=self.attn_tp_size,
+                    parallel_group="attn_tp",
                     prefix=f"{prefix}.g_b_proj",
                 )
 
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
             params_dtype=torch.float32,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=f"{prefix}.qkv_conv1d",
         )
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
@@ -1740,7 +1739,7 @@ class KimiK3DeltaAttention(nn.Module):
         def _a_log_weight_loader(
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
-            tp_rank = get_parallel().attn_tp_rank
+            tp_rank = self.attn_tp_rank
             shard_size = param.data.shape[2]  # local_num_heads
             start_idx = tp_rank * shard_size
 
@@ -1769,8 +1768,7 @@ class KimiK3DeltaAttention(nn.Module):
             # comm lives there).
             reduce_results=not self.all_reduce_fusion,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             # Reduce within the attn-TP group: the default full-TP collective
             # is the wrong group at attn_tp>1 (sums across DP groups) and
             # deadlocks idle DP ranks. Off under all_reduce_fusion: the fused
@@ -1786,7 +1784,6 @@ class KimiK3DeltaAttention(nn.Module):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -1851,6 +1848,11 @@ class KimiK3DeltaAttention(nn.Module):
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
+            # ROCm Quark checkpoints: leave per-channel FP8 / MXFP4 weights on
+            # the unfused b_proj/f_a_proj GEMVs; the merged buffer would drop
+            # their scales.
+            if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
+                return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
@@ -1906,6 +1908,11 @@ class KimiK3DeltaAttention(nn.Module):
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
+        # Whitelist the dtype rather than only require the three to agree: the
+        # merged buffer carries only .weight, so quantized weights that happen to
+        # match each other still lose their per-channel scales.
+        if not _is_unquantized_mergeable(ws):
+            return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
     def _prepare_fused_decode(self) -> None:
@@ -1922,7 +1929,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_K3_KDA_FUSED_BACKEND", "").lower()
+            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
             backend_available = (
                 backend == "aiter"
                 and kda_fused_decode_aiter_hip.available(f_b_weight.device)
@@ -2014,7 +2021,7 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
 
                 if (
                     _is_hip
@@ -2030,7 +2037,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2038,12 +2046,12 @@ class KimiK3DeltaAttention(nn.Module):
                     and get_is_capture_mode()
                     and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
                 ):
-                    # Issue the tiny [f_a|b] + f_b GEMVs on the side stream,
-                    # then the wide [q,k,v,g] GEMM on the main stream (both
-                    # read only hidden_states); join before the consumers.
+                    # Fork before both branches; capture the main projection
+                    # first to avoid CUDA graph replay stream expansion.
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
                         forget_gate = (
@@ -2052,7 +2060,6 @@ class KimiK3DeltaAttention(nn.Module):
                             else gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                         )
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
@@ -2238,7 +2245,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
-        k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # Hand the GEMM a slice of the persistent symmetric buffer
             # (k3_ar_fusion.symm_buffer); the fused AR reduces it in place.
@@ -2258,7 +2264,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
-            # K3 has no LayerCommunicator, so o_proj must reduce within the
+            # K3 owns its output reduction, so o_proj must reduce within the
             # attn-TP group itself: the default full-TP collective is the wrong
             # group at attn_tp>1 and deadlocks idle DP ranks.
             self.o_proj.use_dp_attention_reduce = True
@@ -2271,8 +2277,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=f"{prefix}.g_proj",
             )
             # Output gate multiplies the TP-local attention output right
@@ -2280,9 +2285,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # DeepseekV2AttentionMLA forward cores, so wrap its forward at
             # the instance level (weights, reduce_results, loading untouched).
             self._gate_hidden_states = None
-            # (gate, producer stream) issued on the alt stream by forward();
-            # None when the lazy path computes the gate here instead.
-            self._gate_precomputed = None
+            self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             # Above this token count the attention-core kernels fill the SMs
             # on their own and the overlap only adds sync overhead (same
@@ -2297,20 +2300,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             def _gated_o_proj_forward(x, *args, **kwargs):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
-                precomputed = self._gate_precomputed
-                self._gate_precomputed = None
-                if precomputed is not None:
-                    # Use wait_stream rather than an explicit event so the
-                    # breakable-CUDA-graph runner can track the side-stream
-                    # join across graph-segment boundaries.
-                    torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate = (
-                        precomputed[0]
-                        if precomputed is not None
-                        else self.g_proj(gate_input)[0]
-                    )
-                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
+                    gate = self._compute_output_gate(gate_input)
+                    from sglang.kernels.ops.attention import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding
@@ -2318,6 +2310,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
+                elif self._gate_pending_stream is not None:
+                    # Even a skipped gate must close its capture branch.
+                    torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
+                    self._gate_pending_stream = None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2340,27 +2336,29 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
-    def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
-        """Issue the output-gate GEMM on the alt stream so it overlaps the
-        attention core; the lazy path in the o_proj wrap otherwise computes
-        it on the critical path right before the gate multiply. The gate
-        tensor stays referenced via _gate_precomputed until the wrap joins,
-        so its memory cannot be reused while the alt stream still writes."""
-        self._gate_precomputed = None
+    def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
+        """Fork early, but record the gate after attention to limit replay streams."""
+        self._gate_pending_stream = None
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
-            # The attention-core break ends the segment between the alt-stream
-            # event record and the o_proj-side wait, so under breakable capture
-            # the wait would cross graph segments; use the lazy path instead.
+            # Keep the fork and join within one capture segment.
             and not is_in_breakable_cuda_graph()
             and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
         ):
             alt = self._gate_alt_stream
             alt.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(alt):
-                gate, _ = self.g_proj(hidden_states)
-            self._gate_precomputed = (gate, alt)
+            self._gate_pending_stream = alt
+
+    def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        alt = self._gate_pending_stream
+        self._gate_pending_stream = None
+        if alt is None:
+            return self.g_proj(hidden_states)[0]
+        with torch.cuda.stream(alt):
+            gate, _ = self.g_proj(hidden_states)
+        torch.cuda.current_stream().wait_stream(alt)
+        return gate
 
     def forward(
         self,
@@ -2372,7 +2370,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
-            self._precompute_output_gate(hidden_states)
+            self._fork_output_gate(hidden_states)
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
@@ -2529,7 +2527,9 @@ class KimiK3DecoderLayer(nn.Module):
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
-                    if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
+                    if k3_sp_collective.requires_symmetric_rs(
+                        output_rows, x.device, x.element_size()
+                    ):
                         output = k3_sp_collective.get_o_proj_output_buffer(
                             output_rows, x.dtype, o_proj.output_size
                         )
@@ -2584,7 +2584,7 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
-        # (same as the LayerCommunicator models' is_idle skip).
+        # (matching the idle skip in other DP-attention models).
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
@@ -2627,9 +2627,9 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        # For MLA layers with q_lora_rank, set up communicator attn_inputs
-        # before the forward call (normally done by LayerCommunicator).
-        from sglang.srt.layers.communicator import (
+        # For MLA layers with q_lora_rank, set up attn_inputs before the
+        # forward call (normally done by the attention boundary).
+        from sglang.srt.layers.layer_boundary import (
             AttentionInputs,
             get_attn_tp_context,
         )
@@ -2874,7 +2874,7 @@ class KimiK3LinearModel(nn.Module):
         # Disable on HIP code path.
         self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
                 layer_idx=idx,
@@ -2883,8 +2883,6 @@ class KimiK3LinearModel(nn.Module):
                 prefix=prefix,
                 alt_streams=self.alt_streams,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
 
@@ -2970,7 +2968,14 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        packs_aux = self.packs_aux_hidden_states
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker.for_batch(
+                forward_batch, len(self.dspark_layers_to_capture)
+            )
+            if packs_aux
+            else []
+        )
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
@@ -3061,9 +3066,18 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if packs_aux:
+            return hidden_states, aux_hidden_states.finalize()
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    @property
+    def packs_aux_hidden_states(self) -> bool:
+        # PP stages keep the list: inherited captures arrive pre-concatenated.
+        return (
+            self.dspark_layers_to_capture is not None and self.pp_group.world_size == 1
+        )
 
     def _dspark_capture_stream(
         self,
@@ -3122,7 +3136,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 }
                 quant_config.update_packed_modules_mapping({"model": model_mapping})
             else:
-                quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+                # The loader seeded this mapping from the outer model class;
+                # replacing it would drop those entries.
+                quant_config.update_packed_modules_mapping(
+                    {
+                        **(quant_config.packed_modules_mapping or {}),
+                        **self.packed_modules_mapping,
+                    }
+                )
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -3150,6 +3171,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             layer < self.model.start_layer - 1 for layer in layers
         )
 
+    def get_aux_hidden_states_width(self) -> int:
+        if not self.model.packs_aux_hidden_states:
+            return 0
+        return len(self.model.dspark_layers_to_capture) * self.config.hidden_size
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
             raise ValueError(
@@ -3157,6 +3183,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
+        # taps already capture here, so reuse them without the usual +1 shift.
+        self.set_dspark_layers_to_capture(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -3430,12 +3461,44 @@ class KimiK3LinearForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = False
                 continue
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
+            scale_folded_into_weight = False
+            if _is_hip and kv_b_weight.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+                if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                    from sglang.srt.models.kimi_k3_rocm_quant import (
+                        _k3_channel_fp8_to_bf16,
+                    )
+
+                    # Fold the per-channel scale while dim 0 is still the
+                    # channel axis it indexes, i.e. before the head split.
+                    kv_b_weight = _k3_channel_fp8_to_bf16(
+                        self_attn.kv_b_proj, kv_b_weight
+                    )
+                    scale_folded_into_weight = True
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if hasattr(self_attn.kv_b_proj, "weight_scale"):
+            kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+            if _is_hip and (
+                scale_folded_into_weight
+                or not (
+                    isinstance(kv_b_scale, torch.Tensor) and kv_b_scale.numel() == 1
+                )
+            ):
+                # aiter's absorb GEMM dereferences w_scale as one scalar. A scale
+                # folded into the now-bf16 w_kc/w_vc, a vector the branch above
+                # could not fold, or the None quark leaves on a dequantized
+                # narrow partition must keep DeepseekV2AttentionMLA's 1.0
+                # default. Skip the assignment rather than reset afterwards:
+                # assigning a Parameter registers it, and nn.Module then refuses
+                # a float in its place.
+                pass
+            elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
         # Post-load: precompute the attn-res combined score weights BEFORE
@@ -3614,12 +3677,24 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return 0
         return self.language_model.get_pp_proxy_dspark_hidden_size()
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
             raise AttributeError(
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_aux_hidden_states_width(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_aux_hidden_states_width()
 
     def preprocess_mm_for_encoder(
         self,
@@ -3823,7 +3898,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

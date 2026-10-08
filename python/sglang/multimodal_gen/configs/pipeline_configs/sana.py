@@ -127,3 +127,30 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     def gather_latents_for_sp(self, latents):
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=SanaSamplingParams,
+        pipeline_config_cls=SanaPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",
+            "Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            "Efficient-Large-Model/Sana_1600M_512px_diffusers",
+            "Efficient-Large-Model/Sana_600M_512px_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
+            )
+        ],
+    )
