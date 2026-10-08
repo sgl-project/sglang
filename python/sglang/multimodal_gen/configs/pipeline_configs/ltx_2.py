@@ -601,29 +601,6 @@ class LTX2PipelineConfig(PipelineConfig):
         return latents
 
     @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor,
-        latents_mean: torch.Tensor,
-        latents_std: torch.Tensor,
-        scaling_factor: float = 1.0,
-    ) -> torch.Tensor:
-        # Denormalize latents across the channel dimension [B, C, F, H, W]
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
-    ):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
-
-    @staticmethod
     def _unpack_audio_latents(
         latents: torch.Tensor,
         latent_length: int,

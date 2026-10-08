@@ -767,11 +767,6 @@ def get_sequence_parallel_world_size() -> int:
     return get_sp_world_size()
 
 
-def get_sequence_parallel_rank() -> int:
-    """Return my rank for the sequence parallel group."""
-    return get_sp_parallel_rank()
-
-
 def get_ulysses_parallel_world_size() -> int:
     return get_sp_group().ulysses_world_size
 
