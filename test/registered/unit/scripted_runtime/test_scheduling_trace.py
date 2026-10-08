@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.scheduling_trace import (
     diff_trace_dirs,
     first_divergence,
+    main,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,6 +67,10 @@ class TestDiffTraceDirs(CustomTestCase):
         self.assertIn("DIFFERS      differs.jsonl at record 0", out.getvalue())
         self.assertIn("fields: mode", out.getvalue())
         self.assertIn("ONLY IN OLD  only_old.jsonl", out.getvalue())
+
+    def test_empty_or_missing_dir_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(main([tmp, str(Path(tmp, "missing"))]), 2)
 
 
 def _write(path: Path, records) -> None:

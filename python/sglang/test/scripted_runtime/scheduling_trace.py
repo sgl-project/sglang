@@ -198,6 +198,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="record field to leave out of the comparison (repeatable)",
     )
     args = parser.parse_args(argv)
+    for trace_dir in (args.old_dir, args.new_dir):
+        if not any(trace_dir.glob("*.jsonl")):
+            print(f"error: no *.jsonl traces in {trace_dir}", file=sys.stderr)
+            return 2
     return 1 if diff_trace_dirs(args.old_dir, args.new_dir, ignore=args.ignore) else 0
 
 
