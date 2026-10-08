@@ -352,6 +352,10 @@ class KVIndexTranslator:
             if slc is not None and slc.numel() > 0:
                 max_seq = int(slc.max()) + plan.read_extent
                 width = min(max(-(-max_seq // self.page_size), 1), row_pages)
+            elif into is not None:
+                # No host lengths: a row's speculative headroom outruns the
+                # captured table, which is as wide as its graph reads.
+                width = min(into.shape[1], row_pages)
             else:
                 width = row_pages
             # `zero_tail` writes the sink past each live prefix, so neither a

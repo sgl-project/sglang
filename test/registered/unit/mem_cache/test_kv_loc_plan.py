@@ -507,6 +507,41 @@ class TestKVLocPlan(unittest.TestCase):
             self.assertEqual(len(builds), 1)
             self.assertTrue(torch.equal(other[:, :width], captured[:, :width]))
 
+    def test_a_captured_table_bounds_a_build_without_host_lengths(self):
+        """Without host lengths, a captured first reader narrower than a row
+        has the table built in its own buffer, to its width."""
+        builds = []
+        real = kv_index_translator.build_kv_read_table
+
+        def counting(**kwargs):
+            builds.append(kwargs["out"])
+            return real(**kwargs)
+
+        bs = int(self.rpi.numel())
+        row_pages = -(-self.req_to_token.shape[1] // _PS)
+        captured = torch.full((bs + 1, row_pages // 2), 7, dtype=torch.int32)
+        with patch.object(kv_index_translator, "build_kv_read_table", counting):
+            plan = self.target.plan(
+                req_pool_indices=self.rpi,
+                seq_lens=self.seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=self.window,
+                read_extent=1,
+            )
+            self.target.copy_page_table(plan, out=captured)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0].data_ptr(), captured.data_ptr())
+        self.assertEqual(builds[0].shape[1], captured.shape[1])
+        reference = _reference(
+            self.req_to_token,
+            self.rpi,
+            self.seq_lens + 1,
+            self.allocator.full_v2p_page_table,
+            captured.shape[1],
+        )
+        self.assertTrue(torch.equal(captured[:bs], reference))
+        self.assertEqual(int(captured[bs].abs().sum()), 0)  # padded lane
+
     def test_read_table_is_built_once_and_padded_by_copy(self):
         builds = []
         real = kv_index_translator.build_kv_read_table
