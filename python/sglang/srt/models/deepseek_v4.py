@@ -369,6 +369,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 def _tbo_collective_sizes(
     rank_sizes: List[int], attn_tp_size: int
 ) -> Tuple[List[int], List[int]]:
+    # Collapse attention-TP replicas into DP counts and split each count into TP shards.
     if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
         raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
 

@@ -73,6 +73,7 @@ COMMON_ENV_VARS = {
     "SGLANG_DP_USE_GATHERV": "1",
     "SGLANG_DP_USE_REDUCE_SCATTER": "1",
     "SGLANG_SHARED_EXPERT_TP1": "1",
+    "SGLANG_DP_SHARED_EXPERT_LOCAL": "1",
     "SGLANG_TBO_DEBUG": "1",
     # ROCm HSA-resource stability for TBO at high concurrency.
     "GPU_MAX_HW_QUEUES": "5",
