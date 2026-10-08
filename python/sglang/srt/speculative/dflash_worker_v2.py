@@ -646,7 +646,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Under DP attention each active rank drafts independently inside
             # its attention-TP group. DecodeCudaGraphRunner classifies this
             # draft forward as DP-local, so idle peer DP ranks do not need to
-            # participate in the draft-model graph capture or replay.
+            # participate in either capture or replay.
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -661,27 +661,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "memory is available after target backend initialization.",
                         available_mem,
                     )
-            if (
-                capture_decode_cuda_graph
-                and not self.draft_owns_attention
-                and get_parallel().tp_group.world_size == 1
-            ):
-                # Folding the target head into a draft graph also captures its
-                # distributed logits collective. Keep that tail eager until its
-                # symmetric-memory lifetime is isolated from target prefill;
-                # otherwise the first target collective can observe corrupted
-                # state after draft capture. The draft transformer itself still
-                # uses its CUDA graph.
+            if capture_decode_cuda_graph:
+                # Must run before capture so the draft graph folds the head in.
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
-            elif capture_decode_cuda_graph and self._target_tp_rank == 0:
-                logger.info(
-                    "DFLASH draft model CUDA graph enabled; keeping the "
-                    "distributed draft sampler eager."
-                )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )

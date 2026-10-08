@@ -21,7 +21,15 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDFlashDPAttention(CustomTestCase):
-    def test_distributed_draft_graph_keeps_sampler_eager(self):
+    def test_dp_attention_keeps_draft_graph_enabled(self):
+        draft_worker = SimpleNamespace(init_cuda_graphs=Mock())
+        worker = SimpleNamespace(
+            draft_owns_attention=True,
+            _target_tp_rank=0,
+            _draft_worker=draft_worker,
+            _maybe_build_draft_sampler=Mock(return_value=None),
+            draft_model_runner=SimpleNamespace(capture_tail_hooks=[]),
+        )
         exec_config = SimpleNamespace(
             graph=SimpleNamespace(
                 cuda_graph_config=SimpleNamespace(
@@ -30,48 +38,23 @@ class TestDFlashDPAttention(CustomTestCase):
             )
         )
 
-        for draft_owns_attention, tp_size in ((True, 1), (False, 2)):
-            with self.subTest(
-                draft_owns_attention=draft_owns_attention, tp_size=tp_size
-            ):
-                draft_worker = SimpleNamespace(init_cuda_graphs=Mock())
-                worker = SimpleNamespace(
-                    draft_owns_attention=draft_owns_attention,
-                    _target_tp_rank=0,
-                    _draft_worker=draft_worker,
-                    _maybe_build_draft_sampler=Mock(return_value=None),
-                    draft_model_runner=SimpleNamespace(capture_tail_hooks=[]),
-                )
+        with (
+            patch.object(dflash, "draft_pp_context", return_value=nullcontext()),
+            patch.object(dflash, "draft_tp_context", return_value=nullcontext()),
+            patch.object(dflash, "get_exec", return_value=exec_config),
+            patch.object(
+                dflash,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=True),
+            ),
+            patch.object(dflash.current_platform, "is_out_of_tree", return_value=False),
+            patch.object(dflash, "is_cuda", return_value=False),
+        ):
+            dflash.DFlashWorkerV2.init_cuda_graphs(worker)
 
-                with (
-                    patch.object(
-                        dflash, "draft_pp_context", return_value=nullcontext()
-                    ),
-                    patch.object(
-                        dflash, "draft_tp_context", return_value=nullcontext()
-                    ),
-                    patch.object(dflash, "get_exec", return_value=exec_config),
-                    patch.object(
-                        dflash,
-                        "get_parallel",
-                        return_value=SimpleNamespace(
-                            attn_dp_enabled=draft_owns_attention,
-                            tp_group=SimpleNamespace(world_size=tp_size),
-                        ),
-                    ),
-                    patch.object(
-                        dflash.current_platform,
-                        "is_out_of_tree",
-                        return_value=False,
-                    ),
-                    patch.object(dflash, "is_cuda", return_value=False),
-                ):
-                    dflash.DFlashWorkerV2.init_cuda_graphs(worker)
-
-                draft_worker.init_cuda_graphs.assert_called_once_with(
-                    capture_decode_cuda_graph=True
-                )
-                worker._maybe_build_draft_sampler.assert_not_called()
+        draft_worker.init_cuda_graphs.assert_called_once_with(
+            capture_decode_cuda_graph=True
+        )
 
     def test_dp_lm_head_resolution(self):
         for device, dp_attention, already_enabled in (
@@ -158,10 +141,7 @@ class TestDFlashDPAttention(CustomTestCase):
             patch.object(
                 dflash,
                 "get_parallel",
-                return_value=SimpleNamespace(
-                    attn_dp_enabled=True,
-                    tp_group=SimpleNamespace(world_size=1),
-                ),
+                return_value=SimpleNamespace(attn_dp_enabled=True),
             ),
             patch.object(dflash.current_platform, "is_out_of_tree", return_value=False),
             patch.object(dflash, "is_cuda", return_value=False),
