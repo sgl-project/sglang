@@ -1827,6 +1827,14 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            result_dict["kv_event_sources"] = (
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
+            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -3147,7 +3155,7 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
-            matched_len = len(req.prefix_indices) + req.host_hit_length
+            matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
 
             if (
@@ -3221,7 +3229,7 @@ class Scheduler(
             and buffer_pipeline.has_staged(req.cache_request_handle)
         ):
             return False
-        current_match_len = len(req.prefix_indices) + req.host_hit_length
+        current_match_len = req.prefix_len + req.host_hit_length
         if current_match_len >= previous_match_len:
             return False
         if (
@@ -3580,7 +3588,7 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3670,12 +3678,9 @@ class Scheduler(
             # only finished requests to running_batch.
             reqs_to_exclude.add(self.chunked_req)
 
-            # Stash (cache) the previous chunk only when it produced new KV
-            # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves extend_range.end ==
-            # len(prefix_indices), so there is nothing new to cache and
-            # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
+            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -3903,7 +3908,7 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
-            history_len = len(self.chunked_req.prefix_indices)
+            history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -4121,7 +4126,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4130,9 +4135,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
+                    self.chunked_req.extend_len if self.chunked_req is not None else 0
                 ),
             ),
         )
@@ -4640,10 +4643,9 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob or batch.return_hidden_states:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                batch_result.extend_input_len_per_req = (
+                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+                )
             else:
                 batch_result.extend_input_len_per_req = None
 
@@ -4951,6 +4953,7 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5367,7 +5370,7 @@ class Scheduler(
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
 
@@ -5376,7 +5379,7 @@ class Scheduler(
                 DisaggregationMode.PREFILL,
                 DisaggregationMode.DECODE,
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
@@ -5388,7 +5391,7 @@ class Scheduler(
                     _make_abort_req(req), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -5496,7 +5499,7 @@ class Scheduler(
                 and (req := self.chunked_req) is not None
             ):
                 # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
