@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregatio
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -663,6 +664,8 @@ class TestAllocationIntegration(CustomTestCase):
         mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
         mgr.failed_sessions = set()
+        mgr.state_layout_rejections = {}
+        mgr.state_strides_validated = set()
         mgr.enable_deferred_decode_kv_release = True
         mgr.decode_kv_args_table = {
             "session": SimpleNamespace(requires_dcp_relayout=False, dst_aux_ptrs=[])
@@ -693,9 +696,8 @@ class TestAllocationIntegration(CustomTestCase):
             cleanup_observed.append(room)
 
         mgr.req_to_decode_prefix_len = SimpleNamespace(pop=during_cleanup)
-        chunk = SimpleNamespace(
+        chunk = TransferKVChunk(
             room=1,
-            staging_counted=False,
             index_slice=slice(0, 0),
             prefill_kv_indices=[],
             is_last_chunk=True,
