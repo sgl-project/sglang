@@ -20,7 +20,6 @@ import signal
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
-import psutil
 import pybase64
 import setproctitle
 import torch
@@ -52,7 +51,12 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_logger,
+    freeze_gc,
+    get_parent_process,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -546,7 +550,7 @@ def run_detokenizer_process(
     load_plugins()
     configure_logger(server_args)
     publish(server_args, role="detokenizer")
-    parent_process = psutil.Process().parent()
+    parent_process = get_parent_process()
 
     manager = None
     try:
