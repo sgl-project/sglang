@@ -117,12 +117,15 @@ class _AtenMulCounter(TorchDispatchMode):
 
 
 @pytest.mark.parametrize("kind", ["linear", "replicated"])
+@pytest.mark.parametrize("strength", [1.0, 0.5])
 @pytest.mark.parametrize("runtime_scale", [None, 1.0, 0.5])
-def test_unit_request_lora_scale_adds_no_delta_multiply(kind, runtime_scale):
-    """An unmerged LoRA forward at runtime scale 1.0 multiplies the delta once.
+def test_unit_request_lora_scale_multiplies_delta_at_most_once(
+    kind, strength, runtime_scale
+):
+    """An unmerged LoRA forward multiplies the delta by its scale at most once.
 
-    Every LoRA linear runs per denoising step, so an extra elementwise kernel
-    per call slows LoRA stages (LTX-2 refinement by ~6%).
+    Every LoRA linear runs per denoising step, so each extra elementwise kernel
+    per call slows LoRA stages (LTX-2 refinement by ~6% per multiply).
     """
     base = (
         ReplicatedLinear(4, 3, bias=False)
@@ -131,7 +134,7 @@ def test_unit_request_lora_scale_adds_no_delta_multiply(kind, runtime_scale):
     )
     layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
     layer.set_lora_weights(
-        torch.ones(2, 4), torch.ones(3, 2), strength=0.5, merge_weights=False
+        torch.ones(2, 4), torch.ones(3, 2), strength=strength, merge_weights=False
     )
     x = torch.ones(2, 4)
     counter = _AtenMulCounter()
@@ -142,4 +145,5 @@ def test_unit_request_lora_scale_adds_no_delta_multiply(kind, runtime_scale):
         batch = SimpleNamespace(runtime_lora_scale=runtime_scale)
         with set_forward_context(0, None, forward_batch=batch), counter:
             layer(x)
-    assert counter.count == (1 if runtime_scale in (None, 1.0) else 2)
+    unit = strength * (1.0 if runtime_scale is None else runtime_scale) == 1.0
+    assert counter.count == (0 if unit else 1)
