@@ -6,6 +6,7 @@ from typing import List, Literal, Optional, Union
 from xgrammar import StructuralTag
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -162,14 +163,22 @@ class KimiK3Detector(BaseFormatDetector):
                 if close_idx == -1
                 else text[section_start:close_idx]
             )
-            calls = [
-                ToolCallItem(
-                    tool_index=i,
-                    name=call["name"],
-                    parameters=call["arguments"],
+            tool_indices = self._get_tool_indices(tools)
+            calls = []
+            for call in self._parse_calls(section):
+                if call["name"] not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {call['name']}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
+                calls.append(
+                    ToolCallItem(
+                        tool_index=len(calls),
+                        name=call["name"],
+                        parameters=call["arguments"],
+                    )
                 )
-                for i, call in enumerate(self._parse_calls(section))
-            ]
             return StreamingParseResult(normal_text=before, calls=calls)
         except Exception as e:
             logger.error("Error in Kimi K3 detect_and_parse: %s", e, exc_info=True)
