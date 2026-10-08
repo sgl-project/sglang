@@ -70,8 +70,9 @@ def apply_all():
     # v5 general patches
     _ensure_is_torch_fx_available_compat()
 
-    # CI-only: neutralize HF API calls inside tokenizer from_pretrained
+    # CI-only: avoid HF API calls during from_pretrained
     patch_is_base_mistral_in_ci()
+    _patch_transformers_hub_calls_in_ci()
 
     logger.debug("transformers compatibility patches applied")
 
@@ -464,3 +465,85 @@ def patch_is_base_mistral_in_ci():
         logger.info("CI: patched _patch_mistral_regex to skip HF API calls")
 
     _is_base_mistral_patched = True
+
+
+def _patch_transformers_hub_calls_in_ci():
+    # Serve transformers' per-load Hub API calls from the local cache when it has them.
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_IS_IN_CI.get():
+        return
+
+    from huggingface_hub import get_cached_repo_tree
+    from huggingface_hub.errors import CachedRepoTreeNotFoundError
+    from huggingface_hub.hf_api import RepoFolder
+    from transformers.utils.hub import hf_api
+
+    # transformers' own HfApi instance; huggingface_hub downloads are unaffected.
+    api = hf_api()
+    resolve_revision = api.resolve_revision
+    list_repo_files = api.list_repo_files
+    list_repo_tree = api.list_repo_tree
+
+    def _resolve_revision_from_cache(*args, **kwargs):
+        # The cached ref still pins a load to one commit; a miss stays unresolved.
+        return resolve_revision(*args, **{**kwargs, "local_files_only": True})
+
+    def _cached_repo_files(repo_id, revision, repo_type):
+        # The saved full listing; a snapshot folder holds only what was downloaded.
+        try:
+            return get_cached_repo_tree(repo_id, repo_type=repo_type, revision=revision)
+        except CachedRepoTreeNotFoundError:
+            return None
+
+    def _list_repo_files(repo_id, *, revision=None, repo_type=None, token=None):
+        files = _cached_repo_files(
+            repo_id=repo_id, revision=revision, repo_type=repo_type
+        )
+        if files is None:
+            return list_repo_files(
+                repo_id=repo_id, revision=revision, repo_type=repo_type, token=token
+            )
+        return [entry.path for entry in files]
+
+    def _list_repo_tree(
+        repo_id,
+        path_in_repo=None,
+        *,
+        recursive=False,
+        revision=None,
+        repo_type=None,
+        **kwargs,
+    ):
+        files = _cached_repo_files(
+            repo_id=repo_id, revision=revision, repo_type=repo_type
+        )
+        if files is None:
+            return list_repo_tree(
+                repo_id=repo_id,
+                path_in_repo=path_in_repo,
+                recursive=recursive,
+                revision=revision,
+                repo_type=repo_type,
+                **kwargs,
+            )
+        prefix = f"{path_in_repo.strip('/')}/" if path_in_repo else ""
+        entries, folders = [], set()
+        for entry in files:
+            if not entry.path.startswith(prefix):
+                continue
+            *dirs, _ = entry.path[len(prefix) :].split("/")
+            if recursive:
+                entries.append(entry)
+                folders.update(
+                    prefix + "/".join(dirs[:depth]) for depth in range(1, len(dirs) + 1)
+                )
+            elif dirs:
+                folders.add(prefix + dirs[0])
+            else:
+                entries.append(entry)
+        return entries + [RepoFolder(path=path, oid=None) for path in sorted(folders)]
+
+    api.resolve_revision = _resolve_revision_from_cache
+    api.list_repo_files = _list_repo_files
+    api.list_repo_tree = _list_repo_tree
