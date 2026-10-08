@@ -716,7 +716,7 @@ class _MoriEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
-        self.max_tokens_per_rank = (
+        self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         self.dispatch_dtype = DispatchDtype.bf16
@@ -756,7 +756,11 @@ class _MoriEPDispatcherImplBase:
             # The caller is responsible for covering all received tokens, as
             # with the original EPv1 override. Do not round an explicit cap.
             self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
-        elif self._trim_recv and not self._tbo_enabled and self._is_recv_layout_verified():
+        elif (
+            self._trim_recv
+            and not self._tbo_enabled
+            and self._is_recv_layout_verified()
+        ):
             bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
             # Empty or unproved bounds keep the full view.
             if bound > 0:
@@ -962,7 +966,7 @@ class _MoriEPv1DispatcherImplBase(_MoriEPDispatcherImplBase):
                 self.num_local_experts,
                 self.hidden_size,
                 self.params_dtype,
-                self.max_tokens_per_rank,
+                self.num_max_dispatch_tokens_per_rank,
                 self.deepep_mode,
                 self.instance_id,
                 self.dispatch_dtype,
@@ -1447,7 +1451,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.num_local_experts,
             self.hidden_size,
             self.params_dtype,
-            self.max_tokens_per_rank,
+            self.num_max_dispatch_tokens_per_rank,
             self.instance_id,
             envs.SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS.get(),
             self.dispatch_dtype,

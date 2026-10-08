@@ -3392,6 +3392,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
         return_moe_output: bool = False,
