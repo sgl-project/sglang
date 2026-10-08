@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.mamba import cake_routes
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -998,6 +999,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_states: Optional[torch.Tensor] = None,
         *,
         h_track_buf: Optional[torch.Tensor] = None,
+        unaligned_rows_written: bool = False,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`).
@@ -1006,11 +1008,17 @@ class MambaAttnBackendBase(AttentionBackend):
         when given (its rows follow the batch, selected by the integer index
         ``track_ssm_h_batch_src`` — a boolean mask would nonzero() and sync the
         stream once per layer); otherwise they fall back to the per-chunk
-        states ``h`` (already rounded to the activation dtype)."""
+        states ``h`` (already rounded to the activation dtype).
+        ``unaligned_rows_written``: the kernel already wrote every unaligned
+        row into its track slot (Cake SSD selective checkpoints), so only the
+        chunk-aligned rows' final-state slot copy remains."""
         if forward_metadata.has_mamba_track_mask:
             # Triton always returns h; FlashInfer returns it only when checkpoints
             # were requested. Aligned-only tracking reads the final state below.
-            if forward_metadata.track_ssm_h_src.numel() > 0:
+            if (
+                forward_metadata.track_ssm_h_src.numel() > 0
+                and not unaligned_rows_written
+            ):
                 if h_track_buf is not None:
                     ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
                         forward_metadata.track_ssm_h_batch_src
@@ -1022,7 +1030,8 @@ class MambaAttnBackendBase(AttentionBackend):
                         forward_metadata.track_ssm_h_src
                     ].to(ssm_states.dtype, copy=False)
             if (
-                forward_metadata.track_ssm_recompute_dst is not None
+                not unaligned_rows_written
+                and forward_metadata.track_ssm_recompute_dst is not None
                 and forward_metadata.track_ssm_recompute_dst.numel() > 0
             ):
                 assert track_states is not None
@@ -1119,13 +1128,18 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if forward_batch.mamba_track_mask is not None:
-            if intermediate_states is not None:
+            # The Cake SSD route checkpoints the chunk-unaligned track rows into
+            # the pool in-kernel and returns no chunk grid; its sentinel keeps
+            # the chunk-aligned rows' slot copy and skips the rest.
+            cake_wrote_unaligned = track_states is cake_routes.SSD_TRACK_STATES_IN_PLACE
+            if intermediate_states is not None or cake_wrote_unaligned:
                 self._track_mamba_state_extend(
                     forward_batch,
                     intermediate_states,
                     layer_cache.temporal,
                     self.forward_metadata,
-                    track_states=track_states,
+                    track_states=None if cake_wrote_unaligned else track_states,
+                    unaligned_rows_written=cake_wrote_unaligned,
                 )
 
             if self.forward_metadata.num_decodes > 0:

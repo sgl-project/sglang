@@ -14,8 +14,11 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import os
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
@@ -85,6 +88,7 @@ try:
 except ImportError:
     pass
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -152,6 +156,253 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
+
+# ---------------------------------------------------------------------------
+# Cake (FlashInfer backend="cake") opt-in route: DeepSeek-V3 grouped routing
+# ---------------------------------------------------------------------------
+#
+# ``SGLANG_CAKE_ROUTES=dsv3_grouped_routing`` lets ``biased_grouped_topk_gpu``
+# (DeepSeek-V3 / R1 / V3.2 node-limited sigmoid routing, every forward mode:
+# the router runs per token) take the Cake KernelSpec registered in
+# ``sglang.kernels.ops.moe.cake`` instead of FlashInfer's default
+# ``fused_topk_deepseek``.  The route is taken only when the adapter's
+# ``supports_fused_topk_deepseek`` admission accepts the exact tensors; else
+# the stock dispatch below runs unchanged.  Single in-place launch, no
+# workspace: CUDA-graph capture needs no special casing.  The first "taken"
+# and "fallback" are logged once so an e2e run can prove which kernel ran.
+
+CAKE_ROUTE_DSV3_GROUPED_ROUTING = "dsv3_grouped_routing"
+_CAKE_LOG_PREFIX = "[cake-route]"
+_cake_route_logged: set = set()
+# Shape keys FlashInfer rejected host-side (ValueError / NotImplementedError).
+_cake_route_rejected: set = set()
+
+
+def _cake_reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
+def _log_cake_route_once(route: str, event: str, detail: str) -> None:
+    key = (route, event, _cake_reason_kind(detail) if event == "fallback" else "")
+    if key in _cake_route_logged:
+        return
+    _cake_route_logged.add(key)
+    if event == "taken":
+        logger.info("%s %s: Cake kernel selected (%s)", _CAKE_LOG_PREFIX, route, detail)
+    else:
+        logger.info(
+            "%s %s: fallback to FlashInfer default (%s)",
+            _CAKE_LOG_PREFIX,
+            route,
+            detail,
+        )
+
+
+def reset_cake_route_state_for_tests() -> None:
+    _cake_route_logged.clear()
+    _cake_route_rejected.clear()
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_fused_topk_deepseek_kernels() -> Tuple[Callable[..., bool], Callable]:
+    """Lazy (admission, forwarder) pair for ``moe.fused_topk_deepseek``."""
+    from sglang.kernels.cake_kernels.moe_deepseek_routing import (
+        supports_fused_topk_deepseek,
+    )
+    from sglang.kernels.ops.moe.cake import cake_fused_topk_deepseek
+
+    return supports_fused_topk_deepseek, cake_fused_topk_deepseek
+
+
+# Opt-in per-call diagnostics for the dsv3_grouped_routing route (eager runs only:
+# the check synchronises).  SGLANG_CAKE_DSV3_ROUTING_CHECK=1 runs the stock
+# FlashInfer router next to every Cake call on identical inputs and logs how the
+# expert ids / weights differ; SGLANG_CAKE_DSV3_ROUTING_DUMP_DIR=<dir> saves the
+# first mismatching calls (scores, bias, parameters, both outputs) for replay.
+_CAKE_DSV3_CHECK = os.environ.get("SGLANG_CAKE_DSV3_ROUTING_CHECK", "0") == "1"
+_CAKE_DSV3_DUMP_DIR = os.environ.get("SGLANG_CAKE_DSV3_ROUTING_DUMP_DIR", "")
+_cake_dsv3_check_state = {
+    "calls": 0,
+    "rows": 0,
+    "set_rows": 0,
+    "order_rows": 0,
+    "wmax": 0.0,
+    "dumps": 0,
+}
+
+
+def _cake_dsv3_routing_check(
+    scores, bias, n_group, topk_group, topk, scaling_factor, cake_w, cake_ids
+) -> None:
+    st = _cake_dsv3_check_state
+    stock_w = torch.empty_like(cake_w)
+    stock_ids = torch.empty_like(cake_ids)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        scaling_factor,
+        stock_w,
+        stock_ids,
+        True,
+    )
+    c_ids_s, c_perm = torch.sort(cake_ids.to(torch.int64), dim=-1)
+    s_ids_s, s_perm = torch.sort(stock_ids.to(torch.int64), dim=-1)
+    set_mismatch = (c_ids_s != s_ids_s).any(dim=-1)
+    order_only = (~set_mismatch) & (cake_ids != stock_ids).any(dim=-1)
+    c_w_s = torch.gather(cake_w, -1, c_perm)
+    s_w_s = torch.gather(stock_w, -1, s_perm)
+    same = ~set_mismatch
+    wdiff = (c_w_s - s_w_s).abs()
+    wmax = float(wdiff[same].max()) if bool(same.any()) else 0.0
+    n_set = int(set_mismatch.sum())
+    n_order = int(order_only.sum())
+    st["calls"] += 1
+    st["rows"] += int(scores.shape[0])
+    st["set_rows"] += n_set
+    st["order_rows"] += n_order
+    st["wmax"] = max(st["wmax"], wmax)
+    anomaly = n_set > 0 or n_order > 0 or wmax > 1e-6
+    if anomaly and st["dumps"] < 4 and _CAKE_DSV3_DUMP_DIR:
+        os.makedirs(_CAKE_DSV3_DUMP_DIR, exist_ok=True)
+        st["dumps"] += 1
+        path = os.path.join(
+            _CAKE_DSV3_DUMP_DIR,
+            f"dsv3_routing_dev{scores.device.index}_{st['dumps']}.pt",
+        )
+        torch.save(
+            {
+                "scores": scores.cpu(),
+                "bias": bias.cpu(),
+                "n_group": n_group,
+                "topk_group": topk_group,
+                "topk": topk,
+                "scaling_factor": scaling_factor,
+                "cake_weights": cake_w.cpu(),
+                "cake_ids": cake_ids.cpu(),
+                "stock_weights": stock_w.cpu(),
+                "stock_ids": stock_ids.cpu(),
+            },
+            path,
+        )
+        logger.info("%s dsv3_grouped_routing CHECK dump %s", _CAKE_LOG_PREFIX, path)
+    if anomaly and st["calls"] <= 20 or st["calls"] % 200 == 0:
+        bad = (
+            int(set_mismatch.nonzero()[0])
+            if n_set
+            else (int(order_only.nonzero()[0]) if n_order else -1)
+        )
+        logger.info(
+            "%s dsv3_grouped_routing CHECK call=%d T=%d set_mismatch_rows=%d order_only_rows=%d "
+            "wmax_same_set=%.3e | cumulative rows=%d set=%d order=%d wmax=%.3e | first_bad_row=%d cake=%s stock=%s",
+            _CAKE_LOG_PREFIX,
+            st["calls"],
+            scores.shape[0],
+            n_set,
+            n_order,
+            wmax,
+            st["rows"],
+            st["set_rows"],
+            st["order_rows"],
+            st["wmax"],
+            bad,
+            cake_ids[bad].tolist() if bad >= 0 else None,
+            stock_ids[bad].tolist() if bad >= 0 else None,
+        )
+
+
+def _cake_biased_grouped_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    num_expert_group: int,
+    topk_group: int,
+    topk_routed: int,
+    scaling_factor: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Run the ``dsv3_grouped_routing`` Cake route; ``None`` means "use stock".
+
+    Same contract as the stock FlashInfer branch of ``biased_grouped_topk_gpu``:
+    FP32 ``topk_weights`` and int32 ``topk_ids`` of shape ``[T, topk_routed]``
+    for the routed experts only.  The Cake kernel writes ``topk_values`` in the
+    scores dtype, so the FP32 upcast of the router logits that the stock branch
+    performs is kept (a no-op for FP32 gates).
+    """
+    supports, cake_topk = _cake_fused_topk_deepseek_kernels()
+    key = (
+        tuple(gating_output.shape),
+        gating_output.dtype,
+        correction_bias.dtype,
+        num_expert_group,
+        topk_group,
+        topk_routed,
+    )
+    if key in _cake_route_rejected:
+        return None
+    detail = (
+        f"scores={tuple(gating_output.shape)}/"
+        f"{str(gating_output.dtype).removeprefix('torch.')} "
+        f"bias={str(correction_bias.dtype).removeprefix('torch.')} "
+        f"n_group={num_expert_group} topk_group={topk_group} topk={topk_routed}"
+    )
+    if not supports(
+        gating_output,
+        correction_bias,
+        n_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk_routed,
+    ):
+        _log_cake_route_once(
+            CAKE_ROUTE_DSV3_GROUPED_ROUTING,
+            "fallback",
+            f"adapter admission rejected: {detail}",
+        )
+        return None
+    scores = gating_output.to(dtype=torch.float32)
+    num_tokens = scores.shape[0]
+    topk_weights = torch.empty(
+        (num_tokens, topk_routed), dtype=torch.float32, device=scores.device
+    )
+    topk_ids = torch.empty(
+        (num_tokens, topk_routed), dtype=torch.int32, device=scores.device
+    )
+    try:
+        cake_topk(
+            scores,
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk_routed,
+            scaling_factor,
+            topk_weights,
+            topk_ids,
+            True,  # launch_with_pdl, as the stock branch
+        )
+    except (NotImplementedError, ValueError) as error:  # FlashInfer host check
+        _cake_route_rejected.add(key)
+        _log_cake_route_once(
+            CAKE_ROUTE_DSV3_GROUPED_ROUTING,
+            "fallback",
+            f"FlashInfer rejected the shape ({error}): {detail}",
+        )
+        return None
+    _log_cake_route_once(CAKE_ROUTE_DSV3_GROUPED_ROUTING, "taken", detail)
+    if _CAKE_DSV3_CHECK:
+        _cake_dsv3_routing_check(
+            scores,
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk_routed,
+            scaling_factor,
+            topk_weights,
+            topk_ids,
+        )
+    return topk_weights, topk_ids
 
 
 def _use_rocm_triton_softmax_topk(
@@ -1793,6 +2044,42 @@ def biased_grouped_topk_gpu(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
         )
+    if (
+        _is_cuda
+        and not dynamic_bias
+        and num_expert_group is not None
+        and topk_group is not None
+        and cake_route_enabled(CAKE_ROUTE_DSV3_GROUPED_ROUTING)
+    ):
+        # Cake route (SGLANG_CAKE_ROUTES=dsv3_grouped_routing); the JIT opt-in
+        # above keeps precedence, the stock FlashInfer branch below is the
+        # fallback.  Same scaling convention as that branch: flashinfer applies
+        # the scaling factor internally.
+        cake_scaling_factor = 1.0
+        if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
+            cake_scaling_factor = routed_scaling_factor
+        cake_result = _cake_biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk_routed=topk_routed,
+            scaling_factor=cake_scaling_factor,
+        )
+        if cake_result is not None:
+            topk_weights, topk_ids = cake_result
+            if num_fused_shared_experts > 0:
+                # Shared-expert columns exactly as the stock branch appends them.
+                topk_ids = F.pad(
+                    topk_ids, (0, num_fused_shared_experts), value=num_experts
+                )
+                topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
+                if routed_scaling_factor is not None:
+                    topk_weights[:, topk_routed:] = (
+                        topk_weights[:, :topk_routed].sum(dim=-1, keepdim=True)
+                        / routed_scaling_factor
+                    )
+            return topk_weights, topk_ids
     if (
         _is_cuda
         and fused_topk_deepseek is not None

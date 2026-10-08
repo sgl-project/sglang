@@ -2335,6 +2335,24 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def resolve_nvfp4_moe_runner_backend(
+    moe_runner_backend: MoeRunnerBackend,
+) -> MoeRunnerBackend:
+    """The runner an NVFP4 MoE layer actually uses for ``moe_runner_backend``.
+
+    ``auto`` resolves to the fp4-marlin W4A16 fallback on SM80-SM9x and to the
+    FlashInfer TRT-LLM runner everywhere else (the most performant and tested
+    FP4 MoE backend). Every stage of the layer must apply the same resolution:
+    ``create_moe_runner`` picks the runner, ``process_weights_after_loading``
+    lays the weights out for it, ``apply`` reads the per-runner scale tensors.
+    """
+    if not moe_runner_backend.is_auto():
+        return moe_runner_backend
+    if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+        return MoeRunnerBackend.MARLIN
+    return MoeRunnerBackend.FLASHINFER_TRTLLM
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2344,12 +2362,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
-            capability = get_device_capability()
-            use_marlin_fallback = (8, 0) <= capability < (10, 0)
-        else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
+        # Resolve ``auto`` once, here: the weight layout chosen below and the
+        # runner ``create_moe_runner`` builds must agree. Resolving only in
+        # ``create_moe_runner`` left ``--moe-runner-backend auto`` preparing
+        # the CUTLASS layout (no ``g1_scale_c`` / TRT-LLM shuffle) while
+        # ``apply`` ran the TRT-LLM runner, which failed its first forward
+        # with ``FusedMoE has no attribute g1_scale_c``.
+        moe_runner_backend = resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
+        self._moe_runner_backend = moe_runner_backend
+        use_marlin_fallback = moe_runner_backend.is_marlin()
         if not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
@@ -2357,8 +2378,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
         )
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
@@ -2846,7 +2867,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if moe_runner_backend.is_flashinfer_trtllm():
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -2890,6 +2911,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
+
+            # Opt-in Cake NVFP4 warp-decode runner over the same TRT-LLM weight
+            # view (SGLANG_CAKE_ROUTES=moe_nvfp4_warp_decode); None when the
+            # route is off or the layer geometry is not admitted.
+            from sglang.srt.layers.moe.moe_runner.cake_warp_decode import (
+                maybe_create_cake_warp_decode_moe,
+            )
+
+            layer._cake_warp_decode = maybe_create_cake_warp_decode_moe(layer)
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -3026,17 +3056,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
-        self._moe_runner_backend = moe_runner_backend
+        moe_runner_backend = resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
+        if moe_runner_backend != self._moe_runner_backend:
+            raise RuntimeError(
+                "NVFP4 MoE runner backend changed between weight preparation "
+                f"({self._moe_runner_backend}) and runner creation "
+                f"({moe_runner_backend}); the weights were laid out for the former."
+            )
 
         if get_moe_a2a_backend().is_megamoe():
             # FusedMoE.forward is never reached under megamoe.
@@ -3172,6 +3198,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
+                cake_warp_decode=getattr(layer, "_cake_warp_decode", None),
             )
 
             return self.runner.run(dispatch_output, quant_info)

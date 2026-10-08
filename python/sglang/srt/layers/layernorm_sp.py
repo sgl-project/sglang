@@ -35,10 +35,15 @@ nothing in this module executes.
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+import logging
+import os
+import re
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -46,11 +51,29 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import ceil_align
 
+logger = logging.getLogger(__name__)
+
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
+# LlamaForCausalLM uses the same layer-boundary / residual_batch wiring as
+# Qwen3 and is the target of the Cake ``sp_all_gather_matmul`` route
+# (Llama-3.1-70B: K = 8192; packed-QKV N = 1280 and gate_up N = 7168 at TP8,
+# 2560 / 14336 at TP4); its stock SP run is still to be validated on GPU
+# alongside that route.
 SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+# Llama-3.1 dense models become SP participants only when the Cake
+# all-gather+matmul route is selected (opt-in); the stock SP allowlist is
+# unchanged otherwise.
+_CAKE_SP_EXTRA_ARCHITECTURES = frozenset({"LlamaForCausalLM"})
+
+
+def sp_supported_architectures() -> frozenset:
+    """Architectures accepted by ``--enable-layernorm-sp`` for this process."""
+    if cake_route_enabled("sp_all_gather_matmul"):
+        return SP_SUPPORTED_ARCHITECTURES | _CAKE_SP_EXTRA_ARCHITECTURES
+    return SP_SUPPORTED_ARCHITECTURES
 
 
 def initialize_layernorm_sp(*, model_config) -> None:
@@ -60,8 +83,69 @@ def initialize_layernorm_sp(*, model_config) -> None:
     get_flags().sp.enabled = bool(
         get_parallel().enable_layernorm_sp
         and architectures
-        and architectures[0] in SP_SUPPORTED_ARCHITECTURES
+        and architectures[0] in sp_supported_architectures()
     )
+
+
+def _symm_mem_module():
+    """``torch.distributed._symmetric_memory`` (indirection for tests)."""
+    import importlib
+
+    return importlib.import_module("torch.distributed._symmetric_memory")
+
+
+def select_cake_sp_symm_mem_backend() -> bool:
+    """Choose torch's NVSHMEM symmetric-memory backend for the Cake route.
+
+    FlashInfer's push-wait all-gather matmul allocates its flags and scratch
+    through ``torch.distributed._symmetric_memory`` and refuses any backend but
+    NVSHMEM. The backend is process-global and cannot change once the allocator
+    has been used (an allocation, or even a backend query resolves it), so it is
+    selected here right after distributed setup, before any query. sglang's own
+    all-reduce buffers do not go through torch symmetric memory unless the
+    torch-symm-mem all-reduce is enabled; when the switch is refused the route
+    falls back to the stock path on every call (the adapter admission checks
+    the backend). Called from ``distributed.bootstrap.init_parallel_runtime``
+    right after the device is selected. Returns whether NVSHMEM is now the
+    backend.
+    """
+    global _cake_sp_nvshmem_backend
+    try:
+        symm_mem = _symm_mem_module()
+    except ImportError as error:
+        _log_cake_sp_once("fallback", f"torch symmetric memory unavailable ({error})")
+        return False
+    available = getattr(symm_mem, "is_nvshmem_available", lambda: False)()
+    if not available:
+        _log_cake_sp_once(
+            "fallback", "NVSHMEM symmetric-memory backend unavailable in this torch"
+        )
+        return False
+    try:
+        symm_mem.set_backend("NVSHMEM")
+    except Exception as error:  # noqa: BLE001 - allocator already in use
+        device = torch.device("cuda", torch.cuda.current_device())
+        try:
+            current = str(symm_mem.get_backend(device))
+        except Exception:  # noqa: BLE001
+            current = "unknown"
+        if current.upper() == "NVSHMEM":
+            _cake_sp_nvshmem_backend = True
+            return True
+        _log_cake_sp_once(
+            "fallback",
+            f"cannot select the NVSHMEM symmetric-memory backend ({error}); "
+            f"torch backend stays {current}",
+        )
+        return False
+    _cake_sp_nvshmem_backend = True
+    logger.info(
+        "%s %s: torch symmetric-memory backend set to NVSHMEM "
+        "(torch fused symm-mem SP ops disabled for this process)",
+        _CAKE_LOG_PREFIX,
+        CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+    )
+    return True
 
 
 def layernorm_sp_enabled() -> bool:
@@ -185,6 +269,8 @@ def sp_fused_matmul_eligible(linear) -> bool:
     case the fused ops support). Depends only on static layer properties, so the
     decision is identical across TP ranks.
     """
+    if _cake_sp_nvshmem_backend:
+        return False
     if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -192,6 +278,301 @@ def sp_fused_matmul_eligible(linear) -> bool:
     if not isinstance(linear.quant_method, UnquantizedLinearMethod):
         return False
     return linear.weight.dtype in (torch.bfloat16, torch.float16)
+
+
+# --- Cake all-gather + matmul route (SGLANG_CAKE_ROUTES=sp_all_gather_matmul) --
+# ``column_parallel_g_matmul`` is the engine's all-gather + GEMM site. With the
+# route selected, an unquantized bias-free BF16/FP16 participant whose shard
+# the adapter admits (K = 8192, N % 256 == 0, any local row count, world size
+# 2 / 4 / 8, SM100 / SM103, NVSHMEM symmetric memory) runs FlashInfer's
+# prepared Cake launcher (``communication.prepare_all_gather_matmul``) on the
+# engine's ``weight.t()`` view: FlashInfer reads the ``[N, K]`` parameter in
+# place and masks the 128-row tile tail itself, so the route makes no weight
+# copy and no row padding. Everything else keeps the stock path above
+# unchanged.
+#
+# The launcher binds the weight view, the TP group and a row capacity in one
+# collective (every rank holds the same shard row count, so every rank
+# prepares at the same call) and then serves any row count up to the capacity
+# without a collective or an allocation besides the output. It is cached per
+# participant and re-prepared when the parameter storage is re-bound (an
+# in-place weight reload is visible through the view) or when a call brings
+# more rows than the capacity, which then grows to the 128-row padded count
+# (FlashInfer sizes its scratch in 128-row tiles anyway). SP is prefill-only,
+# so nothing here runs inside CUDA-graph capture; the guard below keeps that
+# invariant explicit.
+
+CAKE_ROUTE_SP_ALL_GATHER_MATMUL = "sp_all_gather_matmul"
+_CAKE_LOG_PREFIX = "[cake-route]"
+# FlashInfer pads the local rows to this MMA tile; launcher capacities are
+# rounded up to it so token counts within one tile share a launcher.
+_CAKE_SP_ROW_TILE = 128
+
+_cake_sp_logged: set[tuple[str, str]] = set()
+# True once select_cake_sp_symm_mem_backend() made NVSHMEM the torch
+# symmetric-memory backend. torch's own fused symm-mem ops
+# (fused_all_gather_matmul / fused_matmul_reduce_scatter) allocate their
+# workspace with a group name, which the NVSHMEM allocator rejects, so the
+# stock fused fast path is disabled for the whole process in that case.
+_cake_sp_nvshmem_backend = False
+# (id(linear), input dtype, world_size) refused by the adapter or FlashInfer
+_cake_sp_rejected: set[tuple] = set()
+
+
+class _CakeSpLauncher(NamedTuple):
+    """A prepared FlashInfer launcher and the contract it was bound to."""
+
+    weight_key: tuple
+    dtype: torch.dtype
+    world_size: int
+    max_rows: int
+    launch: Callable[..., torch.Tensor]
+
+
+# id(linear) -> prepared launcher bound to the participant's weight view
+_cake_sp_launchers: dict[int, _CakeSpLauncher] = {}
+
+
+def _cake_sp_reason_kind(detail: str) -> str:
+    """Digit-normalised prefix of a fallback detail (the text before the tensor
+    dump), so one line is emitted per distinct reason, not per shape."""
+    return re.sub(r"\d+", "N", detail.split(":", 1)[0])[:64]
+
+
+def _log_cake_sp_once(event: str, detail: str) -> None:
+    key = (event, _cake_sp_reason_kind(detail) if event == "fallback" else "")
+    if key in _cake_sp_logged:
+        return
+    _cake_sp_logged.add(key)
+    if event.startswith("taken"):
+        logger.info(
+            "%s %s: Cake kernel selected (%s)",
+            _CAKE_LOG_PREFIX,
+            CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+            detail,
+        )
+    else:
+        logger.info(
+            "%s %s: fallback to stock all-gather + matmul (%s)",
+            _CAKE_LOG_PREFIX,
+            CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+            detail,
+        )
+
+
+def reset_cake_sp_state_for_tests() -> None:
+    global _cake_sp_nvshmem_backend
+    _cake_sp_nvshmem_backend = False
+    _cake_sp_logged.clear()
+    _cake_sp_rejected.clear()
+    _cake_sp_launchers.clear()
+
+
+@functools.lru_cache(maxsize=None)
+def _cake_sp_kernels() -> tuple[Callable, Callable]:
+    """Lazy (supports_prepare, prepare) for the Cake AG-matmul launcher."""
+    from sglang.kernels.cake_kernels.communication import (
+        supports_prepare_all_gather_matmul,
+    )
+    from sglang.kernels.ops.communication.cake import (
+        cake_prepare_all_gather_matmul,
+    )
+
+    return (supports_prepare_all_gather_matmul, cake_prepare_all_gather_matmul)
+
+
+def cake_sp_eligible(linear, bias) -> bool:
+    """Static per-participant gate for the Cake route: unquantized, bias-free,
+    BF16/FP16 2-D weight (the Cake kernel has no bias / quantized form)."""
+    if bias is not None or linear.bias is not None:
+        return False
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    if not isinstance(linear.quant_method, UnquantizedLinearMethod):
+        return False
+    weight = linear.weight
+    return weight.ndim == 2 and weight.dtype in (torch.bfloat16, torch.float16)
+
+
+def _cake_sp_weight_key(weight: torch.Tensor) -> tuple:
+    """Identity of the parameter storage the launcher's weight view is bound to.
+
+    FlashInfer fingerprints the bound view by data pointer, shape, strides,
+    dtype and device and raises if a call no longer matches, so the launcher
+    is re-prepared when this key changes (the parameter tensor was re-bound);
+    an in-place reload keeps the key and is read through the view.
+    """
+    return (
+        weight.data_ptr(),
+        tuple(weight.shape),
+        tuple(weight.stride()),
+        weight.dtype,
+        weight.device,
+    )
+
+
+def _cake_sp_capacity(rows: int) -> int:
+    return (rows + _CAKE_SP_ROW_TILE - 1) // _CAKE_SP_ROW_TILE * _CAKE_SP_ROW_TILE
+
+
+# Diagnostic (SGLANG_CAKE_SP_CHECK=1): after every Cake all-gather + matmul,
+# recompute the stock all-gather + matmul on the same inputs and compare within
+# the BF16 tolerance (atol 1e-2 + rtol 1e-2). Costs one extra collective + GEMM
+# per participant call; for A/B attribution runs only, never for serving.
+_CAKE_SP_CHECK = os.environ.get("SGLANG_CAKE_SP_CHECK", "0") == "1"
+_CAKE_SP_DUMP_DIR = os.environ.get("SGLANG_CAKE_SP_DUMP_DIR", "")
+_CAKE_SP_CHECK_ATOL = 1e-2
+_CAKE_SP_CHECK_RTOL = 1e-2
+_cake_sp_check_stats = {
+    "calls": 0,
+    "bad_calls": 0,
+    "bad_elems": 0,
+    "elems": 0,
+    "max_abs": 0.0,
+    "dumps": 0,
+}
+
+
+def _cake_sp_check(linear, input_parallel, bias, output, num_tokens) -> None:
+    tp_group = get_parallel().tp_group
+    rank = int(getattr(tp_group, "rank_in_group", 0))
+    gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
+    ref = linear.quant_method.apply(linear, gathered, bias)
+    st = _cake_sp_check_stats
+    st["calls"] += 1
+    if tuple(ref.shape) != tuple(output.shape):
+        logger.warning(
+            "%s sp check: shape mismatch cake=%s stock=%s (rank %d)",
+            _CAKE_LOG_PREFIX,
+            tuple(output.shape),
+            tuple(ref.shape),
+            rank,
+        )
+        st["bad_calls"] += 1
+        return
+    out32 = output.float()
+    ref32 = ref.float()
+    diff = (out32 - ref32).abs()
+    bad = int((diff > _CAKE_SP_CHECK_ATOL + _CAKE_SP_CHECK_RTOL * ref32.abs()).sum())
+    max_abs = float(diff.max())
+    st["elems"] += diff.numel()
+    st["bad_elems"] += bad
+    st["max_abs"] = max(st["max_abs"], max_abs)
+    if bad:
+        st["bad_calls"] += 1
+        if st["bad_calls"] <= 5:
+            logger.warning(
+                "%s sp check: %d/%d elements outside tol, max|d|=%.4g, |ref| max=%.4g "
+                "(inp=%s weight=%s rank %d call %d)",
+                _CAKE_LOG_PREFIX,
+                bad,
+                diff.numel(),
+                max_abs,
+                float(ref32.abs().max()),
+                tuple(input_parallel.shape),
+                tuple(linear.weight.shape),
+                rank,
+                st["calls"],
+            )
+        if _CAKE_SP_DUMP_DIR and st["dumps"] < 4:
+            dump_dir = os.path.join(_CAKE_SP_DUMP_DIR, f"rank{rank}")
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    "input_parallel": input_parallel.detach().cpu(),
+                    "weight": linear.weight.detach().cpu(),
+                    "cake_output": output.detach().cpu(),
+                    "stock_output": ref.detach().cpu(),
+                    "num_tokens": num_tokens,
+                    "world_size": tp_group.world_size,
+                    "rank": rank,
+                },
+                os.path.join(dump_dir, f"sp_check_{st['dumps']}.pt"),
+            )
+            st["dumps"] += 1
+    if st["calls"] % 50 == 1:
+        logger.info(
+            "%s sp check summary: calls=%d bad_calls=%d bad_elems=%d/%d max|d|=%.4g (rank %d)",
+            _CAKE_LOG_PREFIX,
+            st["calls"],
+            st["bad_calls"],
+            st["bad_elems"],
+            st["elems"],
+            st["max_abs"],
+            rank,
+        )
+
+
+def cake_column_parallel_g_matmul(
+    linear, input_parallel: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """Cake all-gather + matmul of this rank's shard; ``None`` means "stock".
+
+    Returns the full ``[M_pad, N]`` output in TP-rank order, the same row order
+    as ``sp_exit_gather`` followed by the matmul; the caller narrows it.
+    """
+    tp_group = get_parallel().tp_group
+    world_size = tp_group.world_size
+    detail = (
+        f"inp={tuple(input_parallel.shape)}/"
+        f"{str(input_parallel.dtype).removeprefix('torch.')} "
+        f"weight={tuple(linear.weight.shape)} world_size={world_size}"
+    )
+    if torch.cuda.is_current_stream_capturing():
+        _log_cake_sp_once(
+            "fallback", f"inside CUDA-graph capture (no eager preparation): {detail}"
+        )
+        return None
+    key = (id(linear), input_parallel.dtype, world_size)
+    if key in _cake_sp_rejected:
+        return None
+    # The engine's shard is contiguous; this is the stock fused path's own
+    # no-op for that case (FlashInfer rejects a strided input instead of
+    # copying it).
+    inp = input_parallel.contiguous()
+    rows = int(inp.shape[0])
+    supports_prepare, prepare = _cake_sp_kernels()
+    weight = linear.weight.detach()
+    # FlashInfer's logical [K, N] operand: the engine's [N, K] parameter read
+    # in place through its transposed view (K-major kernel variant), no copy.
+    w_view = weight.t()
+    if not supports_prepare(inp, w_view, world_size=world_size):
+        _cake_sp_rejected.add(key)
+        _log_cake_sp_once("fallback", f"adapter admission rejected: {detail}")
+        return None
+    weight_key = _cake_sp_weight_key(weight)
+    entry = _cake_sp_launchers.get(id(linear))
+    if (
+        entry is None
+        or entry.weight_key != weight_key
+        or entry.dtype != inp.dtype
+        or entry.world_size != world_size
+        or rows > entry.max_rows
+    ):
+        capacity = _cake_sp_capacity(rows)
+        if entry is not None and entry.weight_key == weight_key:
+            capacity = max(capacity, entry.max_rows)
+        try:
+            launch = prepare(inp, w_view, tp_group.device_group, max_rows=capacity)
+        except (NotImplementedError, ValueError) as error:  # FI host refusal
+            _cake_sp_rejected.add(key)
+            _cake_sp_launchers.pop(id(linear), None)
+            _log_cake_sp_once(
+                "fallback", f"FlashInfer refused to prepare ({error}): {detail}"
+            )
+            return None
+        entry = _CakeSpLauncher(weight_key, inp.dtype, world_size, capacity, launch)
+        _cake_sp_launchers[id(linear)] = entry
+        logger.info(
+            "%s %s: prepared launcher for %d rows (%s)",
+            _CAKE_LOG_PREFIX,
+            CAKE_ROUTE_SP_ALL_GATHER_MATMUL,
+            capacity,
+            detail,
+        )
+    output = entry.launch(inp)
+    _log_cake_sp_once("taken-prepared", f"prepared launcher: {detail}")
+    return output
 
 
 def column_parallel_g_matmul(
@@ -202,9 +583,21 @@ def column_parallel_g_matmul(
     The input is this rank's sequence shard ``[M_pad/tp, K]``; all-gather it back
     to the full sequence, matmul, and narrow to the real token count (recorded at
     the entry scatter). Uses the fused symm-mem kernel when eligible (all-gather +
-    GEMM in one shot), else a plain all-gather + matmul.
+    GEMM in one shot), else a plain all-gather + matmul. With
+    ``SGLANG_CAKE_ROUTES=sp_all_gather_matmul`` an admitted participant takes
+    the Cake all-gather + matmul first (see ``cake_column_parallel_g_matmul``).
     """
     num_tokens = sp_num_tokens()
+    if cake_route_enabled(CAKE_ROUTE_SP_ALL_GATHER_MATMUL) and cake_sp_eligible(
+        linear, bias
+    ):
+        output = cake_column_parallel_g_matmul(linear, input_parallel)
+        if output is not None:
+            if _CAKE_SP_CHECK:
+                _cake_sp_check(
+                    linear, input_parallel, bias, output[:num_tokens], num_tokens
+                )
+            return output[:num_tokens]
     if sp_fused_matmul_eligible(linear):
         group_name = get_parallel().tp_group.device_group.group_name
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
