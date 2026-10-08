@@ -636,6 +636,9 @@ class MiMoV2Attention(nn.Module):
         self.v_size = self.num_kv_heads * self.v_head_dim
 
         self.v_scale = v_scale
+        # Set once attention_value_scale has been folded into o_proj weights,
+        # disabling the runtime V multiply (see _fold_attention_value_scale_into_o_proj).
+        self.v_scale_folded = False
 
         self.scaling = self.head_dim**-0.5
 
@@ -713,7 +716,7 @@ class MiMoV2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
 
         inner_state = q, k, v, forward_batch
@@ -743,7 +746,7 @@ class MiMoV2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
 
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
@@ -1652,13 +1655,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             return
         folded = skipped = 0
         for layer in self.model.layers:
-            attn = getattr(layer, "self_attn", None)
-            if attn is None or getattr(attn, "v_scale", None) is None:
-                continue
+            attn = layer.self_attn
             weight = attn.o_proj.weight
             if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
                 weight.data.mul_(v_scale)
-                attn.v_scale = None
+                attn.v_scale_folded = True
                 folded += 1
             else:
                 skipped += 1
