@@ -26,7 +26,7 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_worker_requests_total` | Counter | Per-worker **dispatches** by `worker_url`, `model_id`, `mode`, `outcome` (recorded after dispatch; blind to pre-dispatch drops). See [Dispatch outcomes](#dispatch-outcomes) |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
-| `sgl_router_stream_outcome_total` | Counter | Streaming outcomes by `worker_url`, `model_id`, and `outcome` (`ok`, `stream_error_event`, `upstream_error`, or `client_disconnect`). Counts committed 2xx streams only — non-2xx responses are counted by status in `responses_total` |
+| `sgl_router_stream_outcome_total` | Counter | Streaming outcomes by `worker_url`, `model_id`, and `outcome` (`ok`, `stream_error_event`, `upstream_error`, `client_disconnect`, `expired`, or `aborted`). Counts committed 2xx streams only — non-2xx responses are counted by status in `responses_total` |
 | `sgl_router_active_load` | Gauge | Per-worker prefill-token / decode-block load |
 | `sgl_router_workers` | Gauge | Registered worker count by `mode` |
 | `sgl_router_worker_health` | Gauge | Per-worker health (1=breaker admits, 0=open) |
@@ -40,8 +40,19 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_tree_blocks` | Gauge | Blocks the tree attributes to a `worker_url` / `dp_rank`, by storage `tier` |
 | `sgl_router_kv_block_size` | Gauge | Tokens per block hash, as established from the fleet (0 until a worker reports) |
 | `sgl_router_kv_event_batches_lost_total` | Counter | KV-event batches dropped in transit, from gaps in each publisher's sequence |
+| `sgl_router_kv_event_replays_total` | Counter | Sequence gaps sent to the engine's replay socket, by `outcome` (`repaired`, `incomplete`, `failed`) |
+| `sgl_router_cache_pending_prefix_hits_total` | Counter | Prefix lookups where a prompt routed within `--cache-pending-prefix-ttl-ms` matched deeper than any confirmed prefix |
 | `sgl_router_kv_tree_accounting_errors_total` | Counter | Occupancy-bookkeeping contradictions, by `reason`. Always 0 on a correct tree |
 | `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
+| `sgl_router_kv_bootstrap_peers` | Gauge | Ready sibling router replicas peer bootstrap could pull a tree snapshot from. Emitted only with `--kv-peer-selector` |
+| `sgl_router_kv_bootstrap_peers_synced` | Gauge | 1 once peer discovery has reported at least once; a 0 that never becomes 1 means the peer watch is not delivering (check EndpointSlice RBAC). Emitted only with `--kv-peer-selector` |
+| `sgl_router_kv_tree_nodes` | Gauge | Nodes in this replica's cache-aware tree. 0 after bootstrap settles means the replica is routing cache-blind. Emitted only with `--kv-peer-selector` |
+| `sgl_router_kv_bootstrap_settled` | Gauge | 1 once initial peer bootstrap settled (every rank terminal, or the `--kv-bootstrap-timeout-ms` deadline). Settling says nothing about success — join with `sgl_router_kv_peer_snapshot_total` |
+| `sgl_router_kv_bootstrap_seed_failed` | Gauge | 1 when the last sweep over a non-empty candidate set timed out: siblings were there and their tree could not be pulled. Emitted whether or not `--kv-bootstrap-seed-required` gates on it |
+| `sgl_router_kv_bootstrap_state` | Gauge | Per-rank bootstrap state by `worker_url` / `dp_rank`: 0 pending (events held back, heading for overflow), 1 recovered, 2 failed (routing on live deltas alone) |
+| `sgl_router_kv_peer_snapshot_total` | Counter | Peer snapshot fetches by `outcome` (`accepted` / `unreachable` / `cold_peer` / `rejected`). A fleet pinned at `unreachable` with warm siblings means the per-fetch bound is too small for the body |
+| `sgl_router_kv_bootstrap_rank_total` | Counter | Final per-rank bootstrap verdicts by `outcome` (`warm`, `warm_unwitnessed`, `from_origin`, `gap`, `uncovered`, `abandoned`, `overflow`, `publisher_reset`, `tree_rejected`); one count per rank per incarnation |
+| `sgl_router_kv_bootstrap_sweep_total` | Counter | Peer sweeps by `result` (`found` / `no_peers` / `fleet_cold` / `timed_out` / `ranks_resolved`) — what separates a healthy early settle on a cold fleet from burning the whole deadline |
 
 The legacy `sgl_router_overlap_blocks` metric was removed with the
 `cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,
@@ -117,7 +128,7 @@ worker error the router forwards is a successful *proxy* operation and a failed
 | `client_error` | 4xx except 429 | no — the caller sent something invalid |
 | `backpressure` | 429, 503 | no — responsive but at capacity |
 | `error` | 5xx except 503, plus transport failures, timeouts and incomplete bodies | **yes** |
-| `cancelled` | the router's own stale-request deadline | no |
+| `cancelled` | the router's own stale-request deadline, or a PD decode dispatch dropped because prefill failed first | no |
 
 `error` is the only bucket that means *this worker failed*, which is why the
 Error-ratio panel uses it alone. The split matters during an incident: a
@@ -127,8 +138,11 @@ statuses — so the two agree, and the error ratio keeps pointing at genuine
 faults instead of pegging at 100% exactly when it is being read.
 
 A hung worker surfaces as `error` (the router's upstream timeout), *not* as
-`cancelled`. Only the stale-request deadline produces `cancelled`;
-`sgl_router_stale_requests_total{outcome="expired"}` counts the same events.
+`cancelled`. Two things produce `cancelled`: the stale-request deadline, which
+`sgl_router_stale_requests_total{outcome="expired"}` counts the same events of,
+and a PD decode worker whose dispatch was dropped because prefill failed first —
+the client's status is then prefill's, booked against the prefill worker, so
+decode's abandoned dispatch is counted here rather than disappearing.
 
 ## Access log
 
