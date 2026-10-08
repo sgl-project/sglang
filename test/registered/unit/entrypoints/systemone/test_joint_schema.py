@@ -24,7 +24,7 @@ from sglang.srt.layers.joint_schema_head import (
     pack_decision_layout,
     parse_decision_layout,
 )
-from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
     get_context,
@@ -366,7 +366,7 @@ class TestJointSchemaAdmission(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_tokenizer_refuses_prompts_past_one_prefill(self):
+    def test_tokenizer_refuses_generation_and_prompts_past_one_prefill(self):
         clef = _admission_manager({"hidden_size": 4096})
         layout = [LayoutQuestion(0, (10, 12), ((13, 14), (15, 16)))]
 
@@ -377,7 +377,9 @@ class TestJointSchemaAdmission(CustomTestCase):
                 sampling_params={},
             )
 
+        generation = GenerateReqInput(input_ids=[1, 2, 3], sampling_params={})
         refused = {
+            "generation": (generation, "/v1/systemone"),
             # 4095 tokens pass the context check, but the scheduler takes 4089.
             "past one prefill": (embedding(4095), "at most 4089"),
         }
@@ -385,6 +387,8 @@ class TestJointSchemaAdmission(CustomTestCase):
             with self.subTest(name), self.assertRaisesRegex(ValueError, message):
                 clef._validate_one_request(obj, obj.input_ids)
         clef._validate_one_request(embedding(4089), [1] * 4089)
+        # A server without a joint schema head keeps generating.
+        _admission_manager(None)._validate_one_request(generation, [1, 2, 3])
 
     def test_client_decision_layouts_are_refused_at_encode_and_classify(self):
         manager = SimpleNamespace(requests=[])

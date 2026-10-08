@@ -1297,8 +1297,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
-        if isinstance(obj, EmbeddingReqInput):
-            self._validate_decision_layout(obj, input_ids)
+        self._validate_joint_schema_request(obj, input_ids)
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1403,19 +1402,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask=true."
                 )
 
-    def _validate_decision_layout(
-        self, obj: EmbeddingReqInput, input_ids: List[int]
+    def _validate_joint_schema_request(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
         if self.model_config.joint_head_config is None:
-            if obj.decision_layout is not None:
+            if isinstance(obj, EmbeddingReqInput) and obj.decision_layout is not None:
                 raise ValueError(
                     "decision_layout needs a checkpoint with a joint schema head"
                 )
             return
-        if obj.decision_layout is None:
+        if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
             # Health checks only need a response, which is an empty embedding.
-            if isinstance(obj.rid, str) and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            if (
+                isinstance(obj, EmbeddingReqInput)
+                and isinstance(obj.rid, str)
+                and obj.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            ):
                 return
             raise ValueError(
                 "This checkpoint answers schema decisions, send them to /v1/systemone"
