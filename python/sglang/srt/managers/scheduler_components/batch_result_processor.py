@@ -1563,7 +1563,7 @@ class SchedulerBatchResultProcessor:
             keep_idx = req.kv.mamba_next_track_idx
             keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
             pool.mamba_allocator.free(keep_val.unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
+            pool.clear_mamba_ping_pong_slot(req, keep_idx)
             req.kv.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
@@ -1625,4 +1625,4 @@ class SchedulerBatchResultProcessor:
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
-            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+            pool.clear_mamba_ping_pong_slot(req, other_idx)

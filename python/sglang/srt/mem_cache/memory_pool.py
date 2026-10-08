@@ -1753,20 +1753,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
-        """Update a ping-pong slot value and sync the device-side mapping.
+        """Assign an allocated slot; use clear_mamba_ping_pong_slot to release it."""
+        # Reading a device scalar synchronizes the scheduler, so validate device
+        # tensors only when Mamba debug assertions are enabled.
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.device.type == "cpu"
+            or _MAMBA_DEBUG_ASSERTS
+        ):
+            assert value != -1, "Use clear_mamba_ping_pong_slot to clear a slot"
+        self._update_mamba_ping_pong_slot(req, idx, value, valid=True)
 
-        The req holds the authoritative buffer; this keeps the
-        req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
-        set_mamba_track_indices_from_reqs reads correct slot indices.
-        """
+    def clear_mamba_ping_pong_slot(self, req: Req, idx: int):
+        """Clear a released slot without reading its device-side value."""
+        self._update_mamba_ping_pong_slot(req, idx, -1, valid=False)
+
+    def _update_mamba_ping_pong_slot(self, req: Req, idx: int, value, *, valid: bool):
+        """Keep the request buffer, validity mask, and device mapping in sync."""
         req.kv.mamba_ping_pong_track_buffer[idx] = value
         mask = req.kv.mamba_ping_pong_track_buffer_mask
         if mask is None:
             mask = (1 << req.kv.mamba_ping_pong_track_buffer.numel()) - 1
-        if isinstance(value, int) and value == -1:
-            mask &= ~(1 << idx)
-        else:
+        if valid:
             mask |= 1 << idx
+        else:
+            mask &= ~(1 << idx)
         req.kv.mamba_ping_pong_track_buffer_mask = mask
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.kv.req_pool_idx] = (
             req.kv.mamba_ping_pong_track_buffer

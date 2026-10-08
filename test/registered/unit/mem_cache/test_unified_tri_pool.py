@@ -43,17 +43,66 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     tri_sub_pool_specs,
 )
 
-# Hermetic convention of this directory's pool tests: plain unittest.TestCase,
-# only ci_register imported (no heavy sglang.test.test_utils chain).
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _DEV = "cpu"
+
+
+class TestMambaPingPongSlots(CustomTestCase):
+    def test_clear_and_reassign_slot(self):
+        """Cleared slots must be excluded from cleanup and reappear after allocation."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        for mask in (None, 3):
+            with self.subTest(mask=mask):
+                pool = object.__new__(HybridReqToTokenPool)
+                pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.tensor(
+                    [[4, 7]], dtype=torch.int64
+                )
+                req = SimpleNamespace(
+                    kv=ReqKvInfo(
+                        req_pool_idx=0,
+                        mamba_ping_pong_track_buffer=torch.tensor([4, 7]),
+                        mamba_ping_pong_track_buffer_mask=mask,
+                    )
+                )
+                pool.clear_mamba_ping_pong_slot(req, 0)
+                self.assertEqual(req.kv.mamba_ping_pong_slots().tolist(), [7])
+                self.assertEqual(
+                    pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist(),
+                    [[-1, 7]],
+                )
+                for sentinel in (
+                    -1,
+                    torch.tensor(-1),
+                    req.kv.mamba_ping_pong_track_buffer[0],
+                ):
+                    with self.subTest(sentinel=sentinel):
+                        with self.assertRaisesRegex(
+                            AssertionError, "clear_mamba_ping_pong_slot"
+                        ):
+                            pool.set_mamba_ping_pong_slot(req, 1, sentinel)
+                        self.assertEqual(req.kv.mamba_ping_pong_slots().tolist(), [7])
+                        self.assertEqual(
+                            pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist(),
+                            [[-1, 7]],
+                        )
+                pool.set_mamba_ping_pong_slot(req, 0, torch.tensor(9))
+                self.assertEqual(req.kv.mamba_ping_pong_slots().tolist(), [9, 7])
+                self.assertEqual(
+                    pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist(),
+                    [[9, 7]],
+                )
 
 
 class TestUnifiedTriPool(unittest.TestCase):
@@ -1156,7 +1205,7 @@ class TestTriFactorySizing(unittest.TestCase):
                             # leaves its ping-pong entry unallocated (-1).
                             replacement = allocator.alloc(1)
                             allocator.free(buf[:1].clone())
-                            pool.set_mamba_ping_pong_slot(req, 0, -1)
+                            pool.clear_mamba_ping_pong_slot(req, 0)
                             pool.set_mamba_ping_pong_slot(req, 1, replacement[0])
                         else:
                             pool.set_mamba_ping_pong_slot(req, 1, buf[1])
