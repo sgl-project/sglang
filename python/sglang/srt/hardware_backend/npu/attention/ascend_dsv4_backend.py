@@ -2245,8 +2245,21 @@ class DeepseekV4AscendAttnBackend(
                             pass
                         return "n/a"
 
-                    p = sp
-                    if p < full.numel():
+                    print(
+                        f"[SWAPOS] shape={tuple(buf.shape)} ps={ps} sp={sp} layer={sid}",
+                        flush=True,
+                    )
+                    offs = [
+                        int(x)
+                        for x in os.environ.get(
+                            "DSV4_DUMP_SWA_OFF", "1,128,384,1024"
+                        ).split(",")
+                        if x.strip()
+                    ]
+                    for off in offs:
+                        p = sp - off
+                        if not (0 <= p < full.numel()):
+                            continue
                         rc = p // ps
                         rd_page = int(vals[rc]) if rc < len(vals) else -1
                         rd_row = p % ps
@@ -2255,7 +2268,7 @@ class DeepseekV4AscendAttnBackend(
                         wr_page = wr // ps if wr >= 0 else -1
                         wr_row = wr % ps if wr >= 0 else -1
                         print(
-                            f"[SWAPOS] layer={sid} p={p} full={fs} "
+                            f"[SWAPOS] off={off} p={p} full={fs} "
                             f"rd={rd_page}:{rd_row} wr={wr_page}:{wr_row} "
                             f"rdmd5={_rowmd5(rd_page, rd_row)} "
                             f"wrmd5={_rowmd5(wr_page, wr_row)}",
