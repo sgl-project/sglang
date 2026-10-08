@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -22,6 +23,39 @@ from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+
+
+SPARSE_KV_DEVICE_CACHE_UNIT_SIZE = 2048
+SPARSE_KV_DEVICE_CACHE_CAPACITIES = tuple(
+    factor * SPARSE_KV_DEVICE_CACHE_UNIT_SIZE for factor in range(1, 5)
+)
+
+
+def get_sparsity_driven_kv_offload_device_cache_capacity(
+    *, sparse_context_len: int, enable_lru: bool
+) -> int:
+    """Resolve the device capacity and validate the selected cache policy."""
+    if sparse_context_len <= 0:
+        raise ValueError("Sparse KV offload requires a positive DSA index_topk.")
+    if not enable_lru:
+        return sparse_context_len
+    if sparse_context_len != SPARSE_KV_DEVICE_CACHE_UNIT_SIZE:
+        raise ValueError(
+            "SGLANG_NPU_SPARSE_KV_ENABLE_LRU requires DSA index_topk=2048, "
+            f"got {sparse_context_len}. Disable LRU to use dynamic top-k."
+        )
+    env_field = envs.SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR
+    env_name = env_field.name
+    raw_factor = os.getenv(env_name, str(env_field.default))
+    try:
+        factor = env_field.parse(raw_factor)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name} must be an integer in [1, 4], got {raw_factor!r}."
+        ) from exc
+    if factor < 1 or factor > 4:
+        raise ValueError(f"{env_name} must be an integer in [1, 4], got {factor}.")
+    return factor * SPARSE_KV_DEVICE_CACHE_UNIT_SIZE
 
 
 class SparseKVOffloadMode(str, Enum):
@@ -144,3 +178,55 @@ def get_sparsity_driven_kv_offload_cell_size(
         model_config=model_config
     )
     return index_head_dim * num_layers * element_size
+
+
+def get_sparsity_driven_kv_offload_fixed_memory_size(
+    *,
+    model_config: ModelConfig,
+    use_mla_backend: bool,
+    num_layers: int,
+    element_size: int,
+    max_running_requests_per_worker: int,
+) -> Optional[int]:
+    """Return the fixed device-KV allocation made by the sparse KV manager.
+
+    In addition to the token-scaled index pool, ``SparseKVCacheManager`` keeps
+    a full-MLA-KV cache for every request and layer. With LRU its capacity is
+    ``SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR * 2048``; otherwise it matches
+    the model's ``index_topk``. The request-to-token
+    pool includes a padding row and, on PD decode, preallocated transfer rows.
+    The manager allocates a device cache for all of them.
+    """
+    mode = resolve_sparse_kv_offload_mode(
+        model_config=model_config,
+        use_mla_backend=use_mla_backend,
+    )
+    if not mode.uses_host_kv_offload:
+        return None
+
+    max_running_requests_per_worker = int(max_running_requests_per_worker)
+    if max_running_requests_per_worker <= 0:
+        raise ValueError(
+            "Sparsity-driven KV offload requires a positive per-worker "
+            "max_running_requests, got "
+            f"{max_running_requests_per_worker}."
+        )
+
+    sparse_context_len = get_sparsity_driven_kv_offload_sparse_context_len(
+        model_config=model_config
+    )
+    device_cache_capacity = get_sparsity_driven_kv_offload_device_cache_capacity(
+        sparse_context_len=sparse_context_len,
+        enable_lru=envs.SGLANG_NPU_SPARSE_KV_ENABLE_LRU.get(),
+    )
+    kv_head_dim = int(model_config.kv_lora_rank) + int(model_config.qk_rope_head_dim)
+    request_capacity = max_running_requests_per_worker + 1
+    if mode.uses_pd_decode_staging:
+        request_capacity += get_disagg().disaggregation_decode_extra_slots
+    return (
+        request_capacity
+        * device_cache_capacity
+        * kv_head_dim
+        * num_layers
+        * element_size
+    )

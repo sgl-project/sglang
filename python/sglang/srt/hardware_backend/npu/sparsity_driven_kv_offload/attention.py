@@ -63,8 +63,14 @@ def forward_sparsity_driven_kv_offload(
     sparse_kv_manager = _get_sparse_kv_manager(backend)
     stream = torch.npu.current_stream(backend.device)
 
+    decode_offload_done = None
     if save_kv_cache:
-        sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
+        if forward_batch.forward_mode.is_decode():
+            decode_offload_done = sparse_kv_manager.offload_v2_decode_async(
+                k_nope, k_pe, layer, forward_batch, stream
+            )
+        else:
+            sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:
@@ -129,7 +135,7 @@ def forward_sparsity_driven_kv_offload(
             raise RuntimeError("SFA BSND compact path expects a positive top-k length.")
         if effective_topk_length > selected_kv_length:
             raise RuntimeError(
-                "DSA top-k length exceeds sparse KV device cache capacity: "
+                "DSA top-k length exceeds sparse attention window: "
                 f"topk_len={effective_topk_length}, "
                 f"sparse_context_len={selected_kv_length}."
             )
@@ -157,10 +163,8 @@ def forward_sparsity_driven_kv_offload(
             f"num_query_heads={num_query_heads}"
         )
 
-        # Materialize the compact top-k KV for the current attention step:
-        # device-cache hits and host misses are copied into this buffer, the
-        # device cache is refilled from it, and sparse attention consumes it
-        # directly.
+        # Materialize the current top-k for attention. The manager chooses
+        # whether to retain LRU slots or replace the cache with this window.
         selected_kv_buffer = torch.zeros(
             (
                 batch_size,
@@ -171,55 +175,45 @@ def forward_sparsity_driven_kv_offload(
             dtype=k.dtype,
             device=backend.device,
         )
-        sparse_kv_manager.materialize_selected_kv(
-            layer, forward_batch, topk_indices, selected_kv_buffer, stream
+        (
+            victim_slots,
+            refill_src_index,
+            request_cache_offsets,
+            refill_valid_mask,
+            topk_valid,
+            valid_topk_counts,
+        ) = sparse_kv_manager.materialize_selected_kv(
+            layer,
+            forward_batch,
+            topk_2d,
+            selected_kv_buffer,
+            stream,
+            host_kv_ready_event=decode_offload_done,
         )
 
-        _wait_stream_event(stream, sparse_kv_manager.hit_done)
-        _wait_stream_event(stream, sparse_kv_manager.miss_done)
-
-        selected_k_nope, selected_k_rope = selected_kv_buffer.split(
-            [nope_head_dim, rope_head_dim], dim=-1
-        )
-
-        topk_valid = topk_2d >= 0
-        if forward_batch.seq_lens is not None:
-            valid_rows = (forward_batch.seq_lens[:batch_size] > 0).view(batch_size, 1)
-            topk_valid = topk_valid & valid_rows
+        # Both copies are complete here. Metadata update overlaps preparation
+        # below without consuming selected_kv_buffer.
 
         actual_seq_lengths_kv = (
-            topk_valid.sum(dim=1)
-            .clamp(min=1, max=selected_kv_length)
+            valid_topk_counts.clamp(min=1, max=selected_kv_length)
             .to(device=q_nope.device, dtype=torch.int32)
             .contiguous()
         )
-        actual_seq_lengths_query = torch.ones(
-            batch_size, dtype=torch.int32, device=q_nope.device
-        ).contiguous()
+        actual_seq_lengths_query = sparse_kv_manager._decode_query_seq_lengths[
+            :batch_size
+        ]
 
-        compact_indices = (
-            torch.arange(selected_kv_length, device=q_nope.device, dtype=torch.int32)
-            .view(1, 1, 1, selected_kv_length)
-            .expand(batch_size, 1, num_kv_heads, selected_kv_length)
-            .clone()
-        )
-        compact_valid = topk_valid.view(batch_size, 1, 1, selected_kv_length).expand(
-            batch_size, 1, num_kv_heads, selected_kv_length
-        )
+        compact_valid = topk_valid.view(batch_size, 1, 1, selected_kv_length)
         sparse_indices = torch.where(
             compact_valid,
-            compact_indices,
-            torch.full_like(compact_indices, -1),
+            sparse_kv_manager._compact_sparse_indices,
+            sparse_kv_manager._invalid_sparse_indices,
         ).contiguous()
 
-        empty_rows = (topk_valid.sum(dim=1) == 0).view(batch_size, 1, 1)
+        empty_rows = (valid_topk_counts == 0).view(batch_size, 1, 1)
         sparse_indices[:, :, :, 0] = torch.where(
-            empty_rows.expand(batch_size, 1, num_kv_heads),
-            torch.zeros(
-                (batch_size, 1, num_kv_heads),
-                dtype=torch.int32,
-                device=q_nope.device,
-            ),
+            empty_rows,
+            sparse_kv_manager._zero_sparse_index[:batch_size],
             sparse_indices[:, :, :, 0],
         )
 
@@ -229,6 +223,10 @@ def forward_sparsity_driven_kv_offload(
         q_rope_sfa = q_pe.view(
             batch_size, 1, padded_query_heads, rope_head_dim
         ).contiguous()
+
+        selected_k_nope, selected_k_rope = selected_kv_buffer.split(
+            [nope_head_dim, rope_head_dim], dim=-1
+        )
         k_nope_sfa = selected_k_nope.contiguous()
         k_rope_sfa = selected_k_rope.contiguous()
 
@@ -257,6 +255,24 @@ def forward_sparsity_driven_kv_offload(
             rope_head_dim,
         )
 
+        # Refill can start as soon as victim selection completes. The following
+        # slot-map/reverse-map writes touch different buffers and overlap refill.
+        _wait_stream_event(
+            stream, sparse_kv_manager._materialize_victim_slot_select_done
+        )
+        sparse_kv_manager.refill_selected_kv(
+            layer,
+            selected_kv_buffer,
+            victim_slots,
+            refill_src_index,
+            request_cache_offsets,
+            refill_valid_mask,
+            stream,
+        )
+
+        # Keep the full metadata update ordered before attention/next-layer
+        # work while allowing it to overlap the refill above.
+        _wait_stream_event(stream, sparse_kv_manager._materialize_metadata_update_done)
         ret = torch_npu.npu_sparse_flash_attention(
             q_nope_sfa,
             k_nope_sfa,
@@ -274,9 +290,6 @@ def forward_sparsity_driven_kv_offload(
             attention_mode=2,
             return_softmax_lse=False,
         )
-
-        _wait_stream_event(stream, sparse_kv_manager.refill_done)
-        _wait_stream_event(stream, sparse_kv_manager.slot_map_done)
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(

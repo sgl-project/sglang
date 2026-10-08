@@ -13,6 +13,11 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_DEVICE_CACHE_CAPACITIES,
+    get_sparsity_driven_kv_offload_device_cache_capacity,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
@@ -94,6 +99,23 @@ class SparseKVCacheManager:
                 "SparseKVCacheManager requires a positive sparse_context_len, "
                 f"got {self.sparse_context_len}."
             )
+        self.enable_lru = envs.SGLANG_NPU_SPARSE_KV_ENABLE_LRU.get()
+        self.device_cache_capacity = (
+            get_sparsity_driven_kv_offload_device_cache_capacity(
+                sparse_context_len=self.sparse_context_len,
+                enable_lru=self.enable_lru,
+            )
+        )
+        if self.enable_lru:
+            from sgl_kernel_npu.sparsity_driven_kv_offload import (
+                fused_timestamp_lru_metadata_update_with_probation,
+                parallel_lru_metadata_write,
+            )
+
+            self._lru_metadata_update = (
+                fused_timestamp_lru_metadata_update_with_probation
+            )
+            self._lru_metadata_write = parallel_lru_metadata_write
         self.device = req_to_token_pool.device
         paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
@@ -113,26 +135,39 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
+        self._log_cache_stats = envs.SGLANG_NPU_LOG_SPARSE_KV_CACHE_STATS.get()
+        self._probation_age = envs.SGLANG_NPU_SPARSE_KV_PROBATION_AGE.get()
+
+        # Hit and miss copies overlap on independent 24-AIV streams. Metadata
+        # update runs on a third stream after both copies, while refill remains
+        # on the caller stream to keep selected_kv_buffer stream-local after
+        # the copy join.
         self._materialize_d2d_hit_stream = torch.npu.Stream()
         self._materialize_h2d_miss_stream = torch.npu.Stream()
-        self._materialize_refill_stream = torch.npu.Stream()
-        self._materialize_slot_map_stream = torch.npu.Stream()
-
-        self.hit_done = torch.npu.Event()
-        self.miss_done = torch.npu.Event()
-        self.refill_done = torch.npu.Event()
-        self.slot_map_done = torch.npu.Event()
+        self._materialize_metadata_update_stream = torch.npu.Stream()
+        # Decode offload is submitted to a persistent side stream. Keeping the
+        # stream and events alive on the manager is required by NPU graph
+        # capture: creating either object from the captured forward would make
+        # replay depend on Python-side state that is not part of the graph.
+        self._decode_offload_stream = torch.npu.Stream()
+        self._decode_offload_done = [torch.npu.Event() for _ in range(self.layer_num)]
+        self._materialize_hit_done = torch.npu.Event()
+        self._materialize_miss_done = torch.npu.Event()
+        self._materialize_victim_slot_select_done = torch.npu.Event()
+        self._materialize_metadata_update_done = torch.npu.Event()
 
         # device KV buffer
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                # [bs, ctx_len, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # Physical cache slots are stable. LRU ordering is maintained
+                # separately in device_lru_slots so hits never need a writeback.
+                # Request IDs start at row 0. Invalid requests are masked before
+                # any device-cache row is accessed.
                 self.device_kv_buffer: list[torch.Tensor] = [
                     torch.empty(
                         (
                             self.size,
-                            self.sparse_context_len,
+                            self.device_cache_capacity,
                             self.head_num,
                             self.head_dim,
                         ),
@@ -146,7 +181,7 @@ class SparseKVCacheManager:
 
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                # Reserve the last row for padded requests and ensure token index
+                # Reserve the last row for invalid requests and ensure token index
                 # `max_context_len` is a valid sentinel column for masked writes.
                 # The row width is also aligned to eight int32 values (32 bytes).
                 self.device_slot_map: list[torch.Tensor] = [
@@ -161,11 +196,42 @@ class SparseKVCacheManager:
                     )
                     for _ in range(self.layer_num)
                 ]
-                # Pre-filled all-(-1) template used to reset the slot map with a
-                # fast device-to-device copy instead of an indexed fill.
-                self._device_slot_map_minus_one = torch.full_like(
-                    self.device_slot_map[0], -1
-                )
+                if self.enable_lru:
+                    # Reverse metadata from stable physical slot to token position.
+                    self.device_slot_tokens: list[torch.Tensor] = [
+                        torch.full(
+                            (self.size, self.device_cache_capacity),
+                            -1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+
+                    # Physical-slot permutation paired with descending timestamps.
+                    # Initial equal-stamp ties may use any slot order.
+                    self._initial_lru_slot_order = torch.arange(
+                        self.device_cache_capacity,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ).unsqueeze(0)
+                    self.device_lru_slots: list[torch.Tensor] = [
+                        self._initial_lru_slot_order.expand(
+                            self.size, self.device_cache_capacity
+                        ).clone()
+                        for _ in range(self.layer_num)
+                    ]
+                    # Timestamp is aligned with device_lru_slots: larger means
+                    # older. The fused AIV kernel increments with saturation and
+                    # resets hit/newly-filled slots to zero.
+                    self.device_lru_slot_stamps: list[torch.Tensor] = [
+                        torch.zeros(
+                            (self.size, self.device_cache_capacity),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
@@ -206,8 +272,45 @@ class SparseKVCacheManager:
         self.device_token_pos_cpu = None
         self.current_req_indices_cpu = None
 
-        self._device_cache_slot_ids = torch.arange(
-            self.sparse_context_len, dtype=torch.long, device=self.device
+        # Static flattened row addresses for selected_kv_buffer. The same
+        # addresses are used as the hit/miss copy destinations and the refill
+        # copy sources. Keeping the full request-capacity template avoids three
+        # arange/add/reshape sequences on every decode step; materialization
+        # only takes a view covering the current graph batch.
+        self._selected_kv_copy_indices = torch.arange(
+            self.size * self.sparse_context_len,
+            dtype=torch.long,
+            device=self.device,
+        )
+        # Static sparse-attention metadata templates. Materialization returns
+        # the dynamic validity mask/counts; attention applies them to these
+        # initialization-time tensors without rebuilding arange/full/ones.
+        self._compact_sparse_indices = torch.arange(
+            self.sparse_context_len,
+            dtype=torch.int32,
+            device=self.device,
+        ).view(1, 1, 1, self.sparse_context_len)
+        self._invalid_sparse_indices = torch.full(
+            (1, 1, 1, self.sparse_context_len),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._decode_query_seq_lengths = torch.ones(
+            self.size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._zero_sparse_index = torch.zeros(
+            (self.size, 1, self.head_num),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._slot_map_sentinel_req_indices = torch.full(
+            (self.size,), self.size, dtype=torch.long, device=self.device
+        )
+        self._zero_req_indices = torch.zeros(
+            self.size, dtype=torch.long, device=self.device
         )
         self._slot_map_width = (self.max_context_len // 8 + 1) * 8
         self.pd_decode_k_staging: Optional[list[torch.Tensor]] = None
@@ -218,7 +321,16 @@ class SparseKVCacheManager:
         self._pd_room_to_input_len: dict[int, int] = {}
         self._pd_req_pool_idx_to_room: dict[int, int] = {}
 
-        self._install_req_alloc_hook(req_to_token_pool)
+        # Keep hit/miss counters on device so NPU graph capture/replay does not
+        # need a host synchronization. The dimensions are [layer, request, 2],
+        # where the last dimension stores hit and miss counts respectively.
+        self._cache_stats = torch.zeros(
+            (self.layer_num, self.size, 2),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        self._install_req_lifecycle_hooks(req_to_token_pool)
 
     def _raise_buffer_allocation_error(
         self,
@@ -229,7 +341,8 @@ class SparseKVCacheManager:
             "Failed to allocate sparse KV buffer "
             f"{buffer_name}: req_capacity={self.size}, "
             f"max_context_len={self.max_context_len}, "
-            f"sparse_context_len={self.sparse_context_len}. "
+            f"sparse_context_len={self.sparse_context_len}, "
+            f"device_cache_capacity={self.device_cache_capacity}. "
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
         ) from exc
@@ -348,10 +461,7 @@ class SparseKVCacheManager:
             + [buf.data_ptr() for buf in self.pd_decode_v_staging],
             [buf.nbytes for buf in self.pd_decode_k_staging]
             + [buf.nbytes for buf in self.pd_decode_v_staging],
-            [
-                buf[0, 0].nbytes * transfer_page_size
-                for buf in self.pd_decode_k_staging
-            ]
+            [buf[0, 0].nbytes * transfer_page_size for buf in self.pd_decode_k_staging]
             + [
                 buf[0, 0].nbytes * transfer_page_size
                 for buf in self.pd_decode_v_staging
@@ -474,9 +584,7 @@ class SparseKVCacheManager:
         actual_stream.synchronize()
 
     def init_req(self, req: Req) -> None:
-        if getattr(
-            req, "inflight_middle_chunks", getattr(req, "is_chunked", 0)
-        ) > 0:
+        if getattr(req, "inflight_middle_chunks", getattr(req, "is_chunked", 0)) > 0:
             return
         rid = req.kv.req_pool_idx
         if rid is None:
@@ -496,8 +604,19 @@ class SparseKVCacheManager:
         ).contiguous()
         for layer_idx in range(self.layer_num):
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
+            if self.enable_lru:
+                self.device_slot_tokens[layer_idx].index_fill_(0, req_ids_tensor, -1)
+                self.device_lru_slots[layer_idx].index_copy_(
+                    0,
+                    req_ids_tensor,
+                    self._initial_lru_slot_order.expand(
+                        len(req_ids), self.device_cache_capacity
+                    ).contiguous(),
+                )
+                self.device_lru_slot_stamps[layer_idx].index_fill_(0, req_ids_tensor, 0)
+        self._cache_stats.index_fill_(1, req_ids_tensor, 0)
 
-    def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
+    def _install_req_lifecycle_hooks(self, req_to_token_pool: ReqToTokenPool) -> None:
         original_alloc = getattr(
             req_to_token_pool, "_sparse_kv_original_alloc", req_to_token_pool.alloc
         )
@@ -526,19 +645,61 @@ class SparseKVCacheManager:
                     self.record_pd_request_metadata(req)
             return req_pool_indices
 
-        def free_with_sparse_clear(req: Req):
-            self.clear_pd_request_metadata(
-                req_pool_idx=req.kv.req_pool_idx
-            )
-            return original_free(req)
+        def free_with_sparse_stats(req: Req) -> None:
+            req_pool_idx = req.kv.req_pool_idx
+            try:
+                if req_pool_idx is not None:
+                    if req.finished() and self._log_cache_stats:
+                        self._report_request_cache_stats(req, req_pool_idx)
+                    else:
+                        self.reset_requests([req_pool_idx])
+            except Exception:
+                # Statistics must never prevent the request slot from being freed.
+                logger.exception(
+                    "Failed to report sparse KV cache stats for request rid=%s",
+                    getattr(req, "rid", "unknown"),
+                )
+            finally:
+                self.clear_pd_request_metadata(req_pool_idx=req_pool_idx)
+                original_free(req)
 
         def clear_with_sparse_clear():
             self.clear_all_pd_request_metadata()
             return original_clear()
 
         setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
-        setattr(req_to_token_pool, "free", free_with_sparse_clear)
+        setattr(req_to_token_pool, "free", free_with_sparse_stats)
         setattr(req_to_token_pool, "clear", clear_with_sparse_clear)
+
+    def _report_request_cache_stats(self, req: Req, req_pool_idx: int) -> None:
+        stats = self._cache_stats[:, req_pool_idx, :].cpu().tolist()
+        layer_stats = []
+        total_hits = 0
+        total_misses = 0
+        for layer_idx, (hit_count, miss_count) in enumerate(stats):
+            total_count = hit_count + miss_count
+            hit_rate = hit_count / total_count if total_count else 0.0
+            total_hits += hit_count
+            total_misses += miss_count
+            layer_stats.append(
+                f"  layer {self.start_layer + layer_idx}: "
+                f"hit={hit_count}, miss={miss_count}, hit_rate={hit_rate:.2%}"
+            )
+
+        total_count = total_hits + total_misses
+        overall_hit_rate = total_hits / total_count if total_count else 0.0
+        layer_stats.append(
+            f"  overall: hit={total_hits}, miss={total_misses}, "
+            f"hit_rate={overall_hit_rate:.2%}"
+        )
+
+        logger.info(
+            "Sparse KV cache stats for request rid=%s, req_pool_idx=%d:\n%s",
+            getattr(req, "rid", "unknown"),
+            req_pool_idx,
+            "\n".join(layer_stats),
+        )
+        self.reset_requests([req_pool_idx])
 
     def offload(
         self,
@@ -788,9 +949,7 @@ class SparseKVCacheManager:
                 )
                 token_pos = (
                     flat_prefix_lens
-                    + torch.arange(
-                        extend_seq_lens_sum, device=device, dtype=torch.long
-                    )
+                    + torch.arange(extend_seq_lens_sum, device=device, dtype=torch.long)
                     - flat_seq_starts
                 )
                 dst_index = (
@@ -876,6 +1035,44 @@ class SparseKVCacheManager:
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
+
+    def offload_v2_decode_async(
+        self,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        producer_stream: torch.npu.Stream,
+    ) -> torch.npu.Event:
+        """Submit decode KV offload on the graph-capturable side stream.
+
+        The returned persistent event represents host-KV readiness for this
+        layer. Consumers that may read the just-written token must wait for it;
+        independent decode preparation can continue on ``producer_stream``.
+        """
+        if not forward_batch.forward_mode.is_decode():
+            raise RuntimeError("Async sparse KV offload is only valid for decode.")
+
+        layer_idx = layer.layer_id - self.start_layer
+        self._decode_offload_stream.wait_stream(producer_stream)
+        with torch.npu.stream(self._decode_offload_stream):
+            self.offload_v2(
+                k,
+                k_rope,
+                layer,
+                forward_batch,
+                self._decode_offload_stream,
+            )
+            _record_stream_event(
+                self._decode_offload_stream,
+                self._decode_offload_done[layer_idx],
+            )
+        # These tensors were allocated on the producer stream but are consumed
+        # asynchronously. This also keeps error paths safe if the caller exits
+        # before reaching the host-miss join below.
+        k.record_stream(self._decode_offload_stream)
+        k_rope.record_stream(self._decode_offload_stream)
+        return self._decode_offload_done[layer_idx]
 
     def get_forward_kv(
         self,
@@ -997,8 +1194,16 @@ class SparseKVCacheManager:
         topk_indices: torch.Tensor,
         selected_kv_buffer: torch.Tensor,
         stream: torch.npu.Stream,
-    ) -> None:
-        """Materialize top-k KV entries and refresh the device cache metadata."""
+        host_kv_ready_event: Optional[torch.npu.Event] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Materialize top-k KV and prepare the configured cache policy refill."""
         layer_idx = layer.layer_id - self.start_layer
         stream = stream if stream is not None else torch.npu.current_stream()
 
@@ -1008,25 +1213,61 @@ class SparseKVCacheManager:
             # device_cache_row_indices: invalid -> 0 (masked by valid_topk_mask)
             req_pool_indices = forward_batch.req_pool_indices
             req_pool_indices = req_pool_indices.to(torch.long).contiguous()
+            request_count = req_pool_indices.numel()
+            if request_count > self.size:
+                raise RuntimeError(
+                    "Materialize batch exceeds the initialized copy-index capacity: "
+                    f"batch_size={request_count}, capacity={self.size}."
+                )
             valid_req_mask = (req_pool_indices >= 0) & (req_pool_indices < self.size)
+            if forward_batch.seq_lens is not None:
+                valid_req_mask = valid_req_mask & (
+                    forward_batch.seq_lens[:request_count] > 0
+                )
             slot_map_row_indices = torch.where(
                 valid_req_mask,
                 req_pool_indices,
-                torch.full_like(req_pool_indices, self.size),
+                self._slot_map_sentinel_req_indices[:request_count],
             )
             device_cache_row_indices = torch.where(
                 valid_req_mask,
                 req_pool_indices,
-                torch.zeros_like(req_pool_indices),
+                self._zero_req_indices[:request_count],
             )
 
             # Normalize top-k indices and mask invalid requests and token IDs.
             topk_indices = normalize_batch_topk_indices(topk_indices)
             batch_size, topk_len = topk_indices.shape
+            if batch_size != request_count:
+                raise RuntimeError(
+                    "Top-k and request batch sizes differ: "
+                    f"topk_batch={batch_size}, request_batch={request_count}."
+                )
+            if self.enable_lru and (
+                topk_len != 2048
+                or self.device_cache_capacity not in SPARSE_KV_DEVICE_CACHE_CAPACITIES
+            ):
+                raise RuntimeError(
+                    "The fused timestamp-LRU kernel requires topk_len=2048 and "
+                    "device_cache_capacity in {2048, 4096, 6144, 8192}, got "
+                    f"topk_len={topk_len} and "
+                    f"device_cache_capacity={self.device_cache_capacity}."
+                )
             if topk_len > self.sparse_context_len:
                 raise RuntimeError(
-                    "DSA top-k length exceeds sparse KV device cache capacity: "
+                    "DSA top-k length exceeds sparse attention window: "
                     f"topk_len={topk_len}, sparse_context_len={self.sparse_context_len}."
+                )
+            if (
+                selected_kv_buffer.dim() != 4
+                or selected_kv_buffer.shape[0] != batch_size
+                or selected_kv_buffer.shape[1] != self.sparse_context_len
+            ):
+                raise RuntimeError(
+                    "Current KV buffer must have shape "
+                    "[batch, sparse_context_len, head_num, head_dim], got "
+                    f"{tuple(selected_kv_buffer.shape)} with batch={batch_size} and "
+                    f"sparse_context_len={self.sparse_context_len}."
                 )
             valid_topk_mask = (
                 (topk_indices >= 0)
@@ -1039,20 +1280,38 @@ class SparseKVCacheManager:
                 dtype=torch.int32
             ).contiguous()
             slot_lookup_topk_indices = topk_indices.to(dtype=torch.int32).contiguous()
-            token_on_device, device_token_pos = slot_map_lookup(
-                self.device_slot_map[layer_idx],
-                slot_lookup_req_indices,
-                slot_lookup_topk_indices,
-            )
+            if self.enable_lru:
+                (
+                    token_on_device,
+                    device_token_pos,
+                    hit_position_mask,
+                ) = slot_map_lookup(
+                    self.device_slot_map[layer_idx],
+                    slot_lookup_req_indices,
+                    slot_lookup_topk_indices,
+                    pos_mask_size=self.device_cache_capacity,
+                )
+            else:
+                token_on_device, device_token_pos = slot_map_lookup(
+                    self.device_slot_map[layer_idx],
+                    slot_lookup_req_indices,
+                    slot_lookup_topk_indices,
+                )
             token_on_device = token_on_device.to(torch.bool) & valid_topk_mask
 
-            # Build copy indices on the main stream, then protect their use on
-            # the hit and miss streams with copy_ready.
+            # Build copy indices on the caller stream before releasing the
+            # parallel copies and metadata work to their side streams.
+            selected_kv_copy_indices = self._selected_kv_copy_indices[
+                : batch_size * topk_len
+            ]
+            request_cache_offsets = device_cache_row_indices.unsqueeze(1) * (
+                self.device_cache_capacity
+            )
             hit_src_index, hit_dst_index, hit_valid_mask = _build_hit_src_dst_index(
                 token_on_device,
                 device_token_pos,
-                device_cache_row_indices,
-                self.sparse_context_len,
+                request_cache_offsets,
+                selected_kv_copy_indices,
             )
 
             host_miss_mask = (~token_on_device) & valid_topk_mask
@@ -1061,28 +1320,31 @@ class SparseKVCacheManager:
                 topk_indices,
                 device_cache_row_indices,
                 self.max_context_len,
+                selected_kv_copy_indices,
             )
 
-            cache_slot_ids = self._device_cache_slot_ids[:topk_len]
-            request_cache_offsets = (
-                device_cache_row_indices.unsqueeze(1) * self.sparse_context_len
+            # Accumulate on-device counters as part of graph capture/replay.
+            hit_counts = token_on_device.sum(dim=1, dtype=torch.int32)
+            host_miss_counts = host_miss_mask.sum(dim=1, dtype=torch.int32)
+            valid_topk_counts = hit_counts + host_miss_counts
+            request_stats = torch.stack((hit_counts, host_miss_counts), dim=1)
+            self._cache_stats[layer_idx].index_add_(
+                0, device_cache_row_indices, request_stats
             )
-            refill_src_index = torch.arange(
-                batch_size * topk_len,
-                dtype=torch.long,
-                device=topk_indices.device,
-            )
-            refill_dst_index = (
-                (request_cache_offsets + cache_slot_ids).reshape(-1).contiguous()
-            )
-            refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
 
-            copy_ready = torch.npu.Event()
-            _record_stream_event(stream, copy_ready)
+            refill_src_index = selected_kv_copy_indices
+            refill_valid_mask = (
+                miss_valid_mask
+                if self.enable_lru
+                else valid_topk_mask.reshape(-1).contiguous()
+            )
 
-        # Copy device-cache hits into the selected KV buffer.
+        # Copy device-cache hits and host misses concurrently. Their destination
+        # masks are disjoint, and each stream uses 24 AIVs so both kernels can
+        # occupy the 48 available vector cores at the same time. wait_stream
+        # establishes the dependency on index construction on the caller stream.
+        self._materialize_d2d_hit_stream.wait_stream(stream)
         with torch.npu.stream(self._materialize_d2d_hit_stream):
-            _wait_stream_event(self._materialize_d2d_hit_stream, copy_ready)
             unidex_copy_inplace(
                 self.device_kv_buffer[layer_idx],
                 selected_kv_buffer,
@@ -1093,11 +1355,21 @@ class SparseKVCacheManager:
                 2,  #
                 block_dim=24,
             )
-            _record_stream_event(self._materialize_d2d_hit_stream, self.hit_done)
+            _record_stream_event(
+                self._materialize_d2d_hit_stream,
+                self._materialize_hit_done,
+            )
 
-        # Copy host shared-memory misses into the selected KV buffer.
+        self._materialize_h2d_miss_stream.wait_stream(stream)
         with torch.npu.stream(self._materialize_h2d_miss_stream):
-            _wait_stream_event(self._materialize_h2d_miss_stream, copy_ready)
+            # Decode offload may be writing the current token into the same
+            # host row. Delay only the host-miss copy; hit processing and all
+            # preceding index/LRU preparation stay overlapped with offload.
+            if host_kv_ready_event is not None:
+                _wait_stream_event(
+                    self._materialize_h2d_miss_stream,
+                    host_kv_ready_event,
+                )
             unidex_copy_inplace(
                 self.host_kv_buffer[layer_idx],
                 selected_kv_buffer,
@@ -1109,13 +1381,139 @@ class SparseKVCacheManager:
                 block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
-            _record_stream_event(self._materialize_h2d_miss_stream, self.miss_done)
+            _record_stream_event(
+                self._materialize_h2d_miss_stream,
+                self._materialize_miss_done,
+            )
 
-        # Refill the device cache with the current top-k after hit and miss
-        # copies complete, so the next step can reuse these entries.
-        with torch.npu.stream(self._materialize_refill_stream):
-            _wait_stream_event(self._materialize_refill_stream, self.hit_done)
-            _wait_stream_event(self._materialize_refill_stream, self.miss_done)
+        # Metadata update starts after both copies and overlaps caller-stream
+        # sparse-attention preparation. It does not consume selected_kv_buffer.
+        with torch.npu.stream(self._materialize_metadata_update_stream):
+            _wait_stream_event(
+                self._materialize_metadata_update_stream,
+                self._materialize_hit_done,
+            )
+            _wait_stream_event(
+                self._materialize_metadata_update_stream,
+                self._materialize_miss_done,
+            )
+
+            if self.enable_lru:
+                # Select victims per request, then distribute the sparse slot-map
+                # and reverse-map writes across all AIVs. Stream order carries the
+                # victim_slots/miss_counts dependency between the two kernels.
+                victim_slots, miss_counts = self._lru_metadata_update(
+                    slot_lookup_req_indices,
+                    slot_lookup_topk_indices,
+                    device_token_pos,
+                    hit_position_mask,
+                    self.device_lru_slots[layer_idx],
+                    self.device_lru_slot_stamps[layer_idx],
+                    max_context_len=self.max_context_len,
+                    probation_age=self._probation_age,
+                )
+                _record_stream_event(
+                    self._materialize_metadata_update_stream,
+                    self._materialize_victim_slot_select_done,
+                )
+                self._lru_metadata_write(
+                    self.device_slot_map[layer_idx],
+                    slot_lookup_req_indices,
+                    slot_lookup_topk_indices,
+                    victim_slots,
+                    miss_counts,
+                    self.device_slot_tokens[layer_idx],
+                    max_context_len=self.max_context_len,
+                )
+
+            else:
+                # The original policy replaces the cache with this step's top-k,
+                # including hits whose compact slot may have changed.
+                victim_slots = self._compact_sparse_indices.view(1, -1).expand(
+                    batch_size, topk_len
+                )
+                _record_stream_event(
+                    self._materialize_metadata_update_stream,
+                    self._materialize_victim_slot_select_done,
+                )
+                self._replace_window_metadata(
+                    layer_idx,
+                    slot_map_row_indices,
+                    topk_indices,
+                    valid_topk_mask,
+                    victim_slots,
+                    selected_kv_copy_indices,
+                )
+
+            _record_stream_event(
+                self._materialize_metadata_update_stream,
+                self._materialize_metadata_update_done,
+            )
+
+        # The caller may prepare attention inputs after both copies complete.
+        # Metadata update proceeds independently on its side stream.
+        with torch.npu.stream(stream):
+            _wait_stream_event(stream, self._materialize_hit_done)
+            _wait_stream_event(stream, self._materialize_miss_done)
+
+        return (
+            victim_slots,
+            refill_src_index,
+            request_cache_offsets,
+            refill_valid_mask,
+            valid_topk_mask,
+            valid_topk_counts,
+        )
+
+    def _replace_window_metadata(
+        self,
+        layer_idx: int,
+        req_indices: torch.Tensor,
+        topk_indices: torch.Tensor,
+        valid_mask: torch.Tensor,
+        cache_slots: torch.Tensor,
+        copy_indices: torch.Tensor,
+    ) -> None:
+        """Replace the slot map with the current dynamic top-k window."""
+        self.device_slot_map[layer_idx].fill_(-1)
+        token_indices = torch.where(
+            valid_mask, topk_indices.to(torch.long), self.max_context_len
+        )
+        slot_values = torch.where(valid_mask, cache_slots, -1)
+        flat_indices = (
+            req_indices.unsqueeze(1) * self._slot_map_width + token_indices
+        ).reshape(-1)
+        unidex_copy_inplace(
+            slot_values.reshape(-1, 1).contiguous(),
+            self.device_slot_map[layer_idx].view(-1, 1),
+            copy_indices,
+            flat_indices,
+            valid_mask.reshape(-1),
+            1,
+            1,
+            block_dim=48,
+        )
+
+    def refill_selected_kv(
+        self,
+        layer: RadixAttention,
+        selected_kv_buffer: torch.Tensor,
+        victim_slots: torch.Tensor,
+        refill_src_index: torch.Tensor,
+        request_cache_offsets: torch.Tensor,
+        refill_valid_mask: torch.Tensor,
+        stream: torch.npu.Stream,
+    ) -> None:
+        """Refill selected slots on the caller stream after slot selection."""
+        layer_idx = layer.layer_id - self.start_layer
+        stream = stream if stream is not None else torch.npu.current_stream()
+
+        with torch.npu.stream(stream):
+            refill_dst_index = (
+                (request_cache_offsets + victim_slots.to(torch.long))
+                .reshape(-1)
+                .contiguous()
+            )
             unidex_copy_inplace(
                 selected_kv_buffer,
                 self.device_kv_buffer[layer_idx],
@@ -1124,45 +1522,8 @@ class SparseKVCacheManager:
                 refill_valid_mask,
                 2,
                 2,
-                block_dim=24,
-            )
-            _record_stream_event(self._materialize_refill_stream, self.refill_done)
-
-        # Replace the slot-map row with the current top-k mapping. Invalid
-        # entries use the max_context_len sentinel column to preserve shape.
-        with torch.npu.stream(self._materialize_slot_map_stream):
-            _wait_stream_event(self._materialize_slot_map_stream, copy_ready)
-            self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
-
-            slot_map_token_indices = torch.where(
-                valid_topk_mask,
-                topk_indices.to(torch.long),
-                torch.full_like(topk_indices, self.max_context_len, dtype=torch.long),
-            )
-            slot_map_slot_values = torch.where(
-                valid_topk_mask,
-                cache_slot_ids.to(torch.int32),
-                torch.full_like(cache_slot_ids, -1, dtype=torch.int32),
-            )
-            slot_map_flat_indices = (
-                slot_map_row_indices.unsqueeze(1) * self._slot_map_width
-                + slot_map_token_indices
-            ).reshape(-1)
-            unidex_copy_inplace(
-                slot_map_slot_values.reshape(-1, 1).contiguous(),
-                self.device_slot_map[layer_idx].view(-1, 1),
-                torch.arange(
-                    slot_map_slot_values.numel(),
-                    dtype=torch.long,
-                    device=topk_indices.device,
-                ),
-                slot_map_flat_indices,
-                valid_topk_mask.reshape(-1),
-                1,
-                1,
                 block_dim=48,
             )
-            _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
 
 
 _global_sparse_kv_manager: Optional[SparseKVCacheManager] = None
@@ -1180,13 +1541,14 @@ def get_sparse_kv_manager() -> Optional[SparseKVCacheManager]:
 def _build_hit_src_dst_index(
     token_on_device: torch.Tensor,
     device_token_pos: torch.Tensor,
-    current_req_indices: torch.Tensor,
-    sparse_context_len: int,
+    request_cache_offsets: torch.Tensor,
+    flat_dst_index: torch.Tensor,
 ):
     """
     token_on_device: [bs, topk], bool
     device_token_pos: [bs, topk], int64 or int32
-    current_req_indices: [bs], int64
+    request_cache_offsets: [bs, 1], int64
+    flat_dst_index: [bs * topk], int64, initialized by the manager
 
     Return:
         src_index_full: [bs * topk], int64
@@ -1194,8 +1556,8 @@ def _build_hit_src_dst_index(
         valid_mask: [bs * topk], bool
 
     Flattening rule:
-        src row = req_id * sparse_context_len + device_token_pos
-        dst row = batch_id * topk + topk_pos
+        src row = request_cache_offsets[batch_id] + device_token_pos
+        dst row = flat_dst_index[batch_id, topk_pos]
     """
     if token_on_device.dim() != 2 or device_token_pos.dim() != 2:
         raise RuntimeError(
@@ -1207,37 +1569,29 @@ def _build_hit_src_dst_index(
             f"token_on_device and device_token_pos must have the same shape, got "
             f"{tuple(token_on_device.shape)} and {tuple(device_token_pos.shape)}"
         )
-    if current_req_indices.dim() != 1:
+    if request_cache_offsets.dim() != 2 or request_cache_offsets.shape[1] != 1:
         raise RuntimeError(
-            f"current_req_indices must be 1-D, got {current_req_indices.dim()}"
+            "request_cache_offsets must have shape [batch, 1], got "
+            f"{tuple(request_cache_offsets.shape)}"
         )
 
     bs, topk = token_on_device.shape
-    if current_req_indices.numel() != bs:
+    if request_cache_offsets.shape[0] != bs:
         raise RuntimeError(
-            f"current_req_indices length mismatch: "
-            f"{current_req_indices.numel()} vs batch {bs}"
+            "request_cache_offsets batch mismatch: "
+            f"{request_cache_offsets.shape[0]} vs batch {bs}"
         )
-    if sparse_context_len <= 0:
+    if flat_dst_index.dim() != 1 or flat_dst_index.numel() != bs * topk:
         raise RuntimeError(
-            f"sparse_context_len must be positive, got {sparse_context_len}"
+            "flat_dst_index must contain batch * topk entries, got "
+            f"shape={tuple(flat_dst_index.shape)}, expected={bs * topk}"
         )
-
-    device = token_on_device.device
 
     valid_mask = token_on_device.reshape(-1).contiguous()
-
-    flat_dst_index_all = torch.arange(
-        bs * topk,
-        device=device,
-        dtype=torch.int64,
-    )
-
-    req_offsets = current_req_indices.to(torch.int64).unsqueeze(1) * sparse_context_len
-    src_index_2d = req_offsets + device_token_pos.to(torch.int64)
+    src_index_2d = request_cache_offsets + device_token_pos.to(torch.int64)
     flat_src_index_all = src_index_2d.reshape(-1).contiguous()
 
-    return flat_src_index_all, flat_dst_index_all, valid_mask
+    return flat_src_index_all, flat_dst_index, valid_mask
 
 
 def _build_miss_src_dst_index(
@@ -1245,6 +1599,7 @@ def _build_miss_src_dst_index(
     topk_indices: torch.Tensor,
     current_req_indices: torch.Tensor,
     max_context_len: int,
+    flat_dst_index: torch.Tensor,
 ):
     if token_from_host.dim() != 2 or topk_indices.dim() != 2:
         raise RuntimeError(
@@ -1265,21 +1620,19 @@ def _build_miss_src_dst_index(
             f"current_req_indices length mismatch: "
             f"{current_req_indices.numel()} vs batch {token_from_host.shape[0]}"
         )
-
     bs, topk = token_from_host.shape
-    device = token_from_host.device
+    if flat_dst_index.dim() != 1 or flat_dst_index.numel() != bs * topk:
+        raise RuntimeError(
+            "flat_dst_index must contain batch * topk entries, got "
+            f"shape={tuple(flat_dst_index.shape)}, expected={bs * topk}"
+        )
 
-    valid_2d = token_from_host & (topk_indices >= 0) & (topk_indices < max_context_len)
-    valid_mask = valid_2d.reshape(-1).contiguous()
-
-    flat_dst_index_all = torch.arange(
-        bs * topk,
-        device=device,
-        dtype=torch.int64,
-    )
+    # materialize_selected_kv has already masked invalid requests and token
+    # positions before constructing token_from_host.
+    valid_mask = token_from_host.reshape(-1).contiguous()
 
     req_offsets = current_req_indices.to(torch.int64).unsqueeze(1) * max_context_len
     src_index_2d = req_offsets + topk_indices.to(torch.int64)
     flat_src_index_all = src_index_2d.reshape(-1).contiguous()
 
-    return flat_src_index_all, flat_dst_index_all, valid_mask
+    return flat_src_index_all, flat_dst_index, valid_mask

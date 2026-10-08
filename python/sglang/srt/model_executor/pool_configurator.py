@@ -199,7 +199,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
-    bias = 0
+    bias = fixed sparse-manager device KV allocation, or 0
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -214,6 +214,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = len(effective_layer_ids)
         else:
             num_layers = kvc.layer_info.num_effective_layers
+
+        self._fixed_memory_size = 0
+        if kvc.use_mla_backend and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparsity_driven_kv_offload_fixed_memory_size,
+            )
+
+            max_running_requests = get_schedule().max_running_requests
+            max_running_requests_per_worker = (
+                0
+                if max_running_requests is None
+                else int(max_running_requests) // kvc.ps.attn_dp_size
+            )
+            fixed_memory_size = get_sparsity_driven_kv_offload_fixed_memory_size(
+                model_config=kvc.model_config,
+                use_mla_backend=kvc.use_mla_backend,
+                num_layers=num_layers,
+                element_size=torch._utils._element_size(kvc.kv_cache_dtype),
+                max_running_requests_per_worker=max_running_requests_per_worker,
+            )
+            if fixed_memory_size is not None:
+                self._fixed_memory_size = fixed_memory_size
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
@@ -551,7 +573,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(available_bytes - self._fixed_memory_size, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

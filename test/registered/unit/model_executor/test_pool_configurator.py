@@ -6,6 +6,7 @@ invariants hold (tokens * per_token_cost <= available_bytes).
 """
 
 import contextlib
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -261,6 +262,42 @@ class TestDefaultConfigurator(CustomTestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    def test_sparse_kv_manager_fixed_memory_is_reserved(self):
+        available = 1_000_000
+        fixed_memory = 100_000
+        cell_size = 256
+        page_size = 128
+        mr = _make_model_runner(
+            self,
+            use_mla_backend=True,
+            max_running_requests=8,
+            page_size=page_size,
+        )
+
+        with (
+            mock_cpu_env(),
+            patch.dict(os.environ, {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"}),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_fixed_memory_size",
+                return_value=fixed_memory,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_cell_size",
+                return_value=cell_size,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            config = configurator.calculate_pool_sizes(available, page_size)
+            with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                configurator.calculate_pool_sizes(fixed_memory - 1, page_size)
+
+        expected_tokens = ((available - fixed_memory) // cell_size) // page_size
+        self.assertEqual(config.max_total_num_tokens, expected_tokens * page_size)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
