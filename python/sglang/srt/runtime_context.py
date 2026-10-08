@@ -474,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 

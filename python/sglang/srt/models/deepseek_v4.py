@@ -669,6 +669,25 @@ def _apply_gguf_grouped_wo_a(
     return torch.stack(group_outputs, dim=1)
 
 
+def _materialize_cp_unified_fp8_kv(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    forward_batch: ForwardBatch,
+    stream: Optional[Any],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather a two-pool unified-KV pair in global logical-token order.
+
+    E8M0 scales live inline in the noPE bytes, so both halves travel as one raw
+    byte row and the CP permutation cannot separate scales, noPE and RoPE.
+    """
+    nope_bytes = k_nope.view(torch.uint8)
+    rope_bytes = k_rope.view(torch.uint8)
+    packed = torch.cat((nope_bytes, rope_bytes), dim=-1)
+    packed = cp_materialize_global_token_order(packed, forward_batch, stream)
+    nope, rope = packed.split((nope_bytes.shape[-1], rope_bytes.shape[-1]), dim=-1)
+    return nope.contiguous().view(k_nope.dtype), rope.contiguous().view(k_rope.dtype)
+
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
         Fp8GridActivation,
@@ -893,8 +912,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -903,8 +921,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=wo_a_quant_config,
             prefix=add_prefix("wo_a", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
         if quantize_wo_a:
@@ -936,8 +953,7 @@ class MqaAttentionBase(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("wo_b", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
@@ -2242,20 +2258,6 @@ class MQALayer(MqaAttentionBase):
                 "SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY=1, or run with "
                 "SGLANG_DSV4_UNIFIED_KV_FP8=0."
             )
-        if (
-            unified
-            and is_unified_kv_fp8()
-            and is_cp_active(forward_batch)
-            and not forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            # The gather hands back bf16 kv in global token order *after*
-            # norm+RoPE, so packing would have to move ahead of it and re-derive
-            # RoPE from global-order positions. Whether the CP path has those
-            # ready is unverified, so refuse instead of packing the wrong order.
-            raise NotImplementedError(
-                "fp8 two-pool unified_kv does not support DSA prefill CP "
-                "(SGLANG_DSV4_UNIFIED_KV_FP8=1 with cp_size > 1)."
-            )
 
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
@@ -2376,6 +2378,12 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+            )
+
+        if unified_fp8_prefill and is_cp_active(forward_batch):
+            # kv is the packed noPE half the fused prefill store left on the kv slot.
+            kv, k_rope = _materialize_cp_unified_fp8_kv(
+                kv, k_rope, forward_batch, torch.cuda.current_stream()
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
@@ -2621,7 +2629,7 @@ class MQALayer(MqaAttentionBase):
             and not should_skip_mlp_all_reduce()
         )
         o, _ = self.wo_b(
-            o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+            o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
         )
         if defer_all_reduce:
