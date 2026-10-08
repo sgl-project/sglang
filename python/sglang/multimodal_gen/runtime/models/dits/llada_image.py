@@ -29,7 +29,11 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from sglang.multimodal_gen.configs.models.dits.llada_image import LLaDAImageDitConfig
+from sglang.multimodal_gen.configs.models.dits.llada_image import (
+    SEQUENCE_MULTIPLE,
+    LLaDAImageDitConfig,
+    editing_rope_rows,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
@@ -64,7 +68,6 @@ def apply_rmsnorm_tanh_mul_add(
     return residual + torch.tanh(gate) * norm(x)
 
 
-SEQUENCE_MULTIPLE = 32
 LLADA_IMAGE_ATTENTION_BACKENDS = {
     AttentionBackendEnum.FA,
     AttentionBackendEnum.TORCH_SDPA,
@@ -973,6 +976,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
             batch_image_positions = []
             batch_image_padding = []
             batch_image_noise = []
+            image_token_counts = []
             for image, position_start, noise_value in zip(
                 (source_latents[batch_index], latent),
                 cap_end_positions,
@@ -981,6 +985,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 patches, image_size, token_grid_size = self._patchify_image(
                     image, patch_size, f_patch_size
                 )
+                image_token_counts.append(len(patches))
                 image_height_start = 0
                 padded_features, position_ids, padding_mask, _, noise_mask = (
                     self._pad_with_ids(
@@ -1015,6 +1020,19 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 )
             )
 
+            rope_rows = editing_rope_rows(
+                len(cap_feats[batch_index]),
+                image_token_counts,
+                len(glm_cap_feats[batch_index]),
+            )
+            if rope_rows > self.rope_embedder.axes_lens[0]:
+                # An out-of-range RoPE gather would poison the CUDA context.
+                raise ValueError(
+                    f"LLaDA-Image editing needs {rope_rows} sequence positions "
+                    "for this image size and prompt, above the model limit of "
+                    f"{self.rope_embedder.axes_lens[0]}. Use a smaller image "
+                    "size or a shorter prompt."
+                )
             padded_features, position_ids, padding_mask, _, noise_mask = (
                 self._pad_with_ids(
                     glm_cap_feats[batch_index],
@@ -2252,10 +2270,13 @@ class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
     reverse_param_names_mapping: ClassVar[dict] = {}
 
     def __init__(self, config, hf_config: dict, quant_config=None):
+        if quant_config is not None or "quantization_config" in hf_config:
+            raise ValueError(
+                "LLaDA-Image serves only the BF16 checkpoints, such as "
+                "inclusionAI/LLaDA-Image, and this transformer is quantized"
+            )
         init_kwargs = {
-            key: value
-            for key, value in hf_config.items()
-            if not key.startswith("_") and key != "quantization_config"
+            key: value for key, value in hf_config.items() if not key.startswith("_")
         }
         super().__init__(quant_config=quant_config, **init_kwargs)
         self.sgl_config = config

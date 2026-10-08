@@ -5,6 +5,24 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
+SEQUENCE_MULTIPLE = 32
+
+
+def editing_rope_rows(
+    caption_tokens: int, image_tokens: list[int], sigvq_tokens: int
+) -> int:
+    # Must match LLaDAImageTransformer2DModel._prepare_editing_sequences: two
+    # padded caption copies and the padded image grids precede the SigVQ tokens.
+    def padded(length: int) -> int:
+        return length + (-length) % SEQUENCE_MULTIPLE
+
+    return (
+        1
+        + 2 * padded(caption_tokens)
+        + sum(padded(tokens) for tokens in image_tokens)
+        + sigvq_tokens
+    )
+
 
 @dataclass
 class LLaDAImageArchConfig(DiTArchConfig):

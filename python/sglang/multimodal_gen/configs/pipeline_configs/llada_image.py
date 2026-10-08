@@ -205,16 +205,31 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
 def register():
     from sglang.multimodal_gen.configs.sample.llada_image import (
         LLaDAImageSamplingParams,
+        LLaDAImageTurboSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
+    # Base and Turbo checkpoints share every class name, so Turbo registers
+    # first and the first matching detector wins.
+    register_configs(
+        sampling_param_cls=LLaDAImageTurboSamplingParams,
+        pipeline_config_cls=LLaDAImagePipelineConfig,
+        hf_model_paths=["inclusionAI/LLaDA-Image-Turbo"],
+        model_detectors=[
+            lambda hf_id: "llada-image" in hf_id.lower() and "turbo" in hf_id.lower()
+        ],
+    )
     register_configs(
         sampling_param_cls=LLaDAImageSamplingParams,
         pipeline_config_cls=LLaDAImagePipelineConfig,
         hf_model_paths=["inclusionAI/LLaDA-Image"],
         model_detectors=[
             lambda hf_id: (
-                "lladaimagepipeline" in hf_id.lower() or "llada-image" in hf_id.lower()
+                (
+                    "lladaimagepipeline" in hf_id.lower()
+                    or "llada-image" in hf_id.lower()
+                )
+                and "turbo" not in hf_id.lower()
             )
         ],
     )

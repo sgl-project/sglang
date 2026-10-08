@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from array import array
 from contextlib import nullcontext
@@ -83,6 +84,16 @@ class LLaDAImageTextEncoderRunner:
         text_encoder_path = _resolve_llada_image_component_path(
             model_root, server_args, "text_encoder"
         )
+        text_encoder_config = json.loads(
+            (Path(text_encoder_path) / "config.json").read_text()
+        )
+        if "quantization_config" in text_encoder_config or (
+            text_encoder_config.get("llada_fp8_experts", {}).get("enabled")
+        ):
+            raise ValueError(
+                "LLaDA-Image serves only the BF16 checkpoints, such as "
+                "inclusionAI/LLaDA-Image, and this text encoder is quantized"
+            )
         tokenizer_path = _resolve_llada_image_component_path(
             model_root, server_args, "tokenizer"
         )

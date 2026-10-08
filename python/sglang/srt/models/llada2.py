@@ -67,7 +67,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     apply_qk_norm,
@@ -740,6 +739,43 @@ class LLaDA2MoeModel(nn.Module):
             return hidden_states
 
 
+_EXPERT_PROJECTION_NAMES = frozenset({"gate_proj", "up_proj", "down_proj"})
+
+
+def _prepare_llada2_language_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    num_experts: int,
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Normalize language-model prefixes and expand fused expert tensors."""
+    for name, loaded_weight in weights:
+        if name.startswith("model.language_model."):
+            name = "model." + name.removeprefix("model.language_model.")
+        elif name.startswith("model.lm_head."):
+            name = "lm_head." + name.removeprefix("model.lm_head.")
+
+        expert_prefix, separator, projection_name = name.rpartition(".")
+        is_fused_expert = (
+            separator
+            and expert_prefix.endswith(".mlp.experts")
+            and projection_name in _EXPERT_PROJECTION_NAMES
+        )
+        if not is_fused_expert:
+            yield name, loaded_weight
+            continue
+
+        if loaded_weight.ndim != 3 or loaded_weight.shape[0] != num_experts:
+            raise ValueError(
+                f"Invalid fused expert weight {name!r}: expected first dimension "
+                f"{num_experts}, got shape={tuple(loaded_weight.shape)}"
+            )
+        for expert_id in range(num_experts):
+            yield (
+                f"{expert_prefix}.{expert_id}.{projection_name}.weight",
+                loaded_weight[expert_id],
+            )
+
+
 class LLaDA2MoeModelLM(nn.Module):
     def __init__(
         self,
@@ -837,7 +873,7 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in prepare_llada2_language_weights(
+        for name, loaded_weight in _prepare_llada2_language_weights(
             weights, num_experts=self.config.num_experts
         ):
             if (

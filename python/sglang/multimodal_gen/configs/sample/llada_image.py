@@ -12,11 +12,12 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 class LLaDAImageSamplingParams(SamplingParams):
     data_type: DataType = DataType.IMAGE
     negative_prompt: str | None = None
-    num_inference_steps: int = 4
+    # Base checkpoint recipe from the model card.
+    num_inference_steps: int = 50
     num_frames: int = 1
     height: int = 1024
     width: int = 1024
-    guidance_scale: float = 1.0
+    guidance_scale: float = 5.0
     max_sequence_length: int = 2048
 
     def _validate_with_pipeline_config(self, pipeline_config):
@@ -29,3 +30,10 @@ class LLaDAImageSamplingParams(SamplingParams):
             raise ValueError(
                 "LLaDA-Image max_sequence_length must be between 1 and 3584"
             )
+
+
+@dataclass
+class LLaDAImageTurboSamplingParams(LLaDAImageSamplingParams):
+    # The distilled Turbo checkpoint samples in 4 steps without CFG.
+    num_inference_steps: int = 4
+    guidance_scale: float = 1.0
