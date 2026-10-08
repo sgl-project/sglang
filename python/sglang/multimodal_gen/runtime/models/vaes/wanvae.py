@@ -1514,6 +1514,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
     """
 
     _supports_gradient_checkpointing = False
+    supports_decode_on_frames = True
 
     def __init__(
         self,
@@ -1692,7 +1693,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
         enc = torch.cat([first_frame, enc], dim=2)
         return enc
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, on_frames=None) -> torch.Tensor:
+        """``on_frames`` receives every returned frame once, in order, as soon as it is final."""
         if self.use_feature_cache:
             self.clear_cache()
             iter_ = z.shape[2]
@@ -1711,6 +1713,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        # with the causal cache these frames are final, and full
+                        # height even under spatial-parallel decode
+                        if on_frames is not None:
+                            on_frames(self._output_frames(out_chunks[-1]))
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1
@@ -1725,8 +1731,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)
+            # tiled and whole-clip decodes only finish frames at the end
+            if on_frames is not None:
+                on_frames(out)
 
         return out
+
+    def _output_frames(self, out: torch.Tensor) -> torch.Tensor:
+        """What ``decode`` returns for decoder output ``out``, leaving ``out`` intact."""
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return out.float().clamp(min=-1.0, max=1.0)
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)
