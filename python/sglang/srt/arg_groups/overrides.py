@@ -514,6 +514,21 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "nvfp4":
+        if (
+            hf_config.architectures[0] != "GlmMoeDsaForCausalLM"
+            or major != 12
+            or get_platform().is_hip
+        ):
+            raise ValueError(
+                "DSA NVFP4 KV cache requires GLM DSA on NVIDIA SM120/SM121."
+            )
+        if (
+            getattr(hf_config, "kv_lora_rank", None) != 512
+            or getattr(hf_config, "qk_rope_head_dim", None) != 64
+        ):
+            raise ValueError("DSA NVFP4 requires latent dimension 512 and RoPE 64.")
+        return {}
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
@@ -607,10 +622,10 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
-    is_glm_sm12_fp8 = (
+    is_glm_sm12_quantized = (
         model_arch == "GlmMoeDsaForCausalLM"
         and major == 12
-        and kv_cache_dtype == "fp8_e4m3"
+        and kv_cache_dtype in ("fp8_e4m3", "nvfp4")
         and not get_platform().is_hip
     )
 
@@ -635,14 +650,22 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if is_glm_sm12_fp8:
+    if is_glm_sm12_quantized:
         backend = "flashinfer_sparse_mla"
+        if kv_cache_dtype == "nvfp4":
+            for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+                value = getattr(view, field)
+                if value not in (None, backend):
+                    raise ValueError(
+                        f"GLM DSA NVFP4 KV cache requires {field}={backend!r}; "
+                        f"got {value!r}."
+                    )
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = backend
         if not user_set_decode:
             declared["dsa_decode_backend"] = backend
         logger.warning(
-            "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
+            f"Set DSA backends for GLM {kv_cache_dtype} KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
         )
         return declared

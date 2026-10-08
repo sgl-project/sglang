@@ -444,6 +444,10 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_nvfp4 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False
+        )
+        self._glm_nvfp4_runner = None
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
@@ -657,6 +661,14 @@ class DeepseekSparseAttnBackend(
         )
 
         if uses_flashinfer_sparse_mla:
+            if self.dsa_kv_cache_store_nvfp4:
+                from flashinfer.mla._sparse_mla_glm_nvfp4_sm120 import (
+                    SparseMLAGlmNvfp4Sm120Wrapper,
+                )
+
+                self._glm_nvfp4_runner = SparseMLAGlmNvfp4Sm120Wrapper(
+                    device=torch.device(model_runner.device)
+                )
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_sparse_mla_workspace",
                 lambda: torch.zeros(
@@ -2315,6 +2327,7 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                layer_id=layer.layer_id,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2491,6 +2504,7 @@ class DeepseekSparseAttnBackend(
                 seq_lens=metadata.dsa_cache_seqlens_int32,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                layer_id=layer.layer_id,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -3063,6 +3077,7 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         sm_scale: float,
         skip_softmax_threshold_scale_factor: float | None,
+        layer_id: int,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             flashinfer_sparse_mla_forward,
@@ -3082,6 +3097,12 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            nvfp4_global_scale=(
+                self.token_to_kv_pool.get_mla_kv_global_scale(layer_id)
+                if self.dsa_kv_cache_store_nvfp4
+                else None
+            ),
+            nvfp4_runner=self._glm_nvfp4_runner,
         )
 
     def _forward_flashmla_kv(

@@ -2423,6 +2423,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashinfer_sparse_mla",
                 },
             )
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(arch="GlmMoeDsaForCausalLM", kv_cache_dtype="nvfp4")
+                ),
+                {
+                    "dsa_prefill_backend": "flashinfer_sparse_mla",
+                    "dsa_decode_backend": "flashinfer_sparse_mla",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "requires dsa_decode_backend"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                        dsa_decode_backend="trtllm",
+                    )
+                )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
@@ -2656,6 +2673,43 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
                 )
+
+    def test_glm_dsa_nvfp4_dtype_requires_sm12_and_canonical_dimensions(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_kv_cache_dtype_default,
+        )
+
+        hf = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        view = ResolvedView(
+            SimpleNamespace(
+                _model_config=SimpleNamespace(hf_config=hf),
+                kv_cache_dtype="nvfp4",
+                dsa_prefill_backend=None,
+                dsa_decode_backend=None,
+            )
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+        ):
+            with patch("torch.cuda.get_device_capability", return_value=(12, 0)):
+                self.assertEqual(_dsa_kv_cache_dtype_default(view), {})
+                hf.qk_rope_head_dim = 0
+                with self.assertRaisesRegex(
+                    ValueError, "latent dimension 512 and RoPE 64"
+                ):
+                    _dsa_kv_cache_dtype_default(view)
+                hf.qk_rope_head_dim = 64
+            with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+                with self.assertRaisesRegex(ValueError, "NVIDIA SM120/SM121"):
+                    _dsa_kv_cache_dtype_default(view)
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
         from sglang.srt.arg_groups.overrides import (
