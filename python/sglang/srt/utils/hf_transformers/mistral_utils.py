@@ -542,10 +542,12 @@ def patch_mistral_common_tokenizer(tokenizer):
 
     if hasattr(tokenizer, "_text_to_ids"):
         _orig_text_to_ids = tokenizer._text_to_ids
+        # mistral_common has no text form for control tokens, but the multimodal path
+        # tokenizes the rendered chat template, so map every named one back to its id.
         marker_to_id = {
-            "[IMG]": tokenizer.convert_tokens_to_ids("[IMG]"),
-            "[IMG_BREAK]": tokenizer.convert_tokens_to_ids("[IMG_BREAK]"),
-            "[IMG_END]": tokenizer.convert_tokens_to_ids("[IMG_END]"),
+            marker: tokenizer.convert_tokens_to_ids(marker)
+            for marker in tokenizer.all_special_tokens
+            if not marker.startswith("<SPECIAL_")  # unnamed filler slots
         }
 
         def _text_to_ids_with_pixtral_markers(text, add_special_tokens):
@@ -556,11 +558,14 @@ def patch_mistral_common_tokenizer(tokenizer):
 
             ids = []
             pos = 0
+            # next position of each marker; re-searched only after the loop passes it
+            next_at = {marker: text.find(marker) for marker in marker_to_id}
             while pos < len(text):
                 next_marker = None
                 next_idx = len(text)
-                for marker in marker_to_id:
-                    marker_idx = text.find(marker, pos)
+                for marker, marker_idx in next_at.items():
+                    if 0 <= marker_idx < pos:
+                        marker_idx = next_at[marker] = text.find(marker, pos)
                     if marker_idx != -1 and marker_idx < next_idx:
                         next_marker = marker
                         next_idx = marker_idx
