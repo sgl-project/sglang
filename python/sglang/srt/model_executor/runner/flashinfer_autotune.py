@@ -30,6 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_flags,
+    get_lora,
     get_model,
     get_parallel,
     get_schedule,
@@ -56,8 +58,11 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
 
 def _bf16_cublaslt_weights(
     model_runner: ModelRunner,
-) -> dict[tuple[int, int], torch.Tensor]:
+) -> dict[tuple[int, int, int], torch.Tensor]:
     mr = model_runner
+    logits_processor = getattr(mr.model, "logits_processor", None)
+    if logits_processor is not None:
+        logits_processor._use_bf16_cublaslt_lm_head = False
     if (
         mr.device != "cuda"
         or getattr(mr, "dtype", None) != torch.bfloat16
@@ -91,7 +96,33 @@ def _bf16_cublaslt_weights(
             and weight.is_contiguous()
             and getattr(module, "bias", None) is None
         ):
-            weights.setdefault(tuple(weight.shape), weight)
+            weights.setdefault((128, *weight.shape), weight)
+    lm_head = getattr(mr.model, "lm_head", None)
+    weight = getattr(lm_head, "weight", None)
+    if (
+        type(mr.model).__name__ == "Qwen3VLForConditionalGeneration"
+        and type(mr.model).__module__ == "sglang.srt.models.qwen3_vl"
+        and get_parallel().tp_size == 1
+        and get_parallel().pp_size == 1
+        and not get_lora().enable_lora
+        and not get_flags().capture.enable_torch_compile
+        and not torch.compiler.is_compiling()
+        and logits_processor is not None
+        and not logits_processor.use_fp32_lm_head
+        and logits_processor.rl_on_policy_target is None
+        and lm_head is getattr(getattr(mr.model, "model", None), "embed_tokens", None)
+        and type(getattr(lm_head, "quant_method", None)).__name__
+        == "UnquantizedEmbeddingMethod"
+        and isinstance(weight, torch.Tensor)
+        and tuple(weight.shape) == (151936, 2560)
+        and weight.dtype == torch.bfloat16
+        and weight.is_cuda
+        and weight.is_contiguous()
+        and not weight.requires_grad
+        and getattr(lm_head, "bias", None) is None
+    ):
+        weights[(4, 151936, 2560)] = weight
+        logits_processor._use_bf16_cublaslt_lm_head = True
     return weights
 
 
@@ -391,12 +422,12 @@ def run_flashinfer_autotune_forward(
             from flashinfer import autotune
             from flashinfer.gemm import mm_bf16
 
-            with autotune(tuning_buckets=(128,), round_up=False):
-                for (n, k), weight in weights.items():
-                    x = torch.zeros((128, k), dtype=weight.dtype, device=weight.device)
+            for (m, n, k), weight in weights.items():
+                with autotune(tuning_buckets=(m,), round_up=False):
+                    x = torch.zeros((m, k), dtype=weight.dtype, device=weight.device)
                     out = mm_bf16(x, weight.T, backend="cublaslt")
                     if _has_bf16_cublaslt_tactic(x, weight, out):
-                        verified.add((weight.device.index, n, k))
+                        verified.add((weight.device.index, m, n, k))
         forward_fn()
     if verified:
         from sglang.srt.layers.quantization.unquant import _CUBLASLT_BF16_READY

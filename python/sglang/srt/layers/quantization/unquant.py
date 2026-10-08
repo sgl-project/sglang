@@ -368,7 +368,7 @@ def _bf16_splitk_gemm(
 
 
 _CUBLASLT_BF16_SHAPES = frozenset({(19456, 2560), (2560, 9728)})
-_CUBLASLT_BF16_READY: set[tuple[int, int, int]] = set()
+_CUBLASLT_BF16_READY: set[tuple[int, int, int, int]] = set()
 
 
 def _try_m1_bf16_direct(x, weight, bias, addend=None, out=None):
@@ -426,8 +426,8 @@ def _try_tuned_bf16_cublaslt(x, weight, bias, addend=None, out=None):
         not _CUBLASLT_BF16_READY
         or x.ndim < 2
         or x.shape[-1] == 0
-        or x.numel() != 128 * x.shape[-1]
-        or (x.device.index, *weight.shape) not in _CUBLASLT_BF16_READY
+        or (x.device.index, x.numel() // x.shape[-1], *weight.shape)
+        not in _CUBLASLT_BF16_READY
     ):
         return None
     if (
@@ -448,18 +448,19 @@ def _try_tuned_bf16_cublaslt(x, weight, bias, addend=None, out=None):
         or get_exec().deterministic.enable_deterministic_inference
     ):
         return None
+    m = x.numel() // x.shape[-1]
     if out is not None and (
         x.ndim != 2
         or out.requires_grad
         or out.dtype != torch.bfloat16
         or out.device != x.device
         or not out.is_contiguous()
-        or tuple(out.shape) != (128, weight.shape[0])
+        or tuple(out.shape) != (m, weight.shape[0])
     ):
         return None
     from flashinfer.gemm import mm_bf16
 
-    result = mm_bf16(x.view(128, x.shape[-1]), weight.T, out=out, backend="cublaslt")
+    result = mm_bf16(x.view(m, x.shape[-1]), weight.T, out=out, backend="cublaslt")
     return out if out is not None else result.view(*x.shape[:-1], weight.shape[0])
 
 
