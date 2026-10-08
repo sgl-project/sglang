@@ -11,7 +11,7 @@ import pytest
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend
 from sglang.srt.lora.layers import BaseLayerWithLoRA
-from sglang.srt.lora.utils import capturing_lora_graph
+from sglang.srt.lora.utils import capturing_lora_graph, kv_b_lora_correction
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _lora_backend_skips_inactive,
 )
@@ -50,6 +50,10 @@ def _layer(
         skip_inactive_dense_lora=skip_dense,
     )
     return _Layer(set_lora=set_lora, lora_backend=backend)
+
+
+def _attn(layer):
+    return SimpleNamespace(kv_b_proj=layer)
 
 
 def _active(layer):
@@ -100,6 +104,30 @@ def test_backend_flags_and_decode_runner_default():
         lora_backend=SimpleNamespace(skip_inactive_dense_lora=False)
     )
     assert not _lora_backend_skips_inactive(SimpleNamespace(lora_manager=manager))
+
+
+def test_kv_b_correction_runs_v2_legacy_or_nothing(capture):
+    capture(False)
+    assert kv_b_lora_correction(_attn(_layer(True, skip_dense=True))) == "v2"
+    # An inactive triton_v2 batch runs neither correction: the legacy one
+    # cannot read the v2 batch info.
+    assert kv_b_lora_correction(_attn(_layer(False, skip_dense=True))) is None
+    legacy = dict(skip_dense=False, backend_name="triton")
+    assert kv_b_lora_correction(_attn(_layer(True, **legacy))) == "legacy"
+    assert kv_b_lora_correction(_attn(_layer(False, **legacy))) == "legacy"
+    assert (
+        kv_b_lora_correction(_attn(_layer(True, skip_dense=True, set_lora=False)))
+        is None
+    )
+    assert kv_b_lora_correction(SimpleNamespace()) is None
+
+
+@pytest.mark.parametrize(
+    "variant,expected", [(None, "v2"), ("lora", "v2"), ("nolora", None)]
+)
+def test_kv_b_correction_under_capture(capture, variant, expected):
+    capture(True, variant)
+    assert kv_b_lora_correction(_attn(_layer(False, skip_dense=True))) == expected
 
 
 def test_capture_lora_variant_restores_the_previous_label(capture):
