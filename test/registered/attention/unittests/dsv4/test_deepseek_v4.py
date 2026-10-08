@@ -869,5 +869,26 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         self.assertEqual(out.tolist(), [0, 0])
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestLateLayerTailRequestIndices(CustomTestCase):
+    """The tail's per-row request indices are built every extend forward with
+    decoder SWA bounded replay; their size is host-known and must not sync."""
+
+    def test_repeat_per_request_does_not_sync(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import _repeat_per_request
+
+        values = torch.tensor([3, 1, 7], device="cuda", dtype=torch.int32)
+        counts_cpu = [2, 0, 3]
+        counts = torch.tensor(counts_cpu, device="cuda", dtype=torch.int32)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            out = _repeat_per_request(values, counts, counts_cpu)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.tolist(), [3, 3, 7, 7, 7])
+
+
 if __name__ == "__main__":
     unittest.main()

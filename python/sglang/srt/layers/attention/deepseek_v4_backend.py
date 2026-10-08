@@ -928,6 +928,13 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         )
 
 
+def _repeat_per_request(values, counts, counts_cpu) -> torch.Tensor:
+    # The total is host-known; without output_size repeat_interleave syncs to size it.
+    return torch.repeat_interleave(
+        values.to(torch.int64), counts.to(torch.int64), output_size=sum(counts_cpu)
+    )
+
+
 def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
@@ -1587,8 +1594,8 @@ class DeepseekV4AttnBackend(
             )
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
-        metadata.low_ratio_req_indices = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+        metadata.low_ratio_req_indices = _repeat_per_request(
+            forward_batch.req_pool_indices, tail_lens, tail_lens_cpu
         )
         positions = _tail_rows(
             forward_batch.positions,
