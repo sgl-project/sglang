@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import zmq
 
 from sglang.cli.utils import get_is_diffusion_model
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -72,7 +74,6 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
 )
-from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -150,6 +151,23 @@ def _from_dict_without_model_resolution(
         _mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
+
+
+class TestServerArgsColdImport(unittest.TestCase):
+    def test_public_entry_points_import_in_fresh_processes(self):
+        modules = (
+            "sglang.multimodal_gen.runtime.server_args",
+            "sglang.multimodal_gen.test.runner.diffusion_suite_runner",
+        )
+        for module in modules:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-c", f"import {module}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TestPlatformLifecycleHooks(unittest.TestCase):

@@ -12,13 +12,13 @@ from typing import NamedTuple, cast
 
 import torch
 
+from sglang.multimodal_gen.configs.attention_roles import (
+    AttentionRole,
+    make_component_role_key,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionRequirements,
-)
-from sglang.multimodal_gen.runtime.layers.attention.roles import (
-    AttentionRole,
-    make_component_role_key,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args

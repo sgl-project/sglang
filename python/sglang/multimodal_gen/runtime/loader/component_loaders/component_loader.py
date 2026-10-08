@@ -22,9 +22,9 @@ from transformers import (
 )
 from transformers.quantizers import AutoHfQuantizer
 
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.configs.models.base import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
     component_attn_backend_context_manager,
