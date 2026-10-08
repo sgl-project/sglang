@@ -39,15 +39,6 @@ _BLOCK_CONFIG = {
 }
 
 
-# head_dim: (target stage-1 programs, max splits); long-context hd128 batches need more splits
-_SPLIT_CONFIG = {
-    128: (4096, 64),
-}
-
-
-def split_config(head_dim):
-    return _SPLIT_CONFIG.get(head_dim, (TARGET_PROGRAMS, MAX_N_SPLITS))
-
 
 def block_config(head_dim):
     """
@@ -417,12 +408,8 @@ class VerifyMLA:
         block_n=DEFAULT_BLOCK_N,
         num_warps=DEFAULT_NUM_WARPS,
         kv_group_num=None,
-        target_programs=TARGET_PROGRAMS,
-        max_splits=MAX_N_SPLITS,
     ):
         self.h_q = h_q
-        self.target_programs = target_programs
-        self.max_splits = max_splits
         # MLA is the h_kv == 1 case (kv_group_num == h_q); a GQA draft passes a
         # smaller group. block_h must divide it so a head block maps to one KV
         # head -- can_handle enforces that before this is constructed.
@@ -449,12 +436,12 @@ class VerifyMLA:
         self.max_bs = max_bs
         # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
         self.att_out = torch.empty(
-            (max_bs, self.h_q, self.max_splits, self.l_pad, self.v_head_dim),
+            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad, self.v_head_dim),
             dtype=torch.bfloat16,
             device=self.device,
         )
         self.att_lse = torch.empty(
-            (max_bs, self.h_q, self.max_splits, self.l_pad),
+            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad),
             dtype=torch.float32,
             device=self.device,
         )
@@ -464,8 +451,8 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = self.target_programs // max(1, bs * self.n_head_blocks)
-        return max(1, min(self.max_splits, budget))
+        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
+        return max(1, min(MAX_N_SPLITS, budget))
 
     def _run_prefix_kernel(
         self,
@@ -646,7 +633,6 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
     vk = _VMLA_CACHE.get(key)
     if vk is None:
         block_h, block_n, num_warps = block_config(head_dim)
-        target_programs, max_splits = split_config(head_dim)
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live
@@ -667,8 +653,6 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
             block_n=block_n,
             num_warps=num_warps,
             kv_group_num=kv_group_num,
-            target_programs=target_programs,
-            max_splits=max_splits,
         )
         _VMLA_CACHE[key] = vk
     else:
