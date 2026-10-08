@@ -22,13 +22,21 @@ using namespace sglang::metal_common;
 namespace {
 
 struct Plan {
-  int dim, heads, kv_heads, splits, group;
+  int dim, heads, kv_heads, splits, group, warps, page_size;
   float scale;
   bool tail;
 
   bool operator==(const Plan& other) const {
-    return std::tie(dim, heads, kv_heads, splits, group, scale, tail) ==
-           std::tie(other.dim, other.heads, other.kv_heads, other.splits, other.group, other.scale, other.tail);
+    return std::tie(dim, heads, kv_heads, splits, group, warps, page_size, scale, tail) == std::tie(
+                                                                                               other.dim,
+                                                                                               other.heads,
+                                                                                               other.kv_heads,
+                                                                                               other.splits,
+                                                                                               other.group,
+                                                                                               other.warps,
+                                                                                               other.page_size,
+                                                                                               other.scale,
+                                                                                               other.tail);
   }
 };
 
@@ -65,6 +73,7 @@ class RadixAttention : public Primitive {
     const uint32_t rows = reduce_ ? 0 : inputs[5].shape(0);
     const uint32_t width = reduce_ ? 0 : inputs[5].shape(1);
     const uint32_t slots = reduce_ ? 0 : inputs[3].shape(0);
+    const uint32_t page_size = p.page_size;
     metal::MTLFCList constants = {
         {&heads, MTL::DataType::DataTypeUInt, 0},
         {&splits, MTL::DataType::DataTypeUInt, 2},
@@ -73,20 +82,21 @@ class RadixAttention : public Primitive {
     kernel += dtype_suffix(reduce_ ? out.dtype() : inputs[0].dtype());
     kernel += "_d" + std::to_string(p.dim);
     if (!reduce_) {
-      kernel += "_w4_g" + std::to_string(p.group) + "_p" + std::to_string(p.splits > 1);
+      kernel += "_w" + std::to_string(p.warps) + "_g" + std::to_string(p.group) + "_p" + std::to_string(p.splits > 1);
       constants.emplace_back(&kv_heads, MTL::DataType::DataTypeUInt, 1);
       constants.emplace_back(&p.scale, MTL::DataType::DataTypeFloat, 3);
       constants.emplace_back(&p.tail, MTL::DataType::DataTypeBool, 4);
       constants.emplace_back(&rows, MTL::DataType::DataTypeUInt, 5);
       constants.emplace_back(&width, MTL::DataType::DataTypeUInt, 6);
       constants.emplace_back(&slots, MTL::DataType::DataTypeUInt, 7);
+      constants.emplace_back(&page_size, MTL::DataType::DataTypeUInt, 8);
     }
     uint32_t scale_bits;
     std::memcpy(&scale_bits, &p.scale, sizeof(scale_bits));
     const std::string key = kernel + "_h" + std::to_string(heads) + "_k" + std::to_string(kv_heads) + "_s" +
                             std::to_string(splits) + "_scale" + std::to_string(scale_bits) + "_tail" +
                             std::to_string(p.tail) + "_rows" + std::to_string(rows) + "_width" + std::to_string(width) +
-                            "_slots" + std::to_string(slots);
+                            "_slots" + std::to_string(slots) + "_page" + std::to_string(page_size);
     auto* pipeline = device.get_kernel(kernel, g_library, key, constants);
     auto& encoder = metal::get_command_encoder(stream());
     encoder.set_compute_pipeline_state(pipeline);
@@ -102,7 +112,7 @@ class RadixAttention : public Primitive {
     }
     encoder.dispatch_threadgroups(
         MTL::Size::Make(reduce_ ? 1 : splits, heads / (reduce_ ? 1 : p.group), out.shape(0)),
-        MTL::Size::Make(reduce_ ? 32 : 128, 1, 1));
+        MTL::Size::Make(reduce_ ? 32 : 32 * p.warps, 1, 1));
   }
 
  private:
@@ -110,7 +120,7 @@ class RadixAttention : public Primitive {
   bool reduce_;
 };
 
-void validate(const std::vector<array>& a, float scale, bool tail) {
+void validate(const std::vector<array>& a, float scale, bool tail, int page_size) {
   const auto& q = a[0];
   const auto& k = a[1];
   const auto& pool = a[3];
@@ -124,6 +134,8 @@ void validate(const std::vector<array>& a, float scale, bool tail) {
       table.shape(1) < 1 || a[6].shape() != Shape{batch} || a[7].shape() != Shape{batch} || !std::isfinite(scale) ||
       scale <= 0)
     throw std::invalid_argument("Unsupported compiled radix attention geometry");
+  if ((page_size != 1 && page_size != 16 && page_size != 32 && page_size != 64) || pool.shape(0) % page_size)
+    throw std::invalid_argument("Radix page_size must be 1, 16, 32 or 64 and divide the pool size");
   if (q.dtype() != float16 && q.dtype() != bfloat16 && q.dtype() != float32)
     throw std::invalid_argument("Unsupported compiled radix attention dtype");
   for (int i = 1; i < 5; ++i)
@@ -147,7 +159,8 @@ nb::object radix_py(
     nb::handle lengths,
     float scale,
     nb::handle tail_k,
-    nb::handle tail_v) {
+    nb::handle tail_v,
+    int page_size) {
   auto array_type = nb::module_::import_("mlx.core").attr("array");
   auto unwrap = [&](nb::handle object) -> array {
     if (!nb::isinstance(object, array_type)) throw nb::type_error("AOT radix inputs must be MLX arrays");
@@ -161,19 +174,20 @@ nb::object radix_py(
     inputs.push_back(unwrap(tail_k));
     inputs.push_back(unwrap(tail_v));
   }
-  validate(inputs, scale, tail);
+  validate(inputs, scale, tail, page_size);
   const int batch = inputs[0].shape(0), heads = inputs[0].shape(1), dim = inputs[0].shape(2);
   const int kv_heads = inputs[1].shape(1);
   const int group = (heads / kv_heads) % 2 == 0 ? 2 : 1;
   const int64_t groups = int64_t(batch) * heads / group;
   // Measured on M4 Pro: grouped heads need more KV partitions to fill the GPU.
   const int splits = std::min<int64_t>(16, std::max<int64_t>(1, 128 / groups));
+  const int warps = page_size == 1 ? 4 : 8;
   const Stream stream = default_stream(Device::gpu);
   for (auto& input : inputs)
     input = contiguous(input, false, stream);
   inputs[6] = astype(inputs[6], int64, stream);
   inputs[7] = astype(inputs[7], int64, stream);
-  const Plan plan{dim, heads, kv_heads, splits, group, scale, tail};
+  const Plan plan{dim, heads, kv_heads, splits, group, warps, page_size, scale, tail};
   const auto dtype = inputs[0].dtype();
   const Shape shape = splits > 1 ? Shape{batch, heads, splits, dim + 2} : inputs[0].shape();
   array result(shape, splits > 1 ? float32 : dtype, std::make_shared<RadixAttention>(stream, plan, false), inputs);
@@ -198,5 +212,6 @@ void register_radix_attention(nb::module_& module) {
       nb::arg("lengths"),
       nb::arg("scale"),
       nb::arg("tail_k") = nb::none(),
-      nb::arg("tail_v") = nb::none());
+      nb::arg("tail_v") = nb::none(),
+      nb::arg("page_size") = 1);
 }

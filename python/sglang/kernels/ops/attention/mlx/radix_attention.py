@@ -1,7 +1,9 @@
 """Read-only AOT Metal radix attention, composable inside ``mx.compile``."""
 
 
-def radix_decode(q, k, v, kp, vp, table, requests, lengths, scale, *, tails=None):
+def radix_decode(
+    q, k, v, kp, vp, table, requests, lengths, scale, *, tails=None, page_size=1
+):
     try:
         from sgl_kernel.metal import radix_attention
     except ImportError as error:
@@ -20,4 +22,5 @@ def radix_decode(q, k, v, kp, vp, table, requests, lengths, scale, *, tails=None
         lengths,
         scale,
         tails=tails,
+        page_size=page_size,
     )

@@ -19,6 +19,53 @@ register_mps_ci(est_time=30, suite="stage-a-unit-test-mps")
     "Requires Torch MPS and MLX",
 )
 class TestCompiledGraph(CustomTestCase):
+    def test_radix_lowering_preserves_page_size_and_rejects_broken_pages(self):
+        from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
+        from sglang.kernels.ops.attention.mlx.radix_attention_export import (
+            radix_decode as reference,
+        )
+        from sglang.kernels.ops.attention.mlx.radix_attention_export import (
+            validate_page_slots,
+        )
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Attention(torch.nn.Module):
+            def forward(self, q, k, v, pool, table, rows, lengths):
+                return reference(
+                    q, k, v, pool, pool, table, rows, lengths, 0.125, page_size=16
+                )
+
+        def lower(*args, page_size, tails):
+            return radix_decode(*args, page_size=page_size, tails=tails)
+
+        inputs = (
+            torch.ones((1, 4, 64), device="mps"),
+            torch.ones((1, 2, 64), device="mps"),
+            torch.full((1, 2, 64), 3.0, device="mps"),
+            torch.ones((64, 2, 64), device="mps"),
+            torch.cat((torch.arange(32, 48), torch.arange(16, 32)))
+            .to(device="mps", dtype=torch.int32)
+            .unsqueeze(0),
+            torch.tensor([0], device="mps"),
+            torch.tensor([17], device="mps"),
+        )
+        model = Attention()
+        expected = model(*inputs)
+        graph = CompiledMlxGraph(model=model, example_inputs=inputs, attention=lower)
+        self.addCleanup(graph.close)
+        actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
+        torch.testing.assert_close(actual, expected)
+        slots = inputs[4][0].cpu()
+        for index, value in ((0, 33), (15, 16), (16, 17)):
+            broken = slots.clone()
+            broken[index] = value
+            with (
+                self.subTest(index=index),
+                self.assertRaisesRegex(ValueError, "aligned, contiguous"),
+            ):
+                validate_page_slots(broken, 16)
+
     def test_weighted_rms_fusion_preserves_intermediate_casts(self):
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
@@ -116,7 +163,8 @@ class TestCompiledGraph(CustomTestCase):
                 model=model,
                 req_pool=SimpleNamespace(req_to_token=table),
                 kv_pool=SimpleNamespace(
-                    get_kv_buffer=lambda i: pools[2 * i : 2 * i + 2]
+                    get_kv_buffer=lambda i: pools[2 * i : 2 * i + 2],
+                    page_size=1,
                 ),
                 region=discover_decode_region(model),
             )
@@ -404,9 +452,21 @@ class TestCompiledGraph(CustomTestCase):
         model = torch.nn.Linear(4, 4, device="mps").eval()
         inputs = (torch.ones(1, 4, device="mps"),)
         graph = CompiledMlxGraph(model=model, example_inputs=inputs)
-        model.weight = torch.nn.Parameter(torch.ones(8, 4, device="mps"))
-        with self.assertRaisesRegex(ValueError, "attribute metadata"):
-            graph.bind(inputs)
+        graph.bind(inputs)
+        weight = model.weight
+        for replacement in (
+            weight.T,
+            weight.to(torch.float16),
+            weight.cpu(),
+            torch.ones(8, 4, device="mps"),
+        ):
+            model.weight = torch.nn.Parameter(replacement)
+            with self.subTest(signature=(replacement.shape, replacement.stride())):
+                with self.assertRaisesRegex(ValueError, "attribute metadata"):
+                    graph.bind(inputs)
+        model.weight = weight
+        with self.assertRaisesRegex(ValueError, "input shape, dtype, stride"):
+            graph.bind((torch.ones(1, 8, device="mps")[:, ::2],))
         graph.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             graph.bind(inputs)

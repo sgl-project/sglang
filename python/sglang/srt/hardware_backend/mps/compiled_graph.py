@@ -398,7 +398,7 @@ class CompiledMlxGraph:
                     if self.attention is None:
                         raise ValueError("Radix attention lowering was not provided")
                     tails = (flat[-2][layer], flat[-1][layer]) if tail else None
-                    values[node] = self.attention(*args, tails=tails)
+                    values[node] = self.attention(*args, **kw, tails=tails)
                     layer += 1
                 elif node.target in self.custom_lowerings:
                     values[node] = self.custom_lowerings[node.target](*args, **kw)
@@ -433,7 +433,11 @@ class CompiledMlxGraph:
                 raise ValueError(f"Direct MLX attribute metadata changed: {target}")
             cached = self.views.get(index)
             if tensor.device.type == "mps":
-                if cached is None or not cached.matches(tensor):
+                # Shape, dtype, stride and device were checked above.
+                if (
+                    cached is None
+                    or tensor.data_ptr() != cached.torch_tensor.data_ptr()
+                ):
                     cached = MlxTensorView(tensor, synchronize=False)
                     self.views[index] = cached
                 arrays.append(cached.array)

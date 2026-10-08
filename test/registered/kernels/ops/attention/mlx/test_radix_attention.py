@@ -3,6 +3,7 @@
 import importlib.util
 import tempfile
 import unittest
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -63,11 +64,11 @@ class TestCompiledRadix(CustomTestCase):
         q = mx.ones((2, 4, 64))
         k = mx.ones((2, 2, 64))
         v = mx.full((2, 2, 64), 3.0)
-        pool = mx.full((1, 2, 64), float("nan"))
         table = mx.full((2, 32), -123, dtype=mx.int32)
         requests = mx.array([0, 1])
-        for tail in (False, True):
-            with self.subTest(tail=tail):
+        for page_size, tail in product((1, 16, 32, 64), (False, True)):
+            pool = mx.full((page_size, 2, 64), float("nan"))
+            with self.subTest(page_size=page_size, tail=tail):
                 run = mx.compile(
                     lambda rows, lengths: radix_decode(
                         q,
@@ -80,6 +81,7 @@ class TestCompiledRadix(CustomTestCase):
                         lengths,
                         0.125,
                         tails=(k, v) if tail else None,
+                        page_size=page_size,
                     )
                 )
                 length = 2 if tail else 1
@@ -121,6 +123,35 @@ class TestCompiledRadix(CustomTestCase):
             radix_decode(
                 q[:0], k[:0], k[:0], pool, pool, table, rows[:0], lengths[:0], 0.125
             )
+        for page_size in (0, -16, 2, 32):
+            with self.subTest(page_size=page_size):
+                with self.assertRaisesRegex(ValueError, "page_size"):
+                    radix_decode(
+                        q,
+                        k,
+                        k,
+                        pool,
+                        pool,
+                        table,
+                        rows,
+                        lengths,
+                        0.125,
+                        page_size=page_size,
+                    )
+        for base in (1, 32):
+            result = radix_decode(
+                q,
+                k,
+                k,
+                pool,
+                pool,
+                mx.full_like(table, base),
+                rows,
+                lengths,
+                0.125,
+                page_size=16,
+            )
+            self.assertTrue(mx.all(mx.isnan(result)).item())
 
     def test_read_only_partitions_and_tail_match_committed_reference(self):
         import mlx.core as mx
@@ -132,15 +163,18 @@ class TestCompiledRadix(CustomTestCase):
         from sglang.srt.utils.tensor_bridge import mlx_call_multi
 
         torch.manual_seed(17)
-        for dtype, dim, heads, kv_heads, sequence_lengths in (
-            (torch.float32, 64, 4, 4, [2, 17, 63]),
-            (torch.bfloat16, 128, 4, 2, [2, 513, 8193]),
-            (torch.float16, 256, 4, 1, [2, 4095, 8193]),
-            (torch.bfloat16, 128, 16, 8, [2, 3, 7, 31, 63, 127, 255, 513]),
-            (torch.float32, 64, 16, 16, [2, 3, 7, 31, 63, 127, 255, 513]),
-            (torch.bfloat16, 128, 16, 8, [2, 7, 31, 63] * 4),
-            (torch.float16, 256, 16, 4, [2, 7, 31, 63] * 4),
-            (torch.bfloat16, 128, 6, 2, [2, 17, 63]),
+        for dtype, dim, heads, kv_heads, sequence_lengths, page_size in (
+            (torch.float32, 64, 4, 4, [2, 17, 63], 1),
+            (torch.bfloat16, 128, 4, 2, [2, 513, 8193], 1),
+            (torch.float16, 256, 4, 1, [2, 4095, 8193], 1),
+            (torch.bfloat16, 128, 16, 8, [2, 3, 7, 31, 63, 127, 255, 513], 1),
+            (torch.float32, 64, 16, 16, [2, 3, 7, 31, 63, 127, 255, 513], 1),
+            (torch.bfloat16, 128, 16, 8, [2, 7, 31, 63] * 4, 1),
+            (torch.float16, 256, 16, 4, [2, 7, 31, 63] * 4, 1),
+            (torch.bfloat16, 128, 6, 2, [2, 17, 63], 1),
+            (torch.bfloat16, 128, 16, 8, [2, 15, 16, 17, 31, 32, 33, 8193], 16),
+            (torch.float32, 64, 4, 4, [2, 31, 32, 33, 63, 64, 65], 32),
+            (torch.float16, 256, 6, 2, [2, 63, 64, 65, 127, 128, 129], 64),
         ):
             with (
                 self.subTest(
@@ -149,19 +183,31 @@ class TestCompiledRadix(CustomTestCase):
                     heads=heads,
                     kv_heads=kv_heads,
                     batch=len(sequence_lengths),
+                    page_size=page_size,
                 ),
                 torch.no_grad(),
             ):
                 batch = len(sequence_lengths)
-                width = max(sequence_lengths) + 1
+                width = (max(sequence_lengths) + page_size) // page_size * page_size
                 q = torch.randn(batch, heads, dim, device="mps", dtype=dtype)
                 k = torch.randn(batch, kv_heads, dim, device="mps", dtype=dtype)
                 v, tk, tv = (torch.randn_like(k) for _ in range(3))
-                slots = (batch + 1) * width
+                slots = (batch + 1) * width + page_size
                 kp = torch.randn(slots, kv_heads, dim, device="mps", dtype=dtype)
                 vp = torch.randn_like(kp)
                 table = (
-                    torch.randperm(slots, device="mps").reshape(batch + 1, width).int()
+                    (
+                        (
+                            torch.randperm(slots // page_size - 1, device="mps")[
+                                :, None
+                            ]
+                            + 1
+                        )
+                        * page_size
+                        + torch.arange(page_size, device="mps")
+                    )
+                    .reshape(batch + 1, width)
+                    .int()
                 )
                 requests = torch.tensor([batch, *range(batch - 1)], device="mps")
                 lengths = torch.tensor(sequence_lengths, device="mps")
@@ -174,11 +220,22 @@ class TestCompiledRadix(CustomTestCase):
                     slot = table[requests[index], lengths[index] - 2]
                     committed_k[slot], committed_v[slot] = tk[index], tv[index]
                 expected = reference(
-                    q, k, v, committed_k, committed_v, table, requests, lengths, scale
+                    q,
+                    k,
+                    v,
+                    committed_k,
+                    committed_v,
+                    table,
+                    requests,
+                    lengths,
+                    scale,
+                    page_size=page_size,
                 )
-                plain_expected = reference(*args, scale)
+                plain_expected = reference(*args, scale, page_size=page_size)
                 plain = mlx_call_multi(
-                    mx.compile(lambda *x: (radix_decode(*x, scale),)),
+                    mx.compile(
+                        lambda *x: (radix_decode(*x, scale, page_size=page_size),)
+                    ),
                     *args,
                 )[0]
                 torch.testing.assert_close(
@@ -186,7 +243,11 @@ class TestCompiledRadix(CustomTestCase):
                 )
                 actual = mlx_call_multi(
                     mx.compile(
-                        lambda *x: (radix_decode(*x[:-2], scale, tails=x[-2:]),)
+                        lambda *x: (
+                            radix_decode(
+                                *x[:-2], scale, tails=x[-2:], page_size=page_size
+                            ),
+                        )
                     ),
                     *args,
                     tk,

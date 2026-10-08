@@ -13,7 +13,10 @@ from torch.export.graph_signature import InputKind
 from sglang.kernels.ops.attention.mlx.radix_attention import (
     radix_decode as mlx_radix_decode,
 )
-from sglang.kernels.ops.attention.mlx.radix_attention_export import radix_decode
+from sglang.kernels.ops.attention.mlx.radix_attention_export import (
+    radix_decode,
+    validate_page_slots,
+)
 from sglang.srt.compilation.torch_compile_decoration import _to_torch
 from sglang.srt.hardware_backend.mps.compiled_graph import (
     CompiledMlxGraph,
@@ -105,6 +108,7 @@ class _ExportAttention(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             layer.scaling,
+            page_size=self.token_to_kv_pool.page_size,
         )
         return result.reshape(q.shape[0], -1)
 
@@ -315,6 +319,7 @@ class CompiledMlxRunner(BaseRunner):
             prefix = table[request, : length - 1]
             if bool(((prefix <= 0) | (prefix >= slots)).any()):
                 raise ValueError("Invalid MLX graph decode prefix KV slots")
+            validate_page_slots(table[request, :length], pool.page_size)
         ids = host_alias(batch.input_ids)
         positions = host_alias(batch.positions)
         if bool(((ids < 0) | (ids >= self.model_runner.model.config.vocab_size)).any()):
@@ -360,9 +365,10 @@ class CompiledMlxRunner(BaseRunner):
             self.compile_seconds += elapsed
             self._graphs[size] = graph
             logger.info(
-                "%s decode graph ready: batch=%d, attention=radix, export=%.3fs",
+                "%s decode graph ready: batch=%d, attention=radix, page_size=%d, export=%.3fs",
                 type(graph).__name__,
                 size,
+                mr.token_to_kv_pool.page_size,
                 elapsed,
             )
         return self._graphs[size]
@@ -497,7 +503,7 @@ class CompiledMlxRunner(BaseRunner):
         graph = self._graph(forward_batch)
         arrays = graph.bind(_batch_inputs(forward_batch))
         metadata = self._metadata(forward_batch)
-        weights = self._weights()
+        weights = self._weights() if self._async else ()
         outputs = self._consume(
             graph=graph, batch=forward_batch, metadata=metadata, weights=weights
         )

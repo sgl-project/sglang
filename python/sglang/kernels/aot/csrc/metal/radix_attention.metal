@@ -9,6 +9,7 @@ constant bool HAS_TAIL [[function_constant(4)]];
 constant uint ROWS [[function_constant(5)]];
 constant uint WIDTH [[function_constant(6)]];
 constant uint SLOTS [[function_constant(7)]];
+constant uint PAGE_SIZE [[function_constant(8)]];
 
 template <typename T, typename O, uint D, uint W, uint G, bool PARTIAL>
 inline void radix_impl(
@@ -40,10 +41,25 @@ inline void radix_impl(
   }
   const long span = (length + SPLITS - 1) / SPLITS;
   const long end = min(length, (group.x + 1) * span);
+  long cached_page = -1, page_base = 0;
   for (long token = group.x * span + warp; token < end; token += W) {
     const bool current = token == length - 1;
     const bool previous = HAS_TAIL && token == length - 2;
-    const long slot = (current || previous) ? long(b) : long(table[request * WIDTH + token]);
+    long slot = b;
+    if (!current && !previous) {
+      if (PAGE_SIZE == 1) {
+        slot = long(table[request * WIDTH + token]);
+      } else {
+        // Supported page sizes are powers of two; avoid signed 64-bit division.
+        const long offset = token & (PAGE_SIZE - 1);
+        const long page = token - offset;
+        if (page != cached_page) {
+          page_base = long(table[request * WIDTH + page]);
+          cached_page = page;
+        }
+        slot = page_base < 0 || (page_base & (PAGE_SIZE - 1)) ? -1 : page_base + offset;
+      }
+    }
     if (slot < 0 || (!current && !previous && slot >= SLOTS)) {
       for (uint g = 0; g < G; ++g) { maximum[g] = NAN; sum[g] = NAN; }
       break;
@@ -130,7 +146,7 @@ kernel void radix_##NAME##_d##D##_w##W##_g##G##_p##P( \
 }
 #define PLAN(NAME, T, D, W, G) RADIX(NAME, T, T, D, W, G, 0) RADIX(NAME, T, float, D, W, G, 1)
 #define WARP(NAME, T, D, W) PLAN(NAME, T, D, W, 1) PLAN(NAME, T, D, W, 2)
-#define DIM(NAME, T, D) WARP(NAME, T, D, 4) \
+#define DIM(NAME, T, D) WARP(NAME, T, D, 4) WARP(NAME, T, D, 8) \
 [[host_name("radix_reduce_" #NAME "_d" #D)]] kernel void radix_reduce_##NAME##_d##D( \
     const device float* partials [[buffer(0)]], device T* out [[buffer(1)]], \
     uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \

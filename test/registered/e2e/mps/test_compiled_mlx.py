@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=300, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=420, suite="stage-b-e2e-mps")
 
 
 @unittest.skipUnless(
@@ -28,12 +28,16 @@ register_mps_ci(est_time=300, suite="stage-b-e2e-mps")
 class TestCompiledMlxServing(CustomTestCase):
     backend = "mlx-compiled"
     model_name = "Qwen/Qwen3-0.6B"
+    page_size = 1
+    max_total_tokens = 4096
+    prompts = ["The capital of France is", "The first five prime numbers are"]
 
     def test_decode_and_prefix_reuse_match_eager(self):
         model = try_cached_model(self.model_name)
         results = {}
         distributions = {}
         for backend in ("eager", self.backend):
+            page_size = 1 if backend == "eager" else self.page_size
             env = dict(os.environ, SGLANG_USE_MLX="0")
             log = self.enterContext(tempfile.TemporaryFile(mode="w+"))
             process = popen_launch_server(
@@ -51,7 +55,9 @@ class TestCompiledMlxServing(CustomTestCase):
                     "--context-length",
                     "1024",
                     "--max-total-tokens",
-                    "4096",
+                    str(self.max_total_tokens),
+                    "--page-size",
+                    str(page_size),
                     "--max-running-requests",
                     "4",
                     "--mem-fraction-static",
@@ -66,10 +72,7 @@ class TestCompiledMlxServing(CustomTestCase):
                         json={
                             "return_logprob": True,
                             "top_logprobs_num": 5,
-                            "text": [
-                                "The capital of France is",
-                                "The first five prime numbers are",
-                            ],
+                            "text": self.prompts,
                             "sampling_params": {
                                 "temperature": 0,
                                 "max_new_tokens": 8,
@@ -135,6 +138,40 @@ class TestCompiledMlxServing(CustomTestCase):
                 distributions[backend].append(
                     payload["meta_info"]["output_top_logprobs"]
                 )
+                if self.page_size > 1:
+                    for token in range(44, 48):
+                        response = requests.post(
+                            DEFAULT_URL_FOR_TEST + "/generate",
+                            json={
+                                "input_ids": [token] * 96,
+                                "sampling_params": {
+                                    "temperature": 0,
+                                    "max_new_tokens": 2,
+                                    "ignore_eos": True,
+                                },
+                            },
+                            timeout=180,
+                        )
+                        response.raise_for_status()
+                    response = requests.post(
+                        DEFAULT_URL_FOR_TEST + "/generate",
+                        json={
+                            "text": self.prompts,
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": 8,
+                                "ignore_eos": True,
+                            },
+                        },
+                        timeout=180,
+                    )
+                    response.raise_for_status()
+                    replayed = response.json()
+                    self.assertEqual(
+                        [item["output_ids"] for item in replayed], outputs[1]
+                    )
+                    # The second request may reuse the first one's rebuilt prefix.
+                    self.assertEqual(replayed[0]["meta_info"]["cached_tokens"], 0)
             finally:
                 terminate_and_kill_process_tree(process)
             if backend != "eager":
@@ -143,6 +180,7 @@ class TestCompiledMlxServing(CustomTestCase):
                 self.assertIn("Compiled MLX: executions=", output, output)
                 self.assertNotIn("using eager MPS", output, output)
                 self.assertIn("attention=radix", output, output)
+                self.assertIn(f"page_size={self.page_size}", output, output)
                 self.assertRegex(output, r"Compiled MLX:.*enqueued=[1-9]")
         if self.model_name == "Qwen/Qwen3-0.6B":
             self.assertEqual(results["eager"][1], results[self.backend][1])
@@ -180,6 +218,16 @@ class TestLlamaCompiledMlxServing(TestCompiledMlxServing):
 
 class TestGpt2CompiledMlxServing(TestCompiledMlxServing):
     model_name = "openai-community/gpt2"
+
+
+class TestPagedCompiledMlxServing(TestCompiledMlxServing):
+    page_size = 16
+    max_total_tokens = 256
+    prompts = [
+        "Answer the following question briefly and accurately, without giving any additional explanation. "
+        + question
+        for question in ("The capital of France is", "The first five prime numbers are")
+    ]
 
 
 if __name__ == "__main__":

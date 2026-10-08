@@ -46,6 +46,13 @@ For unquantized dense Qwen3 on a single Apple GPU, you can keep Torch MPS weight
 loading and KV ownership while exporting decode to direct compiled MLX
 (`--mps-execution-backend mlx-compiled`). This single runner option selects
 custom AOT Metal radix attention; no dense-cache or SDPA selector is needed.
+The allocation default remains one token per page. The existing `--page-size 16`
+option enables real contiguous 16-token KV pages on this Torch-MPS path;
+compiled radix also supports 32 and 64. Larger pages trade prefix-sharing
+granularity and partially unused slots for fewer page-table lookups, so benchmark
+the intended workload before selecting them.
+On the measured Qwen3-0.6B workloads, page16/256-thread decode was 0.3-3.0%
+slower than page1/128; keep the default unless measurements justify a change.
 Build the `sgl_kernel` Metal extension and bundled metallib in the serving
 environment using the installation instructions linked below.
 The normal scheduler enables bounded asynchronous greedy lookahead before the
@@ -54,8 +61,14 @@ Prefill remains eager MPS. See the
 [Apple Silicon guide](/docs/hardware-platforms/apple_metal#experimental-direct-compiled-mlx-decode)
 for installation, limits and measured results. This experimental option leaves
 native MLX unchanged and is not faster at every batch size. The current M4 Pro
-standalone comparison uses Qwen3-0.6B BF16, TP=1 and context length 16384;
-the earlier server comparison used context length 1024. These are small-model
+standalone comparison uses Qwen3-0.6B BF16, TP=1 and context length 16384.
+After rebasing onto upstream `6cd9c49506`, live-binding and Torch greedy-reduction
+improvements bring batch-1 decode to 110.50 tokens/s at input512 and 78.65 at
+input8192, versus native MLX's 140.90 and 93.40. These are fresh warm standalone
+decode measurements, not prefill or HTTP request throughput; native parity is
+not claimed. An earlier separate input512/output129
+streaming check measured 104.53 versus native's 165.58 tokens/s, excluding TTFT.
+The earlier correctness server comparison used context length 1024. These are small-model
 Apple measurements rather than the large-model configurations above.
 
 ### 3.2 Configuration Tips

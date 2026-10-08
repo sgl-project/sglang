@@ -141,7 +141,7 @@ The normal scheduler enables bounded greedy lookahead; standalone one-batch
 execution is synchronous because it does not supply scheduler lifecycle fences.
 Native MLX is unchanged, and the default Torch execution backend remains `eager`.
 
-Decode uses a custom AOT page-size-1 Metal radix kernel over the existing request
+Decode uses a custom AOT Metal radix kernel over the existing request
 table. No dense KV mirror, gather/padding buffer or native MLX-LM replacement
 model is created. It retains our request-table API rather than adopting the CSR
 paged-attention API from
@@ -152,6 +152,26 @@ Partitioned grids merge FP32 maxima, sums and numerators; sufficiently large
 grids avoid that extra launch.
 Current-token and private lookahead K/V are read directly, never written into
 the shared pool by MLX.
+
+The default allocation page size remains 1. Add `--page-size 16` to use real
+16-token physical pages; 32 and 64 are also supported by compiled radix.
+The MPS paged allocator reserves contiguous, aligned slots within each page,
+including partial-page extension and decode. The flat Torch-owned pool and
+request-table interface are unchanged. AOT radix reuses each page's base lookup
+instead of loading a separate table entry for every cached token. Prefix sharing
+is page-aligned, and an unfinished page can waste up to `page_size - 1` slots per
+request; a larger page is not automatically faster.
+Decode uses 128 threads at page size 1 and 256 at the larger page sizes.
+In the matched Qwen3-0.6B comparison, page16/256 was 0.3-3.0% slower than
+page1/128; the default is unchanged. Full controls, native-MLX comparisons,
+and the page32/64 kernel sweep are in `benchmark/mps/README.md`.
+
+The references use different settings:
+[PR #28335](https://github.com/sgl-project/sglang/pull/28335) uses **page size 1
+and 32 threads**, whereas the pinned
+[vLLM-Metal configuration](https://github.com/vllm-project/vllm-metal/blob/6c4e4d0cf3135b0853f6dcea704f46f7c2450e23/vllm_metal/config.py)
+defaults to **16-token blocks**, with **256 threads** in its host dispatcher.
+These launch geometries do not make the underlying attention algorithms identical.
 
 The decode and merge shaders are compiled into the bundled metallib at build
 time. C++ MLX primitives enqueue them on the graph's Metal stream without an
@@ -186,6 +206,22 @@ through DLPack. Sampling receives its own FP32 logits copy so in-place Torch
 logit transforms cannot race the queued MLX forward. Direct users of the internal
 graph API must fence Torch producers and drain MLX before mutating borrowed
 weights or pools.
+
+The ordinary Torch MPS greedy sampler uses a hierarchical argmax to avoid a slow
+vocabulary-wide reduction. It preserves first-index ties, NaNs and all-`-inf`
+rows; non-greedy sampling and native MLX are unchanged. Live graph binding reuses
+its existing metadata checks rather than repeating them, and synchronous
+standalone runs omit lookahead-only model-version snapshots. Scheduler
+lookahead still validates model versions and retains every lifecycle fence.
+In a fresh Qwen3-0.6B BF16 standalone comparison on M4 Pro against updated
+upstream `6cd9c49506`, batch-1 decode improved from 95.67 to 110.50 tokens/s at
+input512 and from 69.98 to 78.65 at input8192. Native MLX measured 140.90 and
+93.40 respectively: the gap is smaller,
+not eliminated. See `benchmark/mps/README.md` for the full protocol, ranges and
+larger-batch results.
+The earlier separate normal-scheduler B1 streaming check (input512/output129) measured
+104.53 versus native MLX's 165.58 tokens/s, excluding TTFT. Standalone gains
+therefore do not imply native-speed interactive serving.
 
 ### Scope and extending kernels
 
@@ -223,7 +259,8 @@ forward code are otherwise initialization-static: restart the runner after
 changing them. Changes to borrowed tensor data require the usual Torch/MLX fences.
 
 LoRA, speculative decoding, MoE/recurrent-state regions, distributed execution,
-memory saver and page-major KV layouts are not supported. The runner requires
+memory saver and alternate multidimensional KV layouts are not supported.
+Physical pages in the standard flat MHA pool are supported. The runner requires
 the normal scheduler and local radix cache, not disaggregated serving,
 HiCache, LMCache, PDMux or session radix caching. BF16 rounding can change tied greedy
 choices relative to eager execution. LayerNorm, GELU, ReLU and tanh are supported;

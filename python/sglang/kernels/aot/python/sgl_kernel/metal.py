@@ -43,6 +43,7 @@ def radix_attention(
     scale: float,
     *,
     tails: tuple[mx.array, mx.array] | None = None,
+    page_size: int = 1,
 ) -> mx.array:
     """Read-only radix decode using bundled Metal shaders and lazy MLX primitives.
 
@@ -56,6 +57,8 @@ def radix_attention(
     metadata produces NaNs without out-of-bounds reads. Output matches Q.
     Dispatch geometry is automatic; inputs are never donated or modified.
     Noncontiguous inputs are made contiguous within the lazy graph.
+    page_size is 1, 16, 32 or 64. Larger pages require aligned, contiguous
+    physical slots within each logical page; only its first table entry is read.
     """
     if _metal is None:
         raise ImportError(
@@ -80,6 +83,7 @@ def radix_attention(
         lengths,
         scale,
         *(tails if tails is not None else (None, None)),
+        page_size,
     )
 
 
