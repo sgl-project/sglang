@@ -326,6 +326,7 @@ impl CoreHandle {
                 sampling_params: SamplingParams {
                     max_new_tokens: Some(8),
                     temperature: 0.0,
+                    ignore_eos: self.inner.is_disaggregation,
                     ..Default::default()
                 },
                 stream: false,
@@ -1032,6 +1033,7 @@ mod tests {
         assert_eq!(warmup.input_ids, None);
         assert_eq!(warmup.sampling_params.max_new_tokens, Some(8));
         assert_eq!(warmup.bootstrap_host, None);
+        assert!(!warmup.sampling_params.ignore_eos);
         request
             .sink
             .try_send(ResponseItem::Done(ChunkEvent::default()))
@@ -1065,6 +1067,7 @@ mod tests {
         assert_eq!(warmup.input_ids, Some(vec![10, 11, 12]));
         assert_eq!(warmup.bootstrap_host.as_deref(), Some(FAKE_BOOTSTRAP_HOST));
         assert_eq!(warmup.bootstrap_room, Some(0));
+        assert!(warmup.sampling_params.ignore_eos);
         drop(request);
 
         assert!(warm_up.await.unwrap().is_err());
