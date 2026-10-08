@@ -396,6 +396,40 @@ def start_subprocess_fail_fast_watcher(
     return stop
 
 
+def _get_launch_arg(other_args: list[str], flag: str) -> Optional[str]:
+    for i, arg in enumerate(other_args):
+        if arg == flag and i + 1 < len(other_args):
+            return str(other_args[i + 1])
+        if isinstance(arg, str) and arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _draft_model_cache_complete(other_args: list[str]) -> bool:
+    from sglang.srt.model_loader.weight_utils import _check_index_files_exist
+    from sglang.srt.utils import find_local_repo_dir
+
+    draft = _get_launch_arg(other_args, flag="--speculative-draft-model-path")
+    if draft is None or os.path.isdir(draft):
+        return True
+    snapshot_dir = find_local_repo_dir(
+        draft,
+        revision=_get_launch_arg(other_args, flag="--speculative-draft-model-revision"),
+    )
+    if snapshot_dir is None:
+        return False
+    # Draft repos often ship no tokenizer; only the config and weights must be cached.
+    snapshot = Path(snapshot_dir)
+    has_weights = any(
+        any(snapshot.glob(pattern)) for pattern in ("*.safetensors", "*.bin", "*.pt")
+    )
+    return (
+        (snapshot / "config.json").exists()
+        and has_weights
+        and _check_index_files_exist(snapshot_dir)[0]
+    )
+
+
 def _try_enable_offline_mode_if_cache_complete(
     model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
 ) -> Optional[str]:
@@ -434,10 +468,19 @@ def _try_enable_offline_mode_if_cache_complete(
 
     # Try to find local snapshot
     try:
-        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        snapshot_dir = find_local_repo_dir(
+            model_name_or_path,
+            revision=_get_launch_arg(other_args, flag="--revision"),
+        )
         if not snapshot_dir or not os.path.isdir(snapshot_dir):
             return None
     except Exception:
+        return None
+
+    if not _draft_model_cache_complete(other_args):
+        print(
+            f"CI_OFFLINE: Draft model cache incomplete, will use online mode - {model_name_or_path}"
+        )
         return None
 
     # Detect before the marker check so the current launch's requirements are known.
