@@ -19,7 +19,11 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.encoder_swa_replay import _fold_batch, drop_folded_rows
+from sglang.srt.model_executor.encoder_swa_replay import (
+    _build_replay_batch,
+    _fold_batch,
+    drop_folded_rows,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -312,6 +316,61 @@ class TestFoldMlpSync(CustomTestCase):
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[:, None].float()
         )
+
+    def test_batched_replay_rows_count_in_mlp_sync_totals(self):
+        """Backends that do not fold run one replay forward for all hits of a step.
+        Its rows (128 per hit) are not the scheduled rows the gather counted, so it
+        must sync its own count, or the padding shrinks input_ids."""
+        fx = _Fixture()
+        hits = [(1, 512, 64), (2, 640, 64)]  # (req slot, cached prefix, new tokens)
+        rows = [(s, p, p + n) for s, p, n in hits]
+        batch = SimpleNamespace(
+            **{
+                **vars(fx.batch),
+                "reqs": [
+                    SimpleNamespace(
+                        full_untruncated_fill_ids=[_tok(s, q) for q in range(p + n)]
+                    )
+                    for s, p, n in hits
+                ],
+                "req_pool_indices": torch.tensor([s for s, _, _ in hits]),
+                "req_pool_indices_cpu": torch.tensor([s for s, _, _ in hits]),
+                "prefix_lens": [p for _, p, _ in hits],
+                "extend_lens": [n for _, _, n in hits],
+                "extend_num_tokens": 128,
+                "input_ids": torch.tensor(
+                    [_tok(s, q) for s, a, b in rows for q in range(a, b)]
+                ),
+                "out_cache_loc": torch.tensor(
+                    [_loc(s, q) for s, a, b in rows for q in range(a, b)]
+                ),
+                "extend_logprob_start_lens": [64, 64],
+                "global_num_tokens": [128],
+                "global_num_tokens_for_logprob": [2],
+            }
+        )
+        runner = SimpleNamespace(
+            **vars(fx.runner),
+            model=SimpleNamespace(model=SimpleNamespace(engram_hasher=None)),
+        )
+        replay = _build_replay_batch(
+            batch=batch, runner=runner, rows=[(0, 384, 512), (1, 512, 640)]
+        )
+        fb = self._forward_batch(replay)
+        self._mlp_sync(fb)
+
+        self.assertEqual(fb.global_num_tokens_cpu, [256])
+        self.assertEqual(fb.extend_num_tokens, 256)
+        self.assertEqual(fb.input_ids.shape[0], 256)
+        torch.testing.assert_close(
+            fb.input_ids,
+            torch.tensor(
+                [_tok(1, q) for q in range(384, 512)]
+                + [_tok(2, q) for q in range(512, 640)]
+            ),
+        )
+        # One sampled row per replayed request, as the scheduler would count it.
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
 
 
 if __name__ == "__main__":
