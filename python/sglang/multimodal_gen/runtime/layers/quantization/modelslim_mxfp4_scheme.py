@@ -13,13 +13,6 @@ from typing import List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
-_is_npu = current_platform.is_npu()
-
-if _is_npu:
-    import torch_npu
-
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
     mxfp4_quant_kwargs,
     resolve_precision,
@@ -29,7 +22,11 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     RowvLLMParameter,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+
+if current_platform.is_npu():
+    import torch_npu  # noqa: E402
 
 MXFP4_BLOCK_SIZE = 32
 # L1 (dual) scale groups this many L0 blocks together.
@@ -157,11 +154,19 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if not self.is_dual_scale:
             policy = self.quant_config.get("timestep_policy", {}).get("w4a4_linear", {})
-            kernel = (
-                self.w4a8_kernel
-                if "W4A8" in policy.values()
-                else self.single_level_kernel
-            )
+            uses_w4a8 = "W4A8" in policy.values()
+            # resolve_precision falls back to W4A4 for steps the policy does not
+            # cover, so a policy without a W4A8 "default" still executes W4A4.
+            uses_w4a4 = "W4A4" in policy.values() or "default" not in policy
+            if uses_w4a8 and uses_w4a4:
+                raise NotImplementedError(
+                    f"{self.prefix}: mixed W4A4/W4A8 linear timestep policies are "
+                    "unsupported for single-level MXFP4. The W4A8 load path casts "
+                    "the weight to FRACTAL_NZ, which the W4A4 matmul cannot "
+                    "consume; use a uniform policy until this is verified on "
+                    "hardware."
+                )
+            kernel = self.w4a8_kernel if uses_w4a8 else self.single_level_kernel
             kernel.process_weights_after_loading(layer)
             layer.mxfp4_quant_kwargs = mxfp4_quant_kwargs(self.quant_config)
             if self.has_mul_scale:
