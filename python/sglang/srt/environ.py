@@ -1122,6 +1122,7 @@ class Envs:
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_SM120_LOSSLESS_BF16_HEAD = EnvBool(False)
+    SGLANG_SM120_LOSSLESS_BF16_HEAD_M4 = EnvBool(False)
     SGLANG_SM120_LOSSLESS_BF16_MOE = EnvBool(False)
     SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
