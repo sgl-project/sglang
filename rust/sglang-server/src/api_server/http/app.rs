@@ -38,13 +38,12 @@ async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
         _ if server_args.is_disaggregation() => Duration::from_secs(1800),
         _ => Duration::from_secs(600),
     };
-    match tokio::time::timeout(timeout, core.warm_up(server_args.skip_tokenizer_init)).await {
-        Ok(Ok(())) => {
+    match core.warm_up(server_args.skip_tokenizer_init, timeout).await {
+        Ok(()) => {
             core.mark_ready();
             tracing::info!("The server is fired up and ready to roll!");
         }
-        Ok(Err(e)) => tracing::error!(error = %e, "startup warmup failed"),
-        Err(_) => tracing::error!(?timeout, "startup warmup timed out"),
+        Err(e) => tracing::error!(error = %e, "startup warmup failed"),
     }
 }
 
