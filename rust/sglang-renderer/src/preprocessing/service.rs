@@ -559,6 +559,11 @@ mod tests {
 
     #[test]
     fn top_level_reasoning_effort_reaches_deepseek_v4_formatter() {
+        // The cases below expect SGLang's defaults, not this machine's.
+        unsafe {
+            std::env::remove_var("SGLANG_DEFAULT_THINKING");
+            std::env::remove_var("SGLANG_DSV4_REASONING_EFFORT");
+        }
         let directory = std::env::temp_dir().join(format!(
             "sglang-renderer-deepseek-v4-effort-{}",
             std::process::id()

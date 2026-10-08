@@ -134,7 +134,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
     blend_wan_ti2v_latents,
@@ -637,8 +636,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
+        self._reset_dit_cache_states(batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
+
+    def _reset_dit_cache_states(self, batch: Req) -> None:
+        """Start every DiT's TeaCache and Spectrum state fresh for this request.
+
+        The DiTs reset themselves at denoising step 0, which a boundary expert
+        (Wan2.2 ``transformer_2``) never sees, so its state would otherwise carry
+        over from the previous request.
+        """
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
+                transformer.reset_teacache_state()
+            if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
+                transformer.reset_spectrum_state(batch.spectrum_params)
 
     def _maybe_override_attention_backend(
         self, batch: Req, *, force_fa_for_self_attention: bool = False
@@ -1224,11 +1237,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
-        return StageParallelismType.REPLICATED
 
     def _handle_boundary_ratio(
         self,

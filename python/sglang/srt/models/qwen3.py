@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    supports_quantized_rl_reload,
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
@@ -86,7 +87,6 @@ class Qwen3Attention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
         self.total_num_heads = num_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -126,8 +126,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -135,8 +134,7 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -623,6 +621,7 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @supports_quantized_rl_reload
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
