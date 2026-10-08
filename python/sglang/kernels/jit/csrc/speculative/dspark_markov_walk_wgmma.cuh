@@ -473,8 +473,10 @@ __global__ void __launch_bounds__(kThr, 1) markov_walk_wgmma_kernel(
           const uint32_t tok = key[qd] != 0 ? key_row(key[qd]) : 0u;
           tok_s[bq] = tok;
           if (blockIdx.x == 0) tokens[static_cast<size_t>(bq) * num_steps + k] = tok;
-          if (k + 1 < num_steps) {  // the next gather's u row into L2 before the barrier releases it: a 528-B
-            const uint8_t* src = w1f + static_cast<size_t>(tok) * kW1fBytes;  // row spans 5 128-B lines
+          // The next gather's u row (528 B, 5 lines) into L2 before the barrier releases it, from CTA 0 only: every
+          // CTA gathers the same rows, and 132 copies of the prefetch made bs 64 2-3% slower on H100.
+          if (blockIdx.x == 0 && k + 1 < num_steps) {
+            const uint8_t* src = w1f + static_cast<size_t>(tok) * kW1fBytes;
 #pragma unroll
             for (int32_t l = 0; l < 5; ++l)
               ptx::prefetch_l2_evict_last(src + 128 * l);
