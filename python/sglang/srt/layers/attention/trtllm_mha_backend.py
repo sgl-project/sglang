@@ -14,7 +14,7 @@ Sliding window and attention sink features are supported.
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -28,10 +28,9 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
-    FlashInferMultiStepDraftBackend,
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -159,8 +158,16 @@ class TRTLLMMHAMetadata:
     encoder_row_map: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
-    """TRTLLM MHA attention kernel from flashinfer."""
+class TRTLLMHAAttnBackend(AttentionBackend):
+    """TRTLLM MHA attention kernel from flashinfer.
+
+    Inherits directly from :class:`AttentionBackend` instead of
+    :class:`FlashInferAttnBackend`: all attention-specific behavior (metadata
+    builders, page tables, forward paths) is TRTLLM's own, so the FlashInfer
+    wrapper/updater machinery inherited from the parent was allocated but
+    never used. Only the plumbing shared with other backends (pools,
+    translator, quant method) is kept below.
+    """
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
     # via the full->SWA lookup; see _fill_page_table_device), so we never need the
@@ -168,6 +175,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
+
+    # An extend batch can never carry more seqs than the req pool; dummy
+    # extend batches (autotune, cuda-graph capture) rely on this cap, as with
+    # the FlashInfer backend this class previously inherited from.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -179,12 +191,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        super().__init__()
+
+        # --- Plumbing previously provided by FlashInferAttnBackend ---
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+        self.skip_prefill = skip_prefill
+
+        # Workspace size of the TRTLLM kernels; the FLASHINFER-attributed env
+        # var keeps its name for compatibility with existing deployments.
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
             env_var.get()
@@ -192,9 +211,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "trtllm_mha"
         )
@@ -314,6 +330,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
@@ -445,6 +462,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             f"KV cache method {method_name!r} does not support prefill with "
             f"trtllm_mha. Available prefill accesses: {available}."
         )
+
+    def _kv_write_scales(self, layer: RadixAttention):
+        # Moved here from FlashInferAttnBackend (the only inherited helper this
+        # backend actually called) now that it inherits from AttentionBackend.
+        if self.kv_cache_quant_method.needs_global_scale():
+            return None, None
+        return layer.k_scale, layer.v_scale
 
     def _nvfp4_output_view(self, q: torch.Tensor) -> torch.Tensor:
         if self._nvfp4_fp8_output is None:
@@ -1829,8 +1853,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
-class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
-    """Multi-step TRTLLM MHA attention kernel used by EAGLE."""
+class TRTLLMHAAttnMultiStepDraftBackend:
+    """Multi-step TRTLLM MHA attention kernel used by EAGLE.
+
+    Standalone class (matching TritonMultiStepDraftBackend and friends) rather
+    than a FlashInferMultiStepDraftBackend subclass: every metadata entry
+    point below is TRTLLM's own, so the FlashInfer parent only contributed
+    per-step FlashInferAttnBackend instances that were created and then
+    replaced, plus draft kv_indptr / kv_last_page_len buffers that were
+    allocated and never read by the TRTLLM steps.
+    """
 
     # Per-step backends build the page table on-device (sync-free); mirror that so
     # decide_needs_cpu_seq_lens sees a consistent target + draft value.
@@ -1839,15 +1871,18 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
-        super().__init__(model_runner, topk, speculative_num_steps)
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends: List[TRTLLMHAAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i] = TRTLLMHAAttnBackend(
-                model_runner,
-                skip_prefill=True,
-                kv_indptr_buf=self.kv_indptr[i],
-                kv_last_page_len_buf=self.kv_last_page_len,
-                speculative_step_id=i,
+            self.attn_backends.append(
+                TRTLLMHAAttnBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    speculative_step_id=i,
+                )
             )
+        self.max_context_len = self.attn_backends[0].max_context_len
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
