@@ -36,7 +36,7 @@ pub use block_size_oracle::BlockSizeOracle;
 pub use bootstrap::{BootstrapState, BootstrapTracker, PeerRegistry, WireWorker};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
-pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
+pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64, CacheNamespace};
 pub use index::{KvEventIndex, KvIndexMetrics};
 pub use pending::PendingPrefixes;
 pub use prefix_provider::{PrefixLookupResult, RadixTreePrefixProvider};

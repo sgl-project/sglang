@@ -19,7 +19,7 @@
 //! whatever fixture is checked in.
 
 use serde::Deserialize;
-use sgl_router::state::kv_events::compute_block_hashes;
+use sgl_router::state::kv_events::CacheNamespace;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +27,10 @@ struct ParityCase {
     name: String,
     tokens: Vec<u32>,
     block_size: usize,
+    #[serde(default)]
+    cache_salt: Option<String>,
+    #[serde(default)]
+    lora_name: Option<String>,
     expected_i64_hashes: Vec<i64>,
 }
 
@@ -55,7 +59,7 @@ fn fixture_is_non_empty() {
     );
 }
 
-/// Drives every case in the fixture through `compute_block_hashes` and
+/// Drives every case in the fixture through `CacheNamespace::block_hashes` and
 /// asserts equality with the Python-derived expectation.
 #[test]
 fn rust_block_hashes_match_python_radix_cache() {
@@ -65,7 +69,12 @@ fn rust_block_hashes_match_python_radix_cache() {
         // doesn't include a 0 case, so unwrap is safe.
         let block_size = std::num::NonZeroUsize::new(case.block_size)
             .unwrap_or_else(|| panic!("case {} has block_size=0 which is invalid", case.name));
-        let got = compute_block_hashes(&case.tokens, block_size.get());
+        let namespace = CacheNamespace {
+            cache_salt: case.cache_salt,
+            lora_name: case.lora_name,
+            ambiguous: false,
+        };
+        let got = namespace.block_hashes(&case.tokens, block_size.get(), false);
         assert_eq!(
             got, case.expected_i64_hashes,
             "case {}: tokens={:?} block_size={} — Rust produced {:?}, fixture says {:?}",

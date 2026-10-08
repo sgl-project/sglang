@@ -15,8 +15,7 @@ use tokio::sync::OnceCell;
 
 use crate::config::{AffinityConfig, AffinityMode};
 use crate::state::kv_events::{
-    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, PrefixLookupResult,
-    RadixTreePrefixProvider,
+    BlockSizeOracle, CacheNamespace, PrefixLookupResult, RadixTreePrefixProvider,
 };
 use crate::state::load_monitor::engine_ranking::CandidateLoads;
 use crate::state::load_monitor::engine_reported_load::{
@@ -52,23 +51,24 @@ impl fmt::Debug for CacheSource {
 }
 
 impl CacheSource {
-    async fn lookup(&self, tokens: Option<&[u32]>) -> Result<Signal, PickError> {
+    async fn lookup(
+        &self,
+        tokens: Option<&[u32]>,
+        namespace: &CacheNamespace,
+    ) -> Result<Signal, PickError> {
         let Some(tokens) = tokens else {
             return Ok(None);
         };
         let (index, oracle) = match self {
             Self::Local(provider) => {
-                return Ok(provider.match_request_tokens(tokens).map(Arc::new))
+                return Ok(provider
+                    .match_request_tokens(tokens, namespace)
+                    .map(Arc::new))
             }
             Self::Remote { index, block_size } => (index, block_size),
         };
-        let Some(block_size) = oracle.get() else {
+        let Some(hashes) = oracle.block_hashes(tokens, namespace) else {
             return Ok(None);
-        };
-        let hashes = if oracle.is_bigram() {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
         };
         let query_blocks = hashes.len();
         if query_blocks == 0 {
@@ -304,7 +304,10 @@ impl Policy for CacheAwarePolicy {
                     "cache-aware selection requires a plain or prefill group".into(),
                 ));
             }
-            let lookup = || self.source.lookup(request.token_ids);
+            let lookup = || {
+                self.source
+                    .lookup(request.token_ids, request.cache_namespace)
+            };
             let signal = match request.prefix {
                 Some(memo) => memo
                     .cell(&self.source)
