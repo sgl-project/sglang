@@ -50,16 +50,53 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.runtime_context import get_parallel
 
 
+def attn_cp_interleave_gather(hidden_states: torch.Tensor):
+    """Gather equal padded interleave shards in rank order, not token order.
+
+    Size from the actual shard: the DP scratch length can already describe a
+    shard when dense FFNs run over TP, and is not a CP collective's output size.
+    """
+    parallel = get_parallel()
+    with use_symmetric_memory(
+        parallel.attn_cp_group, disabled=not is_allocation_symmetric()
+    ):
+        gathered = hidden_states.new_empty(
+            (hidden_states.shape[0] * parallel.attn_cp_size, *hidden_states.shape[1:])
+        )
+    attn_cp_all_gather_into_tensor(gathered, hidden_states.contiguous())
+    return gathered
+
+
 @dataclass
 class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    # Tail row -> packed all-gather slot; local tail metadata rows include padding.
+    gather_index: Optional[torch.Tensor] = None
+    local_index: Optional[torch.Tensor] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Mask physical CP padding before the dispatch/combine all-to-alls.
+
+        Attention-TP localization does not split the count over CP ranks.
+        Interleave's valid rows form a prefix of each padded local shard.
+        """
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if not forward_batch.forward_mode.is_context_parallel_extend():
@@ -121,6 +158,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return input_[indices]
 
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
+
+    def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
+        device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
+        if device is None:
+            device = torch.device("cpu")
+        return torch.arange(
+            self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
+        )
 
     def shard_local_tokens(self, input_: Any) -> Any:
         return self._interleave_shard(input_)
@@ -205,6 +250,21 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
         attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
 
+        if metadata.gather_index is not None:
+            return gathered.index_select(0, metadata.gather_index)
+
+        # Equal per-rank lengths: one interleave copy restores the original
+        # token order; cheaper than the index_select fallback below.
+        actual = metadata.per_rank_actual_token
+        if total_tokens == self.cp_size * physical_rank_len and all(
+            int(n) == physical_rank_len for n in actual
+        ):
+            return (
+                gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
+                .transpose(0, 1)
+                .reshape(total_tokens, *x.shape[1:])
+            )
+
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
             flat_indices % self.cp_size
@@ -270,3 +330,15 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         k_nope = full_latent[..., :kv_lora_rank].unsqueeze(1)
         k_rope = full_latent[..., kv_lora_rank:].unsqueeze(1)
         return k_nope, k_rope
+
+
+def interleave_rows_per_request(
+    extend_lens: List[int], cp_rank: int, cp_size: int
+) -> List[int]:
+    """Rows of each request a CP rank holds: global token index congruent to cp_rank."""
+    counts, start = [], 0
+    for n in extend_lens:
+        end = start + n
+        counts.append((end - 1 - cp_rank) // cp_size - (start - 1 - cp_rank) // cp_size)
+        start = end
+    return counts

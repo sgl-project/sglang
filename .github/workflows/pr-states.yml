@@ -14,7 +14,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra", "PR Test ROCm 7.2 (AMD)"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -163,7 +163,7 @@ jobs:
                 'pr-test-extra.yml',
                 (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
               ),
-              findRun('pr-test-amd-rocm720.yml', labelOffOpts),
+              findRun('pr-test-amd.yml', labelOffOpts),
             ]);
 
             // Skipped run = "no real run" -- happens when a label is added
@@ -214,8 +214,8 @@ jobs:
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
-            const amdStart   = '<!-- slot:pr-test-amd-rocm720:start -->';
-            const amdEnd     = '<!-- slot:pr-test-amd-rocm720:end -->';
+            const amdStart   = '<!-- slot:pr-test-amd:start -->';
+            const amdEnd     = '<!-- slot:pr-test-amd:end -->';
 
             const newBlock = [
               outerStart,

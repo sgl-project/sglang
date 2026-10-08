@@ -44,7 +44,7 @@ const SKIP_SPECIAL_TOKENS: bool = true;
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens).
 pub trait StreamDecoder: Send {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error>;
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error>;
 }
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
@@ -53,7 +53,7 @@ struct DynamoDecoder {
 }
 
 impl StreamDecoder for DynamoDecoder {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error> {
+    fn step(&mut self, token_ids: &[i64]) -> Result<String, Error> {
         let mut out = String::new();
         for &id in token_ids {
             if let Some(chunk) = self
@@ -183,9 +183,8 @@ impl Runnable for DetokenizerWorker {
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
-        // clone gone). On shutdown that happens once the API runtime drop cancels
-        // in-flight handlers (their `AbortGuard`s release the last clones) and
-        // to-scheduler/from-scheduler exit — no shutdown signal needed here.
+        // clone gone). On shutdown that happens once to-scheduler/from-scheduler
+        // exit — core calls own only their abort sender, not detok channels.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -396,12 +395,9 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             // Abort ONLY when the sink is full. `Closed` means the handler future is
-            // already gone, so its `AbortGuard` has run: it aborted and released the
-            // rid. A second abort from here is unordered with respect to that
-            // release, so it lands after a resubmit of the same rid has registered
-            // and deregisters the NEW request — the cross-wiring the rid registry
-            // exists to prevent, reached through the one abort producer that
-            // bypasses the guard's ordering.
+            // already gone, so its `CoreCall` has queued the abort; do not emit
+            // the same lifecycle event a second time. A full sink still has a live
+            // handler, so the detokenizer must initiate cleanup itself.
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
@@ -575,7 +571,7 @@ mod tests {
         table.insert(Rid::from("bob"), state(tx_b));
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
 
-        let chunk = |rid: &str, id: i32| ChunkEvent {
+        let chunk = |rid: &str, id: i64| ChunkEvent {
             rid: Rid::from(rid.to_string()),
             token_ids: vec![id],
             ..Default::default()
@@ -615,7 +611,7 @@ mod tests {
     fn final_chunk(
         no_stop_trim: bool,
         finish_reason: serde_json::Value,
-        ids: Vec<i32>,
+        ids: TokenIds,
     ) -> ChunkEvent {
         let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();

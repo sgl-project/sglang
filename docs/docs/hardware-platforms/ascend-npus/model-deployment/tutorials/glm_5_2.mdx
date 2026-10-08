@@ -63,13 +63,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
-It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 node (8 cards, 16 dies) or two A2 nodes.
+It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -82,7 +82,7 @@ The dependencies required for the NPU runtime environment have been integrated i
 online platform. You can directly pull it.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -117,7 +117,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -164,7 +164,7 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 
 ### Single-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on one Atlas 800I A3 node.
+Quantized model `GLM-5.2-w8a8` can be deployed on one Ascend A3 Series node.
 
 Run the following script to execute online inference.
 
@@ -229,7 +229,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on two Atlas 800I A3 nodes.
+Quantized model `GLM-5.2-w8a8` can be deployed on two Ascend A3 Series nodes.
 
 Modify the IP addresses of the two nodes, then run the same script on both nodes.
 
@@ -384,7 +384,7 @@ do
         --disaggregation-transfer-backend ascend --max-running-requests 64 \
         --served-model-name glm-5 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
         --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
-        --dp-size 4 --enable-dp-attention \
+        --attn-dp-size 4 \
         --load-balance-method round_robin \
         --enable-dp-lm-head --moe-dense-tp 1 \
         --speculative-draft-model-quantization unquant \
@@ -418,9 +418,9 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
+        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --attn-dp-size 16 --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
-        --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
+        --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
         --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \

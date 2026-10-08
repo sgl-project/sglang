@@ -16,7 +16,6 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_tp_rank,
     get_tp_world_size,
     model_parallel_is_initialized,
 )
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionTransformer,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl import QwenVLModelBase
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
@@ -80,6 +80,8 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
 )
+
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +139,6 @@ def _tp_world_size() -> int:
     return get_tp_world_size()
 
 
-def _tp_rank() -> int:
-    if not model_parallel_is_initialized():
-        return 0
-    return get_tp_rank()
-
-
 def _linear_output(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     output = linear(x)
     return output[0] if isinstance(output, tuple) else output
@@ -161,8 +157,7 @@ def _make_column_linear(
             out_features,
             bias=bias,
             gather_output=False,
-            tp_size=_tp_world_size(),
-            tp_rank=_tp_rank(),
+            parallel_group="tp" if model_parallel_is_initialized() else "replicated",
         )
     return ReplicatedLinear(in_features, out_features, bias=bias)
 
@@ -179,8 +174,7 @@ def _make_row_linear(
             in_features,
             out_features,
             bias=bias,
-            tp_size=_tp_world_size(),
-            tp_rank=_tp_rank(),
+            parallel_group="tp" if model_parallel_is_initialized() else "replicated",
         )
     return ReplicatedLinear(in_features, out_features, bias=bias)
 
@@ -358,8 +352,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"model.language_model.layers.{layer_idx}.mlp",
             fuse_gate_up=False,
-            tp_size=mlp_tp_size,
-            tp_rank=_tp_rank() if mlp_tp_size > 1 else 0,
+            parallel_group="tp" if mlp_tp_size > 1 else "replicated",
         )
         norm_kwargs = dict(
             eps=config.rms_norm_eps,
@@ -631,7 +624,7 @@ class Qwen2_5_VLTextModel(nn.Module):
         )
 
 
-class Qwen2_5_VLModel(nn.Module):
+class Qwen2_5_VLModel(QwenVLModelBase):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {"^model": "language_model"}
     # Reference: fix gemma3 grad acc #37208
@@ -648,18 +641,6 @@ class Qwen2_5_VLModel(nn.Module):
         self.config = config
         # Initialize weights and apply final processing
         # self.post_init()
-
-    def get_input_embeddings(self):
-        return self.language_model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.language_model.embed_tokens = value
-
-    def set_decoder(self, decoder):
-        self.language_model = decoder
-
-    def get_decoder(self):
-        return self.language_model
 
     def get_rope_index(
         self,
@@ -863,31 +844,7 @@ class Qwen2_5_VLModel(nn.Module):
             ).unsqueeze(1)
             return position_ids, mrope_position_deltas
         else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = (
-                    position_ids.unsqueeze(0)
-                    .expand(3, -1, -1)
-                    .to(attention_mask.device)
-                )
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True
-                )[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
+            return self._get_text_rope_index(input_ids, attention_mask)
 
     def get_video_features(
         self,
@@ -911,6 +868,7 @@ class Qwen2_5_VLModel(nn.Module):
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
+    @cached_conditioning
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
@@ -932,68 +890,6 @@ class Qwen2_5_VLModel(nn.Module):
         ).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
-
-    def get_placeholder_mask(
-        self,
-        input_ids: torch.LongTensor,
-        inputs_embeds: torch.FloatTensor,
-        image_features: torch.FloatTensor = None,
-        video_features: torch.FloatTensor = None,
-    ):
-        """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
-        """
-        if input_ids is None:
-            special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.image_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_image_mask = special_image_mask.all(-1)
-            special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(
-                    self.config.video_token_id,
-                    dtype=torch.long,
-                    device=inputs_embeds.device,
-                )
-            )
-            special_video_mask = special_video_mask.all(-1)
-        else:
-            special_image_mask = input_ids == self.config.image_token_id
-            special_video_mask = input_ids == self.config.video_token_id
-
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = (
-            special_image_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        if (
-            image_features is not None
-            and inputs_embeds[special_image_mask].numel() != image_features.numel()
-        ):
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-            )
-
-        n_video_tokens = special_video_mask.sum()
-        special_video_mask = (
-            special_video_mask.unsqueeze(-1)
-            .expand_as(inputs_embeds)
-            .to(inputs_embeds.device)
-        )
-        if (
-            video_features is not None
-            and inputs_embeds[special_video_mask].numel() != video_features.numel()
-        ):
-            raise ValueError(
-                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-            )
-
-        return special_image_mask, special_video_mask
 
     def forward(
         self,

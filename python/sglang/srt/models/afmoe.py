@@ -152,12 +152,12 @@ class AfmoeMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
 
         self.n_routed_experts = getattr(config, "num_experts", None)
@@ -234,6 +234,7 @@ class AfmoeMoE(nn.Module):
         renormalize = self.route_norm if self.score_func == "sigmoid" else False
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=renormalize,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.n_group if self.use_grouped_topk else None,
@@ -455,6 +456,7 @@ class AfmoeDecoderLayer(nn.Module):
         if use_moe:
             self.mlp = AfmoeMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
