@@ -68,6 +68,11 @@ def parse_args():
     parser.add_argument("--vae-tiling", action="store_true")
     parser.add_argument("--vae-sp", action="store_true")
     parser.add_argument("--attention", default="torch_sdpa")
+    # The oracle comparison needs the reference path; the serving default
+    # "lossless" also mounts VAE fast paths that only move rounding.
+    parser.add_argument(
+        "--quality", choices=("exact", "lossless", "high"), default="exact"
+    )
     args = parser.parse_args()
     if Path(
         args.comparison_name
@@ -556,6 +561,7 @@ def native_run(args):
             generator_device="cpu",
             return_trajectory_latents=True,
             save_output=False,
+            quality=args.quality,
         )
         batch = prepare_request(server_args=server, sampling_params=sampling)
         # prepare_request accepts image prompt strings at the public boundary.

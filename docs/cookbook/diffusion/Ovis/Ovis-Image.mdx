@@ -95,7 +95,10 @@ Full checkpoint and multi-GPU checks use the manual runner. Download only
 `model_index.json`, `scheduler/`, `tokenizer/`, `text_encoder/`, `transformer/`,
 and `vae/` from model revision `41be1c5821a92c970d63d7eb595a2fd3fe32b22e`.
 Use a separate reference environment with Diffusers commit
-`c6df88a511a98740646ee55577b590c9852650ce`.
+`c6df88a511a98740646ee55577b590c9852650ce`. The runner requests
+`quality="exact"` by default; the serving default `lossless` also runs VAE
+fast paths that keep the math but move rounding, so decoded images then match
+the reference to rounding error rather than bit for bit.
 
 ```bash Native TP2 x SP2
 torchrun --standalone --nproc-per-node 4 \
