@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
+    ModelOptFp8LinearMethod as StaticModelOptFp8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
@@ -28,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -578,20 +580,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         copy_or_rebind_param(layer, "weight_scale", processed_weight_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
-        )
+    apply = StaticModelOptFp8LinearMethod.apply
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
