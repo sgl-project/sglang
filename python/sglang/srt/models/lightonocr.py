@@ -31,6 +31,7 @@ References:
 - https://huggingface.co/lightonai/LightOnOCR-2-1B
 """
 
+from array import array
 from dataclasses import fields
 from typing import Iterable, List, Tuple
 
@@ -125,7 +126,7 @@ class LightOnOCRForConditionalGeneration(nn.Module):
             quant_config=quant_config,
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

@@ -1,11 +1,4 @@
-"""Config fields of the ``serving`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``serving`` bag, which is what ``get_serving()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``serving`` namespace."""
 
 from __future__ import annotations
 
@@ -30,6 +23,12 @@ class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    enable_response_store: A[
+        bool,
+        "Enable in-memory Responses storage for retrieval, chaining, and background "
+        "requests. Disabled by default; unsupported with prefill-decode "
+        "disaggregation. Storage has no TTL or size limit.",
+    ] = False
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,
@@ -81,9 +80,15 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "default. Follower nodes expose GetServerInfo only. "
+        "In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    grpc_response_timeout_secs: A[
+        int,
+        "Timeout in seconds waiting for each native gRPC response chunk, "
+        "including the first. Must be positive. Defaults to 300.",
+    ] = 300
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
@@ -152,7 +157,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
     served_model_name: A[
         Optional[str],
@@ -166,6 +171,10 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     ] = None
+    trust_request_chat_template: A[
+        bool,
+        "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
+    ] = False
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
@@ -175,9 +184,9 @@ class Serving(msgspec.Struct):
         "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
     ] = None
     file_storage_path: A[
-        str,
+        Optional[str],
         "The path of the file storage in backend.",
-    ] = "sglang_storage"
+    ] = None
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
@@ -275,6 +284,10 @@ class Serving(msgspec.Struct):
         bool,
         "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
+    constrained_json_max_whitespace_cnt: A[
+        Optional[int],
+        "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer
