@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.gemm import smallm_fp8_blockscale_gfx950 as B
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,9 +37,10 @@ def _quant(x):
 
 @unittest.skipUnless(
     torch.version.hip
+    and fp8_utils._use_aiter_bpreshuffle_gfx95
     and torch.cuda.is_available()
     and torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"),
-    "gfx950 (MI35x) only",
+    "gfx950 (MI35x) with AITER bpreshuffle only",
 )
 class TestSmallMFp8BlockscaleGfx950(CustomTestCase):
     def setUp(self):
