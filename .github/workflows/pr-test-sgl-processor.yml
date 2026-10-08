@@ -1,12 +1,12 @@
 name: PR Test (sglang-processor)
 
-# Keep path and label decisions visible in the gate job, as in pr-test-sgl-router.yml.
+# Keep path detection separate from the shared, live-fetching PR label gate.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
 permissions:
@@ -20,8 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sgl-processor-gate:
-    name: gate
+  sgl-processor-changes:
+    # Ignored label events must not replace real checks on the same commit.
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-changes' || 'sgl-processor-changes' }}
     if: github.event.action != 'labeled' || github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -50,7 +51,6 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PATHS_CHANGED: ${{ steps.paths.outputs.processor }}
-          HAS_RUN_CI: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -58,18 +58,27 @@ jobs:
           elif [[ "$PATHS_CHANGED" != "true" ]]; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             echo "No processor-related changes; skipping checks."
-          elif [[ "$EVENT_NAME" == "pull_request" && "$HAS_RUN_CI" != "true" ]]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "PR is missing the run-ci label; skipping checks."
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             echo "Processor-related changes detected; running checks."
           fi
 
+  # Missing labels fail here; reruns fetch current labels instead of replaying
+  # the original event's labels after /tag-run-ci-label adds run-ci.
+  sgl-processor-gate:
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-gate' || 'sgl-processor-gate' }}
+    needs: sgl-processor-changes
+    if: needs.sgl-processor-changes.outputs.should_run == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      # CPU checks do not need the shared GPU CI cooldown.
+      cool-down-minutes: 0
+
   sgl-processor-lint:
-    name: tier-1 — lint
-    needs: sgl-processor-gate
-    if: needs.sgl-processor-gate.outputs.should_run == 'true'
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-lint' || 'sgl-processor-lint' }}
+    needs: [sgl-processor-changes, sgl-processor-gate]
+    if: needs.sgl-processor-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -94,9 +103,9 @@ jobs:
         run: cargo clippy --locked -p sglang-processor --all-targets --all-features -- -D warnings
 
   sgl-processor-test:
-    name: tier-2 — build + test
-    needs: [sgl-processor-gate, sgl-processor-lint]
-    if: needs.sgl-processor-gate.outputs.should_run == 'true'
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-test' || 'sgl-processor-test' }}
+    needs: [sgl-processor-changes, sgl-processor-gate, sgl-processor-lint]
+    if: needs.sgl-processor-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -133,27 +142,29 @@ jobs:
           done
 
   sgl-processor-finish:
-    needs: [sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-finish' || 'sgl-processor-finish' }}
+    needs: [sgl-processor-changes, sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
     if: always() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check required results
         env:
+          CHANGES_RESULT: ${{ needs.sgl-processor-changes.result }}
           GATE_RESULT: ${{ needs.sgl-processor-gate.result }}
-          SHOULD_RUN: ${{ needs.sgl-processor-gate.outputs.should_run }}
+          SHOULD_RUN: ${{ needs.sgl-processor-changes.outputs.should_run }}
           LINT_RESULT: ${{ needs.sgl-processor-lint.result }}
           TEST_RESULT: ${{ needs.sgl-processor-test.result }}
         run: |
-          if [[ "$GATE_RESULT" != "success" ]]; then
-            echo "::error::Processor gate did not succeed ($GATE_RESULT)."
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "::error::Processor path detection did not succeed ($CHANGES_RESULT)."
             exit 1
           fi
-          if [[ "$SHOULD_RUN" == "true" && "$LINT_RESULT" == "success" && "$TEST_RESULT" == "success" ]]; then
+          if [[ "$SHOULD_RUN" == "true" && "$GATE_RESULT" == "success" && "$LINT_RESULT" == "success" && "$TEST_RESULT" == "success" ]]; then
             echo "All processor checks passed."
-          elif [[ "$SHOULD_RUN" == "false" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
-            echo "Processor checks skipped by the path/label gate."
+          elif [[ "$SHOULD_RUN" == "false" && "$GATE_RESULT" == "skipped" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
+            echo "No processor-related changes; checks skipped."
           else
-            echo "::error::Unexpected processor results: should_run=$SHOULD_RUN, lint=$LINT_RESULT, test=$TEST_RESULT."
+            echo "::error::Unexpected processor results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, test=$TEST_RESULT."
             exit 1
           fi
