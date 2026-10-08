@@ -16,15 +16,15 @@ def _gru_cell_manual(
     """BF16-safe single-layer GRU cell using plain matmul/sigmoid/tanh.
 
     Ascend's DynamicGRU(V2) TBE kernel rejects BF16 ``weight_hidden``, so on NPU
-    we fall back to an explicit GRU cell instead of ``aten::gru_cell``. Gate math
-    runs in fp32 for parity with the CUDA GRU numerics and casts the updated
-    hidden back to the input dtype.
+    we fall back to an explicit GRU cell instead of ``aten::gru_cell``. Linear
+    projections run in the input dtype (BF16 hardware matmul) while the gate and
+    state updates run in fp32 for parity with the CUDA GRU numerics; the updated
+    hidden is cast back to the input dtype.
     """
     out_dtype = x.dtype
-    xf = x.float()
+    gi = F.linear(x, w_ih, b_ih).float()
+    gh = F.linear(h, w_hh, b_hh).float()
     hf = h.float()
-    gi = F.linear(xf, w_ih.float(), b_ih.float() if b_ih is not None else None)
-    gh = F.linear(hf, w_hh.float(), b_hh.float() if b_hh is not None else None)
     i_r, i_z, i_n = gi.chunk(3, dim=-1)
     h_r, h_z, h_n = gh.chunk(3, dim=-1)
     r = torch.sigmoid(i_r + h_r)
@@ -173,7 +173,7 @@ def validate_domino_runtime(
 ) -> None:
     """Validate the deliberately narrow correctness-first Domino runtime."""
     if device.type not in ("cuda", "npu"):
-        raise ValueError(f"DFLASH Domino currently requires CUDA, got {device}.")
+        raise ValueError(f"DFLASH Domino requires CUDA or NPU, got {device}.")
     tp_size = int(tp_size)
     if tp_size < 1:
         raise ValueError(f"DFLASH Domino requires TP>=1, got TP={tp_size}.")
