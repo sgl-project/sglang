@@ -1059,7 +1059,7 @@ class C4IndexerAscendBackendMixin:
                 # host copies; default to the tail pages unless explicitly asked.
                 slab = buf if whole else buf[max(0, pages - 16) : pages]
                 print(
-                    f"[IDXK] layer={layer_id} shape={tuple(buf.shape)} "
+                    f"[IDXK] layer={layer_id} lastpos={lastpos} shape={tuple(buf.shape)} "
                     f"whole={'1' if whole else '0'} md5={_md5(slab)}",
                     flush=True,
                 )
@@ -1078,7 +1078,7 @@ class C4IndexerAscendBackendMixin:
                 lo = min(ids)
                 slab = buf[lo : max(ids) + 1]
                 print(
-                    f"[C4KV] layer={layer_id} pages={pages} ids={ids} "
+                    f"[C4KV] layer={layer_id} lastpos={lastpos} pages={pages} ids={ids} "
                     f"md5={_md5(slab)} bytes={slab.numel()}",
                     flush=True,
                 )
