@@ -22,6 +22,8 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import functools
+import inspect
 import threading
 import warnings
 from contextvars import ContextVar
@@ -218,11 +220,30 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
-    def decorator(inner: Callable):
-        if not enable:
-            return inner
+def eager_on_graph(
+    fn: Optional[Callable] = None,
+    capture_stub: Optional[Callable] = None,
+    *,
+    enable: Optional[bool] = None,
+):
+    """Record an eager call between captured segments.
 
+    A named ``forward_batch`` argument is rebound to the prepared serving batch
+    on replay. All other arguments retain their capture-time identity; tensors
+    must therefore use the static buffers owned by the graph runner.
+    """
+
+    # Transitional support while model callers migrate to the bare decorator.
+    if isinstance(fn, bool):
+        enable, fn = fn, None
+    if enable is False:
+        return lambda inner: inner
+
+    def decorator(inner: Callable):
+        signature = inspect.signature(inner)
+        has_batch = "forward_batch" in signature.parameters
+
+        @functools.wraps(inner)
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None:
@@ -258,9 +279,31 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # captured segment. Keep a strong reference so replay can safely
             # copy fresh eager output into that bridge buffer.
             captured_output = output
+            replay_args = (
+                signature.bind(*captured_args, **captured_kwargs) if has_batch else None
+            )
 
-            def replay_fn():
-                new_out = captured_inner(*captured_args, **captured_kwargs)
+            if replay_args is not None:
+                # Batches own request metadata and tensors. Keep only static tensor
+                # operands between calls, never a captured or previous serving batch.
+                replay_args.arguments["forward_batch"] = None
+                captured_args, captured_kwargs = (), {}
+
+            def replay_fn(forward_batch):
+                if has_batch:
+                    if forward_batch is None:
+                        raise ValueError(
+                            "This eager region requires a replay ForwardBatch"
+                        )
+                    replay_args.arguments["forward_batch"] = forward_batch
+                    try:
+                        new_out = captured_inner(
+                            *replay_args.args, **replay_args.kwargs
+                        )
+                    finally:
+                        replay_args.arguments["forward_batch"] = None
+                else:
+                    new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
@@ -271,7 +314,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
         return wrapper
 
-    return decorator
+    return decorator(fn) if fn is not None else decorator
 
 
 class BreakableCUDAGraph:
@@ -280,17 +323,17 @@ class BreakableCUDAGraph:
 
     def __init__(self, deduped_cuda_graph=None) -> None:
         self._segments: list[Any] = []
-        self._break_fns: list[Callable[[], Any]] = []
+        self._break_fns: list[Callable[[Any], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
 
-    def replay(self) -> None:
+    def replay(self, forward_batch=None) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
                 seg.replay()
                 if i < len(self._break_fns):
-                    self._break_fns[i]()
+                    self._break_fns[i](forward_batch)
         finally:
             _current_stream_var.reset(token)
 
@@ -410,8 +453,7 @@ class BreakableCUDAGraphCapture:
         self._current_graph_needs_instantiate = False
 
 
-@eager_on_graph(True)
+@eager_on_graph
 def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
-    pass

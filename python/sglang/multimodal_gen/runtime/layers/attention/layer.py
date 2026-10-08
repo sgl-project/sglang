@@ -2115,16 +2115,15 @@ def _make_breakable_attention_forward(forward_method):
     disabled this is a transparent pass-through to the original method.
     """
 
-    def _forward_boxing_tuples(*args, **kwargs):
+    @eager_on_graph
+    def _eager_attention(*args, **kwargs):
         out = forward_method(*args, **kwargs)
         return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
-
-    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
-            out = bcg_forward(self, *args, **kwargs)
+            out = _eager_attention(self, *args, **kwargs)
             return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
         return forward_method(self, *args, **kwargs)
 
