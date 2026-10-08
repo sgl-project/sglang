@@ -200,6 +200,8 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         device: str,
         temporal_dtype: Optional[torch.dtype] = None,
+        is_kda: bool = False,
+        spec_num_draft_tokens: Optional[int] = None,
     ):
         self.num_slots = num_slots
         self.device = device
@@ -228,6 +230,19 @@ class MambaCheckpointPool:
         ]
         self.allocator = MambaSlotAllocator(size=num_slots, device=device)
 
+        # NPU active pool normalizes conv to [L, slots, window, channels], while
+        # this checkpoint pool stores conv in the model's own conv_shapes. KDA
+        # already reads (window, channels), so the layouts already match; GDN /
+        # Mamba read (channels, window) and need a (2, 3) flip on transfer.
+        self._is_kda = is_kda
+        # Speculative decoding extends the active conv window by
+        # (spec_num_draft_tokens - 1) extra slots for verify (see
+        # _init_npu_conv_state). The checkpoint only persists the model-configured
+        # window, so the extension is sliced off / re-zeroed on transfer.
+        self._spec_extra_conv_len = (
+            (spec_num_draft_tokens - 1) if spec_num_draft_tokens is not None else 0
+        )
+
     # ---- lifecycle (delegates to the embedded allocator) ----
 
     def alloc(self, n: int = 1):
@@ -254,7 +269,13 @@ class MambaCheckpointPool:
         for i, c in enumerate(self.conv):
             src = cache.conv[i][:, active_slots]
             if _is_npu:
-                src = src.transpose(2, 3)
+                if self._spec_extra_conv_len > 0:
+                    # Drop the speculative-verify extension; the checkpoint only
+                    # persists the model-configured window (conv_kernel - 1).
+                    src = src[:, :, : src.shape[2] - self._spec_extra_conv_len]
+                if not self._is_kda:
+                    # GDN/Mamba checkpoint conv is [C, W]; active NPU conv is [W, C].
+                    src = src.transpose(2, 3)
             c[:, ckpt_slots] = src
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
@@ -264,9 +285,17 @@ class MambaCheckpointPool:
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
             src = c[:, ckpt_slots].to(cache.conv[i].dtype)
-            if _is_npu:
+            if _is_npu and not self._is_kda:
+                # GDN/Mamba checkpoint conv is [C, W]; active NPU conv is [W, C].
                 src = src.transpose(2, 3)
-            cache.conv[i][:, active_slots] = src
+            if _is_npu and self._spec_extra_conv_len > 0:
+                # Restore only the model-configured window and zero the
+                # speculative-verify extension, which was never cached.
+                conv_window = src.shape[2]
+                cache.conv[i][:, active_slots, :conv_window] = src
+                cache.conv[i][:, active_slots, conv_window:] = 0
+            else:
+                cache.conv[i][:, active_slots] = src
 
     @staticmethod
     def estimate_mem_usage_bytes(
@@ -313,6 +342,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     cache_params,
     mamba_layer_ids: List[int],
     device: str,
+    speculative_num_draft_tokens: Optional[int] = None,
 ) -> Optional[MambaCheckpointPool]:
     """Build the optional int8 ``MambaCheckpointPool`` when
     ``--enable-int8-mamba-checkpoint`` is set (and a global server-args context
@@ -369,7 +399,12 @@ def maybe_init_int8_mamba_checkpoint_pool(
             f"(currently {ckpt_size}) or --mem-fraction-static."
         )
 
-    pool = MambaCheckpointPool(device=device, **kwargs)
+    pool = MambaCheckpointPool(
+        device=device,
+        is_kda=getattr(cache_params, "is_kda", False),
+        spec_num_draft_tokens=speculative_num_draft_tokens,
+        **kwargs,
+    )
     # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
     # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
     # The estimate check above guards against an oversized pool; accounting it in

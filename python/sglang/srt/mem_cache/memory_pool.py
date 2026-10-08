@@ -1489,6 +1489,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         if self.mamba_ckpt_pool is not None and (
             self.short_conv_pool.enabled or self.ngram_pool.enabled
