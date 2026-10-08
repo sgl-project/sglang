@@ -28,7 +28,7 @@ pub(super) struct AppState {
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
-/// and a failed or timed-out warmup leaves the listener unready.
+/// and a failed or timed-out warmup shuts the server down.
 async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
     if core.is_ready() {
         return;
@@ -43,7 +43,14 @@ async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
             core.mark_ready();
             tracing::info!("The server is fired up and ready to roll!");
         }
-        Err(e) => tracing::error!(error = %e, "startup warmup failed"),
+        Err(e) => {
+            tracing::error!(error = %e, "startup warmup failed; shutting down");
+            // Same path as a scheduler exception: the parent tears down the
+            // process tree on SIGQUIT, matching Python's warmup failure.
+            if let Some(parent) = rustix::process::getppid() {
+                let _ = rustix::process::kill_process(parent, rustix::process::Signal::QUIT);
+            }
+        }
     }
 }
 
