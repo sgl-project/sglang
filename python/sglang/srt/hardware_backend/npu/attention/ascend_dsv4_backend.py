@@ -917,7 +917,7 @@ class DeepseekV4AscendAttnBackend(
 ):
     # Request-dependent cache stores, indexer and compressors run at an eager
     # BCG boundary. Rebuild metadata for the real batch, as on CUDA, rather
-    # than copying it into the single-request capture layout.
+    # than binding it to the synthetic capture request layout.
     use_captured_forward_metadata_for_breakable_cuda_graph = False
     supports_prefill_cuda_graph_max_context_size = True
 
@@ -927,9 +927,7 @@ class DeepseekV4AscendAttnBackend(
             prefix_lens = prefix_lens.tolist()
         capture_sizes = getattr(self, "_dsv4_prefill_capture_num_tokens", (128,))
         num_tokens = forward_batch.input_ids.numel()
-        has_compatible_bucket = any(
-            num_tokens <= bucket for bucket in capture_sizes
-        )
+        has_compatible_bucket = any(num_tokens <= bucket for bucket in capture_sizes)
         return (
             forward_batch.batch_size > 0
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -1025,22 +1023,23 @@ class DeepseekV4AscendAttnBackend(
         writes, so use it only for this synthetic capture batch.
         """
         num_tokens = int(forward_batch.input_ids.numel())
-        # This constrains the synthetic capture batch only. Serving batches
-        # can contain multiple requests and reuse the same token-bucket graph.
-        if forward_batch.batch_size != 1 or num_tokens == 0 or num_tokens % 128:
+        # The runner splits aggregate token buckets into context-bounded
+        # requests when --cuda-graph-prefill-max-context is set.
+        if forward_batch.batch_size == 0 or num_tokens == 0 or num_tokens % 128:
             raise ValueError(
-                "DSV4 NPU prefill graph capture currently requires one request "
+                "DSV4 NPU prefill graph capture requires a non-empty batch "
                 "and a non-zero token count aligned to 128"
             )
 
         device = forward_batch.input_ids.device
         zeros = lambda count: torch.zeros(count, dtype=torch.int64, device=device)
+        seq_lens = forward_batch.extend_seq_lens_cpu
         forward_batch._dsv4_prefill_graph_capture = True
         forward_batch.out_cache_loc_dsv4 = DSV4OutCacheLoc(
             out_full_loc=forward_batch.out_cache_loc,
             out_swa_loc=zeros(num_tokens),
-            out_c4_loc=zeros(num_tokens // 4),
-            out_c128_loc=zeros(num_tokens // 128),
+            out_c4_loc=zeros(sum(int(length) // 4 for length in seq_lens)),
+            out_c128_loc=zeros(sum(int(length) // 128 for length in seq_lens)),
         )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:

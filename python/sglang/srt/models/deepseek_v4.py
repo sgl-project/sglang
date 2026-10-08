@@ -716,7 +716,7 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 def deepseek_v4_npu_prefill_sources(layer, x, q_lora, kv, positions) -> None:
     """Run request-dependent NPU work between token-bucket graph segments."""
-    # Capture uses one synthetic request; replay must resolve the live batch.
+    # Capture uses synthetic requests; replay must resolve the live batch.
     # Trim the token bucket before cache writes/indexing/compression so padded
     # rows cannot modify another request's cache or compressor state.
     forward_batch = copy.copy(get_tc_piecewise_forward_context().forward_batch)
@@ -2022,11 +2022,12 @@ class MQALayer(MqaAttentionBase):
                     torch.cuda.current_stream(),
                 )
             if not (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
+                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             ):
                 attn_backend.store_cache(
-                    layer_id=self.layer_id, swa_k=kv_for_cache, forward_batch=forward_batch
+                    layer_id=self.layer_id,
+                    swa_k=kv_for_cache,
+                    forward_batch=forward_batch,
                 )
             kv = None
             if q_out is not None:

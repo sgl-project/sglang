@@ -176,6 +176,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_context_size = None
         runner._capture_req_slots = 1
         runner.max_bs = 4
+        runner.backend = object()
         runner._prefill_static_buffers = None
         runner.buffer_registry = registry
         runner.require_mlp_tp_gather = False

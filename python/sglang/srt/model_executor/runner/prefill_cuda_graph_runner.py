@@ -16,9 +16,9 @@
 Backend selection comes from cuda_graph_config.prefill:
   - "breakable"    — default on CUDA, BreakableCudaGraphBackend:
                       segmented capture (no torch.compile). Captures the
-                      transformer body with one request slot, then replays it
-                      with live batch metadata; multi-request prefill is
-                      supported by running attention metadata and the
+                      transformer body with context-bounded request slots,
+                      then replays it with live batch metadata; multi-request
+                      prefill is supported by running attention metadata and the
                       LM-head/logits tail outside the captured body.
   - "full"         — FullCudaGraphBackend: one graph per num_tokens bucket
                       for the captured transformer body. Capture uses
@@ -324,9 +324,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
-        if getattr(
-            model_runner.attn_backend, "can_run_prefill_cuda_graph", None
-        ) is not None:
+        if (
+            getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
+            is not None
+        ):
             model_runner.attn_backend._dsv4_prefill_capture_num_tokens = tuple(
                 self.capture_num_tokens
             )
@@ -1201,9 +1202,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
+            metadata_batch = forward_batch
+            max_seq_len_override = getattr(
+                static_forward_batch, "max_seq_len_override", None
+            )
+            if max_seq_len_override is not None:
+                # Keep the fixed context extent with live, unpadded lengths.
+                # Do not attach a graph-only limit to the serving batch, which
+                # may subsequently run an eager or decode forward.
+                metadata_batch = copy.copy(forward_batch)
+                metadata_batch.max_seq_len_override = max_seq_len_override
+            attn_backend.init_forward_metadata(metadata_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=shape_key.size
+                metadata_batch, num_qo_tokens=shape_key.size
             )
             return
         assert self.attn_metadata_buffers is not None
