@@ -39,7 +39,6 @@ _BLOCK_CONFIG = {
 }
 
 
-
 def block_config(head_dim):
     """
     Return (BLOCK_H, BLOCK_N, num_warps) for a head_dim; default for untuned
