@@ -1749,7 +1749,7 @@ class ModelRunner:
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
-            rank_id = self.gpu_id if get_parallel().attn_dp_size > 1 else None
+            rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
