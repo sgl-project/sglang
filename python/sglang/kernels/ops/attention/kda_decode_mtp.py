@@ -206,7 +206,6 @@ def kda_decode_mtp_kernel(
     # block width signals -- see _block_threads).
     STREAM_STATE = _stream_state(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
     TILES_PER_PASS = 1 if STREAM_STATE else NUM_V_TILES
-    PREFETCH_ONORM = APPLY_ONORM
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
     sK = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
@@ -224,7 +223,7 @@ def kda_decode_mtp_kernel(
         # Compile-time-dead placeholder; avoids charging the non-norm path
         # for an output tile it never touches.
         sOall = sVall
-    if cutlass.const_expr(PREFETCH_ONORM):
+    if cutlass.const_expr(APPLY_ONORM):
         sOnormGate = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
         )
@@ -585,7 +584,7 @@ def kda_decode_mtp_kernel(
             _wv = [r_w4[w] for w in range(KERNEL_WIDTH)]
             # The v warps finish precompute early. Use their spare interval
             # to stage the independent onorm inputs before the existing barrier.
-            if cutlass.const_expr(PREFETCH_ONORM):
+            if cutlass.const_expr(APPLY_ONORM):
                 sOnormWeight[_v_idx] = cutlass.Float32(onorm_weight[_v_idx])
             # Sliding conv window, oldest -> newest.
             _win = [_csv0, _csv1, _csv2]
@@ -603,7 +602,7 @@ def kda_decode_mtp_kernel(
                     cutlass.Float32(1.0) + cute.math.exp(-_vconv, fastmath=True)
                 )
                 sVall[_t * HEAD_DIM + _v_idx] = _vconv
-                if cutlass.const_expr(PREFETCH_ONORM):
+                if cutlass.const_expr(APPLY_ONORM):
                     gate_raw = cutlass.Float32(
                         onorm_g[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
                     )
@@ -777,16 +776,8 @@ def kda_decode_mtp_kernel(
             for i in range(VEC_SIZE):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * HEAD_DIM + v_idx]
-                _tok = bos + cutlass.min(i_t, n_tok - 1)
-                if cutlass.const_expr(PREFETCH_ONORM):
-                    gate = sOnormGate[i_t * HEAD_DIM + v_idx]
-                    weight = sOnormWeight[v_idx]
-                else:
-                    gate_raw = cutlass.Float32(onorm_g[0, _tok, i_hv, v_idx])
-                    gate = cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
-                    )
-                    weight = cutlass.Float32(onorm_weight[v_idx])
+                gate = sOnormGate[i_t * HEAD_DIM + v_idx]
+                weight = sOnormWeight[v_idx]
                 if i_t < n_tok:
                     o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
                         raw_o * rms * weight * gate
