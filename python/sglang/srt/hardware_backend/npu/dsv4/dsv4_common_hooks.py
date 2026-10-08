@@ -60,6 +60,65 @@ def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> N
             )
 
 
+def _zero_c4_boundary(batch: "ScheduleBatch", prefix_lens_cpu: torch.Tensor) -> None:
+    """Diagnostic A/B (env ``SGLANG_DSV4_ZERO_C4_BOUNDARY``): on a prefix-cache
+    hit, zero the c4 compress-STATE rows covering the reused prefix's boundary
+    window ``[prefix - (coff-1)*cmpRatio, prefix)`` = ``[prefix-4, prefix)`` for
+    c4 (coff=2, cmpRatio=4).
+
+    The c4 compress-STATE ring is not a radix-tree component and (on NPU, which
+    is unified_kv) the HiCache state pool is not registered, so a plain radix hit
+    does not restore it; the fused compressor then reads this boundary window
+    from whatever the ring holds. This hook is a DIAGNOSTIC to test whether that
+    boundary state is what drives the deterministic hit != miss split: if zeroing
+    it MOVES the output, the boundary state is on the causal path. Default off.
+    """
+    import os
+
+    if not os.environ.get("SGLANG_DSV4_ZERO_C4_BOUNDARY"):
+        return
+    tree_cache = getattr(batch, "tree_cache", None)
+    alloc = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if alloc is None:
+        return
+    kvcache = alloc.get_kvcache()
+    state_pool_lists = [
+        getattr(kvcache, "compress_state_pools", None),
+        getattr(kvcache, "indexer_compress_state_pools", None),
+    ]
+    if not any(state_pool_lists):
+        return
+
+    ratio = 4
+    coff = 2
+    window = (coff - 1) * ratio  # 4 for c4
+    req_to_token = batch.req_to_token_pool.req_to_token
+    rp = batch.req_pool_indices.to(torch.int64)
+    for i in range(len(batch.reqs)):
+        prefix_len = int(prefix_lens_cpu[i])
+        lo = prefix_len - window
+        if prefix_len <= 0 or lo < 0:
+            continue
+        pos = torch.arange(
+            lo, prefix_len, device=req_to_token.device, dtype=torch.int64
+        )
+        full = req_to_token[rp[i], pos].to(torch.int64)
+        if bool((full < 0).any()):
+            continue
+        swa = alloc.translate_loc_from_full_to_swa(full).to(torch.int64)
+        for pools in state_pool_lists:
+            if not pools:
+                continue
+            for pool in pools:
+                if pool is None or pool.ratio != ratio:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                sloc = pool.translate_from_swa_loc_to_state_loc(swa).to(torch.int64)
+                valid = (sloc >= 0) & (sloc < state.shape[0])
+                if bool(valid.any()):
+                    state[sloc[valid]] = 0
+
+
 def maybe_write_dsv4_extend(
     batch: ScheduleBatch,
     req_pool_indices_cpu: torch.Tensor,
@@ -74,6 +133,7 @@ def maybe_write_dsv4_extend(
 
     """
     _resync_swa_window(batch, prefix_lens_cpu)
+    _zero_c4_boundary(batch, prefix_lens_cpu)
 
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
