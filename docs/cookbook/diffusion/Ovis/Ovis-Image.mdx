@@ -87,8 +87,8 @@ B200 at 1024 x 1024, TP2 denoising is about 15–20% slower than BF16 reduction.
 Checkpoint-free component tests use real tensors and official small models:
 
 ```bash Component tests
-python test/registered/unit/diffusion/test_ovis_image.py
-python test/registered/unit/diffusion/test_ovis_image_config.py
+python python/sglang/multimodal_gen/test/unit/test_ovis_image.py
+python python/sglang/multimodal_gen/test/unit/test_ovis_image_config.py
 ```
 
 Full checkpoint and multi-GPU checks use the manual runner. Download only

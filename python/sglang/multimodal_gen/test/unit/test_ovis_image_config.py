@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # The diffusion lane provides Diffusers and native multimodal dependencies.
 
+
 class TestOvisImageConfig(CustomTestCase):
     @torch.no_grad()
     def test_cfg_text_length_changes_preserve_negative_conditioning(self):

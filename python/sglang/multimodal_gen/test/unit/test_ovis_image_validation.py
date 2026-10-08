@@ -20,7 +20,7 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 RUNNER = (
-    Path(__file__).resolve().parents[4] / "test/manual/diffusion/validate_ovis_image.py"
+    Path(__file__).resolve().parents[5] / "test/manual/diffusion/validate_ovis_image.py"
 )
 SPEC = importlib.util.spec_from_file_location("ovis_image_validation", RUNNER)
 validator = importlib.util.module_from_spec(SPEC)

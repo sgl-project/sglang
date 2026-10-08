@@ -232,8 +232,8 @@ for name in "${selected[@]}"; do
     fi
     if [[ "$name" == components ]]; then
         if run_logged "$name" "$NATIVE_PYTHON" -m pytest -q \
-            test/registered/unit/diffusion/test_ovis_image.py \
-            test/registered/unit/diffusion/test_ovis_image_config.py; then
+            python/sglang/multimodal_gen/test/unit/test_ovis_image.py \
+            python/sglang/multimodal_gen/test/unit/test_ovis_image_config.py; then
             status "$name" 1 pass "$run_dir/logs/$name.log"
         else
             status "$name" 1 fail "$run_dir/logs/$name.log"

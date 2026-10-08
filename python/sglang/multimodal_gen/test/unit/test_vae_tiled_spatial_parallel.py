@@ -19,12 +19,6 @@ import torch.multiprocessing as mp
 
 from sglang.test.test_utils import CustomTestCase
 
-# Native diffusion imports require this lane's Diffusers dependencies.
-# The regression itself uses CPU tensors and real Gloo process groups.
-register_cuda_ci(
-    est_time=300, stage="base-b", runner_config="diffusion-unit-1-gpu-h100"
-)
-
 
 def _check_tiled_spatial_decode(
     rank, rendezvous, world_size=2, latent_shapes=((15, 13),)

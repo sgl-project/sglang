@@ -182,15 +182,14 @@ class TestOvisImageNumerics(CustomTestCase):
         )
         cls.config = OvisImageConfig()
         cls.config.update_model_arch(cls.kwargs)
-        set_global_server_args(
-            ServerArgs(
-                model_path="ATH-MaaS/Ovis-Image-7B",
-                pipeline_config=OvisImagePipelineConfig(dit_config=cls.config),
-                num_gpus=1,
-                attention_backend="torch_sdpa",
-                performance_mode="manual",
-            )
+        cls.server_args = ServerArgs(
+            model_path="ATH-MaaS/Ovis-Image-7B",
+            pipeline_config=OvisImagePipelineConfig(dit_config=cls.config),
+            num_gpus=1,
+            attention_backend="torch_sdpa",
+            performance_mode="manual",
         )
+        set_global_server_args(cls.server_args)
         ensure_distributed_env_defaults()
         maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
         from sglang.srt.runtime_context import get_context, publish
@@ -453,10 +452,20 @@ class TestOvisImageNumerics(CustomTestCase):
             OvisImageSDPAImpl,
             OvisImageUSPAttention,
         )
+        from sglang.multimodal_gen.runtime.server_args import (
+            server_args as server_args_module,
+        )
 
         heads, head_dim = 6, 128
         for dtype in (torch.bfloat16, torch.float32):
-            with set_default_torch_dtype(dtype):
+            # The unit conftest resets the global args per test; this check
+            # targets the explicit torch SDPA backend.
+            with (
+                set_default_torch_dtype(dtype),
+                patch.object(
+                    server_args_module, "_global_server_args", self.server_args
+                ),
+            ):
                 native = NativeAttention(
                     query_dim=heads * head_dim,
                     num_heads=heads,
