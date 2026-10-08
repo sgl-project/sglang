@@ -1054,13 +1054,17 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, True)
                 pages = int(buf.shape[0])
-                whole = os.environ.get("DSV4_DUMP_IDXK_WHOLE")
-                # Hashing the whole index-K buffer every layer/step costs GBs of
-                # host copies; default to the tail pages unless explicitly asked.
-                slab = buf if whole else buf[max(0, pages - 16) : pages]
+                rng = os.environ.get("DSV4_DUMP_IDXK_PAGES")  # e.g. "0:8" (deep prefix) or "120:128" (boundary)
+                if rng:
+                    lo_s, hi_s = rng.split(":")
+                    lo, hi = max(0, int(lo_s)), min(pages, int(hi_s))
+                elif os.environ.get("DSV4_DUMP_IDXK_WHOLE"):
+                    lo, hi = 0, pages
+                else:
+                    lo, hi = max(0, pages - 16), pages  # tail (most recent) by default
                 print(
-                    f"[IDXK] layer={layer_id} lastpos={lastpos} shape={tuple(buf.shape)} "
-                    f"whole={'1' if whole else '0'} md5={_md5(slab)}",
+                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} "
+                    f"win={lo}:{hi} shape={tuple(buf.shape)} md5={_md5(buf[lo:hi])}",
                     flush=True,
                 )
             except Exception as exc:
