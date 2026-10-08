@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.layers.attention.roles import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
+    canonical_quantization_method,
+)
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -493,6 +496,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # stay eager). Mutually exclusive with --enable-torch-compile and
     # Cache-DiT; BCG takes priority when more than one is requested.
     #
+    # PyTorch's two approximate numerics defaults, set explicitly per worker
+    # (see runtime/utils/numerics_policy.py). They are process-global, so they
+    # cannot follow a request's quality level; the defaults keep PyTorch's own
+    # values so the exact tier's speed is unchanged.
+    allow_cudnn_tf32: bool = True
+    allow_bf16_reduced_precision_reduction: bool = True
     # BCG graphs are resolution-specific, so --warmup-resolutions is required
     # when BCG is enabled: every requested resolution is captured at warmup so
     # serving never triggers a fresh capture.
@@ -557,6 +566,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    async_output_save: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -622,6 +632,8 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
     enable_cache_report: bool = False
+    disable_conditioning_cache: bool = False
+    conditioning_cache_max_size_mb: float = 512.0
 
     # Tracing
     enable_trace: bool = False
@@ -946,6 +958,18 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
             return
+
+        if (
+            self.use_fsdp_inference
+            and self.num_gpus > 1
+            # with data parallelism the FSDP mesh would span the replicas
+            and self.dp_size == 1
+            and self.dit_cpu_offload is None
+            # a GGUF or pre-quantized override may not support FSDP
+            and self.transformer_weights_path is None
+        ):
+            # FSDP shards only resident components; component offload would bypass it
+            self.dit_cpu_offload = False
 
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
@@ -2023,6 +2047,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not 0 <= self.conditioning_cache_max_size_mb < float("inf"):
+            raise ValueError(
+                "conditioning_cache_max_size_mb must be finite and nonnegative"
+            )
         if not self._explicit_arg_names:
             self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
                 self
@@ -2066,10 +2094,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
             normalized_direct_gpu_loading[component_name] = enabled
         self.component_direct_gpu_weight_loading = normalized_direct_gpu_loading
+        if self.quantization is not None:
+            self.quantization = canonical_quantization_method(self.quantization)
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
-            quantization = str(quantization).strip().lower()
+            quantization = canonical_quantization_method(
+                str(quantization).strip().lower()
+            )
             if not component or not quantization:
                 raise ValueError(
                     "Component quantization entries require a component and method"
@@ -2511,6 +2543,23 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
         )
         parser.add_argument(
+            "--allow-cudnn-tf32",
+            action=StoreBoolean,
+            default=ServerArgs.allow_cudnn_tf32,
+            help="Let cuDNN run fp32 convolutions on TF32 tensor cores, which "
+            "truncates their inputs to 10 mantissa bits (PyTorch's own "
+            "default). Affects the fp32 VAE decoders; pass false together "
+            "with --allow-bf16-reduced-precision-reduction false for "
+            "reference-precision fp32 and bf16 math.",
+        )
+        parser.add_argument(
+            "--allow-bf16-reduced-precision-reduction",
+            action=StoreBoolean,
+            default=ServerArgs.allow_bf16_reduced_precision_reduction,
+            help="Let a bf16 GEMM accumulate its split-K partials below fp32 "
+            "(PyTorch's own default). See --allow-cudnn-tf32.",
+        )
+        parser.add_argument(
             "--enable-breakable-cuda-graph",
             action=StoreBoolean,
             default=ServerArgs.enable_breakable_cuda_graph,
@@ -2613,7 +2662,8 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
-            help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
+            help="Keep DiT weights on the CPU and move them onto the GPU whole around each "
+            "use. This takes the DiT out of FSDP, which shards only resident components.",
         )
         parser.add_argument(
             "--direct-gpu-weight-loading",
@@ -2874,7 +2924,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8' and 'mxfp4'. Other methods "
+                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
+                "12.0 and 12.1, else on comfy_kitchen; see "
+                "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND; 'kitchen_int8' is a "
+                "deprecated alias). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
@@ -2888,7 +2942,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
@@ -2943,6 +2998,18 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--async-output-save",
+            action="store_true",
+            default=ServerArgs.async_output_save,
+            help="Finalize outputs (frame materialization, image/video encoding, disk "
+            "write, reply) on a background thread so the scheduler can start the next "
+            "request's GPU work immediately. Applies to save-to-file requests on the "
+            "output rank; requests carrying perf instrumentation keep the synchronous "
+            "path. Memory metrics reported for a request may include the next "
+            "request's allocations, and the per-request allocator cache release is "
+            "skipped.",
         )
         parser.add_argument(
             "--host",
@@ -3118,6 +3185,18 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
         )
         parser.add_argument(
+            "--disable-conditioning-cache",
+            action="store_true",
+            default=ServerArgs.disable_conditioning_cache,
+            help="Disable cross-request text/image and VAE posterior caching; reuse within a grouped stage remains enabled.",
+        )
+        parser.add_argument(
+            "--conditioning-cache-max-size-mb",
+            type=float,
+            default=ServerArgs.conditioning_cache_max_size_mb,
+            help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
+        )
+        parser.add_argument(
             "--backend",
             type=str,
             choices=Backend.choices(),
@@ -3179,14 +3258,28 @@ class ServerArgs(DisaggServerArgsMixin):
     def scheduler_endpoint(self):
         """
         Internal endpoint for scheduler.
-        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
+        Wildcard, localhost, and IPv6 hosts use IPv4 loopback for internal ZMQ.
         """
         return self.scheduler_endpoint_for(0)
 
     def scheduler_endpoint_for(self, replica: int) -> str:
-        """Ingress endpoint of one DP replica's driver rank."""
+        """Ingress endpoint of one DP replica's driver rank.
+
+        The scheduler ingress is an unauthenticated pickle-RPC endpoint
+        (``managers/scheduler.py`` ``recv_reqs`` deserializes client bytes
+        with ``pickle.loads``), so it must never be derived from the public
+        ``--host``: binding it to ``0.0.0.0`` would expose unsafe
+        deserialization to the network (CVE-2026-3059 family). Wildcard hosts
+        are pinned to loopback; IPv6 hosts also use IPv4 loopback for internal
+        ZMQ compatibility. Explicit non-wildcard IPv4 hosts and hostnames
+        (used for intentional cross-machine deployments) are honored.
+        """
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if (
+            scheduler_host is None
+            or scheduler_host in ("localhost", "0.0.0.0")
+            or is_valid_ipv6_address(scheduler_host)
+        ):
             scheduler_host = "127.0.0.1"
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]

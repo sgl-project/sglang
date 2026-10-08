@@ -19,15 +19,25 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
     _server_args_for_transformer_component,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.loader.component_loaders.vl_encoder_loader import (
     VisionLanguageEncoderLoader,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class _AliasPipeline(ComposedPipelineBase):
@@ -39,6 +49,85 @@ class _AliasPipeline(ComposedPipelineBase):
 
 
 class TestComponentLoaderIdentity(unittest.TestCase):
+    def test_lazy_transformer_load_register_and_reuse(self):
+        for native_fallback in (False, True):
+            with self.subTest(native_fallback=native_fallback):
+                server_args = ServerArgs(
+                    model_path="x",
+                    component_residency={"transformer": COMPONENT_OFFLOAD},
+                )
+                server_args.model_loaded = {"transformer": False}
+                server_args.model_paths = {"transformer": "/model/transformer"}
+                stage = SimpleNamespace(transformer=None)
+                pipeline = object.__new__(_AliasPipeline)
+                pipeline.modules = {}
+                transformer = nn.Linear(2, 2)
+
+                with (
+                    patch.object(
+                        current_platform, "get_available_gpu_memory", return_value=16.0
+                    ),
+                    patch.object(
+                        TransformerLoader,
+                        "load_customized",
+                        autospec=True,
+                        return_value=transformer,
+                        side_effect=(
+                            ValueError("Unsupported model architecture")
+                            if native_fallback
+                            else None
+                        ),
+                    ) as customized,
+                    patch.object(
+                        TransformerLoader,
+                        "load_native",
+                        autospec=True,
+                        return_value=transformer,
+                    ) as native,
+                ):
+                    self.assertTrue(load_transformer_if_needed(stage, server_args))
+                    self.assertIs(stage.transformer, transformer)
+                    self.assertFalse(server_args.model_loaded["transformer"])
+                    register_loaded_transformer(stage, server_args, pipeline)
+                    self.assertTrue(server_args.model_loaded["transformer"])
+                    self.assertIs(pipeline.get_module("transformer"), transformer)
+                    self.assertFalse(load_transformer_if_needed(stage, server_args))
+                    customized.assert_called_once()
+                    if native_fallback:
+                        self.assertEqual(
+                            native.call_args.args[1:],
+                            (
+                                "/model/transformer",
+                                server_args,
+                                "diffusers",
+                                "transformer",
+                            ),
+                        )
+                    else:
+                        native.assert_not_called()
+                self.assertFalse(transformer.training)
+                self.assertEqual(stage.transformer(torch.ones(1, 2)).shape, (1, 2))
+
+    def test_lazy_transformer_load_failure_preserves_state(self):
+        server_args = ServerArgs(model_path="x")
+        server_args.model_loaded = {"transformer": False}
+        server_args.model_paths = {"transformer": "/missing/transformer"}
+        stage = SimpleNamespace(transformer=None)
+        with (
+            patch.object(
+                current_platform, "get_available_gpu_memory", return_value=16.0
+            ),
+            patch.object(
+                TransformerLoader, "load_customized", side_effect=FileNotFoundError
+            ),
+            patch.object(TransformerLoader, "load_native") as native,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                load_transformer_if_needed(stage, server_args)
+        self.assertIsNone(stage.transformer)
+        self.assertFalse(server_args.model_loaded["transformer"])
+        native.assert_not_called()
+
     def test_structural_identity_selects_roles_and_preserves_exact_policy_keys(self):
         aliases = {
             "conditioning": "text_encoder_2",
