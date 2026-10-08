@@ -82,6 +82,19 @@ MIN_FRAME_INTERPOLATION_EXP = 1
 MAX_FRAME_INTERPOLATION_EXP = 4
 
 
+def validate_frame_interpolation_exp(exp: int) -> None:
+    if (
+        isinstance(exp, bool)
+        or not isinstance(exp, int)
+        or not MIN_FRAME_INTERPOLATION_EXP <= exp <= MAX_FRAME_INTERPOLATION_EXP
+    ):
+        raise ValueError(
+            "frame_interpolation_exp must be an int in "
+            f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
+            f"got {exp!r}"
+        )
+
+
 @dataclass(frozen=True)
 class SkipSoftmaxParams:
     """Validated request-scoped BLASST/Skip-Softmax controls."""
@@ -685,18 +698,7 @@ class SamplingParams:
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
 
-        if (
-            isinstance(self.frame_interpolation_exp, bool)
-            or not isinstance(self.frame_interpolation_exp, int)
-            or not MIN_FRAME_INTERPOLATION_EXP
-            <= self.frame_interpolation_exp
-            <= MAX_FRAME_INTERPOLATION_EXP
-        ):
-            raise ValueError(
-                "frame_interpolation_exp must be an int in "
-                f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
-                f"got {self.frame_interpolation_exp!r}"
-            )
+        validate_frame_interpolation_exp(self.frame_interpolation_exp)
 
         if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
             raise ValueError(

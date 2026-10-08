@@ -176,18 +176,18 @@ def test_raw_rgb_frame_batches_apply_realtime_upscaling(monkeypatch):
     assert frame_batches[0][0] == bytes([1, 2, 3] * 4)
 
 
-@pytest.mark.parametrize("exp", [0, MAX_FRAME_INTERPOLATION_EXP + 1])
+@pytest.mark.parametrize("exp", [0, MAX_FRAME_INTERPOLATION_EXP + 1, 1.5, 2.0, True])
 def test_materialize_output_sample_rejects_out_of_range_interpolation_exp(
     monkeypatch, exp
 ):
-    """exp < 1 made RIFE recurse forever; reject before loading weights."""
+    """Out-of-range or non-int exp must be rejected before loading weights."""
 
     def fail_load(_self):
         raise AssertionError("RIFE weights must not load for an invalid exp")
 
     monkeypatch.setattr(FrameInterpolator, "_ensure_model_loaded", fail_load)
 
-    with pytest.raises(ValueError, match="exp must be in"):
+    with pytest.raises(ValueError, match="frame_interpolation_exp must be an int in"):
         materialize_output_sample(
             torch.zeros(3, 2, 2, 2),
             DataType.VIDEO,

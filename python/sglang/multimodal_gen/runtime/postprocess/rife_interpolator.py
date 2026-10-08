@@ -20,8 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    MAX_FRAME_INTERPOLATION_EXP,
-    MIN_FRAME_INTERPOLATION_EXP,
+    validate_frame_interpolation_exp,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -470,12 +469,7 @@ class FrameInterpolator:
         Returns:
             (interpolated_frames, multiplier) where multiplier = 2**exp.
         """
-        if not MIN_FRAME_INTERPOLATION_EXP <= exp <= MAX_FRAME_INTERPOLATION_EXP:
-            raise ValueError(
-                "frame interpolation exp must be in "
-                f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
-                f"got {exp!r}"
-            )
+        validate_frame_interpolation_exp(exp)
         if len(frames) < 2:
             logger.warning(
                 "Frame interpolation requires at least 2 frames; returning input unchanged."
