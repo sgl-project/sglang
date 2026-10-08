@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
+    get_new_expanded_mm_items,
 )
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
@@ -130,6 +131,19 @@ class TestKimiImageIdentity(CustomTestCase):
         )
         processor.assign_kimi_image_identities([canonical, alias], [_image(0)] * 2)
         self.assertEqual(canonical.identity, alias.identity)
+
+    def test_hf_bundled_grid_alias_splits_before_identity(self):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.arange(12).reshape(12, 1),
+            offsets=[(0, 0), (2, 3)],
+            model_specific_data={"grid_thws": torch.tensor([[1, 2, 2], [1, 2, 4]])},
+            format=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        items = get_new_expanded_mm_items([item])
+        self.assertEqual([len(entry.feature) for entry in items], [4, 8])
+        _IdentityOnly({}).assign_kimi_image_identities(items, None)
+        self.assertNotEqual(items[0].identity, items[1].identity)
 
     def test_epd_embeddings_receive_content_and_grid_identity(self):
         processor = _IdentityOnly({})

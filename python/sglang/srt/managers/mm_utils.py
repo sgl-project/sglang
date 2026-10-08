@@ -1129,6 +1129,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
                 if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("grid_thws")
+                if image_grid_thw is None:
                     image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
