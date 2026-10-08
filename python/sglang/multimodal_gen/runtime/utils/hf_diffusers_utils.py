@@ -18,7 +18,6 @@
 # ==============================================================================
 """Utilities for Huggingface Transformers."""
 
-import contextlib
 import glob
 import json
 import os
@@ -400,18 +399,6 @@ def _verify_diffusers_model_complete(path: str) -> bool:
     )
 
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
-    # ChatGLMConfig.model_type: ChatGLMConfig,
-    # DbrxConfig.model_type: DbrxConfig,
-    # ExaoneConfig.model_type: ExaoneConfig,
-    # Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
-}
-
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
-
-
 def get_hf_config(
     component_model_path: str,
     trust_remote_code: bool,
@@ -428,11 +415,6 @@ def get_hf_config(
         revision=revision,
         **kwargs,
     )
-    if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(component_model_path, revision=revision)
-        # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = component_model_path
     if model_override_args:
         config.update(model_override_args)
 
