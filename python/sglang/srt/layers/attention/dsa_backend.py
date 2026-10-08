@@ -95,6 +95,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
+# Measured crossovers between AITER sparse_mla_fwd and the Triton kernels.
+_GLM53_AITER_DECODE_MIN_TOKENS = 16
+_GLM53_AITER_PREFILL_MAX_TOKENS = 256
 
 
 if is_cuda():
@@ -2224,6 +2227,14 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if self._use_glm53_aiter_sparse_mla(q_nope.shape[0], is_decode=False):
+                return self._forward_aiter_sparse_mla(
+                    q_nope=q_nope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -3261,6 +3272,14 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
+        if self._use_glm53_aiter_sparse_mla(q_nope.shape[0], is_decode=True):
+            return self._forward_aiter_sparse_mla(
+                q_nope=q_nope,
+                kv_cache=kv_cache,
+                v_head_dim=v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=sm_scale,
+            )
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
         )
@@ -3276,6 +3295,46 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
         )
+
+    def _use_glm53_aiter_sparse_mla(self, num_tokens: int, is_decode: bool) -> bool:
+        if not (
+            self._triton_kpool_tail_supported
+            and envs.SGLANG_OPT_GLM53_AITER_SPARSE_MLA.get()
+        ):
+            return False
+        if is_decode:
+            return num_tokens >= _GLM53_AITER_DECODE_MIN_TOKENS
+        return num_tokens <= _GLM53_AITER_PREFILL_MAX_TOKENS
+
+    def _forward_aiter_sparse_mla(
+        self,
+        q_nope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+
+        num_tokens, topk = page_table_1.shape
+        kv_indptr = torch.arange(
+            0,
+            (num_tokens + 1) * topk,
+            topk,
+            dtype=torch.int32,
+            device=q_nope.device,
+        )
+        out, _ = sparse_mla_fwd(
+            q_nope,
+            kv_cache.view(-1, kv_cache.shape[-1]),
+            kv_indptr,
+            page_table_1.reshape(-1),
+            sm_scale,
+            kv_lora_rank=v_head_dim,
+            qk_rope_head_dim=0,
+            has_invalid=True,
+        )
+        return out.unsqueeze(0)
 
     def _forward_intel_xpu_sparse_decode(
         self,

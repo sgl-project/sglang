@@ -138,6 +138,27 @@ class TestPackedRowInference(CustomTestCase):
                 unsupported, topk_indices, "triton", "prefill"
             )
 
+    def test_glm53_aiter_sparse_mla_dispatch_bounds(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        use = DeepseekSparseAttnBackend._use_glm53_aiter_sparse_mla
+        validated = SimpleNamespace(_triton_kpool_tail_supported=True)
+        unvalidated = SimpleNamespace(_triton_kpool_tail_supported=False)
+
+        self.assertFalse(use(validated, 64, is_decode=True))
+        with envs.SGLANG_OPT_GLM53_AITER_SPARSE_MLA.override(True):
+            self.assertFalse(use(unvalidated, 64, is_decode=True))
+            self.assertFalse(use(unvalidated, 64, is_decode=False))
+            for tokens in (1, 2, 4, 8, 12, 15):
+                self.assertFalse(use(validated, tokens, is_decode=True))
+            for tokens in (16, 64, 512, 4096):
+                self.assertTrue(use(validated, tokens, is_decode=True))
+            for tokens in (1, 64, 256):
+                self.assertTrue(use(validated, tokens, is_decode=False))
+            for tokens in (257, 1024, 65536):
+                self.assertFalse(use(validated, tokens, is_decode=False))
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU required")
 class TestScaledCacheLayouts(CustomTestCase):
@@ -481,6 +502,76 @@ class TestTritonDSAZeroRope(CustomTestCase):
                 self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
                 del q, indices, actual
                 empty_gpu_cache()
+
+
+def _aiter_sparse_mla_available():
+    try:
+        from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and is_hip()
+    and is_gfx95_supported()
+    and _aiter_sparse_mla_available(),
+    "AITER sparse_mla_fwd dispatch is gfx950-only",
+)
+class TestAiterSparseMlaDispatch(CustomTestCase):
+    @staticmethod
+    def _aiter(q, kv, indices):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        return DeepseekSparseAttnBackend._forward_aiter_sparse_mla(
+            None,
+            q_nope=q,
+            kv_cache=kv,
+            v_head_dim=512,
+            page_table_1=indices,
+            sm_scale=1.0 / math.sqrt(256),
+        )
+
+    @staticmethod
+    def _inputs(tokens, heads):
+        q, kv, indices = TestTileLangDSAZeroRope._bf16_inputs(
+            tokens=tokens, heads=heads
+        )
+        indices = indices[:, 0, :2051].contiguous()
+        indices[0, 100:] = -1
+        return q, kv, indices
+
+    def test_glm53_decode_and_prefill_match_triton(self):
+        for heads in (8, 16):
+            for tokens in (16, 64, 256):
+                with self.subTest(heads=heads, tokens=tokens):
+                    q, kv, indices = self._inputs(tokens, heads)
+                    actual = self._aiter(q, kv, indices)
+                    decode = TestTritonDSAZeroRope._run_decode(
+                        q, kv, indices.unsqueeze(1), []
+                    )
+                    prefill = TestTritonDSAZeroRope._run(q, kv, indices.unsqueeze(1))
+                    self.assertEqual(actual.shape, decode.shape)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    torch.testing.assert_close(actual, decode, atol=0.04, rtol=0.04)
+                    torch.testing.assert_close(actual, prefill, atol=0.04, rtol=0.04)
+
+    def test_glm53_cuda_graph_replay(self):
+        for heads, tokens in ((16, 64), (8, 512)):
+            with self.subTest(heads=heads, tokens=tokens):
+                q, kv, indices = self._inputs(tokens, heads)
+                eager = self._aiter(q, kv, indices)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._aiter(q, kv, indices)
+                q.copy_(torch.randn_like(q))
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = self._aiter(q, kv, indices)
+                torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+                self.assertFalse(torch.equal(captured, eager))
 
 
 if __name__ == "__main__":

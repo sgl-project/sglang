@@ -976,6 +976,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # GLM-5.3 BF16 sparse attention on gfx950: AITER Gluon sparse_mla_fwd for
+    # decode batches >= 16 and prefill batches <= 256 tokens. Needs AITER with
+    # ROCm/aiter#6276.
+    SGLANG_OPT_GLM53_AITER_SPARSE_MLA = EnvBool(False)
 
     # ===================================================================
     # Apple Silicon and MLX
