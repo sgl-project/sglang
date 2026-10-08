@@ -46,6 +46,45 @@ def test_beam_attention_gate(rows):
         )
 
 
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("column_step", [1, 2])
+def test_beam_packed_gate_without_copy(rows, tp_size, column_step):
+    """A QKV+gate slice must preserve rounding without materializing the gate."""
+    from sglang.kernels.ops.elementwise import _BEAM_ATTENTION_GATE as op
+    from sglang.kernels.ops.elementwise.beam_fused import fused_attention_gate
+
+    q_size, kv_size = 48 * 128 // tp_size, 8 * 128 // tp_size
+    packed = torch.randn(
+        rows,
+        (2 * q_size + 2 * kv_size) * column_step,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate = packed[:, (q_size + 2 * kv_size) * column_step :: column_step]
+    attention = torch.randn(rows, q_size, device="cuda", dtype=gate.dtype)
+    bias = torch.randn(q_size // 128, device="cuda", dtype=gate.dtype)
+    expected = op.forward_native(attention, gate, bias, 128)
+    fused_attention_gate(attention, gate, bias, 128)  # Compile before profiling.
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        actual = fused_attention_gate(attention, gate, bias, 128)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert not {"aten::clone", "aten::copy_"} & {
+        event.key for event in prof.key_averages()
+    }
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = fused_attention_gate(attention, gate, bias, 128)
+    packed.normal_()
+    graph.replay()
+    torch.testing.assert_close(
+        replayed, op.forward_native(attention, gate, bias, 128), atol=0, rtol=0
+    )
+
+
 def test_beam_fp16_gate_rounding_boundaries():
     from sglang.kernels.ops.elementwise import _BEAM_ATTENTION_GATE as op
 
