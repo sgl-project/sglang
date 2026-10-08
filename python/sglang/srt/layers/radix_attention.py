@@ -24,7 +24,11 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -36,6 +40,18 @@ from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+
+_KV_FAKE_QUANT = envs.SGLANG_KV_CACHE_FAKE_QUANT.get()
+if _KV_FAKE_QUANT:
+    if _KV_FAKE_QUANT != "mxfp4":
+        raise ValueError(f"Unsupported SGLANG_KV_CACHE_FAKE_QUANT={_KV_FAKE_QUANT!r}")
+    from quark.torch.kernel.mx import qdq_mxfp4 as _quark_qdq_mxfp4
+
+
+def _kv_fake_quant(x: torch.Tensor) -> torch.Tensor:
+    # MXFP4 QDQ along head_dim: one E8M0 scale per 32 values of a (token, head).
+    return _quark_qdq_mxfp4(x.contiguous(), "even")
+
 
 # When set, RadixAttention.forward runs the attention backend eagerly instead of
 # routing through the tc-piecewise split op. A caller already inside a
@@ -157,6 +173,58 @@ class RadixAttention(nn.Module):
         self.xai_temperature_len = -1
 
     def forward(
+        self,
+        q,
+        k,
+        v,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
+        **kwargs,
+    ):
+        if (
+            _KV_FAKE_QUANT
+            and k is not None
+            and save_kv_cache
+            and not self.is_cross_attention
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            return self._forward_kv_fake_quant(
+                q, k, v, forward_batch, key_value_num_tokens, **kwargs
+            )
+        return self._forward(
+            q, k, v, forward_batch, save_kv_cache, key_value_num_tokens, **kwargs
+        )
+
+    def _forward_kv_fake_quant(
+        self, q, k, v, forward_batch: ForwardBatch, key_value_num_tokens, **kwargs
+    ):
+        k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+        v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+        k_qdq = _kv_fake_quant(k)
+        v_qdq = _kv_fake_quant(v)
+        if forward_batch.forward_mode.is_decode():
+            # Decode attends straight from the cache, new token included.
+            return self._forward(
+                q, k_qdq, v_qdq, forward_batch, True, key_value_num_tokens, **kwargs
+            )
+        # Extend: the chunk attends to its own raw K/V (backend writes raw K/V
+        # and may read them back from the cache), then the chunk's cache slots
+        # are overwritten with QDQ values for every later read.
+        out = self._forward(
+            q, k, v, forward_batch, True, key_value_num_tokens, **kwargs
+        )
+        pool = get_token_to_kv_pool()
+        assert pool.get_key_buffer(self.layer_id).dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ), (
+            "SGLANG_KV_CACHE_FAKE_QUANT expects a BF16/FP16 KV cache (--kv-cache-dtype auto)"
+        )
+        pool.set_kv_buffer(self, forward_batch.out_cache_loc, k_qdq, v_qdq)
+        return out
+
+    def _forward(
         self,
         q,
         k,

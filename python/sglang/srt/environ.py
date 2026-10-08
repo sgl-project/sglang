@@ -581,6 +581,11 @@ class Envs:
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
+    # KV-cache fake quantization for accuracy studies: "mxfp4" QDQs K/V via
+    # Quark's qdq_mxfp4 (block 32, E8M0 "even" scale, RNE) before it lands in
+    # a BF16 cache. The current extend chunk attends to its raw K/V; only
+    # cache reads (prefix, decode) see quantized values. Empty = off.
+    SGLANG_KV_CACHE_FAKE_QUANT = EnvStr("")
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
     # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
