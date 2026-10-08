@@ -70,30 +70,21 @@ if _is_cuda:
 #
 # See: https://github.com/flashinfer-ai/flashinfer/issues/2232
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Adjust degenerate strides for a tensor, make it canonical.
+    """Give each size-1 dim whose stride collides with the next dim's a
+    canonical stride; every other stride is kept, so a non-contiguous KV view
+    keeps its addressing.
+
+    Example: shape ``[num_pages, 1, 64, 128]`` with stride
+    ``[8192, 128, 128, 1]`` becomes stride ``[8192, 8192, 128, 1]``.
     """
     sizes = tensor.size()
-    strides = tensor.stride()
-    ndim = tensor.dim()
-
-    need_fix = any(
-        sizes[i] == 1 and strides[i] == strides[i + 1] for i in range(ndim - 1)
-    )
-
-    if not need_fix:
+    strides = list(tensor.stride())
+    new_strides = list(strides)
+    for i in range(tensor.dim() - 2, -1, -1):
+        if sizes[i] == 1 and strides[i] == strides[i + 1]:
+            new_strides[i] = new_strides[i + 1] * sizes[i + 1]
+    if new_strides == strides:
         return tensor
-
-    # canonicalize the stride
-    # Example:
-    # - shape: [num_pages, 1, 64, 128]
-    # - stride: [8192, 128, 128, 1] (wrong!)
-    # Gives new stride: [8192, 8192, 128 ,1] (correct!)
-    new_strides = [0] * ndim
-    new_strides[-1] = 1
-    for i in range(ndim - 2, -1, -1):
-        new_strides[i] = new_strides[i + 1] * sizes[i + 1]
-
     return tensor.as_strided(sizes, new_strides)
 
 

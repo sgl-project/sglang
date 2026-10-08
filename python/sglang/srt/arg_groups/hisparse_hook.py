@@ -76,6 +76,14 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     )
 
 
+def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
+
+    cfg = resolving_view(server_args)
+    # A mixed batch cannot merge the HiSparse decode batch.
+    if cfg.enable_mixed_chunk:
+        raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -101,6 +109,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     assert cfg.disable_radix_cache, (
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
+    validate_hisparse_feature_combos(server_args)
 
     enable_spec = (
         cfg.speculative_algorithm is not None
