@@ -870,8 +870,8 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
-    # Unset prefers epv2 and falls back to epv1 where EPv2 is unsupported (moe_hook).
-    SGLANG_MORI_EP_VERSION = EnvStr("epv2")
+    # Unset prefers EPv2 and falls back to EPv1 where EPv2 is unsupported (moe_hook).
+    SGLANG_MORI_EP_V2 = EnvBool(True)
     SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.

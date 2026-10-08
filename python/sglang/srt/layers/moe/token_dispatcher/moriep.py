@@ -4,8 +4,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from numbers import Integral
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Sequence
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -58,20 +57,6 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
-_RECV_BOUND_LOGGED: set[tuple[str, int]] = set()
-
-
-def normalize_sender_rows(
-    sender_rows: Optional[Sequence[int]],
-) -> tuple[int, ...] | None:
-    """Copy CPU scheduler metadata without introducing a device sync."""
-    if not isinstance(sender_rows, (list, tuple)):
-        return None
-    if any(
-        isinstance(rows, bool) or not isinstance(rows, Integral) for rows in sender_rows
-    ):
-        return None
-    return tuple(int(rows) for rows in sender_rows)
 
 
 def round_logical_recv_rows(cluster_rows: int, pow2_buckets: bool) -> int:
@@ -185,8 +170,6 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     expert_output: Optional[torch.Tensor] = None
     # Logical MoE input cap selected by the dispatcher; 0 disables trimming.
     recv_cap: int = 0
-    # mori.ops.EpDispatchCombineKernelType that produced the receive layout.
-    kernel_type: Any = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -204,8 +187,6 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
-    # mori.ops.EpDispatchCombineKernelType that produced the receive layout.
-    kernel_type: Any = None
     # Logical MoE input cap selected by the dispatcher; 0 disables trimming.
     recv_cap: int = 0
 
@@ -556,12 +537,8 @@ def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
         world_size, rank, uid, per_rank_vmm=per_rank_vmm_gb * (1 << 30)
     )
     logger.info(
-        "[MORI EPv2 init] cco communicator world=%d rank=%d instance=%d "
-        "per_rank_vmm_gb=%d",
-        world_size,
-        rank,
-        instance_id,
-        per_rank_vmm_gb,
+        f"[MORI EPv2 init] cco communicator world={world_size} rank={rank} "
+        f"instance={instance_id} per_rank_vmm_gb={per_rank_vmm_gb}"
     )
     return comm
 
@@ -694,22 +671,12 @@ def init_mori_epv2_op(
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     logger.info(
-        "[MORI EPv2 init] world=%d rank=%d hidden=%d experts=%d local_experts=%d "
-        "topk=%d max_tokens=%d recv_cap=%d dispatch_dtype=%s combine_dtype=%s "
-        "combine_mode=%s launch_config=%s schedule=%s",
-        world_size,
-        rank,
-        hidden_size,
-        num_experts,
-        num_local_experts,
-        router_topk,
-        max_tokens_per_rank,
-        cfg.effective_max_recv,
-        dispatch_dtype,
-        combine_dtype,
-        cfg.combine_mode,
-        launch_config,
-        cfg.schedule,
+        f"[MORI EPv2 init] world={world_size} rank={rank} hidden={hidden_size} "
+        f"experts={num_experts} local_experts={num_local_experts} topk={router_topk} "
+        f"max_tokens={max_tokens_per_rank} recv_cap={cfg.effective_max_recv} "
+        f"dispatch_dtype={dispatch_dtype} combine_dtype={combine_dtype} "
+        f"combine_mode={cfg.combine_mode} launch_config={launch_config} "
+        f"schedule={cfg.schedule}"
     )
     return op
 
@@ -719,15 +686,15 @@ class _MoriEPDispatcherImplBase:
 
     def __init__(
         self,
-        group,
-        router_topk,
-        permute_fusion,
-        num_experts,
-        num_local_experts,
-        hidden_size,
-        params_dtype,
-        deepep_mode,
-        instance_id=0,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool,
+        num_experts: int,
+        num_local_experts: int,
+        hidden_size: int,
+        params_dtype: torch.dtype,
+        deepep_mode: DeepEPMode,
+        instance_id: int = 0,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -755,9 +722,15 @@ class _MoriEPDispatcherImplBase:
 
     @staticmethod
     def _snapshot_sender_rows() -> tuple[int, ...] | None:
+        """Copy CPU scheduler metadata; non-int rows would need a device sync."""
         from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 
-        return normalize_sender_rows(get_dp_global_num_tokens())
+        rows = get_dp_global_num_tokens()
+        if not isinstance(rows, (list, tuple)) or not all(
+            isinstance(r, int) for r in rows
+        ):
+            return None
+        return tuple(rows)
 
     def _get_physical_recv_rows(self) -> int:
         raise NotImplementedError
@@ -766,39 +739,21 @@ class _MoriEPDispatcherImplBase:
         raise NotImplementedError
 
     def _select_recv_cap(self) -> int:
-        """Select the logical MoE input cap once, before dispatch_b runs."""
-        physical_rows = self._get_physical_recv_rows()
+        """Select the logical MoE input cap before dispatch_b; 0 keeps the full view."""
+        self._recv_cap = 0
         if self._manual_recv_cap > 0:
             # The caller is responsible for covering all received tokens, as
             # with the original EPv1 override. Do not round an explicit cap.
-            recv_cap = min(self._manual_recv_cap, physical_rows)
-        elif self._trim_recv:
-            recv_cap = max(0, int(physical_rows))
-            if not self._tbo_enabled and self._is_recv_layout_verified():
-                bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
-                # Empty or unproved bounds keep the full view.
-                if bound > 0:
-                    recv_cap = min(
-                        recv_cap,
-                        round_logical_recv_rows(
-                            bound, pow2_buckets=self._recv_cap_pow2_buckets
-                        ),
-                    )
-        else:
-            recv_cap = 0
-        self._recv_cap = recv_cap
-        if 0 < recv_cap < physical_rows and get_parallel().launch_world_rank == 0:
-            version = "EPv2" if self._is_epv2 else "EPv1"
-            key = (version, recv_cap)
-            if key not in _RECV_BOUND_LOGGED:
-                _RECV_BOUND_LOGGED.add(key)
-                logger.info(
-                    "MORI %s recv bound: physical=%d logical=%d manual=%s",
-                    version,
-                    physical_rows,
-                    recv_cap,
-                    self._manual_recv_cap > 0,
+            self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
+        elif self._trim_recv and not self._tbo_enabled and self._is_recv_layout_verified():
+            bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
+            # Empty or unproved bounds keep the full view.
+            if bound > 0:
+                cap = round_logical_recv_rows(
+                    bound, pow2_buckets=self._recv_cap_pow2_buckets
                 )
+                if cap < self._get_physical_recv_rows():
+                    self._recv_cap = cap
         return self._recv_cap
 
     def _quantize_dispatch_input(self, hidden_states):
@@ -871,15 +826,15 @@ class _MoriEPDispatcherImplBase:
         event.record(torch.cuda.current_stream())
         return event
 
-    def dispatch_a(self, hidden_states, topk_output):
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
         self._num_tokens = hidden_states.shape[0]
         # Keep metadata attached to this dispatch when a/b are separated or
-        # two TBO children interleave. Unproved TBO bounds keep the full view.
-        self._dispatch_sender_rows = (
-            self._snapshot_sender_rows()
-            if self._trim_recv and self._manual_recv_cap <= 0 and not self._tbo_enabled
-            else None
-        )
+        # two TBO children interleave.
+        self._dispatch_sender_rows = self._snapshot_sender_rows()
         output_dtype = hidden_states.dtype
         hidden_states, scale = self._quantize_dispatch_input(hidden_states)
         topk_weights, topk_ids = self._prepare_topk(topk_output)
@@ -892,8 +847,19 @@ class _MoriEPDispatcherImplBase:
             self._capture_event_if_async(),
         )
 
-    def combine_a(self, hidden_states, topk_ids, topk_weights):
+    def dispatch_b(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
         return hidden_states, topk_ids, topk_weights, self._capture_event_if_async()
+
+    def combine_b(self, *args, **kwargs):
+        raise NotImplementedError
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
@@ -903,36 +869,20 @@ class _MoriEPDispatcherImplBase:
             self.dispatch_dtype = DispatchDtype.fp4
         elif weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             self.dispatch_dtype = DispatchDtype.fp8
-        if self._is_epv2:
-            self._apply_dispatch_dtype_override()
-            # All EPv2 quant funcs are bound together, only when Aiter is available.
-            if (
-                self.dispatch_dtype != DispatchDtype.bf16
-                and self.fp4_quant_func is None
-            ):
-                raise RuntimeError(
-                    f"MORI EPv2 {self.dispatch_dtype} dispatch requires Aiter quantization"
-                )
-            if self._mori_op is None:
-                self._initialize_op()
-        else:
-            self.combine_dtype = (
-                CombineDtype.fp8
-                if weight_dtype == torch.float4_e2m1fn_x2
-                else CombineDtype.bf16
-            )
-            self._apply_dispatch_dtype_override()
+        self.combine_dtype = self._default_combine_dtype(weight_dtype)
+        # Combine overrides read the final dispatch dtype, so apply dispatch first.
+        self._apply_dispatch_dtype_override()
+        self._apply_combine_dtype_override()
+        self._fall_back_from_nan_direct_cast()
+
+    def _default_combine_dtype(self, weight_dtype) -> CombineDtype:
+        raise NotImplementedError
 
     def _apply_dispatch_dtype_override(self):
-        """Apply dispatch and combine dtype overrides for the selected EP version."""
+        """Apply the SGLANG_MORI_DISPATCH_DTYPE override."""
         dispatch_dtype = envs.SGLANG_MORI_DISPATCH_DTYPE.get().lower()
         if self._is_epv2 and dispatch_dtype not in (
-            "",
-            "auto",
-            "bf16",
-            "fp8",
-            "fp4",
-            "mxfp8",
+            "", "auto", "bf16", "fp8", "fp4", "mxfp8"
         ):
             raise ValueError(
                 "SGLANG_MORI_DISPATCH_DTYPE must be auto, bf16, fp8, fp4 or mxfp8 "
@@ -960,60 +910,8 @@ class _MoriEPDispatcherImplBase:
                             "bf16 dispatch."
                         )
 
-        if self._is_epv2:
-            self._apply_epv2_combine_dtype_override()
-        else:
-            self._apply_epv1_combine_dtype_override()
-        self._fall_back_from_nan_direct_cast()
-
-    def _apply_epv1_combine_dtype_override(self):
-        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
-            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
-            if combine_dtype != "auto":
-                if combine_dtype == "fp8":
-                    self.combine_dtype = CombineDtype.fp8
-                elif combine_dtype == "bf16":
-                    self.combine_dtype = CombineDtype.bf16
-                elif combine_dtype == "fp8_direct_cast":
-                    self.combine_dtype = CombineDtype.fp8_direct_cast
-                elif combine_dtype == "fp4":
-                    self.combine_dtype = CombineDtype.fp4
-
-    def _apply_epv2_combine_dtype_override(self):
-        self.combine_dtype = CombineDtype.bf16
-        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
-            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
-            if combine_dtype == "fp8":
-                self.combine_dtype = CombineDtype.fp8
-            elif combine_dtype == "fp8_direct_cast":
-                self.combine_dtype = CombineDtype.fp8_direct_cast
-            elif combine_dtype == "fp4":
-                logger.warning_once(
-                    "SGLANG_MORI_COMBINE_DTYPE=fp4 is not supported by MORI EPv2; "
-                    "falling back to bf16."
-                )
-            elif combine_dtype not in ("", "auto", "bf16"):
-                raise ValueError(
-                    "SGLANG_MORI_COMBINE_DTYPE must be auto, bf16, fp8, "
-                    f"fp8_direct_cast or fp4; got {combine_dtype!r}"
-                )
-        elif "SGLANG_MORI_FP8_COMB" in os.environ:
-            logger.warning_once(
-                "SGLANG_MORI_FP8_COMB is deprecated. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
-            )
-            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
-                self.combine_dtype = CombineDtype.fp8
-        if (
-            self.combine_dtype != CombineDtype.bf16
-            and self.dispatch_dtype != DispatchDtype.bf16
-        ):
-            # MORI EPv2 rejects a quantized combine on an asymmetric (quantized-dispatch) op.
-            logger.warning_once(
-                f"MORI EPv2 {self.combine_dtype} combine requires bf16 dispatch, "
-                f"got {self.dispatch_dtype}; falling back to bf16 combine."
-            )
-            self.combine_dtype = CombineDtype.bf16
+    def _apply_combine_dtype_override(self):
+        raise NotImplementedError
 
     def _fall_back_from_nan_direct_cast(self):
         if (
@@ -1028,11 +926,13 @@ class _MoriEPDispatcherImplBase:
             )
             self.combine_dtype = CombineDtype.fp8
 
-    def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ) -> None:
         self.overlap_args = combine_overlap_args
         self.meta_overlap_args = meta_overlap_args
 
-    def clear_overlap_args(self):
+    def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
 
@@ -1074,6 +974,24 @@ class _MoriEPv1DispatcherImplBase(_MoriEPDispatcherImplBase):
                 self.use_external_inp_buf,
             )
         return self._mori_op
+
+    def _default_combine_dtype(self, weight_dtype) -> CombineDtype:
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            return CombineDtype.fp8
+        return CombineDtype.bf16
+
+    def _apply_combine_dtype_override(self):
+        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
+            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+            if combine_dtype != "auto":
+                if combine_dtype == "fp8":
+                    self.combine_dtype = CombineDtype.fp8
+                elif combine_dtype == "bf16":
+                    self.combine_dtype = CombineDtype.bf16
+                elif combine_dtype == "fp8_direct_cast":
+                    self.combine_dtype = CombineDtype.fp8_direct_cast
+                elif combine_dtype == "fp4":
+                    self.combine_dtype = CombineDtype.fp4
 
     def _get_physical_recv_rows(self) -> int:
         # MORI uses this same capacity to construct its dispatch output views.
@@ -1134,7 +1052,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPv1DispatcherImplBase):
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
             recv_cap=self._recv_cap,
-            kernel_type=self.mori_op.config.kernel_type,
         )
 
     def _dispatch_core(
@@ -1284,7 +1201,11 @@ class _MoriEPDispatcherImplNormal(_MoriEPv1DispatcherImplBase):
 
 
 class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
-    def dispatch_a(self, hidden_states, topk_output):
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
         import mori
 
         assert (
@@ -1357,7 +1278,6 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
-            kernel_type=self.mori_op.config.kernel_type,
             recv_cap=self._recv_cap,
         )
 
@@ -1473,6 +1393,55 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
             self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
 
+    def set_quant_config(self, quant_config: dict) -> None:
+        super().set_quant_config(quant_config)
+        # All EPv2 quant funcs are bound together, only when Aiter is available.
+        if self.dispatch_dtype != DispatchDtype.bf16 and self.fp4_quant_func is None:
+            raise RuntimeError(
+                f"MORI EPv2 {self.dispatch_dtype} dispatch requires Aiter quantization"
+            )
+        # Build the op once the dtypes are final; see _initialize_op for the timing.
+        if self._mori_op is None:
+            self._initialize_op()
+
+    def _default_combine_dtype(self, weight_dtype) -> CombineDtype:
+        return CombineDtype.bf16
+
+    def _apply_combine_dtype_override(self):
+        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
+            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+            if combine_dtype == "fp8":
+                self.combine_dtype = CombineDtype.fp8
+            elif combine_dtype == "fp8_direct_cast":
+                self.combine_dtype = CombineDtype.fp8_direct_cast
+            elif combine_dtype == "fp4":
+                logger.warning_once(
+                    "SGLANG_MORI_COMBINE_DTYPE=fp4 is not supported by MORI EPv2; "
+                    "falling back to bf16."
+                )
+            elif combine_dtype not in ("", "auto", "bf16"):
+                raise ValueError(
+                    "SGLANG_MORI_COMBINE_DTYPE must be auto, bf16, fp8, "
+                    f"fp8_direct_cast or fp4; got {combine_dtype!r}"
+                )
+        elif "SGLANG_MORI_FP8_COMB" in os.environ:
+            logger.warning_once(
+                "SGLANG_MORI_FP8_COMB is deprecated. "
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+            )
+            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
+                self.combine_dtype = CombineDtype.fp8
+        if (
+            self.combine_dtype != CombineDtype.bf16
+            and self.dispatch_dtype != DispatchDtype.bf16
+        ):
+            # MORI EPv2 rejects a quantized combine on an asymmetric (quantized-dispatch) op.
+            logger.warning_once(
+                f"MORI EPv2 {self.combine_dtype} combine requires bf16 dispatch, "
+                f"got {self.dispatch_dtype}; falling back to bf16 combine."
+            )
+            self.combine_dtype = CombineDtype.bf16
+
     def _initialize_op(self):
         # set_quant_config runs during model loading, before CUDA graph capture,
         # so collective CCO window creation and graph-tier JIT happen safely.
@@ -1516,7 +1485,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.mori_op, "backend_name", "unknown"
         ) in ("flydsl", "hip")
 
-    def dispatch_a(self, hidden_states, topk_output):
+    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError(
                 "MORI EPv2 expects BF16 activations before transport quantization; "
@@ -1652,12 +1621,7 @@ class MoriEPDispatcher(BaseDispatcher):
     ):
         super().__init__()
 
-        version = envs.SGLANG_MORI_EP_VERSION.get()
-        if version not in ("epv1", "epv2"):
-            raise ValueError(
-                f"SGLANG_MORI_EP_VERSION must be epv1 or epv2; got {version!r}"
-            )
-        self._is_epv2 = version == "epv2"
+        self._is_epv2 = envs.SGLANG_MORI_EP_V2.get()
         if self._is_epv2 and deepep_mode == DeepEPMode.AUTO:
             deepep_mode = DeepEPMode.NORMAL
         self.deepep_mode = deepep_mode

@@ -139,7 +139,7 @@ def main():
         launch_world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
-    envs.SGLANG_MORI_EP_VERSION.set("epv2")
+    envs.SGLANG_MORI_EP_V2.set(True)
     dispatcher = adapter.MoriEPDispatcher(
         group=group,
         router_topk=topk,
@@ -190,11 +190,13 @@ def main():
             if attn_dp_size > 1
             else attn_tp_size * tokens + attn_tp_rank
         )
-        expected_cap = impl.mori_op.cfg.effective_max_recv
-        if 0 < cluster_rows < expected_cap:
-            expected_cap = round_logical_recv_rows(
+        if cluster_rows > 0:
+            rounded = round_logical_recv_rows(
                 cluster_rows, pow2_buckets=impl._recv_cap_pow2_buckets
             )
+            # A bound that covers the whole receive buffer keeps the full view.
+            if rounded < impl.mori_op.cfg.effective_max_recv:
+                expected_cap = rounded
     assert dispatched.recv_cap == expected_cap
     recv_rows = int(dispatched.num_recv_tokens_per_expert.reshape(-1)[0].item())
     assert recv_rows <= sum(sender_rows), (recv_rows, sender_rows)
@@ -333,7 +335,7 @@ def _run_tbo(rank, world_size):
         async_finish=True,
     )
     with (
-        envs.SGLANG_MORI_EP_VERSION.override("epv2"),
+        envs.SGLANG_MORI_EP_V2.override(True),
         get_flags().moe.override(tbo_enabled=True, a2a_backend=MoeA2ABackend.MORI),
     ):
         dispatcher = MaybeTboDeepEPDispatcher(**kwargs)
@@ -399,16 +401,14 @@ def _run_tbo(rank, world_size):
                 assert output.recv_cap == min(
                     child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
                 )
-            elif not child._trim_recv:
-                assert output.recv_cap == 0
-            elif probe_trim:
+            elif child._trim_recv and probe_trim:
                 expected_cap = round_logical_recv_rows(
                     sum(child_token_counts[child_id]),
                     pow2_buckets=child._recv_cap_pow2_buckets,
                 )
                 assert output.recv_cap == expected_cap
             else:
-                assert output.recv_cap == child.mori_op.cfg.effective_max_recv
+                assert output.recv_cap == 0
             expected_direct = child._direct_output and callable(
                 getattr(child.mori_op, "combine_in_view", None)
             )

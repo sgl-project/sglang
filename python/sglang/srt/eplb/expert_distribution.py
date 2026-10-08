@@ -400,7 +400,7 @@ class _SinglePassGatherer(ABC):
 
         if (
             get_exec().moe.moe_a2a_backend == "mori"
-            and envs.SGLANG_MORI_EP_VERSION.get() == "epv1"
+            and not envs.SGLANG_MORI_EP_V2.get()
         ):
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 

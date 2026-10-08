@@ -517,7 +517,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_MOE_MAX_INPUT_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Manual MoE input row limit for MORI EPv1 (normal and low-latency) and EPv2 with AITER. A positive value overrides automatic receive-bound calculation, even when <code>SGLANG_MORI_RECV_BOUND=0</code>. The row limit is capped at the physical receive capacity and is not rounded. It changes the MoE input view, not the allocated communication buffer; EPv2 keeps the full transport view when this override is set. You must choose a value &gt;= the actual number of received tokens (<code>totalRecvTokenNum</code>); setting it too small causes incorrect results. Values &lt;= <code>0</code> leave the choice to <code>SGLANG_MORI_RECV_BOUND</code>: automatic bounds when enabled, or the full view when disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Manual MoE input row limit for MORI EPv1 and EPv2. A positive value overrides <code>SGLANG_MORI_RECV_BOUND</code> and is used unrounded, capped at the receive capacity; it only narrows the MoE input view, not the communication buffer. It must be &gt;= the actual received tokens, or results are incorrect. <code>0</code> leaves it to <code>SGLANG_MORI_RECV_BOUND</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
 <tr>
