@@ -6,8 +6,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import torch
-
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -160,11 +158,20 @@ def _handle_ultraquant_compatibility(cfg: Any, server_args: Any) -> None:
             "--kv-cache-dtype=ultraquant_4bit does not support MLA models; the "
             "recipe stores separate rotated K and unrotated V."
         )
-    dtype = model_config_of(server_args).dtype
-    if dtype != torch.bfloat16:
+    model_config = model_config_of(server_args)
+    if model_config.is_hybrid_swa:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support hybrid "
+            "sliding-window models yet; SWAKVPool builds its sliding-window "
+            "pool without the UltraQuant recipe."
+        )
+
+    import torch
+
+    if model_config.dtype != torch.bfloat16:
         raise ValueError(
             "--kv-cache-dtype=ultraquant_4bit supports bfloat16 models only; "
-            f"got {dtype}."
+            f"got {model_config.dtype}."
         )
 
 

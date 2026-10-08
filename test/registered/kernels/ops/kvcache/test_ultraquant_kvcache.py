@@ -163,6 +163,36 @@ def test_gather_dequant_matches_reference(head_dim, num_tokens):
     assert torch.equal(v_out, v_ref)
 
 
+def test_gather_dequant_fp8_is_exact_and_saturates():
+    """E2M1 times a power of two is exact in E4M3 up to its +-448 limit.
+
+    The FP8 prefill relies on this: in-range values must match the bf16
+    dequantization bit for bit, and larger ones must clamp rather than wrap
+    to NaN.
+    """
+    head_num, head_dim, num_slots = 2, 256, 256
+    k_codes, k_scales, v_codes, v_scales = _build_cache(
+        num_slots, head_num, head_dim, seed=7
+    )
+    # Scale byte 127 + 7 is 2^7, so code 6.0 dequantizes to 768.
+    k_scales[0, 0, 0] = 134
+    kv_indices = torch.arange(num_slots, device="cuda", dtype=torch.int64)
+
+    def gather(dtype):
+        k_out = torch.empty(num_slots, head_num, head_dim, device="cuda", dtype=dtype)
+        v_out = torch.empty_like(k_out)
+        ultraquant_gather_dequant(
+            k_codes, k_scales, v_codes, v_scales, kv_indices, k_out, v_out
+        )
+        return k_out.float(), v_out.float()
+
+    k_bf16, v_bf16 = gather(torch.bfloat16)
+    k_fp8, v_fp8 = gather(torch.float8_e4m3fn)
+    assert torch.equal(v_fp8, v_bf16)
+    assert torch.equal(k_fp8, k_bf16.clamp(-448.0, 448.0))
+    assert bool((k_bf16[0, 0, :GROUP_SIZE].abs() > 448.0).any())
+
+
 def test_gather_dequant_empty_run_is_noop():
     """A zero-length run happens on padded batches and must not launch."""
     k_codes, k_scales, v_codes, v_scales = _build_cache(8, 2, 256, seed=6)

@@ -35,6 +35,8 @@ this module.
 
 import torch
 
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
+
 GROUP_SIZE = 32
 """Elements sharing one UE8M0 scale; matches the scaled MFMA's scale granularity."""
 
@@ -46,27 +48,6 @@ UE8M0_BIAS = 127
 
 UE8M0_MIN_EXP = -126
 UE8M0_MAX_EXP = 127
-
-# FP4 E2M1 bit pattern -> value, indexed by the 4-bit code.
-# Sign bit (MSB) | 2 exponent bits | 1 mantissa bit (LSB).
-E2M1_VALUES = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
 
 # The 15 distinct E2M1 levels in ascending order; quantization buckets against
 # the midpoints between consecutive levels.

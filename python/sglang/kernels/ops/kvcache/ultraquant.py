@@ -44,7 +44,6 @@ from sglang.srt.layers.quantization.ultraquant_tensor import (
 
 # Compile-time immediates: the store kernel is latency bound.
 _MIDPOINTS = tl.constexpr(tuple(float(m) for m in E2M1_MIDPOINTS))
-_E2M1_VALUES = tl.constexpr(tuple(float(v) for v in E2M1_VALUES))
 _NUM_MIDPOINTS = tl.constexpr(len(E2M1_MIDPOINTS))
 _ZERO_LEVEL = tl.constexpr(E2M1_ZERO_LEVEL_INDEX)
 _MAX_CODE = tl.constexpr(len(E2M1_VALUES) - 1)
@@ -53,6 +52,7 @@ _UE8M0_MIN_EXP = tl.constexpr(UE8M0_MIN_EXP)
 _UE8M0_MAX_EXP = tl.constexpr(UE8M0_MAX_EXP)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+_GATHER_OUT_DTYPES = (*_SUPPORTED_DTYPES, torch.float8_e4m3fn)
 
 
 def check_pool_buffers(
@@ -86,6 +86,15 @@ def check_pool_buffers(
         or k_scale_buffer.stride() != v_scale_buffer.stride()
     ):
         raise ValueError("UltraQuant K and V buffers must share strides")
+
+
+def _log2_head_dim(head_dim: int) -> int:
+    """Butterfly stage count of the Hadamard rotation, which needs a power of two."""
+    if head_dim & (head_dim - 1):
+        raise ValueError(
+            f"Hadamard rotation requires a power-of-two head_dim, got {head_dim}"
+        )
+    return head_dim.bit_length() - 1
 
 
 @triton.jit
@@ -157,12 +166,17 @@ def quantize_fp4_ue8m0(
 
 @triton.jit
 def e2m1_code_to_value(codes):
-    """Decode E2M1 nibbles to fp32. Shape-generic, so attention kernels can
-    apply it to a whole ``[BLOCK_N, HEAD_DIM]`` tile."""
-    values = tl.zeros(codes.shape, tl.float32)
-    for i in tl.static_range(_MAX_CODE + 1):
-        values = tl.where(codes == i, _E2M1_VALUES.value[i], values)
-    return values
+    """Decode E2M1 nibbles (int32, sign in bit 3) to fp32. Shape-generic.
+
+    Builds the fp32 bit pattern directly: magnitude codes 2..7 are
+    ``2**(e - 1) * (1 + m / 2)`` and code 1 is the subnormal 0.5.
+    """
+    mag = codes & 7
+    exponent = mag >> 1
+    mantissa = tl.where(exponent != 0, mag & 1, 0)
+    bits = ((126 + exponent) << 23) | (mantissa << 22)
+    values = tl.where(mag == 0, 0.0, bits.to(tl.float32, bitcast=True))
+    return tl.where((codes & 8) != 0, -values, values)
 
 
 @triton.jit
@@ -176,12 +190,20 @@ def ue8m0_byte_to_scale(scale_bytes):
 
 
 @triton.jit
-def load_dequant(code_ptr, scale_ptr, code_offs, scale_offs, shift, mask):
-    """Load packed E2M1 codes and their UE8M0 scales, dequantized to fp32."""
-    packed = tl.load(code_ptr + code_offs, mask=mask, other=0)
-    scale_bytes = tl.load(scale_ptr + scale_offs, mask=mask, other=0)
-    codes = (packed.to(tl.int32) >> shift) & 0xF
-    return e2m1_code_to_value(codes) * ue8m0_byte_to_scale(scale_bytes)
+def dequant_rows(
+    codes,
+    scale_bytes,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+):
+    """Dequantize ``[BLOCK_N, HEAD_DIM // 2]`` packed codes and their
+    ``[BLOCK_N, HEAD_DIM // GROUP_SIZE_C]`` scale bytes to fp32 rows."""
+    packed = codes.to(tl.int32)
+    values = tl.join(e2m1_code_to_value(packed & 0xF), e2m1_code_to_value(packed >> 4))
+    values = tl.reshape(values, [BLOCK_N, HEAD_DIM // GROUP_SIZE_C, GROUP_SIZE_C])
+    scales = ue8m0_byte_to_scale(scale_bytes)
+    return tl.reshape(values * scales[:, :, None], [BLOCK_N, HEAD_DIM])
 
 
 @triton.jit
@@ -267,15 +289,13 @@ def ultraquant_rotate(x: torch.Tensor, out: Optional[torch.Tensor] = None):
     """Hadamard-rotate the last dimension of ``[num_tokens, head_num, head_dim]``.
 
     Runs the same butterfly the store kernel applies to keys, so queries land
-    in exactly the same basis.
+    in exactly the same basis. The butterfly runs in fp32 and rounds once into
+    ``out``'s dtype; a float8_e4m3fn ``out`` saturates at +-448.
     """
     if x.ndim != 3:
         raise ValueError(f"ultraquant_rotate expects a 3-D tensor, got {x.shape}")
     num_tokens, head_num, head_dim = x.shape
-    if head_dim & (head_dim - 1):
-        raise ValueError(
-            f"Hadamard rotation requires a power-of-two head_dim, got {head_dim}"
-        )
+    log2_d = _log2_head_dim(head_dim)
 
     if out is None:
         out = torch.empty_like(x)
@@ -291,7 +311,7 @@ def ultraquant_rotate(x: torch.Tensor, out: Optional[torch.Tensor] = None):
         out.stride(1),
         HEAD_NUM=head_num,
         HEAD_DIM=head_dim,
-        LOG2_D=head_dim.bit_length() - 1,
+        LOG2_D=log2_d,
         num_warps=4,
         num_stages=1,
     )
@@ -341,6 +361,11 @@ def _ultraquant_gather_dequant_kernel(
     v_scale_byte = tl.load(V_Scale + scale_base + group_off)
     v = e2m1_code_to_value(v_codes) * ue8m0_byte_to_scale(v_scale_byte)
 
+    if K_out.dtype.element_ty == tl.float8e4nv:
+        # E2M1 times a power of two is exact in E4M3 up to its +-448 limit.
+        k = tl.clamp(k, -448.0, 448.0)
+        v = tl.clamp(v, -448.0, 448.0)
+
     tl.store(
         K_out + tok * stride_ko_t + cur_head * stride_ko_h + offs_d,
         k.to(K_out.dtype.element_ty),
@@ -380,9 +405,9 @@ def ultraquant_gather_dequant(
             f"ultraquant_gather_dequant k/v output dtype mismatch: "
             f"{k_out.dtype} vs {v_out.dtype}"
         )
-    if k_out.dtype not in _SUPPORTED_DTYPES:
+    if k_out.dtype not in _GATHER_OUT_DTYPES:
         raise ValueError(
-            f"ultraquant_gather_dequant expects one of {_SUPPORTED_DTYPES}, "
+            f"ultraquant_gather_dequant expects one of {_GATHER_OUT_DTYPES}, "
             f"got {k_out.dtype}"
         )
     if kv_indices.shape[0] < num_tokens:
@@ -451,11 +476,7 @@ def ultraquant_store(
         )
 
     num_tokens, head_num, head_dim = key.shape
-    if head_dim & (head_dim - 1):
-        raise ValueError(
-            f"UltraQuant requires a power-of-two head_dim for the Hadamard "
-            f"rotation, got {head_dim}"
-        )
+    log2_d = _log2_head_dim(head_dim)
     if loc.shape[0] != num_tokens:
         raise ValueError(
             f"ultraquant_store got {loc.shape[0]} locations for {num_tokens} tokens"
@@ -485,7 +506,7 @@ def ultraquant_store(
         k_scale_buffer.stride(1),
         HEAD_NUM=head_num,
         HEAD_DIM=head_dim,
-        LOG2_D=head_dim.bit_length() - 1,
+        LOG2_D=log2_d,
         GROUP_SIZE_C=GROUP_SIZE,
         N_GROUPS_C=n_groups(head_dim),
         CONSTANT_C_V=CONSTANT_C,

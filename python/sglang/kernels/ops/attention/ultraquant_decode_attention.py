@@ -15,12 +15,10 @@
 
 This is a stage-1 kernel in the same split-KV shape as
 ``decode_attention._fwd_grouped_kernel_stage1``, so the stock stage-2 softmax
-reduction consumes its partials unchanged. The difference is that K and V are
-read as packed FP4 codes plus UE8M0 group scales and dequantized in registers
-(exactly, since E2M1 levels times a power of two are representable in bf16).
-
-Queries must arrive Hadamard-rotated, matching the rotation applied to keys at
-store time.
+reduction consumes its partials unchanged. K and V are read as whole rows of
+packed FP4 codes plus UE8M0 group scales. QK runs as a scaled matmul of E4M3
+queries against the packed keys; V is dequantized in registers (exactly, since
+E2M1 levels times a power of two are representable in bf16).
 """
 
 from typing import Optional
@@ -35,11 +33,12 @@ from sglang.kernels.ops.attention.decode_attention import (
     _decode_softmax_reducev_fwd,
     tanh,
 )
-from sglang.kernels.ops.kvcache.ultraquant import check_pool_buffers, load_dequant
+from sglang.kernels.ops.kvcache.ultraquant import (
+    check_pool_buffers,
+    dequant_rows,
+    ultraquant_rotate,
+)
 from sglang.srt.layers.quantization.ultraquant_tensor import GROUP_SIZE
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
 
 
 @triton.jit
@@ -89,6 +88,8 @@ def _fwd_grouped_kernel_stage1_ultraquant(
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_d = tl.arange(0, HEAD_DIM)
+    offs_code = tl.arange(0, HEAD_DIM // 2)
+    offs_group = tl.arange(0, HEAD_DIM // GROUP_SIZE_C)
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
@@ -106,15 +107,6 @@ def _fwd_grouped_kernel_stage1_ultraquant(
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, HEAD_DIM], dtype=tl.float32)
 
-    # Nibble and group scale are functions of the head-dim index. K is read
-    # transposed as [HEAD_DIM, BLOCK_N] for the QK dot, V as [BLOCK_N, HEAD_DIM].
-    k_byte_off = (offs_d // 2)[:, None]
-    k_shift = ((offs_d % 2) * 4)[:, None]
-    k_group_off = (offs_d // GROUP_SIZE_C)[:, None]
-    v_byte_off = (offs_d // 2)[None, :]
-    v_shift = ((offs_d % 2) * 4)[None, :]
-    v_group_off = (offs_d // GROUP_SIZE_C)[None, :]
-
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=mask_h[:, None], other=0.0)
 
@@ -123,21 +115,24 @@ def _fwd_grouped_kernel_stage1_ultraquant(
             n_mask = offs_n < split_kv_end
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_mask, other=0
+            ).to(tl.int64)
+
+            code_row = kv_loc * stride_code_s + cur_kv_head * stride_code_h
+            scale_row = kv_loc * stride_scale_s + cur_kv_head * stride_scale_h
+            code_offs = code_row[:, None] + offs_code[None, :]
+            scale_offs = scale_row[:, None] + offs_group[None, :]
+
+            k_codes = tl.load(K_Code + code_offs, mask=n_mask[:, None], other=0)
+            k_scales = tl.load(K_Scale + scale_offs, mask=n_mask[:, None], other=0)
+            qk = tl.dot_scaled(
+                q,
+                None,
+                "e4m3",
+                tl.trans(k_codes),
+                k_scales,
+                "e2m1",
+                out_dtype=tl.float32,
             )
-
-            code_base = kv_loc * stride_code_s + cur_kv_head * stride_code_h
-            scale_base = kv_loc * stride_scale_s + cur_kv_head * stride_scale_h
-
-            k = load_dequant(
-                K_Code,
-                K_Scale,
-                code_base[None, :] + k_byte_off,
-                scale_base[None, :] + k_group_off,
-                k_shift,
-                n_mask[None, :],
-            ).to(q.dtype)
-
-            qk = tl.dot(q, k)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -145,20 +140,19 @@ def _fwd_grouped_kernel_stage1_ultraquant(
 
             qk = tl.where(mask_h[:, None] & n_mask[None, :], qk, float("-inf"))
 
-            v = load_dequant(
-                V_Code,
-                V_Scale,
-                code_base[:, None] + v_byte_off,
-                scale_base[:, None] + v_group_off,
-                v_shift,
-                n_mask[:, None],
-            ).to(q.dtype)
+            v = dequant_rows(
+                tl.load(V_Code + code_offs, mask=n_mask[:, None], other=0),
+                tl.load(V_Scale + scale_offs, mask=n_mask[:, None], other=0),
+                BLOCK_N,
+                HEAD_DIM,
+                GROUP_SIZE_C,
+            ).to(tl.bfloat16)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            acc += tl.dot(p.to(tl.bfloat16), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -179,6 +173,13 @@ def _fwd_grouped_kernel_stage1_ultraquant(
         tl.store(Att_Lse + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
 
 
+def _launch_config(head_dim: int) -> dict:
+    # Tuned on MI355X with a server-sized pool.
+    if head_dim >= 256:
+        return {"BLOCK_N": 16, "num_warps": 2, "num_stages": 3}
+    return {"BLOCK_N": 32, "num_warps": 2, "num_stages": 2}
+
+
 def decode_attention_fwd_ultraquant(
     q: torch.Tensor,
     k_code_buffer: torch.Tensor,
@@ -195,13 +196,13 @@ def decode_attention_fwd_ultraquant(
     sm_scale: float,
     logit_cap: float = 0.0,
     sinks: Optional[torch.Tensor] = None,
-    block_n: int = 32,
 ) -> None:
     """Grouped decode attention over an UltraQuant KV cache.
 
-    ``q`` is ``[batch, q_head_num, head_dim]`` and must already be
-    Hadamard-rotated. The four KV buffers are the structure-of-arrays pool
-    tensors described in ``sglang.kernels.ops.kvcache.ultraquant``.
+    ``q`` is the raw ``[batch, q_head_num, head_dim]`` query; it is
+    Hadamard-rotated into E4M3 here, matching the rotation keys got at store
+    time. The four KV buffers are the structure-of-arrays pool tensors
+    described in ``sglang.kernels.ops.kvcache.ultraquant``.
     """
     head_dim = q.shape[-1]
     batch, q_head_num = q.shape[0], q.shape[1]
@@ -222,17 +223,15 @@ def decode_attention_fwd_ultraquant(
             f"logical head_dim {head_dim}, not the packed buffer width"
         )
 
+    q_rot = ultraquant_rotate(
+        q, torch.empty(q.shape, dtype=torch.float8_e4m3fn, device=q.device)
+    )
+
     kv_group_num = q_head_num // kv_head_num
     head_tiles = triton.cdiv(kv_group_num, _GROUPED_BLOCK_H) * kv_head_num
 
-    extra_kargs = {}
-    num_stages = 2
-    if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
-
     _fwd_grouped_kernel_stage1_ultraquant[(batch, head_tiles, max_kv_splits)](
-        q,
+        q_rot,
         k_code_buffer,
         k_scale_buffer,
         v_code_buffer,
@@ -243,8 +242,8 @@ def decode_attention_fwd_ultraquant(
         attn_logits,
         attn_lse,
         num_kv_splits,
-        q.stride(0),
-        q.stride(1),
+        q_rot.stride(0),
+        q_rot.stride(1),
         k_code_buffer.stride(0),
         k_code_buffer.stride(1),
         k_scale_buffer.stride(0),
@@ -256,25 +255,23 @@ def decode_attention_fwd_ultraquant(
         q_head_num=q_head_num,
         HEAD_DIM=head_dim,
         GROUP_SIZE_C=GROUP_SIZE,
-        BLOCK_N=block_n,
         BLOCK_H=_GROUPED_BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        num_warps=4,
-        num_stages=num_stages,
-        **extra_kargs,
+        **_launch_config(head_dim),
     )
 
+    # Stage 2 only reads the value width from its V buffer argument, and the
+    # packed code buffer is half as wide, so the output stands in for it.
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
         q,
         o,
         1.0,
-        v_code_buffer,
+        o,
         kv_indptr,
         num_kv_splits,
         max_kv_splits,
         sinks=sinks,
-        v_head_dim=head_dim,
     )

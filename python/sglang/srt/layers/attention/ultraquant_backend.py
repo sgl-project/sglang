@@ -29,6 +29,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+    kv_indices_num_token_blocks,
+)
 from sglang.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
     logit_capping_mod,
@@ -39,11 +43,12 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_gfx95_supported
 
 try:
-    from aiter import flash_attn_varlen_func
+    from aiter import flash_attn_varlen_fp8_pertensor_func, flash_attn_varlen_func
 except ImportError:
-    flash_attn_varlen_func = None
+    flash_attn_varlen_func = flash_attn_varlen_fp8_pertensor_func = None
 
 # Below this chunk size the dequantized run is too small to pay back the extra
 # pass over the KV, so the Triton kernel stays ahead.
@@ -69,16 +74,13 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         # from the model's logical value head dim.
         self.v_head_dim = model_runner.model_config.v_head_dim
 
-        from sglang.kernels.ops.attention.decode_attention import (
-            _decode_softmax_reducev_fwd,
-        )
         from sglang.kernels.ops.attention.flydsl.ultraquant_decode import (
-            ULTRAQUANT_DECODE_BLOCK_KV,
             flydsl_ultraquant_decode,
             flydsl_ultraquant_decode_fits,
             is_flydsl_ultraquant_decode_supported,
+            ultraquant_decode_launch_config,
             ultraquant_decode_max_kv_splits,
-            ultraquant_decode_num_kv_splits,
+            ultraquant_decode_reduce,
         )
         from sglang.kernels.ops.attention.ultraquant_decode_attention import (
             decode_attention_fwd_ultraquant,
@@ -97,10 +99,7 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         )
         self._dense_prefill_kv: Optional[torch.Tensor] = None
         self.flydsl_ultraquant_decode = torch.compiler.disable(flydsl_ultraquant_decode)
-        self.decode_softmax_reducev_fwd = torch.compiler.disable(
-            _decode_softmax_reducev_fwd
-        )
-        self._is_flydsl_supported = is_flydsl_ultraquant_decode_supported
+        self.ultraquant_decode_reduce = torch.compiler.disable(ultraquant_decode_reduce)
         self._flydsl_fits = flydsl_ultraquant_decode_fits
         self.decode_attention_fwd_ultraquant = torch.compiler.disable(
             decode_attention_fwd_ultraquant
@@ -111,15 +110,14 @@ class UltraQuantAttnBackend(TritonAttnBackend):
 
         # FlyDSL picks its split count per launch, so the split buffers only
         # need to be wide enough for the smallest batch at the max context.
-        self.ultraquant_decode_num_kv_splits = ultraquant_decode_num_kv_splits
-        self.flydsl_block_kv = ULTRAQUANT_DECODE_BLOCK_KV
+        self.ultraquant_decode_launch_config = ultraquant_decode_launch_config
         self.min_kv_splits = self.max_kv_splits
-        if is_flydsl_ultraquant_decode_supported(
+        self._flydsl_decode = is_flydsl_ultraquant_decode_supported(
             model_runner.model_config.head_dim,
             self.num_head // self.num_kv_head,
             model_runner.model_config.dtype,
-            self.device,
-        ):
+        )
+        if self._flydsl_decode:
             self.max_kv_splits = ultraquant_decode_max_kv_splits(
                 self.max_kv_splits, self.max_context_len
             )
@@ -132,6 +130,59 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         self.full_precision_layers = (
             self._ultraquant_pool().quant_method.full_precision_layers
         )
+
+        # E2M1 times a power of two dequantizes exactly into E4M3, so where
+        # aiter's FP8 prefill kernel covers the shape the dense run is FP8.
+        self._fp8_dense_prefill = False
+        if flash_attn_varlen_fp8_pertensor_func is not None and is_gfx95_supported():
+            from sglang.srt.layers.attention.aiter_backend import (
+                _aiter_fp8_asm_supports_gqa,
+            )
+
+            self._fp8_dense_prefill = (
+                model_runner.model_config.head_dim == 256
+                and self.v_head_dim == 256
+                and _aiter_fp8_asm_supports_gqa(self.num_head, self.num_kv_head)
+            )
+            self._unit_scale = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._unified_kv = None
+        self._dense_run = None
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        self._unified_kv = None
+        self._dense_run = None
+
+    def _fill_kv_indptr_and_indices(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # One program per request copies a long context serially and runs every
+        # decode step, so spread each request's copy over token blocks.
+        translator = self.kv_index_translator
+        if translator.reads_are_translated:
+            return super()._fill_kv_indptr_and_indices(
+                bs, seq_lens, req_pool_indices, kv_indices
+            )
+        seq_lens = seq_lens[:bs]
+        kv_indptr = self.kv_indptr[: bs + 1]
+        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        req_to_token = translator.req_to_token
+        num_blocks = kv_indices_num_token_blocks(req_to_token.shape[1], bs)
+        create_flashinfer_kv_indices_triton[(bs, num_blocks)](
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=num_blocks > 1,
+        )
+        return kv_indptr
 
     def _verify_pool_recipe(self) -> None:
         """Fail fast: any other pool layout would silently give wrong numbers."""
@@ -159,27 +210,15 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         # id translated to the dense full-attention index.
         return self.token_to_kv_pool.get_raw_kv_buffer(layer_id)
 
-    def _rotated_queries(self, q: torch.Tensor, layer: RadixAttention) -> torch.Tensor:
-        return self.ultraquant_rotate(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-
     def _use_flydsl_decode(
         self, q: torch.Tensor, layer: RadixAttention, sinks, logit_cap
     ) -> bool:
         """Whether the gfx950 FlyDSL decode covers this layer (no sinks or capping)."""
-        if sinks is not None or logit_cap:
+        if not self._flydsl_decode or sinks is not None or logit_cap:
             return False
         if layer.qk_head_dim != layer.v_head_dim:
             return False
-        if not self._flydsl_fits(q.shape[0], layer.tp_q_head_num, self.max_kv_splits):
-            return False
-        return self._is_flydsl_supported(
-            layer.qk_head_dim,
-            layer.tp_q_head_num // self.num_kv_head,
-            q.dtype,
-            self.device,
-        )
+        return self._flydsl_fits(q.shape[0], layer.tp_q_head_num, self.max_kv_splits)
 
     def _use_dense_prefill(
         self, layer: RadixAttention, sinks, logit_cap, sliding_window_size: int
@@ -228,11 +267,32 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             self._dense_prefill_kv = buf
         return buf[0, :num_tokens], buf[1, :num_tokens]
 
+    def _dense_run_layout(
+        self, forward_batch: ForwardBatch, bs: int, unified_kv_indptr: torch.Tensor
+    ):
+        """Total and max KV length of the unified run plus int32 offsets, once per forward."""
+        if self._dense_run is None:
+            kv_lens = [
+                p + e
+                for p, e in zip(
+                    forward_batch.extend_prefix_lens_cpu[:bs],
+                    forward_batch.extend_seq_lens_cpu[:bs],
+                )
+            ]
+            self._dense_run = (
+                sum(kv_lens),
+                max(kv_lens),
+                self.forward_metadata.qo_indptr[: bs + 1].to(torch.int32),
+                unified_kv_indptr[: bs + 1].to(torch.int32),
+            )
+        return self._dense_run
+
     def _forward_extend_dense(
         self,
         q: torch.Tensor,
         o: torch.Tensor,
         layer: RadixAttention,
+        forward_batch: ForwardBatch,
         bs: int,
         kv_buffers,
         unified_kv_indptr: torch.Tensor,
@@ -240,15 +300,14 @@ class UltraQuantAttnBackend(TritonAttnBackend):
     ) -> torch.Tensor:
         """Dequantize the unified KV run, then run flash attention over it."""
         k_codes, v_codes, k_scales, v_scales = kv_buffers
-        head_dim = layer.qk_head_dim
-
-        # The index array is over-allocated, so the length comes from indptr.
-        indptr_cpu = unified_kv_indptr[: bs + 1].cpu()
-        total_kv = int(indptr_cpu[bs])
-        max_kv_len = int((indptr_cpu[1:] - indptr_cpu[:-1]).max())
+        head_num, head_dim = layer.tp_q_head_num, layer.qk_head_dim
+        total_kv, max_kv_len, qo_indptr, kv_indptr = self._dense_run_layout(
+            forward_batch, bs, unified_kv_indptr
+        )
+        dtype = torch.float8_e4m3fn if self._fp8_dense_prefill else q.dtype
 
         k_deq, v_deq = self._dense_prefill_workspace(
-            total_kv, k_codes.shape[1], head_dim, q.dtype
+            total_kv, k_codes.shape[1], head_dim, dtype
         )
         self.ultraquant_gather_dequant(
             k_codes,
@@ -262,17 +321,37 @@ class UltraQuantAttnBackend(TritonAttnBackend):
 
         # Keys stay rotated, so queries are rotated to match. causal=True with
         # unequal q/kv lengths aligns lower-right, as continuation chunks need.
+        q = q.view(-1, head_num, head_dim)
+        max_extend_len = self.forward_metadata.max_extend_len
+        if self._fp8_dense_prefill:
+            q_fp8 = torch.empty(q.shape, dtype=dtype, device=q.device)
+            out = flash_attn_varlen_fp8_pertensor_func(
+                self.ultraquant_rotate(q, q_fp8),
+                k_deq,
+                v_deq,
+                self._unit_scale,
+                self._unit_scale,
+                self._unit_scale,
+                qo_indptr,
+                kv_indptr,
+                max_extend_len,
+                max_kv_len,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+            return out.to(o.dtype).view(o.shape)
+
         flash_attn_varlen_func(
-            self._rotated_queries(q, layer),
+            self.ultraquant_rotate(q),
             k_deq,
             v_deq,
-            self.forward_metadata.qo_indptr[: bs + 1].to(torch.int32),
-            unified_kv_indptr[: bs + 1].to(torch.int32),
-            self.forward_metadata.max_extend_len,
+            qo_indptr,
+            kv_indptr,
+            max_extend_len,
             max_kv_len,
             softmax_scale=layer.scaling,
             causal=True,
-            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            out=o.view(-1, head_num, layer.v_head_dim),
         )
         return o
 
@@ -284,7 +363,7 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             raise NotImplementedError(
                 f"The ultraquant backend does not support score_mod in {name}."
             )
-        if getattr(layer, "xai_temperature_len", -1) > 0:
+        if layer.xai_temperature_len > 0:
             raise NotImplementedError(
                 f"The ultraquant backend does not support xai temperature in {name}."
             )
@@ -339,19 +418,15 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         if self._use_flydsl_decode(q, layer, sinks, logit_cap):
             attn_logits = self.forward_metadata.attn_logits
             attn_lse = self.forward_metadata.attn_lse
-            num_kv_splits = self.forward_metadata.num_kv_splits
             q_heads = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-            num_splits = self.ultraquant_decode_num_kv_splits(
+            num_splits, block_kv, work_budget = self.ultraquant_decode_launch_config(
                 q_heads.shape[0],
                 self.num_kv_head,
                 self.min_kv_splits,
                 self.max_kv_splits,
                 self.device_core_count,
+                attn_logits.shape[0] * attn_logits.shape[2],
             )
-            # The kernel's grid covers every launched split, so each one is
-            # written and the reducer has to merge them all. Empty splits carry
-            # a -inf log-sum-exp and drop out of the merge on their own.
-            num_kv_splits.fill_(num_splits)
             self.flydsl_ultraquant_decode(
                 q_heads,
                 k_codes,
@@ -364,24 +439,22 @@ class UltraQuantAttnBackend(TritonAttnBackend):
                 kv_indices,
                 layer.scaling,
                 num_splits=num_splits,
+                block_kv=block_kv,
+                work_budget=work_budget,
             )
-            self.decode_softmax_reducev_fwd(
+            self.ultraquant_decode_reduce(
                 attn_logits,
                 attn_lse,
-                q_heads,
-                o_heads,
-                1.0,
-                v_codes,
                 kv_indptr,
-                num_kv_splits,
-                self.max_kv_splits,
-                v_head_dim=layer.v_head_dim,
-                strided_block_kv=self.flydsl_block_kv,
+                o_heads,
+                num_splits,
+                block_kv,
+                work_budget,
             )
             return o
 
         self.decode_attention_fwd_ultraquant(
-            self._rotated_queries(q, layer),
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k_codes,
             k_scales,
             v_codes,
@@ -411,7 +484,6 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         sinks: Optional[torch.Tensor] = None,
         score_mod=None,
         aux_tensors=None,
-        **kwargs,
     ):
         self._reject_unsupported(layer, score_mod, aux_tensors, "extend")
         if layer.layer_id in self.full_precision_layers:
@@ -449,26 +521,28 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             prefix_kv_indptr,
             prefix_kv_indices,
             sliding_window_size,
-            window_start_pos,
-        ) = self._extend_window_metadata(layer, forward_batch, bs)
+        ) = self._extend_window_metadata(layer)
 
-        extend_seq_lens, extend_start_loc = self._extend_lengths(forward_batch, bs)
-        extend_kv_indices = (
-            self.forward_metadata.out_cache_loc_full_physical
-            if self.forward_metadata.out_cache_loc_full_physical is not None
-            else forward_batch.out_cache_loc
-        )
-
-        unified_kv_indptr, unified_kv_indices, prefix_lens = (
-            self.build_unified_kv_indices(
+        # Every full-attention layer of one forward reads the same unified run.
+        if sliding_window_size > 0 or self._unified_kv is None:
+            extend_kv_indices = (
+                self.forward_metadata.out_cache_loc_full_physical
+                if self.forward_metadata.out_cache_loc_full_physical is not None
+                else forward_batch.out_cache_loc
+            )
+            unified_kv = self.build_unified_kv_indices(
                 prefix_kv_indptr,
                 prefix_kv_indices,
-                extend_start_loc,
-                extend_seq_lens,
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
                 extend_kv_indices,
                 bs,
             )
-        )
+            if sliding_window_size <= 0:
+                self._unified_kv = unified_kv
+        else:
+            unified_kv = self._unified_kv
+        unified_kv_indptr, unified_kv_indices, prefix_lens = unified_kv
 
         kv_buffers = self._kv_buffers(layer.layer_id)
         k_codes, v_codes, k_scales, v_scales = kv_buffers
@@ -479,6 +553,7 @@ class UltraQuantAttnBackend(TritonAttnBackend):
                 q,
                 o,
                 layer,
+                forward_batch,
                 bs,
                 kv_buffers,
                 unified_kv_indptr,
@@ -486,7 +561,7 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             )
 
         self.extend_attention_fwd_ultraquant(
-            self._rotated_queries(q, layer),
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k_codes,
             k_scales,
@@ -502,62 +577,21 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             custom_mask=self.forward_metadata.custom_mask,
             mask_indptr=self.forward_metadata.mask_indptr,
             sinks=sinks,
-            window_start_pos=window_start_pos,
             sliding_window_size=sliding_window_size,
             logit_cap=logit_cap,
         )
         return o
 
-    def _extend_window_metadata(self, layer, forward_batch, bs):
+    def _extend_window_metadata(self, layer):
         """Resolve the prefix index arrays and sliding-window geometry."""
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            prefix_kv_indptr = self.forward_metadata.window_kv_indptr
-            prefix_kv_indices = self.forward_metadata.window_kv_indices
-            window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
-            if forward_batch.extend_prefix_lens is not None:
-                window_start_pos = (
-                    forward_batch.extend_prefix_lens[:bs] - window_kv_lens
-                )
-            elif forward_batch.forward_mode.is_target_verify():
-                window_start_pos = forward_batch.seq_lens[:bs] - window_kv_lens
-            else:
-                window_start_pos = None
             return (
-                prefix_kv_indptr,
-                prefix_kv_indices,
+                self.forward_metadata.window_kv_indptr,
+                self.forward_metadata.window_kv_indices,
                 layer.sliding_window_size,
-                window_start_pos,
             )
         return (
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             -1,
-            None,
         )
-
-    def _extend_lengths(self, forward_batch, bs):
-        """Per-request extend lengths and their exclusive prefix sum."""
-        if forward_batch.extend_seq_lens is None:
-            if not forward_batch.forward_mode.is_target_verify():
-                raise RuntimeError(
-                    "extend_seq_lens is None outside TARGET_VERIFY mode."
-                )
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.forward_metadata.max_extend_len,
-                dtype=torch.int32,
-                device=self.device,
-            )
-        else:
-            extend_seq_lens = forward_batch.extend_seq_lens
-
-        if forward_batch.extend_start_loc is None:
-            extend_start_loc = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32, device=self.device),
-                    torch.cumsum(extend_seq_lens[:-1], dim=0),
-                ]
-            )
-        else:
-            extend_start_loc = forward_batch.extend_start_loc
-        return extend_seq_lens, extend_start_loc

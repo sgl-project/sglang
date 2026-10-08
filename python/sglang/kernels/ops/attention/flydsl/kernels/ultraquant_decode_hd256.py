@@ -1,5 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 # UltraQuant D=256 decode (FlyDSL) — gfx950 / CDNA4
 #
 # Scaled FP4×E4M3 QK MFMA, native V CVT, HW V-transpose, strided tile-groups,
@@ -19,6 +20,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import math as _math
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
@@ -46,14 +48,11 @@ def _vector_insert(value, dest, *, static_position):
 HEAD_SIZE = 256
 TILE_SIZE = 16  # MFMA tile = 16 tokens
 WARP_SIZE = 64
-KV_COMPUTE_BLOCK = 256  # 16 K-tiles × 16 tokens
-TILES_PER_GROUP = KV_COMPUTE_BLOCK // TILE_SIZE
 
 FP8_GROUP_SIZE = 32
 N_GROUPS = HEAD_SIZE // FP8_GROUP_SIZE  # 8 UE8M0 scale bytes per head
 KEY_CODE_BYTES = HEAD_SIZE // 2  # 128
 
-# MFMA
 MFMA_N = 16
 PV_N_CHUNKS = HEAD_SIZE // MFMA_N  # 16 for HEAD_SIZE=256
 
@@ -91,17 +90,34 @@ def _vsplat_mul(vec, scalar):
 def create_ultraquant_decode_hd256_kernel(
     num_kv_heads: int,
     num_partitions: int,
+    block_kv: int,
     softmax_scale: float,
     query_group_size: int,
     stride_q_seq: int,
     stride_q_head: int,
     split_stride: int,
+    work_budget: int = 0,
+    seqs_per_lane: int = 1,
 ):
     """Build the kernel and wrap it in a launchable entry point.
 
-    Partition p walks tile-groups p, p + P, p + 2P, ... Batch size is a launch
-    argument rather than a build parameter, so every CUDA-graph batch bucket
-    reuses one compiled variant.
+    With ``work_budget`` zero, each sequence runs on ``num_partitions``
+    partitions and partition p walks the ``block_kv``-token blocks p, p + P,
+    p + 2P, ... of it; the launch grid is (batch, Hk, P).
+
+    With a nonzero ``work_budget`` W the batch's tokens are cut into chunks of
+    C = ceil(batch_tokens / ((W - batch) * block_kv)) * block_kv tokens (at
+    least one block), and sequence s owns workgroups g(s) .. g(s) +
+    ceil(len_s / C) - 1, with g(s) = (kv_indptr[s] - kv_indptr[0]) // C + s.
+    Rounding each sequence up to whole chunks costs at most one workgroup per
+    sequence, so g stays below W. Workgroup g walks its chunk's blocks in order
+    and writes split row g of ``[rows, Hq, 1, D]`` buffers, so every workgroup
+    has the same work and each sequence's chunks sit next to each other in
+    launch order. The grid is (batch + W, Hk, 1), keeping W a build constant;
+    the last workgroups find no chunk.
+
+    Batch size is a launch argument rather than a build parameter, so every
+    CUDA-graph batch bucket reuses one compiled variant.
     """
     # GQA 6 reuses the 8-row WHT lane map; rows past QG are discarded by the
     # `mfma_row < QG` output gate.
@@ -109,8 +125,14 @@ def create_ultraquant_decode_hd256_kernel(
         f"query_group_size must be 6, 8 or 16; got {query_group_size}"
     )
     assert split_stride >= num_partitions
+    assert block_kv > 0 and block_kv % TILE_SIZE == 0
+    assert work_budget >= 0
 
     NUM_PARTS_C = num_partitions
+    CHUNKED = work_budget > 0
+    assert not CHUNKED or (num_partitions == 1 and split_stride == 1)
+    SEQS_PER_LANE = seqs_per_lane
+    TILES_PER_BLOCK = block_kv // TILE_SIZE
     MFMA_SCALED_K = 128
     MFMA_ISSUES = HEAD_SIZE // MFMA_SCALED_K  # 2 for HEAD_SIZE=256
     GRPS_PER_ISSUE = MFMA_SCALED_K // FP8_GROUP_SIZE  # 4
@@ -149,7 +171,10 @@ def create_ultraquant_decode_hd256_kernel(
     allocator = SmemAllocator(
         None,
         arch=arch,
-        global_sym_name=f"ultraquant_hd256_smem_p{num_partitions}_s{split_stride}",
+        global_sym_name=(
+            f"ultraquant_hd256_smem_p{num_partitions}_b{block_kv}_s{split_stride}"
+            f"_w{work_budget}_k{seqs_per_lane}"
+        ),
     )
     q_off = 0
     allocator.ptr = _Q_LDS_BYTES
@@ -172,9 +197,7 @@ def create_ultraquant_decode_hd256_kernel(
     ):
         # ---- IDs ---------------------------------------------------------
         tid = gpu.thread_idx.x
-        seq = gpu.block_idx.x
         kv_h = gpu.block_idx.y
-        part = gpu.block_idx.z
         lane = tid  # 0..63
         mfma_row = lane & fx.Int32(15)
         mfma_col_grp = lane >> fx.Int32(4)  # 0..3, K-group dim
@@ -241,6 +264,93 @@ def create_ultraquant_decode_hd256_kernel(
             ]
             return _f32x8_to_fp8_i64(f)
 
+        # ===== Sequence, length and the blocks this workgroup walks ========
+        # kv_indptr is the ragged row-pointer over kv_indices: a sequence owns
+        # kv_indices[kv_base : kv_base + seq_len]. Taking the length from the
+        # same tensor as the base keeps the two from ever disagreeing, and
+        # matches how the Triton ultraquant kernel reads it.
+        c_kcb = fx.Int32(block_kv)
+        c_one_i32 = fx.Int32(1)
+        c_zero = fx.Int32(0)
+
+        def _load_indptr(i):
+            return buffer_ops.buffer_load(kip_rsrc, i, vec_width=1, dtype=T.i32)
+
+        if const_expr(CHUNKED):
+            # ultraquant_decode_reduce derives the same chunking; keep the two equal.
+            chunk = fx.Int32(gpu.block_idx.x)
+            num_seqs = fx.Int32(gpu.grid_dim.x) - fx.Int32(work_budget)
+            kv_start = _load_indptr(c_zero)
+            batch_tokens = _load_indptr(num_seqs) - kv_start
+            # Lane l holds kv_indptr[l*K .. l*K + K], clamped to the batch end,
+            # all fetched in the same round as the batch extent.
+            lane_first = lane * fx.Int32(SEQS_PER_LANE)
+            ptrs = []
+            for i in range_constexpr(SEQS_PER_LANE + 1):
+                idx = lane_first + fx.Int32(i)
+                ptrs.append(_load_indptr((idx < num_seqs).select(idx, num_seqs)))
+            c_budget_tokens = (fx.Int32(work_budget) - num_seqs) * c_kcb
+            chunk_tokens = (
+                (batch_tokens + c_budget_tokens - c_one_i32) // c_budget_tokens * c_kcb
+            )
+            # An empty batch still needs a nonzero divisor.
+            chunk_tokens = (chunk_tokens > c_kcb).select(chunk_tokens, c_kcb)
+
+            # The sequence is the last s with g(s) <= chunk. g rises with s, so
+            # the passing sequences are a prefix and counting them finds s.
+            num_hits = c_zero
+            for i in range_constexpr(SEQS_PER_LANE):
+                s_i = lane_first + fx.Int32(i)
+                hit = (s_i < num_seqs) & (
+                    (ptrs[i] - kv_start) // chunk_tokens + s_i <= chunk
+                )
+                mask = rocdl.ballot(T.i64, hit)
+                num_hits = num_hits + fx.Int32(arith.trunci(T.i32, _math.ctpop(mask)))
+            seq = num_hits - c_one_i32
+            owner = seq // fx.Int32(SEQS_PER_LANE)
+            owner_slot = seq - owner * fx.Int32(SEQS_PER_LANE)
+            kv_base = c_zero
+            kv_end = c_zero
+            for i in range_constexpr(SEQS_PER_LANE):
+                is_slot = owner_slot == fx.Int32(i)
+                kv_base = is_slot.select(
+                    fx.Int32(rocdl.readlane(T.i32, ptrs[i], owner)), kv_base
+                )
+                kv_end = is_slot.select(
+                    fx.Int32(rocdl.readlane(T.i32, ptrs[i + 1], owner)), kv_end
+                )
+            seq_len = kv_end - kv_base
+            total_tgs = (seq_len + c_kcb - c_one_i32) // c_kcb
+            local = chunk - ((kv_base - kv_start) // chunk_tokens + seq)
+            n_chunks = (seq_len + chunk_tokens - c_one_i32) // chunk_tokens
+            n_chunks = (n_chunks > c_one_i32).select(n_chunks, c_one_i32)
+            active = local < n_chunks
+            blocks_per_chunk = chunk_tokens // c_kcb
+            blk0 = local * blocks_per_chunk
+            blk_stride = c_one_i32
+            trip = total_tgs - blk0
+            trip = (trip < blocks_per_chunk).select(trip, blocks_per_chunk)
+            trip = (trip > c_zero).select(trip, c_zero)
+            out_row = chunk
+            out_part = c_zero
+        else:
+            # Workgroups go to the XCDs round robin by linear id. Rotating the
+            # sequence by the partition spreads each sequence over every XCD;
+            # otherwise one XCD takes all of sequence s whenever the batch is a
+            # multiple of the XCD count.
+            part = fx.Int32(gpu.block_idx.z)
+            seq = (fx.Int32(gpu.block_idx.x) + part) % fx.Int32(gpu.grid_dim.x)
+            kv_base = _load_indptr(seq)
+            seq_len = _load_indptr(seq + c_one_i32) - kv_base
+            total_tgs = (seq_len + c_kcb - c_one_i32) // c_kcb
+            active = part < fx.Int32(NUM_PARTS_C)
+            blk0 = part
+            blk_stride = fx.Int32(NUM_PARTS_C)
+            # part < P, so the trip count is >= 0 and 0 when the sequence ends first.
+            trip = (total_tgs - part + blk_stride - c_one_i32) // blk_stride
+            out_row = seq
+            out_part = part
+
         # ===== STEP A: in-kernel Q rotation (fused WHT) ===================
         # Q @ PiT is a Walsh-Hadamard transform (PiT is the Sylvester Hadamard
         # with a column permutation folded in), so 8 butterfly stages replace a
@@ -266,7 +376,7 @@ def create_ultraquant_decode_hd256_kernel(
         _inv_sqrtD = arith.constant(1.0 / math.sqrt(HEAD_SIZE), type=T.f32)
         for _qit in range_constexpr((QG + 7) // 8):
             _qrow = _wrow + fx.Int32(_qit * 8)
-            if _qrow < fx.Int32(QG):
+            if (_qrow < fx.Int32(QG)) & active:
                 _qb = seq * c_sq + (kv_h * c_qg + _qrow) * c_qh + _wchk * fx.Int32(32)
                 # ---- load this lane's 32 raw-Q head-dims (4 x dwordx4) ----
                 _v = []
@@ -392,17 +502,6 @@ def create_ultraquant_decode_hd256_kernel(
         zero_v4 = arith.constant_vector(0.0, T.f32x4)
         acc_pv = [zero_v4 for _ in range(PV_N_CHUNKS)]
 
-        # ===== STEP C: Sequence-len + partition base ====================
-        # kv_indptr is the ragged row-pointer over kv_indices: this sequence
-        # owns kv_indices[kv_base : kv_base + seq_len]. Taking the length from
-        # the same tensor as the base keeps the two from ever disagreeing, and
-        # matches how the Triton ultraquant kernel reads it.
-        kv_base = buffer_ops.buffer_load(kip_rsrc, seq, vec_width=1, dtype=T.i32)
-        kv_end = buffer_ops.buffer_load(
-            kip_rsrc, seq + fx.Int32(1), vec_width=1, dtype=T.i32
-        )
-        seq_len = kv_end - kv_base
-
         # Per-K-tile dequant lane assignment: lane t -> token = t/4,
         # chunk_in_tok = t%4 (each chunk = SUBCHUNK_HDIMS=64 head-dims = 2 groups).
         tok_in_tile = lane >> fx.Int32(2)
@@ -412,13 +511,7 @@ def create_ultraquant_decode_hd256_kernel(
         # 8-byte scale region. Load once; extract per-half below.
         c_scale_word_off = (chunk_in_tok >> fx.Int32(1)) * fx.Int32(4)
 
-        # ===== STEP D: K-tile loop =======================================
-        # part < P, so the trip count is >= 0 and 0 when the sequence ends first.
-        c_kcb = fx.Int32(KV_COMPUTE_BLOCK)
-        c_one_i32 = fx.Int32(1)
-        c_nparts = fx.Int32(NUM_PARTS_C)
-        total_tgs = (seq_len + c_kcb - c_one_i32) // c_kcb
-        trip = (total_tgs - part + c_nparts - c_one_i32) // c_nparts
+        # ===== STEP C: K-tile loop =======================================
         c_zero_idx = arith.constant(0, index=True)
         c_one_idx = arith.constant(1, index=True)
         trip_idx = arith.index_cast(T.index, _ival(trip))
@@ -436,7 +529,7 @@ def create_ultraquant_decode_hd256_kernel(
         with ir.InsertionPoint(_for_op.body):
             tg_idx = _for_op.induction_variable
             tg_i32 = fx.Int32(arith.index_cast(T.i32, tg_idx))
-            partition_start = (part + tg_i32 * c_nparts) * c_kcb
+            partition_start = (blk0 + tg_i32 * blk_stride) * c_kcb
             running_max = _for_op.inner_iter_args[0]
             running_sum = _for_op.inner_iter_args[1]
             acc_pv = list(_for_op.inner_iter_args[2:])
@@ -510,10 +603,10 @@ def create_ultraquant_decode_hd256_kernel(
                 return (_kpl, _vpl, _ksw, _vsw)
 
             next_loads = _emit_tile_loads(0)
-            for n_tile in range_constexpr(TILES_PER_GROUP):
+            for n_tile in range_constexpr(TILES_PER_BLOCK):
                 _ntile_tok = fx.Int32(n_tile * TILE_SIZE)
                 (k_packed_list, v_packed_list, kscale_word, vscale_word) = next_loads
-                if const_expr(n_tile + 1 < TILES_PER_GROUP):
+                if const_expr(n_tile + 1 < TILES_PER_BLOCK):
                     next_loads = _emit_tile_loads(n_tile + 1)
                 # Store raw FP4 codes (natural contiguous order,
                 # 16 B = 32 nibbles per UE8M0 group) straight to KV LDS as
@@ -686,9 +779,10 @@ def create_ultraquant_decode_hd256_kernel(
                 gpu.barrier()
 
                 # ---- PV MFMA: A=V[head_dim, token], B=P (=qk_acc bf16) -----
+                # V_lds holds V[token][head_dim] row-major, so the HW transpose
+                # on read is what supplies A in the order the MFMA wants.
                 p_bf16 = arith.trunc_f(T.vec(4, T.bf16), qk_acc)
                 p_op = vector.bitcast(T.vec(4, T.i16), p_bf16)
-                # HW-transpose PV: V_lds row-major V[token][head_dim].
                 token_idx = lane >> fx.Int32(2)
                 hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
                 v_lane_byte = (
@@ -722,7 +816,7 @@ def create_ultraquant_decode_hd256_kernel(
         running_sum = _for_op.results[1]
         acc_pv = list(_for_op.results[2:])
 
-        # ===== STEP E: Output ===========================================
+        # ===== STEP D: Output ===========================================
         safe_sum = (running_sum > ZERO_F).select(running_sum, ONE_F)
         rcp = ONE_F / safe_sum
 
@@ -730,15 +824,18 @@ def create_ultraquant_decode_hd256_kernel(
         # group row into the head index here (q_head = kv_h * QG + row).
         q_head = kv_h * fx.Int32(QG) + mfma_row
         out_base = (
-            seq * fx.Int32(_stride_out_seq)
+            out_row * fx.Int32(_stride_out_seq)
             + q_head * fx.Int32(_stride_out_qhead)
-            + part * fx.Int32(_stride_out_split)
+            + out_part * fx.Int32(_stride_out_split)
         )
 
-        valid_row_pred = arith.cmpi(
-            arith.CmpIPredicate.ult,
-            _ival(mfma_row),
-            arith.constant(QG, type=T.i32),
+        valid_row_pred = arith.andi(
+            arith.cmpi(
+                arith.CmpIPredicate.ult,
+                _ival(mfma_row),
+                arith.constant(QG, type=T.i32),
+            ),
+            _ival(active),
         )
         _if = _scf.IfOp(valid_row_pred)
         with ir.InsertionPoint(_if.then_block):
@@ -758,9 +855,9 @@ def create_ultraquant_decode_hd256_kernel(
             # it drops out of the reducer's merge.
             lse = running_max + fx.log(running_sum)
             lse_off = (
-                seq * fx.Int32(_stride_lse_seq)
+                out_row * fx.Int32(_stride_lse_seq)
                 + q_head * fx.Int32(_stride_lse_qhead)
-                + part
+                + out_part
             )
             buffer_ops.buffer_store(lse, lse_rsrc, lse_off)
             _scf.YieldOp([])

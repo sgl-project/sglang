@@ -1085,7 +1085,7 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_kv4_compatibility(args)
 
     @staticmethod
-    def _make_ultraquant_args(dtype=torch.bfloat16, **overrides):
+    def _make_ultraquant_args(dtype=torch.bfloat16, is_hybrid_swa=False, **overrides):
         args = ServerArgs(
             model_path="dummy",
             kv_cache_dtype="ultraquant_4bit",
@@ -1093,7 +1093,7 @@ class TestKV4Compatibility(unittest.TestCase):
             **overrides,
         )
         # Pre-set the memoized model config so the hook does not load "dummy".
-        args._model_config = SimpleNamespace(dtype=dtype)
+        args._model_config = SimpleNamespace(dtype=dtype, is_hybrid_swa=is_hybrid_swa)
         return args
 
     @override_platform(is_cuda=False, is_hip=True)
@@ -1126,6 +1126,12 @@ class TestKV4Compatibility(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "MLA"),
         ):
+            handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_rejects_hybrid_swa_models(self):
+        args = self._make_ultraquant_args(is_hybrid_swa=True)
+        with self.assertRaisesRegex(ValueError, "sliding-window"):
             handle_kv4_compatibility(args)
 
     @override_platform(is_cuda=False, is_hip=True)

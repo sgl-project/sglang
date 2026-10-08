@@ -1049,17 +1049,6 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
             loc,
         )
 
-    def dequantize_kv_tensor(
-        self,
-        fp4_tensor: Tensor,
-        scales: Tensor,
-        layer_id: int,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Tensor:
-        return UltraQuantKVQuantizeUtil.batched_dequantize(
-            fp4_tensor, scales, dtype=dtype or torch.bfloat16
-        )
-
     def dequantize_prev_kv(
         self,
         k_fp4: Tensor,
@@ -1070,8 +1059,8 @@ class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
     ) -> tuple[Tensor, Tensor]:
         """Dequantize stored KV. Keys stay in the rotated basis."""
         return (
-            self.dequantize_kv_tensor(k_fp4, k_scales, layer_id),
-            self.dequantize_kv_tensor(v_fp4, v_scales, layer_id),
+            UltraQuantKVQuantizeUtil.batched_dequantize(k_fp4, k_scales),
+            UltraQuantKVQuantizeUtil.batched_dequantize(v_fp4, v_scales),
         )
 
     def compute_cell_size(
