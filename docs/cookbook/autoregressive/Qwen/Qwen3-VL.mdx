@@ -165,7 +165,7 @@ benchmark client, source hashes, and evaluation protocol.
 <Accordion title="Pinned B300 BF16 HND configuration and throughput snapshot">
 
 This separate text-only snapshot uses source commit
-[`3016f3b591`](https://github.com/zcnrex/sglang/commit/3016f3b5917650199c12b47195b9dc1be4c26e4e)
+[`c76cfaba1a`](https://github.com/zcnrex/sglang/commit/c76cfaba1a1154a4a24b8694184cb8d3318fc358)
 from PR #42913, with HND KV-cache layout and mixed chunking enabled. It is not
 an off/on comparison and does not measure the causal benefit of mixed chunking
 or HND. The historical NHD comparison above retains its original configuration.
@@ -194,7 +194,7 @@ uses 30/40/80/80/160/320/640 measured requests and `max(64, concurrency)` warmup
 requests, followed by a cache flush. Every run completed the exact requested
 request, input-token and output-token counts. Commands, the pinned benchmark
 client and raw measurements are retained in the
-[snapshot evidence](https://github.com/zcnrex/sglang/tree/15e34e059db446325c16903e218f0f882567e2f1/benchmark/qwen3_vl/results/current_pr_full_sweep/attempt2).
+[snapshot evidence](https://github.com/zcnrex/sglang/tree/a2f3a4e381d359e3fb4f1e9984ceb9f94b6a3f2e/benchmark/qwen3_vl/results/final_qkv_full_sweep).
 
 Throughput is **output tokens/s on one GPU**, not combined input/output
 throughput. TTFT and TPOT below are **medians in milliseconds**.
@@ -202,27 +202,36 @@ throughput. TTFT and TPOT below are **medians in milliseconds**.
 <table>
   <thead><tr><th>Concurrency</th><th>Output tokens/s</th><th>Median TTFT ms</th><th>Median TPOT ms</th></tr></thead>
   <tbody>
-    <tr><td>1</td><td>393.56</td><td>87.42</td><td>2.46</td></tr>
-    <tr><td>4</td><td>1229.73</td><td>236.64</td><td>3.02</td></tr>
-    <tr><td>8</td><td>1908.32</td><td>355.15</td><td>3.84</td></tr>
-    <tr><td>16</td><td>2583.19</td><td>644.92</td><td>5.58</td></tr>
-    <tr><td>32</td><td>3141.89</td><td>804.63</td><td>9.40</td></tr>
-    <tr><td>64</td><td>3542.95</td><td>818.60</td><td>17.27</td></tr>
-    <tr><td>128</td><td>3833.22</td><td>600.93</td><td>32.64</td></tr>
-    <tr><td>128, second GPU</td><td>3847.33</td><td>592.38</td><td>32.53</td></tr>
+    <tr><td>1</td><td>411.63</td><td>85.58</td><td>2.35</td></tr>
+    <tr><td>4</td><td>1276.59</td><td>254.64</td><td>2.89</td></tr>
+    <tr><td>8</td><td>1907.64</td><td>380.05</td><td>3.83</td></tr>
+    <tr><td>16</td><td>2582.38</td><td>635.04</td><td>5.59</td></tr>
+    <tr><td>32</td><td>3139.82</td><td>808.90</td><td>9.36</td></tr>
+    <tr><td>64</td><td>3540.85</td><td>687.28</td><td>17.31</td></tr>
+    <tr><td>128</td><td>3832.18</td><td>599.64</td><td>32.68</td></tr>
+    <tr><td>128, second GPU</td><td>3845.56</td><td>591.80</td><td>32.53</td></tr>
   </tbody>
 </table>
 
-At concurrency 128, mean TTFT was 1421.79/1462.02 ms, p95 was
-6725.15/6769.09 ms, and p99 was 8616.83/8594.28 ms for the two GPUs,
+At concurrency 128, mean TTFT was 1475.70/1466.74 ms, p95 was
+6803.68/6799.04 ms, and p99 was 8642.01/8627.08 ms for the two GPUs,
 respectively. The median alone understates first-token latency for some requests.
 The eight servers ran concurrently on separate B300 GPUs on one host. Normal
 public startup autotuning used fresh per-worker caches; the two C128 runs
 selected different M128 down-projection tactics and differed in throughput by
-0.368%. GPU clocks and overlapping host work also varied. These are individual
+0.349%. GPU clocks and overlapping host work also varied. These are individual
 configuration measurements, not an isolated same-device comparison or a
-repeatability bound. No new accuracy evaluation accompanied this sweep; the
-historical accuracy results above do not certify this source snapshot.
+repeatability bound.
+
+Separate normal-startup GSM8K validation of the batch-one/two QKV extension
+scored 1217/1314 in both arms at concurrency 1, and 1213/1314 with the extension
+versus 1216/1314 without it at concurrency 2. The latter used matching startup
+tactics; its three-question deficit remains an empirical limitation. A fixed-batch
+diagnostic on four disagreement prompts then matched full logits through 512
+decode steps, but does not explain the full-serving differences or establish
+broad accuracy equivalence. One-fixture image checks also passed. Detailed
+protocols, per-question results and limitations are in the
+[validation record](https://github.com/zcnrex/sglang/tree/a2f3a4e381d359e3fb4f1e9984ceb9f94b6a3f2e/benchmark/qwen3_vl).
 
 </Accordion>
 
