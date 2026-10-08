@@ -652,9 +652,14 @@ def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
             mean,
             [0.5, 0.5, 0.5],
         )
-        fingerprints.append(
-            build_processor_fingerprint(wrapper, SimpleNamespace(to_dict=lambda: {}))
-        )
+        with get_context().override_server_args(
+            revision=None, disable_fast_image_processor=False, mm_process_config={}
+        ):
+            fingerprints.append(
+                build_processor_fingerprint(
+                    wrapper, SimpleNamespace(to_dict=lambda: {})
+                )
+            )
     assert fingerprints[0] != fingerprints[1]
 
 
@@ -743,6 +748,7 @@ def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
 
 def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     processor = object.__new__(KimiK3ImageProcessor)
+    processor.processor_fingerprint = "epd-test-config"
     processor.hf_config = SimpleNamespace(
         vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
     )

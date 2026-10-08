@@ -244,11 +244,13 @@ void hash_pages_to_hex_blob(const RawToken *raw, std::size_t logical_len,
        start += page_size, ++page_idx) {
     const std::size_t page_units = std::min(page_size, logical_len - start);
     const auto *page_start = raw + (is_bigram ? start : start * unit_width);
-    const std::size_t raw_count = is_bigram ? page_units + 1 : page_units * unit_width;
+    const std::size_t raw_count =
+        is_bigram ? page_units + 1 : page_units * unit_width;
     if (has_wide_tokens(page_start, raw_count)) {
-      hash_wide_page(page_start, is_bigram ? page_units : raw_count,
-                     is_bigram, has_prior_digest, prior_digest);
-      digest_to_hex_chars(prior_digest.data(), hex_blob.data() + page_idx * kHexLen);
+      hash_wide_page(page_start, is_bigram ? page_units : raw_count, is_bigram,
+                     has_prior_digest, prior_digest);
+      digest_to_hex_chars(prior_digest.data(),
+                          hex_blob.data() + page_idx * kHexLen);
       continue;
     }
     const std::size_t page_bytes =
@@ -281,8 +283,8 @@ std::string hash_all(const RawToken *raw, std::size_t logical_len,
   if (is_bigram) {
     unit_width = 2;
   }
-  const std::size_t raw_count = is_bigram && logical_len > 0
-      ? logical_len + 1 : logical_len * unit_width;
+  const std::size_t raw_count =
+      is_bigram && logical_len > 0 ? logical_len + 1 : logical_len * unit_width;
   if (has_wide_tokens(raw, raw_count)) {
     hash_wide_page(raw, is_bigram ? logical_len : raw_count, is_bigram,
                    has_prior_digest, prior_digest);

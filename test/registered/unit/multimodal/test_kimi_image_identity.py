@@ -14,7 +14,10 @@ from PIL import Image
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    embed_mm_inputs,
+)
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
@@ -64,6 +67,45 @@ class _LoadingProcessor(KimiGridMMDataMixin, BaseMultimodalProcessor):
 
 
 class TestKimiImageIdentity(CustomTestCase):
+    def test_wide_padding_reaches_embedding_scatter(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                item = _image_item([1, 4, 4])
+                item.set_identity(kimi_image_identity("sha256:" + "12" * 32, [1, 4, 4]))
+                item.offsets = [(1, 6)]
+                item.feature = None
+                item.precomputed_embeddings = (
+                    torch.arange(18, device=device).reshape(6, 3).float()
+                )
+                mm_inputs = MultimodalInputs(mm_items=[item], im_token_id=9)
+                padded = (
+                    MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+                        array("q", [1, 9, 9, 9, 9, 9, 9, 2]), mm_inputs
+                    )
+                )
+                embedding = torch.nn.Embedding(10, 3, device=device)
+                for prefix, length in ((0, 8), (3, 4)):
+                    inputs = torch.tensor(
+                        padded[prefix : prefix + length], device=device
+                    )
+                    actual, _ = embed_mm_inputs(
+                        [mm_inputs],
+                        [prefix],
+                        [length],
+                        inputs,
+                        embedding,
+                        data_embedding_func_mapping={Modality.IMAGE: lambda _: None},
+                    )
+                    expected = (
+                        item.precomputed_embeddings
+                        if prefix == 0
+                        else item.precomputed_embeddings[2:6]
+                    )
+                    self.assertTrue(
+                        torch.equal(actual[1:7] if prefix == 0 else actual, expected)
+                    )
+
     def test_loader_hashes_the_same_snapshot_it_decodes(self):
         encoded = BytesIO()
         _image(0).save(encoded, format="JPEG")
