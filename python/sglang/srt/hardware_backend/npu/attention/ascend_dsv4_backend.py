@@ -1032,6 +1032,12 @@ class C4IndexerAscendBackendMixin:
         except Exception:
             lastpos = -1
 
+        # Cost/volume gate: reuse the SWAW window envs. Unset => no bound.
+        lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+        hi = int(os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+        if lastpos < lo or lastpos > hi:
+            return
+
         if _want(dump_cmpidx):
             try:
                 t = topk_idxs.detach().to(torch.int32).cpu()
@@ -1047,8 +1053,14 @@ class C4IndexerAscendBackendMixin:
         if _want(dump_idxk):
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, True)
+                pages = int(buf.shape[0])
+                whole = os.environ.get("DSV4_DUMP_IDXK_WHOLE")
+                # Hashing the whole index-K buffer every layer/step costs GBs of
+                # host copies; default to the tail pages unless explicitly asked.
+                slab = buf if whole else buf[max(0, pages - 16) : pages]
                 print(
-                    f"[IDXK] layer={layer_id} shape={tuple(buf.shape)} md5={_md5(buf)}",
+                    f"[IDXK] layer={layer_id} shape={tuple(buf.shape)} "
+                    f"whole={'1' if whole else '0'} md5={_md5(slab)}",
                     flush=True,
                 )
             except Exception as exc:
@@ -2685,7 +2697,9 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        self._dump_a5_op_shape(layer, cmp_kv, cmp_block_table, ori_kv, attn_kwargs)
+        self._dump_a5_op_shape(
+            layer, cmp_kv, cmp_block_table, ori_kv, attn_kwargs, forward_batch
+        )
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
         out, _ = attn_op(q_arg, **attn_kwargs)
@@ -2698,6 +2712,7 @@ class DeepseekV4AscendAttnBackend(
         cmp_block_table: torch.Tensor,
         ori_kv: torch.Tensor,
         kwargs: dict,
+        forward_batch: ForwardBatch,
     ) -> None:
         """Diagnostic for the DSV4/A5 hit != miss divergence: dump the exact
         tensor shapes handed to the A5 op, which drive its data-shape-dependent
@@ -2720,6 +2735,18 @@ class DeepseekV4AscendAttnBackend(
             return
         lid = getattr(layer, "layer_id", -1)
         if want not in ("", "all") and want != str(lid):
+            return
+        try:
+            lastpos = (
+                int(forward_batch.positions.reshape(-1)[-1].item())
+                if forward_batch.positions.numel()
+                else -1
+            )
+        except Exception:
+            lastpos = -1
+        lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+        hi = int(os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+        if lastpos < lo or lastpos > hi:
             return
 
         def _shape(t):
