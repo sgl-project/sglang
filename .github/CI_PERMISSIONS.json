@@ -1248,6 +1248,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "shodoco": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "shuaills": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,

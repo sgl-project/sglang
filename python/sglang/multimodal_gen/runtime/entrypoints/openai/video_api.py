@@ -490,6 +490,8 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
@@ -526,14 +528,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.prompt_optional:
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -611,9 +614,15 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        width_val = form_value("width", width)
+        height_val = form_value("height", height)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # ``prompt`` is a required str field on VideoGenerationsRequest; it is only
+            # ``None`` here for a prompt-optional pipeline (the gate above already
+            # rejected a missing prompt for every other one), so an empty string is the
+            # correct substitute, not a real (ignored) prompt value.
+            prompt=prompt or "",
             enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
@@ -628,6 +637,8 @@ async def create_video(
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
+            width=width_val,
+            height=height_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_text_value("negative_prompt", negative_prompt),
@@ -710,6 +721,8 @@ async def create_video(
                         detail=f"Failed to process image source: {str(e)}",
                     )
                 payload["input_reference"] = input_path
+            if resolve_sampling_params_cls(server_args).prompt_optional:
+                payload.setdefault("prompt", "")
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")

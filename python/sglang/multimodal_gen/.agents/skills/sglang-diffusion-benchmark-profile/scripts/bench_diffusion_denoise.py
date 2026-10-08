@@ -16,7 +16,7 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
-    # Check Eager/BCG at every request quality on one GPU set; extra-high/high
+    # Check Eager/BCG at every request quality on one GPU set; lossless/high
     # + BCG are invalid when request-scoped DiT fusions mount only after the
     # lossless graph capture.
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
@@ -81,7 +81,7 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
-BENCHMARK_QUALITY_LEVELS = ("lossless", "extra-high", "high")
+BENCHMARK_QUALITY_LEVELS = ("exact", "lossless", "high")
 BCG_CAPTURE_SIGNAL = "[diffusion bcg] captured"
 BCG_INVALID_SIGNALS = (
     "[diffusion bcg] capture failed",
@@ -92,14 +92,14 @@ BCG_INVALID_SIGNALS = (
 )
 BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
 QUALITY_BCG_ABBA_MATRIX = (
+    ("eager-exact-a", "exact", False),
+    ("bcg-exact-a", "exact", True),
+    ("bcg-exact-b", "exact", True),
+    ("eager-exact-b", "exact", False),
     ("eager-lossless-a", "lossless", False),
     ("bcg-lossless-a", "lossless", True),
     ("bcg-lossless-b", "lossless", True),
     ("eager-lossless-b", "lossless", False),
-    ("eager-extra-high-a", "extra-high", False),
-    ("bcg-extra-high-a", "extra-high", True),
-    ("bcg-extra-high-b", "extra-high", True),
-    ("eager-extra-high-b", "extra-high", False),
     ("eager-high-a", "high", False),
     ("bcg-high-a", "high", True),
     ("bcg-high-b", "high", True),
@@ -427,7 +427,7 @@ MODELS = {
     },
     # H3 rejects a 1-step warmup request, hence --warmup-steps=2.
     "fasth3-t2va-vsa": {
-        "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "path": "FastVideo/FastVideo-FastH3-8-Step-V2",
         "prompt": (
             "A curious raccoon peers through a vibrant field of yellow "
             "sunflowers, its eyes wide with interest."
@@ -441,12 +441,11 @@ MODELS = {
                 "aspect_ratio": "16:9",
                 "duration_seconds": 10.0,
             },
-            "num_inference_steps": 5,
+            "num_inference_steps": 9,
         },
         "extra_args": [
             "--num-gpus=4",
-            "--attention-backend=video_sparse_attn_h3",
-            '--attention-backend-config={"VSA_sparsity": 0.9}',
+            "--component-attention-backends=transformer=video_sparse_attn_h3",
             "--enable-torch-compile=false",
             "--warmup-steps=2",
         ],
@@ -1897,7 +1896,7 @@ def _run_benchmark_once_impl(
             if BCG_CAPTURE_SIGNAL in lower_line:
                 bcg_capture_detected = True
             if (
-                quality in {"extra-high", "high"}
+                quality in {"lossless", "high"}
                 and breakable_cuda_graph
                 and bcg_capture_detected
                 and "mounted " in lower_line
@@ -2315,7 +2314,7 @@ def main():
         "--quality-bcg-matrix",
         action="store_true",
         help=(
-            "Run lossless/extra-high/high Eager-vs-BCG as three ABBA pairs "
+            "Run exact/lossless/high Eager-vs-BCG as three ABBA pairs "
             "on one GPU set "
             "and one task-owned model cache."
         ),
