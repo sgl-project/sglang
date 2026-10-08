@@ -160,6 +160,7 @@ class TestPageShardScratchSizing(CustomTestCase):
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
             model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
                 context_len=context_len,
                 kv_lora_rank=16,
                 qk_rope_head_dim=8,
@@ -496,9 +497,9 @@ class TestMTPKVShardConfig(CustomTestCase):
         ] + [
             (kvc.model_config, "num_nextn_predict_layers", None, "EAGLE MTP"),
             (kvc.model_config, "num_nextn_predict_layers", 0, "EAGLE MTP"),
-            (kvc, "is_hybrid_swa", True, "dense MLA and MHA"),
-            (kvc, "mambaish_config", object(), "dense MLA and MHA"),
-            (kvc, "sliding_window_size", 128, "dense MLA and MHA"),
+            (kvc, "is_hybrid_swa", True, "MLA, DSA and MHA"),
+            (kvc, "mambaish_config", object(), "MLA, DSA and MHA"),
+            (kvc, "sliding_window_size", 128, "MLA, DSA and MHA"),
             (kvc, "post_capture_kv_active", True, "plain per-layer KV layout"),
             (kvc, "kv_cache_dtype_str", "mxfp8", "plain per-layer KV layout"),
         ]
@@ -509,10 +510,13 @@ class TestMTPKVShardConfig(CustomTestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 _build_mtp_pool(kvc)
-        for options in ({"is_dsa_model": True}, {"is_dsv4_model": True}):
+        for options, message in (
+            ({"is_dsa_model": True}, "same DSA indexer layout"),
+            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+        ):
             with (
                 self.subTest(options=options),
-                self.assertRaisesRegex(ValueError, "dense MLA and MHA"),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 _build_mtp_pool(kvc, **options)
         for context, options, message in (

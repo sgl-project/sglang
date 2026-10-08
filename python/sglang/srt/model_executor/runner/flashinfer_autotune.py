@@ -60,6 +60,11 @@ def should_run_flashinfer_autotune(
     mr = model_runner
     if mr.device != "cuda":
         return False
+    if get_parallel().enable_kv_cache_sharding:
+        # The generic dummy uses decode-shaped metadata and physical page zero.
+        # Sharded P pools only implement logical-page extend; warm them through
+        # real extend batches until the dummy owns a rotation-aware allocation.
+        return False
     if get_exec().kernel.disable_flashinfer_autotune:
         return False
     if get_exec().deterministic.enable_deterministic_inference:

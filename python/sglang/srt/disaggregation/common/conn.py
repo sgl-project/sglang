@@ -489,12 +489,15 @@ class CommonKVManager(BaseKVManager):
         Prefill CP materializes global token order before writing state pools, so
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
-        exception because each CP rank owns different state layers.
+        exception because each CP rank owns different state layers. Page-sharded
+        DSA indexer state likewise needs every owner; Mooncake filters its page
+        lists before transfer instead of suppressing whole ranks.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and getattr(self, "kv_shard_size", 1) <= 1
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
