@@ -94,7 +94,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
             token_to_kv_pool=SimpleNamespace(
                 get_key_buffer=lambda _layer_id: torch.zeros((24, 3))
             ),
-            real_page_size=1,
+            physical_page_size=1,
             kv_cache_dim=3,
             use_fused_topk=False,
             qk_nope_head_dim=2,
