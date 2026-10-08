@@ -4483,6 +4483,19 @@ class TestLoraMoeRunnerBackendGuards(unittest.TestCase):
             )
             check_lora_moe_runner_args(server_args)
 
+    def test_nvfp4_needs_the_marlin_provider(self):
+        for runner in ("lora_cutedsl", "lora_triton"):
+            with self.subTest(runner=runner):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    moe_runner_backend=runner,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    quantization="modelopt_fp4",
+                )
+                with self.assertRaisesRegex(ValueError, "lora_marlin"):
+                    check_lora_moe_runner_args(server_args)
+
     def test_rejects_explicitly_disabled_lora(self):
         server_args = ServerArgs(
             model_path="dummy",

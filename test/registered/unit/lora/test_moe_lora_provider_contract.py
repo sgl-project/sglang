@@ -40,6 +40,52 @@ class _ContiguousRowStateStub(msgspec.Struct, kw_only=True):
     """Providers subclass the real row state, so the stub must be a Struct too."""
 
 
+class TestNvFp4PreparedQuantInfo(CustomTestCase):
+    def _layer(self, dtype=torch.bfloat16):
+        return SimpleNamespace(
+            w13_weight=torch.zeros((2, 4, 8), dtype=torch.int32),
+            w2_weight=torch.zeros((2, 4, 8), dtype=torch.int32),
+            w13_weight_scale=torch.zeros((2, 8, 1), dtype=torch.float8_e4m3fn),
+            w2_weight_scale=torch.zeros((2, 4, 1), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_2=torch.ones(2, dtype=dtype),
+            w2_weight_scale_2=torch.zeros(2, dtype=dtype),
+            num_local_experts=2,
+            intermediate_size_per_partition=4,
+            hidden_size=8,
+        )
+
+    def test_prepared_marlin_metadata_is_aliased_not_repacked(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        for dtype in (torch.float16, torch.bfloat16):
+            layer = self._layer(dtype)
+            info = MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+            for field, source in (
+                ("w13_qweight", "w13_weight"),
+                ("w2_qweight", "w2_weight"),
+                ("w13_scales", "w13_weight_scale"),
+                ("w2_scales", "w2_weight_scale"),
+                ("w13_global_scale", "w13_weight_scale_2"),
+                ("w2_global_scale", "w2_weight_scale_2"),
+            ):
+                self.assertIs(getattr(info, field), getattr(layer, source))
+
+    def test_unprepared_weights_fail_without_mutation(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        for field in ("w13_weight", "w2_weight"):
+            layer = self._layer()
+            setattr(layer, field, getattr(layer, field).to(torch.uint8))
+            original = vars(layer).copy()
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "already-prepared"),
+            ):
+                MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+            for name, value in original.items():
+                self.assertIs(getattr(layer, name), value)
+
+
 class TestProviderGeometry(CustomTestCase):
     def test_provider_constructs_every_builtin_capability_from_shared_constants(self):
         """Catch missing runtime imports in the attach-time registry builder."""

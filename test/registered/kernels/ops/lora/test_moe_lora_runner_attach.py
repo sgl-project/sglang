@@ -241,6 +241,18 @@ class TestEngineAdmission(CustomTestCase):
             for other in every_vendor - set(vendors):
                 assert select_provider_cls("route_major", family, other) is default
 
+    def test_vendors_without_a_masked_domain_serve_expert_major_rows(self):
+        """Vendors without a masked domain serve expert-major requests through their route-major class."""
+
+        for vendor, family in (
+            ("triton", "bf16"),
+            ("triton", "fp8"),
+            ("marlin", "nvfp4"),
+        ):
+            assert select_provider_cls(
+                "expert_major", family, vendor
+            ) is select_provider_cls("route_major", family, vendor)
+
     def test_rejects_architectures_with_neither_mma_family(self):
         """SM90 and SM100 are a closed set, not a floor: SM120 reports major 12
         yet has neither WGMMA nor tcgen05, so a ">= SM90" check mis-admits it."""

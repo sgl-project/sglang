@@ -194,9 +194,15 @@ class MoeLoraRunner:
                     "a Marlin-repacked FP8 layer is unsupported"
                 )
             return "fp8"
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+            return "nvfp4"
         raise NotImplementedError(
-            "MoE LoRA supports unquantized BF16 and 128-block FP8 MoE; "
-            f"this layer's quant method is {type(quant_method).__name__}"
+            "MoE LoRA supports unquantized BF16, 128-block FP8, and NVFP4 "
+            f"MoE; this layer's quant method is {type(quant_method).__name__}"
         )
 
     @classmethod
