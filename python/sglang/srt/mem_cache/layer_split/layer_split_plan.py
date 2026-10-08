@@ -103,14 +103,13 @@ class PageTransferPlan:
 
     ``op_id`` is the one deliberate exception: it is *this rank's* submission
     counter, so it may differ between ranks and must never feed a cross-rank
-    decision. It is carried only to scope the engine's local operation records.
+    decision. It identifies the native operation locally, not a buffer lease.
     Everything that has to agree -- ``page_hashes``,
     ``page_owners``, ``window_base``, ``shard_size``, ``pages_per_window`` -- is
     derived from the request, see :func:`rotation_base`.
     """
 
     op_id: int
-    generation: int
     request_id: str
     page_hashes: Tuple[str, ...]
     page_owners: Tuple[int, ...]
@@ -134,10 +133,6 @@ class PageTransferPlan:
     @property
     def page_count(self) -> int:
         return len(self.page_hashes)
-
-    def num_tokens(self, page_size: int) -> int:
-        """Logical token count for either transfer direction."""
-        return self.page_count * page_size
 
     def windows(self) -> List[PageWindow]:
         """Split the plan into transfer windows, in submission order.
@@ -222,7 +217,6 @@ class PageTransferPlan:
 def build_transfer_plan(
     *,
     op_id: int,
-    generation: int,
     request_id: str,
     page_hashes: Sequence[str],
     staging_buffer_config: StagingBufferConfig,
@@ -239,7 +233,6 @@ def build_transfer_plan(
     shard_size = staging_buffer_config.shard_size
     return PageTransferPlan(
         op_id=op_id,
-        generation=generation,
         request_id=request_id,
         page_hashes=hashes,
         page_owners=tuple(page_owner(i, base, shard_size) for i in range(len(hashes))),
@@ -247,39 +240,6 @@ def build_transfer_plan(
         pages_per_window=staging_buffer_config.pages_per_window,
         window_base=base,
     )
-
-
-class PlanSequencer:
-    """Hands out this rank's ``op_id`` / ``generation`` bookkeeping.
-
-    ``op_id`` keys in-flight records within this rank. The native worker, not
-    the ID itself, keeps operations in queue order. Cross-rank ownership comes
-    from the request rather than this local counter; see :func:`rotation_base`.
-
-    The engine advances ``generation`` on an idle reset after I/O retirement.
-    Normal truncation keeps the generation; fatal timeouts require process
-    restart rather than recycling buffers that native I/O may still touch.
-    """
-
-    def __init__(self, first_op_id: int = 1) -> None:
-        if first_op_id < 0:
-            raise ValueError(f"first_op_id must not be negative, got {first_op_id}")
-        self._next_op_id = first_op_id
-        self._generation = 0
-
-    @property
-    def generation(self) -> int:
-        return self._generation
-
-    def next_op_id(self) -> int:
-        op_id = self._next_op_id
-        self._next_op_id += 1
-        return op_id
-
-    def bump_generation(self) -> int:
-        """Advance the bookkeeping epoch; this does not cancel native I/O."""
-        self._generation += 1
-        return self._generation
 
 
 # ---------------------------------------------------------------------------
@@ -300,22 +260,12 @@ class ExchangeRound:
     exchange off local I/O completion order instead would let ranks issue collectives
     in different sequences, which mismatches the collective and hangs.
 
-    ``index`` restarts at zero in each window, so it does not identify a round
-    on its own -- use :meth:`key`.
+    ``index`` addresses the window-local fixed buffer. It restarts at zero only
+    after the previous window has finished using that buffer.
     """
 
-    window_index: int
     index: int
     contributions: Tuple[Optional[int], ...]
-
-    def key(self) -> Tuple[int, int]:
-        """Identity of this round within its operation.
-
-        Operation-wide completion tracking must include the window, since round
-        indices restart in each window. Window-local fixed buffers may use
-        ``index`` directly and are reused only after the previous window retires.
-        """
-        return (self.window_index, self.index)
 
     def pages(self) -> List[int]:
         """Page ordinals carried by this round, ascending."""
@@ -347,9 +297,5 @@ def build_exchange_rounds(
         contributions = tuple(
             owned[k] if k < len(owned) else None for owned in per_rank
         )
-        rounds.append(
-            ExchangeRound(
-                window_index=window.index, index=k, contributions=contributions
-            )
-        )
+        rounds.append(ExchangeRound(index=k, contributions=contributions))
     return rounds

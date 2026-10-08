@@ -102,6 +102,7 @@ def test_native_worker_publishes_fixed_ack_schedule_and_leaves_progress_to_sched
     cc.prefetch_buffer.put(op)
 
     def run_window(plan, window, indices, *, stop_requested):
+        assert plan.op_id == op.id
         if short or window.index == len(plan.windows()) - 1:
             cc.storage_stop_event.set()
         return (1 if short else window.page_count), False
@@ -119,52 +120,9 @@ def test_native_worker_publishes_fixed_ack_schedule_and_leaves_progress_to_sched
     assert acks[1].completed_req is True
     assert cc.prefetch_sync_queue.empty()
     assert not cc.staging_engine.stages[PREFETCH].active
-    # Use native scheduler ACK consumption, including deferred tail ownership.
-    for ack in acks:
-        cc.ack_prefetch_queue.put(ack)
-    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.cache_controller = cc
-    cache.host_memory_mode = "cache"
-    cache.ongoing_prefetch = {op.handle: SimpleNamespace(operation=op)}
-    cache._handle_prefetch_result = mock.Mock()
-    cache._drain_storage_control_queues_impl(0, 2, 0, 0, {}, False)
-    assert op.completed_tokens == (2 if short else 10)
-    assert op.pool_transfers_done
-    cache._handle_prefetch_result.assert_called_once_with(op)
-    assert torch.equal(
-        cc.append_host_mem_release.call_args.args[0],
-        op.host_indices[op.completed_tokens :],
-    )
-
-
-def test_cancelled_request_releases_all_unpublished_rows_only_at_final_ack():
-    cc, op = controller(), operation()
-    op.mark_terminate()
-    with mock.patch.object(
-        cc.staging_engine,
-        "prefetch_window",
-        side_effect=lambda plan, window, indices, stop_requested: (
-            window.page_count,
-            stop_requested(),
-        ),
-    ):
-        cc.staging_engine.prefetch(op)
-    assert op.completed_tokens == 0
+    # Actual ACK reduction, scheduler consumption and cancellation/tail release
+    # are covered together by the real-Gloo test in test_layer_split_transfers.
     cc.append_host_mem_release.assert_not_called()
-    from sglang.srt.managers.cache_controller import PrefetchAck
-
-    cc.ack_prefetch_queue.put(cc.prefetch_sync_queue.get_nowait())
-    cc.ack_prefetch_queue.put(
-        PrefetchAck(rid=op.request_id, operation=op, completed_req=True)
-    )
-    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-    cache.cache_controller = cc
-    cache.host_memory_mode = "cache"
-    cache.ongoing_prefetch = {}
-    cache._handle_prefetch_result = mock.Mock()
-    cache._drain_storage_control_queues_impl(0, 2, 0, 0, {}, False)
-    cache._handle_prefetch_result.assert_not_called()
-    assert torch.equal(cc.append_host_mem_release.call_args.args[0], op.host_indices)
 
 
 @pytest.mark.parametrize("agreed", [0, 4, 10])
@@ -176,7 +134,7 @@ def test_allocation_agreement_precedes_submission_and_rolls_back_tail(agreed):
         mock.patch.object(cc, "_allocate_storage_hit", return_value=(indices, 10)),
         mock.patch.object(cc, "free_prefetch_host_buffers") as rollback,
         mock.patch.object(
-            cc.staging_engine, "align_prefetch_allocations", return_value=[agreed]
+            cc.staging_engine, "align_prefetch_allocation", return_value=agreed
         ),
     ):
         result, count = cc.allocate_storage_hit(
@@ -199,13 +157,40 @@ def test_failed_local_allocation_still_participates_in_agreement():
     with (
         mock.patch.object(cc, "_allocate_storage_hit", return_value=(None, 10)),
         mock.patch.object(
-            cc.staging_engine, "align_prefetch_allocations", return_value=[0]
+            cc.staging_engine, "align_prefetch_allocation", return_value=0
         ) as agreement,
     ):
         assert cc.allocate_storage_hit(
             op, 10, allow_partial=True, min_tokens=2, evict_host=mock.Mock()
         ) == (None, 0)
-    agreement.assert_called_once_with([op], [0])
+    agreement.assert_called_once_with(op, 0)
+
+
+@pytest.mark.parametrize(
+    "local_length,agreed_length,mismatch",
+    [(10, 4, False), (10, 0, False), (0, 0, False), (10, 10, True)],
+)
+def test_single_allocation_agrees_length_and_identity(
+    local_length, agreed_length, mismatch
+):
+    cc, op = controller(), operation()
+    engine = cc.staging_engine
+    digest = engine._identity([op.request_id, len(op.hash_value), *op.hash_value])
+
+    def reduce(states, reduction):
+        assert reduction == torch.distributed.ReduceOp.MIN
+        assert states.tolist() == [local_length, digest, -digest]
+        states[0] = agreed_length
+        if mismatch:
+            states[2] = -digest - 1
+
+    with mock.patch.object(engine, "_reduce_control", side_effect=reduce) as agreement:
+        if mismatch:
+            with pytest.raises(RuntimeError, match="identities differ"):
+                engine.align_prefetch_allocation(op, local_length)
+        else:
+            assert engine.align_prefetch_allocation(op, local_length) == agreed_length
+    agreement.assert_called_once()
 
 
 def test_backup_uses_native_fifo_and_cap_waits_for_scheduler_retirement():

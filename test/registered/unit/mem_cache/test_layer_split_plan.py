@@ -11,7 +11,6 @@ from sglang.srt.mem_cache.layer_split.layer_split_plan import (
     EXCHANGE_COMPONENTS,
     PageTransferPlan,
     PageWindow,
-    PlanSequencer,
     build_exchange_rounds,
     build_transfer_plan,
     page_owner,
@@ -42,14 +41,12 @@ def make_plan(
     page_count,
     *,
     op_id=1,
-    generation=0,
     window_base=0,
     request_id="req",
     shard_size=SHARD_SIZE,
 ):
     return build_transfer_plan(
         op_id=op_id,
-        generation=generation,
         request_id=request_id,
         page_hashes=make_hashes(page_count),
         staging_buffer_config=STAGING_BUFFER_CONFIG.with_host_layout(
@@ -108,7 +105,6 @@ class TestPlanConstruction(CustomTestCase):
         hashes = make_hashes(3)
         plan = build_transfer_plan(
             op_id=1,
-            generation=0,
             request_id="r",
             page_hashes=hashes,
             staging_buffer_config=STAGING_BUFFER_CONFIG,
@@ -119,7 +115,6 @@ class TestPlanConstruction(CustomTestCase):
     def test_window_base_defaults_to_the_request_rotation(self):
         plan = build_transfer_plan(
             op_id=5,
-            generation=0,
             request_id="req",
             page_hashes=make_hashes(8),
             staging_buffer_config=STAGING_BUFFER_CONFIG,
@@ -130,7 +125,6 @@ class TestPlanConstruction(CustomTestCase):
     def test_empty_plan_still_derives_a_base(self):
         plan = build_transfer_plan(
             op_id=1,
-            generation=0,
             request_id="req",
             page_hashes=[],
             staging_buffer_config=STAGING_BUFFER_CONFIG,
@@ -142,7 +136,6 @@ class TestPlanConstruction(CustomTestCase):
         with self.assertRaises(ValueError):
             PageTransferPlan(
                 op_id=1,
-                generation=0,
                 request_id="req",
                 page_hashes=("a", "b"),
                 page_owners=(0,),
@@ -157,7 +150,6 @@ class TestPlanDeterminism(CustomTestCase):
         # No window_base, so this exercises the production default.
         return build_transfer_plan(
             op_id=op_id,
-            generation=0,
             request_id=request_id,
             page_hashes=make_hashes(page_count),
             staging_buffer_config=STAGING_BUFFER_CONFIG,
@@ -276,44 +268,6 @@ class TestOwnership(CustomTestCase):
         self.assertNotEqual(tail_owner_zero, tail_owner_one)
 
 
-class TestRounds(CustomTestCase):
-    def test_round_count_is_set_by_the_busiest_owner(self):
-        plan = make_plan(PAGES_PER_WINDOW)
-        window = plan.windows()[0]
-        self.assertEqual(plan.rounds(window), PAGES_PER_WINDOW // SHARD_SIZE)
-
-    def test_partial_window_rounds_cover_the_busiest_owner(self):
-        plan = make_plan(30)
-        window = plan.windows()[0]
-        counts = plan.owner_page_counts()
-        self.assertEqual(plan.rounds(window), max(counts))
-
-    def test_rounds_are_enough_for_every_owner(self):
-        plan = make_plan(PAGES_PER_WINDOW + 13)
-        for window in plan.windows():
-            rounds = plan.rounds(window)
-            for rank in range(SHARD_SIZE):
-                self.assertLessEqual(len(plan.owned_ordinals(rank, window)), rounds)
-
-
-class TestPlanSequencer(CustomTestCase):
-    def test_op_ids_are_strictly_increasing(self):
-        seq = PlanSequencer()
-        ids = [seq.next_op_id() for _ in range(5)]
-        self.assertEqual(ids, sorted(set(ids)))
-        self.assertEqual(len(ids), len(set(ids)))
-
-    def test_generation_bump_changes_bookkeeping_epoch(self):
-        seq = PlanSequencer()
-        self.assertEqual(seq.generation, 0)
-        self.assertEqual(seq.bump_generation(), 1)
-        self.assertEqual(seq.generation, 1)
-
-    def test_rejects_negative_first_op_id(self):
-        with self.assertRaises(ValueError):
-            PlanSequencer(first_op_id=-1)
-
-
 class TestConsistencyWithLayerShard(CustomTestCase):
     def test_owner_layer_ranges_tile_all_layers(self):
         # The plan decides *which rank fetches a page*; the layer shard helper
@@ -337,29 +291,25 @@ class TestExchangeRounds(CustomTestCase):
         # Every rank contributes in every round, so each collective is balanced.
         self.assertTrue(all(r.is_full() for r in rounds))
 
-    def test_rounds_cover_each_page_exactly_once(self):
-        plan = make_plan(PAGES_PER_WINDOW + 21)
-        for window in plan.windows():
-            carried = [
-                p for r in build_exchange_rounds(plan, window) for p in r.pages()
-            ]
-            self.assertEqual(sorted(carried), list(window.ordinals()))
-
-    def test_each_rank_contributes_at_most_one_page_per_round(self):
-        plan = make_plan(PAGES_PER_WINDOW + 21)
-        for window in plan.windows():
-            for exchange_round in build_exchange_rounds(plan, window):
-                contributed = [p for p in exchange_round.contributions if p is not None]
-                self.assertEqual(len(contributed), len(set(contributed)))
-                self.assertEqual(len(exchange_round.contributions), SHARD_SIZE)
-
-    def test_contribution_is_always_owned_by_that_rank(self):
-        plan = make_plan(200)
-        for window in plan.windows():
-            for exchange_round in build_exchange_rounds(plan, window):
-                for rank, ordinal in enumerate(exchange_round.contributions):
-                    if ordinal is not None:
-                        self.assertEqual(plan.page_owners[ordinal], rank)
+    def test_rounds_cover_pages_once_with_the_correct_owners(self):
+        for count in (1, 3, 8, 17, 30, PAGES_PER_WINDOW, PAGES_PER_WINDOW + 21):
+            with self.subTest(page_count=count):
+                plan = make_plan(count)
+                for window in plan.windows():
+                    rounds = build_exchange_rounds(plan, window)
+                    busiest_owner = max(
+                        len(plan.owned_ordinals(rank, window))
+                        for rank in range(SHARD_SIZE)
+                    )
+                    self.assertEqual(plan.rounds(window), busiest_owner)
+                    self.assertEqual(len(rounds), busiest_owner)
+                    carried = [page for r in rounds for page in r.pages()]
+                    self.assertEqual(sorted(carried), list(window.ordinals()))
+                    for r in rounds:
+                        self.assertEqual(len(r.contributions), SHARD_SIZE)
+                        for rank, ordinal in enumerate(r.contributions):
+                            if ordinal is not None:
+                                self.assertEqual(plan.page_owners[ordinal], rank)
 
     def test_partial_window_lets_short_owners_idle(self):
         # 30 pages over 8 ranks -> 4 rounds; ranks owning only 3 idle in the last.
@@ -399,16 +349,6 @@ class TestExchangeRounds(CustomTestCase):
 
 
 class TestRoundEdges(CustomTestCase):
-    def test_short_rounds_cover_valid_pages_without_padding_pages(self):
-        for count in (1, 3, 8, 17, PAGES_PER_WINDOW):
-            plan = make_plan(count)
-            pages = [
-                p
-                for r in build_exchange_rounds(plan, plan.windows()[0])
-                for p in r.pages()
-            ]
-            self.assertEqual(sorted(pages), list(range(count)))
-
     def test_idle_owner_is_not_always_last(self):
         positions = set()
         for request_id in (f"req{i}" for i in range(32)):

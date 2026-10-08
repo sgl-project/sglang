@@ -33,7 +33,6 @@ from sglang.srt.mem_cache.layer_split.layer_split_host_view import LayerSplitHos
 from sglang.srt.mem_cache.layer_split.layer_split_plan import (
     EXCHANGE_COMPONENTS,
     PageTransferPlan,
-    PlanSequencer,
     build_exchange_rounds,
     build_transfer_plan,
 )
@@ -54,13 +53,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StagingPrefetchOp:
-    """Scheduler-visible result; finished only after the engine retires its I/O."""
+    """Local input/result of a serial prefetch; the native ACK publishes progress."""
 
     plan: PageTransferPlan
     host_indices: Any = field(default=None, repr=False)
     published_pages: int = 0
     truncation_reason: Optional[str] = None
-    is_finished: bool = False
 
 
 @dataclass
@@ -125,8 +123,6 @@ class LayerSplitTransferEngine:
             else None
         )
         self.stages: dict[int, _Stage] = {}
-        self._prefetch_sequencer = PlanSequencer()
-        self._prefetch_ops: dict[int, StagingPrefetchOp] = {}
         self.backup_ops_run = 0
         self.backup_pages_written = 0
         self.backup_pages_skipped = 0
@@ -235,9 +231,7 @@ class LayerSplitTransferEngine:
             ]
         operation.pool_transfers_done = False
 
-    def build_plan(
-        self, *, op_id, request_id, page_hashes: Sequence[str], generation=0
-    ):
+    def build_plan(self, *, op_id, request_id, page_hashes: Sequence[str]):
         """Both directions use the same full-page/window geometry.
 
         The controller supplies the already-admitted page list. Prefetch query
@@ -245,31 +239,10 @@ class LayerSplitTransferEngine:
         """
         return build_transfer_plan(
             op_id=op_id,
-            generation=generation,
             request_id=request_id,
             page_hashes=page_hashes,
             staging_buffer_config=self.staging_buffer_config,
         )
-
-    def next_prefetch_plan_ids(self):
-        return (
-            self._prefetch_sequencer.next_op_id(),
-            self._prefetch_sequencer.generation,
-        )
-
-    def prefetch_submit(self, plan, *, host_indices=None):
-        op = StagingPrefetchOp(plan, host_indices=host_indices)
-        self._prefetch_ops[plan.op_id] = op
-        return op
-
-    def reap_prefetch(self):
-        finished = [key for key, op in self._prefetch_ops.items() if op.is_finished]
-        for op_id in finished:
-            del self._prefetch_ops[op_id]
-        return len(finished)
-
-    def pending_prefetch_ops(self):
-        return [op for op in self._prefetch_ops.values() if not op.is_finished]
 
     def prefetch_run(self, op, *, stop_requested: Callable[[], bool] = lambda: False):
         with self._transfer_errors("prefetch"):
@@ -289,7 +262,6 @@ class LayerSplitTransferEngine:
                     if stop_agreed and window.index != len(windows) - 1:
                         op.truncation_reason = "aborted"
                         break
-            op.is_finished = True
             return op
 
     def backup_run(self, op, host_indices):
@@ -311,10 +283,6 @@ class LayerSplitTransferEngine:
             raise RuntimeError(
                 "Cannot reset/detach before backup completions are consumed"
             )
-        if self.pending_prefetch_ops():
-            raise RuntimeError(
-                "Cannot clean up shared staging with unfinished prefetches"
-            )
         if any(stage.active for stage in self.stages.values()):
             raise RuntimeError("Cannot clean up shared staging with active operations")
         self.pg_pool.assert_idle()
@@ -322,8 +290,6 @@ class LayerSplitTransferEngine:
     def reset(self):
         self.assert_idle()
         # Idle fixed buffers and live process groups are reused.
-        self._prefetch_ops.clear()
-        self._prefetch_sequencer.bump_generation()
         self._write_ack_stall_since = None
 
     def detach(self):
@@ -332,7 +298,6 @@ class LayerSplitTransferEngine:
         for stage in self.stages.values():
             stage.executor.shutdown(wait=True)
         self.stages.clear()
-        self._prefetch_ops.clear()
         self.pg_pool = None
         self.storage_backend = None
         self.host_view = None
@@ -583,22 +548,16 @@ class LayerSplitTransferEngine:
             hashlib.blake2b(payload, digest_size=8).digest(), "little"
         ) & ((1 << 63) - 1)
 
-    def align_prefetch_allocations(self, operations, lengths):
-        if not operations:
-            return lengths
-        values = []
-        for operation, length in zip(operations, lengths):
-            digest = self._identity(
-                [operation.request_id, len(operation.hash_value), *operation.hash_value]
-            )
-            values.extend((length, digest, -digest))
-        states = torch.tensor(values, dtype=torch.int64)
+    def align_prefetch_allocation(self, operation, length):
+        digest = self._identity(
+            [operation.request_id, len(operation.hash_value), *operation.hash_value]
+        )
+        states = torch.tensor([length, digest, -digest], dtype=torch.int64)
         self._reduce_control(states, torch.distributed.ReduceOp.MIN)
-        result = states.tolist()
-        for offset in range(0, len(result), 3):
-            if result[offset + 1] != -result[offset + 2]:
-                raise RuntimeError("Prefetch allocation identities differ across ranks")
-        return result[::3]
+        agreed_length, minimum_digest, negative_maximum_digest = states.tolist()
+        if minimum_digest != -negative_maximum_digest:
+            raise RuntimeError("Prefetch allocation identities differ across ranks")
+        return agreed_length
 
     def prefetch(self, operation):
         """Publish through the community ACK pipeline, never mutate scheduler progress.
@@ -607,15 +566,12 @@ class LayerSplitTransferEngine:
         even after a short GET or an agreed early stop. The native auxiliary
         worker supplies completed_req; its ACK consumer owns tail release.
         """
-        self.reap_prefetch()
-        op_id, generation = self.next_prefetch_plan_ids()
         plan = self.build_plan(
-            op_id=op_id,
-            generation=generation,
+            op_id=operation.id,
             request_id=operation.request_id,
             page_hashes=operation.hash_value,
         )
-        handle = self.prefetch_submit(plan, host_indices=operation.host_indices)
+        handle = StagingPrefetchOp(plan, host_indices=operation.host_indices)
         self.prefetch_run(handle, stop_requested=operation.is_terminated)
         self._controller.prefetch_sync_queue.put(
             PrefetchAck(
@@ -684,7 +640,6 @@ class LayerSplitTransferEngine:
         hashes = list(operation.hash_value or [])
         plan = self.build_plan(
             op_id=operation.id,
-            generation=0,
             request_id=f"backup:{len(hashes)}:{hashes[-1] if hashes else ''}",
             page_hashes=hashes,
         )

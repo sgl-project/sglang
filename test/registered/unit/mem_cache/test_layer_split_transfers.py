@@ -2,7 +2,6 @@
 
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
 from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
@@ -23,6 +22,7 @@ from sglang.srt.mem_cache.layer_split.layer_split_config import StagingBufferCon
 from sglang.srt.mem_cache.layer_split.layer_split_engine import (
     LayerSplitTransferEngine,
     StagingBackupOp,
+    StagingPrefetchOp,
 )
 from sglang.srt.mem_cache.layer_split.layer_split_host_view import LayerSplitShardView
 from sglang.srt.mem_cache.layer_split.layer_split_plan import EXCHANGE_COMPONENTS
@@ -41,9 +41,7 @@ register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 
 def _prefetch(engine, plan, indices, **kwargs):
-    return engine.prefetch_run(
-        engine.prefetch_submit(plan, host_indices=indices), **kwargs
-    )
+    return engine.prefetch_run(StagingPrefetchOp(plan, host_indices=indices), **kwargs)
 
 
 def _backup(engine, plan, indices):
@@ -248,7 +246,8 @@ def test_prefetch_finishes_l2_copy_before_starting_next_window(outcome):
             for window in range(windows)
             for kind in ("get", "exchange", "unpack")
         ]
-        assert result.published_pages == published and result.is_finished
+        assert result.published_pages == published
+        assert not engine.stages[PREFETCH].active
         for view in views.values():
             actual = torch.empty(
                 view.owned_layers * 2 * view.row_bytes, dtype=torch.uint8
@@ -336,19 +335,6 @@ def test_shared_backup_read_failures_skip_pages_and_continue_later_windows(
     finally:
         for stage in engine.stages.values():
             stage.executor.shutdown(wait=True)
-
-
-def test_common_window_size_must_be_page_aligned():
-    with pytest.raises(ValueError, match="multiple of page_size"):
-        LayerSplitTransferEngine(
-            storage_backend=None,
-            rank=0,
-            staging_buffer_config=replace(_config(), window_size=7),
-            layer_count=5,
-            exchange_ranks=[0, 1],
-            l2_pools={},
-            pin_memory=False,
-        )
 
 
 @pytest.mark.parametrize(
@@ -533,7 +519,7 @@ def test_failed_communication_keeps_fixed_buffer_and_work_references():
     engine.stages = {PREFETCH: stage}
     engine.pg_pool = mock.Mock(spec=["abort", "close", "assert_idle"])
     plan = engine.build_plan(op_id=1, request_id="fatal", page_hashes=["a"])
-    op = engine.prefetch_submit(plan)
+    op = StagingPrefetchOp(plan)
     with mock.patch("psutil.Process.send_signal") as signal:
         with pytest.raises(RuntimeError, match="collective"):
             with mock.patch.object(
@@ -543,8 +529,9 @@ def test_failed_communication_keeps_fixed_buffer_and_work_references():
     signal.assert_called_once()
     engine.pg_pool.abort.assert_called_once()
     assert stage.active and stage.works == [retained]
-    with pytest.raises(RuntimeError, match="unfinished prefetches"):
-        engine.detach()
+    for cleanup in (engine.reset, engine.detach):
+        with pytest.raises(RuntimeError, match="active operations"):
+            cleanup()
     engine.pg_pool.close.assert_not_called()
 
 
@@ -654,7 +641,9 @@ def _native_prefetch_ack_round_trip(engine, keys, indices, views, start, outcome
         dist.destroy_process_group(ack_group)
 
 
-def _worker(rank, rendezvous, objects, shards, layers, pages, indexer_layers):
+def _worker(
+    rank, rendezvous, objects, shards, layers, pages, indexer_layers, native_ack
+):
     torch.set_num_threads(1)
     signal_patch = mock.patch("psutil.Process.send_signal")
     signals = signal_patch.start()
@@ -805,13 +794,24 @@ def _worker(rank, rendezvous, objects, shards, layers, pages, indexer_layers):
             == pages
         )
         before = len(selected)
-        assert _prefetch(engine, build(8, []), indices).is_finished
+        assert _prefetch(engine, build(8, []), indices).published_pages == 0
         assert _backup(engine, build(9, []), indices).written_pages == 0
         assert len(selected) == before
-        for outcome in ("complete", "failed_get", "cancelled"):
-            _native_prefetch_ack_round_trip(
-                engine, keys, indices + pages * 2, views, start, outcome
-            )
+        # Layout/byte checks run for every shape. Exercise the native ACK
+        # lifecycle once, with multiple ranks and a rank owning no indexer layers.
+        if native_ack:
+            for outcome in ("complete", "failed_get", "cancelled"):
+                _native_prefetch_ack_round_trip(
+                    engine, keys, indices + pages * 2, views, start, outcome
+                )
+        # Reset needs no registry/epoch: idle fixed buffers and PGs are reused.
+        data_groups = tuple(engine.pg_pool.data_groups)
+        engine.reset()
+        assert tuple(engine.pg_pool.data_groups) == data_groups
+        assert (
+            _prefetch(engine, build(10, keys), indices + pages * 2).published_pages
+            == pages
+        )
         for lane, stage in engine.stages.items():
             assert not stage.active and not stage.works and stage.io is None
             assert {
@@ -829,16 +829,18 @@ def _worker(rank, rendezvous, objects, shards, layers, pages, indexer_layers):
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo unavailable")
 @pytest.mark.parametrize(
-    "shards,layers,pages,indexer_layers",
+    "shards,layers,pages,indexer_layers,native_ack",
     [
-        (1, 3, 9, None),
-        (2, 5, 9, None),
-        (3, 2, 5, None),
-        (2, 5, 7, (0, 3, 4)),
-        (2, 5, 7, (4,)),
+        (1, 3, 9, None, False),
+        (2, 5, 9, None, False),
+        (3, 2, 5, None, False),
+        (2, 5, 7, (0, 3, 4), False),
+        (2, 5, 7, (4,), True),
     ],
 )
-def test_shared_pg_round_trip(tmp_path, shards, layers, pages, indexer_layers):
+def test_shared_pg_round_trip(
+    tmp_path, shards, layers, pages, indexer_layers, native_ack
+):
     with mp.Manager() as manager:
         mp.spawn(
             _worker,
@@ -849,6 +851,7 @@ def test_shared_pg_round_trip(tmp_path, shards, layers, pages, indexer_layers):
                 layers,
                 pages,
                 indexer_layers,
+                native_ack,
             ),
             nprocs=shards,
             join=True,

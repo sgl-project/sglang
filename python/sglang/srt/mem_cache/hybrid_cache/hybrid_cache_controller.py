@@ -863,9 +863,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.staging_engine is not None:
             # Query hits are rank-agreed; local L2 allocation can still fail
             # or shorten under pressure. Agree before building any window plan.
-            agreed = self.staging_engine.align_prefetch_allocations(
-                [operation], [length if indices is not None else 0]
-            )[0]
+            agreed = self.staging_engine.align_prefetch_allocation(
+                operation, length if indices is not None else 0
+            )
             if indices is not None:
                 if agreed < min_tokens:
                     self.free_prefetch_host_buffers(operation, indices)
