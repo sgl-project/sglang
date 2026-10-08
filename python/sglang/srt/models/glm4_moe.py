@@ -82,6 +82,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    is_unused_nextn_checkpoint_weight,
+)
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -1059,6 +1062,9 @@ class Glm4MoeForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, is_nextn=False)
+
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -1135,25 +1141,10 @@ class Glm4MoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if nextn_layer_prefix and not name.startswith(nextn_layer_prefix):
-                    continue
-
+            if is_unused_nextn_checkpoint_weight(name, self.config, is_nextn):
+                continue
+            if is_nextn:
                 if nextn_layer_prefix is not None:  # mtp
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
-
                     is_decoder = True
                     # For nextn specific weights
                     for weight_name in nextn_spec_weight_names:

@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -114,6 +115,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_name,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
@@ -411,6 +413,13 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        is_unused_weight: Optional[Callable[[str], bool]] = None
+        """Optional model rule over original checkpoint names, before remapping.
+
+        True must mean the weight is unused. False may conservatively retain
+        extra weights; the model's load_weights still owns mapping and loading.
+        """
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -422,6 +431,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -591,6 +601,16 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _select_safetensors_files(self, source: Source, files: List[str]) -> List[str]:
+        # Prefixing and draft layer remapping happen after file iteration.
+        if (
+            source.is_unused_weight is None
+            or source.prefix
+            or self.load_config.draft_model_idx is not None
+        ):
+            return files
+        return filter_safetensors_files_by_weight_name(files, source.is_unused_weight)
+
     def _get_weights_iterator(
         self,
         source: Source,
@@ -616,6 +636,10 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_folder,
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
+                )
+            if use_safetensors:
+                hf_weights_files = self._select_safetensors_files(
+                    source, hf_weights_files
                 )
         else:
             hf_folder = resolved_source.hf_folder
@@ -785,6 +809,8 @@ class DefaultModelLoader(BaseModelLoader):
                     "model.safetensors.index.json",
                     source.model_config.hf_config,
                 )
+            if use_safetensors:
+                weight_files = self._select_safetensors_files(source, weight_files)
             resolved_sources.append(
                 DefaultModelLoader.ResolvedSource(
                     source=source,

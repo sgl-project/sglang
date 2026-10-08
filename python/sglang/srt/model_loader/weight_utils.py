@@ -744,6 +744,20 @@ def download_safetensors_index_file_from_hf(
             logger.debug("No %s found in local cache.", index_file)
 
 
+def filter_safetensors_files_by_weight_name(
+    hf_weights_files: List[str],
+    is_unused_weight: Callable[[str], bool],
+) -> List[str]:
+    """Keep shards containing a weight the model may load, using headers only."""
+    kept = []
+    for path in hf_weights_files:
+        with safetensors.safe_open(path, framework="pt") as weights:
+            if any(not is_unused_weight(name) for name in weights.keys()):
+                kept.append(path)
+    # Preserve the model's existing missing-weight validation on empty selection.
+    return kept or hf_weights_files
+
+
 # For models like Mistral-7B-v0.3, there are both sharded
 # safetensors files and a consolidated safetensors file.
 # Passing both of these to the weight loader functionality breaks.
