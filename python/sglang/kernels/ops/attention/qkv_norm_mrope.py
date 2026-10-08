@@ -71,7 +71,8 @@ def _rotate(x, y, c, s, upper, *, loc=None, ip=None):
 
 class _QKVNormMRopeEpilogue:
     def __init__(self, num_tokens):
-        self.iterations = num_tokens // 4
+        self.num_tokens = num_tokens
+        self.iterations = max(1, num_tokens // 4)
 
     @cute.experimental.jit
     def allocate_scratch(self, dtype: cutlass.Constexpr):
@@ -93,44 +94,45 @@ class _QKVNormMRopeEpilogue:
         qw, kw, rope, positions, axes, kc, vc, slots = ep
         for iteration in cutlass.range_constexpr(self.iterations):
             token = warp + iteration * 4
-            d = lane * 4
-            x0 = sE[d, token].to(cutlass.Float32)
-            x1 = sE[d + 1, token].to(cutlass.Float32)
-            x2 = sE[d + 2, token].to(cutlass.Float32)
-            x3 = sE[d + 3, token].to(cutlass.Float32)
-            scale = cutlass.Float32(1.0)
-            if head < 40:
-                scale = _norm_factor(x0, x1, x2, x3)
-            for component in cutlass.range_constexpr(4):
-                dim = d + component
-                value = sE[dim, token].to(cutlass.Float32)
+            if cutlass.const_expr(self.num_tokens >= 4) or token < self.num_tokens:
+                d = lane * 4
+                x0 = sE[d, token].to(cutlass.Float32)
+                x1 = sE[d + 1, token].to(cutlass.Float32)
+                x2 = sE[d + 2, token].to(cutlass.Float32)
+                x3 = sE[d + 3, token].to(cutlass.Float32)
+                scale = cutlass.Float32(1.0)
                 if head < 40:
-                    weight = cutlass.Float32(0.0)
-                    if head < 32:
-                        weight = qw[dim].to(cutlass.Float32)
-                    else:
-                        weight = kw[dim].to(cutlass.Float32)
-                    normalized = (
-                        _norm_value(value, scale, weight)
-                        .to(c_dtype)
-                        .to(cutlass.Float32)
-                    )
-                    partner = cute.arch.shuffle_sync_bfly(normalized, 16)
-                    pair_dim = dim % 64
-                    pos = positions[axes[pair_dim], token]
-                    cosine = rope[pos, pair_dim].to(cutlass.Float32)
-                    sine = rope[pos, pair_dim + 64].to(cutlass.Float32)
-                    value = _rotate(
-                        normalized, partner, cosine, sine, cutlass.Int32(lane >= 16)
-                    )
-                rounded = value.to(c_dtype)
-                gD_tile[dim, token] = rounded
-                slot = slots[token]
-                if head >= 32 and slot >= 0:
+                    scale = _norm_factor(x0, x1, x2, x3)
+                for component in cutlass.range_constexpr(4):
+                    dim = d + component
+                    value = sE[dim, token].to(cutlass.Float32)
                     if head < 40:
-                        kc[slot // 32, head - 32, slot % 32, dim] = rounded
-                    else:
-                        vc[slot // 32, head - 40, slot % 32, dim] = rounded
+                        weight = cutlass.Float32(0.0)
+                        if head < 32:
+                            weight = qw[dim].to(cutlass.Float32)
+                        else:
+                            weight = kw[dim].to(cutlass.Float32)
+                        normalized = (
+                            _norm_value(value, scale, weight)
+                            .to(c_dtype)
+                            .to(cutlass.Float32)
+                        )
+                        partner = cute.arch.shuffle_sync_bfly(normalized, 16)
+                        pair_dim = dim % 64
+                        pos = positions[axes[pair_dim], token]
+                        cosine = rope[pos, pair_dim].to(cutlass.Float32)
+                        sine = rope[pos, pair_dim + 64].to(cutlass.Float32)
+                        value = _rotate(
+                            normalized, partner, cosine, sine, cutlass.Int32(lane >= 16)
+                        )
+                    rounded = value.to(c_dtype)
+                    gD_tile[dim, token] = rounded
+                    slot = slots[token]
+                    if head >= 32 and slot >= 0:
+                        if head < 40:
+                            kc[slot // 32, head - 32, slot % 32, dim] = rounded
+                        else:
+                            vc[slot // 32, head - 40, slot % 32, dim] = rounded
 
 
 @cute.experimental.jit
@@ -166,7 +168,7 @@ def qkv_norm_mrope(
     *,
     out=None,
 ):
-    """Write exact M4/M8 BF16 QKV and HND page32 caches, or return None if unsupported.
+    """Write exact M1/M2/M4/M8 BF16 QKV and HND page32 caches, or return None if unsupported.
 
     Slots must be valid physical cache locations or negative padding sentinels.
     Positions and axis values must index the supplied rotary table. Buffers must
@@ -175,7 +177,7 @@ def qkv_norm_mrope(
     if (
         torch.compiler.is_compiling()
         or torch.is_grad_enabled()
-        or tuple(x.shape) not in ((4, 2560), (8, 2560))
+        or tuple(x.shape) not in ((1, 2560), (2, 2560), (4, 2560), (8, 2560))
     ):
         return None
     m = x.shape[0]

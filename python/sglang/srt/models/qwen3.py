@@ -214,7 +214,8 @@ class Qwen3Attention(nn.Module):
     def _try_qkv_norm_mrope(self, positions, hidden_states, forward_batch):
         if (
             not self.use_qkv_norm_mrope
-            or tuple(hidden_states.shape) not in ((4, 2560), (8, 2560))
+            or tuple(hidden_states.shape)
+            not in ((1, 2560), (2, 2560), (4, 2560), (8, 2560))
             or hidden_states.dtype != torch.bfloat16
             or not hidden_states.is_contiguous()
             or torch.is_grad_enabled()
@@ -290,7 +291,7 @@ class Qwen3Attention(nn.Module):
         return q, k, v, False
 
     def forward_prepare_native(self, positions, hidden_states, forward_batch):
-        if self.use_qkv_norm_mrope and hidden_states.shape[0] in (4, 8):
+        if self.use_qkv_norm_mrope and hidden_states.shape[0] in (1, 2, 4, 8):
             fused = self._try_qkv_norm_mrope(positions, hidden_states, forward_batch)
             if fused is not None:
                 return fused

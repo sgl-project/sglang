@@ -434,7 +434,7 @@ register_kernel(
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             in_place=True,
-            description="M4/M8 QKV projection, Q/K RMSNorm, MRoPE and HND page32 cache write.",
+            description="M1/M2/M4/M8 QKV projection, Q/K RMSNorm, MRoPE and HND page32 cache write.",
         ),
     )
 )
