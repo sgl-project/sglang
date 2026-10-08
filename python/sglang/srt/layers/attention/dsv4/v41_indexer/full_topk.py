@@ -10,7 +10,6 @@ import torch
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -24,11 +23,7 @@ from .scoring import (
     select_decode,
     write_prefill,
 )
-from .types import (
-    CapturedPrefillInputs,
-    DecodeInputs,
-    PrefillInputs,
-)
+from .types import CapturedPrefillInputs, DecodeInputs, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -156,7 +151,7 @@ class FullTopKIndexer:
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
         topk = min(indexer.index_topk, width)
-        for rows, plan in metadata.row_chunks():
+        for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
                 k_cache,
@@ -166,11 +161,15 @@ class FullTopKIndexer:
                 plan,
                 width,
             )
-            topk_transform_paged_torch(
+            topk_transform_paged_from_metadata(
                 logits,
-                lens[rows],
-                page_table[rows],
-                inputs.out_page_indices[rows, :topk],
-                page_size,
-                inputs.out_raw_indices[rows, :topk],
+                metadata,
+                inputs.out_page_indices[:, :topk],
+                inputs.out_raw_indices[:, :topk],
+                rows=rows,
+                topk_metadata=(
+                    metadata.topk_plan_for_chunk(chunk_idx, rows)
+                    if metadata.use_topk_v2
+                    else None
+                ),
             )

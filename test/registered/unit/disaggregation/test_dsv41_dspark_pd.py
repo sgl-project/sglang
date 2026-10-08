@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
-from sglang.srt.mem_cache.common import retraction_backup
+from sglang.srt.mem_cache.common import backup_kv_cache
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -158,14 +158,13 @@ class TestDSV41DSparkPD(CustomTestCase):
                 )
                 request_pool = Mock()
                 self.assertTrue(
-                    retraction_backup(
-                        req, Mock(), request_pool, allocator, "cpu_tensor"
-                    )
+                    backup_kv_cache(req, Mock(), request_pool, allocator, "cpu_tensor")
                 )
                 queue = SimpleNamespace(
                     token_to_kv_pool_allocator=allocator,
                     _check_if_req_exceed_kv_capacity=Mock(return_value=False),
                     _create_receiver_and_enqueue=Mock(),
+                    _init_receiver=Mock(),
                     _resolve_prefill_dp_rank=Mock(return_value=0),
                     retracted_queue=[],
                     pending_reqs=[],
