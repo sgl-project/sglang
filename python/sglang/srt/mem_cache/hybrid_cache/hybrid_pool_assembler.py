@@ -2164,6 +2164,18 @@ class _DsaStrategy(StackStrategy):
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
         host_pool_group = build_host_pool_group(config=config)
+        layer_split_options = {}
+        if kvcache.layer_shard_enabled:
+            if get_memory().enable_hicache_layer_split_staging:
+                from sglang.srt.mem_cache.layer_split.layer_split_config import (
+                    StagingBufferConfig,
+                )
+
+                layer_split_options["staging_buffer_config"] = (
+                    StagingBufferConfig.from_environment()
+                )
+            else:
+                layer_split_options["layer_split_direct"] = True
         cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
             host_pool_group,
@@ -2183,6 +2195,7 @@ class _DsaStrategy(StackStrategy):
             transfer_layer_id_max=kvcache.layer_num,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=get_memory().hicache_host_memory_mode,
+            **layer_split_options,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

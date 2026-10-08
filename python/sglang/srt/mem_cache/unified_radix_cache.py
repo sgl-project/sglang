@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+    StorageCoordination,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -171,6 +172,11 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    @property
+    def storage_coordination(self) -> Optional[StorageCoordination]:
+        # Runtime detach/attach replaces the engine; never retain the old one.
+        return getattr(self.cache_controller, "staging_engine", None)
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -1925,6 +1931,8 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        if operation_id is None:
+            return
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
@@ -3096,6 +3104,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
+            # BACKUP_ORDER_CONTRACT: rank-local FIFO preserves the same upstream
+            # operation sequence. Count-MIN agrees completion, not task identity.
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
@@ -3107,6 +3117,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                if self.storage_coordination is not None:
+                    self.storage_coordination.retire_backup(operation.id)
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -3360,6 +3372,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = finish_count_tensor.item()
+
+        if self.storage_coordination is not None:
+            self.storage_coordination.check_write_ack_progress(
+                self._count_ready_acks(cc.ack_write_queue), finish_count
+            )
 
         # Process completed acks
         while finish_count > 0:

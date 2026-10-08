@@ -96,6 +96,10 @@ class Memory(msgspec.Struct):
     # Hierarchical cache
     # -------------------------------------------------------------------------
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_hicache_layer_split_staging: A[
+        bool,
+        "Use shared full-page staging for LayerSplit L3 prefetch and backup.",
+    ] = False
     hicache_host_memory_mode: A[
         str,
         Arg(

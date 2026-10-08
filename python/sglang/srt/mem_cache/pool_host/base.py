@@ -363,6 +363,16 @@ class HostKVCache(abc.ABC):
         shard_size = device_pool.layer_shard_size
         return (device_pool.layer_num + shard_size - 1) // shard_size
 
+    def _storage_host_layer_ids(self):
+        """Persist owned layers, omitting equal-capacity LayerSplit padding."""
+        if not self._is_device_layer_sharded():
+            return range(self.layer_num)
+        lo, hi = self._device_owned_layer_range()
+        return [
+            *range(min(hi - lo, self.target_layer_num)),
+            *range(self.target_layer_num, self.layer_num),
+        ]
+
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         start, end = self._device_owned_layer_range(device_pool)
         return start <= layer_id < end

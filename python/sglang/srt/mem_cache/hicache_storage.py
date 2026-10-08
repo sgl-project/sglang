@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Set
 
 import torch
 
@@ -21,6 +21,36 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True)
+class LayerShardStorageSpec:
+    """Explicit rank-local object geometry, absent for canonical full pages."""
+
+    rank: int
+    size: int
+    layer_count: int
+    start: int
+    end: int
+
+    def __post_init__(self):
+        if not (
+            0 <= self.rank < self.size
+            and self.layer_count > 0
+            and 0 <= self.start <= self.end <= self.layer_count
+        ):
+            raise ValueError("Invalid LayerSplit storage shard geometry")
+
+    @property
+    def empty(self) -> bool:
+        return self.start == self.end
+
+    @property
+    def key_suffix(self) -> str:
+        return (
+            f"ls.v1.cp{self.rank}of{self.size}"
+            f".l{self.start}-{self.end}of{self.layer_count}"
+        )
 
 
 @dataclass
@@ -40,6 +70,8 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    external_buffer_pools: tuple[str, ...] = ()
+    layer_shard: Optional[LayerShardStorageSpec] = None
 
 
 @dataclass
@@ -118,6 +150,12 @@ class PoolTransfer:
     # Full IDs backing a dependent device allocation: resident tensors or
     # slices of the full rows allocated by this load, in transfer order.
     anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
+    buffer_pool_name: Optional[str] = None
+
+    @property
+    def physical_pool_name(self):
+        """Buffer registration name, independent of the logical object key."""
+        return self.buffer_pool_name or self.name
 
 
 @dataclass(frozen=True)
@@ -167,6 +205,14 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+class StorageCoordination(Protocol):
+    """Optional completion bookkeeping for collective storage I/O."""
+
+    def retire_backup(self, operation_id: int) -> None: ...
+
+    def check_write_ack_progress(self, ready_count: int, finish_count: int) -> None: ...
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
@@ -181,6 +227,17 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def _transfer_buffer_pool(self, transfer: PoolTransfer):
+        """Resolve v2 buffers for backends declaring external_buffer_pools."""
+        physical = transfer.physical_pool_name
+        if physical in self.external_buffer_pools:
+            raise ValueError(
+                f"{transfer.name} requires an explicit physical buffer binding"
+            )
+        if physical == PoolName.KV:
+            return self.mem_pool_host
+        return self.registered_pools[physical]
 
     def batch_exists_v2(
         self,

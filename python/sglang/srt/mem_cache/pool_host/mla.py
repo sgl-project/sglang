@@ -1175,7 +1175,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):
-                for layer_id in range(self.layer_num):
+                for layer_id in self._storage_host_layer_ids():
                     k_ptr = (
                         kv_buffer_data_ptr
                         + indices[index] * self.kv_cache_dim * self.dtype.itemsize
