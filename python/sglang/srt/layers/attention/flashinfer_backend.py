@@ -2369,6 +2369,29 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
 
+def _build_draft_indptr_host(
+    seq_lens_cpu: torch.Tensor, topk: int, num_steps: int
+) -> torch.Tensor:
+    """Mirror the draft kernel's prefix sums from resolved host lengths.
+
+    At draft entry, positions repeat each committed sequence length ``topk``
+    times. Step i adds i+1 tokens per branch. This also covers the graph
+    runner's padded rows, whose CPU lengths have already been filled.
+    """
+    assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
+    offsets = [0]
+    for length in seq_lens_cpu.tolist():
+        for _ in range(topk):
+            offsets.append(offsets[-1] + length)
+    return torch.tensor(
+        [
+            [offset + branch * (step + 1) for branch, offset in enumerate(offsets)]
+            for step in range(num_steps)
+        ],
+        dtype=torch.int32,
+    )
+
+
 class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
@@ -2447,8 +2470,22 @@ class FlashInferMultiStepDraftBackend:
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
         )
+        host_lengths = forward_batch.seq_lens_cpu
+        use_host_indptr = (
+            envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            and host_lengths is not None
+            and host_lengths.device.type == "cpu"
+            and host_lengths.numel() == num_seqs
+        )
+        # The existing token-block kernel copies every index, but distributes
+        # long contexts across CTAs instead of serially walking them in 3 CTAs.
+        num_blocks = (
+            min(32, max(1, (max(host_lengths.tolist(), default=0) + 511) // 512))
+            if use_host_indptr
+            else 1
+        )
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_blocks, num_seqs, self.topk)
         ](
             src.row_ids,
             src.ids,
@@ -2468,24 +2505,33 @@ class FlashInferMultiStepDraftBackend:
             ENTRY_PAGE_SIZE=src.entry_page_size,
             v2p=src.v2p,
             TRANSLATE=src.v2p is not None,
+            NUM_STEPS=self.speculative_num_steps if use_host_indptr else 0,
         )
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        # resolve_seq_lens_cpu already supplies the committed lengths after
+        # acceptance/rollback. Do not drain the GPU queue to read them again.
+        indptr_cpu_whole = (
+            _build_draft_indptr_host(
+                host_lengths, self.topk, self.speculative_num_steps
+            )
+            if use_host_indptr
+            else self.kv_indptr[:, : bs + 1].cpu()
+        )
         global global_override_indptr_cpu
-
-        for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
-            ]
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            call_fn(i, forward_batch)
-
-        global_override_indptr_cpu = None
+        previous_override = global_override_indptr_cpu
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
+                ]
+                global_override_indptr_cpu = indptr_cpu_whole[i]
+                call_fn(i, forward_batch)
+        finally:
+            global_override_indptr_cpu = previous_override
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
