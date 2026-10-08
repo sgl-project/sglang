@@ -383,7 +383,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
     def test_a_layer_gathered_over_moe_cp_does_not_fuse(self):
-        # Fusion skips finish_complete_output, which holds the CP scatter; a dense
+        # Fusion skips the exit's completion, which holds the CP scatter; a dense
         # layer gathered over the MoE-CP group (moe_dp_size == attn_cp_size) is
         # not caught by the is_enable_moe_cp_allgather gate.
         self.assertFalse(
@@ -521,7 +521,7 @@ class TestDeferFfnReduction(CustomTestCase):
             return communicator.output._defers_sum(
                 forward_batch,
                 communicator.output.plan.path_for(forward_batch),
-                mlp_reduce_scatter=reduce_scatter,
+                sum_in_reduce_scatter=reduce_scatter,
                 dp_step=step,
             )
 
