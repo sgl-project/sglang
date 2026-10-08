@@ -262,7 +262,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
-        device_hit_len = int(result.device_indices.numel())
+        device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
             return result
 
@@ -355,19 +355,18 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> request-private device slots ----
 
-    def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+    def load_back(self, req: Req) -> tuple[int, NodeId]:
         """Queue the external hit into device slots owned by ``req``.
 
-        The returned tail extends the request's prefix but stays out of the
+        The loaded tail extends the request's prefix but stays out of the
         tree (``req.last_node`` is unchanged): the request inserts it like
         computed KV after its forward, once :meth:`finish_loads` has confirmed
         the load.
         """
         cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
-            return empty_indices, req.last_node
+            return 0, req.last_node
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -386,7 +385,7 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
-                return empty_indices, req.last_node
+                return 0, req.last_node
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
@@ -407,7 +406,7 @@ class UnifiedCacheLinkerWrapper:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
-            return empty_indices, req.last_node
+            return 0, req.last_node
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -437,7 +436,7 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
-        return full_transfer.device_indices, req.last_node
+        return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
         self,

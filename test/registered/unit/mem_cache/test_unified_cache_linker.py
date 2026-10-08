@@ -394,18 +394,19 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.device_prefix_len, 0)
         self.assertEqual(match.host_hit_length, len(tokens))
         self._apply_match_to_req(req, match)
 
-        loaded, loaded_node = consumer.init_load_back(
+        loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), len(tokens))
+        self.assertEqual(loaded_len, len(tokens))
+        loaded = consumer.linker.private_load_indices[req.rid]
         # The tail is request-private: nothing is published until it lands.
         self.assertEqual(loaded_node, req.last_node)
         (kv_load,) = consumer_linker.queued_loads[req.rid]
@@ -421,7 +422,11 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertTrue(torch.equal(final_match.device_indices, loaded))
+        self.assertTrue(
+            torch.equal(
+                consumer.path_device_indices(final_match.last_device_node), loaded
+            )
+        )
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
@@ -463,7 +468,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(MatchPrefixParams(key=lookup_key, req=req))
 
         self.assertTrue(lookup_key.is_bigram)
-        self.assertEqual(match.device_indices.numel(), 4)
+        self.assertEqual(match.device_prefix_len, 4)
         self.assertEqual(match.host_hit_length, 4)
         self.assertEqual(len(consumer_linker.lookup_calls), 1)
         _, transfers = consumer_linker.lookup_calls[0]
@@ -580,7 +585,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
         )
-        self.assertEqual(match.device_indices.numel(), 2)
+        self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
         self.assertEqual(match.swa_host_hit_length, 2)
         self._apply_match_to_req(req, match)
@@ -589,16 +594,19 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         raced_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens[:3])))
         )
-        raced_full = raced_match.device_indices[-1:].clone()
+        raced_full = consumer.path_device_indices(raced_match.last_device_node)[
+            -1:
+        ].clone()
 
-        loaded, loaded_node = consumer.init_load_back(
+        loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
                 best_match_node=match.best_match_node,
                 host_hit_length=match.host_hit_length,
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), 2)
+        self.assertEqual(loaded_len, 2)
+        loaded = consumer.linker.private_load_indices[req.rid]
         load_by_pool = {
             transfer.name: transfer
             for transfer in consumer_linker.queued_loads[req.rid]
@@ -624,8 +632,17 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
             # The raced page stays; the request's duplicate of it is freed.
-            self.assertTrue(torch.equal(final.device_indices[2:3], raced_full))
-            self.assertTrue(torch.equal(final.device_indices[3:], loaded[1:]))
+            self.assertTrue(
+                torch.equal(
+                    consumer.path_device_indices(final.last_device_node)[2:3],
+                    raced_full,
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    consumer.path_device_indices(final.last_device_node)[3:], loaded[1:]
+                )
+            )
         else:
             consumer_linker.load_landed = False
             self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
@@ -638,7 +655,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             unpublished = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
-            self.assertEqual(unpublished.device_indices.numel(), 3)
+            self.assertEqual(unpublished.device_prefix_len, 3)
         consumer.sanity_check()
 
 
@@ -1156,9 +1173,11 @@ def full_linker_component():
         return PoolTransfer(
             name=PoolName.KV,
             keys=keys,
-            device_indices=None
-            if phase == LinkerTransferPhase.LOOKUP
-            else torch.arange(len(keys) * 2),
+            device_indices=(
+                None
+                if phase == LinkerTransferPhase.LOOKUP
+                else torch.arange(len(keys) * 2)
+            ),
         )
 
     return SimpleNamespace(
@@ -1196,7 +1215,7 @@ def test_linker_filters_request_relative_swa_from_lookup(
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     assert wrapper._components == (full,)
     result = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=0,
         last_host_node=0,
         best_match_node=0,
@@ -1309,11 +1328,6 @@ def test_linker_load_preserves_swa_boundaries(
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
         token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
-        tree_core=SimpleNamespace(
-            empty_match_result=SimpleNamespace(
-                device_indices=torch.empty(0, dtype=torch.int64)
-            ),
-        ),
         insert=MagicMock(side_effect=AssertionError("the tail must stay private")),
     )
     backend = _FakeLinker()
@@ -1339,17 +1353,19 @@ def test_linker_load_preserves_swa_boundaries(
         priority=0,
         swa_branching_seqlen=2,  # inside the loaded tail
     )
-    restored, last_node = wrapper.load_back(req)
+    restored_len, last_node = wrapper.load_back(req)
 
     assert last_node == 0
     if load_refused:
         # Refused before PREPARE: allocations undone, request untouched, recompute.
-        assert restored.numel() == 0 and req.kv is kv
+        assert restored_len == 0 and req.kv is kv
         assert wrapper.inflight_load_rids == []
         assert wrapper.private_load_indices == {}
         phases = [c.args[0] for c in swa.update_external_linker_load.call_args_list]
         assert phases == ([ExternalLinkerLoadPhase.ABORT] if participates else [])
         return
+    assert restored_len == 4
+    restored = wrapper.private_load_indices["rid"]
     assert restored.tolist() == list(range(4))
     assert wrapper.inflight_load_rids == ["rid"]
     assert torch.equal(wrapper.private_load_indices["rid"], restored)

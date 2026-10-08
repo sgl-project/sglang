@@ -57,6 +57,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    # Default VSA-H3 sparsity; --attention-backend-config VSA_sparsity overrides.
+    vsa_sparsity: float = 0.9
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
@@ -333,16 +335,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+    """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
+
+    # The checkpoint's trained sparsity (fastvideo_inference.json).
+    vsa_sparsity: float = 0.8
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
+        self.vae_config.stack_tiling = True
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
-            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
-            'audited high-quality deployment. Use quality="exact".'
+            "4xH200 deployment; FastH3 has no audited high-quality deployment. "
+            'Use quality="exact", or the default "lossless".'
         )
 
     def validate_server_args(self, server_args) -> None:
@@ -383,7 +389,7 @@ def register():
         sampling_param_cls=FastH3SamplingParams,
         pipeline_config_cls=FastH3PipelineConfig,
         hf_model_paths=[
-            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+            "FastVideo/FastVideo-FastH3-8-Step-V2",
         ],
         model_detectors=[
             lambda model_id: (
