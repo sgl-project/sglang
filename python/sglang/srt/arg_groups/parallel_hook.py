@@ -768,8 +768,9 @@ def handle_fault_tolerance(server_args: Any):
     cfg = resolving_view(server_args)
     if not cfg.enable_fault_tolerance:
         return
-    assert cfg.dp_size > 1, "Fault tolerance requires --dp-size greater than 1."
-    assert cfg.enable_dp_attention, "Fault tolerance requires --enable-dp-attention."
+    assert cfg.attn_dp_size > 1, (
+        "Fault tolerance requires --attn-dp-size greater than 1."
+    )
     assert cfg.disaggregation_mode == "null", (
         "Fault tolerance does not support disaggregation."
     )

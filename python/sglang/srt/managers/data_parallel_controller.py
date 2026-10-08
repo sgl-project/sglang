@@ -179,7 +179,9 @@ class DataParallelController:
                 # Recover uses private ports, but FT reports go to the primary.
                 primary_addr = NetworkAddress.parse(get_parallel().dist_init_addr)
                 num_derived_ports = (
-                    6 + get_parallel().dp_size if envs.SGLANG_RUST_SERVER.get() else 6
+                    6 + get_parallel().num_dp_ranks
+                    if envs.SGLANG_RUST_SERVER.get()
+                    else 6
                 )
                 primary_port = (
                     primary_addr.port - num_derived_ports - 1

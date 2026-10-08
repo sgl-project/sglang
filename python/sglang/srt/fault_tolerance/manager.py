@@ -60,7 +60,7 @@ class FaultToleranceManager:
         self.send_to_watchdog: Dict[int, zmq.asyncio.Socket] = {}
         self._watchdog_endpoints: Dict[int, str] = {}
         self.state = FaultToleranceState(
-            dp_size=server_args.dp_size,
+            dp_size=server_args.num_dp_ranks,
             strategy=server_args.fault_tolerance_on_error_strategy,
             global_rank_count=server_args.tp_size,
         )
@@ -71,7 +71,7 @@ class FaultToleranceManager:
         self._shutdown_waiter: Optional[Tuple[set[int], asyncio.Future]] = None
         self._watchdog_leases: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
         self._watchdog_lease_task: Optional[asyncio.Task] = None
-        self._route_dp_mask = [True] * server_args.dp_size
+        self._route_dp_mask = [True] * self.state.dp_size
         self._last_ft_request_id: Optional[str] = None
         self._ft_error: Optional[str] = None
 
