@@ -46,13 +46,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
-from sglang.srt.utils import (
-    envs,
-    is_cpu,
-    is_npu,
-    is_xpu,
-    logger,
-)
+from sglang.srt.utils import envs, is_cpu, is_npu, is_xpu, logger
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
