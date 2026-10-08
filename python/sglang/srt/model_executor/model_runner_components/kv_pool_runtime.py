@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
@@ -17,32 +16,42 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_mm,
+    get_parallel,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
 
 def is_post_capture_kv_active(
-    *, server_args: ServerArgs, is_draft_worker: bool
+    *,
+    server_args: ServerArgs,
+    is_draft_worker: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
 ) -> bool:
-
-    return (
-        post_capture_kv_sizing_planned(server_args)
-        and current_platform.is_cuda()
-        and not is_draft_worker
-    )
+    if is_draft_worker:
+        # A dflash-family draft pool is indexed by the target's token ids, so it
+        # follows the target pool's post-capture backing.
+        return (
+            spec_algorithm.is_dflash_family()
+            and token_to_kv_pool_allocator.get_kvcache().post_capture_active
+        )
+    return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()
 
 
 class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     full_max_total_num_tokens: Optional[int]
     swa_max_total_num_tokens: Optional[int]
+    unified_memory_pool_bytes: Optional[int]
     capped_max_running_requests: Optional[int]
 
 
@@ -59,8 +68,8 @@ def compute_post_capture_kv_resize(
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_world_group().world_size > 1,
-        cpu_group=get_world_group().cpu_group,
+        distributed=get_parallel().launch_world_size > 1,
+        cpu_group=get_parallel().world_group.cpu_group,
     )
     headroom_gb = model_runner.pre_model_load_memory * (
         1 - model_runner.mem_fraction_static
@@ -108,15 +117,26 @@ def compute_post_capture_kv_resize(
         ),
         default=0,
     )
+    # Drafts take the target's token count; the target cell already charges their
+    # bytes. A draft that aliases the target pool is finalized once, as the target.
+    draft_pools = tuple(
+        runner.token_to_kv_pool
+        for runner in draft_runners
+        if runner.token_to_kv_pool is not pool
+        and runner.token_to_kv_pool.post_capture_active
+    )
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
+        + sum(draft_pool.post_capture_backed_bytes for draft_pool in draft_pools)
         - canary_workspace_bytes
     )
     config = model_runner.kv_cache_configurator.config_from_budget(
         budget_bytes, cap_tokens=model_runner.max_total_num_tokens
     )
     pool.finalize_backing(config)
+    for draft_pool in draft_pools:
+        draft_pool.finalize_backing(config)
     model_runner.token_to_kv_pool_allocator.resize(config)
     model_runner.req_to_token_pool.reset_aux_cache_allocator()
     if canary_workspace_bytes:
@@ -165,9 +185,18 @@ def compute_post_capture_kv_resize(
         pool.post_capture_backed_bytes / (1 << 30),
         get_available_gpu_memory(model_runner.device, model_runner.gpu_id),
     )
+    for draft_pool in draft_pools:
+        logger.info(
+            "Post-capture KV sizing: draft KV cache allocated. dtype: %s, "
+            "#tokens: %d, KV size: %.2f GB",
+            draft_pool.dtype,
+            draft_pool.size,
+            draft_pool.post_capture_backed_bytes / (1 << 30),
+        )
     return PostCaptureKVResize(
         max_total_num_tokens=config.max_total_num_tokens,
         full_max_total_num_tokens=config.full_max_total_num_tokens,
         swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        unified_memory_pool_bytes=config.unified_memory_pool_bytes,
         capped_max_running_requests=capped_max_running_requests,
     )

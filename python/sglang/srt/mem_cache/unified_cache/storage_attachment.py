@@ -14,9 +14,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -73,6 +75,23 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
+        # Write-back can retain auxiliary host rows without FULL, or backed
+        # descendants below an unbacked FULL ancestor. Those states are invalid
+        # for write-through insertion and eviction. Check before changing any
+        # policy, including on the same-backend update and re-attach paths.
+        if (
+            cache.is_write_back
+            and cache.host_memory_mode != "buffer_only"
+            and hicache_write_policy in ("write_through", "write_through_selective")
+            and not cache.tree_core.is_write_through_compatible()
+        ):
+            return (
+                False,
+                "Cannot switch HiCache from write_back to write_through while "
+                "the cache has host data without its FULL prefix. "
+                "Flush the cache before changing the write policy.",
+            )
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:
@@ -89,10 +108,6 @@ class StorageAttachment:
                 "HiCache storage backend already enabled with same backend; "
                 "policies updated.",
             )
-
-        # Apply policies before the controller attach, so the storage threads
-        # observe the new values as soon as they start.
-        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
 
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
@@ -113,7 +128,23 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        original_policies = (
+            cache.prefetch_stop_policy,
+            controller.write_policy,
+            cache.write_through_threshold,
+            cache.is_write_back,
+        )
         try:
+            prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
+            if cache.host_memory_mode == "buffer_only":
+                validate_buffer_only_stack(
+                    sidecar_pool_specs=cache.sidecar_pool_specs,
+                    host_pool_group=cache.host_pool_group,
+                    swa_component=cache.components.get(ComponentType.SWA),
+                    storage_prefetch_threshold=prefetch_threshold,
+                )
+            # New workers must see the requested policy from their first operation.
+            self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
             controller.attach_storage_backend(
                 storage_backend=storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -122,6 +153,12 @@ class StorageAttachment:
                 host_pools=controller.mem_pool_host.entries,
             )
         except Exception as e:
+            (
+                cache.prefetch_stop_policy,
+                controller.write_policy,
+                cache.write_through_threshold,
+                cache.is_write_back,
+            ) = original_policies
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
@@ -253,6 +290,16 @@ class StorageAttachment:
         else:
             cache.storage_metrics_collector = None
 
+    def resolve_prefetch_threshold(self, configured: int) -> int:
+        """Use the same complete-window minimum for every buffer-mode anchor."""
+        cache = self._cache
+        window = cache.sliding_window_size
+        if not window or cache.host_memory_mode != "buffer_only":
+            return configured
+        page_size = cache.page_size
+        window_tokens = ((window + page_size - 1) // page_size) * page_size
+        return max(configured, window_tokens)
+
     def _resolve_metrics_collector(
         self,
         storage_backend: Optional[str],
@@ -265,13 +312,14 @@ class StorageAttachment:
         """
         cache = self._cache
         controller = cache.cache_controller
+        config = controller.storage_config
         attn_cp_rank, attn_cp_size = controller.get_attn_cp_rank_and_size()
         labels = {
             "storage_backend": storage_backend,
-            "tp_rank": controller.tp_rank,
-            "dp_rank": controller.dp_rank,
-            "pp_rank": controller.pp_rank,
-            "pp_size": controller.pp_size,
+            "tp_rank": config.tp_rank,
+            "dp_rank": config.dp_rank,
+            "pp_rank": config.pp_rank,
+            "pp_size": config.pp_size,
             "attn_cp_rank": attn_cp_rank,
             "attn_cp_size": attn_cp_size,
         }
@@ -364,39 +412,27 @@ class StorageAttachment:
         cache = self._cache
         controller = cache.cache_controller
 
-        for req_id in list(cache.ongoing_prefetch):
-            info = cache.ongoing_prefetch[req_id]
+        for handle in list(cache.ongoing_prefetch):
+            info = cache.ongoing_prefetch[handle]
             try:
-                cache.discard_storage_prefetch_accounting(req_id)
+                cache.discard_storage_prefetch_accounting(handle)
                 if info.host_indices is None:
                     # Host pages were never allocated for this operation.
-                    cache.revoke_pending_prefetch(req_id)
+                    cache.revoke_pending_prefetch(handle)
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
-                del cache.ongoing_prefetch[req_id]
-                if info.anchor_lock_params is not None:
-                    cache.dec_host_lock_ref(
-                        info.anchor_node_id, info.anchor_lock_params
-                    )
-                if cache.buffer_pipeline is not None:
-                    cache.buffer_pipeline.pop_prefix_ctx(req_id)
-                    cache.buffer_pipeline.release_anchor_lock(req_id)
-                controller.append_host_mem_release(
-                    host_indices=info.host_indices[:completed_tokens],
-                    extra_pools=[
-                        x for xfers in info.comp_xfers.values() for x in xfers
-                    ],
-                )
-                controller.prefetch_tokens_occupied = max(
-                    0,
-                    controller.prefetch_tokens_occupied
-                    - cache._prefetch_occupied_span(
-                        info.prefetch_key, info.host_indices
+                cache._retire_ongoing_prefetch(
+                    handle,
+                    info.host_indices[:completed_tokens],
+                    (
+                        [x for xfers in info.comp_xfers.values() for x in xfers]
+                        if info.operation.pool_transfers_done
+                        else None
                     ),
                 )
             except Exception:
-                logger.exception("Failed to release pending prefetch %s", req_id)
-                cache.ongoing_prefetch.pop(req_id, None)
+                logger.exception("Failed to release pending prefetch %s", handle.rid)
+                cache.ongoing_prefetch.pop(handle, None)
 
         for ack_id in list(cache.ongoing_backup):
             node_id, lock_params = cache.ongoing_backup.pop(ack_id)
@@ -405,7 +441,8 @@ class StorageAttachment:
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
 
-        for req_id in list(cache._storage_prefetch_hit_remaining_by_reqid):
-            cache.discard_storage_prefetch_accounting(req_id)
+        for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
+            cache.discard_storage_prefetch_accounting(handle)
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
+        cache.storage_prefetch_retries.clear()

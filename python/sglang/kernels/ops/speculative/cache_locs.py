@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import triton
 import triton.language as tl
@@ -25,7 +27,15 @@ if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
 
 
-@triton.jit
+def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.is_out_of_tree():
+        return None
+    return current_platform.get_speculative_cache_locs_fn()
+
+
+@triton.jit(do_not_specialize=["BS"])
 def assign_draft_cache_locs_contiguous(
     req_pool_indices,
     req_to_token,
@@ -34,6 +44,11 @@ def assign_draft_cache_locs_contiguous(
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
+    positions=None,
+    mrope=None,
+    BS=0,
+    WRITE_POSITIONS: tl.constexpr = False,
+    WRITE_MROPE: tl.constexpr = False,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
@@ -51,6 +66,51 @@ def assign_draft_cache_locs_contiguous(
         data = tl.load(token_pool + kv_start + copy_offset, mask=mask)
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
+    if WRITE_POSITIONS:
+        topk_offset = tl.arange(0, BLOCK_SIZE)
+        tl.store(positions + pid * topk + topk_offset, kv_start, topk_offset < topk)
+        if WRITE_MROPE:
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope + axis * BS * topk + pid * topk + topk_offset,
+                    kv_start,
+                    topk_offset < topk,
+                )
+
+
+@triton.jit
+def _translate_token_ids(ids, v2p, mask, page_size: tl.constexpr):
+    """Virtual token ids -> physical ones through the page-level v2p table,
+    as `translate_kv_loc` does. A negative id maps to the page-0 sink instead
+    of loading before `v2p`."""
+    i64 = ids.to(tl.int64)
+    vpage = tl.where(i64 < 0, 0, i64 // page_size)
+    phys = tl.load(v2p + vpage, mask=mask, other=0)
+    return tl.where(i64 < 0, 0, tl.maximum(phys * page_size + i64 % page_size, 0))
+
+
+@triton.jit
+def _load_token_ids(
+    row_ptr,
+    pos,
+    mask,
+    v2p,
+    page_size: tl.constexpr,
+    ENTRY_PAGE_SIZE: tl.constexpr,
+    TRANSLATE: tl.constexpr,
+):
+    """Token ids at positions ``pos`` of one read-source row: the row's own
+    entries when token-granular, ``entry * ps + pos % ps`` when page-granular;
+    with ``TRANSLATE``, virtual ids mapped through ``v2p`` on the way out."""
+    if ENTRY_PAGE_SIZE == 1:
+        ids = tl.load(row_ptr + pos, mask=mask)
+    else:
+        entry = tl.load(row_ptr + pos // ENTRY_PAGE_SIZE, mask=mask, other=0)
+        ids = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
+    if TRANSLATE:
+        ids = _translate_token_ids(ids, v2p, mask, page_size)
+    return ids
+
 
 @triton.jit
 def generate_draft_decode_kv_indices(
@@ -60,23 +120,25 @@ def generate_draft_decode_kv_indices(
     kv_indices,
     kv_indptr,
     positions,
-    pool_len: tl.constexpr,
+    # Runtime, not constexpr: the unified pool's read table is as wide as the
+    # iteration's longest row, so a constexpr stride would recompile per width.
+    row_stride,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
     bs_upper: tl.constexpr,
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    window_size: tl.constexpr = 0,
+    sink_size: tl.constexpr = 0,
     NUM_STEPS: tl.constexpr = 0,
+    ENTRY_PAGE_SIZE: tl.constexpr = 1,
+    # The source's page table (`KVIndexTable.v2p`), applied with TRANSLATE.
+    v2p=None,
+    TRANSLATE: tl.constexpr = False,
 ):
-    # Optional token-block parallelism (NUM_STEPS > 0): the first grid axis
-    # packs (draft step, token block) as ``step + NUM_STEPS * block``,
-    # spreading the per-request index copy below over many programs instead
-    # of one program crawling the whole context serially (which bottlenecks
-    # long-context spec decode, where this kernel runs every iteration).
-    # NUM_STEPS == 0 (default) is the historical one-program-per-step kernel:
-    # the same 128-wide copy loop, in the same order, with the token-block
-    # branches folded away at compile time.
+    # window_size > 0 restricts the draft (not the target) to sink_size prefix
+    # tokens + the most-recent window_size; window_size == 0 is the identity.
     BLOCK_SIZE: tl.constexpr = 128 if NUM_STEPS == 0 else 512
     pid0 = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
@@ -98,57 +160,70 @@ def generate_draft_decode_kv_indices(
     kv_indptr += kv_indptr_stride * iters
     iters += 1
 
-    if NUM_STEPS == 0:
-        load_offset = tl.arange(0, bs_upper)
-        seq_lens = tl.load(
-            paged_kernel_lens + load_offset, mask=load_offset < bid, other=0
-        )
-        seq_len = tl.load(paged_kernel_lens + bid)
-        cum_seq_len = tl.sum(seq_lens)
+    load_offset = tl.arange(0, bs_upper)
+    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
+    seq_len = tl.load(paged_kernel_lens + bid)
+    if window_size > 0:
+        cap = window_size + sink_size
+        seq_lens = tl.minimum(seq_lens, cap)
+        seq_len_w = tl.minimum(seq_len, cap)
+        s_eff = tl.minimum(sink_size, seq_len)
+        recent_start = seq_len - (seq_len_w - s_eff)
     else:
-        seq_len = tl.load(paged_kernel_lens + bid)
-        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-        # Blocks with no copy work exit before the O(bs) prefix-sum below;
-        # block 0 always continues (it owns the extension and kv_indptr).
-        if blk >= num_loop and blk > 0:
-            return
-        load_offset = tl.arange(0, bs_upper)
-        seq_lens = tl.load(
-            paged_kernel_lens + load_offset, mask=load_offset < bid, other=0
-        )
-        cum_seq_len = tl.sum(seq_lens)
+        seq_len_w = seq_len
+        s_eff = 0
+        recent_start = 0
+    cum_seq_len = tl.sum(seq_lens)
 
     # Update kv_indices
-    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
+    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len_w + iters)
     kv_ptr = kv_indices + kv_offset
-    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * row_stride
 
+    num_loop = tl.cdiv(seq_len_w, BLOCK_SIZE)
+    if NUM_STEPS != 0 and blk >= num_loop and blk > 0:
+        return
     if NUM_STEPS == 0:
-        kv_offset = tl.arange(0, BLOCK_SIZE)
-        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+        copy_offset = tl.arange(0, BLOCK_SIZE)
         for _ in range(num_loop):
-            mask = kv_offset < seq_len
-            data = tl.load(token_pool_ptr + kv_offset, mask=mask)
-            tl.store(kv_ptr + kv_offset, data, mask=mask)
-            kv_offset += BLOCK_SIZE
+            mask = copy_offset < seq_len_w
+            src = tl.where(
+                copy_offset < s_eff,
+                copy_offset,
+                recent_start + copy_offset - s_eff,
+            )
+            data = _load_token_ids(
+                token_pool_ptr, src, mask, v2p, page_size, ENTRY_PAGE_SIZE, TRANSLATE
+            )
+            tl.store(kv_ptr + copy_offset, data, mask=mask)
+            copy_offset += BLOCK_SIZE
     else:
         for i in range(blk, num_loop, num_blk):
-            tok_off = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = tok_off < seq_len
-            data = tl.load(token_pool_ptr + tok_off, mask=mask)
-            tl.store(kv_ptr + tok_off, data, mask=mask)
+            copy_offset = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = copy_offset < seq_len_w
+            src = tl.where(
+                copy_offset < s_eff,
+                copy_offset,
+                recent_start + copy_offset - s_eff,
+            )
+            data = _load_token_ids(
+                token_pool_ptr, src, mask, v2p, page_size, ENTRY_PAGE_SIZE, TRANSLATE
+            )
+            tl.store(kv_ptr + copy_offset, data, mask=mask)
 
     # Extension entries and kv_indptr belong to token block 0 alone; other
     # blocks neither compute nor store them.
     if blk == 0:
         extend_offset = tl.arange(0, iter_upper)
         if page_size == 1 or topk == 1:
-            extend_data = tl.load(
-                token_pool_ptr
-                + seq_len
-                + topk_id * num_steps
-                + tl.arange(0, iter_upper),
-                mask=extend_offset < iters,
+            extend_data = _load_token_ids(
+                token_pool_ptr,
+                seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
+                extend_offset < iters,
+                v2p,
+                page_size,
+                ENTRY_PAGE_SIZE,
+                TRANSLATE,
             )
         else:
             prefix_len = seq_len
@@ -162,24 +237,30 @@ def generate_draft_decode_kv_indices(
                 + topk_id * num_new_pages_per_topk * page_size
                 + last_page_len
             )
-            extend_data = tl.load(
-                token_pool_ptr + start + extend_offset,
-                mask=extend_offset < iters,
+            extend_data = _load_token_ids(
+                token_pool_ptr,
+                start + extend_offset,
+                extend_offset < iters,
+                v2p,
+                page_size,
+                ENTRY_PAGE_SIZE,
+                TRANSLATE,
             )
 
         tl.store(
-            kv_ptr + seq_len + extend_offset,
+            kv_ptr + seq_len_w + extend_offset,
             extend_data,
             mask=extend_offset < iters,
         )
 
         # Update kv_indptr
         bs_offset = tl.arange(0, num_tokens_upper)
-
         zid = bid * topk + topk_id
         if zid == 0:
             zid = num_seqs * topk
         pos_vals = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+        if window_size > 0:
+            pos_vals = tl.minimum(pos_vals, window_size + sink_size)
         base = tl.sum(pos_vals)
         tl.store(kv_indptr + zid, base + zid * iters)
 
@@ -489,6 +570,18 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
+    platform_fn = _get_oot_speculative_cache_locs_fn()
+    if platform_fn is not None:
+        return platform_fn(
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),

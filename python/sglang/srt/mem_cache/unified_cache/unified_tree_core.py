@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
@@ -127,6 +128,10 @@ class UnifiedTreeNode:
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
+        # T-LRU only (0 under other policies): tokens root -> self, and the
+        # branch's high-water depth, which survives tail trimming.
+        self._tlru_cached_prefix_len = 0
+        self._tlru_history_len = 0
         self.external_cache_stored = False
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -180,6 +185,28 @@ class UnifiedTreeNode:
             chunks.append(node.hash_value)
             node = node.parent
         return [value for chunk in reversed(chunks) for value in chunk]
+
+
+def _set_tlru_lens_and_raise_history(
+    node: UnifiedTreeNode, parent: UnifiedTreeNode
+) -> None:
+    """Record a new node's path depth and raise the branch high-water mark.
+
+    The walk stops early only at an ancestor whose subtree already reached this
+    depth (e.g. under a deeper sibling); a conversation that keeps setting a new
+    high-water mark walks its whole root path, so an insert costs O(path nodes)
+    in the worst case. The path length is bounded by the number of node segments
+    (roughly extend/split operations, not tokens), and the walk only runs under
+    --radix-eviction-policy tlru.
+    """
+    assert node.key is not None
+    node._tlru_cached_prefix_len = parent._tlru_cached_prefix_len + len(node.key)
+    if node._tlru_history_len < node._tlru_cached_prefix_len:
+        node._tlru_history_len = node._tlru_cached_prefix_len
+    cur = parent
+    while cur is not None and cur._tlru_history_len < node._tlru_cached_prefix_len:
+        cur._tlru_history_len = node._tlru_cached_prefix_len
+        cur = cur.parent
 
 
 class UnifiedLRUList:
@@ -341,18 +368,6 @@ class UnifiedLRUList:
             return None
         return x
 
-    def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
-        if check_id:
-            assert node.id in self.cache
-        pt = self._pt
-        ct = self.component_type
-        x = node.lru_prev[pt]
-        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[pt]
-        if x == self.head:
-            return None
-        return x
-
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
         if check_id:
@@ -368,9 +383,6 @@ class UnifiedLRUList:
 
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
-
-    def get_leaf_lru_no_lock(self):
-        return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_lru_no_host_lock(self):
         return self.get_prev_no_host_lock(self.tail, check_id=False)
@@ -425,6 +437,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
+        # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
+        # every other policy skips the per-insert bookkeeping entirely.
+        self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -460,6 +475,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        # End suspended walks while their session-cursor sentinels still
+        # belong to the old LRUs, clearing any pending internal victim.
+        for component in self.components:
+            if component.is_evict_device_ongoing:
+                component.evict_device_end()
+        # Internal victims awaiting the controller's backup and finish call.
+        self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
 
@@ -503,12 +525,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
+        self._empty_device_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
         self._empty_match_result = MatchResult(
-            device_indices=torch.empty(
-                (0,),
-                dtype=torch.int64,
-                device=self.device,
-            ),
+            device_prefix_len=0,
             last_device_node=self.root_node.id,
             last_host_node=self.root_node.id,
             best_match_node=self.root_node.id,
@@ -521,6 +542,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         TODO(Jialin): Make TreeCore-internal after the Unified Radix Cache split.
         """
         return self._node_arena[node_id]
+
+    def is_write_through_compatible(self) -> bool:
+        for node in self._node_arena.values():
+            if node is self.root_node:
+                continue
+            full_host = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if full_host is None:
+                if any(
+                    node.component_data[ct].host_value is not None
+                    for ct in self.component_types
+                    if ct != BASE_COMPONENT_TYPE
+                ):
+                    return False
+            elif node.parent is not self.root_node and not node.parent.backuped:
+                return False
+        return True
 
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
@@ -709,6 +746,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only the FULL device slots on the node's root path; the SWA segment
+        lock is left alone since its receipt does not survive a window re-attach."""
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].acquire_component_lock(
+            node=node, result=IncLockRefResult()
+        )
+        self._update_evictable_leaf_sets(node)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
+            node=node, params=None
+        )
+        self._update_evictable_leaf_sets(node)
+
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        result = DecSwaLockOnlyResult()
+        node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
+        if node is self.root_node or component_type in params.skipped_lock_components:
+            return result
+        self.components_by_type[component_type].release_window_lock(
+            node,
+            params.get_lock_uuid(component_type),
+            result.device_frees,
+            result.host_frees,
+        )
+        return result
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -719,11 +791,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
         self._assert_receipt_anchor(node, params)
+        if node is self.root_node:
+            return result
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
-            node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
+            node,
+            params.get_lock_uuid(ComponentType.SWA),
+            result.device_frees,
+            result.host_frees,
         )
 
         # Drop strictly-lower-priority locks co-located on the node, skipping
@@ -872,6 +949,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Read-only FULL-device match, independent of auxiliary components; the
+        third result counts the whole deepest node (a partial match pins it all)."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched_len = 0
+        pinned_len = 0
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            value = child.component_data[BASE_COMPONENT_TYPE].value
+            if value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
+            matched_len += prefix_len
+            node = child
+            pinned_len += len(child.key)
+            if prefix_len < len(child.key):
+                break
+            key = key[prefix_len:]
+        return matched_len, node.id, pinned_len
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -902,12 +1005,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node if self.enable_hicache else best_match_device_node
         )
 
-        if best_match_device_value_len > 0:
-            device_indices = torch.cat(value[:best_match_device_value_len])
-        else:
-            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=sum(len(v) for v in value[:best_match_device_value_len]),
             last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
@@ -932,7 +1031,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         return self._empty_match_result
 
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
@@ -953,7 +1052,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             prefix_chunks.append(value)
             node = node.parent
         if not prefix_chunks:
-            return self._empty_match_result.device_indices
+            return self._empty_device_indices
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
@@ -965,11 +1064,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
-        self, node: UnifiedTreeNode, chunked: bool = False
-    ) -> bool:
+    def _inc_hit_count_and_check(self, node: UnifiedTreeNode) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
@@ -1161,7 +1258,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
-            self._unevict_node_on_insert(node, state.value[:prefix_len])
+            self._unevict_node_on_insert(
+                node,
+                state.value[:prefix_len],
+                session_id=state.params.session_id,
+            )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1204,14 +1305,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 dup = value_slice[dup_start:consumed_from]
                 abs_start = state.total_prefix_length + dup_start
                 swa_already_freed = min(
-                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
+                    max(
+                        state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start,
+                        0,
+                    ),
+                    dup.numel(),
                 )
                 if swa_already_freed > 0:
                     step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
                 if swa_already_freed < dup.numel():
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        # Nodes this request already inserted were counted back then.
+        node_end = state.total_prefix_length + prefix_len
+        if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1235,6 +1342,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.key,
                 state.value,
                 priority=state.priority,
+                session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
@@ -1271,8 +1379,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
-            return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+            leaf_end = state.total_prefix_length + len(state.target_node.key)
+            return (
+                leaf_end > state.params.inserted_len
+                and self._inc_hit_count_and_check(state.target_node)
             )
 
         node = state.target_node
@@ -1284,7 +1394,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append terminal backup actions."""
+        """Refresh the LRUs and append the insert backup: a new-leaf write-through,
+        or an SWA window publish on an existing backed node."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1295,7 +1406,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self._should_backup_after_insert(state):
             state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+                self._build_backup_kv_action(
+                    state.target_node, write_back=self.is_write_back
+                )
             )
 
     def _split_node(
@@ -1308,6 +1421,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hit_count = child.hit_count
         new_node.external_cache_stored = child.external_cache_stored
         new_node.creation_time = child.creation_time
+        if self.tlru_bookkeeping:
+            # A split adds no depth to the branch: the new parent sits at
+            # split_len tokens and inherits the branch's high-water mark, while
+            # child keeps its own depth because its path length is unchanged.
+            new_node._tlru_cached_prefix_len = (
+                new_node.parent._tlru_cached_prefix_len + split_len
+            )
+            new_node._tlru_history_len = child._tlru_history_len
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
         # The rotation base is constant along a chain (position-page P keeps
@@ -1360,11 +1481,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        session_id: Optional[str] = None,
         rotation_base: Optional[int] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
+        if self.tlru_bookkeeping:
+            _set_tlru_lens_and_raise_history(new_node, parent)
         # Chain-constant under sharding: the pre-flight decline in
         # begin_insert() guarantees this tail continues the matched prefix's
         # rotation, so stamping the inserting request's base keeps every node
@@ -1378,11 +1502,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
 
     def _unevict_node_on_insert(
-        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+        self,
+        node: UnifiedTreeNode,
+        fresh_value: torch.Tensor,
+        session_id: Optional[str] = None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1400,7 +1527,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(
+            node,
+            medium=StorageMedium.GPU,
+            session_id=session_id,
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1479,12 +1610,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
+        component = self.components_by_type[component_type]
+        assert component_type not in self._pending_internal_evictions, (
+            f"finish the pending internal {component_type.name} eviction "
+            "before advancing"
+        )
         updated_tracker = defaultdict(int, tracker)
         self._begin_tracking_unbacked_tokens()
         try:
-            result.node_id = self.components_by_type[
-                component_type
-            ].evict_device_next_node(
+            step = component.evict_device_next_node(
                 updated_tracker, result.device_frees, result.host_frees
             )
         finally:
@@ -1493,12 +1627,99 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
-        result.made_progress = result.node_id is not None or bool(result.tracker)
+        if isinstance(step, InternalStateBackup):
+            assert component_type in (ComponentType.MAMBA, ComponentType.SWA)
+            self._pending_internal_evictions[component_type] = step.node_id
+            if component_type == ComponentType.MAMBA:
+                result.mamba_backup_node_id = step.node_id
+            else:
+                result.swa_backup_node_id = step.node_id
+                result.swa_backup_num_tokens = step.num_tokens
+        else:
+            result.node_id = step
+        result.made_progress = (
+            result.node_id is not None
+            or result.mamba_backup_node_id is not None
+            or result.swa_backup_node_id is not None
+            or bool(result.tracker)
+        )
+        return result
+
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.MAMBA, node_id)
+
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        return self._finish_internal_component_eviction(ComponentType.SWA, node_id)
+
+    def _finish_internal_component_eviction(
+        self, component_type: ComponentType, node_id: NodeId
+    ) -> EvictDeviceNextNodeResult:
+        """Resume an internal tombstone after the controller's backup attempt."""
+        component = self.components_by_type[component_type]
+        assert component.is_evict_device_ongoing, (
+            f"{component_type.name} device eviction not started"
+        )
+        assert self._pending_internal_evictions.get(component_type) == node_id, (
+            f"no matching pending internal {component_type.name} eviction"
+        )
+        del self._pending_internal_evictions[component_type]
+        # Consuming the pending request advances the walk even if I/O changed
+        # this victim's eligibility. No frees occur before backup completion.
+        result = EvictDeviceNextNodeResult(made_progress=True)
+        node = self._node_arena.get(node_id)
+        lru = self.lru_lists[component_type]
+        enabled = self.enable_session_radix_cache
+        if (
+            node is None
+            or node.component_data[component_type].value is None
+            or node.component_data[component_type].lock_ref > 0
+            or (
+                component_type == ComponentType.MAMBA
+                and node.load_back_pending_id is not None
+            )
+            or not lru.in_list(node)
+        ):
+            if enabled:
+                component._evict_device_cursor = lru.cursor_next()
+            return result
+        if (
+            node in self.evictable_device_leaves
+            and (not enabled or component._can_evict_leaf_atomically(node))
+        ) or (
+            component_type == ComponentType.MAMBA
+            and node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            # Re-select changed leaves through the normal walk; internal
+            # finish must not accidentally perform an atomic Full eviction.
+            component._evict_device_cursor = node
+            return result
+        self._begin_tracking_unbacked_tokens()
+        try:
+            self._evict_component_and_detach_lru(
+                node,
+                component,
+                target=EvictLayer.DEVICE,
+                tracker=result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+            self._cascade_evict(
+                node,
+                component,
+                result.tracker,
+                device_frees=result.device_frees,
+                host_frees=result.host_frees,
+            )
+        finally:
+            result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        if enabled:
+            component._evict_device_cursor = lru.cursor_next()
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
         """Finish a component's device-eviction walk."""
         self.components_by_type[component_type].evict_device_end()
+        self._pending_internal_evictions.pop(component_type, None)
 
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
@@ -1546,14 +1767,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+        if node.load_back_pending_id is not None or any(
+            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+        ):
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
             cur = stack.pop()
-            if any(
-                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(
+                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+                )
             ):
                 return result
             descendants.append(cur)
@@ -2065,11 +2292,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         child_key = key.child_key(self.page_size)
         matched_length = 0
+        host_prefix_len = 0
+        refilled_host_node = None
         cache_actions: list[CacheAction | ComponentAction] = []
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
+
+            matched_host_value = host_value[:prefix_len]
+            matched_hash_value = hash_value[: prefix_len // self.page_size]
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -2081,18 +2313,37 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if action is not None:
                     cache_actions.append(action)
 
+            if not self.is_write_back:
+                full_data = node.component_data[BASE_COMPONENT_TYPE]
+                if full_data.host_value is None:
+                    full_data.host_value = matched_host_value.clone()
+                    if node.hash_value is None:
+                        node.hash_value = list(matched_hash_value)
+                    self.kv_events.record_store(node, medium=StorageMedium.CPU)
+                    self._update_evictable_leaf_sets(node)
+                    if node.parent is not None:
+                        self._update_evictable_leaf_sets(node.parent)
+                    self._update_duplicate_tracking(node)
+                    refilled_host_node = node
+                else:
+                    assert refilled_host_node is None, (
+                        "write-through host-prefix invariant broken: encountered "
+                        f"backed node {node.id} below a refilled host tombstone"
+                    )
+                    host_prefix_len += prefix_len
+
             if len(key):
                 child_key = key.child_key(self.page_size)
 
         result = InsertResult(
-            prefix_len=matched_length,
+            prefix_len=(matched_length if self.is_write_back else host_prefix_len),
             total_len=total_len,
             cache_actions=cache_actions,
         )
         if len(key) == 0:
-            if (
-                node is not self.root_node
-                and node.component_data[BASE_COMPONENT_TYPE].host_value is not None
+            if node is not self.root_node and (
+                refilled_host_node is not None
+                or node.component_data[BASE_COMPONENT_TYPE].host_value is not None
             ):
                 result.inserted_host_node = node.id
             return result
@@ -2110,6 +2361,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
         new_node.key = key
+        if self.tlru_bookkeeping:
+            _set_tlru_lens_and_raise_history(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
@@ -2122,6 +2375,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_backup_spec(self, node_id: NodeId):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
+
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        node = self.node_by_id(node_id)
+        named: dict[ComponentType, dict[PoolName, list[str]]] = {}
+        for comp in self.components:
+            pool_keys = comp.buffer_backup_keys(node, hash_values)
+            if pool_keys:
+                named[comp.component_type] = pool_keys
+        return named
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        return self._build_backup_kv_action(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather missing Full and component transfers for Host backup."""
@@ -2178,6 +2445,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Route a build_hicache_transfers call to the component for the given type."""
@@ -2187,6 +2455,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_indices=host_indices,
             token_ids=token_ids,
             prefetch_tokens=prefetch_tokens,
+            staging_tokens=staging_tokens,
             last_hash=last_hash,
         )
 
@@ -2223,6 +2492,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
+        # SWA can be evicted independently of FULL, including holes between
+        # resident SWA nodes. Describe precisely which full rows back it.
+        full_load_slices = {}
+        offset = 0
+        for nid in kv_xfer.nodes_to_load or ():
+            count = len(self.node_by_id(nid).key)
+            full_load_slices[nid] = slice(offset, offset + count)
+            offset += count
+        for xfer in comp_xfers.get(ComponentType.SWA, ()):
+            xfer.anchor_index_parts = [
+                full_load_slices[nid]
+                if nid in full_load_slices
+                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
+                for nid in xfer.nodes_to_load or ()
+            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -2237,7 +2521,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:
-        """Build the backup action for a node and its not-yet-persisted ancestors."""
+        """Build the backup action for a node; write-through also chains its
+        unbacked ancestors."""
         chain = [node]
         if not write_back:
             ancestor = node.parent
@@ -2462,6 +2747,106 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._update_duplicate_tracking(node)
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
+    def _walk_span(self, key: RadixKey, end: int):
+        """Yield nodes and their matched spans along ``key`` through ``end``."""
+        node = self.root_node
+        pos = 0
+        remaining = key
+        while pos < end and len(remaining) > 0:
+            child = node.children.get(remaining.child_key(self.page_size))
+            if child is None or (child.evicted and not child.backuped):
+                return
+            prefix_len = child.key.match(remaining, page_size=self.page_size)
+            if prefix_len == 0:
+                return
+            yield child, pos, prefix_len
+            if prefix_len < len(child.key):
+                return
+            node = child
+            pos += prefix_len
+            remaining = remaining[prefix_len:]
+
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
+        ranges: list[tuple[int, int]] = []
+        for child, pos, prefix_len in self._walk_span(key, end):
+            seg_end = pos + prefix_len
+            if seg_end <= start:
+                continue
+            if child.component_data[ComponentType.SWA].value is not None:
+                continue
+            lo, hi = max(start, pos), min(end, seg_end)
+            if ranges and ranges[-1][1] == lo:
+                ranges[-1] = (ranges[-1][0], hi)
+            else:
+                ranges.append((lo, hi))
+            if hi >= end:
+                break
+        return ranges
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA slice to an existing tombstoned tree span."""
+        assert len(swa_values) == window_end - window_start, (
+            f"attach_swa_window size mismatch: got {len(swa_values)} "
+            f"for [{window_start}, {window_end})"
+        )
+        actions: list[CacheAction | ComponentAction] = []
+        covered = window_start
+        for child, pos, prefix_len in list(self._walk_span(key, window_end)):
+            seg_end = pos + prefix_len
+            if seg_end <= window_start:
+                continue
+            seg_start = max(pos, window_start)
+            assign_end = min(seg_end, window_end)
+            assert child.component_data[ComponentType.SWA].value is None, (
+                f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
+                f"of [{window_start}, {window_end})"
+            )
+            self._attach_swa_segment(
+                child,
+                pos,
+                seg_start,
+                assign_end,
+                swa_values[seg_start - window_start : assign_end - window_start],
+                actions,
+            )
+            covered = assign_end
+            if covered >= window_end:
+                break
+        assert covered == window_end, (
+            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
+        )
+        return actions
+
+    def _attach_swa_segment(
+        self,
+        node: UnifiedTreeNode,
+        node_start: int,
+        seg_start: int,
+        seg_end: int,
+        values: torch.Tensor,
+        actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        target = node
+        if seg_start > node_start:
+            _, action = self._split_node(target.key, target, seg_start - node_start)
+            if action is not None:
+                actions.append(action)
+        if seg_start + len(target.key) > seg_end:
+            fragment, action = self._split_node(target.key, target, seg_end - seg_start)
+            if action is not None:
+                actions.append(action)
+            target = fragment
+        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
+
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
     ) -> None:
@@ -2665,16 +3050,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Aux host-only states must match the host LRU. A host lock
+                # delists its node, so locked nodes are exempt on both sides.
                 host_lru = self.host_lru_lists[ct]
+                host_locked_ids = {
+                    n.id for n in all_nodes if n.component_data[ct].host_lock_ref > 0
+                }
                 s3_ids = {
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
-                }
-                host_lru_ids = set(host_lru.cache.keys())
+                } - host_locked_ids
+                host_lru_ids = set(host_lru.cache.keys()) - host_locked_ids
                 if s3_ids != host_lru_ids:
                     E(
                         f"{ct} host LRU: "
@@ -2826,6 +3215,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_evictable_size(self, component_type: ComponentType) -> int:
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
+
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        return self.component_protected_size_.get(component_type, 0)
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
