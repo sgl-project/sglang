@@ -121,7 +121,8 @@ def _bf16_cublaslt_weights(
         and not weight.requires_grad
         and getattr(lm_head, "bias", None) is None
     ):
-        weights[(4, 151936, 2560)] = weight
+        for batch_size in (4, 8):
+            weights[(batch_size, 151936, 2560)] = weight
         logits_processor._use_bf16_cublaslt_lm_head = True
     return weights
 

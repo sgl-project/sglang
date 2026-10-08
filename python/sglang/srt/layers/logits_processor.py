@@ -1018,7 +1018,7 @@ class LogitsProcessor(nn.Module):
                 logits = None
                 if (
                     self._use_bf16_cublaslt_lm_head
-                    and hidden_states.shape == (4, 2560)
+                    and hidden_states.shape in ((4, 2560), (8, 2560))
                     and hidden_states.dtype == torch.bfloat16
                     and not torch.compiler.is_compiling()
                 ):
