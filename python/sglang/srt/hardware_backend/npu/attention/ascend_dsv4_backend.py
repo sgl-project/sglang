@@ -1013,8 +1013,15 @@ class C4IndexerAscendBackendMixin:
             return val is not None and (val in ("", "all") or val == str(layer_id))
 
         def _md5(t: torch.Tensor) -> str:
-            a = t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
-            return hashlib.md5(a).hexdigest()[:16]
+            x = t.detach().to("cpu").contiguous()
+            try:
+                raw = x.view(torch.uint8).numpy().tobytes()
+            except Exception:
+                # Some backends disallow .view(uint8) on fp8 dtypes; fall back to
+                # an fp32 re-encode (deterministic, and identical across the two
+                # runs being compared, which is all the md5 needs).
+                raw = x.to(torch.float32).numpy().tobytes()
+            return hashlib.md5(raw).hexdigest()[:16]
 
         try:
             lastpos = (
@@ -1028,7 +1035,7 @@ class C4IndexerAscendBackendMixin:
         if _want(dump_cmpidx):
             try:
                 t = topk_idxs.detach().to(torch.int32).cpu()
-                row = t.reshape(t.shape[0], -1)[-1].tolist()[:16]
+                row = t.reshape(t.shape[0], -1)[-1].tolist()[:16] if t.numel() else []
                 print(
                     f"[CMPIDX] layer={layer_id} mode={forward_batch.forward_mode} "
                     f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} tail={row}",
