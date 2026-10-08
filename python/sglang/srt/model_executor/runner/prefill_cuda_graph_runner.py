@@ -727,6 +727,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if self.enable_cp_bcg_capture:
+            cp_positions = self.prefill_cp_bcg_input.model_positions(forward_batch)
+            if cp_positions is not None:
+                return cp_positions
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -1265,6 +1269,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        if getattr(
+            self, "enable_cp_bcg_capture", False
+        ) and not self.prefill_cp_bcg_input.allows_replay(
+            batch_size, num_tokens, prefix_lens, contains_mm_inputs
+        ):
+            return False
         if contains_mm_inputs and (
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
