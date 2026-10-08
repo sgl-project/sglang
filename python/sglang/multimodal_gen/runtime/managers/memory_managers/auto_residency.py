@@ -30,7 +30,6 @@ from typing import Iterable, Mapping
 import msgspec
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
@@ -153,22 +152,6 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
         ):
             return LAYERWISE_OFFLOAD
         return RESIDENT
-
-    def option_key(self) -> str:
-        target_mode = self.target_mode()
-        if target_mode == COMPONENT_OFFLOAD:
-            return f"{self.component_name}:component-offload"
-        if self.target_layerwise_resident_layers is None:
-            return f"{self.component_name}:resident"
-        layer_counts = ",".join(
-            str(count) for count in self.target_layerwise_resident_layers
-        )
-        pinned = "|".join(
-            ",".join(str(index) for index in indices) or "-"
-            for indices in self.target_layerwise_pinned_layers or ()
-        )
-        permanence = "permanent" if self.permanent_residency else "stage"
-        return f"{self.component_name}:{permanence}:layers={layer_counts}:pins={pinned}"
 
 
 class RankResidencyReport(msgspec.Struct, frozen=True):
