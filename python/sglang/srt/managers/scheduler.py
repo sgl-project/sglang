@@ -3757,9 +3757,10 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                finishing_reqs = self._reqs_finishing_in_flight(running_batch)
+                finishing_reqs = self._reqs_finishing_inflight(running_batch)
                 if finishing_reqs:
                     running_batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
+                    # update_running_batch only sees later shrinkage; reopen admission.
                     running_batch.batch_is_full = False
                 if (
                     finishing_reqs
@@ -4157,7 +4158,7 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            finishing_reqs = self._reqs_finishing_in_flight(running_batch)
+            finishing_reqs = self._reqs_finishing_inflight(running_batch)
             running_batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
             if finishing_reqs:
                 running_batch.batch_is_full = False
@@ -4212,7 +4213,7 @@ class Scheduler(
                 new_lora_set
             )
 
-    def _reqs_finishing_in_flight(self, batch: ScheduleBatch) -> List[Req]:
+    def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
         if not self.enable_skip_finishing_decode or not self.result_queue:
             return []
