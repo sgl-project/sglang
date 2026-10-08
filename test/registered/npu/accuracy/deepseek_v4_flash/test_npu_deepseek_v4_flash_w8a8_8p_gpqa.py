@@ -33,6 +33,8 @@ register_npu_ci(
 # The nightly pipeline is path-triggered by pull requests too, so the dataset must follow the
 # pipeline that invoked the test rather than the triggering event. Reusable workflows inherit
 # the caller's github context, so GITHUB_WORKFLOW_REF identifies the caller's workflow file.
+# TEMP: both pipelines run GSM8K for now; the nightly run (full 1319 questions) calibrates the
+# PR subset threshold before GPQA is restored for nightly.
 _is_pr_pipeline = (
     "/.github/workflows/nightly-test-npu.yml"
     not in os.environ.get("GITHUB_WORKFLOW_REF", "")
@@ -150,7 +152,7 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
     accuracy = 0.85 if _is_pr_pipeline else 0.874
-    datasets = ["gsm8k"] if _is_pr_pipeline else ["gpqa_diamond"]
+    datasets = ["gsm8k"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
     limit = 100 if _is_pr_pipeline else 100000

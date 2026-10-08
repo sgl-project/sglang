@@ -23,7 +23,7 @@ on:
         description: 'The a3 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B081'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
       image_a5:
         description: 'The a5 running docker image of the test task.'
         required: false
@@ -94,7 +94,7 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B081" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
@@ -144,10 +144,7 @@ jobs:
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      # Install sglang from the checked-out source: the pinned image ships a
-      # stale sglang snapshot that lacks symbols used by the current
-      # run_suite.py (e.g. HWBackend.MPS), which aborts the suite at import.
-      install_sglang_deps: true
+      install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
