@@ -43,6 +43,11 @@ struct uint_trait<8> {
   using type = uint64_t;
 };
 
+template <>
+struct uint_trait<16> {
+  using type = uint4;
+};
+
 /// \brief Alias: maps `sizeof(T)` to matching unsigned int type.
 template <typename T>
 using sized_int = typename uint_trait<sizeof(T)>::type;
