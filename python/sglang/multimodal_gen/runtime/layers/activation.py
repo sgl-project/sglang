@@ -111,9 +111,6 @@ class GeluAndMul(CustomOp):
 
 @CustomOp.register("gelu_new")
 class NewGELU(CustomOp):
-    def __init__(self):
-        super().__init__()
-
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
@@ -129,9 +126,6 @@ class NewGELU(CustomOp):
 @CustomOp.register("quick_gelu")
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
-    def __init__(self):
-        super().__init__()
-
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
