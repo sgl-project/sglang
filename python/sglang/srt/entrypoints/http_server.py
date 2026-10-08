@@ -914,6 +914,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    return await serve_generate_request(obj, request)
+
+
+async def serve_generate_request(obj: GenerateReqInput, request: Request):
+    """Serve an admitted generate request: `generate_request` after its
+    contract check. A route that admits requests with its own parser calls
+    this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
