@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -845,19 +846,21 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(
-            requested_bytes, self.allocator, self.device_pool.device
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
         )
-        if requested_bytes > available_bytes:
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes, self.allocator, self.device_pool.device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             layout,
         )
 

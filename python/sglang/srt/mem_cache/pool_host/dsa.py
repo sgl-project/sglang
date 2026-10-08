@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -194,16 +195,16 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        requested_bytes = storage_info.host_bytes(
-            page_num=self.page_num, layer_num=self.layer_num, page_size=self.page_size
+        allocation_bytes = host_memory_allocation_bytes(
+            self.get_mapping_lengths(), self.allocator, self.device_pool.device
         )
         available_bytes = host_memory_budget_bytes(
-            requested_bytes, self.allocator, self.device_pool.device
+            allocation_bytes, self.allocator, self.device_pool.device
         )
-        if requested_bytes > available_bytes:
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         draft_layer_num = self.layer_num - self.target_layer_num
@@ -212,7 +213,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s), "
                 "packed MTP layers: "
                 "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                requested_bytes / 1e9,
+                allocation_bytes / 1e9,
                 self.layout,
                 self.target_layer_num,
                 draft_layer_num,
@@ -221,7 +222,7 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             logger.info(
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-                requested_bytes / 1e9,
+                allocation_bytes / 1e9,
                 self.layout,
             )
         self.init_kv_buffer()
