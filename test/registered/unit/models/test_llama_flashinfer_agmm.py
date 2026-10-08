@@ -18,6 +18,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "python/sglang/srt/models/llama_flashinfer_agmm.py"
 LLAMA_SOURCE = ROOT / "python/sglang/srt/models/llama.py"
+ENGINE_SOURCE = ROOT / "python/sglang/srt/entrypoints/engine.py"
 
 
 def load_module():
@@ -247,6 +248,21 @@ class EligibilityTests(unittest.TestCase):
             self.module._model_contract_reason(model, torch_stub, topology),
             "layer_0_parallel_contract",
         )
+
+    def test_process_env_selects_the_nvshmem_backend_unless_already_set(self):
+        environ = {}
+        self.module.apply_process_env(environ)
+        self.assertEqual(environ, {"TORCH_SYMMMEM": "NVSHMEM"})
+        environ = {"TORCH_SYMMMEM": "CUDA"}
+        self.module.apply_process_env(environ)
+        self.assertEqual(environ, {"TORCH_SYMMMEM": "CUDA"})
+
+    def test_engine_applies_the_process_env_for_the_true_sp_flag(self):
+        source = ENGINE_SOURCE.read_text()
+        start = source.index("def _set_envs_and_config(")
+        body = source[start : source.index("\ndef ", start + 1)]
+        self.assertIn("if cfg.enable_flashinfer_agmm_true_sp:", body)
+        self.assertIn("apply_process_env(os.environ)", body)
 
     def test_prepared_api_signature_is_exact(self):
         def accepted(inp, w, group, *, backend="auto", max_rows=None, verbose=False):

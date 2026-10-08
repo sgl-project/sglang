@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, MutableMapping, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -44,6 +44,29 @@ _EXPECTED_MODEL = {
     "num_key_value_heads": 8,
 }
 _FULL_ROWS = 4096
+_SYMM_MEM_BACKEND_ENV = "TORCH_SYMMMEM"
+_SYMM_MEM_BACKEND = "NVSHMEM"
+
+
+def apply_process_env(environ: MutableMapping[str, str]) -> None:
+    """Select torch symmetric memory's NVSHMEM backend for the server processes.
+
+    FlashInfer's prepared AGMM allocates its symmetric scratch through that
+    backend, and torch fixes the backend per process at its first symmetric
+    memory allocation (the custom all-reduce makes one at distributed init), so
+    the engine applies this before the scheduler processes start. A value the
+    user set wins; the route validates the selected backend when it is built.
+    """
+    environ.setdefault(_SYMM_MEM_BACKEND_ENV, _SYMM_MEM_BACKEND)
+
+
+def _symm_mem_backend(torch_mod: Any) -> str:
+    import torch.distributed._symmetric_memory as symm_mem
+
+    device = torch_mod.device("cuda", torch_mod.cuda.current_device())
+    return str(symm_mem.get_backend(device)).upper()
+
+
 _MODEL_TOKEN_ATTRIBUTE = "_flashinfer_agmm_true_sp_model_token"
 
 
@@ -265,6 +288,14 @@ class LlamaFlashInferAgmmTrueSP:
 
         self._torch = torch
         self._topology = self._validate_runtime_config()
+        backend = _symm_mem_backend(torch)
+        if backend != _SYMM_MEM_BACKEND:
+            raise RuntimeError(
+                "--enable-flashinfer-agmm-true-sp requires the NVSHMEM torch "
+                f"symmetric-memory backend, found {backend}: the engine selects "
+                f"it through {_SYMM_MEM_BACKEND_ENV}={_SYMM_MEM_BACKEND} unless "
+                "the environment overrides it"
+            )
         if not callable(prepare_all_gather_matmul):
             raise RuntimeError("FlashInfer prepared AGMM API is unavailable")
         _validate_prepare_signature(prepare_all_gather_matmul)
@@ -396,7 +427,7 @@ class LlamaFlashInferAgmmTrueSP:
             raise RuntimeError(
                 "--enable-flashinfer-agmm-true-sp requires SM100/SM103 TP8 or SM103 TP4"
             )
-        if str(symm_mem.get_backend(device)).upper() != "NVSHMEM":
+        if str(symm_mem.get_backend(device)).upper() != _SYMM_MEM_BACKEND:
             raise RuntimeError(
                 "--enable-flashinfer-agmm-true-sp requires the NVSHMEM backend"
             )

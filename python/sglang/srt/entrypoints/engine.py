@@ -1847,6 +1847,12 @@ def _set_envs_and_config(server_args: ServerArgs):
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
+    if cfg.enable_flashinfer_agmm_true_sp:
+        # The FlashInfer AGMM true-SP route needs torch symmetric memory's
+        # NVSHMEM backend in every scheduler process; see apply_process_env.
+        from sglang.srt.models.llama_flashinfer_agmm import apply_process_env
+
+        apply_process_env(os.environ)
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
