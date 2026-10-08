@@ -1,59 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model integration and topology checks for collocated prefill CP (hybrid
-linear-attention models; the CP group is the TP group)."""
+"""Model integration and topology checks for CP-TP group sharing: prefill CP
+for hybrid linear-attention models where the CP group is the TP group."""
 
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
-    model_config_of,
     resolved_view,
     resolving_view,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.connector import ConnectorType
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import parse_connector_type
 
-# Architectures whose model code implements the collocated prefill CP contract:
-# the CP group is the TP group, the residual stream / attention / indexer are
-# CP-sharded, MoE and linear attention keep their TP partition (the linear
-# attention gathers the sequence where its recurrence needs it). Model ports
-# register here.
+# Architectures whose model code implements CP-TP group sharing: the CP group
+# is the TP group, the residual stream / attention / indexer are CP-sharded,
+# MoE and linear attention keep their TP partition (the linear attention
+# gathers the sequence where its recurrence needs it). Model ports register
+# here; every other model keeps the ordinary prefill CP path.
 _SUPPORTED_MODELS: set[str] = set()
 
 
-def resolve_collocated_cp(server_args: Any) -> None:
+def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     cfg, view = resolving_view(server_args), resolved_view(server_args)
-    if not cfg.enable_prefill_cp or view.attn_cp_size <= 1:
+    if (
+        not cfg.enable_prefill_cp
+        or view.attn_cp_size <= 1
+        or model.hf_config.architectures[0] not in _SUPPORTED_MODELS
+    ):
         return
-    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
-        return
-
-    model = model_config_of(server_args)
-    linear_config = mambaish_config(model)
-    if linear_config is None:
-        return
-    architecture = model.hf_config.architectures[0]
-    if architecture not in _SUPPORTED_MODELS:
+    # Attention DP or attention TP would leave the CP group narrower than TP.
+    if view.attn_cp_size != cfg.tp_size:
         raise ValueError(
-            f"Collocated prefill CP is not integrated with {architecture}. "
-            f"Supported models: {sorted(_SUPPORTED_MODELS) or 'none'}."
+            "CP-TP group sharing requires --attn-cp-size == --tp-size, got "
+            f"attn_cp_size={view.attn_cp_size}, tp_size={cfg.tp_size}."
         )
     if cfg.cp_strategy != "zigzag":
-        raise ValueError("Collocated prefill CP requires --cp-strategy zigzag.")
+        raise ValueError("CP-TP group sharing requires --cp-strategy zigzag.")
 
     unsupported = {
         "speculative-algorithm": cfg.speculative_algorithm is not None,
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
-        "enable-dp-attention": view.enable_dp_attention,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
+        "disaggregation-mode": cfg.disaggregation_mode != "null",
     }
     for flag, enabled in unsupported.items():
         if enabled:
-            raise ValueError(f"--{flag} is not supported with collocated prefill CP.")
+            raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")
 
+    linear_config = mambaish_config(model)
     if getattr(linear_config, "linear_num_key_heads", None) is not None:
         heads = {
             name: getattr(linear_config, name)
@@ -68,15 +63,10 @@ def resolve_collocated_cp(server_args: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
-    if cfg.disaggregation_mode != "null":
-        raise ValueError(
-            "Collocated prefill CP with PD disaggregation is not supported."
-        )
-
     declare_resolution(
         server_args,
-        "resolve_collocated_cp",
-        enable_collocated_cp=True,
+        "resolve_cp_tp_group_sharing",
+        enable_cp_tp_group_sharing=True,
         # The sequence collectives have batch-dependent sizes.
         cuda_graph_config=with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED

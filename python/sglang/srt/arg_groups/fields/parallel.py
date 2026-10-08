@@ -161,13 +161,13 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
-    enable_collocated_cp: A[
+    enable_cp_tp_group_sharing: A[
         bool,
         Arg(
-            help="(Derived) collocated prefill CP for hybrid linear-attention "
-            "models: the CP group is the TP group; the residual stream, "
-            "attention and indexer are CP-sharded while MoE and linear "
-            "attention keep TP. Resolved from the model architecture.",
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
             no_cli=True,
             resolvable=True,
         ),

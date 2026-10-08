@@ -127,6 +127,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_stream,
+    linear_attn_parallel_group,
 )
 
 # Utils
@@ -312,10 +313,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Linear attention keeps a TP head partition. Under collocated prefill
-        # CP the attention-TP group has width 1 (the CP group is the TP group),
-        # so the plain TP group is the partition there.
-        parallel_group = "tp" if get_parallel().enable_collocated_cp else "attn_tp"
+        parallel_group = linear_attn_parallel_group()
         self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
             parallel_group
         )

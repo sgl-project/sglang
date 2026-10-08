@@ -25,7 +25,7 @@ from sglang.srt.configs.mamba_utils import (
     mamba2_state_dtype,
 )
 from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, linear_attn_tp_size
 from sglang.srt.utils import is_cpu
 
 logger = logging.get_logger(__name__)
@@ -297,15 +297,8 @@ class Qwen3NextConfig(PretrainedConfig):
         # decode with different attn_tp_size (see _send_mamba_state_slice).
         key_dim = self.linear_key_head_dim * self.linear_num_key_heads
         value_dim = self.linear_value_head_dim * self.linear_num_value_heads
-        parallel = get_parallel()
         shape = Mamba2StateShape.create(
-            # Linear attention keeps its TP head partition; under collocated
-            # prefill CP that is the whole TP group (attention TP width is 1).
-            tp_world_size=(
-                parallel.tp_size
-                if parallel.enable_collocated_cp
-                else parallel.attn_tp_size
-            ),
+            tp_world_size=linear_attn_tp_size(),
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
