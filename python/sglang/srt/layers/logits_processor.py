@@ -107,6 +107,8 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
+    # Request-major verify positions, padded past each request's accept length.
+    tokens_per_request: int = 1
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
@@ -236,8 +238,8 @@ class LogitsProcessorOutput:
     # Post-filter support IDs and requested behavior logprobs, bounded by server
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[np.ndarray]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[np.ndarray]]] = None
+    next_token_sampling_mask_idx: Optional[List[Optional[List[np.ndarray]]]] = None
+    next_token_sampling_logprobs: Optional[List[Optional[List[np.ndarray]]]] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor

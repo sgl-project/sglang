@@ -331,6 +331,9 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_sampling_mask import (
+    spec_sampling_mask_unsupported_reason,
+)
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -2971,14 +2974,21 @@ class Scheduler(
                 return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
-            # Spec workers do not emit one sampling support per accepted token, so
-            # the returned mask would not align 1:1 with generated tokens. Reject
-            # the combination instead of silently returning a misaligned mask.
-            error_msg = (
-                "return_sampling_mask is not supported with speculative decoding."
+            error_msg = spec_sampling_mask_unsupported_reason(
+                spec_algorithm=self.spec_algorithm,
+                eagle_topk=get_spec().speculative_eagle_topk,
+                use_rejection_sampling=get_spec().speculative_use_rejection_sampling,
+                accept_thresholds=(
+                    get_spec().speculative_accept_threshold_single,
+                    get_spec().speculative_accept_threshold_acc,
+                ),
+                min_p=req.sampling_params.min_p,
+                cuda=is_cuda(),
+                simulate_acceptance=envs.SGLANG_SIMULATE_ACC_LEN.get() > 0,
             )
-            self._reject_sampling_mask_request(req, error_msg)
-            return
+            if error_msg is not None:
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the

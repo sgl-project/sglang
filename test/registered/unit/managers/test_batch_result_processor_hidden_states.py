@@ -5,13 +5,18 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,7 +60,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
     def test_selected_and_support_modes_share_one_batch(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
                 lengths=torch.tensor([2, 2]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -77,18 +82,18 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             output=output,
         )
         self.assertEqual(
-            [row.tolist() for row in output.next_token_sampling_mask_idx],
+            [row[0].tolist() for row in output.next_token_sampling_mask_idx],
             [[7, 8], [9, 10]],
         )
         self.assertEqual(
-            [row.tolist() for row in output.next_token_sampling_logprobs],
+            [row[0].tolist() for row in output.next_token_sampling_logprobs],
             [[-0.5], [-0.25, -1.5]],
         )
 
     def test_selected_mode_does_not_require_support_tensor(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
                 lengths=torch.tensor([2]),
                 selected_logprobs=torch.tensor([-0.5]),
@@ -105,7 +110,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_logprobs[0].tolist(), [-0.5])
+        self.assertEqual(output.next_token_sampling_logprobs[0][0].tolist(), [-0.5])
 
     def test_packed_ids_are_copied_before_per_request_slicing(self):
         """Non-overlap capture must not perform one device copy per request."""
@@ -114,7 +119,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         packed_ids.cpu.return_value = torch.tensor([[7, 8, 0], [9, 0, 0]])
         output = LogitsProcessorOutput(
             next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
+            sampling_mask_output=SamplingMaskOutput(
                 token_ids=packed_ids,
                 lengths=torch.tensor([2, 1]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
@@ -135,14 +140,14 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         packed_ids.cpu.assert_called_once_with()
         self.assertEqual(
             [
-                None if row is None else row.tolist()
+                None if row is None else row[0].tolist()
                 for row in output.next_token_sampling_mask_idx
             ],
             [[7, 8], None, [9]],
         )
         self.assertEqual(
             [
-                None if row is None else row.tolist()
+                None if row is None else row[0].tolist()
                 for row in output.next_token_sampling_logprobs
             ],
             [[-0.5, -0.75], None, [-0.25]],
@@ -192,6 +197,61 @@ class _DecodeReq:
     def update_finish_state(self, new_accept_len):
         if len(self.output_ids) >= 6:
             self.finished_len = 5
+
+
+class TestDecodeSamplingMaskRetention(CustomTestCase):
+    def test_stop_inside_verify_run_keeps_only_emitted_masks(self):
+        processor = _make_processor(self)
+        req = _DecodeReq()
+        req.return_hidden_states = False
+        req.return_sampling_mask = True
+        req.sampling_logprobs_mode = "selected"
+        req.sampling_mask_rows = SamplingMaskRows()
+        req.output_ids = [1, 2, 3]
+        # The fake request stops at five total tokens, inside this verify step.
+        req.output_ids_through_stop = [1, 2, 3, 4, 5]
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            batch_size=lambda: 1,
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                sampling_mask_output=SamplingMaskOutput(
+                    token_ids=torch.tensor([[4], [5], [6], [0]], dtype=torch.int32),
+                    lengths=torch.tensor([1, 1, 1, 0]),
+                    selected_logprobs=torch.zeros(4),
+                    support_logprobs=None,
+                    statuses=torch.zeros(4, dtype=torch.int32),
+                    tokens_per_request=4,
+                ),
+            ),
+            speculative_num_draft_tokens=4,
+        )
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_normalize_decode_outputs",
+                return_value=([[4, 5, 6]], None),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.get_observability",
+                return_value=SimpleNamespace(enable_metrics=False),
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+        self.assertEqual(req.finished_len, 5)
+        self.assertEqual(
+            req.sampling_mask_rows.take().to_lists(False), ([[4], [5]], [0.0, 0.0])
+        )
 
 
 class TestPrefillHiddenStateOffsets(CustomTestCase):

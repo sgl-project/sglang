@@ -19,7 +19,11 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.speculative.spec_sampling_mask import (
+    joint_filtered_verify_probs,
+    verify_sampling_mask_output,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -806,6 +810,8 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
+    mask_req_rows = sampling_info.sampling_mask_batch_indices
+    mask_probs = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
@@ -927,6 +933,20 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+        if mask_req_rows is not None:
+            mask_rows, mask_probs = joint_filtered_verify_probs(
+                target_probs=target_probs,
+                mask_req_rows=mask_req_rows,
+                top_ks=sampling_info.top_ks
+                if sampling_info.need_top_k_sampling
+                else None,
+                top_ps=sampling_info.top_ps
+                if sampling_info.need_top_p_sampling
+                else None,
+                draft_token_num=verify_input.draft_token_num,
+                top_k_renorm_prob=top_k_renorm_prob,
+                top_p_renorm_prob=top_p_renorm_prob,
+            )
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
                 target_probs,
@@ -943,6 +963,8 @@ def eagle_sample(
                 ),
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        if mask_probs is not None:
+            target_probs = target_probs.index_copy(0, mask_rows, mask_probs)
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -967,6 +989,9 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
+        if mask_req_rows is not None:
+            # A zero coin can accept a filtered-out draft because verify uses <=.
+            coins.clamp_(min=torch.finfo(coins.dtype).tiny)
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -1005,6 +1030,29 @@ def eagle_sample(
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
+
+    if mask_req_rows is not None:
+        if SIMULATE_ACC_LEN > 0:
+            raise ValueError(
+                "return_sampling_mask does not support simulated acceptance."
+            )
+        if mask_probs is None and not sampling_info.is_all_greedy:
+            raise RuntimeError("This verify sampler cannot return sampling masks.")
+        tp_group = get_parallel().tp_group.device_group
+        cp_group = None
+        if is_dp_attention_enabled():
+            tp_group = get_parallel().attn_tp_group.device_group
+            cp_group = get_parallel().attn_cp_group.device_group
+        logits_output.sampling_mask_output = verify_sampling_mask_output(
+            mask_req_rows=mask_req_rows,
+            mask_probs=mask_probs,
+            predict=predict,
+            accept_index=accept_index,
+            draft_token_num=verify_input.draft_token_num,
+            max_tokens=get_exec().features.sampling_mask_max_tokens,
+            support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
+            sync_groups=(tp_group, cp_group),
+        )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement

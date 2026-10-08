@@ -158,13 +158,15 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
     assert result.copy_done.record_count == 1
 
 
-def test_pipeline_sampling_mask_round_trip_without_logprobs():
+@pytest.mark.parametrize("stride", [1, 4])
+def test_pipeline_sampling_mask_round_trip_without_logprobs(stride):
     sampling_output = SamplingMaskOutput(
-        token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
-        lengths=torch.tensor([2], dtype=torch.int32),
-        selected_logprobs=torch.tensor([-0.5]),
-        support_logprobs=torch.tensor([[-0.5, -1.0]]),
-        statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
+        token_ids=torch.tensor([[3, 5]] * stride, dtype=torch.int32),
+        lengths=torch.tensor([2] * stride, dtype=torch.int32),
+        selected_logprobs=torch.tensor([-0.5] * stride),
+        support_logprobs=torch.tensor([[-0.5, -1.0]] * stride),
+        statuses=torch.tensor([SamplingMaskStatus.OK] * stride, dtype=torch.int32),
+        tokens_per_request=stride,
     )
     result = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
@@ -186,6 +188,8 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         torch.testing.assert_close(
             getattr(output.sampling_mask_output, name), getattr(sampling_output, name)
         )
+
+    assert output.sampling_mask_output.tokens_per_request == stride
 
 
 def test_non_pp_auxiliary_output_only_requires_host_copy_support():

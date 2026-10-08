@@ -20,6 +20,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
+- [Sampling-support masks](#sampling-support-masks)
 - [Full Parameter Reference](#full-parameter-reference)
 - [OOM Troubleshooting](#oom-troubleshooting)
 - [References](#references)
@@ -851,6 +852,27 @@ print(response.choices[0].message.content)
 ```
 
 ---
+
+## Sampling-support masks
+
+On NVIDIA CUDA, you can request `return_sampling_mask: true` with chain
+EAGLE, EAGLE3, or NEXTN decoding. Set `--speculative-eagle-topk 1`, keep both
+speculative acceptance thresholds at `1.0`, and leave rejection sampling and
+simulated acceptance disabled. Other speculative algorithms and `min_p > 0`
+are not supported with sampling masks.
+
+Use `top_k=1` for greedy requests, or a finite `top_k` no larger than
+`--sampling-mask-max-tokens`. Each emitted token receives its target-model
+support after joint top-k/top-p filtering, including accepted draft tokens and
+the final sampled token. For opted-in requests, top-p is applied to the original
+target probabilities rather than the top-k-renormalized distribution, matching
+the non-speculative joint sampler. This can change the sampled tokens compared
+with speculative requests that do not request masks.
+
+Both `sampling_logprobs_mode="selected"` and `"support"` are supported. Returned
+masks and log probabilities stop at the same output-token boundary as generation;
+unused verify positions are not returned. Capture adds filtering and packing work
+for opted-in requests.
 
 ## Full Parameter Reference
 
