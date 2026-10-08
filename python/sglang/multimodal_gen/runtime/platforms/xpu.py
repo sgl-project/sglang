@@ -63,11 +63,6 @@ class XpuPlatform(Platform):
         return True
 
     @classmethod
-    def log_warnings(cls) -> None:
-        """Log any XPU-specific warnings."""
-        pass
-
-    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
