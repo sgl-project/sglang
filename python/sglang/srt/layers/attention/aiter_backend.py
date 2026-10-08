@@ -40,6 +40,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -344,6 +345,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
@@ -1946,10 +1948,11 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indices, kv_indptr, qo_indptr, _ = (
                     forward_batch.spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        paged_kernel_lens=forward_batch.seq_lens,
+                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                        translator=self.kv_index_translator,
+                        plan=forward_batch.kv_loc_plan,
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -2149,6 +2152,7 @@ class AiterAttnBackend(AttentionBackend):
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
+                    plan=forward_batch.kv_loc_plan,
                 )
 
                 max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -2189,6 +2193,7 @@ class AiterAttnBackend(AttentionBackend):
                     prefix_lens,
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
+                    plan=forward_batch.kv_loc_plan,
                 )
 
                 if self.use_sliding_window_kv_pool:
@@ -4438,6 +4443,7 @@ class AiterIndicesUpdaterPrefill:
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indices = None
@@ -4452,6 +4458,8 @@ class AiterIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
+        *,
+        plan: KVLocPlan,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -4464,6 +4472,8 @@ class AiterIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
+        *,
+        plan: KVLocPlan,
     ):
         kv_start_idx = None
         kv_indptr = self.kv_indptr
@@ -4509,10 +4519,11 @@ class AiterIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.kv_index_translator,
+                    plan=plan,
                 )
             )
 
@@ -4526,6 +4537,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
         # Buffers and wrappers
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.kv_index_translator = model_runner.kv_index_translator
         self.update = self.update_single_wrapper
 
         self.kv_indptr = None
@@ -4544,6 +4556,8 @@ class AiterMlaIndicesUpdaterPrefill:
         max_q_len: int,
         max_kv_len: int,
         spec_info: Optional[SpecInput],
+        *,
+        plan: KVLocPlan,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -4557,6 +4571,8 @@ class AiterMlaIndicesUpdaterPrefill:
         max_q_len: int,
         max_kv_len: int,
         spec_info: Optional[SpecInput],
+        *,
+        plan: KVLocPlan,
     ):
         bs = len(req_pool_indices)
 
@@ -4587,10 +4603,11 @@ class AiterMlaIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    kv_lens,
-                    kv_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=kv_lens,
+                    paged_kernel_lens_sum=kv_lens_sum,
+                    translator=self.kv_index_translator,
+                    plan=plan,
                 )
             )
 
@@ -4644,6 +4661,7 @@ class AiterMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = get_schedule().page_size
+        self.kv_index_translator = model_runner.kv_index_translator
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
@@ -4659,16 +4677,21 @@ class AiterMultiStepDraftBackend:
             if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
             else 1
         )
+        src = self.kv_index_translator.read_source(
+            forward_batch.kv_loc_plan,
+            req_pool_indices=forward_batch.req_pool_indices,
+            bs=num_seqs,
+        )
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
-            forward_batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
+            src.row_ids,
+            src.ids,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            self.pool_len,
+            src.row_stride,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
             triton.next_power_of_2(num_seqs),
@@ -4678,6 +4701,9 @@ class AiterMultiStepDraftBackend:
             # A single token block is the historical launch; NUM_STEPS=0 keeps
             # its 128-wide program instead of the token-block specialization.
             NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
+            ENTRY_PAGE_SIZE=src.entry_page_size,
+            v2p=src.v2p,
+            TRANSLATE=src.v2p is not None,
         )
 
         for i in range(self.speculative_num_steps - 1):
