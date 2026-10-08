@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.pipelines.wan_animate_2_pipeline import (
     WanAnimate2Pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.before_denoising import (
     WanAnimate2BeforeDenoisingStage,
     WanAnimate2RequestState,
@@ -1391,6 +1392,11 @@ def test_vae_adapter_uses_the_sglang_vae_return_types():
     class _StubWanVae(torch.nn.Module):
         latents_mean = [0.5, -0.5]
         latents_std = [2.0, 4.0]
+        use_parallel_decode = True
+        tiled = False
+
+        def enable_tiling(self):
+            self.tiled = True
 
         def encode(self, x):
             # mean = x's per-channel mean, logvar = 0, in the [B, 2C, T, H, W] layout.
@@ -1415,6 +1421,26 @@ def test_vae_adapter_uses_the_sglang_vae_return_types():
     # denormalize (z * std + mean) = [2.5, 0.0], then the stub's x3, clamped to [-1, 1]
     torch.testing.assert_close(decoded.flatten(), torch.tensor([1.0, 0.0]))
     assert decoded.shape[0] == 1 and decoded.dtype == torch.float32
+
+    args = SimpleNamespace(
+        pipeline_config=Wan_Animate_2_14B_Config(),
+        disable_autocast=False,
+        enable_torch_compile=False,
+    )
+    args.pipeline_config.vae_tiling = True
+    stage = DecodingStage(adapter)
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    ):
+        raw = stage.decode_raw(latent.unsqueeze(0), args, vae_dtype=torch.float32)
+        normalized = stage.decode(latent.unsqueeze(0), args, vae_dtype=torch.float32)
+    torch.testing.assert_close(raw, decoded, rtol=0, atol=0)
+    torch.testing.assert_close(normalized, (decoded / 2 + 0.5).clamp(0, 1))
+    assert adapter.vae.tiled and adapter.use_parallel_decode
+    torch.testing.assert_close(
+        adapter.decode([latent, latent]), decoded.expand(2, -1, -1, -1, -1)
+    )
 
 
 # Deployment topology

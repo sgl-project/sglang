@@ -102,6 +102,13 @@ Each clip uses the shared denoising loop for step profiling, NVTX ranges, progre
 and DiT release. Reference K/V preparation and clip-specific prediction remain
 model hooks; clip decoding still feeds the next clip's conditioning. This does
 not enable cache-dit or breakable CUDA graphs for this model.
+Clip decoding uses the shared `DecodingStage.decode_raw` path for VAE compilation,
+tiling and OOM diagnostics. Raw decoded pixels are kept for the next clip: no
+extra conversion to and from `[0, 1]` is introduced. The adapter preserves the
+existing FP32 VAE execution and per-channel latent scaling.
+QKV projections, cross-attention, FFN and the output head are inherited from the
+native Wan implementation. Ulysses exchanges use the shared packed-QKV path;
+the model-specific reference attention mask and K/V lifecycle are retained.
 Text and image conditioning projections are reused within each clip and CFG
 branch, rather than recomputed at every timestep. These projected tensors are
 released after the clip and never reused across requests. Decoded output is

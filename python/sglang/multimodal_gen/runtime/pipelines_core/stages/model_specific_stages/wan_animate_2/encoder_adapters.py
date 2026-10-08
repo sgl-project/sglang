@@ -115,8 +115,12 @@ class WanAnimate2VaeAdapter(nn.Module):
     ``[B, C, T, H, W]`` fp32 in [-1, 1], which is why ``Wan_Animate_2_14B_Config.get_decode_scale_and_shift``
     returns ``(1.0, None)``."""
 
-    # DecodingStage._can_use_parallel_decode may read this; decode is single-process.
-    use_parallel_decode: bool = False
+    @property
+    def use_parallel_decode(self) -> bool:
+        return self.vae.use_parallel_decode
+
+    def enable_tiling(self) -> None:
+        self.vae.enable_tiling()
 
     def __init__(self, vae: nn.Module) -> None:
         super().__init__()
@@ -194,8 +198,8 @@ class WanAnimate2VaeAdapter(nn.Module):
                 decoded = self.vae.decode(z)
             out.append(decoded.float().clamp_(-1.0, 1.0).squeeze(0))
 
-        # Re-stack to the batched [B, C, T, H, W] tensor the DenoisingStage expects.
-        return torch.stack(out, dim=0)
+        # Clips are decoded individually; avoid copying their full pixel tensor.
+        return out[0].unsqueeze(0) if len(out) == 1 else torch.stack(out, dim=0)
 
     def forward(
         self,

@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multi
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -122,6 +123,7 @@ class WanAnimate2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, pipeline=pipeline, vae=vae
         )
         self.vae: WanAnimate2VaeAdapter = vae
+        self.clip_decoder = DecodingStage(vae, pipeline=pipeline)
         # Clips > 0 are conditioned inside this stage, so it holds the image encoder too.
         self.image_encoder = image_encoder
 
@@ -418,7 +420,11 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                     component_name="vae", module=self.vae.vae
                 ):
                     # [1, C, T, H, W] fp32 in [-1, 1]
-                    decoded_frames = self.vae.decode([denoised_latents])
+                    decoded_frames = self.clip_decoder.decode_raw(
+                        denoised_latents.unsqueeze(0),
+                        server_args,
+                        vae_dtype=torch.float32,
+                    )
 
                 # [T, H, W, C] uint8
                 output_frames_for_clip = (

@@ -441,23 +441,5 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
             )
         return hidden_states
 
-    def _unpatchify(
-        self,
-        hidden_states: torch.Tensor,
-        timestep_embeddings: torch.Tensor,
-        grid_size: tuple[int, int, int],
-    ) -> torch.Tensor:
-        """Output head (norm_out + proj_out) and unpatchify to ``[1, 16, f, h, w]``."""
-        shift, scale = (
-            self.scale_shift_table + timestep_embeddings.unsqueeze(1)
-        ).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states, _ = self.proj_out(hidden_states)
-        f, h, w = grid_size
-        p_t, p_h, p_w = self.patch_size
-        latent = hidden_states.reshape(1, f, h, w, p_t, p_h, p_w, -1)
-        latent = latent.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        return latent.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
 
 EntryClass = WanAnimate2Transformer3DModel

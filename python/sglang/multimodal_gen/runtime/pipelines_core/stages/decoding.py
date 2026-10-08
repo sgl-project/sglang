@@ -223,8 +223,20 @@ class DecodingStage(PipelineStage):
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
-            normalized to [0, 1] range and moved to CPU as float32
+            normalized to [0, 1] on the decode device.
         """
+        image = self.decode_raw(latents, server_args, vae_dtype=vae_dtype)
+        return (image / 2 + 0.5).clamp(0, 1)
+
+    @torch.no_grad()
+    def decode_raw(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        *,
+        vae_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Decode without pixel normalization, including for inter-clip conditioning."""
         latents = latents.to(get_local_torch_device())
         # The caller resolves the decode-only override before component use so
         # residency and execution agree on the target dtype.
@@ -286,8 +298,6 @@ class DecodingStage(PipelineStage):
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
 
-        # De-normalize image to [0, 1] range
-        image = (image / 2 + 0.5).clamp(0, 1)
         return image
 
     def load_model(self):

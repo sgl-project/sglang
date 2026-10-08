@@ -17,12 +17,14 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
-    sequence_model_parallel_all_to_all_4D,
 )
-from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
-    WanTransformerBlock,
-    tensor_parallel_rms_norm,
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all_qkv as _sp_gather_qkv,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_output_all_to_all,
+)
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
 
 # Eager flex_attention materializes the full [Q, KV] scores over the padded [gen | reference-video]
 # sequence (tens of GiB at video resolution); compiled, it is one fused kernel.
@@ -72,21 +74,9 @@ def _make_score_mod(hw: int, log_scale: float) -> Callable[..., torch.Tensor]:
     return partial(_score_mod_impl, hw=hw, log_scale=log_scale)
 
 
-def _sp_gather_qkv(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ulysses input a2a: [B, S_local, N_tp, C] -> [B, S_full, N_local, C].
-    N_tp must be divisible by the SP world size."""
-    qkv = torch.cat([query, key, value], dim=0)
-    qkv = sequence_model_parallel_all_to_all_4D(qkv, scatter_dim=2, gather_dim=1)
-    return qkv.chunk(3, dim=0)
-
-
 def _sp_scatter_out(attn_output: torch.Tensor) -> torch.Tensor:
     """Ulysses output a2a: [B, S_full, N_local, C] -> [B, S_local, N_tp, C]."""
-    return sequence_model_parallel_all_to_all_4D(
-        attn_output, scatter_dim=1, gather_dim=2
-    )
+    return _usp_output_all_to_all(attn_output, head_dim=2)
 
 
 def _reference_video_key_mask(
@@ -135,62 +125,6 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             6, dim=1
         )
         return shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa
-
-    def _qkv(
-        self, norm_hidden_states: torch.Tensor, local_heads: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """to_q/to_k/to_v + qk-norm + unflatten to heads. Mirrors wanvideo.py."""
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
-        if self.tp_rmsnorm:
-            query = tensor_parallel_rms_norm(query, self.norm_q)
-            key = tensor_parallel_rms_norm(key, self.norm_k)
-        else:
-            query = self.norm_q(query)
-            key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (local_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (local_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (local_heads, self.dim_head))
-        return query, key, value
-
-    def _cross_and_ffn(
-        self,
-        hidden_states: torch.Tensor,
-        attn_output: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        gate_msa: torch.Tensor,
-        c_shift_msa: torch.Tensor,
-        c_scale_msa: torch.Tensor,
-        c_gate_msa: torch.Tensor,
-        orig_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Self-attn residual -> cross-attn -> ffn, shared by forward_ref / forward_gen."""
-        attn_output, _ = self.to_out(attn_output)
-        attn_output = attn_output.squeeze(1)
-
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
-        )
-        norm_hidden_states = norm_hidden_states.to(orig_dtype)
-        hidden_states = hidden_states.to(orig_dtype)
-
-        # cross-attention (WanI2VCrossAttention splits context[:, :257] as image)
-        attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
-        )
-        norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
-        )
-        norm_hidden_states = norm_hidden_states.to(orig_dtype)
-        hidden_states = hidden_states.to(orig_dtype)
-
-        ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        return hidden_states.to(orig_dtype)
 
     def forward(
         self, *, kv_cache_mode: Literal["ref", "gen"], **kwargs: Any

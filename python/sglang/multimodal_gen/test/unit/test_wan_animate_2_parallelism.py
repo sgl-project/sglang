@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.models.dits import wan_animate_2_block
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
     WanAnimate2Transformer3DModel,
 )
@@ -27,14 +28,16 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     _apply_rope_interleaved,
     _InContextLayout,
     _make_score_mod,
-    _sp_gather_qkv,
     _sp_scatter_out,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
     WanAnimate2ClipConditioning,
     WanAnimate2ReferenceKV,
 )
-from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+    WanTransformer3DModel,
+    WanTransformerBlock,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.denoising import (
     WanAnimate2DenoisingStage,
 )
@@ -514,12 +517,23 @@ def test_reference_pass_masks_the_sp_tail_padding_with_the_per_clip_mask():
 def test_gather_then_scatter_round_trips():
     # _sp_gather_qkv: [B,S_local,N_tp,C] -> [B,S_full,N_local,C]; _sp_scatter_out inverts it.
     fake = _FakeAllToAll4D()
-    with patch(f"{_BLOCK}.sequence_model_parallel_all_to_all_4D", side_effect=fake):
+    with (
+        patch(
+            f"{_BLOCK}._sp_gather_qkv",
+            side_effect=lambda q, k, v: fake(
+                torch.cat([q, k, v]), scatter_dim=2, gather_dim=1
+            ).chunk(3),
+        ) as gather,
+        patch(
+            f"{_BLOCK}._usp_output_all_to_all",
+            side_effect=lambda x, head_dim: fake(x, scatter_dim=1, gather_dim=2),
+        ) as scatter,
+    ):
         q = torch.arange(1 * 4 * 8 * 16, dtype=torch.float32).reshape(1, 4, 8, 16)
         k = q + 1000.0
         v = q + 2000.0
 
-        gq, gk, gv = _sp_gather_qkv(q, k, v)
+        gq, gk, gv = wan_animate_2_block._sp_gather_qkv(q, k, v)
         assert tuple(gq.shape) == (1, 8, 4, 16)
         assert tuple(gk.shape) == (1, 8, 4, 16)
         assert tuple(gv.shape) == (1, 8, 4, 16)
@@ -527,6 +541,8 @@ def test_gather_then_scatter_round_trips():
         back = _sp_scatter_out(gq)
         assert tuple(back.shape) == tuple(q.shape)
         assert torch.equal(back, q)
+        gather.assert_called_once_with(q, k, v)
+        scatter.assert_called_once_with(gq, head_dim=2)
 
     assert fake.calls == [(2, 1), (1, 2)]
 
@@ -771,3 +787,13 @@ def test_dit_constructs_only_its_own_blocks():
 
     assert [type(block) for block in model.blocks] == [WanAnimate2TransformerBlock] * 2
     assert constructed == [WanAnimate2TransformerBlock] * 2
+
+
+def test_dit_inherits_shared_wan_projections_and_output_head():
+    assert WanAnimate2TransformerBlock._qkv is WanTransformerBlock._qkv
+    assert (
+        WanAnimate2TransformerBlock._cross_and_ffn is WanTransformerBlock._cross_and_ffn
+    )
+    assert (
+        WanAnimate2Transformer3DModel._unpatchify is WanTransformer3DModel._unpatchify
+    )
