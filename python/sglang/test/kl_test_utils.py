@@ -15,14 +15,13 @@ LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
 DEFAULT_PROMPT_TOKENS = 3000  # Maximum number of tokens to use
-# Outside the checkout: CI's checkout clean deletes untracked files in the repo,
-# while a self-hosted runner's home cache persists across jobs.
+# Outside the repo, where CI's checkout clean would wipe it before every job.
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "sglang",
     "longbench",
 )
-# Fail fast instead of letting a slow streaming download run out the CI job.
+# Fail the test instead of letting a slow stream run out the CI job.
 DOWNLOAD_TIMEOUT_S = 300
 
 # In-memory cache for the current session
@@ -88,7 +87,7 @@ def get_input_ids(
 
     input_ids = []
     deadline = time.monotonic() + DOWNLOAD_TIMEOUT_S
-    for i, example in enumerate(dataset):
+    for example in dataset:
         if len(input_ids) >= num_samples:
             break
         if time.monotonic() > deadline:
