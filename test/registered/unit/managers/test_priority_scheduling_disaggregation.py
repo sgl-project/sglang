@@ -207,7 +207,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 req_pool_idx=1,
                 cache_protected_len=2,
             ),
-            prefix_indices=torch.tensor([8, 9], dtype=torch.int64),
+            prefix_len=2,
             priority=3,
             extra_key=None,
             cache_salt=None,
@@ -279,7 +279,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.advance_unpublished_req(req)
 
-        self.assertTrue(torch.equal(req.prefix_indices, torch.tensor([8, 9, 10, 11])))
         self.assertEqual(req.kv.cache_protected_len, 2)
         self.assertIs(req.last_node, last_node)
         prepare_params = component.prepare_for_caching_req.call_args.kwargs[
@@ -343,12 +342,21 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy="write_through")
         cache.advance_unpublished_req = MagicMock()
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.int32).reshape(1, 8)
+        )
         scheduler.tree_cache = cache
-        req = SimpleNamespace(pending_bootstrap=True)
+        req = SimpleNamespace(
+            pending_bootstrap=True,
+            kv=SimpleNamespace(req_pool_idx=0),
+            extend_end=5,
+        )
 
         SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
 
         cache.advance_unpublished_req.assert_called_once_with(req)
+        # The next chunk still resumes after this one.
+        self.assertEqual(req.prefix_len, 5)
 
     def test_bootstrap_success_publishes_once(self):
         scheduler = SimpleNamespace(
