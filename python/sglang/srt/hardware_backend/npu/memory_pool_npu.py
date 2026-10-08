@@ -733,6 +733,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self._finalize_allocation_log(size)
 
+    @property
+    def dcp_localizes_write_indices(self):
+        # Dense MLA's token-interleaved KV writer consumes global slots. DSA
+        # instead consumes the page-interleaved slots localized by KVLocPlan.
+        return self.index_head_dim is None and not self.is_draft_worker
+
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
