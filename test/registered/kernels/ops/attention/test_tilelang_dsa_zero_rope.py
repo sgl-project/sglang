@@ -139,25 +139,45 @@ class TestPackedRowInference(CustomTestCase):
             )
 
     def test_glm53_aiter_sparse_mla_dispatch_bounds(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+        from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
+            DeepseekSparseAttnBackendKPoolMixin,
+        )
+        from sglang.srt.layers.attention.dsa_backend import _use_aiter_sparse_mla
 
-        use = DeepseekSparseAttnBackend._use_glm53_aiter_sparse_mla
-        validated = SimpleNamespace(_triton_kpool_tail_supported=True)
-        unvalidated = SimpleNamespace(_triton_kpool_tail_supported=False)
+        for tokens in (1, 64, 4096):
+            self.assertFalse(_use_aiter_sparse_mla("triton", tokens, is_decode=True))
+            self.assertFalse(_use_aiter_sparse_mla("triton", tokens, is_decode=False))
+        for tokens in (1, 2, 4, 8, 12, 15):
+            self.assertFalse(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=True)
+            )
+        for tokens in (16, 64, 512, 4096):
+            self.assertTrue(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=True)
+            )
+        for tokens in (1, 64, 256):
+            self.assertTrue(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=False)
+            )
+        for tokens in (257, 1024, 65536):
+            self.assertFalse(
+                _use_aiter_sparse_mla("aiter_sparse_mla", tokens, is_decode=False)
+            )
 
-        self.assertFalse(use(validated, 64, is_decode=True))
-        with envs.SGLANG_OPT_GLM53_AITER_SPARSE_MLA.override(True):
-            self.assertFalse(use(unvalidated, 64, is_decode=True))
-            self.assertFalse(use(unvalidated, 64, is_decode=False))
-            for tokens in (1, 2, 4, 8, 12, 15):
-                self.assertFalse(use(validated, tokens, is_decode=True))
-            for tokens in (16, 64, 512, 4096):
-                self.assertTrue(use(validated, tokens, is_decode=True))
-            for tokens in (1, 64, 256):
-                self.assertTrue(use(validated, tokens, is_decode=False))
-            for tokens in (257, 1024, 65536):
-                self.assertFalse(use(validated, tokens, is_decode=False))
+        topk_indices = torch.empty(1, 2051, device="meta", dtype=torch.int32)
+        DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+            SimpleNamespace(dsa_index_kpool=4, _triton_kpool_tail_supported=True),
+            topk_indices,
+            "aiter_sparse_mla",
+            "decode",
+        )
+        with self.assertRaises(NotImplementedError):
+            DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend(
+                SimpleNamespace(dsa_index_kpool=4, _triton_kpool_tail_supported=False),
+                topk_indices,
+                "aiter_sparse_mla",
+                "decode",
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "GPU required")

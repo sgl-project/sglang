@@ -100,6 +100,15 @@ _GLM53_AITER_DECODE_MIN_TOKENS = 16
 _GLM53_AITER_PREFILL_MAX_TOKENS = 256
 
 
+def _use_aiter_sparse_mla(dsa_impl: str, num_tokens: int, is_decode: bool) -> bool:
+    """aiter_sparse_mla keeps Triton outside the measured AITER-faster batch sizes."""
+    if dsa_impl != "aiter_sparse_mla":
+        return False
+    if is_decode:
+        return num_tokens >= _GLM53_AITER_DECODE_MIN_TOKENS
+    return num_tokens <= _GLM53_AITER_PREFILL_MAX_TOKENS
+
+
 if is_cuda():
     import deep_gemm
 
@@ -338,6 +347,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "triton",
+    "aiter_sparse_mla",
     "trtllm",
     "intel_xpu",
 ]
@@ -572,7 +582,8 @@ class DeepseekSparseAttnBackend(
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self._triton_kpool_tail_supported = False
         if self.dsa_index_kpool > 1 and (
-            self.dsa_prefill_impl == "triton" or self.dsa_decode_impl == "triton"
+            self.dsa_prefill_impl in ("triton", "aiter_sparse_mla")
+            or self.dsa_decode_impl in ("triton", "aiter_sparse_mla")
         ):
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 can_use_glm53_triton_sparse_attention,
@@ -607,6 +618,15 @@ class DeepseekSparseAttnBackend(
                     f"index_topk={self.dsa_index_topk}, "
                     f"index_kpool={self.dsa_index_kpool}."
                 )
+        if (
+            "aiter_sparse_mla" in (self.dsa_prefill_impl, self.dsa_decode_impl)
+            and not self._triton_kpool_tail_supported
+        ):
+            raise ValueError(
+                "aiter_sparse_mla is only validated for GLM-5.3 on gfx950 with "
+                "BF16 Q/KV, 8 or 16 query heads, zero-width RoPE, 512-wide "
+                "Q/KV/output, index_topk=2048, and index_kpool=4."
+            )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -2226,8 +2246,8 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl == "triton":
-            if self._use_glm53_aiter_sparse_mla(q_nope.shape[0], is_decode=False):
+        elif dsa_impl in ("triton", "aiter_sparse_mla"):
+            if _use_aiter_sparse_mla(dsa_impl, q_nope.shape[0], is_decode=False):
                 return self._forward_aiter_sparse_mla(
                     q_nope=q_nope,
                     kv_cache=kv_cache,
@@ -2560,7 +2580,15 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl == "triton":
+        elif dsa_impl in ("triton", "aiter_sparse_mla"):
+            if _use_aiter_sparse_mla(dsa_impl, q_nope.shape[0], is_decode=True):
+                return self._forward_aiter_sparse_mla(
+                    q_nope=q_nope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3272,14 +3300,6 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        if self._use_glm53_aiter_sparse_mla(q_nope.shape[0], is_decode=True):
-            return self._forward_aiter_sparse_mla(
-                q_nope=q_nope,
-                kv_cache=kv_cache,
-                v_head_dim=v_head_dim,
-                page_table_1=page_table_1,
-                sm_scale=sm_scale,
-            )
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
         )
@@ -3295,16 +3315,6 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
         )
-
-    def _use_glm53_aiter_sparse_mla(self, num_tokens: int, is_decode: bool) -> bool:
-        if not (
-            self._triton_kpool_tail_supported
-            and envs.SGLANG_OPT_GLM53_AITER_SPARSE_MLA.get()
-        ):
-            return False
-        if is_decode:
-            return num_tokens >= _GLM53_AITER_DECODE_MIN_TOKENS
-        return num_tokens <= _GLM53_AITER_PREFILL_MAX_TOKENS
 
     def _forward_aiter_sparse_mla(
         self,

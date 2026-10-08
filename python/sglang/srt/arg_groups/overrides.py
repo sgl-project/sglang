@@ -533,7 +533,7 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
-    rocm_only = {"triton"} & chosen
+    rocm_only = {"triton", "aiter_sparse_mla"} & chosen
     if not hip and rocm_only:
         raise ValueError(
             f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
