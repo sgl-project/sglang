@@ -16,9 +16,9 @@ more than its memory projection.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -33,8 +33,7 @@ _MAX_GROUP_TOKENS = 65536
 _MAX_GROUP_SLOTS = 1 << 18
 
 
-@dataclass(frozen=True)
-class LayoutQuestion:
+class LayoutQuestion(msgspec.Struct, frozen=True):
     question_type: int
     question_span: Tuple[int, int]
     option_spans: Tuple[Tuple[int, int], ...]
