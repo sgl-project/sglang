@@ -314,6 +314,27 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         for answer in (team, urgent, severity):
             self.assertNotIn("x_label_mass", answer)
 
+    async def test_url_images_are_read_once_and_forwarded_as_counted(self):
+        """An image URL whose content changes between reads must be scored as the
+        image that was counted against the prompt budget."""
+        manager = HeadManager(self.tokenizer)
+        url = "http://images.example/chart.png"
+        data = _png_bytes(224, 224)
+        image = {"url": url, "detail": "high"}
+        request = {**REQUEST, "state": "word " * 5000, "images": [image]}
+        target = "sglang.srt.entrypoints.systemone.serving.get_image_bytes"
+        with mock.patch(target, return_value=data) as fetch:
+            response = await _handler(manager).handle_request(
+                SystemOneRequest(**request), None
+            )
+        fetch.assert_called_once_with(url)
+        (forwarded,) = manager.requests[0].image_data
+        self.assertTrue(forwarded.url.startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(forwarded.url.split(",", 1)[1]), data)
+        self.assertEqual(forwarded.detail, "high")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["usage"]["input_tokens"], 4089)
+
     async def test_refusals(self):
         manager = HeadManager(self.tokenizer)
         cases = {
