@@ -621,7 +621,7 @@ class CPUGraphRunner:
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -646,7 +646,7 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
+        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture
@@ -752,7 +752,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.captured_req_width,
-                tp_group=self.model_runner.tp_group,
+                tp_group=get_parallel().tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
                     bs, forward, skip_cross_attention=True
@@ -816,6 +816,7 @@ class CPUGraphRunner:
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
+            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -855,7 +856,7 @@ class CPUGraphRunner:
                     forward_batch.spec_info,
                 )
                 with torch.no_grad():
-                    self.model_runner.tp_group.barrier()
+                    get_parallel().tp_group.barrier()
                     self.model_runner.model.forward(
                         forward_batch.input_ids,
                         forward_batch.positions,
@@ -877,7 +878,7 @@ class CPUGraphRunner:
 
                 with torch.no_grad():
                     for _ in range(2):
-                        self.model_runner.tp_group.barrier()
+                        get_parallel().tp_group.barrier()
                         out = run_once()
                     # Save the captured forward_batch in the appropriate dict
                     if skip_cross_attention:
