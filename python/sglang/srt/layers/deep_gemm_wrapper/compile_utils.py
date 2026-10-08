@@ -275,13 +275,24 @@ class _BaseWarmupExecutor:
     @staticmethod
     def get_memory_requirement(
         kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
-    ) -> int:
-        # Return the required memory space in GB for warmup executor
+    ) -> float:
+        # Return the required memory space in GB for warmup executor.
+        # Include the FP32 scales allocated by _empty_*_fp8: omitting them
+        # can exceed a tight startup budget even when the FP8 payload fits.
         _GB = 1 << 30
+        lhs_scales = max_m * ceil_div(k, _BLOCK_SIZE) * 4
+        rhs_scales = ceil_div(n, _BLOCK_SIZE) * ceil_div(k, _BLOCK_SIZE) * 4
         if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
-            return (max_m * k + n * k + max_m * n * 2) / _GB
+            return (max_m * k + n * k + max_m * n * 2 + lhs_scales + rhs_scales) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+            return (
+                max_m * k
+                + num_groups * n * k
+                + max_m * 4
+                + max_m * n * 2
+                + lhs_scales
+                + num_groups * rhs_scales
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
             return (
                 max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
@@ -292,6 +303,7 @@ class _BaseWarmupExecutor:
                 + num_groups * n * k
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+                + num_groups * (lhs_scales + rhs_scales)
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
