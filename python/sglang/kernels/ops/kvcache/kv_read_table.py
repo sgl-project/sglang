@@ -170,7 +170,6 @@ def build_kv_read_indices_kernel(
     )
 
 
-# As above, and the row counts too, which follow the batch size.
 def _launch(
     *,
     req_to_token: torch.Tensor,
@@ -246,10 +245,9 @@ def build_kv_read_table(
     it up to ``max_pages`` -- what a fresh ``torch.empty`` table needs, in the
     same launch. Never rebound.
 
-    ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
-    verify contract (draft KV read back from the pool). Every row stops at
-    ``max_pages``: a widened window that outruns the row is cut there rather
-    than spilling into the next row, on CUDA as on CPU.
+    ``seq_len_delta`` widens every row's live prefix (a verify reads its draft
+    tokens' KV back from the pool); a widened row is cut at ``max_pages``
+    rather than spilling into the next row.
     """
     bs = int(req_pool_indices.numel())
     assert out.dtype == torch.int32, (

@@ -607,13 +607,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         """
-        Run draft model extend to correctly fill the KV cache. ``kv_loc_plan``
-        is the target prefill's plan; the draft writes the same slots.
+        Run draft model extend to correctly fill the KV cache.
 
         Args:
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            kv_loc_plan: The target prefill's plan; the draft writes the same
+                slots.
         """
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
@@ -783,8 +784,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
-            # Both loc sources read req_to_token untranslated, so `locs` is the
-            # PRE-translate write loc the capture rail needs.
+            # Both loc sources read req_to_token untranslated: `locs` is virtual.
             out_cache_loc_virtual=locs,
             kv_loc_plan=self.draft_runner_list[0].kv_index_translator.plan(
                 req_pool_indices=batch.req_pool_indices,

@@ -533,8 +533,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`;
-    # capture-time batches declare it.
+    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`.
     out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64

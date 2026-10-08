@@ -1874,8 +1874,7 @@ class KVWriteLoc:
       PHYSICAL on every pool: by allocation on non-unified pools, the
       iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise): the same columns of the same plan in the sliding-window
-      sub-pool, derived once from its virtual window
+      otherwise): the same plan's write ids in the sliding-window sub-pool
       (``KVIndexTranslator.write_ids``).
     - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
       space as ``loc``; pools fall back to ``loc`` when it is ``None``.

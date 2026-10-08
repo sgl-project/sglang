@@ -435,8 +435,6 @@ class DraftBlockProposer:
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
-        # The draft block writes the first `query_token_num` columns of the
-        # verify window, through the iteration's plan.
         verify_window.kv_loc_plan.bind(
             draft_forward_batch,
             self.draft_model_runner.kv_index_translator,

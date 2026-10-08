@@ -149,8 +149,7 @@ class MHASubPoolSpec(SubPoolSpec):
         [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
 
     The slot stride stays the one entry, so host and draft views are indexed
-    by the same physical token id; only their offsets differ. `draft_region
-    is None` keeps the layout byte-identical to the unfused one.
+    by the same physical token id; only their offsets differ.
     """
 
     head_num: int

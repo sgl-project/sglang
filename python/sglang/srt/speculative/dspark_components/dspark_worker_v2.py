@@ -706,8 +706,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
-        # The draft KV goes to the slots the target prefill just wrote, through
-        # the plan that forward wrote them with.
+        # The draft KV goes to the slots the target prefill just wrote.
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
         batch_output.kv_loc_plan = None
         token_indices = logits_output.hidden_states_token_indices

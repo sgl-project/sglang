@@ -803,8 +803,8 @@ class DSparkDraftMixin:
                     attn.attn.v_scale,
                 )
             else:
-                # Translated by the injector (physical by allocation on a plain
-                # pool).
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
                 pool.set_kv_buffer(
                     attn.attn,
                     KVWriteLoc(cache_loc, physical=True),

@@ -67,9 +67,9 @@ class NgramVerifyInput(SpecInput):
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """CSR verify args, gathered straight into the packed stream. The lens
-        are widened here and handed to the translator, so nothing materializes
-        a ``[bs, max_pages]`` rectangle to repack from."""
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         bs = req_pool_indices.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)

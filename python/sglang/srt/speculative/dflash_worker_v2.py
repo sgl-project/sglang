@@ -2316,8 +2316,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            # The draft KV goes to the slots the target prefill just wrote,
-            # through the plan that forward wrote them with.
+            # The draft KV goes to the slots the target prefill just wrote.
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(kv_loc_plan),

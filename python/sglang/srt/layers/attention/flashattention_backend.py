@@ -467,10 +467,9 @@ class FlashAttentionBackend(AttentionBackend):
         if not forward_batch.forward_mode.is_draft_extend_v2():
             return
         if self.kv_index_translator.is_translating:
-            # The draft-extend runners record this call unconditionally, but a
-            # translating backend rebuilds these tables out of graph on every
-            # replay; a captured raw req_to_token gather would then overwrite
-            # them with virtual ids.
+            # The draft-extend runners record this call unconditionally; a
+            # translating backend rebuilds these tables out of graph, and a
+            # captured req_to_token gather would overwrite them with virtual ids.
             return
         bs = forward_batch.batch_size
         metadata = self.draft_extend_metadata[bs]
@@ -817,17 +816,14 @@ class FlashAttentionBackend(AttentionBackend):
     def _spec_read_seq_len_delta(
         self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
     ) -> int:
-        """Columns past ``seq_lens`` this mode's whole-sequence read covers —
-        the translated table's fill must reach ``cache_seqlens``. Takes the
-        two fields rather than a ForwardBatch: the captured build slices its
-        batch and has none. Now read by both builds, so eager and replay
-        widen identically.
+        """Columns past ``seq_lens`` this mode's whole-sequence read covers;
+        the translated table must reach ``cache_seqlens``.
 
         Zero for the prefix-only shapes: normal decode/extend, the topk>1
-        split (drafts read via the expand metadata), draft-extend whose lens
-        already include the window, and draft-extend's idle batch. The ragged
-        verify layout's per-row lens are bounded by the draft window, so its
-        upper bound rides the same delta."""
+        split (drafts read via the expand metadata), draft-extend (whose lens
+        already include the window) and its idle batch. The ragged verify
+        layout's per-row lens are bounded by the draft window, so the same
+        delta bounds it."""
         if spec_info is None:
             return 0
         if forward_mode.is_target_verify() and self.topk <= 1:
@@ -3209,8 +3205,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
             if self.kv_index_translator.reads_are_translated:
-                # The plan's page ids, copied into the captured tables with
-                # their sliding-window twin.
                 rows = int(req_pool_indices.numel())
                 self.kv_index_translator.copy_page_table(
                     plan, out=metadata.page_table[:rows]

@@ -5,45 +5,23 @@ The nesting, outermost first:
   sub-pool  a named pool inside the unified pool, with its own grow direction
             and frontier. HOST is the role it plays when its entries also
             carry draft bytes; only "full" hosts a draft here.
-  slot      one token entry of that sub-pool. The draft's KV becomes extra
-            parts of every slot, after the host's own parts at
-            `draft_offset_in_entry()`, so ONE slot id per token covers target
-            and draft: one allocation, one free, one whole-page relocation
-            carry both.
+  slot      one token entry of that sub-pool. The draft's KV is extra parts of
+            every slot, after the host's own parts, so ONE slot id per token
+            covers target and draft: one allocation, one free, one whole-page
+            relocation carry both.
   region    the draft geometry inside the host's entries. A region is not a
             `SubPoolSpec`: no grow direction, no frontier logic, only geometry.
   lane      one position in the region's layer dimension -- one draft layer of
             one runner, present in every slot.
 
-Runners are the draft's execution copies, and the two head shapes place them
-oppositely. A replicated head gives EVERY runner all the draft's layers, so
-each needs its own lanes or the runners clobber each other's KV (3 runners x
-2 layers = 6 lanes). A per-depth head (depth 0 predicts the next token,
-depth 1 the one after, and so on) gives each runner ONE depth (8 layers
-across 2 runners = 2 lanes). Lane count is therefore not layer count, in
-either direction. Each runner owns a contiguous run of lanes, and the runs
-tile the region in runner order.
+A lane is not a layer. Runners are the draft's execution copies: a
+replicated head gives EVERY runner all the draft's layers, on lanes of its own
+so runners do not clobber each other's KV (3 runners x 2 layers = 6 lanes),
+while a per-depth head (one block per predicted position) gives each runner
+ONE depth (8 layers across 2 runners = 2 lanes). Each runner owns a
+contiguous run of lanes, and the runs tile the region in runner order.
 
-Three phases, three moments in boot, and what carries each:
-
-  PLAN   on the TARGET, before any memory exists
-    KVCacheConfigurator._fused_draft_decision()
-      draft_kv_profile(draft_model_config)  what the checkpoint asks for
-      place_fused_draft(profile, runners)   admit, or decline with a reason
-    KVCacheConfigurator.fused_entry_bytes() prices it for the boot solve
-
-  CARVE  as the byte buffer is cut
-    KVCacheConfigurator._fused_draft_for_pool_factory()  resolve once
-      init_unified_*_pools(fused_draft=...)
-      MHASubPoolSpec.draft_offset_in_entry() / .entry_bytes()
-      UnifiedKVPool.build_dense_draft_views()
-
-  BIND   on each DRAFT runner, built after the target
-    KVCacheConfigurator._fused_draft_from_target_buffer(alloc)
-      bind_fused_draft(...) -> UnifiedDraftKVPool
-    KVIndexTranslator: fused_draft_host_allocator(pool) is alloc -> translate
-
-A draft whose layers need another sub-pool kind declines to a private pool.
+A draft whose layers need another sub-pool kind declines fusion as a whole.
 """
 
 from typing import List, Optional, Tuple
@@ -57,8 +35,8 @@ from sglang.srt.mem_cache.layout.token_major import ROW_ALIGN_BYTES, DensePart
 class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
     """Geometry of the DRAFT model's K/V rows fused into every slot of a host
     sub-pool. The draft is a separate checkpoint, so its head geometry and
-    layer count differ from the host's; its K and V rows are two more parts of
-    the host entry, indexed by the host's physical token id."""
+    layer count can differ from the host's; its K and V rows are two more parts
+    of the host entry, indexed by the host's physical token id."""
 
     lane_num: int
     head_num: int
@@ -174,7 +152,6 @@ def draft_state_layer_num(draft_model_config) -> int:
     mambaish = mambaish_config(draft_model_config)
     if mambaish is None:
         return 0
-    # Optional HF attribute: only conv-chain MTP configs declare it.
     if getattr(draft_model_config.hf_text_config, "mtp_local_layer_ids", None) is None:
         return 0
     return len(mambaish.mamba2_cache_params.layers)
@@ -217,8 +194,8 @@ def draft_kv_profile(
 
 
 class FusedDraftDecision(msgspec.Struct, frozen=True, kw_only=True):
-    """`place_fused_draft`'s answer: the placement, or why the draft keeps a
-    private pool. Neither means fusion simply does not apply."""
+    """`place_fused_draft`'s answer: the placement, or why the draft cannot
+    fuse. Neither means fusion does not apply."""
 
     placement: Optional[FusedDraftPlacement] = None
     declined: Optional[str] = None
@@ -253,8 +230,8 @@ def place_fused_draft(
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
-    ``"full"``. A layer kind no host arm serves declines the whole draft to
-    its private pool."""
+    ``"full"``. A layer kind no host sub-pool serves declines the whole
+    draft."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)

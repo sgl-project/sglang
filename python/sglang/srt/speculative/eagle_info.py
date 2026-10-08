@@ -97,9 +97,9 @@ class EagleVerifyInput(SpecInput):
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """CSR verify args, gathered straight into the packed stream. The lens
-        are widened here and handed to the translator, so nothing materializes
-        a ``[bs, max_pages]`` rectangle to repack from."""
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the translator packs the read ids straight into
+        ``kv_indices``."""
         device = req_pool_indices.device
         batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
@@ -410,8 +410,8 @@ class EagleDraftExtendInput(SpecInput):
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
     ):
-        """Draft-extend CSR args. The lens already include the window, so
-        unlike verify nothing is widened here."""
+        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
+        draft-extend window."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).

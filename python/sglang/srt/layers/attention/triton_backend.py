@@ -132,8 +132,6 @@ class ForwardMetadata:
     swa_attn_logits: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
-    # cuda-graph: capture-stable buffer view). None for non-unified pools.
     # Lean decode (persistent-grid partial-result buffers)
     lean_Mp: Optional[torch.Tensor] = None
     lean_Lp: Optional[torch.Tensor] = None

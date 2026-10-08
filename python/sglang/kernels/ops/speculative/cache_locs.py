@@ -99,11 +99,9 @@ def _load_token_ids(
     ENTRY_PAGE_SIZE: tl.constexpr,
     TRANSLATE: tl.constexpr,
 ):
-    """The token ids at positions ``pos`` of one row of a read source: the row
-    itself on a token-granular table, ``entry * ps + pos % ps`` on the
-    unified pool's page-granular one (its entries are physical pages); with
-    ``TRANSLATE``, virtual rows mapped through ``v2p`` on the way out (no
-    shared table this iteration)."""
+    """Token ids at positions ``pos`` of one read-source row: the row's own
+    entries when token-granular, ``entry * ps + pos % ps`` when page-granular;
+    with ``TRANSLATE``, virtual ids mapped through ``v2p`` on the way out."""
     if ENTRY_PAGE_SIZE == 1:
         ids = tl.load(row_ptr + pos, mask=mask)
     else:

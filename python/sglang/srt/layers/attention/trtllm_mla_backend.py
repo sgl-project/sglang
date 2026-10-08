@@ -300,8 +300,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # [:n] view of a capture-stable buffer on the cuda-graph path; None on
-        # the eager path, which passes forward_batch.out_cache_loc through.
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
         # async asserts: the fused path writes the pool directly and would
@@ -1279,7 +1277,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
             # `out_cache_loc` is physical on every pool, eager or captured
-            # (the runner's slot), so one path serves both.
+            # (the runner's slot).
             if merge_query and self._fused_set_kv_concat_q:
                 # Fused: KV scatter + [q_nope | q_rope] concat in one launch;
                 # None when the inputs are not covered.

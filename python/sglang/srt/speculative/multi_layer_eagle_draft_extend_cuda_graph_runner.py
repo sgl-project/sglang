@@ -750,9 +750,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         out_cache_loc_virtual,
         kv_loc_plan,
     ):
-        # Staging runs before `prepare`, so the rail and the plan arrive here
-        # rather than off a ForwardBatch; `prepare` overwrites them with the
-        # batch's own.
+        # Staging runs before `prepare` has a ForwardBatch, so the virtual write
+        # ids and the plan come in here; `prepare` replaces them with the batch's.
         self._out_cache_loc_virtual = out_cache_loc_virtual
         self._kv_loc_plan = kv_loc_plan
         self._kv_loc_cols = None

@@ -510,10 +510,9 @@ class KVCacheConfigurator:
         token_to_kv_pool = None
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
-        # from one byte buffer, then return. Gated to the target worker by ROLE:
-        # a compact-window DFLASH draft also passes req_to_token_pool=None, and
-        # would allocate a SECOND unified byte buffer here. Supports hybrid
-        # Mamba and hybrid SWA (not DSV4).
+        # from one byte buffer, then return. Target worker only: a compact-window
+        # DFLASH draft also passes req_to_token_pool=None. Supports hybrid Mamba
+        # and hybrid SWA (not DSV4).
         if (
             get_memory().enable_unified_memory
             and req_to_token_pool is None
@@ -581,7 +580,6 @@ class KVCacheConfigurator:
                 alloc = token_to_kv_pool_allocator
                 placement = self._fused_draft_from_target_buffer(alloc)
                 if placement is not None:
-                    # FUSED arm
                     from sglang.srt.mem_cache.layout.fused_draft import (
                         draft_swa_layer_ids,
                     )
@@ -619,7 +617,6 @@ class KVCacheConfigurator:
                         token_to_kv_pool_allocator=alloc,
                         unified_memory_pool=None,
                     )
-                # PRIVATE arm
                 draft_virtual_id_space = alloc.draft_virtual_id_space
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
                     "unified allocator virtual space smaller than the token "
@@ -627,7 +624,7 @@ class KVCacheConfigurator:
                     f"max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
                 # Round UP to page alignment (paged draft backends view the
-                # pool as (-1, page_size, H, D); the space is not aligned).
+                # pool as (-1, page_size, H, D); the virtual space is not aligned).
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
@@ -733,11 +730,8 @@ class KVCacheConfigurator:
         )
 
     def _fused_draft_from_target_buffer(self, alloc):
-        """The placement this draft binds to, or None for the private-pool
-        fallback (the draft then owns a raw-virtual-indexed pool of its own).
-        Target boot declines a placement whenever the fused region cannot
-        serve the draft (`_fused_draft_decision`), so the private arm is the
-        rollback lever, not a boot-order bug."""
+        """The placement this draft binds to, or None when the target placed
+        none and the draft builds a private pool over the virtual id space."""
         if not (
             self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
@@ -961,14 +955,10 @@ class KVCacheConfigurator:
 
     def _fused_draft_decision(self):
         """Whether, and where, the draft's layers fuse into the target's
-        sub-pools. Fusion applies only for: unified memory ON, a unified target
-        (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
-        or DFLASH/DSPARK algorithm whose draft config was loaded at target
-        boot. It declines, keeping the draft's private pool, for a non-MHA
-        draft, a draft backend off the translated MHA rails, DCP, HiCache,
-        host-pool decode retraction, or an explicit draft KV dtype unlike the
-        host's; `place_fused_draft` then admits or declines the draft's layer
-        kinds."""
+        sub-pools. An empty decision means fusion does not apply (unified
+        memory off, no hybrid host, or no EAGLE- or DFLASH-family draft config
+        loaded at target boot); a declined one says why the draft cannot fuse.
+        The pool factories decide whether a decline refuses the boot."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -998,10 +988,9 @@ class KVCacheConfigurator:
                     "the fused region holds dense MHA K/V rows"
                 )
             )
-        # The backend(s) the draft runner will run. A DFLASH-family draft
-        # worker resolves one as `build_draft_tp_worker` does; an EAGLE draft
-        # runs the published draft backend, else the target's prefill/decode
-        # pair. A published draft backend carries model-hook declarations.
+        # The draft runner's backend, resolved as its worker will: an EAGLE
+        # draft with no backend of its own runs the target's prefill/decode
+        # pair. The published draft backend carries model-hook declarations.
         if self.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
@@ -1066,10 +1055,9 @@ class KVCacheConfigurator:
             else 1
         )
         # A fused draft stores its rows in the host's KV dtype. An explicit
-        # draft dtype resolves without the draft model, as the draft runner
-        # resolves it, so a mismatch is declined here; `auto` follows the
-        # draft's quant config, which only the draft runner knows, and is
-        # checked when it binds.
+        # draft dtype resolves here as the draft runner will; `auto` follows
+        # the draft's quant config, which only the draft runner knows, so it
+        # is checked when the draft binds.
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
         if draft_kv_cache_dtype not in (None, "auto"):
             from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
@@ -1098,11 +1086,10 @@ class KVCacheConfigurator:
         )
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
-        """Per-token bytes of ``sub_pool_name``'s FUSED entry (host + draft +
-        pad) for the boot solve's cell model. Single source of truth: assembled
-        through the same spec the pool factory builds, so the priced entry and
-        the allocated entry cannot drift. None when the draft does not fuse
-        into that sub-pool."""
+        """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +
+        pad), built from the same spec as the pool factory's so the priced and
+        allocated entries agree; None when the draft does not fuse into that
+        sub-pool."""
         placement = self._fused_draft_decision().placement
         if placement is None or sub_pool_name != "full":
             return None
@@ -1150,14 +1137,11 @@ class KVCacheConfigurator:
 
     def _fused_draft_for_mamba_factory(self):
         """`_fused_draft_for_pool_factory` for a mamba-hybrid host. Its unified
-        buffer takes the WHOLE profiled KV budget (`unified_total_bytes`), so a
-        private draft pool -- sized to the full virtual id span -- would be
-        allocated on top of it, unbudgeted. Until the mamba solve prices that
-        pool, an EAGLE-family or DFLASH draft that does not fuse is refused here
-        instead of overcommitting GPU memory. A DSPARK draft that does not fuse
-        keeps its private pool, unpriced: refusing it would refuse DSPARK on
-        these hosts whenever its draft declines fusion, as the Kimi-Linear
-        default (a trtllm_mha draft) does."""
+        buffer takes the whole profiled KV budget, so a private draft pool
+        would sit on top of it unbudgeted: an EAGLE-family or DFLASH draft that
+        does not fuse is refused. A DSPARK draft that does not fuse keeps its
+        private pool, unpriced, so DSPARK still boots where its draft declines
+        fusion (as the Kimi-Linear default, a trtllm_mha draft, does)."""
         decision = self._fused_draft_decision()
         placement = self._fused_draft_for_pool_factory(decision)
         if (
@@ -1169,18 +1153,16 @@ class KVCacheConfigurator:
             raise ValueError(
                 "--enable-unified-memory + EAGLE/EAGLE3/DFLASH on a mamba-hybrid "
                 "target needs the draft's KV fused into the target's pages, but "
-                f"this draft would keep a private pool ({reason}). A mamba host's "
-                "unified buffer takes the whole KV budget, so a private draft "
-                "pool would overcommit GPU memory."
+                f"this draft cannot fuse ({reason}). A private draft pool would "
+                "overcommit the KV budget the unified buffer already takes."
             )
         return placement
 
     def _fused_draft_for_swa_factory(self):
         """`_fused_draft_for_pool_factory` for a hybrid-SWA host. Its boot solve
         prices a private EAGLE draft pool at the target's per-token size, not
-        at the draft's own heads, head_dim and KV dtype, so a draft that does
-        not fuse is refused here, as on a mamba host, instead of overcommitting
-        GPU memory."""
+        the draft's own geometry and KV dtype, so an EAGLE draft that does not
+        fuse is refused rather than overcommit GPU memory."""
         decision = self._fused_draft_decision()
         placement = self._fused_draft_for_pool_factory(decision)
         if (
@@ -1192,15 +1174,14 @@ class KVCacheConfigurator:
             raise ValueError(
                 "--enable-unified-memory + EAGLE/EAGLE3 on a hybrid-SWA target "
                 "needs the draft's KV fused into the target's pages, but this "
-                f"draft would keep a private pool ({reason}), which the unified "
-                "pool's sizing does not price."
+                f"draft cannot fuse ({reason}), and the unified pool's sizing "
+                "does not price a private draft pool."
             )
         return placement
 
     def _fused_draft_for_pool_factory(self, decision):
-        """The placement a pool factory is handed, from ONE resolved decision,
-        so the boot log reports exactly that placement: a declined fusion and
-        an engaged one otherwise look identical from outside."""
+        """The placement a pool factory is handed. It logs the decision it
+        returns, so the boot log shows whether fusion engaged or why not."""
         if decision.placement is None:
             if decision.declined is not None:
                 logger.warning("fused draft KV disabled: %s", decision.declined)

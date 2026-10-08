@@ -253,11 +253,10 @@ def prepare_for_draft(
     target_translator: Optional[KVIndexTranslator] = None,
     num_draft_tokens: Optional[int] = None,
 ) -> tuple[ForwardBatch, bool, Optional[KVLocPlan]]:
-    """The draft-decode batch. With ``target_translator``, a chain draft
-    plans the iteration's whole write window -- the ``num_draft_tokens``
-    slots past ``seq_lens`` that verify and draft extend write too -- once,
-    and the draft writes its first ``num_steps`` columns; that plan is
-    returned for the iteration's later forwards (None otherwise)."""
+    """The draft-decode batch. With ``target_translator``, a chain draft plans
+    the iteration's whole write window (the ``num_draft_tokens`` slots past
+    ``seq_lens`` that verify and draft extend also write) and writes its first
+    ``num_steps`` columns; that plan is returned, else None."""
     prepared_positions = None
     prepared_mrope_positions = None
     kv_loc_plan = None
