@@ -1004,7 +1004,7 @@ class TestFactory(CustomTestCase):
 
     def test_chunk_cap_configurator_selection(self):
         # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
-        def _cfg(max_running_requests):
+        def _cfg(max_running_requests, chunked_prefill_size=4):
             mr = _make_model_runner(
                 self,
                 is_hybrid_swa=True,
@@ -1012,7 +1012,7 @@ class TestFactory(CustomTestCase):
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
                 disable_radix_cache=True,
-                chunked_prefill_size=4,
+                chunked_prefill_size=chunked_prefill_size,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
             )
@@ -1029,6 +1029,10 @@ class TestFactory(CustomTestCase):
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+        # Chunked prefill off: a whole prompt can exceed the cap.
+        self.assertNotIsInstance(
+            _cfg(2, chunked_prefill_size=-1), SWAChunkCapPoolConfigurator
+        )
 
 
 class TestDflashDraftKvBudget(CustomTestCase):
