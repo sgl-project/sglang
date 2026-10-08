@@ -976,13 +976,14 @@ class C4IndexerAscendBackendMixin:
             )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
-        self._dump_dsv4_sparse_chain(c4_indexer, topk_idxs, forward_batch)
+        self._dump_dsv4_sparse_chain(c4_indexer, topk_idxs, forward_batch, x)
 
     def _dump_dsv4_sparse_chain(
         self,
         c4_indexer,
         topk_idxs: torch.Tensor,
         forward_batch: ForwardBatch,
+        x: torch.Tensor,
     ) -> None:
         """Diagnostic for the DSV4/A5 hit != miss divergence: hash the three
         links of the sparse chain the A5 attention op consumes, so one hit run
@@ -1004,7 +1005,13 @@ class C4IndexerAscendBackendMixin:
         dump_cmpidx = os.environ.get("DSV4_DUMP_CMPIDX")
         dump_idxk = os.environ.get("DSV4_DUMP_IDXK")
         dump_c4kv = os.environ.get("DSV4_DUMP_C4KV")
-        if dump_cmpidx is None and dump_idxk is None and dump_c4kv is None:
+        dump_xin = os.environ.get("DSV4_DUMP_XIN")
+        if (
+            dump_cmpidx is None
+            and dump_idxk is None
+            and dump_c4kv is None
+            and dump_xin is None
+        ):
             return
 
         layer_id = getattr(c4_indexer, "layer_id", -1)
@@ -1037,6 +1044,17 @@ class C4IndexerAscendBackendMixin:
         hi = int(os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
         if lastpos < lo or lastpos > hi:
             return
+
+        if _want(dump_xin):
+            try:
+                xt = x.detach().contiguous().to("cpu")
+                print(
+                    f"[XIN] layer={layer_id} lastpos={lastpos} "
+                    f"shape={tuple(xt.shape)} md5={_md5(xt)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[XIN] skipped: {exc}", flush=True)
 
         if _want(dump_cmpidx):
             try:
