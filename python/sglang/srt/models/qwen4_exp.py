@@ -514,7 +514,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and x.device.type == "cuda"
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -1778,7 +1778,7 @@ class Qwen4ExpAttentionDecoderLayer(
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
-            if attn_output.is_cuda:
+            if attn_output.device.type == "cuda":
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
