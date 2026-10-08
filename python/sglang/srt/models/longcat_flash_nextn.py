@@ -488,6 +488,15 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     module.weight, module.weight_scale_inv, weight_block_size
                 )
 
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return (
+            ".mtp." not in name
+            or "embed_tokens" in name
+            or "shared_head.head" in name
+            or "rotary_emb.inv_freq" in name
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -543,7 +552,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
-                if ".mtp." not in name:
+                if self.is_unused_checkpoint_weight(name):
                     continue
                 if name in weight_names_mapping:
                     name = weight_names_mapping[name]

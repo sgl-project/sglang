@@ -1680,6 +1680,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             return hidden_states
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # Match the name normalization and extra-layer check in load_weights.
+        name = name.replace("language_model.", "")
+        if getattr(self.config, "num_nextn_predict_layers", 0) > 0 and name.startswith(
+            "model.layers"
+        ):
+            parts = name.split(".")
+            if len(parts) >= 3:
+                return int(parts[2]) >= self.config.num_hidden_layers
+        return False
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):

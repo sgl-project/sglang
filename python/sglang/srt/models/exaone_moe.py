@@ -754,6 +754,24 @@ class ExaoneMoEForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def _is_unused_checkpoint_weight(name: str, is_mtp: bool) -> bool:
+        if ("mtp" in name) != is_mtp:
+            return True
+        # ColossalAI checkpoints may include cached rotary tensors.
+        return any(
+            token in name
+            for token in (
+                "rotary_emb.inv_freq",
+                "rotary_emb.cos_cached",
+                "rotary_emb.sin_cached",
+                "projector",
+            )
+        )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=False)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
@@ -776,9 +794,9 @@ class ExaoneMoEForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if self._is_unused_checkpoint_weight(name, is_mtp):
+                continue
             if is_mtp:
-                if "mtp" not in name:
-                    continue
                 if name in [
                     "mtp.fc.weight",
                     "mtp.pre_fc_norm_embedding.weight",
@@ -788,15 +806,6 @@ class ExaoneMoEForCausalLM(nn.Module):
                 else:
                     name = name.replace("mtp", "model")
 
-            if not is_mtp and "mtp" in name:
-                continue
-
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 

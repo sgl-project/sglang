@@ -330,6 +330,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self._owns_lm_head = False
+        self._checkpoint_has_target_layers = None
         # Required for parent's load_weights
         self.pp_group = get_parallel().pp_group
 
@@ -374,6 +375,27 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def begin_checkpoint_weight_selection(self) -> None:
+        self._checkpoint_has_target_layers = False
+
+    def observe_checkpoint_weight_names(self, names: Iterable[str]) -> None:
+        # The draft's head-ownership decision needs the *full* checkpoint,
+        # including target-only shards that pre-read selection will skip.
+        self._checkpoint_has_target_layers = bool(
+            self._checkpoint_has_target_layers
+        ) or any(
+            name.removeprefix("language_model.").startswith(
+                ("backbone.layers.", "model.layers.")
+            )
+            for name in names
+        )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        name = self._map_checkpoint_weight_name(name.removeprefix("language_model."))
+        return (
+            "mtp" not in name and "embed_tokens" not in name and "lm_head" not in name
+        )
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
@@ -395,7 +417,12 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
 
         # Inspect names while streaming: buffering a full target checkpoint here
         # would double its host-memory footprint during embedded MTP loading.
-        super().load_weights(normalized_weights(), is_mtp=True)
+        try:
+            super().load_weights(normalized_weights(), is_mtp=True)
+        finally:
+            checkpoint_has_target_layers = bool(self._checkpoint_has_target_layers)
+            self._checkpoint_has_target_layers = None
+        has_target_layers |= checkpoint_has_target_layers
         self._owns_lm_head = bool(
             has_mtp_layers and not has_target_layers and head_weights
         )

@@ -983,6 +983,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_head=self.markov_head,
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # Use the same platform-specific mapping as load_weights so shard
+        # selection follows the model's actual checkpoint layout.
+        mapped = (
+            self._remap_dspark_weight_name_npu(name)
+            if _is_npu
+            else self._remap_dspark_weight_name(name)
+        )
+        return mapped is None
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()

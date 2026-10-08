@@ -453,6 +453,13 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     def lm_head(self):
         return self.language_model.lm_head
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if not name.startswith("language_model."):
+            return False
+        return self.language_model.is_unused_checkpoint_weight(
+            name.removeprefix("language_model.")
+        )
+
     def _normalize_vision_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.vision_final_layernorm is None:
             return features

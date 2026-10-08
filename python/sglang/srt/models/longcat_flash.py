@@ -900,6 +900,10 @@ class LongcatFlashForCausalLM(nn.Module):
                 ]:
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return "mtp" in name or "rotary_emb.inv_freq" in name
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -1016,6 +1016,11 @@ class InklingForConditionalGeneration(nn.Module):
         # tree / state_dict.
         return self.llm
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if "rotary_emb.inv_freq" in name:
+            return True
+        return name.removeprefix("model.").startswith("mtp.")
+
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
         def base_layer(module: torch.nn.Module) -> torch.nn.Module:
             from sglang.srt.lora.layers import BaseLayerWithLoRA
@@ -1393,7 +1398,7 @@ class InklingForConditionalGeneration(nn.Module):
         embed_tokens_weight: Optional[torch.Tensor] = None
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             # The checkpoint nests the sub-models under model.{llm,audio,visual}.;
             # strip the container prefix so the llm./audio./visual. mapping below
@@ -1841,6 +1846,30 @@ class InklingForConditionalGenerationMTP(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def is_unused_checkpoint_weight_with_draft_model_idx(self, name: str) -> bool:
+        # This is the raw checkpoint name, before DefaultModelLoader remaps the
+        # selected model.mtp.layers.<idx> block to layer 0.
+        if "rotary_emb.inv_freq" in name:
+            return True
+        match = re.match(r"model\.mtp\.layers\.(\d+)\.", name)
+        if match is not None and int(match.group(1)) != self.draft_model_idx:
+            return True
+        name = name.removeprefix("model.")
+        if name in (
+            "llm.embed_tokens.weight",
+            "llm.embed.weight",
+            "llm.lm_head.weight",
+            "llm.unembed.weight",
+            "embed.weight",
+            "unembed.weight",
+            "embed_norm.weight",
+            "llm.embed_norm.weight",
+        ):
+            return False
+        # Matches the draft load_weights skip; retain other layouts unless the
+        # model itself proves they are unused.
+        return name.startswith("llm.") and ".mtp." not in name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())

@@ -140,23 +140,22 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        mtp_layer_found = False
-        mtp_weight_patterns = [
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        mtp_weight_patterns = (
             f"mtp_block.{self.mtp_layer_id}",
             f"mtp_emb_norm.{self.mtp_layer_id}",
             f"mtp_hidden_norm.{self.mtp_layer_id}",
             f"mtp_linear_proj.{self.mtp_layer_id}",
-        ]
+        )
+        return not any(pattern in name for pattern in mtp_weight_patterns)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        mtp_layer_found = False
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            # Only name matched patterns should be loaded
-            for layer_pattern in mtp_weight_patterns:
-                if layer_pattern in name:
-                    mtp_layer_found = True
-                    break
-            else:
+            if self.is_unused_checkpoint_weight(name):
                 continue
+            mtp_layer_found = True
             # But strip mtp_layer_id before loading, because each MTP layer is a MTP model.
             name = name.replace(f".{self.mtp_layer_id}.", ".")
             for (

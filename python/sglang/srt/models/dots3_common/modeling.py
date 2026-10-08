@@ -1901,6 +1901,20 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if "rotary_emb.inv_freq" in name:
+            return True
+        if self.config.num_nextn_predict_layers > 0:
+            if name.startswith("model.mtp."):
+                return True
+            if name.startswith("model.layers."):
+                layer_id = name.split(".")[2]
+                return (
+                    layer_id.isdecimal()
+                    and int(layer_id) >= self.config.num_hidden_layers
+                )
+        return False
+
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -2092,18 +2106,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 weight_names.append(name)
 
                 if not is_nextn:
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-                    # The NextN draft model owns model.mtp.* weights.
-                    if num_nextn_layers > 0 and name.startswith("model.mtp."):
+                    if self.is_unused_checkpoint_weight(name):
                         continue
                 else:
+                    if self.is_unused_checkpoint_weight(name):
+                        continue
                     # Remap the MTP-specific embedding into the draft model.
                     if name == "model.mtp.embed_tokens.weight":
                         name = "model.embed_tokens.weight"
@@ -2523,6 +2530,11 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.thinker.get_input_embeddings()
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if name.startswith(("vision_encoder.", "audio_encoder.")):
+            return self.thinker.visual is None
+        return self.thinker.language_model.is_unused_checkpoint_weight(name)
 
     def load_weights(self, weights, *args, **kwargs):
         # Partition the flat checkpoint in one pass. This avoids reading the

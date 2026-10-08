@@ -31,6 +31,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
     NextNDisabledConfig,
     NextNEnabledConfig,
+    is_unused_nextn_checkpoint_weight,
 )
 from sglang.srt.models.gigachat35 import (
     GigaChat35Config,
@@ -203,6 +204,15 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
             nextn_layer_id=nextn_layer_id,
             nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
             nextn_spec_weight_names=["shared_head.norm", "eh_proj", "enorm", "hnorm"],
+        )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self.is_unused_checkpoint_weight_with_draft_model_idx(name)
+
+    def is_unused_checkpoint_weight_with_draft_model_idx(self, name: str) -> bool:
+        nextn_layer_id = self._initialize_nextn_conf(True).nextn_layer_id
+        return is_unused_nextn_checkpoint_weight(
+            name, self.config, True, nextn_layer_id
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

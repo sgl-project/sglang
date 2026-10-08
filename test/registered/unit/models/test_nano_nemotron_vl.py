@@ -118,6 +118,28 @@ class TestNemotronHOmniVideo(CustomTestCase):
 
 
 class TestNemotronHOmniModel(CustomTestCase):
+    def test_main_checkpoint_selection_delegates_only_language_weights(self):
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        model.language_model = SimpleNamespace(
+            is_unused_checkpoint_weight=lambda name: "mtp" in name
+        )
+
+        self.assertTrue(
+            model.is_unused_checkpoint_weight(
+                "language_model.backbone.mtp.layers.0.weight"
+            )
+        )
+        self.assertFalse(
+            model.is_unused_checkpoint_weight("language_model.backbone.layers.0.weight")
+        )
+        self.assertFalse(
+            model.is_unused_checkpoint_weight("vision_model.radio_model.weight")
+        )
+        self.assertFalse(
+            model.is_unused_checkpoint_weight("vision_projector.mlp1.linear1.weight")
+        )
+
     def test_existing_nano_model_keeps_ignoring_unrecognized_weights(self):
         model = object.__new__(NemotronH_Nano_VL_V2)
         nn.Module.__init__(model)
