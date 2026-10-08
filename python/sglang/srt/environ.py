@@ -193,6 +193,10 @@ class EnvIntWithAlias(_DeprecatedEnvFallback, EnvInt):
     pass
 
 
+class EnvStrWithAlias(_DeprecatedEnvFallback, EnvStr):
+    pass
+
+
 class EnvFloat(EnvField):
     def parse(self, value: str) -> float:
         try:
@@ -1836,6 +1840,10 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Opt-in Kimi-K3 gfx950 MLA decode path: fuse identity-RoPE Q
+    # materialization, Q concat and latent KV-cache write into AITER's
+    # per-head kernel. Fail closed to the existing split/cat/cache chain.
+    SGLANG_ROCM_K3_AITER_MLA_Q_CACHE_FUSION = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
@@ -1844,6 +1852,17 @@ class Envs:
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     # Fold the BM=16 MoE sort into the radix-4 launch for decode-sized M.
     SGLANG_ROCM_K3_RADIX4_FUSE_SORT = EnvBool(True)
+    # Per-operator opt-ins for the gfx950 FlyDSL specializations. Each one
+    # fail-closes to the split GEMM chain when the chip, shape or AITER build
+    # cannot service it, so enabling one on unsupported hardware is a no-op.
+    SGLANG_ROCM_K3_AITER_MLA_GATE = EnvBool(False)
+    # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
+    # falls back to AITER, "sglang" and "aiter" pin one source.
+    SGLANG_ROCM_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
+    # Prepend an SGLang-shipped BF16 tuned-GEMM profile for M=16384 to AITER's
+    # config search path. Read before any import can initialize AITER_CONFIGS.
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
