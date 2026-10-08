@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import fastapi
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.lora.classification_head import (
+    finish_on_cancel,
+    prepare_classification_bundle,
+)
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -650,12 +654,25 @@ class TokenizerControlMixin:
         )
         if result.success:
             self.pending_lora_unloads.pop(obj.lora_name)
+            self.classification_heads.pop(lora_id, None)
+            snapshot = self.classification_snapshots.pop(lora_id, None)
+            if snapshot is not None:
+                await finish_on_cancel(asyncio.to_thread(snapshot.cleanup))
         return result
 
     async def load_lora_adapter(
         self: TokenizerManager,
         obj: LoadLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterReqOutput:
+        # Finish the load transaction even if the HTTP caller disconnects.
+        # Otherwise the backend may accept the LoRA while the registry/head
+        # publication is cancelled, leaving an unaddressable GPU adapter.
+        return await finish_on_cancel(self._load_lora_adapter_transaction(obj))
+
+    async def _load_lora_adapter_transaction(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterReqInput,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
 
@@ -681,6 +698,33 @@ class TokenizerControlMixin:
                         "Retry the unload before loading it again."
                     )
 
+                # Validate the complete CPU bundle before touching GPU state.
+                # File IO, hashing and tensor validation must not block chat.
+                registered = self.lora_registry.get_all_adapters()
+                if obj.lora_name in registered:
+                    return LoadLoRAAdapterReqOutput(
+                        success=False,
+                        error_message=f"LoRA adapter '{obj.lora_name}' is already loaded",
+                        loaded_adapters={
+                            name: ref.lora_path for name, ref in registered.items()
+                        },
+                    )
+                source_path = obj.lora_path
+                bundle = await asyncio.to_thread(
+                    prepare_classification_bundle,
+                    source_path,
+                    self.model_config.hidden_size,
+                )
+                if bundle is not None:
+                    try:
+                        self._validate_classification_runtime()
+                    except BaseException:
+                        await finish_on_cancel(
+                            asyncio.to_thread(bundle.directory.cleanup)
+                        )
+                        raise
+                    obj.lora_path = bundle.path
+
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -690,16 +734,36 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
+                if bundle is not None:
+                    self.classification_snapshots[new_adapter.lora_id] = (
+                        bundle.directory
+                    )
+                    # Preserve cleanup state if the backend call itself fails.
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
                 rank_results = await self.update_lora_adapter_communicator(obj)
                 result = _merge_lora_update_results(rank_results)
                 if result.success:
                     await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                    if bundle is not None:
+                        self.classification_heads[new_adapter.lora_id] = bundle.head
+                        self.pending_lora_unloads.pop(obj.lora_name, None)
+                    # Reloads must validate a fresh source bundle; snapshots are
+                    # deleted on unload and may never be reused by adapter name.
+                    self.lora_ref_cache[obj.lora_name] = LoRARef(
+                        lora_id=new_adapter.lora_id,
+                        lora_name=obj.lora_name,
+                        lora_path=source_path,
+                        pinned=obj.pinned,
+                    )
                 elif (
                     obj.lora_name not in self.lora_registry.get_all_adapters()
                     and _lora_load_needs_cleanup(rank_results, obj.lora_name)
                 ):
                     self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
+                elif bundle is not None:
+                    self.pending_lora_unloads.pop(obj.lora_name, None)
+                    self.classification_snapshots.pop(new_adapter.lora_id, None)
+                    await finish_on_cancel(asyncio.to_thread(bundle.directory.cleanup))
 
                 if get_lora().max_loaded_loras is not None:
                     while (
@@ -742,6 +806,14 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: LoadLoRAAdapterFromTensorsReqInput,
         _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        # All LoRA updates share one queueing communicator. Cancellation must
+        # not let a late reply complete the next operation in that queue.
+        return await finish_on_cancel(self._load_lora_tensors_transaction(obj))
+
+    async def _load_lora_tensors_transaction(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorsReqInput,
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         self.auto_create_handle_loop()
 
@@ -828,6 +900,12 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
+    ) -> UnloadLoRAAdapterReqOutput:
+        return await finish_on_cancel(self._unload_lora_adapter_transaction(obj))
+
+    async def _unload_lora_adapter_transaction(
+        self: TokenizerManager,
+        obj: UnloadLoRAAdapterReqInput,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
 
