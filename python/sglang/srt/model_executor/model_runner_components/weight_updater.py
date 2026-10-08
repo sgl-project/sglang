@@ -52,6 +52,15 @@ def _unsupported_derived_weight_cache_error(
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get():
+        return (
+            "Online weight updates are not supported while "
+            "SGLANG_SM120_NVFP4_PHASE_LAYOUT is enabled. Disable the layout "
+            "cycle before loading a new checkpoint and capturing graphs."
+        )
+
     from sglang.kernels.ops.gemm.sm120_lossless_bf16_head import (
         lossless_bf16_head_enabled,
     )

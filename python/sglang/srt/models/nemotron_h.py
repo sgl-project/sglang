@@ -1160,6 +1160,12 @@ class NemotronHForCausalLM(nn.Module):
         input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: PPProxyTensors | None = None,
     ):
+        if hasattr(self, "_sglang_nvfp4_layout_cycle"):
+            from sglang.srt.model_executor.model_runner_components.nvfp4_layout import (
+                prepare_nvfp4_layout,
+            )
+
+            prepare_nvfp4_layout(self, forward_batch)
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )

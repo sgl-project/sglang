@@ -66,6 +66,7 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     is_gated: bool = True
     activation: Optional[str] = None
     lossless_bf16_buffers: Optional[tuple[torch.Tensor, ...]] = None
+    pair_w2_weight: Optional[torch.Tensor] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -400,7 +401,9 @@ def _run_flashinfer_cutlass(
             x,
             quant_info.w13_weight,
             qs[1],
-            quant_info.w2_weight,
+            quant_info.pair_w2_weight
+            if quant_info.pair_w2_weight is not None
+            else quant_info.w2_weight,
             qs[4],
             qs[2],
             qs[5],
@@ -409,7 +412,11 @@ def _run_flashinfer_cutlass(
             topk_ids,
             topk_weights,
             out=output,
+            pair_layout=quant_info.pair_w2_weight is not None,
         )
+
+    if quant_info.pair_w2_weight is not None:
+        raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
 
     # SM120 decode fast path: M=1 NVFP4 non-gated ReLU^2 grouped GEMV.
     if (
