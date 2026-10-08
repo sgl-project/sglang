@@ -194,8 +194,8 @@ def _req_radix_key(
     )
 
 
-def refresh_waiting_prefix(tree_cache: BasePrefixCache, req: Req) -> None:
-    tree_cache.refresh_device_prefix(
+def refresh_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    tree_cache.refresh_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
     )
 

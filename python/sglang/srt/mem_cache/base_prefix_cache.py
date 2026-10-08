@@ -438,14 +438,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
-    def refresh_device_prefix(self, key: RadixKey) -> None:
+    def refresh_prefix(self, key: RadixKey) -> None:
         """Touch the cached prefix of ``key`` so LRU eviction sees it as recent.
 
-        The scheduler calls this for waiting requests, at most every
-        ``WAITING_PREFIX_REFRESH_INTERVAL_S``. It walks the tree only: with a host
-        tier it also touches host-backed nodes, but it never allocates, loads, or
-        enqueues lookups on a storage backend or external connector, as
-        ``match_prefix`` may. Caches without such a walk leave this a no-op.
+        The scheduler calls this periodically for waiting requests. It walks the
+        tree only: with a host tier it also touches host-backed nodes, but it never
+        allocates, loads, or enqueues lookups on a storage backend or external
+        connector, as ``match_prefix`` may. Caches without such a walk leave this a
+        no-op.
         """
 
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:

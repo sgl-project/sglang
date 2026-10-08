@@ -217,16 +217,15 @@ class SchedulePolicy:
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
-        # Skip on decode (never prefills).
+        # Cache-agnostic policies sort without matching; match anyway so the load
+        # snapshot sees num_matched_prefix_tokens. Decode never prefills.
         if (
             not isinstance(policy, CacheAwarePolicy)
+            and self.tree_cache.supports_fast_match_prefix()
             and get_disagg().disaggregation_mode != "decode"
         ):
-            # Cache-agnostic policies sort without matching; match anyway so the
-            # load snapshot sees num_matched_prefix_tokens.
-            if self.tree_cache.supports_fast_match_prefix():
-                for r in waiting_queue:
-                    match_kv_cache(r, self.tree_cache)
+            for r in waiting_queue:
+                match_kv_cache(r, self.tree_cache)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -282,11 +281,9 @@ class SchedulePolicy:
     def _refresh_waiting_prefixes(
         self, policy: Policy, waiting_queue: List[Req]
     ) -> None:
-        # Under LRU, a waiting request's prefix ages while it waits and is evicted
-        # before idle prefixes. Refresh in admission order, head last, so eviction
-        # takes the prefix needed latest. Cache-aware policies already refresh as
-        # they match; other eviction strategies rank by other keys, and MRU would
-        # evict the refreshed prefixes first.
+        # Under LRU a waiting prefix ages and is evicted before idle ones; refresh in
+        # admission order, head last. Cache-aware policies refresh as they match, and
+        # other eviction strategies do not rank by recency (MRU would invert it).
         if (
             isinstance(policy, CacheAwarePolicy)
             or not waiting_queue
@@ -302,7 +299,7 @@ class SchedulePolicy:
             return
         self._last_waiting_prefix_refresh = now
         for r in reversed(waiting_queue[:WAITING_PREFIX_REFRESH_MAX_QUEUE]):
-            refresh_waiting_prefix(self.tree_cache, r)
+            refresh_waiting_prefix(r, self.tree_cache)
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
