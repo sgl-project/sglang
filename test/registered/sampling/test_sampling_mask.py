@@ -2,7 +2,7 @@ import json
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 import torch
@@ -340,12 +340,19 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
 
     @staticmethod
     def _sampling_info(
-        batch_size, top_k, top_p, min_p=0.0, need_min_p=False, requested_rows=None
+        batch_size,
+        top_k,
+        top_p,
+        min_p=0.0,
+        need_min_p=False,
+        requested_rows=None,
+        seed=None,
+        npu_eligible=False,
     ):
         if requested_rows is None:
             requested_rows = range(batch_size)
         return SimpleNamespace(
-            sampling_seed=None,
+            sampling_seed=seed,
             need_top_k_sampling=True,
             need_top_p_sampling=True,
             need_min_p_sampling=need_min_p,
@@ -353,11 +360,22 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             top_ps=torch.full((batch_size,), top_p),
             min_ps=torch.full((batch_size,), min_p),
             temperatures=torch.ones(batch_size, 1),
-            npu_top_k_top_p_eligible=False,
+            npu_top_k_top_p_eligible=npu_eligible,
             sampling_mask_batch_indices=torch.tensor(
                 list(requested_rows), dtype=torch.long
             ),
         )
+
+    @staticmethod
+    def _fused_op_output(logits, top_k):
+        """What torch_npu.npu_top_k_top_p returns: the top_k logits of each row.
+
+        The op filters in logit space, so the excluded entries are driven to -inf
+        and the softmax applied right after it yields exact zeros for them.
+        """
+        masked = torch.full_like(logits, float("-inf"))
+        top_ids = logits.topk(top_k, dim=-1).indices
+        return masked.scatter_(1, top_ids, logits.gather(1, top_ids))
 
     def _materialize(self, sampled, capture, sampling_info):
         """Run the scheduler's host-materialization step over a captured batch."""
@@ -396,7 +414,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             simple_sampling_case=False,
             return_logprob=False,
             positions=torch.zeros(batch_size, dtype=torch.int64),
-            return_sampling_mask=True,
         )
 
         self.assertIsNone(logprobs)
@@ -448,7 +465,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             simple_sampling_case=False,
             return_logprob=False,
             positions=torch.zeros(batch_size, dtype=torch.int64),
-            return_sampling_mask=True,
         )
 
         self.assertIsNotNone(capture)
@@ -533,6 +549,133 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
         # Without the opt-in the caller gets the bare token IDs back, so nothing
         # extra is materialized and existing callers keep working unchanged.
         self.assertEqual(tuple(sampled.shape), (batch_size,))
+
+    def test_fused_export_is_vocab_ordered_and_bounded_by_top_k(self):
+        """The production path: the fused op supplies the post-filter weights."""
+        batch_size, vocab_size, top_k = 2, 16, 4
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        fused_logits = self._fused_op_output(logits, top_k)
+        sampling_info = self._sampling_info(
+            batch_size, top_k, top_p=1.0, npu_eligible=True
+        )
+
+        with patch.object(
+            sampler_module,
+            "torch_npu",
+            SimpleNamespace(
+                npu_top_k_top_p=MagicMock(return_value=fused_logits.clone())
+            ),
+            create=True,
+        ):
+            sampled, _, capture = self.sampler._forward_ascend_backend(
+                logits.clone(),
+                sampling_info,
+                simple_sampling_case=False,
+                return_logprob=False,
+                positions=torch.zeros(batch_size, dtype=torch.int64),
+            )
+
+        self.assertIsNotNone(capture)
+        # The exported weights must be the op's own softmax in vocabulary order.
+        # Every drawn column is positive in that copy, so the repair is a no-op.
+        self.assertTrue(
+            torch.equal(capture.weights, torch.softmax(fused_logits, dim=-1))
+        )
+        expected_support = logits.topk(top_k, dim=-1).indices
+        for row in range(batch_size):
+            support = (capture.weights[row] > 0).nonzero(as_tuple=True)[0]
+            self.assertEqual(
+                sorted(support.tolist()), sorted(expected_support[row].tolist())
+            )
+            self.assertIn(int(sampled[row]), support.tolist())
+
+        output = self._materialize(sampled, capture, sampling_info)
+        for row in range(batch_size):
+            self.assertIn(
+                int(sampled[row]), output.next_token_sampling_mask_idx[row].tolist()
+            )
+
+    def test_seeded_fused_export_keeps_float32_support(self):
+        """A seeded draw must export the same support the unseeded one does."""
+        batch_size, vocab_size, top_k = 1, 12, 3
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        fused_logits = self._fused_op_output(logits, top_k)
+        sampling_info = self._sampling_info(
+            batch_size, top_k, top_p=1.0, seed=torch.tensor([1234]), npu_eligible=True
+        )
+
+        with (
+            patch.object(
+                sampler_module,
+                "torch_npu",
+                SimpleNamespace(
+                    npu_top_k_top_p=MagicMock(return_value=fused_logits.clone())
+                ),
+                create=True,
+            ),
+            patch.object(
+                sampler_module,
+                "multinomial_with_seed",
+                return_value=torch.tensor([[0]]),
+            ),
+        ):
+            sampled, filtered_probs = (
+                sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                    logits.clone(),
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    torch.zeros(batch_size, dtype=torch.int64),
+                    npu_top_k_top_p_eligible=True,
+                    return_filtered_probs=True,
+                )
+            )
+
+        # Exporting before the float64 log-space draw skips the exp() round trip,
+        # so the support is the op's float32 softmax, not a re-exp'd copy of it.
+        self.assertEqual(filtered_probs.dtype, torch.float32)
+        self.assertTrue(
+            torch.equal(filtered_probs, torch.softmax(fused_logits, dim=-1))
+        )
+        # multinomial_with_seed is mocked to draw index 0 of the vocab-ordered row.
+        self.assertEqual(int(sampled[0]), 0)
+
+    def test_seeded_torch_fallback_export_is_vocab_ordered(self):
+        batch_size, vocab_size, top_k = 1, 12, 3
+        torch.manual_seed(0)
+        logits = torch.randn(batch_size, vocab_size)
+        sampling_info = self._sampling_info(
+            batch_size, top_k, top_p=1.0, seed=torch.tensor([1234])
+        )
+
+        with patch.object(
+            sampler_module, "multinomial_with_seed", return_value=torch.tensor([[0]])
+        ):
+            sampled, filtered_probs = (
+                sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                    logits.clone(),
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    torch.zeros(batch_size, dtype=torch.int64),
+                    npu_top_k_top_p_eligible=False,
+                    return_filtered_probs=True,
+                )
+            )
+
+        expected_ids = torch.softmax(logits, dim=-1).topk(top_k, dim=-1).indices[0]
+        self.assertEqual(filtered_probs.dtype, torch.float32)
+        support_ids = (filtered_probs[0] > 0).nonzero(as_tuple=True)[0]
+        self.assertEqual(sorted(support_ids.tolist()), sorted(expected_ids.tolist()))
+        # The mocked draw takes sorted-order index 0, which the code maps back
+        # through probs_idx, so the sampled token is the row's top-1 token.
+        self.assertEqual(int(sampled[0]), int(expected_ids[0]))
 
 
 class SamplingMaskTestMixin:

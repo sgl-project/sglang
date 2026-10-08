@@ -2984,10 +2984,6 @@ class Scheduler(
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
-        # The ascend sampling backend is supported: it exports the post-filter
-        # weights of its fused kernels so the sampler can build the same mask as
-        # the other backends. See Sampler._build_ascend_sampling_mask_capture.
-
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             try:
