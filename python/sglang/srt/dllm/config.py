@@ -15,6 +15,7 @@ class DllmConfig:
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
         requires_separate_context_encoding: bool = False,
+        capture_input_preparation: bool = False,
         delete_token_id: int | None = None,
         split_token_id: int | None = None,
     ):
@@ -25,6 +26,7 @@ class DllmConfig:
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
         self.requires_separate_context_encoding = requires_separate_context_encoding
+        self.capture_input_preparation = capture_input_preparation
         self.delete_token_id = delete_token_id
         self.split_token_id = split_token_id
 
@@ -163,6 +165,10 @@ class DllmConfig:
             first_done_first_out_mode=cfg.dllm_fdfo,
             requires_separate_context_encoding=(
                 algorithm_cls.requires_separate_context_encoding
+            ),
+            capture_input_preparation=(
+                algorithm_cls.capture_input_preparation
+                and algorithm_config.get("capture_input_preparation", True)
             ),
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
