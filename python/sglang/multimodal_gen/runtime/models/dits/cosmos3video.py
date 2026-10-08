@@ -96,6 +96,34 @@ def _can_enable_t1_fused_qk_norm_rope(
     return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
+def sequence_shard_padding(seq_len: int, world_size: int) -> int:
+    """Tokens appended so a sequence splits evenly over ``world_size`` ranks."""
+    if world_size <= 1:
+        return 0
+    return (-seq_len) % world_size
+
+
+def shard_sequence(
+    tensor: torch.Tensor, world_size: int, rank: int, *, dim: int, pad_last: bool
+) -> torch.Tensor:
+    """This rank's contiguous shard of ``tensor`` along ``dim``.
+
+    The sequence is first padded to a multiple of ``world_size`` by repeating the
+    last entry (``pad_last``, for positions) or with zeros (for tokens).
+    """
+    if world_size <= 1:
+        return tensor
+    pad = sequence_shard_padding(tensor.shape[dim], world_size)
+    if pad:
+        tail = tensor.narrow(dim, tensor.shape[dim] - 1, 1)
+        filler = tail.expand(*[pad if i == dim else -1 for i in range(tensor.ndim)])
+        if not pad_last:
+            filler = torch.zeros_like(filler)
+        tensor = torch.cat([tensor, filler], dim=dim)
+    local = tensor.shape[dim] // world_size
+    return tensor.narrow(dim, rank * local, local).contiguous()
+
+
 # -----------------------------------------------------------------------------
 # mRoPE position ID computation (Qwen3VL-style)
 # -----------------------------------------------------------------------------
@@ -1560,10 +1588,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         action_frames = 0
         if action_latents is not None:
-            if self.sp_size > 1:
-                raise NotImplementedError(
-                    "Cosmos3 action generation does not support sequence parallelism yet"
-                )
             action_frames = action_latents.shape[1]
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(
@@ -1638,32 +1662,18 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                    if token_noisy_mask is not None:
-                        mask_pad = torch.zeros(
-                            (batch_size, seq_shard_pad, 1),
-                            dtype=token_noisy_mask.dtype,
-                            device=token_noisy_mask.device,
-                        )
-                        token_noisy_mask = torch.cat(
-                            [token_noisy_mask, mask_pad], dim=1
-                        )
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
                 if token_noisy_mask is not None:
-                    token_noisy_mask = token_noisy_mask.view(
-                        batch_size, self.sp_size, local_seq_len, 1
-                    )[:, self.sp_rank, :, :]
+                    token_noisy_mask = shard_sequence(
+                        token_noisy_mask,
+                        self.sp_size,
+                        self.sp_rank,
+                        dim=1,
+                        pad_last=False,
+                    )
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
@@ -1711,19 +1721,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
             seq_len_orig = hidden_gen.shape[1]
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                # The zero pad lands after the last modality (action or sound)
+                # and is dropped again after the post-loop all-gather.
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
 
         self._ensure_cache_dicts()
 
@@ -1770,12 +1773,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 text_ids, text_mask, text_pos_ids
             )
             if sequence_shard_enabled:
-                if seq_shard_pad > 0:
-                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
-                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
-                vis_pos_ids = vis_pos_ids.view(
-                    3, batch_size, self.sp_size, local_seq_len
-                )[:, :, self.sp_rank, :]
+                vis_pos_ids = shard_sequence(
+                    vis_pos_ids, self.sp_size, self.sp_rank, dim=2, pad_last=True
+                )
             cos_sin_gen, gen_rope_cache_positions = (
                 self.language_model.rotary_emb.build_rope_cache_inputs(
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
