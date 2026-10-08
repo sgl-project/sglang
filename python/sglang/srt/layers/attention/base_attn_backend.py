@@ -163,6 +163,7 @@ class AttentionBackend(ABC):
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
+    dllm_attention = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.

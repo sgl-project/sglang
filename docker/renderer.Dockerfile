@@ -49,7 +49,9 @@ COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json experimental/sgl
 RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=renderer-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=renderer-target-${TARGETARCH},target=/build/rust/target,sharing=locked \
-    cargo test --manifest-path rust/Cargo.toml -p sglang-processor -p sglang-renderer --locked
+    cargo test --manifest-path rust/Cargo.toml -p sglang-processor -p sglang-renderer --locked \
+    && cargo check --manifest-path rust/Cargo.toml -p sglang-processor --locked \
+        --no-default-features --features render,tokenizer
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 

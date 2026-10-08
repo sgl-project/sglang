@@ -351,7 +351,7 @@ class BaseLayerWithLoRA(nn.Module):
         """An in-place merge is about to write the base storage; if the
         snapshot is a zero-copy view into it, materialize the clone now."""
         if self._base_is_view:
-            self.cpu_weight = self.cpu_weight.clone()
+            self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
             self._base_is_view = False
 
     @torch.no_grad()
@@ -495,11 +495,10 @@ class BaseLayerWithLoRA(nn.Module):
         if self.disable_lora:
             return
 
-        # Zero-copy views unmerge by subtracting B@A; do not clone the base.
-        if not self._base_is_view:
-            self._ensure_base_snapshot_owned()
         if self.merged:
             self.unmerge_lora_weights()
+        # Only layers actually merged need a snapshot of the mutable backing store.
+        self._ensure_base_snapshot_owned()
 
         lora_list = self._active_lora_list()
         if not lora_list:
@@ -612,66 +611,13 @@ class BaseLayerWithLoRA(nn.Module):
             )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
-        elif self._base_is_view:
-            self._unmerge_by_inverse()
         else:
-            current_device = self.base_layer.weight.data.device
-            cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            if self.base_layer.weight.data.is_inference():
-                self.base_layer.weight.data = self._as_mutable_tensor(
-                    cpu_weight_on_device
-                )
-            else:
-                self.base_layer.weight.data.copy_(cpu_weight_on_device)
-            if (
-                cpu_weight_on_device.data_ptr()
-                != self.base_layer.weight.data.data_ptr()
-            ):
-                del cpu_weight_on_device
+            # Update the offload backing store too, not a transient GPU placeholder.
+            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
+            restored = self.cpu_weight.clone()
+            write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
 
         self.merged = False
-
-    @torch.no_grad()
-    def _unmerge_by_inverse(self) -> None:
-        lora_list = self._active_lora_list()
-        if not lora_list:
-            raise ValueError(
-                "LoRA weights not set; cannot unmerge a zero-copy view by inverse."
-            )
-        src, current_device = self._materialized_weight_src()
-        data = self._as_mutable_tensor(src.to(get_local_torch_device()))
-        target_dtype = data.dtype
-        if (
-            self._should_merge_in_fp32(lora_list)
-            and data.is_floating_point()
-            and data.dtype != torch.float32
-        ):
-            data = data.to(torch.float32)
-        inverted = [
-            (
-                lora_A,
-                lora_B,
-                lora_path,
-                -lora_strength,
-                lora_rank,
-                lora_alpha,
-                output_offset,
-            )
-            for (
-                lora_A,
-                lora_B,
-                lora_path,
-                lora_strength,
-                lora_rank,
-                lora_alpha,
-                output_offset,
-            ) in reversed(lora_list)
-        ]
-        self._merge_lora_into_data(data, inverted)
-        write_dense_weight(
-            self.base_layer,
-            self._as_mutable_tensor(data.to(dtype=target_dtype)),
-        )
 
     @torch.no_grad()
     def commit_merged_as_base(self) -> None:

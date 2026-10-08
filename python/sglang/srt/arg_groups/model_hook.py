@@ -143,6 +143,7 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
         is_kimi_k3,
@@ -210,6 +211,23 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
+    decision_config = model_config.decision_config
+    if (
+        decision_config is not None
+        and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
+    ):
+        # A cached prefix or a prefill chunk would attend to only part of its prompt.
+        logger.info(
+            "Radix cache and chunked prefill are disabled for a decision "
+            "checkpoint with noncausal full attention."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+        )
+
     _hybrid_spec = get_linear_attn_spec(hf_config)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
         handle_mamba_radix_cache(server_args, hf_config)
@@ -237,6 +255,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+
+    if model_arch == "Glm5NextForConditionalGeneration":
+        from sglang.srt.arg_groups.glm5_next_hook import (
+            apply_glm5_next_spec_backend_defaults,
+        )
+
+        apply_glm5_next_spec_backend_defaults(server_args)
 
     if model_arch in [
         "DeepseekV4ForCausalLM",
