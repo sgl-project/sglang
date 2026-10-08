@@ -3406,6 +3406,36 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
+    def test_response_template_messages_thinking_replay(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+        from sglang.srt.parser.beam import BeamReasoningDetector
+
+        self.chat.chat_encoding_spec = None
+        self.chat._reasoning_detector = BeamReasoningDetector()
+        request = AnthropicMessagesRequest(
+            model="x",
+            max_tokens=32,
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Consider the question."},
+                        {"type": "text", "text": "Hello."},
+                    ],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+        converted = AnthropicServing(self.chat)._convert_to_chat_completion_request(
+            request
+        )
+        self.assertEqual(
+            converted.messages[1].reasoning_content, "Consider the question."
+        )
+        self.assertEqual(converted.messages[1].content, "Hello.")
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""

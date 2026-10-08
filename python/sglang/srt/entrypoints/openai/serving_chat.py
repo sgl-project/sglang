@@ -3168,11 +3168,13 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
-        """Whether the chat encoder takes history as ``reasoning_content`` rather
-        than via :meth:`wrap_reasoning_history`; see
+        """Whether the encoder or response template takes ``reasoning_content``
+        rather than inline wire markers; see
         :func:`chat_encoding.spec_owns_reasoning_history` for why.
         """
-        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
+        return chat_encoding.spec_owns_reasoning_history(
+            self.chat_encoding_spec
+        ) or isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
