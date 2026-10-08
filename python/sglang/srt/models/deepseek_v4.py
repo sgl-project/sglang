@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import functools
 import logging
 import time
@@ -710,6 +711,54 @@ def deepseek_v4_attention_with_output(
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
+)
+
+
+def deepseek_v4_npu_prefill_sources(layer, x, q_lora, kv, positions) -> None:
+    """Run request-dependent NPU work between token-bucket graph segments."""
+    # Capture uses one synthetic request; replay must resolve the live batch.
+    # Trim the token bucket before cache writes/indexing/compression so padded
+    # rows cannot modify another request's cache or compressor state.
+    forward_batch = copy.copy(get_tc_piecewise_forward_context().forward_batch)
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        return
+    forward_batch.input_ids = forward_batch.input_ids[:real_num_tokens]
+    forward_batch.positions = positions[:real_num_tokens]
+    forward_batch.out_cache_loc = forward_batch.out_cache_loc[:real_num_tokens]
+    x = x[:real_num_tokens]
+    q_lora = q_lora[:real_num_tokens]
+    attn_backend = get_attn_backend()
+    attn_backend.store_cache(
+        layer_id=layer.layer_id, swa_k=kv[:real_num_tokens], forward_batch=forward_batch
+    )
+    if layer.compress_ratio in (1, 2) and (
+        layer.compressor is not None or layer.indexer is not None
+    ):
+        # Already outside the graph: do not invoke a nested eager_on_graph.
+        attn_backend.forward_low_ratio_sources(
+            layer=layer,
+            x=x,
+            q_lora=q_lora,
+            positions=forward_batch.positions,
+            forward_batch=forward_batch,
+        )
+    else:
+        if layer.indexer is not None:
+            layer.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
+        if layer.compressor is not None:
+            attn_backend.forward_core_compressor(
+                x, forward_batch, layer.layer_id, layer.compressor
+            )
+
+
+bcg_deepseek_v4_npu_prefill_sources = eager_on_graph(True)(
+    deepseek_v4_npu_prefill_sources
 )
 
 
@@ -1972,11 +2021,13 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv_for_cache,
-                forward_batch=forward_batch,
-            )
+            if not (
+                forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+            ):
+                attn_backend.store_cache(
+                    layer_id=self.layer_id, swa_k=kv_for_cache, forward_batch=forward_batch
+                )
             kv = None
             if q_out is not None:
                 q_out.copy_(q)
@@ -2033,6 +2084,18 @@ class MQALayer(MqaAttentionBase):
                 kv = None
 
         del qkv_a
+
+        if (
+            _is_npu
+            and forward_batch.forward_mode.is_extend()
+            and is_in_breakable_cuda_graph()
+        ):
+            # Q/KV projections, normalization and RoPE stay in the graph.
+            # Only operations consuming request-shaped metadata break out.
+            bcg_deepseek_v4_npu_prefill_sources(
+                self, x, q_lora, kv_for_cache, positions
+            )
+            return q, kv
 
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
@@ -2130,6 +2193,13 @@ class MQALayer(MqaAttentionBase):
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
+
+        if (
+            _is_npu
+            and forward_batch.forward_mode.is_extend()
+            and is_in_breakable_cuda_graph()
+        ):
+            enable_multi_stream = False
 
         low_ratio_multi_stream = (
             _is_cuda

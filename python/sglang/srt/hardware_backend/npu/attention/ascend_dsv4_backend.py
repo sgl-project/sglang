@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-
-import numpy as np
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -33,58 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-def _copy_dsv4_graph_metadata_(dst, src, path="metadata"):
-    """Refresh capture-owned metadata buffers without changing their addresses."""
-    copies = []
-    def collect(dst_value, src_value, value_path):
-        if type(dst_value) is not type(src_value):
-            raise ValueError(f"{value_path}: incompatible metadata types")
-        if isinstance(src_value, torch.Tensor):
-            # Length/index buffers may use int32 in the serving path and
-            # int64 in the synthetic capture batch. copy_ safely converts values
-            # while retaining the capture-owned tensor address.
-            if (dst_value.shape != src_value.shape
-                    or dst_value.device != src_value.device):
-                raise ValueError(
-                    f"{value_path}: incompatible tensor metadata: "
-                    f"capture(shape={tuple(dst_value.shape)}, dtype={dst_value.dtype}, "
-                    f"device={dst_value.device}) vs replay(shape={tuple(src_value.shape)}, "
-                    f"dtype={src_value.dtype}, device={src_value.device})"
-                )
-            copies.append((dst_value, src_value))
-        elif isinstance(src_value, np.ndarray):
-            if dst_value.shape != src_value.shape or dst_value.dtype != src_value.dtype:
-                raise ValueError(f"{value_path}: incompatible array metadata")
-            copies.append((dst_value, src_value))
-        elif isinstance(src_value, dict):
-            if dst_value.keys() != src_value.keys():
-                raise ValueError(f"{value_path}: metadata keys changed")
-            for key in src_value:
-                collect(dst_value[key], src_value[key], f"{value_path}.{key}")
-        elif isinstance(src_value, (tuple, list)):
-            if len(dst_value) != len(src_value):
-                raise ValueError(f"{value_path}: metadata length changed")
-            for index, value in enumerate(src_value):
-                collect(dst_value[index], value, f"{value_path}[{index}]")
-        elif hasattr(src_value, "__dict__"):
-            # The indexer writes this graph output during model execution.
-            dst_fields = vars(dst_value).keys() - {"c4_topk_indices"}
-            src_fields = vars(src_value).keys() - {"c4_topk_indices"}
-            if dst_fields != src_fields:
-                raise ValueError(f"{value_path}: metadata fields changed")
-            for key in src_fields:
-                collect(getattr(dst_value, key), getattr(src_value, key),
-                        f"{value_path}.{key}")
-        elif dst_value != src_value:
-            raise ValueError(f"{value_path}: captured scalar changed: "
-                             f"{dst_value!r} -> {src_value!r}")
-    collect(dst, src, path)
-    for dst_value, src_value in copies:
-        if isinstance(dst_value, torch.Tensor):
-            dst_value.copy_(src_value)
-        else:
-            np.copyto(dst_value, src_value)
 
 
 # A5 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
@@ -260,6 +206,7 @@ class CompressorAscendBackendMixin:
             device=forward_batch.seq_lens.device,
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            seq_lens_max_override=self._prefill_graph_max_context_size(forward_batch),
         )
         for k, v in result.items():
             setattr(fm, k, v)
@@ -968,7 +915,11 @@ class C4IndexerAscendBackendMixin:
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
-    use_captured_forward_metadata_for_breakable_cuda_graph = True
+    # Request-dependent cache stores, indexer and compressors run at an eager
+    # BCG boundary. Rebuild metadata for the real batch, as on CUDA, rather
+    # than copying it into the single-request capture layout.
+    use_captured_forward_metadata_for_breakable_cuda_graph = False
+    supports_prefill_cuda_graph_max_context_size = True
 
     def can_run_prefill_cuda_graph(self, forward_batch) -> bool:
         prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -977,77 +928,19 @@ class DeepseekV4AscendAttnBackend(
         capture_sizes = getattr(self, "_dsv4_prefill_capture_num_tokens", (128,))
         num_tokens = forward_batch.input_ids.numel()
         has_compatible_bucket = any(
-            num_tokens <= bucket <= num_tokens * 2 for bucket in capture_sizes
+            num_tokens <= bucket for bucket in capture_sizes
         )
         return (
-            forward_batch.batch_size == 1
+            forward_batch.batch_size > 0
             and forward_batch.forward_mode.is_extend_without_speculative()
             and num_tokens > 0
             and has_compatible_bucket
             and prefix_lens is not None
-            and len(prefix_lens) == 1
-            and int(prefix_lens[0]) == 0
+            and len(prefix_lens) == forward_batch.batch_size
+            and all(int(length) == 0 for length in prefix_lens)
             and forward_batch.out_cache_loc_dsv4 is not None
             and getattr(forward_batch, "attn_cp_metadata", None) is None
         )
-
-    def init_forward_metadata_for_breakable_cuda_graph_capture(self, forward_batch):
-        self.init_forward_metadata(forward_batch)
-        return self.forward_metadata
-
-    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
-        self, capture_metadata, forward_batch, *, static_forward_batch=None
-    ) -> None:
-        metadata_batch = static_forward_batch or forward_batch
-        self.init_forward_metadata(metadata_batch)
-        fresh_metadata = self.forward_metadata
-        # This capacity sizes capture-time compressor workspaces. Replay uses
-        # the selected bucket capacity while seqused retains the real length.
-        fresh_metadata.dsv4_max_input_capacity = (
-            capture_metadata.dsv4_max_input_capacity
-        )
-        if not is_npu_arch35():
-            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items():
-                fresh_metadata.dsv4_explicit_state_block_tables[ratio] = (
-                    _build_explicit_state_block_table(
-                        compress_ratio=ratio,
-                        coff=2 if ratio == 4 else 1,
-                        state_pool=state_pool,
-                        token_to_kv_pool=self.token_to_kv_pool,
-                        req_to_token=self.req_to_token,
-                        req_pool_indices=metadata_batch.req_pool_indices,
-                        start_pos=fresh_metadata.start_pos,
-                        cu_seqlens=fresh_metadata.actual_seq_lengths_q_pa,
-                        seqused=fresh_metadata.seqused,
-                        max_input_capacity=fresh_metadata.dsv4_max_input_capacity,
-                    )
-                )
-        # The runner pads input_ids/positions to the selected capture bucket,
-        # while the cache allocator returns locs only for complete compressor
-        # blocks in the real request. Pad the incremental C4/C128 write lists
-        # to the captured shape; slot 0 is reserved for graph dummy writes.
-        for name in ("c4_loc", "c128_loc"):
-            capture_locs = getattr(capture_metadata, name, None)
-            replay_locs = getattr(fresh_metadata, name, None)
-            if capture_locs is None:
-                continue
-            if not isinstance(capture_locs, torch.Tensor):
-                continue
-            if replay_locs is None:
-                replay_locs = capture_locs.new_empty((0,))
-            if replay_locs.numel() > capture_locs.numel():
-                raise ValueError(
-                    f"{name} has more replay locs ({replay_locs.numel()}) than "
-                    f"captured capacity ({capture_locs.numel()})"
-                )
-            if replay_locs.shape != capture_locs.shape:
-                padded_locs = torch.zeros_like(capture_locs)
-                if replay_locs.numel() > 0:
-                    padded_locs[: replay_locs.numel()].copy_(replay_locs)
-                setattr(fresh_metadata, name, padded_locs)
-
-        _copy_dsv4_graph_metadata_(capture_metadata, fresh_metadata)
-        self.forward_metadata = capture_metadata
 
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
@@ -1132,6 +1025,8 @@ class DeepseekV4AscendAttnBackend(
         writes, so use it only for this synthetic capture batch.
         """
         num_tokens = int(forward_batch.input_ids.numel())
+        # This constrains the synthetic capture batch only. Serving batches
+        # can contain multiple requests and reuse the same token-bucket graph.
         if forward_batch.batch_size != 1 or num_tokens == 0 or num_tokens % 128:
             raise ValueError(
                 "DSV4 NPU prefill graph capture currently requires one request "

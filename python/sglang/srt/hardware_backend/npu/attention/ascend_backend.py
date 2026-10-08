@@ -476,6 +476,38 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
         )
 
+    def _prefill_graph_max_context_size(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        if not (
+            self.supports_prefill_cuda_graph_max_context_size
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        max_context_size = forward_batch.max_seq_len_override
+        if max_context_size is None:
+            return None
+        if not 0 < max_context_size <= min(
+            self.max_context_len, self.req_to_token.shape[1]
+        ):
+            raise ValueError(
+                "Prefill CUDA graph max context size must fit the model and "
+                f"request-to-token pool: {max_context_size=}"
+            )
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None and len(seq_lens_cpu):
+            actual_max_seq_len = (
+                int(seq_lens_cpu.max().item())
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else max(seq_lens_cpu)
+            )
+            if actual_max_seq_len > max_context_size:
+                raise ValueError(
+                    "Prefill CUDA graph max context size is smaller than the "
+                    f"live context: {max_context_size=} < {actual_max_seq_len=}"
+                )
+        return max_context_size
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -506,6 +538,10 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max += self.speculative_step_id + 1
         else:
             seq_lens_max = forward_batch.seq_lens.max()
+        max_context_size = self._prefill_graph_max_context_size(forward_batch)
+        if max_context_size is not None:
+            # Fix the table extent while retaining live seq/extend lengths.
+            seq_lens_max = max_context_size
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
