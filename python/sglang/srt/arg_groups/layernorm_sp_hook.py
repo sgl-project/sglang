@@ -28,6 +28,7 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
         tp_size=cfg.tp_size,
         ep_size=cfg.ep_size,
         pp_size=cfg.pp_size,
+        attn_cp_size=cfg.attn_cp_size,
         attn_dp_enabled=attn_dp_enabled_of(cfg),
         speculative_algorithm=cfg.speculative_algorithm,
     )
@@ -39,6 +40,7 @@ def validate_layernorm_sp(
     tp_size: int,
     ep_size: int,
     pp_size: int,
+    attn_cp_size: int,
     attn_dp_enabled: bool,
     speculative_algorithm: Optional[str],
 ) -> None:
@@ -65,6 +67,11 @@ def validate_layernorm_sp(
             raise ValueError(
                 "--enable-layernorm-sp requires pp_size == 1 for Qwen4Exp; "
                 f"got pp_size={pp_size}."
+            )
+        if attn_cp_size != 1:
+            raise ValueError(
+                "--enable-layernorm-sp requires attn_cp_size == 1 for Qwen4Exp; "
+                f"got attn_cp_size={attn_cp_size}."
             )
     if attn_dp_enabled:
         raise ValueError(

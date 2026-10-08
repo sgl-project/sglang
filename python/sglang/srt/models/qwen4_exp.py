@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -48,6 +46,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -90,6 +89,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 from sglang.srt.utils.common import is_building_neighbour_layer
+from torch import nn
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -1620,6 +1620,9 @@ class Qwen4ExpLayerExtensionMixin:
                             forward_batch,
                             defer_finalize=False,
                         ),
+                        output_is_tp_partial=not post_experts_output_is_complete(
+                            is_tp_path=True
+                        ),
                     )
                 else:
                     hidden_states = self.mlp(
@@ -1671,6 +1674,7 @@ class Qwen4ExpLinearDecoderLayer(
                 hidden_states = layernorm_sp.run_replicated_token_rows(
                     hidden_states,
                     lambda full_tokens: self.linear_attn(full_tokens, forward_batch),
+                    output_is_tp_partial=True,
                 )
             else:
                 hidden_states = self.linear_attn(hidden_states, forward_batch)
@@ -1853,6 +1857,7 @@ class Qwen4ExpAttentionDecoderLayer(
                         hidden_states=full_tokens,
                         forward_batch=forward_batch,
                     ),
+                    output_is_tp_partial=True,
                     total_rows=positions.shape[-1],
                 )
             else:

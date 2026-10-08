@@ -39,7 +39,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -171,15 +170,21 @@ def run_replicated_token_rows(
     hidden_states: torch.Tensor,
     compute: Callable[[torch.Tensor], torch.Tensor],
     *,
+    output_is_tp_partial: bool,
     total_rows: Optional[int] = None,
     group=None,
 ) -> torch.Tensor:
-    """Run a full-row-only operation while the surrounding region stays SP."""
+    """Run a full-row-only operation while the surrounding region stays SP.
+
+    Sum partial TP output while scattering it; locally shard complete output.
+    """
     group = group or get_parallel().tp_group
     full_rows = all_gather_token_rows(hidden_states, total_rows=total_rows, group=group)
     with get_forward().scoped(sp_active=False):
-        full_partial = compute(full_rows)
-    return reduce_scatter_token_rows(full_partial, group=group)
+        full_output = compute(full_rows)
+    if output_is_tp_partial:
+        return reduce_scatter_token_rows(full_output, group=group)
+    return shard_token_rows(full_output, group=group)
 
 
 # --- entry scatter / exit gather (once per forward, at the boundary) ----------
