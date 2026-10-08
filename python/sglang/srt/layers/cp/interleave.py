@@ -85,7 +85,11 @@ def is_interleave_extend(forward_batch):
 
 
 def cp_interleave_to_sequence_order(hidden_states, forward_batch):
-    """Undo the boundary's rank-major gather before sequence-dependent compute.
+    """Restore sequence order after CP attention and before linear attention.
+
+    With CP2 and seven tokens, the boundary all-gathers the interleaved shards
+    as ``[t0, t2, t4, t6, t1, t3, t5, pad]``. This returns
+    ``[t0, t1, t2, t3, t4, t5, t6]`` for sequence-dependent compute.
 
     The residual and mHC coefficients do not move: only the already-read mixer
     input is reordered. Remove physical CP padding before the recurrent kernel.
@@ -105,8 +109,14 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
     )
 
 
-def cp_interleave_to_rank_order(hidden_states, forward_batch, gathered_rows):
-    """Restore the declared output rows, ready for the boundary's CP sum."""
+def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
+    """Restore interleave order after linear attention and before CP attention.
+
+    With CP2 and seven tokens, ``[t0, t1, t2, t3, t4, t5, t6]`` becomes
+    ``[t0, t2, t4, t6, t1, t3, t5, 0]``. These padded rank-major rows match
+    the boundary's reduce-scatter and the local residual/mHC rows. The reorder
+    itself performs no communication or reduction.
+    """
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
