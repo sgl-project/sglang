@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -80,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ElasticDrainClearReq,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
@@ -190,6 +192,37 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+# Poll interval while a staged grow waits out the previous stage's warmup window.
+_ELASTIC_STAGE_RETRY_S = 2.0
+
+# Budget for a grow below the launch width to learn the width its joiner joins at.
+# Covers a joiner process starting from scratch, which is dominated by interpreter and
+# torch import and so scales with host load: measured 32s on an idle node. Overshooting
+# costs nothing, since only this one grow shape waits and it used to spend a whole
+# extra stage unconditionally.
+_JOINER_ANNOUNCE_WAIT_S = 120.0
+_JOINER_ANNOUNCE_POLL_S = 0.5
+
+
+def elastic_stage_plan(current: int, launch_ep: int, target: int) -> List[int]:
+    """Split a grow the schedulers cannot serve in one step into ordered stages.
+
+    A partial regrow is planned direct. A recover joiner covers
+    ``[ep_join_rank_offset, ep_join_rank_offset + tp_size)`` and sizes its expert map to
+    that upper bound, so only a target short of it needs an intermediate, and only the
+    schedulers can see which joiner is waiting. One booted at exactly the target is
+    served in a single step, the case this used to spend a joiner per retired slot on.
+
+    So that split is decided a step later, in ``_scale_elastic_ep_locked``, off a
+    scheduler reject. Growing past the launch width still splits here, since recover
+    and scale slots cannot mix in one request. Stage 2 can therefore be a shrink, which
+    is why the driver gates on target rather than intent, and a grow that lands exactly
+    on the launch width needs no stage.
+    """
+    if current < launch_ep and current < target and target > launch_ep:
+        return [launch_ep, target]
+    return [target]
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -495,6 +528,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        # Orchestrator view: id of the in-flight scale and the slots it freed.
+        self.elastic_operation_id = None
+        self.elastic_retired_ranks: List[int] = []
+        # Targets still owed on a staged grow, plus the caller's starting width,
+        # since stage 2 can shrink while the phase must report the caller's grow.
+        self.elastic_pending_stages: List[int] = []
+        self.elastic_staged_from: Optional[int] = None
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
@@ -730,6 +770,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+        # Shrink admission gate (scale-up routes via DPC ready barrier). Scoped to
+        # the slots that are leaving; see _await_elastic_shrink_gate.
+        self._elastic_shrink_pause_event = asyncio.Event()
+        self._elastic_shrink_pause_event.set()
+        self._elastic_shrink_retiring: set[int] = set()
+        self._elastic_scale_lock = asyncio.Lock()
+        # Strong refs to in-flight staged-grow drivers; see forward_elastic_scale_update.
+        self._elastic_stage_tasks: Set[asyncio.Task] = set()
+
     def init_lora(self):
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
@@ -876,16 +925,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "--enable-strict-thinking"
             )
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            num_dp_ranks = self.elastic_worker_count
-            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
-                )
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         request_states = {
@@ -901,6 +941,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            await self._await_elastic_shrink_gate(obj)
+            # Re-validate: the width checked above was the pre-shrink one, so a pin
+            # that was in range then can name a rank that has since departed. The DPC
+            # rejects an inactive pin, so passing it on moves the failure there.
+            self._validate_routed_dp_rank(obj)
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
@@ -1710,6 +1756,61 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+
+    def _validate_routed_dp_rank(self, obj) -> None:
+        """Check an explicit DP pin against the width that is live right now.
+
+        Called again after the shrink gate: a shrink narrows the width while a request
+        waits, so a pin accepted on entry can be out of range by the time it is sent."""
+        if not isinstance(obj, GenerateReqInput) or obj.routed_dp_rank is None:
+            return
+        num_dp_ranks = self.elastic_worker_count
+        if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+            logger.debug(
+                f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
+            )
+        elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+            raise ValueError(
+                f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
+            )
+
+    async def _await_elastic_shrink_gate(self, obj) -> None:
+        """Hold a request only if it is pinned to a slot that is leaving.
+
+        Unpinned work is the DPC's to place and it already skips the draining slots, so
+        a server wide hold would stall every rank for as long as the retiree's longest
+        in-flight request. What makes the narrow scope safe is that the retiree's idle
+        test discounts request-free batches: under dp-attention it is pulled into one on
+        every iteration a survivor holds tokens, and counting those kept a drained
+        retiree from ever reporting idle. See ``Scheduler._pending_results``.
+
+        On the 4 to 3 eager lane this takes the admission blackout from 24.7 s to 0.9 s
+        and the settle from 26.5 s to 5.5 s, for a worst in-flight stall of 138 ms
+        against 71 ms."""
+        if self._elastic_shrink_pause_event.is_set():
+            return
+        pin = getattr(obj, "routed_dp_rank", None)
+        if pin is None or pin not in self._elastic_shrink_retiring:
+            return
+        await self._elastic_shrink_pause_event.wait()
+
+    def _close_elastic_shrink_gate(self, retiring: Iterable[int]) -> None:
+        """``retiring`` is required: an empty set makes the pinned-only scope a no-op."""
+        self._elastic_shrink_retiring = set(retiring)
+        self._elastic_shrink_pause_event.clear()
+
+    def _open_elastic_shrink_gate(self) -> None:
+        self._elastic_shrink_retiring = set()
+        self._elastic_shrink_pause_event.set()
+
+    def _clear_elastic_draining(self) -> None:
+        """Tell the DPC the retiring slots are staying, so it routes to them again.
+
+        The gate above is this side of the same pair: the DPC stopped feeding those
+        slots when the request went out, and only a successful scale update takes it
+        back. A rejection never produces one.
+        """
+        self._dispatch_to_scheduler(ElasticDrainClearReq())
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -3499,30 +3600,163 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
         if not msg.success:
             self.elastic_pending_ep_size = None
+            self._clear_staged_scale()
             self.elastic_scale_phase = "failed"
             self.elastic_last_error = msg.error
+            self.elastic_retired_ranks = []
+            # A shrink can fail after its retirees exited; reconcile the width to who
+            # is alive, or later control ops park on a departed rank.
+            if msg.effective_ep_size and (
+                msg.effective_ep_size != self.elastic_worker_count
+            ):
+                logger.warning(
+                    "[Elastic EP] scale failed after ranks departed; narrowing "
+                    "control fan-out %d -> %d",
+                    self.elastic_worker_count,
+                    msg.effective_ep_size,
+                )
+                self.elastic_worker_count = msg.effective_ep_size
+                self.update_control_communicator_fan_out(msg.effective_ep_size)
+            self._open_elastic_shrink_gate()
             return
 
         self._dispatch_to_scheduler(msg)
         self.elastic_worker_count = msg.effective_ep_size
+        if self.elastic_pending_stages:
+            # Intermediate stage: widen the fan-out to the landed cohort but leave
+            # pending_ep_size and the shrink gate untouched -- the op is unfinished.
+            self.update_control_communicator_fan_out(msg.effective_ep_size)
+            self.elastic_scale_phase = "staged_grow"
+            # Held, not fire-and-forget: asyncio only weakly references running tasks,
+            # so an unreferenced one can be collected mid-stage, and a task nobody
+            # awaits swallows its exception. _drive_next_elastic_stage records failure
+            # in the scale phase itself, so the callback only has to drop the handle.
+            task = asyncio.create_task(
+                self._drive_next_elastic_stage(self.elastic_pending_stages.pop(0))
+            )
+            self._elastic_stage_tasks.add(task)
+            task.add_done_callback(self._elastic_stage_tasks.discard)
+            return
         self.elastic_pending_ep_size = None
-        self.elastic_scale_phase = "serving_expanded"
+        # Direction from the caller's request: a partial regrow's last stage shrinks.
+        shrank = (
+            msg.effective_ep_size < self.elastic_staged_from
+            if self.elastic_staged_from is not None
+            else msg.direction == "shrink"
+        )
+        self._clear_staged_scale()
+        self.elastic_scale_phase = "serving_shrunk" if shrank else "serving_expanded"
         self.elastic_last_error = None
+        # Published only post-commit: until then these ranks are load-bearing.
+        self.elastic_retired_ranks = (
+            list(range(msg.slot_offset, msg.slot_offset + msg.slot_count))
+            if msg.direction == "shrink"
+            else []
+        )
         self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self._open_elastic_shrink_gate()
 
     def get_elastic_ep_state(self):
+        # A grow clears pending_ep_size at commit but stays warming_up until served.
+        settled = (
+            self.elastic_pending_ep_size is None
+            and self.elastic_scale_phase != "warming_up"
+        )
         return {
-            "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "is_scaling_elastic_ep": not settled,
             "effective_ep_size": self.elastic_worker_count,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "operation_id": self.elastic_operation_id,
+            "retired_ranks": list(self.elastic_retired_ranks),
+            # Safe only once the survivors committed; empty mid-scale.
+            "safe_to_terminate_ranks": (
+                list(self.elastic_retired_ranks)
+                if settled and self.elastic_scale_phase == "serving_shrunk"
+                else []
+            ),
         }
+
+    def _elastic_launch_ep(self) -> int:
+        return get_parallel().elastic_ep_initial_size or get_parallel().tp_size
+
+    def _elastic_stage_plan(self, target: int) -> List[int]:
+        return elastic_stage_plan(
+            self.elastic_worker_count, self._elastic_launch_ep(), target
+        )
+
+    def _stage_through(
+        self, obj: ScaleElasticEPReqInput, width: int
+    ) -> ScaleElasticEPReqInput:
+        """Redirect this request through ``width``, leaving the target for stage two."""
+        self.elastic_staged_from = self.elastic_worker_count
+        self.elastic_pending_stages = [self.elastic_pending_ep_size]
+        return ScaleElasticEPReqInput(new_ep_size=width, operation_id=obj.operation_id)
+
+    def _clear_staged_scale(self) -> None:
+        """Drop staging state as one unit -- a stale origin width mislabels a phase."""
+        self.elastic_pending_stages = []
+        self.elastic_staged_from = None
 
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         """Send a scale request to every DP scheduler."""
+        # Serialize concurrent HTTP-driven scale requests.
+        async with self._elastic_scale_lock:
+            return await self._scale_elastic_ep_locked(obj)
+
+    async def _drive_next_elastic_stage(self, target: int) -> None:
+        """Issue the next stage of a staged grow once the schedulers will take it.
+
+        Schedulers reject while ``warming_up``, so retry rather than send once. Failure
+        must clear the pinned pending size or the duplicate guard blocks later scales.
+        """
+        obj = ScaleElasticEPReqInput(
+            new_ep_size=target, operation_id=self.elastic_operation_id
+        )
+        deadline = time.monotonic() + get_exec().moe.elastic_ep_scale_timeout
+        try:
+            # Gate by target, not intent: a partial regrow's stage 2 shrinks, and a
+            # shrink needs the gate shut so the router stops feeding the retiree.
+            if target < self.elastic_worker_count:
+                self._close_elastic_shrink_gate(
+                    range(target, self.elastic_worker_count)
+                )
+            while True:
+                # A landed stage answers "noop": arrival, not failure, and it can
+                # land mid-send. Equality, not >=: stage 2 can sit below stage 1.
+                if self.elastic_worker_count == target:
+                    return
+                responses = await self.scale_elastic_ep_communicator(obj)
+                if all(r.success for r in responses):
+                    return  # under way; the completion message reports the outcome
+                stale = next(r for r in responses if not r.success)
+                if stale.old_ep_size == target:
+                    return
+                retryable = (
+                    stale.scale_phase == "warming_up"
+                    or stale.pending_ep_size is not None
+                )
+                if not retryable or time.monotonic() >= deadline:
+                    raise RuntimeError(stale.message)
+                await asyncio.sleep(_ELASTIC_STAGE_RETRY_S)
+        except BaseException as exc:
+            self._clear_staged_scale()
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "failed"
+            self.elastic_last_error = (
+                f"staged grow to {target} did not start: {type(exc).__name__}: {exc}"
+            )
+            logger.error("[Elastic EP] %s", self.elastic_last_error)
+            self._open_elastic_shrink_gate()
+            if not isinstance(exc, Exception):
+                raise
+
+    async def _scale_elastic_ep_locked(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
         if self.elastic_pending_ep_size is not None:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -3536,19 +3770,122 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[
-            ScaleElasticEPReqOutput
-        ] = await self.scale_elastic_ep_communicator(obj)
+
+        # Close the shrink gate and publish pending; reopened on completion/failure.
+        is_shrink = obj.new_ep_size < self.elastic_worker_count
+        # Restored if the schedulers refuse below: a rejected request must not overwrite
+        # the last completed operation's view, or an orchestrator polling for
+        # safe_to_terminate_ranks would see this id, idle, and nothing left to reap.
+        prev_operation_id = self.elastic_operation_id
+        prev_retired_ranks = list(self.elastic_retired_ranks)
+        # The phase with them. A rejection answers with the scheduler's phase, which is
+        # idle on a scheduler that is not mid-scale, and writing that over this one's
+        # serving_shrunk is what leaves safe_to_terminate_ranks empty for an operation
+        # that already completed and still has ranks to reap.
+        prev_scale_phase = self.elastic_scale_phase
+        self.elastic_pending_ep_size = obj.new_ep_size
+        self.elastic_scale_phase = "waiting_for_cohort"
+        self.elastic_operation_id = obj.operation_id
+        self.elastic_retired_ranks = []
+        if is_shrink:
+            self._close_elastic_shrink_gate(
+                range(obj.new_ep_size, self.elastic_worker_count)
+            )
+
+        # pending_ep_size stays on the caller's target; only the wire request narrows.
+        stages = self._elastic_stage_plan(obj.new_ep_size)
+        self.elastic_pending_stages = stages[1:]
+        if self.elastic_pending_stages:
+            self.elastic_staged_from = self.elastic_worker_count
+            obj = ScaleElasticEPReqInput(
+                new_ep_size=stages[0], operation_id=obj.operation_id
+            )
+
+        try:
+            responses: List[
+                ScaleElasticEPReqOutput
+            ] = await self.scale_elastic_ep_communicator(obj)
+            # The joiner is a separate process launched alongside this request and
+            # cannot announce its width until it is up, measured 11s later. So the
+            # waiting lives here: the schedulers answer from one store read and never
+            # block their loop, and a resend is clean because they validate first. A
+            # reject for any other reason ends the wait rather than hiding behind it.
+            deadline = time.monotonic() + _JOINER_ANNOUNCE_WAIT_S
+            requested = obj.new_ep_size
+            while (rejects := [r for r in responses if not r.success]) and all(
+                r.retry_when_joiner_announces for r in rejects
+            ):
+                if time.monotonic() >= deadline:
+                    # Nothing announced in time. The launch width serves any joiner.
+                    obj = self._stage_through(obj, self._elastic_launch_ep())
+                    break
+                await asyncio.sleep(_JOINER_ANNOUNCE_POLL_S)
+                responses = await self.scale_elastic_ep_communicator(obj)
+            else:
+                # Reached when the loop stopped on its own, so a width is known, and
+                # skipped on the timeout break above. A reject naming required_ep_size
+                # means the joiner that announced is wider than this target, so the
+                # grow has to land at its width before it can narrow. Only reachable on
+                # the direct path: a plan that already staged sends the launch width,
+                # which no recover joiner can exceed.
+                required = max(
+                    (r.required_ep_size for r in rejects if r.required_ep_size),
+                    default=0,
+                )
+                if required > obj.new_ep_size:
+                    obj = self._stage_through(obj, required)
+            if obj.new_ep_size != requested:
+                logger.info(
+                    "[Elastic EP][scale] grow to %d staged through %d to serve the "
+                    "joiner waiting below the launch width",
+                    requested,
+                    obj.new_ep_size,
+                )
+                responses = await self.scale_elastic_ep_communicator(obj)
+        # BaseException, not Exception: a disconnected client cancels this task, and
+        # a skipped reopen blocks every later generate() on the shrink gate.
+        except BaseException:
+            self.elastic_pending_ep_size = None
+            self._clear_staged_scale()
+            self.elastic_scale_phase = "failed"
+            self.elastic_operation_id = prev_operation_id
+            self.elastic_retired_ranks = prev_retired_ranks
+            if is_shrink:
+                self._open_elastic_shrink_gate()
+                self._clear_elastic_draining()
+            raise
+
         for res in responses:
             if not res.success:
-                self.elastic_scale_phase = res.scale_phase
+                self.elastic_scale_phase = prev_scale_phase
                 self.elastic_pending_ep_size = res.pending_ep_size
+                self._clear_staged_scale()
                 self.elastic_last_error = res.message
+                self.elastic_operation_id = prev_operation_id
+                self.elastic_retired_ranks = prev_retired_ranks
+                if is_shrink:
+                    self._open_elastic_shrink_gate()
+                    self._clear_elastic_draining()
                 return res
-        self.elastic_pending_ep_size = responses[0].pending_ep_size
         self.elastic_scale_phase = responses[0].scale_phase
         self.elastic_last_error = None
-        return responses[0]
+        if not self.elastic_pending_stages:
+            self.elastic_pending_ep_size = responses[0].pending_ep_size
+            return responses[0]
+        # Keep pending_ep_size at the caller's target: a stage width would read as done.
+        final = self.elastic_pending_ep_size
+        return ScaleElasticEPReqOutput(
+            success=True,
+            message=(
+                f"Scaling initiated from {responses[0].old_ep_size} to {final} via "
+                f"{[responses[0].new_ep_size] + self.elastic_pending_stages}; "
+                "poll /is_scaling_elastic_ep for completion"
+            ),
+            old_ep_size=responses[0].old_ep_size,
+            new_ep_size=final,
+            pending_ep_size=final,
+            scale_phase=responses[0].scale_phase,
+        )
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)

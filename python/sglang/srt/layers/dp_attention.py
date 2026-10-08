@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     resolving_view,
 )
 from sglang.srt.distributed import (
@@ -75,16 +75,30 @@ def dp_slot_in(per_rank) -> int:
     The sequence carries one entry per replica of the gather this process
     takes part in, so its length is the gather width. Length one is the
     all-gather-skipped batch, which carries this process's entry alone.
+
+    Under elastic EP a graph-facing sequence is instead sized to the pool
+    ceiling (see dp_capacity_for), so it stays wider than the live gather.
+    Retirees are the contiguous tail, so every live slot keeps its offset and
+    the unfilled tail reads as ranks with no tokens: the same index applies.
     """
     if len(per_rank) == 1:
         return 0
     width = dp_gather_width()
-    if len(per_rank) != width:
+    ceiling_sized = (
+        get_exec().moe.elastic_ep_backend is not None and len(per_rank) > width
+    )
+    if len(per_rank) != width and not ceiling_sized:
         raise ValueError(
             f"a per-replica sequence of {len(per_rank)} entries does not "
             f"belong to a DP gather of width {width}"
         )
-    return dp_gather_slot()
+    slot = dp_gather_slot()
+    if slot >= len(per_rank):
+        raise ValueError(
+            f"DP slot {slot} is outside a per-replica sequence of "
+            f"{len(per_rank)} entries"
+        )
+    return slot
 
 
 def dp_gather_slot() -> int:
@@ -355,10 +369,12 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    # Not attn_dp_rank: an offset joiner's slot in the expanded WORLD gather is
+    # tp_rank + ep_join_rank_offset, so reading attn_dp_rank picks another
+    # rank's token count and the local length stops matching the residual.
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
-        global_num_tokens[dp_rank],
+        global_num_tokens[dp_slot_in(global_num_tokens)],
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
         forward_batch.global_num_tokens_gpu,
@@ -422,7 +438,9 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
     dp.enabled = get_parallel().attn_dp_enabled
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        # Resolution, not a bag: callers reach this from processes whose
+        # publish may not have happened. Offset covers a recover joiner too.
+        if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
 
@@ -530,6 +548,29 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+def dp_capacity_for(dp_size: int) -> int:
+    """DP width graph-facing buffers are sized to: the pool ceiling, not the live width.
+
+    Retirees are the contiguous tail, so a shrink leaves surviving rank offsets put
+    and a retired slot reads as a rank with zero tokens. Takes the width as an
+    argument so the buffer allocators can call it before DP attention is
+    initialized.
+
+    The ceiling is max_ep_size: a replica never spans less than one EP rank, so no
+    gather can hold more slots than the pool holds ranks. Scaling it by the calling
+    process's own tp_size instead made a joiner, which holds one slice of the
+    deployment, size against a different ceiling than the server -- 24 against 12
+    for a tp-2 joiner into a tp-4 pool. Over-sizing is inert (the tail fills with
+    ranks contributing nothing); disagreeing across processes is not.
+    """
+    if get_exec().moe.elastic_ep_backend is None:
+        return dp_size
+    max_ep_size = get_parallel().max_ep_size
+    if not max_ep_size:
+        return dp_size
+    return max(dp_size, max_ep_size)
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:

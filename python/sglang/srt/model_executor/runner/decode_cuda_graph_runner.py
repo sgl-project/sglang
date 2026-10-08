@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -605,9 +606,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
-    def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
+    def _global_num_tokens_for_graph(
+        self, num_tokens: int, *, dp_len: Optional[int] = None
+    ) -> Optional[list[int]]:
+        # dp_len lets capture size to the buffer ceiling so a shrink cannot
+        # resize storage the graph replays against; replay passes live num_dp_ranks.
         if self.require_mlp_tp_gather:
-            return [num_tokens] * self.num_dp_ranks
+            return [num_tokens] * (dp_len or self.num_dp_ranks)
         if self.require_attn_tp_gather:
             return [num_tokens]
         return None
@@ -964,7 +969,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-        global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
+        global_num_tokens_cpu = self._global_num_tokens_for_graph(
+            num_tokens, dp_len=dp_capacity_for(self.num_dp_ranks)
+        )
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
