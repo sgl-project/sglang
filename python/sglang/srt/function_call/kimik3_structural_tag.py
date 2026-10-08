@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 from xgrammar import StructuralTag
 from xgrammar.structural_tag import (
@@ -347,15 +347,74 @@ def _known_argument_format(
     return OrFormat(elements=variants)
 
 
+# Regex text of the characters an argument key may not contain, and the same
+# characters as a Python set.
+_KEY_FORBIDDEN_CHARS = r'"& \t\r\n\f\v=<>'
+_KEY_FORBIDDEN_SET = set('"& \t\r\n\f\v=<>')
+
+
+def _regex_literal(text: str) -> str:
+    """Escape ``text`` for xgrammar's regex dialect, inside or outside a class."""
+    return "".join(
+        char
+        if char.isascii() and (char.isalnum() or char == "_")
+        else f"\\{char}"
+        if char.isascii()
+        else f"\\u{ord(char):04x}"
+        if ord(char) <= 0xFFFF
+        else f"\\U{ord(char):08x}"
+        for char in text
+    )
+
+
+def _dynamic_key_pattern(excluded_keys: Iterable[str]) -> str:
+    """Regex for an argument key that is none of ``excluded_keys``.
+
+    A strict tool pins each declared property to its own schema, so the
+    additionalProperties branch must not accept a declared name under the
+    looser schema (JSON Schema applies additionalProperties only to keys that
+    ``properties`` does not name). xgrammar's regex dialect has no lookahead,
+    so the exclusion walks a trie of the names: a key is acceptable when it
+    leaves the trie with a character no excluded name continues with, or when
+    it stops at a proper prefix of an excluded name.
+    """
+    any_key_char = f"[^{_KEY_FORBIDDEN_CHARS}]"
+    names = {key for key in excluded_keys if key and not set(key) & _KEY_FORBIDDEN_SET}
+    if not names:
+        return any_key_char + "+"
+
+    trie: Dict[str, Any] = {}
+    for name in names:
+        node = trie
+        for char in name:
+            node = node.setdefault(char, {})
+        node[""] = {}
+
+    alternatives: List[str] = []
+
+    def walk(node: Dict[str, Any], prefix: str) -> None:
+        children = [char for char in node if char]
+        diverge = f"[^{_KEY_FORBIDDEN_CHARS}{''.join(map(_regex_literal, children))}]"
+        alternatives.append(f"{_regex_literal(prefix)}{diverge}{any_key_char}*")
+        if prefix and "" not in node:
+            alternatives.append(_regex_literal(prefix))
+        for char in children:
+            walk(node[char], prefix + char)
+
+    walk(trie, "")
+    return "(?:" + "|".join(alternatives) + ")"
+
+
 def _dynamic_argument_format(
     schema: Union[bool, Dict[str, Any]],
     root_schema: Dict[str, Any],
     loose_strings: bool = False,
+    excluded_keys: Iterable[str] = (),
 ) -> Format:
     variants = [
         SequenceFormat(
             elements=[
-                RegexFormat(pattern=r'[^"& \t\r\n\f\v=<>]+'),
+                RegexFormat(pattern=_dynamic_key_pattern(excluded_keys)),
                 ConstStringFormat(
                     value=(f'" type="{_JSON_TO_XTML_TYPE[json_type]}"<|sep|>')
                 ),
@@ -409,11 +468,22 @@ def _strict_arguments_format(parameters: Dict[str, Any]) -> Format:
         )
 
     additional = parameters.get("additionalProperties", True)
+    declared = set(properties)
     if additional is True:
-        elements.append(StarFormat(content=_dynamic_argument_format(True, parameters)))
+        elements.append(
+            StarFormat(
+                content=_dynamic_argument_format(
+                    True, parameters, excluded_keys=declared
+                )
+            )
+        )
     elif isinstance(additional, dict):
         elements.append(
-            StarFormat(content=_dynamic_argument_format(additional, parameters))
+            StarFormat(
+                content=_dynamic_argument_format(
+                    additional, parameters, excluded_keys=declared
+                )
+            )
         )
     elif additional is not False:
         raise ValueError(
