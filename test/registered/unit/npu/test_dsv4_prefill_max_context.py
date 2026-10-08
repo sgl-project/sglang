@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=2, suite="stage-a-unit-test-npu")
@@ -22,6 +24,9 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
     def setUp(self):
         # Exercise real metadata builders with CPU tensors; no model or kernel
         # launch is needed to check table extents and live sequence lengths.
+        context = ExitStack()
+        self.addCleanup(context.close)
+        context.enter_context(get_parallel().override(dcp_enabled=False))
         self.backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         backend = self.backend
         backend.device = torch.device("cpu")
