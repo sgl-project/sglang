@@ -56,11 +56,19 @@ def resolve_cp_tp_group_sharing(server_args: Any, model_config: Any) -> None:
             f"num_heads={heads} must be divisible by --tp-size={cfg.tp_size}."
         )
 
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    prefill_backend = Backend.DISABLED
+    if (
+        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        and supports_prefill_cp_bcg(server_args)
+    ):
+        prefill_backend = Backend.BREAKABLE
     declare_resolution(
         server_args,
         "resolve_cp_tp_group_sharing",
         cp_tp_group_sharing=True,
         cuda_graph_config=with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            cfg.cuda_graph_config, Phase.PREFILL, backend=prefill_backend
         ),
     )

@@ -50,6 +50,10 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
+    if cfg.cp_strategy == "interleave":
+        from sglang.srt.layers.cp.interleave_bcg import supports_interleave_bcg
+
+        return supports_interleave_bcg(server_args)
     return (
         cfg.enable_prefill_cp
         and cfg.pp_size == 1
@@ -101,6 +105,10 @@ class PrefillCPBCGInput:
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
+        if cls is PrefillCPBCGInput and get_cp_strategy().name == "interleave":
+            from sglang.srt.layers.cp.interleave_bcg import InterleaveCPBCGInput
+
+            return InterleaveCPBCGInput.create(runner)
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -115,6 +123,13 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
             )
+
+    def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
+        return True
+
+    def model_positions(self, forward_batch):
+        # No override: retain the runner's existing model/mRoPE selection.
+        return None
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
         """Return the aligned CP-local rows required by a live zigzag layout."""

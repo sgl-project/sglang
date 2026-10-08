@@ -16,7 +16,8 @@ def dsa_cp_interleave_q_seqs_kernel(
     cp_size: tl.constexpr,
     cp_rank: tl.constexpr,
 ):
-    extra_seq = 0
+    # Eager metadata uses int32, while prefill graph buffers may use int64.
+    extra_seq = tl.full((), 0, in_seqs_ptr.dtype.element_ty)
     bs_idx = 0
     for bs in range(tokens):
         cur_len = tl.load(in_seqs_ptr + bs)
