@@ -5,11 +5,13 @@ import asyncio
 import base64
 import json
 import math
+import random
 import unittest
 from io import BytesIO
 from types import SimpleNamespace
 from unittest import mock
 
+import pybase64
 from PIL import Image
 from transformers import AutoTokenizer
 
@@ -18,7 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.systemone.joint_schema import encode_joint_schema
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
-from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.systemone.serving import SystemOneServing, _read_image
 from sglang.srt.layers.joint_schema_head import (
     LayoutQuestion,
     pack_decision_layout,
@@ -34,6 +36,7 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -416,6 +419,34 @@ class TestJointSchemaAdmission(CustomTestCase):
         ]
         self.assertEqual(manager.requests, [])
         self.assertEqual([response.status_code for response in responses], [400, 400])
+
+    def test_inline_images_are_sized_from_a_header_prefix(self):
+        """Sizing an inline image must not decode its whole payload, and an image
+        whose header runs past the decoded prefix must still be sized."""
+        noise = BytesIO()
+        pixels = random.Random(0).randbytes(256 * 192 * 3)
+        Image.frombytes("RGB", (256, 192), pixels).save(noise, format="PNG")
+        late = BytesIO()
+        # A 60 KB EXIF segment puts the JPEG frame header far into the payload.
+        exif = b"Exif\x00\x00" + bytes(60000)
+        Image.new("RGB", (64, 48)).save(late, format="JPEG", exif=exif)
+        cases = {
+            "png": ("image/png", noise.getvalue(), (256, 192)),
+            "late jpeg header": ("image/jpeg", late.getvalue(), (64, 48)),
+        }
+        for name, (mime, data, size) in cases.items():
+            with self.subTest(name):
+                payload = base64.b64encode(data).decode()
+                image = ImageData(url=f"data:{mime};base64,{payload}")
+                with mock.patch("pybase64.b64decode", wraps=pybase64.b64decode) as read:
+                    forwarded, header = _read_image(0, image)
+                self.assertIs(forwarded, image)
+                self.assertEqual(header.size, size)
+                decoded = [len(call.args[0]) for call in read.call_args_list]
+                if name == "png":
+                    self.assertLess(max(decoded), len(payload))
+                else:
+                    self.assertEqual(decoded[-1], len(payload))
 
 
 if __name__ == "__main__":

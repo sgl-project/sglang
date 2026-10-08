@@ -59,6 +59,12 @@ _DECIDER_SYSTEM = (
     "Reply with only the selected option code."
 )
 
+# Image sources whose content can change between reads, as load_image reads them.
+_MUTABLE_SOURCES = ("http://", "https://", "file://", "/")
+# Base64 characters decoded to size an inline image, 48 KiB of image data.
+# Arbitrary; an image whose header runs longer is decoded in full.
+_INLINE_HEADER_CHARS = 1 << 16
+
 
 class SystemOneServing(OpenAIServingDecisions):
     """Answers System One questions with the rendering, label checks, and scoring of
@@ -508,15 +514,32 @@ def _read_image(index: int, image: ImageData) -> Tuple[ImageData, Image.Image]:
     """The image to forward, and its header opened only as far as its size, read
     once from the sources load_image reads."""
     url = image.url
+    if not url.startswith(_MUTABLE_SOURCES):
+        # An inline image is forwarded as sent, and the processor decodes all of it.
+        header = _inline_header(url)
+        if header is not None:
+            return image, header
     source = unquote(urlparse(url).path) if url.startswith("file://") else url
     try:
         data = get_image_bytes(source)
         header = Image.open(BytesIO(data))
     except CLIENT_MEDIA_EXCEPTIONS as e:
         raise ValueError(f"image {index} could not be read: {e}") from e
-    if url.startswith(("http://", "https://", "file://", "/")):
+    if url.startswith(_MUTABLE_SOURCES):
         # A source that can change between reads is forwarded as the bytes counted.
         mime = Image.MIME.get(header.format, "application/octet-stream")
         encoded = pybase64.b64encode(data).decode()
         image = dataclasses.replace(image, url=f"data:{mime};base64,{encoded}")
     return image, header
+
+
+def _inline_header(url: str) -> Optional[Image.Image]:
+    """An inline image's header from a prefix of its base64, or None when the
+    header does not open from that prefix."""
+    start = url.find(",") + 1 if url.startswith("data:") else 0
+    prefix = url[start : start + _INLINE_HEADER_CHARS]
+    try:
+        return Image.open(BytesIO(pybase64.b64decode(prefix, validate=True)))
+    except Exception:
+        # A header past the prefix, or malformed data that the full read reports.
+        return None
