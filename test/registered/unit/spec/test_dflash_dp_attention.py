@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.arg_groups import speculative_hook
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -20,6 +21,41 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDFlashDPAttention(CustomTestCase):
+    def test_dp_attention_keeps_draft_graph_enabled(self):
+        draft_worker = SimpleNamespace(init_cuda_graphs=Mock())
+        worker = SimpleNamespace(
+            draft_owns_attention=True,
+            _target_tp_rank=0,
+            _draft_worker=draft_worker,
+            _maybe_build_draft_sampler=Mock(return_value=None),
+            draft_model_runner=SimpleNamespace(capture_tail_hooks=[]),
+        )
+        exec_config = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend=Backend.FULL)
+                )
+            )
+        )
+
+        with (
+            patch.object(dflash, "draft_pp_context", return_value=nullcontext()),
+            patch.object(dflash, "draft_tp_context", return_value=nullcontext()),
+            patch.object(dflash, "get_exec", return_value=exec_config),
+            patch.object(
+                dflash,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=True),
+            ),
+            patch.object(dflash.current_platform, "is_out_of_tree", return_value=False),
+            patch.object(dflash, "is_cuda", return_value=False),
+        ):
+            dflash.DFlashWorkerV2.init_cuda_graphs(worker)
+
+        draft_worker.init_cuda_graphs.assert_called_once_with(
+            capture_decode_cuda_graph=True
+        )
+
     def test_dp_lm_head_resolution(self):
         for device, dp_attention, already_enabled in (
             ("cuda", True, False),
@@ -31,7 +67,8 @@ class TestDFlashDPAttention(CustomTestCase):
             with self.subTest(device=device, dp_attention=dp_attention):
                 cfg = SimpleNamespace(
                     device=device,
-                    enable_dp_attention=dp_attention,
+                    attn_dp_size=2 if dp_attention else 1,
+                    ep_join_mode=None,
                     enable_dp_lm_head=already_enabled,
                     pp_size=1,
                     speculative_draft_model_path="draft",
@@ -59,56 +96,61 @@ class TestDFlashDPAttention(CustomTestCase):
                     resolve.assert_not_called()
 
     def test_draft_scope_restores_target_state(self):
-        initial_group, runtime_group, target_group = object(), object(), object()
-        state = SimpleNamespace(group=target_group, enabled=True)
+        state = SimpleNamespace(pp_active=False, tp_active=False)
 
         @contextmanager
-        def tp_scope(group):
-            self.assertIs(state.group, target_group, "nested TP patch")
-            state.group = group
+        def pp_scope():
+            state.pp_active = True
             try:
                 yield
             finally:
-                state.group = target_group
+                state.pp_active = False
 
         @contextmanager
-        def dp_scope(*, enabled):
-            old = state.enabled
-            state.enabled = enabled
+        def tp_scope(owns_attention):
+            self.assertTrue(owns_attention)
+            state.tp_active = True
             try:
                 yield
             finally:
-                state.enabled = old
+                state.tp_active = False
 
-        worker = SimpleNamespace(
-            enable_dp_attention=True,
-            _draft_tp_group=initial_group,
-            draft_model_runner=SimpleNamespace(tp_group=runtime_group),
+        def capture(**kwargs):
+            self.assertTrue(state.pp_active)
+            self.assertTrue(state.tp_active)
+            raise RuntimeError("draft failure")
+
+        exec_config = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend=Backend.FULL)
+                )
+            )
         )
-        flags = SimpleNamespace(dp=SimpleNamespace(override=dp_scope))
+        worker = SimpleNamespace(
+            draft_owns_attention=True,
+            _target_tp_rank=0,
+            _draft_worker=SimpleNamespace(init_cuda_graphs=Mock(side_effect=capture)),
+            _maybe_build_draft_sampler=Mock(return_value=None),
+            draft_model_runner=SimpleNamespace(capture_tail_hooks=[]),
+        )
         with (
-            patch.object(dflash, "draft_pp_context", return_value=nullcontext()),
+            patch.object(dflash, "draft_pp_context", side_effect=pp_scope),
             patch.object(dflash, "draft_tp_context", side_effect=tp_scope),
-            patch.object(dflash, "get_flags", return_value=flags),
+            patch.object(dflash, "get_exec", return_value=exec_config),
+            patch.object(
+                dflash,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=True),
+            ),
+            patch.object(dflash.current_platform, "is_out_of_tree", return_value=False),
+            patch.object(dflash, "is_cuda", return_value=False),
         ):
-            for initializing in (False, True):
-                with self.subTest(initializing=initializing):
-                    with self.assertRaisesRegex(RuntimeError, "draft failure"):
-                        with dflash.DFlashWorkerV2._draft_context(
-                            worker, initializing=initializing
-                        ):
-                            self.assertIs(
-                                state.group,
-                                initial_group if initializing else runtime_group,
-                            )
-                            self.assertFalse(state.enabled)
-                            raise RuntimeError("draft failure")
-                    self.assertIs(state.group, target_group)
-                    self.assertTrue(state.enabled)
-            worker.enable_dp_attention = False
-            with dflash.DFlashWorkerV2._draft_context(worker):
-                self.assertIs(state.group, target_group)
-                self.assertTrue(state.enabled)
+            with self.assertRaisesRegex(RuntimeError, "draft failure"):
+                dflash.DFlashWorkerV2.init_cuda_graphs(worker)
+
+        self.assertFalse(state.pp_active)
+        self.assertFalse(state.tp_active)
 
     def test_non_extend_rank_skips_prompt_kv(self):
         for mode in (ForwardMode.IDLE, ForwardMode.DECODE):
@@ -172,7 +214,7 @@ class TestDFlashDPAttention(CustomTestCase):
                     patch.object(
                         dflash,
                         "get_parallel",
-                        return_value=SimpleNamespace(enable_dp_attention=dp_attention),
+                        return_value=SimpleNamespace(attn_dp_enabled=dp_attention),
                     ),
                     patch.object(dflash, "DFlashVerifyInput") as verify,
                 ):
@@ -300,7 +342,7 @@ class TestDFlashDPAttention(CustomTestCase):
                                 model_config=SimpleNamespace(vocab_size=7),
                             )
                         ),
-                        ps=SimpleNamespace(tp_rank=rank),
+                        _target_tp_rank=rank,
                     )
 
                     def gather(outputs, local, *, group):
@@ -317,7 +359,7 @@ class TestDFlashDPAttention(CustomTestCase):
                             dflash,
                             "get_parallel",
                             return_value=SimpleNamespace(
-                                enable_dp_attention=True,
+                                attn_dp_enabled=True,
                                 attn_tp_group=attn_group,
                                 tp_group=global_group,
                             ),

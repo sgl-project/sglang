@@ -643,16 +643,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention.
-                capture_decode_cuda_graph = False
-                if self._target_tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
+            # Under DP attention each active rank drafts independently inside
+            # its attention-TP group. DecodeCudaGraphRunner classifies this
+            # draft forward as DP-local, so idle peer DP ranks do not need to
+            # participate in either capture or replay.
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
