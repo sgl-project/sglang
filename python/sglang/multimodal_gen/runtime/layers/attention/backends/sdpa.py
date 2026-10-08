@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import math
 from contextlib import nullcontext
 
 import torch
@@ -17,6 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -30,6 +35,26 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
+# PyTorch's flash forward splits the keys across thread blocks when
+# batch * heads * ceil(query_len / 128) falls below 80% of the SMs
+# (num_splits_heuristic in ATen's flash_api.cpp). Measured on sm100 for
+# head_dim 64 and 128.
+_FLASH_QUERY_BLOCK = 128
+_FLASH_SPLIT_OCCUPANCY = 0.8
+
+
+@functools.cache
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _request_quality_is_exact() -> bool:
+    # Split versus unsplit flash only moves rounding, which "lossless" allows;
+    # the slower unsplit kernel is reserved for "exact" requests.
+    context = get_forward_context_or_none()
+    batch = getattr(context, "forward_batch", None)
+    return getattr(batch, "quality", None) == "exact"
 
 
 class SDPABackend(AttentionBackend):
@@ -53,6 +78,9 @@ class SDPABackend(AttentionBackend):
 
 
 class SDPAImpl(AttentionImpl):
+    # cuDNN SDPA does not depend on the head count; only flash needs padding.
+    _pad_flash_split_queries = True
+
     def __init__(
         self,
         num_heads: int,
@@ -67,6 +95,40 @@ class SDPAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        # Heads of the unsharded layer; set when TP or Ulysses shards them.
+        self.global_num_heads = extra_impl_args.get("global_num_heads")
+
+    def _unsplit_query_len(self, query: torch.Tensor) -> int:
+        """Query length that keeps sharded heads on the full layer's kernel.
+
+        Fewer local heads can push a short sequence onto PyTorch's split-KV
+        flash kernel while the unsharded layer is not split, which reorders
+        the softmax sums. Query rows attend independently, so padding them
+        past the split threshold restores the unsharded kernel exactly.
+        Applies to "exact" quality requests only.
+        ``query`` is [B, H, S, D].
+        """
+        batch, heads, query_len, head_dim = query.shape
+        if (
+            not self._pad_flash_split_queries
+            or self.allow_cudnn_sdp
+            or self.global_num_heads is None
+            or heads >= self.global_num_heads
+            or self.dropout
+            or not query.is_cuda
+            or query.dtype not in (torch.float16, torch.bfloat16)
+            or head_dim > 256
+            or not _request_quality_is_exact()
+        ):
+            return query_len
+        threshold = _FLASH_SPLIT_OCCUPANCY * _multi_processor_count(query.device.index)
+        blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)
+        if (
+            batch * heads * blocks >= threshold
+            or batch * self.global_num_heads * blocks < threshold
+        ):
+            return query_len
+        return math.ceil(threshold / (batch * heads)) * _FLASH_QUERY_BLOCK
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
@@ -106,11 +168,24 @@ class SDPAImpl(AttentionImpl):
         }
         if query.shape[1] != key.shape[1]:
             attn_kwargs["enable_gqa"] = True
+        query_len = query.shape[-2]
+        if attn_mask is None and not is_causal:
+            padded_len = self._unsplit_query_len(query)
+            if padded_len > query_len:
+                query = torch.cat(
+                    [
+                        query,
+                        query.new_zeros(
+                            *query.shape[:2], padded_len - query_len, query.shape[-1]
+                        ),
+                    ],
+                    dim=2,
+                )
         with self._sdpa_context(query):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs
             )
-        output = output.transpose(1, 2)
+        output = output[:, :, :query_len].transpose(1, 2)
         return output
 
     def forward_varlen(
@@ -218,6 +293,8 @@ class CudnnSDPABackend(SDPABackend):
 
 
 class CudnnSDPAImpl(SDPAImpl):
+    _pad_flash_split_queries = False
+
     def _sdpa_context(self, query: torch.Tensor):
         if query.device.type == "cuda":
             return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
