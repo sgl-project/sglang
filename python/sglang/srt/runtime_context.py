@@ -697,6 +697,10 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # mHC sequence parallelism region (DeepSeek-V4.1): the batch's total row
+        # count while the model loop runs with the residual sharded, None
+        # otherwise; see layers/dsv41_mhc_sp.py.
+        "sp_mhc_rows": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -714,6 +718,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "sp_mhc_rows",
         }
     )
 
