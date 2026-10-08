@@ -367,16 +367,19 @@ class TestRadixCache(CustomTestCase):
                 result = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3])))
                 )
-                self.assertEqual(len(result.device_indices), 3)
-                torch.testing.assert_close(result.device_indices, value)
+                self.assertEqual(result.device_prefix_len, 3)
+                torch.testing.assert_close(
+                    cache.path_device_indices(result.last_device_node), value
+                )
 
                 # Test partial match
                 result = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", [1, 2])))
                 )
-                self.assertEqual(len(result.device_indices), 2)
+                self.assertEqual(result.device_prefix_len, 2)
                 torch.testing.assert_close(
-                    result.device_indices, torch.tensor([10, 20], dtype=torch.int64)
+                    cache.path_device_indices(result.last_device_node),
+                    torch.tensor([10, 20], dtype=torch.int64),
                 )
 
     def test_insert_with_none_value(self):
@@ -447,6 +450,7 @@ class TestRadixCache(CustomTestCase):
             cache_salt=None,
             priority=0,
             last_node=cache.root_node,
+            lock=None,
         )
         req.full_untruncated_fill_ids = token_ids
         req.origin_input_ids = token_ids
@@ -496,12 +500,13 @@ class TestRadixCache(CustomTestCase):
             cache_salt=None,
             priority=0,
             last_node=cache.root_node,
+            lock=None,
         )
 
         up_to = len(prompt_ids) + len(output_ids)
         cache.checkpoint(req, up_to=up_to)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
-        cache.unpin(req)
+        cache.unlock(req.lock)
 
         (prompt_node,) = cache.root_node.children.values()
         (output_node,) = prompt_node.children.values()
@@ -513,7 +518,7 @@ class TestRadixCache(CustomTestCase):
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
         )
-        self.assertEqual(len(match.device_indices), len(prompt_ids))
+        self.assertEqual(match.device_prefix_len, len(prompt_ids))
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""
@@ -640,23 +645,26 @@ class TestRadixCache(CustomTestCase):
         )
 
         # Each should match only its own data
-        self.assertEqual(len(result1.device_indices), 3)
+        self.assertEqual(result1.device_prefix_len, 3)
         torch.testing.assert_close(
-            result1.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+            cache.path_device_indices(result1.last_device_node),
+            torch.tensor([10, 20, 30], dtype=torch.int64),
         )
 
-        self.assertEqual(len(result2.device_indices), 3)
+        self.assertEqual(result2.device_prefix_len, 3)
         torch.testing.assert_close(
-            result2.device_indices, torch.tensor([40, 50, 60], dtype=torch.int64)
+            cache.path_device_indices(result2.last_device_node),
+            torch.tensor([40, 50, 60], dtype=torch.int64),
         )
 
-        self.assertEqual(len(result3.device_indices), 3)
+        self.assertEqual(result3.device_prefix_len, 3)
         torch.testing.assert_close(
-            result3.device_indices, torch.tensor([70, 80, 90], dtype=torch.int64)
+            cache.path_device_indices(result3.last_device_node),
+            torch.tensor([70, 80, 90], dtype=torch.int64),
         )
 
         # Non-existent extra_key should not match
-        self.assertEqual(len(result4.device_indices), 0)
+        self.assertEqual(result4.device_prefix_len, 0)
 
     def test_cache_salt_isolation_is_independent_of_extra_key(self):
         cache = RadixCache.create_simulated()
@@ -682,10 +690,12 @@ class TestRadixCache(CustomTestCase):
             MatchPrefixParams(key=RadixKey(tokens, extra_key="c", cache_salt="ab"))
         )
         torch.testing.assert_close(
-            first.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+            cache.path_device_indices(first.last_device_node),
+            torch.tensor([10, 20, 30], dtype=torch.int64),
         )
         torch.testing.assert_close(
-            second.device_indices, torch.tensor([40, 50, 60], dtype=torch.int64)
+            cache.path_device_indices(second.last_device_node),
+            torch.tensor([40, 50, 60], dtype=torch.int64),
         )
 
     def test_cache_salt_is_included_in_store_and_remove_events(self):
@@ -871,10 +881,10 @@ class TestRadixCache(CustomTestCase):
                 result = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", tokens)))
                 )
-                self.assertGreater(len(result.device_indices), 0)
+                self.assertGreater(result.device_prefix_len, 0)
 
                 # Match length should be page-aligned
-                match_len = len(result.device_indices)
+                match_len = result.device_prefix_len
                 self.assertEqual(match_len % page_size, 0)
 
     def test_advanced_prefix_match_with_node_splits(self):
@@ -904,7 +914,9 @@ class TestRadixCache(CustomTestCase):
                 result1 = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", query1)))
                 )
-                torch.testing.assert_close(result1.device_indices, val1[:4])
+                torch.testing.assert_close(
+                    cache.path_device_indices(result1.last_device_node), val1[:4]
+                )
                 # No data change after structural split during matching.
                 self.assertEqual(cache.total_size(), baseline_total)
 
@@ -912,21 +924,27 @@ class TestRadixCache(CustomTestCase):
                 result_full = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", seq1)))
                 )
-                torch.testing.assert_close(result_full.device_indices, val1)
+                torch.testing.assert_close(
+                    cache.path_device_indices(result_full.last_device_node), val1
+                )
 
                 # Another split deeper on the path (after matching 6 tokens, then diverge).
                 query2 = [1, 2, 3, 4, 5, 6, 777, 888]
                 result2 = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", query2)))
                 )
-                torch.testing.assert_close(result2.device_indices, val1[:6])
+                torch.testing.assert_close(
+                    cache.path_device_indices(result2.last_device_node), val1[:6]
+                )
                 self.assertEqual(cache.total_size(), baseline_total)
 
                 # Matching the short diverging branch should return exactly its indices.
                 result_branch = cache.match_prefix(
                     MatchPrefixParams(key=RadixKey(array("q", seq2)))
                 )
-                torch.testing.assert_close(result_branch.device_indices, val2)
+                torch.testing.assert_close(
+                    cache.path_device_indices(result_branch.last_device_node), val2
+                )
 
     def test_hash_value_storage(self):
         """Test that hash_value is stored correctly after insert operations."""
