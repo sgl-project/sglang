@@ -11,7 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""How a draft-shaped KVCacheConfigurator binds its KV under the unified pool.
+"""Draft-shaped KVCacheConfigurator dispatch under the unified pool.
+
+BUG REGRESSION (fast path). The fast path was gated on `req_to_token_pool is
+None` alone, but a compact-window DFLASH draft (`--speculative-draft-window-size`)
+also passes None — it builds a private req_to_token of its own — so the draft
+worker would allocate a SECOND unified byte buffer at boot. A draft-shaped
+configurator must fall through to the normal pool build instead.
 
 DERIVED PROPERTY (binding dispatch). The fused-vs-private draft binding
 dispatches on the spec algorithm, not the allocator kind: a non-EAGLE draft on
@@ -39,7 +45,11 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    MHASubPoolSpec,
+    UnifiedKVPool,
+    _store_dtype_for,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -47,6 +57,81 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _ReachedNormalBuild(Exception):
+    """Sentinel: control flow fell past the unified fast path."""
+
+
+class TestUnifiedFastPathDraftGate(CustomTestCase):
+    def _run(self, *, is_draft_worker: bool):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.is_draft_worker = is_draft_worker
+        cfg.mambaish_config = object()  # would select the mamba unified arm
+        cfg.is_hybrid_swa = False  # not the mamba+SWA tri-pool arm
+        cfg.model_config = SimpleNamespace(hf_config={})  # not DSV4
+        # Every field the fast path reads: a missing one raises while the
+        # arm's arguments are evaluated, which reads here as "took the fast
+        # path but called nothing".
+        sizes = SimpleNamespace(
+            max_running_requests=8,
+            max_total_num_tokens=64,
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            unified_total_bytes=1 << 20,
+        )
+        taken = []
+        with (
+            patch.object(
+                kcc,
+                "get_memory",
+                return_value=SimpleNamespace(enable_unified_memory=True),
+            ),
+            patch.object(
+                kcc,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="null"),
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_init_unified_mamba_pools",
+                lambda self, **kw: taken.append("mamba") or None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_init_unified_swa_pools",
+                lambda self, **kw: taken.append("swa") or None,
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_req_to_token_pool",
+                side_effect=_ReachedNormalBuild,
+            ),
+        ):
+            try:
+                cfg._init_pools(
+                    sizes=sizes,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                )
+            except _ReachedNormalBuild:
+                return "normal", taken
+            except (AttributeError, TypeError):
+                # The stubbed unified arm returned None; anything past the
+                # fast-path dispatch counts as having taken it.
+                return "unified", taken
+        return "unified", taken
+
+    def test_draft_worker_falls_through_to_the_normal_build(self):
+        path, taken = self._run(is_draft_worker=True)
+        self.assertEqual(path, "normal")
+        self.assertEqual(taken, [])
+
+    def test_target_worker_still_takes_the_fast_path(self):
+        """The guard must narrow to drafts only — a target regression here
+        silently turns --enable-unified-memory into a no-op."""
+        path, taken = self._run(is_draft_worker=False)
+        self.assertEqual(taken, ["mamba"])
 
 
 class _FakeKVCache:
@@ -87,10 +172,22 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
+    def _swa_allocator(
+        self,
+        *,
+        with_draft_region: bool,
+        n_full=32,
+        n_swa=16,
+        kv_dtype=torch.bfloat16,
+    ):
+        store_dtype = _store_dtype_for(kv_dtype)
         region = (
             DenseDraftRegion(
-                lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                lane_num=1,
+                head_num=1,
+                head_dim=16,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
             )
             if with_draft_region
             else None
@@ -99,8 +196,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="full",
             layer_num=2,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="down",
             draft_region=region,
         )
@@ -108,8 +205,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             name="swa",
             layer_num=1,
             head_num=2,
-            head_dim=4,
-            store_dtype=torch.bfloat16,
+            head_dim=8,
+            store_dtype=store_dtype,
             grow_direction="up",
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
@@ -136,7 +233,15 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
 
-    def _run(self, *, algorithm, alloc, max_total_num_tokens, kv_dtype=torch.bfloat16):
+    def _run(
+        self,
+        *,
+        algorithm,
+        alloc,
+        max_total_num_tokens,
+        kv_dtype=torch.bfloat16,
+        state_layers=(),
+    ):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -184,6 +289,11 @@ class TestDraftBindingDispatch(CustomTestCase):
             patch.object(kcc.KVCacheConfigurator, "_build_token_to_kv_pool", _capture),
             # The real scan walks the draft nn.Module for RadixAttention layers.
             patch.object(unified_draft_pool, "draft_kv_layer_ids", return_value=[0]),
+            patch.object(
+                unified_draft_pool,
+                "draft_state_layer_classes",
+                return_value=list(state_layers),
+            ),
         ):
             return cfg._init_pools(
                 sizes=sizes,
@@ -226,6 +336,42 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
                 kv_dtype=torch.float8_e4m3fn,
+            )
+
+    def test_an_fp8_region_binds_an_fp8_draft_and_refuses_another_fp8(self):
+        """Every fp8 flavor is stored as uint8, so the bind compares KV dtypes:
+        a draft resolving the target's fp8 binds a pool that casts to that fp8,
+        and one resolving a different fp8 refuses instead of reading e4m3 bytes
+        as e5m2."""
+        alloc = self._swa_allocator(
+            with_draft_region=True, kv_dtype=torch.float8_e4m3fn
+        )
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.EAGLE3,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        self.assertEqual(pools.token_to_kv_pool.dtype, torch.float8_e4m3fn)
+        self.assertEqual(pools.token_to_kv_pool.store_dtype, torch.uint8)
+        with self.assertRaisesRegex(ValueError, "speculative-draft-kv-cache-dtype"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+                kv_dtype=torch.float8_e5m2,
+            )
+
+    def test_a_draft_with_state_layers_refuses_to_bind(self):
+        """The target places a draft from its config; the built model is the
+        ground truth. Recurrent layers would run with no state pool."""
+        alloc = self._swa_allocator(with_draft_region=True)
+        with self.assertRaisesRegex(ValueError, "MambaMixer2"):
+            self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+                state_layers=["MambaMixer2"],
             )
 
     def test_eagle_draft_without_a_placement_falls_back_to_the_private_arm(self):

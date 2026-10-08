@@ -65,6 +65,9 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    # The KV cache dtype the rows hold, where it differs from how they are
+    # stored: fp8 rows are stored as uint8.
+    kv_dtype: Optional[torch.dtype] = None
 
     def validate(self) -> None:
         assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
@@ -75,6 +78,9 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
 
     def resolved_v_head_dim(self) -> int:
         return self.head_dim if self.v_head_dim is None else self.v_head_dim
+
+    def resolved_kv_dtype(self) -> torch.dtype:
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -152,6 +158,26 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     full: DraftKVGeometry
     swa_layer_ids: Tuple[int, ...] = ()
     num_depths: int = 1
+    num_state_layers: int = 0
+
+
+def draft_state_layer_num(draft_model_config) -> int:
+    """Recurrent-state layers the draft HEAD owns -- not the trunk's.
+
+    A plain NEXTN head of a linear-attention trunk inherits the trunk's
+    config class, so `mamba2_cache_params` lists the TRUNK's state layers
+    while the head itself is a full-attention block. Only a conv-chain MTP
+    head declares `mtp_local_layer_ids`, so that is what separates them.
+    """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    mambaish = mambaish_config(draft_model_config)
+    if mambaish is None:
+        return 0
+    # Optional HF attribute: only conv-chain MTP configs declare it.
+    if getattr(draft_model_config.hf_text_config, "mtp_local_layer_ids", None) is None:
+        return 0
+    return len(mambaish.mamba2_cache_params.layers)
 
 
 def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
@@ -180,6 +206,7 @@ def draft_kv_profile(
         ),
         swa_layer_ids=draft_swa_layer_ids(mc),
         num_depths=1 if num_depths is None else int(num_depths),
+        num_state_layers=draft_state_layer_num(mc),
     )
 
 
@@ -216,6 +243,7 @@ def place_fused_draft(
     profile: DraftKVProfile,
     num_runners: int,
     store_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
@@ -224,6 +252,13 @@ def place_fused_draft(
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
+    if profile.num_state_layers:
+        return FusedDraftDecision(
+            declined=(
+                f"the draft has {profile.num_state_layers} recurrent-state "
+                "layer(s) of its own, which no host state pool carries"
+            )
+        )
     num_swa = sum(swa for _, swa in counts)
     if num_swa:
         return FusedDraftDecision(
@@ -256,6 +291,7 @@ def place_fused_draft(
         head_dim=geometry.head_dim,
         v_head_dim=geometry.v_head_dim,
         store_dtype=store_dtype,
+        kv_dtype=kv_dtype,
     )
     return FusedDraftDecision(
         placement=FusedDraftPlacement(region=region, runner_lane_counts=full_counts)

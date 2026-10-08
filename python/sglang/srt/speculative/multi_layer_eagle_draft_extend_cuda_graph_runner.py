@@ -474,6 +474,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         seq_lens_sum: Optional[int],
         spec_info: EagleDraftExtendInput,
         seq_lens_cpu: Optional[torch.Tensor],
+        *,
+        out_cache_loc_virtual: Optional[torch.Tensor],
     ):
         """Init this step's attention metadata for the prepared bucket and
         replay its graph. Buffers must already be populated by the composite
@@ -498,6 +500,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             # Virtual input stays separate from the backend's physical buffer.
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
+            out_cache_loc_virtual=out_cache_loc_virtual,
             spec_info=spec_info,
         )
         if (
@@ -546,6 +549,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.captured_req_width = 1
         self.num_front_tokens = 0
         self.prune_draft_extend_logits = False
+        self._out_cache_loc_virtual = None
 
         self._init_and_capture()
 
@@ -730,8 +734,17 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         """Hook for subclasses to populate extra per-call buffers (e.g. sconv)."""
 
     def stage_shared_reads(
-        self, *, seq_lens, req_pool_indices, out_cache_loc, positions=None
+        self,
+        *,
+        seq_lens,
+        req_pool_indices,
+        out_cache_loc,
+        positions=None,
+        out_cache_loc_virtual=None,
     ):
+        # Staging runs before `prepare`, so the rail arrives here rather than
+        # off a ForwardBatch; `prepare` overwrites it with the batch's own.
+        self._out_cache_loc_virtual = out_cache_loc_virtual
         raw_bs = req_pool_indices.shape[0]
         bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
         buffers = self.buffers
@@ -766,6 +779,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             extend_seq_lens=buffers.extend_seq_lens[:bs],
             out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
+            out_cache_loc_virtual=self._out_cache_loc_virtual,
         )
         for backend in backends:
             backend.init_forward_metadata_out_graph(batch)
@@ -776,6 +790,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         buffers = self.buffers
         raw_bs = forward_batch.batch_size
         num_tokens = raw_bs * self.captured_req_width
+
+        self._out_cache_loc_virtual = forward_batch.out_cache_loc_virtual
 
         # Bucketize to a captured batch size (padding the tail).
         if self.require_mlp_tp_gather:
@@ -879,7 +895,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         runner = self.runners[step]
         runner.raw_bs = self.raw_bs
         out = runner.replay(
-            self.bs, self.seq_lens_sum, self._replay_spec_info, self.seq_lens_cpu
+            self.bs,
+            self.seq_lens_sum,
+            self._replay_spec_info,
+            self.seq_lens_cpu,
+            out_cache_loc_virtual=self._out_cache_loc_virtual,
         )
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens

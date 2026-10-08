@@ -62,7 +62,9 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         super().__init__(
             size=num_pages * page_size - page_size,
             page_size=page_size,
-            dtype=region.store_dtype,
+            # The KV dtype, not its storage: `set_kv_buffer` casts to `dtype`
+            # and views the result as `store_dtype` (uint8 for fp8).
+            dtype=region.resolved_kv_dtype(),
             head_num=region.head_num,
             head_dim=region.head_dim,
             layer_num=len(layer_ids),
@@ -120,6 +122,22 @@ def draft_kv_layer_ids(model) -> List[int]:
 
     return sorted(
         {m.layer_id for m in model.modules() if isinstance(m, RadixAttention)}
+    )
+
+
+def draft_state_layer_classes(model) -> List[str]:
+    """Class names of the BUILT draft model's recurrent / linear-attention
+    modules. A fused draft has KV lanes only, so any of these would run with
+    no state pool of its own."""
+    from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+    return sorted(
+        {
+            type(m).__name__
+            for m in model.modules()
+            if isinstance(m, (MambaMixer2, RadixLinearAttention))
+        }
     )
 
 

@@ -242,7 +242,8 @@ class MLASubPoolSpec(SubPoolSpec):
     One latent row (``kv_lora_rank + qk_rope_head_dim``) per token per layer; V
     is a prefix slice of the same row, so there is no separate V region. Not a
     subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
-    invariant there do not apply.
+    invariant there do not apply. With `draft_region` set, the draft's K and V
+    parts follow the latent rows inside every slot's entry, as on an MHA host.
     """
 
     kv_lora_rank: int
@@ -257,9 +258,8 @@ class MLASubPoolSpec(SubPoolSpec):
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
-        assert self.draft_region is None, (
-            "MLA sub-pools do not carry a fused draft region yet"
-        )
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     @property
     def kv_cache_dim(self) -> int:
@@ -268,24 +268,37 @@ class MLASubPoolSpec(SubPoolSpec):
     def row_bytes(self) -> int:
         return self.kv_cache_dim * self.store_dtype.itemsize
 
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot, before any draft parts."""
+        return self.layer_num * self.row_bytes()
+
+    def draft_offset_in_entry(self) -> int:
+        """Byte offset of the fused draft parts inside one slot's entry."""
+        assert self.draft_region is not None
+        return align_part_offset(self.host_entry_bytes())
+
     def entry_bytes(self) -> int:
-        return align_entry_bytes(self.layer_num * self.row_bytes())
+        if self.draft_region is None:
+            return align_entry_bytes(self.host_entry_bytes())
+        return align_entry_bytes(
+            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
+        )
 
     def layout(self) -> DenseEntryLayout:
         _check_row_alignment(self.name, latent=self.row_bytes())
-        return DenseEntryLayout(
-            entry_bytes=self.entry_bytes(),
-            parts=(
-                DensePart(
-                    name="kv",
-                    offset_bytes=0,
-                    layer_stride_bytes=self.row_bytes(),
-                    layer_num=self.layer_num,
-                    row_shape=(1, self.kv_cache_dim),
-                    dtype=self.store_dtype,
-                ),
+        parts = (
+            DensePart(
+                name="kv",
+                offset_bytes=0,
+                layer_stride_bytes=self.row_bytes(),
+                layer_num=self.layer_num,
+                row_shape=(1, self.kv_cache_dim),
+                dtype=self.store_dtype,
             ),
         )
+        if self.draft_region is not None:
+            parts += self.draft_region.parts(self.draft_offset_in_entry())
+        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
@@ -1442,6 +1455,7 @@ def init_unified_mamba_pools(
     use_mla_backend: bool,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
     mamba_layer_ids: List[int],
     full_attention_layer_ids: List[int],
     mamba2_cache_params,
@@ -1478,8 +1492,8 @@ def init_unified_mamba_pools(
             f"qk_rope_head_dim; got {kv_lora_rank} / {qk_rope_head_dim}"
         )
         assert not is_draft_worker, (
-            "init_unified_mamba_pools: draft workers (speculative decoding) are "
-            "not supported with the MLA unified pool"
+            "init_unified_mamba_pools: a draft worker binds views over the "
+            "target's buffer instead of building one of its own"
         )
         full_spec = MLASubPoolSpec(
             name="full",
@@ -1488,6 +1502,7 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     else:
         full_spec = MHASubPoolSpec(
@@ -1498,6 +1513,7 @@ def init_unified_mamba_pools(
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1540,6 +1556,7 @@ def init_unified_mamba_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -2167,6 +2184,7 @@ def init_unified_mamba_swa_pools(
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
     decode_pre_alloc_size: int = 0,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -2182,7 +2200,8 @@ def init_unified_mamba_swa_pools(
 
     Sizing inputs are the same token counts the 2-pool factories take (ratio-
     fed until the byte configurator lands); the buffer budget is their byte
-    sum and the runtime split floats.
+    sum and the runtime split floats. With ``fused_draft``, every entry of the
+    "full" sub-pool carries the draft's parts, as in the 2-pool factories.
     """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedMambaSWATokenToKVPoolAllocator,
@@ -2209,6 +2228,7 @@ def init_unified_mamba_swa_pools(
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -2270,6 +2290,7 @@ def init_unified_mamba_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
