@@ -212,6 +212,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Both models are fully loaded now (the scheduler loads the target
+        # before this constructor, and overlap-mode deferred loading is
+        # unsupported under speculative decoding): rebind the draft's
+        # embed/lm_head to the target's copies and drop the draft's own
+        # redundant tensors, so the KV pool sizing that follows this
+        # constructor measures the freed memory. alloc_memory_pool re-runs
+        # these idempotently as a fallback for paths that skip this ctor.
+        self.init_token_map()
+        self.init_lm_head()
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def alloc_memory_pool(
