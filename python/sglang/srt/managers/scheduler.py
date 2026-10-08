@@ -3757,22 +3757,12 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                finishing_reqs = self._reqs_finishing_inflight(running_batch)
-                if finishing_reqs:
-                    running_batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
-                    # update_running_batch only sees later shrinkage; reopen admission.
-                    running_batch.batch_is_full = False
-                if (
-                    finishing_reqs
-                    and not running_batch.is_empty()
-                    and not running_batch.check_decode_mem()
-                ):
-                    # The queued result frees the finishing requests' KV at the end of
-                    # this step; decode the rest next step instead of retracting them.
-                    ret = None
-                else:
-                    running_batch = self.update_running_batch(running_batch)
-                    ret = running_batch if not running_batch.is_empty() else None
+                decode_batch = self.update_running_batch(running_batch)
+                ret = (
+                    decode_batch
+                    if decode_batch is not None and not decode_batch.is_empty()
+                    else None
+                )
             else:
                 ret = None
 
@@ -4229,16 +4219,24 @@ class Scheduler(
         ]
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        finishing_reqs = self._reqs_finishing_inflight(batch)
+        batch.filter_batch(chunked_req_to_exclude=finishing_reqs)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
 
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and finishing_reqs:
+            # The queued result frees the finishing requests' KV at the end of
+            # this step; decode the rest next step instead of retracting them.
+            batch.batch_is_full = False
+            return None
+
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             if self.decode_offload_manager is not None:
