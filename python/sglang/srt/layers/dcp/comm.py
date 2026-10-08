@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -519,7 +520,12 @@ def dcp_a2a_lse_reduce(
         send_words[:, :, :, D // lpd],
     )
 
-    if _is_hip and out_dtype in (torch.bfloat16, torch.float16):
+    if (
+        _is_hip
+        and out_dtype in (torch.bfloat16, torch.float16)
+        and send_combined.numel() * send_combined.element_size()
+        <= envs.SGLANG_ROCM_DCP_LSE_AG_MAX_BYTES.get()
+    ):
         # ROCm: RCCL a2a latency dominates small decode messages; the aiter
         # custom all-gather is much faster even though it moves W x the bytes.
         recv_combined = cp_group.all_gather(send_combined, dim=0).view(

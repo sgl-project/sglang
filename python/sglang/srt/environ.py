@@ -936,6 +936,10 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # DCP LSE merge on ROCm: payloads up to this many bytes per rank use the aiter
+    # custom all-gather (latency-bound); larger ones use the RCCL all-to-all,
+    # which moves 1/W of the bytes.
+    SGLANG_ROCM_DCP_LSE_AG_MAX_BYTES = EnvInt(1 << 20)
     # DSA + DCP prefill attends this rank's share of the top-k and LSE-merges
     # (Q all-gather + head-partial merge, ~3 * heads * extend tokens of traffic
     # per cached prefix token) when the cached prefix exceeds
