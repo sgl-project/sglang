@@ -689,12 +689,13 @@ class Sampler(nn.Module):
             SGLANG_RETURN_ORIGINAL_LOGPROB is set. sampling_mask_capture is None
             unless the batch requested sampling masks.
         """
+        return_sampling_mask = sampling_info.sampling_mask_batch_indices is not None
         logits.div_(sampling_info.temperatures)
         batch_next_token_ids, filtered_probs = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )
         sampling_mask_capture = None
-        if sampling_info.sampling_mask_batch_indices is not None:
+        if return_sampling_mask:
             assert filtered_probs is not None
             sampling_mask_capture = self._build_ascend_sampling_mask_capture(
                 filtered_probs, batch_next_token_ids, sampling_info
@@ -710,26 +711,11 @@ class Sampler(nn.Module):
         batch_next_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> _SamplingMaskCapture:
-        """Turn the Ascend kernels' post-filter weights into a mask capture.
+        """Build the mask capture from the weights the Ascend kernel exported.
 
-        The kernels draw the token from ``filtered_probs``, so that tensor is the
-        only faithful source of the sampling support: replaying top-k/top-p on our
-        own would risk disagreeing with the kernel that actually chose the token.
-        It is exported in vocabulary order, which is what the shared mask builder
-        expects when ``token_ids`` is None (the column index is the token id).
-
-        The kernels' internal softmax and this exported tensor can disagree by one
-        ulp at the support boundary. Force the drawn token's own column positive so
-        a boundary rounding difference cannot report the drawn token as outside its
-        own support. This only touches the sampled column, in place, and is a no-op
-        whenever the exported weight is already positive.
-
-        The forced value is the smallest normal float of the dtype, so a repaired row
-        reports ``log(tiny / support_mass)`` - about -87 in float32 - for the drawn
-        token instead of the exact zero the export carried. That is the honest
-        reading of "the kernel drew a token our copy of the distribution does not
-        carry"; the alternative is reporting the row as INVALID, which fails the
-        request outright.
+        The export is the only faithful support source: replaying top-k/top-p could
+        disagree with the kernel that drew the token. The drawn column is forced
+        positive so a one-ulp boundary difference cannot exclude the drawn token.
         """
         capture_rows = sampling_info.sampling_mask_batch_indices
         assert capture_rows is not None, (
@@ -744,6 +730,8 @@ class Sampler(nn.Module):
             torch.where(
                 sampled_weights > 0,
                 sampled_weights,
+                # Smallest normal float: keeps the drawn column in the support and
+                # its reported logprob finite instead of failing the request.
                 torch.full_like(
                     sampled_weights, torch.finfo(filtered_probs.dtype).tiny
                 ),
