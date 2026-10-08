@@ -28,14 +28,13 @@ class _FakeReq:
     """Carries the fill-id state convert_decode_to_extend touches, with the
     real Req methods so the array bookkeeping is not re-implemented here."""
 
-    _refresh_fill_ids = Req._refresh_fill_ids
-    set_extend_range = Req.set_extend_range
+    refresh_fill_ids = Req.refresh_fill_ids
 
     def __init__(self, *, num_prompt_tokens: int, num_output_tokens: int):
         self.origin_input_ids = array("l", range(num_prompt_tokens))
         self.output_ids = list(range(num_output_tokens))
         self.full_untruncated_fill_ids = array("l", self.origin_input_ids)
-        self.extend_range = None
+        self.extend_end = None
         self.beam_group = None
 
 
@@ -68,7 +67,7 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(batch.extend_lens, [1] * len(seq_lens))
         self.assertEqual(batch.extend_num_tokens, len(seq_lens))
         for req, seq_len in zip(batch.reqs, seq_lens, strict=True):
-            self.assertEqual(tuple(req.extend_range), (seq_len - 1, seq_len))
+            self.assertEqual(req.extend_end, seq_len)
         # What the attention path actually consumes: arange(prefix, prefix+len)
         # must land on the slot prepare_for_decode allocated, at seq_len - 1.
         for prefix_len, extend_len, seq_len in zip(
