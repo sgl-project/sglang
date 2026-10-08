@@ -56,17 +56,15 @@ register_kernel(
 )
 
 # Exactly SM90: wgmma / mma.sync int8 kernels launched as cooperative grids, tuned on H100.
-for _fn in ("markov_walk_single", "markov_walk_small_batch", "markov_walk_wgmma"):
-    register_kernel(
-        KernelSpec(
-            op=f"speculative.dspark_{_fn}",
-            backend=KernelBackend.JIT,
-            target=f"sglang.kernels.ops.speculative.dspark.markov_walk:{_fn}",
-            capabilities=frozenset(
-                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
-            ),
-        )
+register_kernel(
+    KernelSpec(
+        op="speculative.dspark_markov_walk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.dspark.markov_walk:markov_walk",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
     )
-del _fn
+)
 
 __all__ = []

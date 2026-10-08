@@ -264,31 +264,17 @@ def _chi2_pvalue(samples: torch.Tensor, prob: torch.Tensor) -> float:
 
 
 def _launch_one_step(walker, kind, base, anchor, temps, tokens):
-    w = walker.weights
-    common = dict(
-        row_scale=w.row_scale,
+    assert walker.kernel_for(base.shape[0]) == kind
+    mw.markov_walk(
+        weights=walker.weights,
+        states=walker.states,
         base_logits=base,
         anchor=anchor,
+        temps=temps,
         tokens_out=tokens,
         corrected_out=None,
-        state=walker.states[kind],
-        temps=temps,
-        num_steps=1,
-        valid_rows=walker.vocab,
-        seed=walker.seeds[kind],
+        seed=walker.seed,
     )
-    if kind == "wgmma":
-        mw.markov_walk_wgmma(
-            w2_res=w.w2_res,
-            w2_str=w.w2_str,
-            w1f=w.w1f,
-            stream_mask=w.stream_mask,
-            **common,
-        )
-    elif kind == "small_batch":
-        mw.markov_walk_small_batch(frag=w.frag, w1q=w.w1q, **common)
-    else:
-        mw.markov_walk_single(frag=w.frag, w1q=w.w1q, **common)
 
 
 @pytest.mark.parametrize("kind", ["single", "small_batch", "wgmma"])
@@ -396,7 +382,7 @@ def test_graph_replay_draws_fresh_noise(case, bs):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         body()
-    state = walker.states[kind]
+    state = walker.states.of(kind)
     seen = []
     for _ in range(3):
         round_before = int(state[0])
@@ -431,7 +417,7 @@ def test_host_rejects_bad_arguments(case):
             anchor=anchor,
             tokens_out=tokens,
             corrected_out=None,
-            state=walker.states["wgmma"],
+            state=walker.states.wgmma,
             temps=temps,
             num_steps=walker.gamma,
             valid_rows=walker.vocab,
@@ -439,7 +425,7 @@ def test_host_rejects_bad_arguments(case):
             stream_mask=w.stream_mask,
         )
         args.update(over)
-        mw.markov_walk_wgmma(**args)
+        mw._walk_wgmma(**args)
 
     big = torch.zeros(
         mw.MAX_BS + 1, walker.gamma, walker.vocab, dtype=torch.bfloat16, device=DEV
@@ -454,10 +440,12 @@ def test_host_rejects_bad_arguments(case):
         dict(valid_rows=walker.vocab + 8),
         dict(tokens_out=tokens[:-1]),
         dict(temps=temps[:-1]),
-        dict(state=walker.states["wgmma"][1:]),
+        dict(state=walker.states.wgmma[1:]),
         dict(
             state=torch.zeros(
-                mw.state_words("wgmma", walker.gamma - 1), dtype=torch.int64, device=DEV
+                mw.MarkovWalkStates.words("wgmma", walker.gamma - 1),
+                dtype=torch.int64,
+                device=DEV,
             )
         ),
         dict(w2_res=w.w2_res[:-1]),

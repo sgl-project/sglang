@@ -15,6 +15,7 @@ iteration, so W1 / W2 (77.8 MB each in bf16 at V = 151936, 38.9 MB of int8 W2)
 are as cold in L2 as after the target forward.
 """
 
+import msgspec
 import torch
 
 from sglang.kernels.jit.benchmark import marker
@@ -120,34 +121,23 @@ def _int8_walk(
     tokens,
     corrected,
     state,
-    row_scale,
     **weights,
 ):
     bs, steps, vocab = base_logits.shape
     temps = walker.temps_buf[:bs]
     torch.where(greedy_mask, zero, temperatures, out=temps)
     walker.anchor_buf[:bs].copy_(anchor)
-    common = dict(
-        row_scale=row_scale,
+    # the per-iteration clones of the weights and of this bs's state replace the walker's
+    mw.markov_walk(
+        weights=msgspec.structs.replace(walker.weights, **weights),
+        states=msgspec.structs.replace(walker.states, **{walker.kernel_for(bs): state}),
         base_logits=base_logits,
         anchor=walker.anchor_buf[:bs],
+        temps=temps,
         tokens_out=tokens,
         corrected_out=corrected.view(bs, steps, vocab),
-        state=state,
-        temps=temps,
-        num_steps=steps,
-        valid_rows=vocab,
         seed=1,
     )
-    kind = walker.kernel_for(bs)
-    if kind == "wgmma":
-        mw.markov_walk_wgmma(
-            stream_mask=walker.weights.stream_mask, **weights, **common
-        )
-    elif kind == "small_batch":
-        mw.markov_walk_small_batch(**weights, **common)
-    else:
-        mw.markov_walk_single(**weights, **common)
 
 
 def _int8_walk_weights(walker, bs):
@@ -185,7 +175,7 @@ def benchmark(vocab: int, num_steps: int, bs: int, mode: str, impl: str):
     if impl == "int8_walk":
         inputs.update(
             zero=torch.zeros((), device="cuda"),
-            state=walker.states[walker.kernel_for(bs)].clone(),
+            state=walker.states.of(walker.kernel_for(bs)).clone(),
             **_int8_walk_weights(walker, bs),
         )
         fn = lambda **kw: _int8_walk(walker, **kw)  # noqa: E731

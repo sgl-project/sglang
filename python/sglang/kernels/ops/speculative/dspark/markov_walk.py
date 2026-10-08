@@ -104,7 +104,7 @@ def _jit_wgmma_module(tiles: int, res: int, stream_mask: int) -> Module:
     )
 
 
-def markov_walk_single(
+def _walk_single(
     *,
     frag: torch.Tensor,
     row_scale: torch.Tensor,
@@ -119,14 +119,7 @@ def markov_walk_single(
     valid_rows: int,
     seed: int,
 ) -> None:
-    """bs = 1 walk with W2 held in registers + SMEM.
-
-    base_logits bf16 [1, kb >= num_steps, V]; anchor int64 [1]; temps fp32 [1]
-    (<= 0 or NaN: greedy); tokens_out int64 [num_steps]; corrected_out None or
-    bf16 shaped like base_logits, written for T > 0 only. The weights are those
-    of MarkovWalkWeights; state is int64 [state_words(kind, S)] for S >= num_steps
-    (MarkovWalker.states holds one per kind, S = gamma rounded up to 16).
-    """
+    """bs = 1, W2 held in registers + SMEM."""
     _jit_single_module().walk(
         frag,
         row_scale,
@@ -143,7 +136,7 @@ def markov_walk_single(
     )
 
 
-def markov_walk_small_batch(
+def _walk_small_batch(
     *,
     frag: torch.Tensor,
     row_scale: torch.Tensor,
@@ -158,11 +151,7 @@ def markov_walk_small_batch(
     valid_rows: int,
     seed: int,
 ) -> None:
-    """bs 1..8 walk sharing one on-chip W2.
-
-    base_logits bf16 [bs, kb, V]; anchor int64 [bs]; temps fp32 [bs]; tokens_out
-    int64 [bs * num_steps], row-major; otherwise as markov_walk_single.
-    """
+    """bs 1..8 sharing one on-chip W2 (serving dispatch: bs 2..4)."""
     _jit_small_batch_module().walk(
         frag,
         row_scale,
@@ -179,7 +168,7 @@ def markov_walk_small_batch(
     )
 
 
-def markov_walk_wgmma(
+def _walk_wgmma(
     *,
     w2_res: torch.Tensor,
     w2_str: torch.Tensor,
@@ -196,11 +185,8 @@ def markov_walk_wgmma(
     seed: int,
     stream_mask: int,
 ) -> None:
-    """bs 1..64 wgmma walk; W2 tiles SMEM-resident or streamed from L2.
-
-    w2_res / w2_str int8 [grid, res | tiles - res, 16384]; bit t of stream_mask
-    = tile t streams. Batch tensors as markov_walk_small_batch.
-    """
+    """bs 1..64; W2 tiles SMEM-resident or streamed from L2 (bit t of stream_mask
+    = tile t streams)."""
     module = _jit_wgmma_module(
         w2_res.shape[1] + w2_str.shape[1], w2_res.shape[1], stream_mask
     )
@@ -429,19 +415,117 @@ def _kernel_for(bs: int, *, big_vocab: bool) -> str:
     return "single" if bs == 1 else "small_batch"
 
 
-def state_words(kind: str, num_steps: int) -> int:
-    """int64 words of a kernel's state for up to num_steps steps: round | pad | two
-    sets (round parity) of {key, count} pairs, one 16-B pair per step for single,
-    one 128-B pair per (step, request) for small_batch / wgmma."""
-    if kind == "single":
-        return 2 + 4 * num_steps
-    return 16 + 2 * num_steps * MAX_BS * 16
-
-
 def _aligned_zeros(n: int, *, device: torch.device) -> torch.Tensor:
     t = torch.zeros(n, dtype=torch.int64, device=device)
     assert t.data_ptr() % 128 == 0, "state buffer not 128-B aligned"
     return t
+
+
+class MarkovWalkStates(msgspec.Struct, frozen=True):
+    """One exchange state per kernel family, zeroed once and never reset: its round
+    counter advances in-kernel. single / small_batch exist in standard mode only."""
+
+    steps: int  # capacity: serves any num_steps <= steps
+    single: Optional[torch.Tensor]
+    small_batch: Optional[torch.Tensor]
+    wgmma: torch.Tensor
+
+    @staticmethod
+    def words(kind: str, steps: int) -> int:
+        """int64 words of a kernel's state: round | pad | two sets (round parity) of
+        {key, count} pairs, one 16-B pair per step for single, one 128-B pair per
+        (step, request) for small_batch / wgmma."""
+        if kind == "single":
+            return 2 + 4 * steps
+        return 16 + 2 * steps * MAX_BS * 16
+
+    @classmethod
+    def zeros(
+        cls, weights: MarkovWalkWeights, *, steps: int, device: torch.device
+    ) -> MarkovWalkStates:
+        def make(kind: str) -> torch.Tensor:
+            return _aligned_zeros(cls.words(kind, steps), device=device)
+
+        standard = not weights.big_vocab
+        return cls(
+            steps=steps,
+            single=make("single") if standard else None,
+            small_batch=make("small_batch") if standard else None,
+            wgmma=make("wgmma"),
+        )
+
+    def of(self, kind: str) -> torch.Tensor:
+        state = {
+            "single": self.single,
+            "small_batch": self.small_batch,
+            "wgmma": self.wgmma,
+        }[kind]
+        assert state is not None, f"no {kind} state in big-vocabulary mode"
+        return state
+
+    def tensors(self) -> list[torch.Tensor]:
+        return [t for t in (self.single, self.small_batch, self.wgmma) if t is not None]
+
+
+# One Philox key per kernel family: their counters overlap, and a request moving
+# between families (bs 1 -> a 2..4 batch) must not replay noise.
+_SEED_SALTS = {
+    "single": 0,
+    "small_batch": 0x2545F4914F6CDD1D,
+    "wgmma": 0x5851F42D4C957F2D,
+}
+_SEED_MASK = (1 << 63) - 1
+
+
+def markov_walk(
+    *,
+    weights: MarkovWalkWeights,
+    states: MarkovWalkStates,
+    base_logits: torch.Tensor,
+    anchor: torch.Tensor,
+    temps: torch.Tensor,
+    tokens_out: torch.Tensor,
+    corrected_out: Optional[torch.Tensor],
+    seed: int,
+) -> None:
+    """One round of the int8 markov walk; the kernel is picked by bs:
+
+    * standard vocabulary: bs 1 -> single, bs 2..4 -> small_batch, bs 5..64 -> wgmma;
+    * big vocabulary: wgmma for every bs.
+
+    base_logits bf16 [bs, num_steps, V], V = weights.vocab, row stride % 8 == 0;
+    anchor int64 [bs]; temps fp32 [bs] (<= 0 or NaN: greedy, T > 0 clamped to
+    [1e-5, 1e4]); tokens_out int64 [bs * num_steps], row-major; corrected_out
+    None or bf16 shaped like base_logits, written for T > 0 only. num_steps must
+    be <= states.steps. No host sync and no allocation: capturable into a CUDA
+    graph once every kernel has run (MarkovWalker.warmup).
+    """
+    bs, num_steps, _ = base_logits.shape
+    kind = _kernel_for(bs, big_vocab=weights.big_vocab)
+    common = dict(
+        row_scale=weights.row_scale,
+        base_logits=base_logits,
+        anchor=anchor,
+        tokens_out=tokens_out,
+        corrected_out=corrected_out,
+        state=states.of(kind),
+        temps=temps,
+        num_steps=num_steps,
+        valid_rows=weights.vocab,
+        seed=(seed ^ _SEED_SALTS[kind]) & _SEED_MASK,
+    )
+    if kind == "wgmma":
+        _walk_wgmma(
+            w2_res=weights.w2_res,
+            w2_str=weights.w2_str,
+            w1f=weights.w1f,
+            stream_mask=weights.stream_mask,
+            **common,
+        )
+    elif kind == "small_batch":
+        _walk_small_batch(frag=weights.frag, w1q=weights.w1q, **common)
+    else:
+        _walk_single(frag=weights.frag, w1q=weights.w1q, **common)
 
 
 class MarkovWalker:
@@ -494,15 +578,7 @@ class MarkovWalker:
         self.max_bs = max_bs
         self.vocab = vocab
         self.device = device
-        # One Philox key per kernel family: their counters overlap, and a request
-        # moving between families (bs 1 -> a 2..4 batch) must not replay noise.
-        base_seed = seed & ((1 << 63) - 1)
-        salts = {
-            "single": 0,
-            "small_batch": 0x2545F4914F6CDD1D,
-            "wgmma": 0x5851F42D4C957F2D,
-        }
-        self.seeds = {k: (base_seed ^ s) & ((1 << 63) - 1) for k, s in salts.items()}
+        self.seed = seed & _SEED_MASK
         with torch.cuda.device(device), torch.no_grad():
             self._load_modules_and_weights(w1, w2)
         self._warm = False
@@ -513,15 +589,11 @@ class MarkovWalker:
         self.weights = _build_weights(
             w1.to(self.device), w2.to(self.device), num_sms=num_sms
         )
-        kinds = (
-            ("wgmma",) if self.weights.big_vocab else ("single", "small_batch", "wgmma")
-        )
         # Capacity in whole 16-step units: on H100 a 7-step set stride made wgmma
         # 1.2-1.7% slower at bs 5-16 than the 16-step one, with identical code.
-        steps = -(-self.gamma // 16) * 16
-        self.states = {
-            k: _aligned_zeros(state_words(k, steps), device=self.device) for k in kinds
-        }
+        self.states = MarkovWalkStates.zeros(
+            self.weights, steps=-(-self.gamma // 16) * 16, device=self.device
+        )
         self.anchor_buf = torch.zeros(MAX_BS, dtype=torch.int64, device=self.device)
         # temps_buf is caller-writable: stage temperatures into it in-graph.
         self.temps_buf = torch.zeros(MAX_BS, dtype=torch.float32, device=self.device)
@@ -576,54 +648,19 @@ class MarkovWalker:
         ):
             self.temps_buf[:bs].copy_(temps.reshape(-1))
             temps = self.temps_buf[:bs]
-        corrected = (
-            None if corrected_out is None else corrected_out.view(bs, steps, vocab)
-        )
-        self._launch(
-            kind=self.kernel_for(bs),
+        markov_walk(
+            weights=self.weights,
+            states=self.states,
             base_logits=base_logits,
             anchor=anchors,
             temps=temps,
             tokens_out=tokens_out,
-            corrected=corrected,
+            corrected_out=(
+                None if corrected_out is None else corrected_out.view(bs, steps, vocab)
+            ),
+            seed=self.seed,
         )
         return tokens_out.view(bs, steps)
-
-    def _launch(
-        self,
-        *,
-        kind: str,
-        base_logits: torch.Tensor,
-        anchor: torch.Tensor,
-        temps: torch.Tensor,
-        tokens_out: torch.Tensor,
-        corrected: Optional[torch.Tensor],
-    ) -> None:
-        w = self.weights
-        common = dict(
-            row_scale=w.row_scale,
-            base_logits=base_logits,
-            anchor=anchor,
-            tokens_out=tokens_out,
-            corrected_out=corrected,
-            state=self.states[kind],
-            temps=temps,
-            num_steps=self.gamma,
-            valid_rows=self.vocab,
-            seed=self.seeds[kind],
-        )
-        if kind == "wgmma":
-            markov_walk_wgmma(
-                w2_res=w.w2_res,
-                w2_str=w.w2_str,
-                w1f=w.w1f,
-                stream_mask=w.stream_mask,
-                **common,
-            )
-        elif kind == "small_batch":
-            markov_walk_small_batch(frag=w.frag, w1q=w.w1q, **common)
-        else:
-            markov_walk_single(frag=w.frag, w1q=w.w1q, **common)
 
     def warmup(
         self,
@@ -674,5 +711,5 @@ class MarkovWalker:
         w = self.weights
         tensors = [w.row_scale, w.w2_res, w.w2_str, w.w1f, w.frag, w.w1q]
         tensors += [self.anchor_buf, self.temps_buf, self._greedy_temps]
-        tensors += list(self.states.values())
+        tensors += self.states.tensors()
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
