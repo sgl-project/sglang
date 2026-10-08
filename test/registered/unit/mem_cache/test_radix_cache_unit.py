@@ -447,6 +447,7 @@ class TestRadixCache(CustomTestCase):
             cache_salt=None,
             priority=0,
             last_node=cache.root_node,
+            lock=None,
         )
         req.full_untruncated_fill_ids = token_ids
         req.origin_input_ids = token_ids
@@ -496,12 +497,13 @@ class TestRadixCache(CustomTestCase):
             cache_salt=None,
             priority=0,
             last_node=cache.root_node,
+            lock=None,
         )
 
         up_to = len(prompt_ids) + len(output_ids)
         cache.checkpoint(req, up_to=up_to)
         cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
-        cache.unpin(req)
+        cache.unlock(req.lock)
 
         (prompt_node,) = cache.root_node.children.values()
         (output_node,) = prompt_node.children.values()

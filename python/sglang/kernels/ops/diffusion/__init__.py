@@ -50,6 +50,20 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.residual_gate_fp32",
+        KernelBackend.TRITON,
+        "modulate.residual_gate_fp32:residual_gate_fp32",
+        _CUDA,
+        "Residual gating with separate FP32 product and sum rounding.",
+    ),
+    (
+        "diffusion.matrix_rope",
+        KernelBackend.TRITON,
+        "rope.matrix_rope:apply_matrix_rope",
+        _CUDA,
+        "Interleaved FP32 matrix RoPE with separate product and sum rounding.",
+    ),
+    (
         "diffusion.fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.fp8_rowwise_triton:fp8_rowwise",
@@ -300,6 +314,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
         _CUDA,
         "Paired LTX-2.5 decoder 3D RoPE.",
+    ),
+    (
+        "diffusion.rope_rotate_half_fp32",
+        KernelBackend.TRITON,
+        "rope.rope_rotate_half_fp32:fused_rope_rotate_half_fp32",
+        _CUDA,
+        "Paired split-half RoPE with FP32 arithmetic and one output cast.",
     ),
     (
         "diffusion.rope_rotate_half",
@@ -583,6 +604,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "apply_matrix_rope": "rope.matrix_rope",
+    "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
@@ -619,6 +642,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
@@ -667,6 +691,8 @@ _EXPORTS: dict[str, str] = {
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
+    "can_use_fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
+    "fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",

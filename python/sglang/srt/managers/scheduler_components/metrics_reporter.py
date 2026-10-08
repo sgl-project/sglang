@@ -219,6 +219,13 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
+        parallel = get_parallel()
+        # The max/mean token ratio is engine-wide; one scheduler reports it.
+        self.reports_dp_token_imbalance_ratio = (
+            parallel.attn_dp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
+        )
         self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
@@ -418,7 +425,9 @@ class SchedulerMetricsReporter:
                 prefill_lengths.add(len(req.origin_input_ids))
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
-            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
+            # each req's own prefix was already advanced by result processing.
+            sum_prefill_kv_tokens = sum(batch.prefix_lens[: len(prefill_reqs)])
 
         decode_kv = WelfordAccumulator()
         if batch.forward_mode.is_mixed():
@@ -1114,6 +1123,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.current_scheduler_metrics_enabled
+            and (dp_balance_stats := batch.dp_balance_stats) is not None
+        ):
+            self.metrics_collector.observe_dp_balance(dp_balance_stats)
+            if self.reports_dp_token_imbalance_ratio:
+                self.metrics_collector.observe_dp_token_imbalance_ratio(
+                    dp_balance_stats
+                )
+
         if not isinstance(result, GenerationBatchResult):
             return
 
