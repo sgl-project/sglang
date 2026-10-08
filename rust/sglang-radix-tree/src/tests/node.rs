@@ -54,8 +54,8 @@ impl ChildKeyType for CountedKey {
         Cow::Owned(Self::from(token_ids.into_owned()))
     }
 
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32> {
-        std::iter::once(*atom as u32)
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64> {
+        std::iter::once(*atom as u64)
     }
 
     fn raw_token_ids(atoms: &[Self::Atom]) -> Cow<'_, [i64]> {
