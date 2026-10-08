@@ -2198,6 +2198,71 @@ class DeepseekV4AscendAttnBackend(
                                 print(f"[SWAF] skipped: {exc}", flush=True)
             except Exception as exc:
                 print(f"[SWAKV] skipped: {exc}", flush=True)
+        if os.environ.get("DSV4_DUMP_SWA_POS"):
+            # Per-position fingerprint, one line per step, so a hit log and a miss
+            # log can be diffed position-by-position at the divergence token.
+            # Prints this step's position only: the read slot the table maps it
+            # to, the write slot full_to_swa assigns it, and the row bytes each
+            # slot holds. Equal md5 across runs => same KV content (bug is later);
+            # different md5 => the KV written for this position already differs.
+            try:
+                sid = int(os.environ.get("DSV4_DUMP_SWA_POS", "0"))
+                pmin = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
+                pmax = int(os.environ.get("DSV4_DUMP_MAX_POS", "17540"))
+                _spp = getattr(fm, "start_pos", None)
+                sp = (
+                    int(_spp.reshape(-1)[-1].item())
+                    if torch.is_tensor(_spp) and _spp.numel()
+                    else -1
+                )
+                if pmin <= sp <= pmax:
+                    pool = self.token_to_kv_pool
+                    ps = int(pool.swa_kv_pool.kernel_page_size)
+                    buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(sid)]
+                    tbl = getattr(fm, "swa_page_table", None)
+                    vals = (
+                        tbl[0].reshape(-1).tolist()
+                        if torch.is_tensor(tbl) and tbl.numel()
+                        else []
+                    )
+                    rp = forward_batch.req_pool_indices[:1].to(torch.int64)
+                    full = self.req_to_token[rp][0].to(torch.int64)
+                    mp = pool.full_to_swa_index_mapping
+
+                    def _rowmd5(pg_i: int, rw_i: int) -> str:
+                        try:
+                            if 0 <= pg_i < buf.shape[0] and 0 <= rw_i < buf.shape[1]:
+                                b = (
+                                    buf[pg_i, rw_i]
+                                    .detach()
+                                    .view(torch.uint8)
+                                    .cpu()
+                                    .numpy()
+                                    .tobytes()
+                                )
+                                return hashlib.md5(b).hexdigest()[:10]
+                        except Exception:
+                            pass
+                        return "n/a"
+
+                    p = sp
+                    if p < full.numel():
+                        rc = p // ps
+                        rd_page = int(vals[rc]) if rc < len(vals) else -1
+                        rd_row = p % ps
+                        fs = int(full[p].item())
+                        wr = int(mp[full[p]].item()) if fs >= 0 else -1
+                        wr_page = wr // ps if wr >= 0 else -1
+                        wr_row = wr % ps if wr >= 0 else -1
+                        print(
+                            f"[SWAPOS] layer={sid} p={p} full={fs} "
+                            f"rd={rd_page}:{rd_row} wr={wr_page}:{wr_row} "
+                            f"rdmd5={_rowmd5(rd_page, rd_row)} "
+                            f"wrmd5={_rowmd5(wr_page, wr_row)}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"[SWAPOS] skipped: {exc}", flush=True)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
