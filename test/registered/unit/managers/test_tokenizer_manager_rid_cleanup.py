@@ -905,6 +905,31 @@ class TestCreateAbortTask(CustomTestCase):
         self.assertFalse(replacement_state.abort_sent)
         tm._dispatch_to_scheduler.assert_not_called()
 
+    def test_delayed_cleanup_preserves_new_state_for_same_request_object(self):
+        """Reusing an input object does not reuse its completed lifecycle."""
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text="hello", rid="reused-rid")
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        tm._dispatch_to_scheduler = Mock()
+
+        async def replace_state(_delay):
+            tm._handle_abort_req(_make_abort_req(obj.rid))
+            tm._init_req_state(obj)
+            tm.rid_to_state[obj.rid].dispatched = True
+
+        async def drive():
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(side_effect=replace_state),
+            ):
+                await tm.create_abort_task(obj)()
+
+        asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state[obj.rid].abort_sent)
+        tm._dispatch_to_scheduler.assert_not_called()
+
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
