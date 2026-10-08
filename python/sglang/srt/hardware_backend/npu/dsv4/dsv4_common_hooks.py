@@ -48,16 +48,28 @@ def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> N
     component = components.get(ComponentType.SWA)
     if component is None:
         return
+    req_to_token_pool = getattr(batch, "req_to_token_pool", None)
     for i, req in enumerate(batch.reqs):
         if i >= len(prefix_lens_cpu) or int(prefix_lens_cpu[i]) <= 0:
             continue
         node_id = getattr(req, "last_node", None)
-        if node_id is not None:
-            # deepest match node can be the freshly-extended suffix node; the
-            # window to repair ends at this req's cached prefix length instead.
-            component.resync_window_full_to_swa_mapping(
-                node_id, int(prefix_lens_cpu[i])
-            )
+        if node_id is None:
+            continue
+        prefix = int(prefix_lens_cpu[i])
+        # The read-side page table indexes the LUT by the request's own full locs
+        # (`req_to_token[req, p]`), which on a hit can differ from the tree node's
+        # BASE.value once the pool recycled slots; hand those over so the resync
+        # re-points through the exact index the attention reads.
+        req_full_locs = None
+        req_pool_idx = getattr(getattr(req, "kv", None), "req_pool_idx", None)
+        if req_to_token_pool is not None and req_pool_idx is not None:
+            lo = max(0, prefix - component.sliding_window_size)
+            req_full_locs = req_to_token_pool.req_to_token[
+                int(req_pool_idx), lo:prefix
+            ].to(torch.int64)
+        # deepest match node can be the freshly-extended suffix node; the
+        # window to repair ends at this req's cached prefix length instead.
+        component.resync_window_full_to_swa_mapping(node_id, prefix, req_full_locs)
 
 
 def maybe_write_dsv4_extend(
