@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.score_mod import (
 )
 from sglang.kernels.ops.gemm.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.memory.row_compact import row_compact_bf16
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -269,7 +270,6 @@ class InklingQKVRLinear(MergedColumnParallelLinear):
         inkling_head_dim: int,
         inkling_num_heads: int,
         inkling_d_rel: int,
-        inkling_tp_size: int,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -277,7 +277,6 @@ class InklingQKVRLinear(MergedColumnParallelLinear):
         self.inkling_head_dim = inkling_head_dim
         self.inkling_num_heads = inkling_num_heads
         self.inkling_d_rel = inkling_d_rel
-        self.inkling_tp_size = inkling_tp_size
 
 
 class InklingAttention(nn.Module):
@@ -305,7 +304,6 @@ class InklingAttention(nn.Module):
         self.hidden_size = hidden_size
         self.alt_stream = alt_stream
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.tp_size = attn_tp_size
@@ -339,24 +337,21 @@ class InklingAttention(nn.Module):
             output_sizes=output_sizes,
             bias=q_bias,
             prefix=add_prefix("qkvr", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             quant_config=quant_config,
             inkling_num_kv_heads=self.num_total_kv_heads,
             inkling_head_dim=self.head_dim,
             inkling_num_heads=self.num_total_heads,
             inkling_d_rel=self.d_rel,
-            inkling_tp_size=attn_tp_size,
         )
         self.wo_ud = RowParallelLinear(
             input_size=self.head_dim * self.num_total_heads,
             output_size=self.hidden_size,
             bias=o_bias,
             prefix=add_prefix("wo_ud", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
+            parallel_group="attn_tp",
             use_dp_attention_reduce=True,
+            reduce_results=False,
             quant_config=quant_config,
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
@@ -1005,7 +1000,11 @@ class InklingAttention(nn.Module):
         )
         if buf is not None and type(wo_ud.quant_method) is UnquantizedLinearMethod:
             torch.matmul(attn_output, wo_ud.weight.t(), out=buf)
-            bias_ = None if (wo_ud.tp_rank > 0 or wo_ud.skip_bias_add) else wo_ud.bias
+            bias_ = (
+                None
+                if (get_group_rank_size(wo_ud.tp_group)[0] > 0 or wo_ud.skip_bias_add)
+                else wo_ud.bias
+            )
             if bias_ is not None:
                 buf.add_(bias_)
             if not reduce:
