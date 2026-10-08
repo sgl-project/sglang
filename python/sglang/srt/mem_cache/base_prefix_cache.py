@@ -272,10 +272,10 @@ class MatchResult(NamedTuple):
 
     Attributes:
         device_prefix_len:  Length of the device-resident matched prefix. Its KV
-                            indices are not materialized: they normally lie on the
-                            path to ``last_device_node``, but a cache with loaded
-                            slots not yet in the tree (LMCache) reports more. Read
-                            a request's indices with ``prefix_device_indices``.
+                            indices lie on the path to ``last_device_node``, except
+                            slots LMCache loaded but has not published (which
+                            ``prefix_device_indices`` appends) and a streaming
+                            session's match, which lives in the lent row.
         last_device_node:   The last TreeNode on the device that was matched.
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
@@ -531,9 +531,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             self.dec_lock_ref(lock.node, lock.receipt)
 
     def path_device_indices(self, node: Any) -> torch.Tensor:
-        """Device KV indices on the path from the root to ``node``, in root
-        order; empty for the root. Unless the path is locked, read them before
-        the next allocation or eviction can free it."""
+        """Device KV indices on the path from the root to ``node``; valid until
+        the next allocation or eviction unless the path is locked."""
         raise NotImplementedError
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:

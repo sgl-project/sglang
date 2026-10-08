@@ -8,7 +8,6 @@ use crate::components::ComponentType;
 use crate::node::ChildKeyType;
 use crate::unified_tree_core::{CacheAction, EvictionStepResult, MatchResult, UnifiedTreeCore};
 
-/// Device KV indices of a match, read off the path to its last device node.
 pub(crate) fn matched_device_indices<K: ChildKeyType>(
     tc: &UnifiedTreeCore<K>,
     result: &MatchResult,

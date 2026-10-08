@@ -374,8 +374,7 @@ class RadixCache(BasePrefixCache):
 
         Returns:
             MatchResult: ``device_prefix_len`` is the length of the longest
-            cached prefix (may be 0); ``path_device_indices`` reads its KV cache
-            indices off ``last_device_node``.
+            cached prefix (may be 0).
             ``last_device_node`` and ``last_host_node`` (currently the same) are the tree node objects
             representing the terminal node of the matched prefix. This method
             may mutate internal structure by splitting an existing node if the

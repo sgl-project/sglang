@@ -73,7 +73,6 @@ class ChunkCache(BasePrefixCache):
         )
 
     def path_device_indices(self, node: Any) -> torch.Tensor:
-        # The tree owns no KV.
         return torch.empty((0,), dtype=torch.int64)
 
     def insert(self, params: InsertParams) -> InsertResult:

@@ -3500,8 +3500,8 @@ class UnifiedRadixCacheSuite:
                 full_match.assert_not_called()
             else:
                 full_match.assert_called_once()
-                # Admission reads the rematched prefix; a load-back committing in
-                # this window also reads its span for the slot-ownership check.
+                # A load-back committing here reads the path again for its
+                # slot-ownership check.
                 collect_indices.assert_called()
         new_indices = (
             cache.tree_core.empty_device_indices if loaded is None else loaded[0]
