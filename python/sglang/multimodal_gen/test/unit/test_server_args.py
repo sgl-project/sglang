@@ -823,6 +823,40 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
         self.assertEqual(server_args.warmup_mode, "request")
 
 
+class TestRingAttentionBackendDefault(unittest.TestCase):
+    """`_adjust_attention_backend` picks the ring kernel the platform can serve."""
+
+    def _ring_args(self, **extra):
+        return _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "sp_degree": 2,
+                "ring_degree": 2,
+                "performance_mode": "manual",
+                **extra,
+            }
+        )
+
+    def test_cuda_defaults_to_fa(self):
+        self.assertEqual(self._ring_args().attention_backend, "fa")
+
+    def test_rocm_defaults_to_aiter(self):
+        # FA dispatches through FA3 (CUDA-only), so ROCm resolves a "fa"
+        # default to a backend with no softmax LSE and cannot ring at all
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_rocm",
+            return_value=True,
+        ):
+            self.assertEqual(self._ring_args().attention_backend, "aiter")
+
+    def test_explicit_backend_survives_the_ring_default(self):
+        self.assertEqual(
+            self._ring_args(attention_backend="sage_attn").attention_backend,
+            "sage_attn",
+        )
+
+
 class TestWarmupModeNormalization(unittest.TestCase):
     """`_adjust_warmup` resolves the canonical warmup mode."""
 

@@ -158,30 +158,57 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
-        # The FA backend dispatches through FA3, which is CUDA-only, so the
-        # unspecified-backend case on ROCm is AITER with SDPA as the fallback.
-        # SDPA has no softmax LSE output, so only the AITER path can serve ring
-        # attention.
-        try:
-            import aiter  # noqa: F401
-
-            if dtype not in (torch.float16, torch.bfloat16):
-                logger.warning(
-                    "AITer backend works best with fp16/bf16 inputs but got dtype=%s. "
-                    "Proceeding with AITer anyway.",
-                    dtype,
-                )
-            logger.info("Using AITer backend on ROCm.")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
-        except ImportError:
+        target_backend = AttentionBackendEnum.FA
+        if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
-                "Cannot use AITer backend because the aiter package is not found."
+                "Cannot use FlashAttention backend for dtype other than "
+                "torch.float16 or torch.bfloat16."
             )
+            target_backend = AttentionBackendEnum.TORCH_SDPA
 
-        logger.info("Using Torch SDPA backend.")
-        return (
-            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-        )
+        if target_backend == AttentionBackendEnum.FA:
+            try:
+                import flash_attn  # noqa: F401
+
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    _is_fa3_supported,
+                )
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                    FlashAttentionBackend,
+                )
+
+                if not _is_fa3_supported():
+                    logger.info(
+                        "FlashAttention backend now dispatches through FA3 "
+                        "(CUDA-only). Using Torch SDPA backend on ROCm."
+                    )
+                    target_backend = AttentionBackendEnum.TORCH_SDPA
+
+                if target_backend == AttentionBackendEnum.FA:
+                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                    if head_size not in supported_sizes:
+                        logger.info(
+                            "Cannot use FlashAttention-2 backend for head size %d.",
+                            head_size,
+                        )
+                        target_backend = AttentionBackendEnum.TORCH_SDPA
+            except ImportError:
+                logger.info(
+                    "Cannot use FlashAttention backend because the "
+                    "flash_attn package is not found. "
+                    "Make sure that flash_attn was built and installed "
+                    "(on by default)."
+                )
+                target_backend = AttentionBackendEnum.TORCH_SDPA
+
+        if target_backend == AttentionBackendEnum.TORCH_SDPA:
+            logger.info("Using Torch SDPA backend.")
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+        logger.info("Using Flash Attention backend.")
+
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

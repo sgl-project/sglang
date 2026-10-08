@@ -108,6 +108,14 @@ MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
+def _default_ring_attention_backend() -> str:
+    # FA dispatches through FA3, which is CUDA-only, so ROCm serves the ring
+    # kernel from AITER instead.
+    if current_platform.is_rocm():
+        return AttentionBackendEnum.AITER.name.lower()
+    return RING_CAPABLE_ATTENTION_BACKENDS[0]
+
+
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
@@ -1180,7 +1188,7 @@ class ServerArgs(DisaggServerArgsMixin):
                     f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
+                self.attention_backend = _default_ring_attention_backend()
                 logger.info(
                     "Ring Attention requires a ring-capable backend; "
                     "attention_backend has been automatically set to %s",
