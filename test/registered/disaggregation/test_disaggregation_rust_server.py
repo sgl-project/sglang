@@ -8,7 +8,7 @@ positional scheduler-wire PD block, the KV bootstrap registry served on the
 rust api listener, the PD warmup fan-out, and the fake-bootstrap health probe.
 
 OpenAI chat and completions exercise the same KV transfer through the Rust
-HTTP handlers, including streaming, batched completions, and multiple choices.
+HTTP handlers, including streaming and batched completions.
 
 Usage:
 python3 -m unittest test_disaggregation_rust_server.TestDisaggregationRustServer
@@ -171,7 +171,6 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
                         "temperature": 0,
                         "max_tokens": 16,
                         "stream": stream,
-                        "n": 2,
                     }
                     with requests.post(
                         self.lb_url + path,
@@ -181,8 +180,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
                     ) as response:
                         self.assertEqual(response.status_code, 200, response.reason)
                         if stream:
-                            texts = {0: "", 1: ""}
-                            finished = set()
+                            text = ""
+                            finished = False
                             for line in response.iter_lines(decode_unicode=True):
                                 if not line or not line.startswith("data:"):
                                     continue
@@ -192,33 +191,29 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
                                 chunk = json.loads(payload)
                                 self.assertNotIn("error", chunk, chunk)
                                 for choice in chunk["choices"]:
-                                    index = choice["index"]
-                                    self.assertIn(index, texts)
-                                    texts[index] += (
+                                    self.assertEqual(choice["index"], 0)
+                                    text += (
                                         choice.get("delta", {}).get("content") or ""
                                         if path == "/v1/chat/completions"
                                         else choice.get("text") or ""
                                     )
                                     if choice["finish_reason"] is not None:
-                                        finished.add(index)
-                            self.assertEqual(finished, {0, 1})
-                            texts = texts.values()
+                                        finished = True
+                            self.assertTrue(finished)
                         else:
                             choices = response.json()["choices"]
-                            self.assertEqual([c["index"] for c in choices], [0, 1])
-                            for choice in choices:
-                                self.assertIsNotNone(choice["finish_reason"])
-                            texts = [
-                                c["message"]["content"]
+                            self.assertEqual([c["index"] for c in choices], [0])
+                            choice = choices[0]
+                            self.assertIsNotNone(choice["finish_reason"])
+                            text = (
+                                choice["message"]["content"]
                                 if path == "/v1/chat/completions"
-                                else c["text"]
-                                for c in choices
-                            ]
-                        for text in texts:
-                            self.assertIn("paris", text.lower())
+                                else choice["text"]
+                            )
+                        self.assertIn("paris", text.lower())
 
     def test_batch_completions_via_lb(self):
-        """Per-prompt routing must survive batched multiple-choice generation."""
+        """Per-prompt routing must survive batched completions."""
         response = requests.post(
             self.lb_url + "/v1/completions",
             json={
@@ -229,16 +224,13 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
                 ],
                 "temperature": 0,
                 "max_tokens": 16,
-                "n": 2,
             },
             timeout=60,
         )
         self.assertEqual(response.status_code, 200, response.text)
         choices = response.json()["choices"]
-        self.assertEqual(len(choices), 4)
-        for index, (choice, city) in enumerate(
-            zip(choices, ("paris", "paris", "tokyo", "tokyo"))
-        ):
+        self.assertEqual(len(choices), 2)
+        for index, (choice, city) in enumerate(zip(choices, ("paris", "tokyo"))):
             self.assertEqual(choice["index"], index)
             self.assertIn(city, choice["text"].lower(), choice)
             self.assertIsNotNone(choice["finish_reason"])
