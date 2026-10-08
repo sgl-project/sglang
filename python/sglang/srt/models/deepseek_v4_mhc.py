@@ -35,11 +35,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
@@ -591,7 +586,6 @@ def can_use_mega_mhc_prefill(
         and residual.dtype == torch.bfloat16
         and residual.is_contiguous()
         and not get_forward().sp_active
-        and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
         and not is_batch_invariant_mode_enabled()
     )
 

@@ -26,7 +26,8 @@ def mhc_mega_boundary(
 
     The collapse uses ``pre`` from the preceding sublayer, not the new pre
     produced from the updated residual. Preserve this DSv4.1 shifted ordering.
-    Only called by the eager, opt-in Blackwell prefill path.
+    Used by the opt-in SM10x prefill path. Before CUDA graph capture, warm up
+    on the capture stream to initialize DeepGEMM's per-stream barriers.
     """
     import deep_gemm
 
