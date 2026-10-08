@@ -297,9 +297,6 @@ class MiniMaxM3MLP(nn.Module):
         hidden_size = config.hidden_size
         hidden_act = config.hidden_act
         self.fuse_swiglu_oai_mxfp8 = hidden_act == "swigluoai"
-        if self.fuse_swiglu_oai_mxfp8:
-            self.swiglu_alpha = float(config.swiglu_alpha)
-            self.swiglu_limit = float(config.swiglu_limit)
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -321,9 +318,11 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
+            self.swiglu_alpha = float(config.swiglu_alpha)
+            self.swiglu_limit = float(config.swiglu_limit)
             if _is_npu:
                 self.act_fn = lambda x: self._swigluoai_fused(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
             else:
                 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -331,7 +330,7 @@ class MiniMaxM3MLP(nn.Module):
                 )
 
                 self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
         else:
             raise ValueError(

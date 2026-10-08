@@ -25,7 +25,7 @@ _E4M3 = torch.float8_e4m3fn
 
 def _scale_numel(rows: int, k: int) -> int:
     n_groups = k // 32
-    return -(-rows // 128) * 128 * (-(-n_groups // 4) * 4)
+    return triton.cdiv(rows, 128) * 128 * (triton.cdiv(n_groups, 4) * 4)
 
 
 @triton.jit
@@ -237,7 +237,7 @@ def mxfp8_quantize_swizzled(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     if rows == 0:
         return q, s
     n_groups = k // 32
-    n_col_blocks = -(-n_groups // 4)
+    n_col_blocks = triton.cdiv(n_groups, 4)
     block_r, g = 32, 8
     grid = (triton.cdiv(rows, block_r), triton.cdiv(n_groups, g))
     with torch.get_device_module().device(x.device):
@@ -277,7 +277,7 @@ def _swiglu_mxfp8(
         if n % 128:
             raise ValueError(f"DeepGEMM MXFP8 scales need n % 128 == 0, got {n=}")
         q = torch.empty(rows, n, dtype=_E4M3, device=hidden.device)
-        dg_rows = -(-rows // 4) * 4
+        dg_rows = triton.cdiv(rows, 4) * 4
         base = torch.empty(n // 128, dg_rows, dtype=torch.int32, device=hidden.device)
         s = base.T[:rows]
         s_bytes = base.view(torch.uint8)
@@ -286,11 +286,11 @@ def _swiglu_mxfp8(
         q, s = _alloc(rows, n, hidden.device, zero_scales=False)
         s_bytes = s
         dg_rows = 0
-        padded_rows = -(-rows // 128) * 128
+        padded_rows = triton.cdiv(rows, 128) * 128
     if rows == 0:
         return q, s
     n_groups = n // 32
-    n_col_blocks = -(-n_groups // 4)
+    n_col_blocks = triton.cdiv(n_groups, 4)
     block_r, g = (4 if rows <= 1024 else 16), 8
     grid = (triton.cdiv(padded_rows, block_r), triton.cdiv(n_groups, g))
     with torch.get_device_module().device(hidden.device):
@@ -356,7 +356,7 @@ def indexed_scale_shift_mxfp8_(
     if rows == 0:
         return (x if keep_bf16 else None), q, s
     n_groups = hidden_size // 32
-    n_col_blocks = -(-n_groups // 4)
+    n_col_blocks = triton.cdiv(n_groups, 4)
     block_n = triton.next_power_of_2(hidden_size)
     with torch.get_device_module().device(x.device):
         _indexed_scale_shift_mxfp8_kernel[(rows,)](
