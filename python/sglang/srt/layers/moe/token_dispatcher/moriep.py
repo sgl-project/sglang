@@ -513,9 +513,9 @@ class CommStreamPool:
 def _get_tbo_comm_stream(group, tbo_enabled: bool, async_finish: bool):
     if not (tbo_enabled and async_finish):
         return None
-    if not get_bool_env_var("SGLANG_MORI_EPV2_TBO_USE_COMM_STREAM", "true"):
+    if not envs.SGLANG_MORI_EPV2_TBO_USE_COMM_STREAM.get():
         return None
-    priority = get_int_env_var("SGLANG_MORI_EPV2_TBO_COMM_STREAM_PRIORITY", 0)
+    priority = envs.SGLANG_MORI_EPV2_TBO_COMM_STREAM_PRIORITY.get()
     return CommStreamPool.get_stream_from_pool(group, priority)
 
 
@@ -670,6 +670,16 @@ def init_mori_epv2_op(
     )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
+    prepare_recv_cap = getattr(op, "prepare_recv_cap", None)
+    if prepare_recv_cap is not None:
+        # Pre-compile the power-of-two receive caps that CUDA graphs may capture.
+        cap_max = min(
+            envs.SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX.get(), cfg.effective_max_recv
+        )
+        cap = MORI_MIN_LOGICAL_RECV_ROWS
+        while cap <= cap_max:
+            prepare_recv_cap(cap)
+            cap *= 2
     logger.info(
         f"[MORI EPv2 init] world={world_size} rank={rank} hidden={hidden_size} "
         f"experts={num_experts} local_experts={num_local_experts} topk={router_topk} "
@@ -717,7 +727,7 @@ class _MoriEPDispatcherImplBase:
         self.async_finish = False
         self._tbo_enabled = is_tbo_enabled()
         self._trim_recv = envs.SGLANG_MORI_RECV_BOUND.get()
-        self._manual_recv_cap = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
+        self._manual_recv_cap = envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.get()
         self._recv_cap_pow2_buckets = False
 
     @staticmethod
@@ -1363,25 +1373,19 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         tbo_enabled = self._tbo_enabled
         # TBO children own separate arenas (instance_id); combine waits on the
         # compute event recorded after the expert writes into its child's view.
-        self._direct_output = get_bool_env_var(
-            "SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT", "true"
-        )
+        self._direct_output = envs.SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT.get()
         self._comm_stream = _get_tbo_comm_stream(
             self.group, tbo_enabled=tbo_enabled, async_finish=async_finish
         )
         self._launch_config = _get_epv2_launch_config(
             tbo_enabled=tbo_enabled,
-            dispatch_block_num=get_int_env_var(
-                "SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM", 32
+            dispatch_block_num=envs.SGLANG_MORI_EPV2_TBO_DISPATCH_BLOCK_NUM.get(),
+            combine_block_num=envs.SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM.get(),
+            dispatch_warp_num_per_block=(
+                envs.SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK.get()
             ),
-            combine_block_num=get_int_env_var(
-                "SGLANG_MORI_EPV2_TBO_COMBINE_BLOCK_NUM", 48
-            ),
-            dispatch_warp_num_per_block=get_int_env_var(
-                "SGLANG_MORI_EPV2_TBO_DISPATCH_WARP_NUM_PER_BLOCK", 4
-            ),
-            combine_warp_num_per_block=get_int_env_var(
-                "SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK", 4
+            combine_warp_num_per_block=(
+                envs.SGLANG_MORI_EPV2_TBO_COMBINE_WARP_NUM_PER_BLOCK.get()
             ),
         )
         self._mori_op = None
@@ -1408,8 +1412,8 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         return CombineDtype.bf16
 
     def _apply_combine_dtype_override(self):
-        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
-            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+        if envs.SGLANG_MORI_COMBINE_DTYPE.is_set():
+            combine_dtype = envs.SGLANG_MORI_COMBINE_DTYPE.get().lower()
             if combine_dtype == "fp8":
                 self.combine_dtype = CombineDtype.fp8
             elif combine_dtype == "fp8_direct_cast":
@@ -1424,13 +1428,6 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
                     "SGLANG_MORI_COMBINE_DTYPE must be auto, bf16, fp8, "
                     f"fp8_direct_cast or fp4; got {combine_dtype!r}"
                 )
-        elif "SGLANG_MORI_FP8_COMB" in os.environ:
-            logger.warning_once(
-                "SGLANG_MORI_FP8_COMB is deprecated. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
-            )
-            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
-                self.combine_dtype = CombineDtype.fp8
         if (
             self.combine_dtype != CombineDtype.bf16
             and self.dispatch_dtype != DispatchDtype.bf16
@@ -1454,21 +1451,13 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.params_dtype,
             self.max_tokens_per_rank,
             self.instance_id,
-            get_int_env_var("SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0),
+            envs.SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS.get(),
             self.dispatch_dtype,
             self.combine_dtype,
             self._launch_config,
         )
-        prepare_recv_cap = getattr(self._mori_op, "prepare_recv_cap", None)
-        # Keep logical caps on the power-of-two ladder prepared below.
-        self._recv_cap_pow2_buckets = prepare_recv_cap is not None
-        if prepare_recv_cap is None:
-            return
-        graph_cap_max = get_int_env_var("SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX", 8192)
-        graph_cap = 32
-        while graph_cap <= min(graph_cap_max, self._mori_op.cfg.effective_max_recv):
-            prepare_recv_cap(graph_cap)
-            graph_cap *= 2
+        # Keep logical caps on the power-of-two ladder init_mori_epv2_op pre-compiled.
+        self._recv_cap_pow2_buckets = hasattr(self._mori_op, "prepare_recv_cap")
 
     @property
     def mori_op(self):

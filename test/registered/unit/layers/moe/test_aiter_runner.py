@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
@@ -157,8 +158,6 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
         MoriEPNormalDispatchOutput,
     )
 
-    # The dispatcher owns the override. The runner must not read it again.
-    monkeypatch.setenv("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", "3")
     fake_utils = ModuleType("sglang.kernels.ops.moe.rocm_moe_utils")
     fake_utils.upscale = None
     fake_utils.upscale_mxfp4 = None
@@ -183,9 +182,11 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
     )
     quant_info = _quant_info(quant_type=AiterQuantType.NONE)
     state = {}
-    result = aiter_runner._pre_permute_deepep_to_aiter(
-        dispatched, quant_info, MoeRunnerConfig(), state
-    )
+    # The dispatcher owns the override. The runner must not read it again.
+    with envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.override(3):
+        result = aiter_runner._pre_permute_deepep_to_aiter(
+            dispatched, quant_info, MoeRunnerConfig(), state
+        )
     assert result.hidden_states.shape[0] == expected_rows
     assert result.topk_ids.shape[0] == expected_rows
     assert result.topk_weights.shape[0] == expected_rows
