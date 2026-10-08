@@ -5503,6 +5503,8 @@ class Scheduler(
                 req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+        elif self.enable_overlap_mlx:
+            self._drain_mlx_pending_jobs()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
