@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -367,6 +368,89 @@ class TestTokenDenseBridgeOwnership(CustomTestCase):
                 gate_up_b=None,
                 act=ActSpec(ActFamily.B_ACTIVATION, ActivationFn.SILU),
             )
+
+
+class TestMoeSplitKLaunchContract(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Pin the shipped tables, not a user's optional override directory.
+        cls.tables = {
+            architecture: _MODULE._PlansFileModel.model_validate(
+                json.loads(
+                    (
+                        _SOURCE.parent / "configs" / f"{architecture}.plans.json"
+                    ).read_text()
+                )
+            )
+            for architecture in ("sm90", "sm100")
+        }
+
+    def _resolve(self, architecture, rank, *, shared=False):
+        with patch.object(
+            _MODULE, "_load_plans", return_value=self.tables[architecture]
+        ):
+            return _MODULE.resolve_plans(
+                quant_family="bf16",
+                architecture=architecture,
+                is_shared_outer=shared,
+                physical_rank=rank,
+                activation=ActivationFn.SILU,
+                hidden_size=4096,
+                num_local_experts=256,
+            )
+
+    def test_sm100_decode_gate_up_split_k_ladder_uses_physical_pool_rank(self):
+        for rank in (8, 16, 32):
+            selected = self._resolve("sm100", rank)[Phase.DECODE]
+            self.assertEqual(selected.name, "decode.per_expert")
+            self.assertIs(selected.plan.gate_up_a.family, AFamily.GROUPED)
+            for tokens, small_rank_split in ((1, 8), (4, 8), (5, 4), (16, 4), (17, 1)):
+                with self.subTest(rank=rank, tokens=tokens):
+                    launch = selected.tiles.config_for(tokens)
+                    self.assertEqual(
+                        launch.gate_up_a.get("SPLIT_K", 1),
+                        small_rank_split if rank <= 16 else 1,
+                    )
+                    self.assertEqual(launch.down_a.get("SPLIT_K", 1), 1)
+
+    def test_ladder_excludes_other_phases_layouts_and_architectures(self):
+        for architecture in ("sm90", "sm100"):
+            for rank in (8, 16, 32):
+                for shared in (False, True):
+                    for phase, selected in self._resolve(
+                        architecture, rank, shared=shared
+                    ).items():
+                        if (
+                            architecture == "sm100"
+                            and not shared
+                            and phase is Phase.DECODE
+                        ):
+                            continue  # Pinned independently, including rank 32, above.
+                        for tokens in (1, 4, 5, 16, 17):
+                            with self.subTest(
+                                architecture=architecture,
+                                rank=rank,
+                                shared=shared,
+                                phase=phase,
+                                tokens=tokens,
+                            ):
+                                launch = selected.tiles.config_for(tokens)
+                                self.assertEqual(launch.gate_up_a.get("SPLIT_K", 1), 1)
+                                self.assertEqual(launch.down_a.get("SPLIT_K", 1), 1)
+
+    def test_moe_a_configs_reject_explicit_split_mode(self):
+        # MoE consumes serial output, never a dense-style planes bridge.
+        # Numeric split modes must be rejected, not accepted as tile dimensions.
+        for site in ("gate_up_a", "down_a"):
+            for mode in (0, 1, "serial", "planes"):
+                sites = {site: {"BLOCK_SIZE_N": 16, "SPLIT_K": 4, "SPLIT_MODE": mode}}
+                with self.subTest(site=site, mode=mode):
+                    with self.assertRaisesRegex(ValueError, "SPLIT_MODE"):
+                        MoeLoraLaunchConfig(**sites)
+                    # External JSON overrides pass through this same constructor.
+                    rule = _MODULE._TileRuleModel.model_validate({"sites": sites})
+                    with self.assertRaisesRegex(ValueError, "SPLIT_MODE"):
+                        _MODULE._tile_table([rule], physical_rank=16)
 
 
 if __name__ == "__main__":
