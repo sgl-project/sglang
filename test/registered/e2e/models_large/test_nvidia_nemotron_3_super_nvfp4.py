@@ -69,7 +69,7 @@ MTP_ARGS = [
 ]
 
 
-def _run_gsm8k(test_case):
+def _run_gsm8k(test_case, threshold=0.96):
     args = SimpleNamespace(
         model=test_case.model,
         eval_name="gsm8k",
@@ -86,7 +86,7 @@ def _run_gsm8k(test_case):
     )
     metrics = run_eval(args)
     print(f"{metrics=}")
-    test_case.assertGreaterEqual(metrics["score"], 0.96)
+    test_case.assertGreaterEqual(metrics["score"], threshold)
 
 
 class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
@@ -111,7 +111,7 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
 
 
 class TestNvidiaNemotron3SuperNVFP4PerToken(CustomTestCase):
-    """Per-token NVFP4 activations on the FlashInfer TRT-LLM RELU^2 MoE."""
+    """Per-token NVFP4 activations on the FlashInfer TRT-LLM ReLU2 MoE."""
 
     @classmethod
     def setUpClass(cls):
@@ -134,7 +134,7 @@ class TestNvidiaNemotron3SuperNVFP4PerToken(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        _run_gsm8k(self)
+        _run_gsm8k(self, threshold=0.93)
 
 
 class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):

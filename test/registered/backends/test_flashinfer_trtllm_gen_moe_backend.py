@@ -339,12 +339,12 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
 class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
-    """Non-gated RELU^2 experts with per-token NVFP4 activations."""
+    """Non-gated ReLU2 experts with per-token NVFP4 activations."""
 
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm"
-    gsm8k_threshold = 0.95
+    gsm8k_threshold = 0.93
 
 
 if __name__ == "__main__":

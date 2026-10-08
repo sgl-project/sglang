@@ -16,7 +16,7 @@ Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
 sizes, so a failure looks like one a real checkpoint would hit.
 
 The TRT-LLM weight padding is pinned here too: Nemotron 3 (hidden 2688,
-intermediate 1856, RELU^2 experts) needs a 128-aligned intermediate and, for
+intermediate 1856, ReLU2 experts) needs a 128-aligned intermediate and, for
 per-token activations, a 512-aligned hidden; padding must be zero-filled.
 """
 
