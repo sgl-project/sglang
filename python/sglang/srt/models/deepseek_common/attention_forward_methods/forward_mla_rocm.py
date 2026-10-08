@@ -491,6 +491,20 @@ def _fused_bmm_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
+    def _absorb_v_bmm(self, attn_output: torch.Tensor) -> torch.Tensor:
+        """Model extension point for the TP-local absorbed value projection."""
+        return rocm_absorb_v_bmm(self, attn_output)
+
+    def _prepare_kc_cache(
+        self,
+        query: torch.Tensor,
+        latent: torch.Tensor,
+        key_tail: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Model extension point for an absorbed key/cache preparation kernel."""
+        return None
+
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -662,6 +676,25 @@ class DeepseekMLARocmForwardMixin:
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
+        kc_prepared = self._prepare_kc_cache(q, k_nope, k_pe, forward_batch)
+        if kc_prepared is not None:
+            # The model hook already wrote the physical cache. Carry its fresh
+            # BF16 key to core attention, which must therefore disable the
+            # backend's normal cache writer.
+            return (
+                q_pe,
+                k_pe,
+                None,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+                topk_indices,
+                llama_4_scaling,
+                None,
+                kc_prepared,
+            )
+
         # The fused kernel wins at decode-sized batches (decode, target verify,
         # draft extend); prefill shapes run faster as the two separate launches.
         fuse_bmm_rope_cache = (
@@ -802,6 +835,7 @@ class DeepseekMLARocmForwardMixin:
             topk_indices,
             llama_4_scaling,
             q_nope if fuse_bmm_rope_cache else None,
+            None,
         )
 
     def forward_absorb_rocm_core(
@@ -816,7 +850,20 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
         q_nope_unabsorbed=None,
+        kc_prepared=None,
     ):
+        if kc_prepared is not None:
+            qcat, fresh_key, latent_key = kc_prepared
+            rows = qcat.shape[0]
+            attn_output = self.attn_mqa(
+                qcat,
+                fresh_key.view(rows, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+                latent_key.view(rows, 1, self.kv_lora_rank),
+                forward_batch,
+                save_kv_cache=False,
+            )
+            return self._finish_absorb_rocm(attn_output, forward_batch, topk_indices)
+
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
@@ -992,6 +1039,18 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        return self._finish_absorb_rocm(
+            attn_output, forward_batch, topk_indices, locals().get("lse")
+        )
+
+    def _finish_absorb_rocm(
+        self,
+        attn_output: torch.Tensor,
+        forward_batch: ForwardBatch,
+        topk_indices: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor] = None,
+    ):
+        """Shared post-attention value projection and output tail."""
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
@@ -1008,6 +1067,7 @@ class DeepseekMLARocmForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
+                assert lse is not None
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
@@ -1063,7 +1123,7 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = self._absorb_v_bmm(attn_output)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
