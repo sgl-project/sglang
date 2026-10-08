@@ -32,9 +32,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
 )
-from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
 )
@@ -651,27 +648,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.strength = 1.0
 
 
-class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
-    """
-    Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
-
-    Note: The current version does not yet implement the LoRA functionality.
-    This class behaves exactly the same as the base VocabParallelEmbedding.
-    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
-    """
-
-    def __init__(
-        self,
-        base_layer: VocabParallelEmbedding,
-    ) -> None:
-        super().__init__(base_layer)
-
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "We don't support VocabParallelEmbeddingWithLoRA yet."
-        )
-
-
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,
@@ -989,7 +965,6 @@ def wrap_with_lora_layer(
     """
     supported_layer_types: dict[type[nn.Module], type[BaseLayerWithLoRA]] = {
         # the order matters
-        # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         # Weight-only FP8 LoRA is currently dynamic-only and intended for
         # single-GPU deployments.
         WeightOnlyFP8Linear: WeightOnlyFP8LinearWithLoRA,
