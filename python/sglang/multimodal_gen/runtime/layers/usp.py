@@ -385,9 +385,7 @@ def _usp_input_all_to_all_packed_qkv(
         q.device.type == "cpu"
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         and not torch.compiler.is_compiling()
     ):
         # CPU C++ fast path.

@@ -1464,9 +1464,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
-        if current_platform.is_cpu() and (
-            self.tp_size > 1 or (self.sp_degree or 1) > 1
-        ):
+        if current_platform.is_cpu():
+            if self.sp_degree is None:
+                self.sp_degree = 1
             self.num_gpus = self.tp_size * self.sp_degree
 
         if self.hsdp_shard_dim is None:

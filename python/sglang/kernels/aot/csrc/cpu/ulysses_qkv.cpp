@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
+#include <ATen/native/cpu/utils.h>
 #include <torch/library.h>
 
 #include <cstring>
@@ -59,7 +60,6 @@ void pack_qkv_destination_major_cpu(
   const int64_t head_size = q.size(2);
   TORCH_CHECK(global_heads % world_size == 0, "world_size must divide global_heads");
   const int64_t local_heads = global_heads / world_size;
-  TORCH_CHECK(output.scalar_type() == q.scalar_type(), "output must have the same dtype as q/k/v");
   TORCH_CHECK(
       output.size(0) == world_size && output.size(1) == rows && output.size(2) == local_heads &&
           output.size(3) == 3 * head_size,
@@ -68,25 +68,29 @@ void pack_qkv_destination_major_cpu(
   if (q.numel() == 0) {
     return;
   }
+
   const int64_t q_stride_row = q.stride(0);
   const int64_t q_stride_head = q.stride(1);
   const int64_t k_stride_row = k.stride(0);
   const int64_t k_stride_head = k.stride(1);
   const int64_t v_stride_row = v.stride(0);
   const int64_t v_stride_head = v.stride(1);
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "pack_qkv_destination_major_cpu", [&] {
     const scalar_t* q_ptr = q.data_ptr<scalar_t>();
     const scalar_t* k_ptr = k.data_ptr<scalar_t>();
     const scalar_t* v_ptr = v.data_ptr<scalar_t>();
     scalar_t* out_ptr = output.data_ptr<scalar_t>();
+
     const size_t head_bytes = static_cast<size_t>(head_size) * sizeof(scalar_t);
     const int64_t total_head_slots = rows * global_heads;
+
     at::parallel_for(0, total_head_slots, 0, [&](int64_t begin, int64_t end) {
+      int64_t destination{0};
+      int64_t row{0};
+      int64_t local_head{0};
+      data_index_init(begin, destination, world_size, row, rows, local_head, local_heads);
       for (int64_t head_slot = begin; head_slot < end; ++head_slot) {
-        const int64_t local_head = head_slot % local_heads;
-        const int64_t row_slot = head_slot / local_heads;
-        const int64_t row = row_slot % rows;
-        const int64_t destination = row_slot / rows;
         const int64_t global_head = destination * local_heads + local_head;
         const scalar_t* q_src = q_ptr + row * q_stride_row + global_head * q_stride_head;
         const scalar_t* k_src = k_ptr + row * k_stride_row + global_head * k_stride_head;
@@ -97,6 +101,8 @@ void pack_qkv_destination_major_cpu(
         std::memcpy(out, q_src, head_bytes);
         std::memcpy(out + head_size, k_src, head_bytes);
         std::memcpy(out + 2 * head_size, v_src, head_bytes);
+
+        data_index_step(destination, world_size, row, rows, local_head, local_heads);
       }
     });
   });
