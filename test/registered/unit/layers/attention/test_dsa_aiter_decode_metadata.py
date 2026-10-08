@@ -4,10 +4,20 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import (
+    DSA_PAGE_SIZE,
+    DSAAttentionCase,
+)
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
+    run_dsa_eagle_draft_cuda_graph_runner_case,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 class TestAiterDSADecodeMetadata(CustomTestCase):
@@ -85,6 +95,26 @@ class TestAiterDSADecodeMetadata(CustomTestCase):
         backend.on_after_cuda_graph_warmup()
 
         self.assertIsNone(backend.aiter_dsa_decode_metadata_owner)
+
+
+@unittest.skipUnless(is_hip(), "AITER DSA decode requires ROCm")
+class TestAiterDSAEagleDraftCudaGraph(CustomTestCase):
+    def test_raw_fp8_graph_matches_eager(self):
+        case = DSAAttentionCase(
+            name="aiter_raw_fp8_eagle_draft_cuda_graph",
+            backend="dsa",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=DSA_PAGE_SIZE,
+            prefix_lens=(128, 192),
+        )
+        run_dsa_eagle_draft_cuda_graph_runner_case(
+            self,
+            case,
+            dsa_decode_backend="aiter",
+            fp8_kv_cache=True,
+        )
 
 
 if __name__ == "__main__":
