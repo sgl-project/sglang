@@ -221,9 +221,14 @@ class SWAComponent(TreeComponent):
                     )
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            full_indices
+        swa_indices = (
+            self.cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                full_indices
+            )
         )
+        # Tree component values use int64 indices; normalize transfer ids at the
+        # tree boundary.
+        return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
@@ -351,7 +356,7 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
-        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+        swa_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable SWA window. The branching
         # point is the last page-aligned position within the Full-KV hit that lies
@@ -843,7 +848,7 @@ class SWAComponent(TreeComponent):
             covered += len(cur.key)
             if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
+                    comp.metadata[uuid_key] = next_component_uuid(ct)
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
@@ -1049,6 +1054,26 @@ class SWAComponent(TreeComponent):
             self.cache.evict_host(num_tokens, ComponentType.SWA)
             host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         return host_indices
+
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        # Buffer mode stages the node's own SWA rows, one key per page from
+        # the chain's tail, so admission needs no transfer (and no device op).
+        if not self.tree_core.is_host_memory_buffer_only:
+            return {}
+        cd = node.component_data[self.component_type]
+        if not self.tree_core.has_swa_host_pool or cd.value is None:
+            return {PoolName.SWA: []}
+        rows = (
+            node.component_data[BASE_COMPONENT_TYPE].value
+            if self._unified_allocator() is not None
+            else cd.value
+        )
+        num_pages = len(rows) // self._swa_kv_pool_host.page_size
+        if num_pages == 0 or num_pages > len(hash_values):
+            return {PoolName.SWA: []}
+        return {PoolName.SWA: list(hash_values[-num_pages:])}
 
     def build_hicache_transfers(
         self,

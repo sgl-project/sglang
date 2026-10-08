@@ -26,9 +26,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -164,7 +164,6 @@ class MellumAttention(Qwen3MoeAttention):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
@@ -194,8 +193,7 @@ class MellumAttention(Qwen3MoeAttention):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -204,8 +202,7 @@ class MellumAttention(Qwen3MoeAttention):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -439,13 +436,12 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 reduce_results=False,
             )
 
-        is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -454,12 +450,6 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == cfg.num_hidden_layers - 1,
         )
 
 

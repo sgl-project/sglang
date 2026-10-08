@@ -29,17 +29,16 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -79,8 +78,8 @@ class ExaoneMoEMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         gateup_quant_config = quant_config
@@ -97,8 +96,7 @@ class ExaoneMoEMLP(nn.Module):
             bias=False,
             quant_config=gateup_quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -107,8 +105,7 @@ class ExaoneMoEMLP(nn.Module):
             quant_config=down_quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -196,7 +193,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 **(
-                    dict(tp_rank=0, tp_size=1)
+                    dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
                     else {}
                 ),
@@ -312,7 +309,6 @@ class ExaoneMoEAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -353,8 +349,7 @@ class ExaoneMoEAttention(nn.Module):
             bias=bias,
             quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -363,8 +358,7 @@ class ExaoneMoEAttention(nn.Module):
             quant_config=o_quant_config,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -493,7 +487,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         )
         is_moe_layer = config.is_moe_layer
         num_layers = config.num_hidden_layers
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -503,13 +497,6 @@ class ExaoneMoEDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_moe_layer[layer_id - 1],
-                next_layer_sparse=is_moe_layer[layer_id],
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == num_layers - 1,
         )
 
     def forward(

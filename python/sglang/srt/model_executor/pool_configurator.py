@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
+    get_dsa_index_kpool,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -247,7 +248,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_entry_bytes("full")
+            if fused_full_entry is not None:
+                self._cell_size = int(fused_full_entry)
+            elif (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -295,7 +299,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_entry_bytes("full")
+            if fused_full_entry is not None:
+                self._cell_size = int(fused_full_entry)
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -515,8 +522,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+        indexer_size_per_token = ceil_div(
+            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+            get_dsa_index_kpool(kvc.model_config.hf_config),
         )
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
@@ -642,9 +650,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                index_elements = (
+                index_elements = ceil_div(
                     index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+                    get_dsa_index_kpool(model_config.hf_config),
                 )
                 self._full_per_token += index_elements * torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
@@ -711,8 +720,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        self._fused_full_entry = kvc.fused_entry_bytes("full")
+        if self._fused_full_entry is not None:
+            self._draft_full_layers_num = 0
+            self._draft_swa_layers_num = 0
+            self._draft_swa_full_layers_num = 0
+            self._draft_cell_size = 0
 
         self._recompute_cell_size()
+
+    def _full_cell_bytes(self) -> int:
+        """Bytes per full-side token: the fused entry when the draft is placed
+        there, else the target's rows plus the private draft's full rows."""
+        if self._fused_full_entry is not None:
+            return self._fused_full_entry
+        return self._full_per_token * (
+            self._full_layers_num + self._draft_full_layers_num
+        )
+
+    def _swa_cell_bytes(self) -> int:
+        return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
 
     def _recompute_cell_size(self) -> None:
         # Bytes per token of max_total_num_tokens: full_tokens when hybrid, else
@@ -727,12 +754,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
         else:
             self._cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
+                self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
-                + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
+                + self._swa_full_tokens_ratio * self._swa_cell_bytes()
                 + self._draft_cell_size
             )
 
@@ -744,9 +768,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_cell_size
         )
 
+    def _unified_full_bytes_per_token(self) -> int:
+        """Bytes one full-side token takes in the unified pool: the fused
+        entry (host + draft + pad) when the draft lives in it, else the
+        target's own rows. A private draft pool is priced separately."""
+        if self._fused_full_entry is not None:
+            return self._fused_full_entry
+        return self._full_per_token * self._full_layers_num
+
     def _unified_pool_bytes(self, full_tokens: int, swa_tokens: int) -> int:
         return (
-            full_tokens * self._full_per_token * self._full_layers_num
+            full_tokens * self._unified_full_bytes_per_token()
             + swa_tokens * self._swa_per_token * self._swa_layers_num
         )
 
@@ -758,7 +790,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         """Find the largest page-aligned full capacity whose allocations fit."""
         draft_bytes_per_token = self._draft_pool_bytes_per_token()
-        target_full_bytes_per_token = self._full_per_token * self._full_layers_num
+        target_full_bytes_per_token = self._unified_full_bytes_per_token()
         assert target_full_bytes_per_token > 0
 
         def allocation_bytes(full_pages: int) -> int:
@@ -927,19 +959,14 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
-        fixed_swa_bytes = (
-            swa_tokens
-            * self._swa_per_token
-            * (self._swa_layers_num + self._draft_swa_layers_num)
-        )
-        if self._enable_unified_memory:
+        fixed_swa_bytes = swa_tokens * self._swa_cell_bytes()
+        if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
             full_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
         else:
             full_cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
+                self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
             )
             full_tokens = (
