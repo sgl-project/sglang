@@ -92,7 +92,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     prefill_graph_tolerates_sum_len,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -1166,6 +1171,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
+    def _plan_dcp_metadata(self, forward_batch: ForwardBatch):
+        """DCP prefill metadata (gather buffer and KV indices), planned per batch
+        as the eager runner does before every extend; None without DCP."""
+        model = self.model_runner.model
+        if (
+            get_parallel().attn_dcp_size <= 1
+            or not hasattr(model, "prepare_context_parallel_metadata_for_dcp")
+            or forward_batch.extend_prefix_lens is None
+        ):
+            return None
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            return model.prepare_context_parallel_metadata_for_dcp(
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens,
+                forward_batch.req_pool_indices,
+                get_req_to_token_pool().req_to_token,
+                forward_batch.seq_lens_sum,
+                get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                self.model_runner.kv_cache_dtype,
+                self.model_runner.device,
+                create_chunked_prefix_cache_kv_indices,
+            )
+
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, shape_key: ShapeKey
     ) -> None:
@@ -1573,6 +1605,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        forward_batch.attn_dcp_metadata = self._plan_dcp_metadata(forward_batch)
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -2002,6 +2035,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture=False,
             )
             metadata_forward_batch = static_forward_batch
+
+        dcp_metadata = self._plan_dcp_metadata(forward_batch)
+        if dcp_metadata is not None:
+            forward_batch.attn_dcp_metadata = dcp_metadata
+            static_forward_batch.attn_dcp_metadata = dcp_metadata
+        # Eager breaks that run a whole attention module (Kimi-K3's MLA) need
+        # the unpadded batch the attention metadata is planned on.
+        static_forward_batch.live_forward_batch = forward_batch
 
         shape_key = self._shape_key(static_num_tokens, forward_batch)
         self._prepare_forward_metadata_for_replay(
