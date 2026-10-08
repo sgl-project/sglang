@@ -481,7 +481,9 @@ class TestDPBalanceMetrics(CustomTestCase):
         # when a boundary is not in it; pin the ladder so an edit cannot regress that.
         reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=0)
         batch = types.SimpleNamespace(
-            dp_balance_stats=DPBalanceStats.create(4, [8, 4], 0.002)
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
+            )
         )
         reporter.log_batch_result_stats(batch, result=object())
 
