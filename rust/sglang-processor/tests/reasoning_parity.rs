@@ -17,7 +17,8 @@ fn fixtures_match_sglang() {
             serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
         let parser = fixture["parser"].as_str().unwrap();
         for case in fixture["cases"].as_array().unwrap() {
-            let chunks: Vec<&str> = case["chunks"]
+            let input = case["input"].as_u64().unwrap() as usize;
+            let chunks: Vec<&str> = fixture["inputs"][input]["chunks"]
                 .as_array()
                 .unwrap()
                 .iter()
