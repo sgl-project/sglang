@@ -18,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import torch
 
@@ -79,6 +79,21 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _dsa_cp_metadata_backend(model_runner, forward_batch) -> Optional[Any]:
+    """Return the backend that must prepare per-token DSA CP metadata, if any.
+
+    The probe keeps every non-NPU backend untouched. Whether the model really is
+    a DSA model (and thus needs the per-token metadata) is decided by the backend
+    itself, so that a V4 draft worker sharing the class is a no-op.
+    """
+    if getattr(forward_batch, "attn_cp_metadata", None) is None:
+        return None
+    backend = model_runner.attn_backend
+    if not hasattr(backend, "prepare_dsa_cp_metadata"):
+        return None
+    return backend
 
 
 class EagerRunner(BaseRunner):
@@ -398,6 +413,24 @@ class EagerRunner(BaseRunner):
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
+            # NPU DSA under prefill CP: the rank-local shard is physically padded
+            # (per_rank_actual_token) while the DSA operators consume per-token
+            # metadata, and forward_batch.positions must point at the rank-local
+            # rows the model body actually sees. Prepared here -- after the shard
+            # (which needs the full-sequence positions) and before the model -- so
+            # that a single hook covers every model entry, target and MTP draft
+            # alike, instead of each model file re-implementing it.
+            dsa_cp_backend = _dsa_cp_metadata_backend(self.model_runner, forward_batch)
+            if dsa_cp_backend is not None:
+                dsa_cp_backend.prepare_dsa_cp_metadata(forward_batch)
+                local_positions = getattr(
+                    forward_batch, "dsa_cp_local_positions", None
+                )
+                if (
+                    local_positions is not None
+                    and sharded_positions.shape[0] == local_positions.shape[0]
+                ):
+                    forward_batch.positions = sharded_positions
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors

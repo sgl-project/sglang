@@ -3073,17 +3073,6 @@ class DeepseekV2Model(nn.Module):
                 "topk_indices from the previous stage."
             )
         device = hidden_states.device
-        attn_backend = get_attn_backend()
-        # DeepseekV2Model is shared by DSA and non-DSA models; only DSA models
-        # (e.g. GLM-5.2) consume per-token DSA CP metadata.
-        if _is_npu and self.use_dsa and forward_batch.attn_cp_metadata is not None:
-            attn_backend.prepare_dsa_cp_metadata(forward_batch)
-            local_positions = getattr(forward_batch, "dsa_cp_local_positions", None)
-            if (
-                local_positions is not None
-                and positions.shape[0] == local_positions.shape[0]
-            ):
-                forward_batch.positions = positions
 
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
