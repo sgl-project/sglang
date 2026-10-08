@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.loader.weight_utils import load_stacked_weight
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
     get_folding_tp_group,
@@ -618,37 +618,13 @@ class T5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
             if "decoder" in name or "lm_head" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 
@@ -709,41 +685,16 @@ class UMT5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
             if "decoder" in name or "lm_head" in name:
                 continue
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name,
+                loaded_weight,
+                params_dict,
+                self.config.arch_config.stacked_params_mapping,
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 
