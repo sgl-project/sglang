@@ -28,11 +28,14 @@ class _RecordingCallback:
 
 
 class _FakeTokenizerManager:
-    def __init__(self, responses):
+    def __init__(self, responses, error=None):
         self.responses = responses
+        self.error = error
 
     def generate_request(self, obj, request=None):
         async def generate():
+            if self.error is not None:
+                raise self.error
             for response in self.responses:
                 yield response
 
@@ -134,6 +137,32 @@ class TestNativeGrpcOpenAIResponses(CustomTestCase):
         payload, kwargs = calls[-1]
         self.assertEqual(kwargs["status_code"], 200)
         self.assertEqual(json.loads(payload)[0]["score"], 0.5)
+
+
+class TestNativeGrpcErrors(CustomTestCase):
+    def _run(self, error, stream):
+        callback = _RecordingCallback()
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = _FakeTokenizerManager([], error=error)
+        obj = SimpleNamespace(rid="rid-1", sampling_params={})
+        asyncio.run(handle._run_generate(obj, callback, stream=stream, request=None))
+        return callback.calls
+
+    def test_invalid_input_finishes_with_bad_request_abort(self):
+        for stream in (False, True):
+            calls = self._run(ValueError("cannot load image"), stream)
+            self.assertEqual(len(calls), 1)
+            payload, finished, error = calls[0]
+            self.assertTrue(finished)
+            self.assertIsNone(error)
+            reason = payload["meta_info"]["finish_reason"]
+            self.assertEqual(reason["type"], "abort")
+            self.assertEqual(reason["status_code"], 400)
+            self.assertIn("cannot load image", reason["message"])
+
+    def test_server_failure_stays_an_error(self):
+        calls = self._run(RuntimeError("scheduler died"), stream=False)
+        self.assertEqual(calls, [({}, True, "scheduler died")])
 
 
 class TestEngineStateNotifications(CustomTestCase):

@@ -57,6 +57,22 @@ class _GrpcRequest:
         return bool(self._is_disconnected_fn())
 
 
+def _bad_request_chunk(rid: Any, error: Exception) -> Dict[str, Any]:
+    """A terminal chunk carrying FINISH_ABORT's JSON with HTTP 400."""
+    return {
+        "output_ids": [],
+        "meta_info": {
+            "id": rid,
+            "finish_reason": {
+                "type": "abort",
+                "message": str(error),
+                "status_code": 400,
+                "err_type": "BadRequestError",
+            },
+        },
+    }
+
+
 class RuntimeHandle:
     """Thin Python handle that the Rust gRPC server calls into.
 
@@ -343,6 +359,14 @@ class RuntimeHandle:
                         return
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
+        except ValueError as e:
+            # Invalid client input found while preparing the request, such as
+            # an image that cannot be fetched or decoded. Finish with SGLang's
+            # abort shape so the client sees a 400 rather than INTERNAL.
+            logger.error("gRPC generate rejected rid=%s: %s", obj.rid, e)
+            self._safe_callback(
+                chunk_callback, _bad_request_chunk(obj.rid, e), finished=True
+            )
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
