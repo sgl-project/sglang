@@ -34,12 +34,26 @@ def _int(d, k, default=-1):
 
 
 def parse(path):
+    """Parse probe lines into field-dicts per tag.
+
+    Rows produced before c85e85c lack ``lastpos`` on [IDXK]/[C4KV]; infer it
+    from the most recent [CMPIDX] line (same forward step), so old logs still
+    align.
+    """
     recs = defaultdict(list)
+    cur_lp = None
     with open(path, "r", errors="replace") as fh:
         for ln in fh:
             mt = TAG.search(ln)
-            if mt:
-                recs[mt.group(1)].append(dict(KV.findall(ln)))
+            if not mt:
+                continue
+            tag = mt.group(1)
+            d = dict(KV.findall(ln))
+            if tag == "CMPIDX" and "lastpos" in d:
+                cur_lp = d["lastpos"]
+            elif "lastpos" not in d and cur_lp is not None:
+                d["lastpos"] = cur_lp
+            recs[tag].append(d)
     return recs
 
 
