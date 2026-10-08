@@ -6,7 +6,9 @@ Marlin kernel itself, driving it from an already-Marlin-shaped layer. What is
 only reachable through the scheme is the checkpoint-to-Marlin translation in
 process_weights_after_loading: compressed-tensors stores the global scale as a
 divisor and names the packed weight `weight_packed`, and both must be converted
-before the kernel sees them.
+before the kernel sees them. On SM100 the same checkpoint can instead go to
+FlashInfer mm_bf16_fp4 (--fp4-gemm-backend flashinfer_cutedsl/cudnn), whose
+weight and block-scale preparation is separate from Marlin's.
 """
 
 import sys
@@ -15,18 +17,32 @@ from collections.abc import Callable
 import pytest
 import torch
 
+from sglang.srt.layers.quantization import fp4_utils
+
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
 )
 from sglang.srt.utils.common import (
     is_sm80_supported,
     is_sm90_supported,
+    is_sm100_supported,
     is_sm120_supported,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import make_nvfp4_weight_and_ref
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+requires_fp4_marlin = pytest.mark.skipif(
+    not (
+        is_sm80_supported()
+        or is_sm90_supported()
+        or is_sm100_supported()
+        or is_sm120_supported()
+    ),
+    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM100/SM120",
+)
 
 SIZE_M = 17
 SIZE_K = 256
@@ -65,10 +81,7 @@ def _build_layer(
     return layer
 
 
-@pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM120",
-)
+@requires_fp4_marlin
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_input_global_scale", [False, True])
 def test_scheme_matches_dequant_reference(dtype, has_input_global_scale):
@@ -100,10 +113,7 @@ def test_scheme_matches_dequant_reference(dtype, has_input_global_scale):
     assert rel < 0.02, f"relative error {rel:.4f} too large"
 
 
-@pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM120",
-)
+@requires_fp4_marlin
 def test_uninverted_global_scale_would_overflow():
     """Guards the divisor-vs-scale conversion specifically.
 
@@ -135,6 +145,52 @@ def test_uninverted_global_scale_would_overflow():
         "expected the un-inverted divisor to overflow; if this now stays finite "
         "the reciprocal guard above no longer proves anything"
     )
+
+
+@pytest.mark.skipif(
+    not is_sm100_supported(), reason="FlashInfer mm_bf16_fp4 requires SM100"
+)
+@pytest.mark.parametrize(
+    "backend",
+    [
+        fp4_utils.Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        fp4_utils.Fp4GemmRunnerBackend.FLASHINFER_CUDNN,
+    ],
+)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_flashinfer_backend_matches_dequant_reference(monkeypatch, backend, has_bias):
+    """Covers the FlashInfer weight prep: the 128x4 block-scale swizzle and the
+    inverted global scale passed as alpha. The input is 3D to cover the reshape
+    around the 2D GEMM."""
+    if backend.is_flashinfer_cudnn():
+        cudnn = pytest.importorskip("cudnn")
+        # FlashInfer's minimum for the cuDNN bf16 x fp4 GEMM (9.23.1).
+        if cudnn.backend_version() < 92301:
+            pytest.skip(f"cuDNN {cudnn.backend_version()} lacks bf16 x fp4 GEMM")
+    monkeypatch.setattr(fp4_utils, "FP4_GEMM_RUNNER_BACKEND", backend)
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+
+    scheme = CompressedTensorsW4A16Fp4()
+    layer = _build_layer(scheme, dtype)
+    fp4_weight, scales, global_scale, weight_ref = make_nvfp4_weight_and_ref(
+        SIZE_N, SIZE_K, dtype, group_size=16
+    )
+    _load_checkpoint_weights(layer, fp4_weight, scales, global_scale)
+    scheme.process_weights_after_loading(layer)
+    assert layer.use_flashinfer_bf16_fp4
+
+    a_input = torch.randn((2, SIZE_M, SIZE_K), dtype=dtype, device="cuda") / 10
+    bias = torch.randn(SIZE_N, dtype=dtype, device="cuda") if has_bias else None
+    output = scheme.apply_weights(layer, a_input, bias)
+    output_ref = torch.matmul(a_input, weight_ref.T)
+    if bias is not None:
+        output_ref = output_ref + bias
+    torch.cuda.synchronize()
+
+    assert output.shape == (2, SIZE_M, SIZE_N)
+    rel = (output.float() - output_ref.float()).norm() / output_ref.float().norm()
+    assert rel < 0.02, f"relative error {rel:.4f} too large"
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import logging
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -30,6 +32,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
     CompressedTensorsWNA16,
 )
+from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
 LINEAR_LAYER = "model.layers.0.self_attn.q_proj"
@@ -222,6 +225,119 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         layer, _ = self._create(has_input_global_scale=False)
         self.assertEqual(layer.params_dtype, torch.bfloat16)
         self.assertEqual(layer.quant_config.group_size, 16)
+
+    def test_mismatched_fused_global_scales_are_rejected(self):
+        """Both kernels take one global scale per layer. Substituting one scale
+        for fused projections (q/k/v) that differ, while keeping their group
+        scales, silently changes the others' dequantized weights."""
+        layer = torch.nn.Module()
+        scheme = CompressedTensorsW4A16Fp4()
+        scheme.create_weights(
+            layer=layer,
+            output_partition_sizes=[256, 128, 128],
+            input_size_per_partition=2048,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        layer.weight_global_scale.data.copy_(torch.tensor([2.0, 2.0, 4.0]))
+        with self.assertRaisesRegex(ValueError, "share one weight_global_scale"):
+            scheme.process_weights_after_loading(layer)
+
+
+class TestWeightOnlyFp4BackendSelection(CustomTestCase):
+    """The weight-only GEMM follows --fp4-gemm-backend. `auto` is resolved at
+    startup (cutedsl on SM100, marlin on SM80-SM90); only the cuDNN and CuTe-DSL
+    FlashInfer backends implement bf16 x fp4."""
+
+    def _use_flashinfer(
+        self, backend, is_blackwell, dtype=torch.bfloat16, cudnn_version=92301
+    ):
+        """cudnn_version=None simulates cuDNN not being installed."""
+        from sglang.srt.layers.quantization import fp4_utils
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w4a16_nvfp4 as scheme_module,
+        )
+
+        cudnn = (
+            None
+            if cudnn_version is None
+            else SimpleNamespace(backend_version=lambda: cudnn_version)
+        )
+        with (
+            mock.patch.object(fp4_utils, "FP4_GEMM_RUNNER_BACKEND", backend),
+            override_platform(is_blackwell=is_blackwell),
+            mock.patch.dict(sys.modules, {"cudnn": cudnn}),
+        ):
+            return scheme_module._use_flashinfer_bf16_fp4(dtype)
+
+    def test_marlin_and_unresolved_auto_keep_marlin(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for backend in (Fp4GemmRunnerBackend.AUTO, Fp4GemmRunnerBackend.MARLIN):
+            with self.subTest(backend=backend.value):
+                self.assertFalse(self._use_flashinfer(backend, is_blackwell=True))
+
+    def test_flashinfer_bf16_fp4_backends_use_flashinfer_on_blackwell(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for backend in (
+            Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            Fp4GemmRunnerBackend.FLASHINFER_CUDNN,
+        ):
+            with self.subTest(backend=backend.value):
+                self.assertTrue(self._use_flashinfer(backend, is_blackwell=True))
+
+    def test_backends_without_bf16_fp4_fall_back_to_marlin(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for backend in (
+            Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+            Fp4GemmRunnerBackend.FLASHINFER_TRTLLM,
+        ):
+            with self.subTest(backend=backend.value):
+                self.assertFalse(self._use_flashinfer(backend, is_blackwell=True))
+
+    def test_fp16_activations_fall_back_to_marlin(self):
+        """mm_bf16_fp4 supports only bf16 activations."""
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        self.assertFalse(
+            self._use_flashinfer(
+                Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+                is_blackwell=True,
+                dtype=torch.float16,
+            )
+        )
+
+    def test_old_or_missing_cudnn_is_rejected_at_load(self):
+        """FlashInfer checks the cuDNN version only when the GEMM first runs, and
+        torch pins a cuDNN (9.20) older than the 9.23.1 the GEMM needs."""
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for version, found in ((92000, "found 92000"), (None, "not installed")):
+            with self.subTest(cudnn_version=version):
+                with self.assertRaisesRegex(ValueError, found):
+                    self._use_flashinfer(
+                        Fp4GemmRunnerBackend.FLASHINFER_CUDNN,
+                        is_blackwell=True,
+                        cudnn_version=version,
+                    )
+        # The CuTe-DSL backend does not use cuDNN.
+        self.assertTrue(
+            self._use_flashinfer(
+                Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+                is_blackwell=True,
+                cudnn_version=None,
+            )
+        )
+
+    def test_flashinfer_backend_before_blackwell_raises(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            self._use_flashinfer(
+                Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, is_blackwell=False
+            )
 
 
 if __name__ == "__main__":

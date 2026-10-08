@@ -20,6 +20,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -155,8 +156,11 @@ class TestWeightOnlyNvfp4MoeWeightCreation(CustomTestCase):
     """The registered parameters are a contract with the checkpoint's tensor
     names, shapes and dtypes; a mismatch surfaces only as a load-time failure."""
 
-    def _create(self, has_input_global_scale=False):
+    def _create(self, has_input_global_scale=False, is_gated=True):
         layer = torch.nn.Module()
+        # FusedMoE sets moe_runner_config before create_weights; w13's shard count
+        # comes from it.
+        layer.moe_runner_config = MoeRunnerConfig(is_gated=is_gated)
         scheme = CompressedTensorsW4A16Nvfp4MoE(
             has_input_global_scale=has_input_global_scale
         )
@@ -201,6 +205,27 @@ class TestWeightOnlyNvfp4MoeWeightCreation(CustomTestCase):
         layer, _ = self._create(has_input_global_scale=True)
         self.assertEqual(layer.w13_input_global_scale.shape, (8, 2))
         self.assertEqual(layer.w2_input_global_scale.shape, (8,))
+
+    def test_non_gated_experts_register_one_w13_shard(self):
+        """Non-gated experts have only an up projection. Allocating two shards
+        breaks the shape check when the weights are repacked for Marlin, which
+        sizes w13 from the same is_gated flag."""
+        layer, _ = self._create(has_input_global_scale=True, is_gated=False)
+        self.assertEqual(layer.w13_weight_packed.shape, (8, 1536, 1024))
+        self.assertEqual(layer.w13_weight_scale.shape, (8, 1536, 128))
+        self.assertEqual(layer.w13_weight_global_scale.shape, (8, 1))
+        self.assertEqual(layer.w13_input_global_scale.shape, (8, 1))
+
+    def test_mismatched_gate_up_global_scales_are_rejected(self):
+        """Marlin takes one w13 global scale per expert. Collapsing gate and up
+        to one scale while keeping the up group scales would silently change
+        the dequantized up weights, so this must fail at load instead."""
+        layer, scheme = self._create()
+        layer.w13_weight_global_scale.data.fill_(2.0)
+        layer.w13_weight_global_scale.data[3, 1] = 4.0
+        layer.w2_weight_global_scale.data.fill_(2.0)
+        with self.assertRaisesRegex(ValueError, r"experts \[3\] differ"):
+            scheme.process_weights_after_loading(layer)
 
 
 if __name__ == "__main__":

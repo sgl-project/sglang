@@ -15,17 +15,88 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_nvfp4_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import copy_or_rebind_param
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsW4A16Fp4"]
 
 NVFP4_GROUP_SIZE = 16
+# The first cuDNN backend with the bf16 x fp4 block-scaled GEMM that FlashInfer's
+# cudnn backend calls; older libraries do not implement it at all.
+CUDNN_BF16_FP4_MIN_VERSION = 92301
+
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args) -> None:
+    # The scheme is built per layer; log a backend fallback once per model.
+    if key not in _warned:
+        _warned.add(key)
+        logger.warning(msg, *args)
+
+
+def _check_cudnn_bf16_fp4() -> None:
+    """Fail at load rather than on the first forward: FlashInfer checks the
+    cuDNN version only when the GEMM runs, and torch pins an older cuDNN."""
+    try:
+        import cudnn
+
+        version = cudnn.backend_version()
+    except ImportError:
+        version = None
+    if version is None or version < CUDNN_BF16_FP4_MIN_VERSION:
+        found = "not installed" if version is None else f"found {version}"
+        raise ValueError(
+            "--fp4-gemm-backend flashinfer_cudnn needs cuDNN >= 9.23.1 for the "
+            f"bf16 x fp4 GEMM ({found}). Use --fp4-gemm-backend flashinfer_cutedsl "
+            "(the SM100 default), or upgrade the nvidia-cudnn wheel and "
+            "nvidia-cudnn-frontend."
+        )
+
+
+def _use_flashinfer_bf16_fp4(params_dtype: torch.dtype) -> bool:
+    """Whether to serve this weight-only layer with FlashInfer ``mm_bf16_fp4``
+    instead of FP4 Marlin, following ``--fp4-gemm-backend``.
+
+    ``auto`` already resolves to ``flashinfer_cutedsl`` on SM100 and to
+    ``marlin`` on SM80-SM90 (``initialize_fp4_gemm_config``). Only the cuDNN and
+    CuTe-DSL FlashInfer backends implement bf16 x fp4, and only for bf16
+    activations, so every other case keeps the Marlin path.
+    """
+    backend = get_fp4_gemm_runner_backend()
+    if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cudnn()):
+        if backend.is_flashinfer():
+            _warn_once(
+                "no_bf16_fp4_backend",
+                "--fp4-gemm-backend %s has no bf16 x fp4 GEMM; serving NVFP4 "
+                "weight-only linears with FP4 Marlin.",
+                backend.value,
+            )
+        return False
+    if not get_platform().is_blackwell:
+        raise ValueError(
+            f"--fp4-gemm-backend {backend.value} for NVFP4 weight-only linears "
+            "requires SM100+. Use --fp4-gemm-backend marlin on SM80-SM90."
+        )
+    if backend.is_flashinfer_cudnn():
+        _check_cudnn_bf16_fp4()
+    if params_dtype != torch.bfloat16:
+        _warn_once(
+            "non_bf16",
+            "FlashInfer mm_bf16_fp4 supports only bfloat16 activations; serving "
+            "NVFP4 weight-only linears with FP4 Marlin for this %s model.",
+            params_dtype,
+        )
+        return False
+    return True
 
 
 class _Nvfp4MarlinQuantConfig:
@@ -37,8 +108,11 @@ class _Nvfp4MarlinQuantConfig:
 
 
 class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
-    """Weight-only NVFP4 via the FP4 Marlin kernel: FP4 weights, FP16/BF16
-    activations.
+    """Weight-only NVFP4: FP4 weights, FP16/BF16 activations.
+
+    The GEMM follows ``--fp4-gemm-backend``: FlashInfer ``mm_bf16_fp4`` for
+    ``flashinfer_cutedsl`` / ``flashinfer_cudnn`` (the SM100 default) with bf16
+    activations, FP4 Marlin otherwise (the SM80-SM90 default).
 
     Serves two config shapes:
       - nvfp4a16, which has no ``input_activations`` at all;
@@ -122,19 +196,47 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         if self.has_input_global_scale:
             del layer.input_global_scale
 
-        if torch.unique(layer.weight_global_scale).numel() != 1:
-            logger.warning(
-                "In NVFP4 weight-only linear, weight_global_scale differs across "
-                "fused parallel layers. Accuracy may be degraded."
+        # Both kernels take one global scale per layer. With fused projections
+        # (q/k/v, gate/up) that only matches the checkpoint if every projection
+        # shares it: substituting one scale while keeping the other projections'
+        # group scales would silently change their dequantized weights.
+        # llm-compressor fuses these global scales when exporting.
+        global_scale = layer.weight_global_scale.data
+        if torch.unique(global_scale).numel() != 1:
+            raise ValueError(
+                "NVFP4 weight-only linear requires all fused projections to share "
+                f"one weight_global_scale, got {global_scale.tolist()}. Re-export "
+                "the checkpoint with fused global scales."
             )
         # compressed-tensors stores the global scale as a divisor (1/scale),
-        # while Marlin's prep helper expects the scale itself. Skipping the
-        # inversion overflows the bf16 bias multiply to inf, zeroing all logits.
-        copy_or_rebind_param(
-            layer,
-            "weight_global_scale",
-            (1 / layer.weight_global_scale.max()).to(torch.float32),
-        )
+        # while both kernels expect the scale itself. Skipping the inversion
+        # overflows the bf16 bias multiply to inf, zeroing all logits.
+        weight_scale_2 = (1 / global_scale[0]).to(torch.float32)
+
+        layer.use_flashinfer_bf16_fp4 = _use_flashinfer_bf16_fp4(layer.params_dtype)
+        if layer.use_flashinfer_bf16_fp4:
+            from flashinfer import prepare_bf16_fp4_weights
+
+            layer.flashinfer_backend = (
+                get_fp4_gemm_runner_backend().get_flashinfer_backend()
+            )
+            weight, weight_scale, alpha = prepare_bf16_fp4_weights(
+                layer.weight_packed.data,
+                swizzle_blockscale(layer.weight_scale.data),
+                weight_scale_2.reshape(1),
+                backend=layer.flashinfer_backend,
+            )
+            del layer.weight_packed, layer.weight_scale, layer.weight_global_scale
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", weight_scale)
+            # The backend may fold the global scale into the block scales.
+            if alpha is None:
+                layer.alpha = None
+            else:
+                copy_or_rebind_param(layer, "alpha", alpha)
+            return
+
+        copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
 
         # prepare_nvfp4_layer_for_marlin operates on `weight`; compressed-tensors
         # names the packed weight `weight_packed`.
@@ -149,6 +251,21 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if layer.use_flashinfer_bf16_fp4:
+            from flashinfer import mm_bf16_fp4
+
+            out = mm_bf16_fp4(
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                layer.weight_scale_interleaved,
+                layer.alpha,
+                backend=layer.flashinfer_backend,
+                out_dtype=x.dtype,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.view(*x.shape[:-1], layer.output_size_per_partition)
+
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
