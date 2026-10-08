@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.speculative.spec_sampling_mask import (
-    joint_filtered_verify_probs,
     verify_sampling_mask_output,
 )
 from sglang.srt.utils import (
@@ -933,20 +932,6 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if mask_req_rows is not None:
-            mask_rows, mask_probs = joint_filtered_verify_probs(
-                target_probs=target_probs,
-                mask_req_rows=mask_req_rows,
-                top_ks=sampling_info.top_ks
-                if sampling_info.need_top_k_sampling
-                else None,
-                top_ps=sampling_info.top_ps
-                if sampling_info.need_top_p_sampling
-                else None,
-                draft_token_num=verify_input.draft_token_num,
-                top_k_renorm_prob=top_k_renorm_prob,
-                top_p_renorm_prob=top_p_renorm_prob,
-            )
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
                 target_probs,
@@ -963,9 +948,9 @@ def eagle_sample(
                 ),
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        if mask_probs is not None:
-            target_probs = target_probs.index_copy(0, mask_rows, mask_probs)
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        if mask_req_rows is not None:
+            mask_probs = target_probs.index_select(0, mask_req_rows).flatten(0, 1)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
@@ -989,9 +974,6 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        if mask_req_rows is not None:
-            # A zero coin can accept a filtered-out draft because verify uses <=.
-            coins.clamp_(min=torch.finfo(coins.dtype).tiny)
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

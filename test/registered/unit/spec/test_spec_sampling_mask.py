@@ -13,7 +13,6 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
-    joint_filtered_verify_probs,
     spec_sampling_mask_unsupported_reason,
     verify_sampling_mask_output,
 )
@@ -23,43 +22,34 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _top_k_renorm(probs, top_ks):
-    out = torch.zeros_like(probs)
-    for i, k in enumerate(top_ks.tolist()):
-        values, idx = probs[i].topk(int(k))
-        out[i, idx] = values / values.sum()
-    return out
-
-
-def _top_p_renorm(probs, top_ps):
-    out = torch.zeros_like(probs)
-    for i, p in enumerate(top_ps.tolist()):
-        values, idx = probs[i].sort(descending=True)
-        keep = (values.cumsum(0) - values) < p
-        out[i, idx[keep]] = values[keep] / values[keep].sum()
-    return out
-
-
 class TestSpecSamplingMask(CustomTestCase):
-    def test_joint_filter_keeps_what_the_non_speculative_sampler_keeps(self):
-        """Top-p over the top-k-renormalized distribution (verify's order) drops token 2."""
-        probs = torch.tensor([[0.40, 0.30, 0.20, 0.10]] * 2)
-        rows, joint = joint_filtered_verify_probs(
-            target_probs=probs,
-            mask_req_rows=torch.tensor([1]),
-            top_ks=torch.tensor([4, 3]),
-            top_ps=torch.tensor([1.0, 0.75]),
+    def test_capture_preserves_the_verifiers_filtered_distribution(self):
+        # [0.4, 0.3, 0.2, 0.1] after sequential top-k=3, top-p=0.75.
+        probs = torch.tensor([[4 / 7, 3 / 7, 0.0, 0.0]])
+        original = probs.clone()
+        predict = torch.tensor([1], dtype=torch.int32)
+        accept_index = torch.tensor([[0]], dtype=torch.int32)
+        output = verify_sampling_mask_output(
+            mask_req_rows=torch.tensor([0]),
+            mask_probs=probs,
+            predict=predict,
+            accept_index=accept_index,
             draft_token_num=1,
-            top_k_renorm_prob=_top_k_renorm,
-            top_p_renorm_prob=_top_p_renorm,
+            max_tokens=4,
+            support_capture_indices=torch.tensor([0]),
+            sync_groups=(),
         )
-        sequential = _top_p_renorm(
-            _top_k_renorm(probs[1:], torch.tensor([3])), torch.tensor([0.75])
+        self.assertEqual(output.lengths.tolist(), [2])
+        self.assertEqual(output.token_ids[0, :2].tolist(), [0, 1])
+        self.assertAlmostEqual(
+            output.selected_logprobs.item(), math.log(3 / 7), places=6
         )
-        self.assertEqual(rows.tolist(), [1])
-        self.assertEqual((joint[0] > 0).tolist(), [True, True, True, False])
-        self.assertEqual((sequential[0] > 0).tolist(), [True, True, False, False])
-        torch.testing.assert_close(joint[0, :3], probs[1, :3] / 0.9)
+        torch.testing.assert_close(
+            output.support_logprobs[0, :2], original[0, :2].log()
+        )
+        torch.testing.assert_close(probs, original, rtol=0, atol=0)
+        self.assertEqual(predict.tolist(), [1])
+        self.assertEqual(accept_index.tolist(), [[0]])
 
     def test_supports_follow_accept_index_rows(self):
         """Opted-in requests 0 and 2 of 3; padding past the accept run; out-of-support is invalid."""

@@ -1,7 +1,6 @@
 """Target-model sampling supports for chain EAGLE/NEXTN verification.
 
-Each accepted position uses its verify row's target distribution, filtered with
-joint top-k/top-p to match the non-speculative sampler.
+Capture the verifier's already-filtered distribution without changing sampling.
 """
 
 from typing import Optional, Tuple
@@ -42,36 +41,6 @@ def spec_sampling_mask_unsupported_reason(
     if min_p > 0:
         return "return_sampling_mask with speculative decoding does not support min_p."
     return None
-
-
-def joint_filtered_verify_probs(
-    *,
-    target_probs: torch.Tensor,
-    mask_req_rows: torch.Tensor,
-    top_ks: Optional[torch.Tensor],
-    top_ps: Optional[torch.Tensor],
-    draft_token_num: int,
-    top_k_renorm_prob,
-    top_p_renorm_prob,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Opted-in verify rows (``req * draft_token_num + j``) and their normalized joint distribution."""
-    offsets = torch.arange(draft_token_num, device=mask_req_rows.device)
-    rows = (mask_req_rows.view(-1, 1) * draft_token_num + offsets).view(-1)
-    probs = target_probs.index_select(0, rows)
-    filtered = probs
-    if top_ks is not None:
-        ks = top_ks.index_select(0, mask_req_rows).repeat_interleave(draft_token_num)
-        filtered = top_k_renorm_prob(probs, ks)
-    if top_ps is not None:
-        ps = top_ps.index_select(0, mask_req_rows).repeat_interleave(draft_token_num)
-        top_p_probs = top_p_renorm_prob(probs, ps)
-        filtered = (
-            top_p_probs
-            if filtered is probs
-            else filtered.masked_fill(top_p_probs <= 0, 0)
-        )
-    # The verify kernel compares a coin with a draft's probability, so rows must sum to 1.
-    return rows, filtered / filtered.sum(dim=-1, keepdim=True)
 
 
 def verify_sampling_mask_output(
