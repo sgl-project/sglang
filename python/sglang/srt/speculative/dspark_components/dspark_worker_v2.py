@@ -642,6 +642,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=True,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -660,12 +661,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             on_publish(batch_output.new_seq_lens)
 
         self._inject_prefill_target_hidden(
-            batch, logits_output, next_token_ids.device, target_hidden_is_projected
+            batch,
+            logits_output,
+            batch_output.kv_loc_plan,
+            next_token_ids.device,
+            target_hidden_is_projected,
         )
+        batch_output.kv_loc_plan = None
         for replay in batch_output.swa_recompute_outputs or ():
             self._inject_prefill_target_hidden(
                 replay.batch,
                 replay.logits_output,
+                replay.kv_loc_plan,
                 next_token_ids.device,
                 target_hidden_is_projected,
             )
@@ -679,6 +686,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         logits_output,
+        kv_loc_plan,
         device,
         target_hidden_is_projected: bool,
     ) -> None:
@@ -727,7 +735,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
-        cache_loc = batch.out_cache_loc
+        # The draft KV goes to the slots the target prefill just wrote.
+        cache_loc = self._kv_injector.ids_for(kv_loc_plan)
         token_indices = logits_output.hidden_states_token_indices
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
@@ -858,6 +867,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else draft_input.nxt_kv_lens_cpu
+            ),
         )
 
         sampling_info = batch.sampling_info
@@ -952,6 +966,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,
+                    verify_window=verify_window,
                     inject_gate=fold_eligible,
                 )
             else:

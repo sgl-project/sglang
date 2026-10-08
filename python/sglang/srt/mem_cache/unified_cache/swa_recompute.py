@@ -84,7 +84,7 @@ def swa_recompute_hit_length(
 
 def init_swa_recompute(
     cache: UnifiedRadixCache, req: Req, key: RadixKey
-) -> Optional[tuple[torch.Tensor, NodeId, SWARecompute]]:
+) -> Optional[tuple[int, NodeId, SWARecompute]]:
     """Bind fresh SWA rows behind the FULL prefix and publish its last window.
     The window holds no data until the returned replay runs, so the request must
     enter the batch being built."""
@@ -122,12 +122,12 @@ def init_swa_recompute(
         tree_core.dec_full_pin(node_id)
 
     match = cache.match_prefix(MatchPrefixParams(key=key))
-    assert len(match.device_indices) == full_len, (
+    assert match.device_prefix_len == full_len, (
         f"SWA recompute published [{full_len - window}, {full_len}) but the "
-        f"prefix matches {len(match.device_indices)} tokens"
+        f"prefix matches {match.device_prefix_len} tokens"
     )
     return (
-        match.device_indices[matched_len:],
+        full_len - matched_len,
         match.last_device_node,
         SWARecompute(start=full_len - replay_len, workspace=replayed[:-window]),
     )

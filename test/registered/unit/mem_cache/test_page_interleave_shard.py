@@ -652,7 +652,7 @@ def _insert(tree, tokens, rotation_base=None, value=None):
 
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(res.device_indices)
+    return res.device_prefix_len
 
 
 class _TreeCoreBackendCase(CustomTestCase):

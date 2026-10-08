@@ -10,12 +10,14 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 
 
 class SWARecomputeOutput(msgspec.Struct):
     # Extend-shaped view of the replayed span: prefix_lens, extend_lens, out_cache_loc.
     batch: ScheduleBatch
     logits_output: LogitsProcessorOutput
+    kv_loc_plan: KVLocPlan
 
 
 def _replay_batch(batch: ScheduleBatch, i: int, start: int, runner) -> ScheduleBatch:
@@ -81,6 +83,10 @@ def run_swa_recompute(
         forward_batch.swa_recompute = True
         out = runner.forward(forward_batch)
         outputs.append(
-            SWARecomputeOutput(batch=replay, logits_output=out.logits_output)
+            SWARecomputeOutput(
+                batch=replay,
+                logits_output=out.logits_output,
+                kv_loc_plan=forward_batch.kv_loc_plan,
+            )
         )
     return outputs

@@ -134,7 +134,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
     blend_wan_ti2v_latents,
@@ -1238,11 +1237,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
-        return StageParallelismType.REPLICATED
 
     def _handle_boundary_ratio(
         self,

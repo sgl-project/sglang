@@ -343,9 +343,8 @@ class SchedulePolicy:
                     match_result = zero_match_result(
                         self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
-                in_batch_matching_prefixes = match_result.device_indices
                 if (
-                    len(in_batch_matching_prefixes)
+                    match_result.device_prefix_len
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
                     temporary_deprioritized.add(r.rid)
@@ -1376,8 +1375,7 @@ class PrefillAdder:
                     )
                 if loaded is None:
                     return AddReqResult.OTHER
-                new_indices, req.last_node = loaded
-                req.host_loaded_length = len(new_indices)
+                req.host_loaded_length, req.last_node = loaded
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "
@@ -1416,7 +1414,7 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
-                req.prefix_len += len(new_indices)
+                req.prefix_len += req.host_loaded_length
                 req.kv.cache_protected_len = req.prefix_len
 
             if req.swa_recompute_hit_length:
@@ -1437,8 +1435,8 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 else:
-                    new_indices, req.last_node, req.swa_recompute = recomputed
-                    req.prefix_len += len(new_indices)
+                    gained_len, req.last_node, req.swa_recompute = recomputed
+                    req.prefix_len += gained_len
                     req.kv.cache_protected_len = req.prefix_len
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.

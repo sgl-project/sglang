@@ -616,7 +616,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa_recompute_hit_length=swa_recompute_hit_length(
                     self,
                     params.key,
-                    len(result.device_indices),
+                    result.device_prefix_len,
                     result.full_kv_hit_length,
                 )
             )
@@ -624,7 +624,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_swa_recompute(
         self, req: Req, key: RadixKey
-    ) -> Optional[tuple[torch.Tensor, NodeId, SWARecompute]]:
+    ) -> Optional[tuple[int, NodeId, SWARecompute]]:
         return init_swa_recompute(self, req, key)
 
     def release_swa_recompute_workspace(self, req: Req) -> None:
@@ -1235,8 +1235,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # page-aligned boundary, so the normal match remains safe to repoint.
         # The tree's own walk: a session slot must not answer for the insert.
         match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -3478,10 +3478,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
-        """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node), or None when buffer-mode
-        admission must retry without committing a load."""
+    ) -> Optional[tuple[int, NodeId]]:
+        """Only buffer mode returns None: its admission retries without
+        committing a load."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3505,22 +3504,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id, last_best_match_device_node_id
                 )
                 if new_indices.numel() == 0:
-                    return (
-                        self.tree_core.empty_match_result.device_indices,
-                        last_best_match_device_node_id,
-                    )
+                    return 0, last_best_match_device_node_id
 
                 logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node_id,
                 )
-                return new_indices, best_match_node_id
+                return len(new_indices), best_match_node_id
 
-        return (
-            self.tree_core.empty_match_result.device_indices,
-            last_best_match_device_node_id,
-        )
+        return 0, last_best_match_device_node_id
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
@@ -3835,11 +3828,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
 
-    def prefix_device_indices(self, req: Req) -> torch.Tensor:
-        root = self.root_node_handle(req.extra_key)
-        path = self.tree_core.collect_full_device_indices(req.last_node, root)
-        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
-        return path[: req.prefix_len]
+    def path_device_indices(self, node: NodeId) -> torch.Tensor:
+        return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
