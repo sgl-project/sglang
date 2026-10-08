@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from torch import nn
+
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -88,7 +90,6 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 from sglang.srt.utils.common import is_building_neighbour_layer
-from torch import nn
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 

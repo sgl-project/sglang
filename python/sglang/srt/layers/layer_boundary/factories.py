@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Mapping, Optional
 
 import msgspec
+
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_exit_rows,

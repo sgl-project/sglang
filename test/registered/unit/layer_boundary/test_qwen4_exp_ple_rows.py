@@ -7,6 +7,7 @@ from unittest.mock import patch
 import test_declared_decoder_boundary as fixture
 import torch
 from parameterized import parameterized
+
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
@@ -167,9 +168,7 @@ class TestQwen4ExpPleSequenceParallelRows(CustomTestCase):
                         self._batch(embedding_rows, physical_tokens),
                     )
 
-                full = torch.arange(
-                    embedding_rows, dtype=torch.float32
-                ).unsqueeze(-1)
+                full = torch.arange(embedding_rows, dtype=torch.float32).unsqueeze(-1)
                 full = torch.nn.functional.pad(
                     full, (0, 0, 0, physical_tokens - embedding_rows)
                 )
