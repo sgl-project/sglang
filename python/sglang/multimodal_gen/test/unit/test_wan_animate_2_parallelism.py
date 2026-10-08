@@ -510,6 +510,7 @@ class _KvTaggingTransformer:
     ``__call__`` records the (clip_cond, reference_kv) pair each forward was handed."""
 
     def __init__(self):
+        self.context_calls = 0
         self.forward_calls: list[
             tuple[WanAnimate2ClipConditioning, WanAnimate2ReferenceKV]
         ] = []
@@ -517,6 +518,10 @@ class _KvTaggingTransformer:
     def build_reference_kv(self, *, clip_cond):
         latents = clip_cond.reference_video_latents
         return WanAnimate2ReferenceKV(k={0: latents}, v={0: latents})
+
+    def prepare_context(self, prompt_embeddings, image_embeddings):
+        self.context_calls += 1
+        return prompt_embeddings
 
     def __call__(self, *, hidden_states, clip_cond, reference_kv, **_unused):
         self.forward_calls.append((clip_cond, reference_kv))
@@ -606,6 +611,7 @@ def test_each_clip_is_denoised_with_kv_from_its_own_reference_video():
 
     # 2 clips x 2 steps; every forward of a clip gets the K/V built from that clip's latents.
     assert len(transformer.forward_calls) == 4
+    assert transformer.context_calls == 2
     for clip_cond, reference_kv in transformer.forward_calls:
         assert reference_kv.k[0] is clip_cond.reference_video_latents
     assert transformer.forward_calls[0][1] is not transformer.forward_calls[2][1]
@@ -627,6 +633,10 @@ def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
             events.append("forward")
             return super().__call__(**kwargs)
 
+        def prepare_context(self, *args):
+            events.append("context")
+            return super().prepare_context(*args)
+
     stage = _fake_denoising_stage(_EventTransformer(), events=events)
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(flow_shift=5.0), enable_cfg_parallel=False
@@ -644,8 +654,16 @@ def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
             clip_index=0,
         )
 
-    assert events == ["begin:transformer", "reference_kv"] + ["forward"] * 4 + [
-        "finish"
+    assert events == [
+        "begin:transformer",
+        "reference_kv",
+        "context",
+        "forward",
+        "context",
+        "forward",
+        "forward",
+        "forward",
+        "finish",
     ]
 
 

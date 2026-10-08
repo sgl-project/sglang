@@ -268,6 +268,7 @@ class WanAnimate2DenoisingStage(DenoisingStage):
             current_timestep=0, attn_metadata=None, forward_batch=batch
         ):
             reference_kv = self.transformer.build_reference_kv(clip_cond=clip_condition)
+        context_by_branch: dict[str, torch.Tensor] = {}
 
         # One record per step across every clip, like the shared loop: the perf dump and the
         # CI harness read avg/median denoise-step time from them.
@@ -287,12 +288,20 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                         attn_metadata=None,
                         forward_batch=batch,
                     ):
+                        if branch.name not in context_by_branch:
+                            context_by_branch[branch.name] = (
+                                self.transformer.prepare_context(
+                                    branch.kwargs["encoder_hidden_states"],
+                                    reference_image_embeddings,
+                                )
+                            )
                         prediction = self.transformer(
                             hidden_states=latents,
                             timestep=timestep,
                             encoder_hidden_states_image=reference_image_embeddings,
                             clip_cond=clip_condition,
                             reference_kv=reference_kv,
+                            projected_context=context_by_branch[branch.name],
                             **branch.kwargs,
                         )
                     return prediction.contiguous() if cfg_parallel else prediction
@@ -391,6 +400,8 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                     .detach()
                     .to(torch.bfloat16)
                 )
+                # only the independent overlap frames survive into the next clip
+                del decoded_frames, denoised_latents, latents, clip_condition
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()

@@ -196,36 +196,27 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
         return hidden_states, grid_size
 
-    def _condition_embeddings(
-        self,
-        timestep: torch.Tensor,  # [B]
-        prompt_embeddings: torch.Tensor,  # [B, L, text_dim]
-        image_embeddings: torch.Tensor | None,  # [B, 257, image_dim] or None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns ``(timestep_embeddings [B, C], timestep_modulation [B, 6, C],
-        encoder_hidden_states [B, 257 + L, C])``."""
-        (
-            timestep_embeddings,
-            timestep_modulation,
-            prompt_hidden_states,
-            image_hidden_states,
-        ) = self.condition_embedder(
-            timestep, prompt_embeddings, image_embeddings, timestep_seq_len=None
-        )
-        timestep_modulation = timestep_modulation.unflatten(1, (6, -1))
+    def _time_embeddings(
+        self, timestep: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        timestep_embeddings = self.condition_embedder.time_embedder(timestep, None)
+        timestep_modulation = self.condition_embedder.time_modulation(
+            timestep_embeddings
+        ).unflatten(1, (6, -1))
+        return timestep_embeddings, timestep_modulation
 
-        # Cross-attention context, image tokens first; the blocks split it at 257.
-        if image_hidden_states is not None:
-            encoder_hidden_states = torch.cat(
-                [image_hidden_states, prompt_hidden_states], dim=1
-            )
-        else:
-            encoder_hidden_states = prompt_hidden_states
-        return (
-            timestep_embeddings,
-            timestep_modulation,
-            encoder_hidden_states.to(self._dtype),
-        )
+    def prepare_context(
+        self,
+        prompt_embeddings: torch.Tensor,
+        image_embeddings: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Project one branch's timestep-invariant context; owned by the current clip."""
+        prompt_embeddings = self._pad_or_truncate_prompt_embeddings(prompt_embeddings)
+        context = self.condition_embedder.text_embedder(prompt_embeddings)
+        if image_embeddings is not None:
+            image_context = self.condition_embedder.image_embedder(image_embeddings)
+            context = torch.cat([image_context, context], dim=1)
+        return context.to(self._dtype)
 
     def _pad_or_truncate_prompt_embeddings(
         self, prompt_embeddings: torch.Tensor
@@ -268,21 +259,15 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         reference_video_frame_0_image_embeddings = (
             clip_cond.reference_video_frame_0_image_embeddings
         )  # [1, 257, 1280] bf16
-        prompt_ref_embeddings = self._pad_or_truncate_prompt_embeddings(
-            clip_cond.prompt_ref_embeddings
-        )
 
         # reference-video timestep is forced to 1.
         reference_video_timestep = torch.ones(1, device=self._device, dtype=torch.long)
         hidden_states, (reference_video_f, reference_video_h, reference_video_w) = (
             self._patch_embeddings(reference_video_latent_36ch)
         )
-        _, timestep_modulation, reference_video_encoder_hidden_states = (
-            self._condition_embeddings(
-                reference_video_timestep,
-                prompt_ref_embeddings,
-                reference_video_frame_0_image_embeddings,
-            )
+        _, timestep_modulation = self._time_embeddings(reference_video_timestep)
+        reference_video_encoder_hidden_states = self.prepare_context(
+            clip_cond.prompt_ref_embeddings, reference_video_frame_0_image_embeddings
         )
 
         reference_video_rope_cos, reference_video_rope_sin = self._reference_video_rope(
@@ -345,6 +330,7 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         reference_kv: WanAnimate2ReferenceKV,
         # This clip's conditioning from build_clip_conditioning.
         clip_cond: WanAnimate2ClipConditioning,
+        projected_context: torch.Tensor | None = None,
         # The unconditional CFG branch skips block 9 (see _run_generation_blocks).
         is_unconditional: bool = False,
     ) -> torch.Tensor:
@@ -353,13 +339,13 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
         latent_36ch = self._make_generation_input(
             hidden_states, clip_cond.generation_condition
         )
-        prompt_embeddings = self._pad_or_truncate_prompt_embeddings(
-            encoder_hidden_states
-        )
         hidden_states, (f, h, w) = self._patch_embeddings(latent_36ch)
-        timestep_embeddings, timestep_modulation, generation_encoder_hidden_states = (
-            self._condition_embeddings(
-                timestep, prompt_embeddings, encoder_hidden_states_image
+        timestep_embeddings, timestep_modulation = self._time_embeddings(timestep)
+        generation_encoder_hidden_states = (
+            projected_context
+            if projected_context is not None
+            else self.prepare_context(
+                encoder_hidden_states, encoder_hidden_states_image
             )
         )
         layout = _InContextLayout(
