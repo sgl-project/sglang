@@ -1,13 +1,29 @@
-"""CPU contracts for expanding media placeholders in token space.
+"""CPU contracts for token-space expansion and per-item media processing.
 
 partly expanded IDs + boundary -> suffix matcher -> IDs
+loaded media -> process_media_async, one task per item -> BatchFeature
 
-The matcher preserves history and never scans inserted tokens.
+The matcher preserves history and never scans inserted tokens. Source configs
+must align with the media, and decoders opened by loading are closed even when
+an item fails.
 """
 
+import asyncio
+import concurrent.futures
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import torch
+from PIL import Image
+from transformers import ProcessorMixin
+
+from sglang.srt.multimodal.media_processor import MultimodalProcessorMixin
 from sglang.srt.multimodal.mm_token_expansion import expand_token_placeholders
+from sglang.srt.multimodal.token_space.process_strategy import (
+    TokenSpaceProcessStrategy,
+)
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -92,6 +108,84 @@ class TestMMTokenExpansion(unittest.TestCase):
         ]:
             with self.subTest(input_ids=input_ids), self.assertRaises(ValueError):
                 expand_token_placeholders(input_ids, mm_token_expansion_spec)
+
+
+class _FakeMediaProcessor(ProcessorMixin):
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+class _ClosableVideoDecoder(VideoDecoderWrapper):
+    def __init__(self):
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
+class _ImageWidthStrategy(TokenSpaceProcessStrategy):
+    def process_image(self, image, processor, source_config, **kwargs):
+        pixels = torch.tensor([[image.width]], dtype=torch.float32)
+        return {"pixel_values": pixels, "num_image_tokens": [image.width]}
+
+    def get_mm_token_expansion_spec(self, processor, media_features):
+        return [([99], [[99] * count for count in media_features["num_image_tokens"]])]
+
+
+def _init_media_host(host):
+    host._tokenizer = SimpleNamespace(
+        decode=Mock(side_effect=AssertionError("Caller IDs must never decode")),
+        init_kwargs={},
+    )
+    host._processor = _FakeMediaProcessor(host._tokenizer)
+    host.FEATURE_NAMES = ["pixel_values"]
+    host.image_config = host.video_config = host.audio_config = {}
+    host.disable_fast_image_processor = True
+    host.mm_processor_executor = None
+    host.io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    host.token_space_process_strategy = _ImageWidthStrategy(None, host._processor)
+
+
+class _MediaHost(MultimodalProcessorMixin):
+    def __init__(self):
+        _init_media_host(self)
+
+
+class TestProcessMedia(unittest.TestCase):
+    def make_host(self):
+        host = _MediaHost()
+        self.addCleanup(host.io_executor.shutdown)
+        return host
+
+    def test_source_configs_must_match_media_count(self):
+        host = self.make_host()
+        for modality in ("image", "video", "audio"):
+            for configs in ([], [{}, {}]):
+                with self.subTest(modality=modality, configs=configs):
+                    with self.assertRaisesRegex(
+                        ValueError, "Source configs must align"
+                    ):
+                        asyncio.run(
+                            host.process_media_async(
+                                **{
+                                    f"{modality}s": [object()],
+                                    f"{modality}_source_configs": configs,
+                                }
+                            )
+                        )
+
+    def test_failure_still_closes_every_loaded_decoder(self):
+        # [image | decoder (unsupported video, fails)] -> the request fails after
+        # both tasks finish, and the decoder opened by loading is closed.
+        host = self.make_host()
+        decoder = _ClosableVideoDecoder()
+        with self.assertRaises(NotImplementedError):
+            asyncio.run(
+                host.process_media_async(
+                    images=[Image.new("RGB", (2, 1))], videos=[decoder]
+                )
+            )
+        self.assertEqual(decoder.close_count, 1)
 
 
 if __name__ == "__main__":
