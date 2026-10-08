@@ -214,7 +214,7 @@ class Qwen3Attention(nn.Module):
     def _try_qkv_norm_mrope(self, positions, hidden_states, forward_batch):
         if (
             not self.use_qkv_norm_mrope
-            or tuple(hidden_states.shape) != (8, 2560)
+            or tuple(hidden_states.shape) not in ((4, 2560), (8, 2560))
             or hidden_states.dtype != torch.bfloat16
             or not hidden_states.is_contiguous()
             or torch.is_grad_enabled()
@@ -231,9 +231,9 @@ class Qwen3Attention(nn.Module):
             or get_parallel().attn_dcp_size != 1
             or type(self.qkv_proj) is not QKVParallelLinear
             or self.qkv_proj.bias is not None
-            or tuple(positions.shape) != (3, 8)
+            or tuple(positions.shape) != (3, hidden_states.shape[0])
             or positions.dtype != torch.int64
-            or forward_batch.out_cache_loc.numel() != 8
+            or forward_batch.out_cache_loc.numel() != hidden_states.shape[0]
         ):
             return None
         from sglang.srt.layers.attention.trtllm_mha_backend import (
@@ -248,7 +248,7 @@ class Qwen3Attention(nn.Module):
 
         if (
             type(self.qkv_proj.quant_method) is not UnquantizedLinearMethod
-            or not use_bf16_splitk_gemm(8, 6144, 2560)
+            or not use_bf16_splitk_gemm(hidden_states.shape[0], 6144, 2560)
             or not get_bf16_gemm_backend().is_cutedsl()
             or not envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
         ):
@@ -290,7 +290,7 @@ class Qwen3Attention(nn.Module):
         return q, k, v, False
 
     def forward_prepare_native(self, positions, hidden_states, forward_batch):
-        if self.use_qkv_norm_mrope and hidden_states.shape[0] == 8:
+        if self.use_qkv_norm_mrope and hidden_states.shape[0] in (4, 8):
             fused = self._try_qkv_norm_mrope(positions, hidden_states, forward_batch)
             if fused is not None:
                 return fused

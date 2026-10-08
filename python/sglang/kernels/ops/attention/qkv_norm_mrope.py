@@ -70,6 +70,9 @@ def _rotate(x, y, c, s, upper, *, loc=None, ip=None):
 
 
 class _QKVNormMRopeEpilogue:
+    def __init__(self, num_tokens):
+        self.iterations = num_tokens // 4
+
     @cute.experimental.jit
     def allocate_scratch(self, dtype: cutlass.Constexpr):
         return cute_ext.allocate(
@@ -88,7 +91,7 @@ class _QKVNormMRopeEpilogue:
         lane = epi_tid % 32
         warp = epi_tid // 32
         qw, kw, rope, positions, axes, kc, vc, slots = ep
-        for iteration in cutlass.range_constexpr(2):
+        for iteration in cutlass.range_constexpr(self.iterations):
             token = warp + iteration * 4
             d = lane * 4
             x0 = sE[d, token].to(cutlass.Float32)
@@ -163,14 +166,19 @@ def qkv_norm_mrope(
     *,
     out=None,
 ):
-    """Write exact M8 BF16 QKV and HND page32 caches, or return None if unsupported.
+    """Write exact M4/M8 BF16 QKV and HND page32 caches, or return None if unsupported.
 
     Slots must be valid physical cache locations or negative padding sentinels.
     Positions and axis values must index the supplied rotary table. Buffers must
     not overlap inputs or each other. Compilation occurs only outside capture.
     """
-    if torch.compiler.is_compiling() or torch.is_grad_enabled():
+    if (
+        torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or tuple(x.shape) not in ((4, 2560), (8, 2560))
+    ):
         return None
+    m = x.shape[0]
     tensors = (
         x,
         weight,
@@ -184,8 +192,7 @@ def qkv_norm_mrope(
         slots,
     )
     if (
-        tuple(x.shape) != (8, 2560)
-        or tuple(weight.shape) != (6144, 2560)
+        tuple(weight.shape) != (6144, 2560)
         or not x.is_cuda
         or torch.cuda.current_device() != x.device.index
         or torch.cuda.get_device_capability(x.device) != (10, 3)
@@ -202,13 +209,13 @@ def qkv_norm_mrope(
         or tuple(k_weight.shape) != (128,)
         or rope.ndim != 2
         or rope.shape[1] != 128
-        or tuple(positions.shape) != (3, 8)
+        or tuple(positions.shape) != (3, m)
         or positions.dtype != torch.int64
         or positions.stride(1) != 1
-        or positions.stride(0) < 8
+        or positions.stride(0) < m
         or tuple(axes.shape) != (64,)
         or axes.dtype != torch.int64
-        or tuple(slots.shape) != (8,)
+        or tuple(slots.shape) != (m,)
         or slots.dtype != torch.int64
         or key_cache.ndim != 4
         or tuple(key_cache.shape[1:]) != (8, 32, 128)
@@ -216,7 +223,7 @@ def qkv_norm_mrope(
     ):
         return None
     if out is not None and (
-        tuple(out.shape) != (8, 6144)
+        tuple(out.shape) != (m, 6144)
         or out.dtype != torch.bfloat16
         or out.device != x.device
         or not out.is_contiguous()
@@ -248,18 +255,18 @@ def qkv_norm_mrope(
     if compiled is None and torch.cuda.is_current_stream_capturing():
         return None
     if out is None:
-        out = torch.empty((8, 6144), dtype=x.dtype, device=x.device)
+        out = torch.empty((m, 6144), dtype=x.dtype, device=x.device)
     args = _to_cute_swap(x, weight.T, out, None)
     extra = tuple(from_dlpack(t, assumed_align=8) for t in ep)
     stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     if compiled is None:
-        validate_tactic(_TACTIC, 8, 6144, 2560)
+        validate_tactic(_TACTIC, m, 6144, 2560)
         assert _align_up(_smem_bytes(_TACTIC, 6), 128) + 2048 <= 227 * 1024
         kernel = SplitKDenseGemmKernel(
             tactic=_TACTIC,
             use_pdl=True,
             has_bias=False,
-            epilogue_hook=_QKVNormMRopeEpilogue(),
+            epilogue_hook=_QKVNormMRopeEpilogue(m),
         )
         compiled = cute_ext.compile(_run, kernel, *args[:3], extra, stream)
         _COMPILED[key] = compiled
