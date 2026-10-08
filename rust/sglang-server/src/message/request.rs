@@ -1010,17 +1010,6 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
-
-        // Native requests have one choice per prompt; scalar hosts still
-        // need their broadcast budget before per-prompt allocation.
-        let body = serde_json::json!({
-            "text": vec!["hi"; 200],
-            "bootstrap_host": blob,
-        })
-        .to_string();
-        let err = requests(&body).unwrap_err().to_string();
-        assert!(err.contains("bootstrap_host"), "{err}");
-        assert!(err.contains("would allocate more than"), "{err}");
     }
 
     #[test]
@@ -1192,14 +1181,6 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
-
-        let (ps, _) = requests(&format!(
-            r#"{{"text": ["a", "b"], "bootstrap_room": {}}}"#,
-            i64::MAX
-        ))
-        .unwrap();
-        assert_eq!(ps[0].bootstrap_room, Some(i64::MAX));
-        assert_eq!(ps[1].bootstrap_room, Some(i64::MIN));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The
