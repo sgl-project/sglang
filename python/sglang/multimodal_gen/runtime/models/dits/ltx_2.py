@@ -692,7 +692,6 @@ class LTX2TPRMSNormAcrossHeads(nn.Module):
     ) -> None:
         super().__init__()
         self.full_hidden_size = full_hidden_size
-        self.local_hidden_size = local_hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(local_hidden_size))
 

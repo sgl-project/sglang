@@ -375,7 +375,6 @@ class DomainAwareLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
         self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
         nn.init.xavier_uniform_(

@@ -203,7 +203,6 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
         tp_size = get_tp_world_size()
 
         # layers
