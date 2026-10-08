@@ -87,10 +87,8 @@ def parse_decision_layout(
     """The questions of a layout, placed on the sequence the model reads.
 
     Every span follows the prompt's images, so expanding their placeholders
-    shifts all spans by the number of added tokens. Spans come in prompt order
-    without overlap, each question before its options, as encode_joint_schema
-    writes them. Raises ValueError when the layout does not describe the
-    sequence, or needs more option slots than one head pass holds.
+    shifts all spans by the number of added tokens. Raises ValueError when the
+    layout does not describe the sequence.
     """
     if len(layout) < 2 or any(type(value) is not int for value in layout):
         raise ValueError("decision_layout must be a list of ints")
@@ -100,7 +98,6 @@ def parse_decision_layout(
         raise ValueError("decision_layout does not match the prompt length")
     questions = []
     cursor = 2
-    previous_end = 0
     for _ in range(num_questions):
         if cursor + 4 > len(layout):
             raise ValueError("decision_layout is truncated")
@@ -109,32 +106,22 @@ def parse_decision_layout(
         if (
             not 0 <= question_type < len(QUESTION_TYPES)
             or num_options < 1
-            or not previous_end <= start < end <= prompt_length
+            or not 0 <= start < end <= prompt_length
             or cursor + 2 * num_options > len(layout)
         ):
             raise ValueError("decision_layout has an invalid question")
-        previous_end = end
         spans = []
         for _ in range(num_options):
             option_start, option_end = layout[cursor : cursor + 2]
             cursor += 2
-            if not previous_end <= option_start < option_end <= prompt_length:
+            if not 0 <= option_start < option_end <= prompt_length:
                 raise ValueError("decision_layout has an invalid option span")
-            previous_end = option_end
             spans.append((option_start + shift, option_end + shift))
         questions.append(
             LayoutQuestion(question_type, (start + shift, end + shift), tuple(spans))
         )
     if cursor != len(layout):
         raise ValueError("decision_layout has trailing values")
-    # The head pads every question to the widest one, and _groups never splits
-    # a request, so one layout must fit one pass.
-    slots = num_questions * max(len(question.option_spans) for question in questions)
-    if slots > _MAX_GROUP_SLOTS:
-        raise ValueError(
-            f"decision_layout needs {slots} option slots, "
-            f"but one head pass holds {_MAX_GROUP_SLOTS}"
-        )
     return questions
 
 
