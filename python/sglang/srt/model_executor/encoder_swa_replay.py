@@ -96,7 +96,11 @@ def _build_replay_batch(*, batch, runner, rows):
     replay = copy(batch)
     replay.reqs = reqs
     replay.input_ids = torch.tensor(
-        [t for r, s, e in zip(reqs, starts, ends) for t in r.full_untruncated_fill_ids[s:e]],
+        [
+            t
+            for r, s, e in zip(reqs, starts, ends)
+            for t in r.full_untruncated_fill_ids[s:e]
+        ],
         dtype=torch.int64,
         device=runner.device,
     )
@@ -156,7 +160,9 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         if r:
             head = list(req.full_untruncated_fill_ids[pre[i] : pre[i] + r])
             ids.append(torch.tensor(head, dtype=batch.input_ids.dtype, device=device))
-            locs.append(req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].long())
+            locs.append(
+                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].long()
+            )
             cpu_ids.append(torch.tensor(head, dtype=torch.int64))
         ids.append(batch.input_ids[off : off + n])
         locs.append(batch.out_cache_loc[off : off + n].long())
@@ -180,8 +186,12 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
             x + r for x, r in zip(batch.extend_logprob_start_lens, replay)
         ]
     if batch.engram_history is not None:
-        folded.engram_history = _engram_history(reqs=batch.reqs, starts=pre, runner=runner)
-    floor = torch.tensor([p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64)
+        folded.engram_history = _engram_history(
+            reqs=batch.reqs, starts=pre, runner=runner
+        )
+    floor = torch.tensor(
+        [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
+    )
     row_floor = torch.repeat_interleave(
         floor, torch.tensor(new_ext), output_size=fold_off
     )
@@ -189,6 +199,8 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         batch=folded,
         keep_rows=torch.cat(keep).to(device, non_blocking=True),
         row_floor=row_floor.to(device, non_blocking=True),
-        compress_skip=torch.tensor(replay, dtype=torch.int32).to(device, non_blocking=True),
+        compress_skip=torch.tensor(replay, dtype=torch.int32).to(
+            device, non_blocking=True
+        ),
         num_rows=fold_off,
     )
