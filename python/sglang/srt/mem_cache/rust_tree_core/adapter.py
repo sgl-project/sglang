@@ -267,7 +267,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
 def _match_result_from_binding(result) -> MatchResult:
     """Build the Python MatchResult for the binding's match result."""
     return MatchResult(
-        device_indices=result.device_indices,
+        device_prefix_len=result.device_prefix_len,
         last_device_node=result.last_device_node_id,
         last_host_node=result.last_host_node_id,
         best_match_node=result.best_match_node_id,
@@ -439,6 +439,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # The default-root empty result, prebuilt once from the binding.
         self._empty_match_result = _match_result_from_binding(
             self._binding.empty_match_result()
+        )
+        self._empty_device_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
         )
 
     def _binding_class(self) -> type:
@@ -716,6 +719,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def empty_match_result(self) -> MatchResult:
         return self._empty_match_result
+
+    @property
+    def empty_device_indices(self) -> torch.Tensor:
+        return self._empty_device_indices
 
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
         return self._binding.is_full_device_evicted(node_id)
