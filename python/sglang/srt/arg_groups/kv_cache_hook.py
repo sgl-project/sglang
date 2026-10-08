@@ -755,6 +755,9 @@ def handle_page_major_kv_layout(server_args: Any):
     # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
     #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
     #   int64 strides), with the same KDA-only caveat.
+    #   aiter is absent on purpose. Its paged state_cache accepts a padded
+    #   stride(0), which is the envelope shape. Measure it under
+    #   --enable-page-major-kv-layout before you admit it.
     # - mamba (mamba2/short-conv state): triton only.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.

@@ -192,12 +192,30 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "NVIDIA KDA prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_aiter():
+            from sglang.srt.layers.attention.linear.kernels.kda_aiter import (
+                AiterKDAKernel,
+            )
+
+            aiter_kernel = AiterKDAKernel()
+            if aiter_kernel.supports_prefill:
+                self.extend_kernel = aiter_kernel
+            else:
+                # The backend needs gfx950 and an AITER that has
+                # chunk_kimi_delta_attn. Every other case serves on Triton
+                # instead of failing the launch.
+                self.extend_kernel = triton_kernel
+                rank0_log(
+                    "AITER KDA prefill is unavailable "
+                    f"({aiter_kernel.unavailable_reason}); "
+                    "falling back to Triton extend."
+                )
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM100 or SM103)."
+                "KDA supports 'triton', 'aiter', 'helion', 'flashkda', 'cutedsl', "
+                "'nvidia_kda', or 'ptx_kda' (aiter prefill needs ROCm gfx950; "
+                "cutedsl/nvidia_kda prefill need SM100, ptx_kda SM100 or SM103)."
             )
 
         self.supports_packed_decode = getattr(

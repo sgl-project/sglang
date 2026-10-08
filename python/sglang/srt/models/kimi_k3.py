@@ -3556,6 +3556,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
+
+            from sglang.srt.layers.attention.linear.kernels.kda_aiter import (
+                precompile_aiter_kda_prefill,
+            )
+
+            if precompile_aiter_kda_prefill(
+                num_heads=layer.self_attn.local_num_heads,
+                head_k_dim=layer.self_attn.head_k_dim,
+                head_v_dim=layer.self_attn.head_v_dim,
+                device=layer.self_attn.dt_bias.device,
+            ):
+                rank0_log("Precompiled the AITER Kimi-K3 KDA prefill kernel.")
             break
 
 
