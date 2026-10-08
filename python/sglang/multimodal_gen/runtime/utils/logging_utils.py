@@ -19,56 +19,12 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
-import sglang.multimodal_gen.envs as envs
-
-SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
-SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
-
 # color
 CYAN = "\033[1;36m"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RESET = "\033[0;0m"
-
-_FORMAT = (
-    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s: %(lineno)d] %(message)s"
-)
-
-# _FORMAT = "[%(asctime)s] %(message)s"
-_DATE_FORMAT = "%m-%d %H:%M:%S"
-
-DEFAULT_LOGGING_CONFIG = {
-    "formatters": {
-        "sgl_diffusion": {
-            "class": "sglang.multimodal_gen.runtime.utils.logging_utils.ColoredFormatter",
-            "datefmt": _DATE_FORMAT,
-            "format": _FORMAT,
-        },
-    },
-    "handlers": {
-        "sgl_diffusion": {
-            "class": "logging.StreamHandler",
-            "formatter": "sgl_diffusion",
-            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
-            "stream": "ext://sys.stdout",
-        },
-    },
-    "loggers": {
-        "sgl_diffusion": {
-            "handlers": ["sgl_diffusion"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-    "root": {
-        "handlers": ["sgl_diffusion"],
-        "level": "DEBUG",
-    },
-    "version": 1,
-    "disable_existing_loggers": False,
-}
 
 
 class ColoredFormatter(logging.Formatter):
