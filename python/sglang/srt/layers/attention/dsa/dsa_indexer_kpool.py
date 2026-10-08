@@ -63,7 +63,9 @@ logger = logging.getLogger(__name__)
 if is_npu():
     try:
         if envs.SGLANG_NPU_INDEXER_INT8.get():
-            logger.warning("SGLANG_NPU_INDEXER_INT8 is True and it force to call torch_npu.npu_quant_lightning_indexer that is crashed after custom_ops  overrides it. So  custom_ops is disabled for SGLANG_NPU_INDEXER_INT8==True ")
+            logger.warning(
+                "SGLANG_NPU_INDEXER_INT8 is True and it force to call torch_npu.npu_quant_lightning_indexer that is crashed after custom_ops  overrides it. So  custom_ops is disabled for SGLANG_NPU_INDEXER_INT8==True "
+            )
         else:
             import custom_ops  # noqa: F401
     except ImportError:

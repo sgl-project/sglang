@@ -648,14 +648,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
-        self.indexer_kv_store_int8 = index_head_dim is not None and envs.SGLANG_NPU_INDEXER_INT8.get()
+        self.indexer_kv_store_int8 = (
+            index_head_dim is not None and envs.SGLANG_NPU_INDEXER_INT8.get()
+        )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
         else:
             self.index_k_store_dtype = self.store_dtype
-            self.index_k_scale_dtype = torch.float32 if self.dsa_kv_cache_store_fp8 else None
-
+            self.index_k_scale_dtype = (
+                torch.float32 if self.dsa_kv_cache_store_fp8 else None
+            )
 
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
@@ -707,7 +710,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if (self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8) and self.num_indexer_layers > 0:
+                if (
+                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -809,7 +814,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        assert scale.dtype == self.index_k_scale_dtype, f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        assert scale.dtype == self.index_k_scale_dtype, (
+            f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        )
         torch_npu.npu_scatter_nd_update_(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
@@ -954,7 +961,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
     ):
         if self.indexer_kv_store_int8:
-            assert index_k.dtype == self.index_k_store_dtype, f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            )
         else:
             if index_k.dtype != self.dtype:
                 index_k = index_k.to(self.dtype)

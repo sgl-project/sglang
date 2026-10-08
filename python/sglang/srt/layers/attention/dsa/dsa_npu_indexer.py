@@ -211,7 +211,10 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.index_k_store_dtype, pool.index_k_scale_dtype
+                k,
+                pool.indexer_hadamard_128,
+                pool.index_k_store_dtype,
+                pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(
                 layer_id, forward_batch.out_cache_loc, k_scale
@@ -293,7 +296,9 @@ class DSANPUIndexerMixin:
             and forward_batch.attn_cp_metadata is not None
         ):
             if use_quant_indexer and pool.indexer_kv_store_int8:
-                raise RuntimeError("SGLANG_NPU_INDEXER_INT8 is on together with prefill CP (attn_cp_size>1)")
+                raise RuntimeError(
+                    "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP (attn_cp_size>1)"
+                )
             block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -316,11 +321,15 @@ class DSANPUIndexerMixin:
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
                     pool.index_k_store_dtype,
-                    pool.index_k_scale_dtype
+                    pool.index_k_scale_dtype,
                 )
 
-                #int8 keys requires fp16 weights
-                op_weights = weights.to(torch.float16) if pool.index_k_store_dtype == torch.int8 else weights
+                # int8 keys requires fp16 weights
+                op_weights = (
+                    weights.to(torch.float16)
+                    if pool.index_k_store_dtype == torch.int8
+                    else weights
+                )
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=query,
