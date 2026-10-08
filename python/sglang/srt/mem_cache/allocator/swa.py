@@ -539,6 +539,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         self.swa_attn_allocator.free_page_ids(swa_pages)
+        # `maybe_evict_swa` releases a request's out-of-window SWA pages right
+        # before the SAME step's `alloc_extend` runs. With `need_sort` off,
+        # `free_page_ids` PREPENDS the released pages, so the new tokens are
+        # handed those very pages straight back and the reused prefix's window
+        # ends up aliasing rows the prefix still references. Park the just-freed
+        # pages at the back of the free list instead: the next allocation then
+        # draws from pages this request did not just release.
+        _n = int(swa_pages.numel())
+        _fp = self.swa_attn_allocator.free_pages
+        if not self.swa_attn_allocator.need_sort and _n > 0 and _n <= _fp.numel():
+            self.swa_attn_allocator.free_pages = torch.cat((_fp[_n:], _fp[:_n]))
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def _free_swa_pages_none_cuda(
