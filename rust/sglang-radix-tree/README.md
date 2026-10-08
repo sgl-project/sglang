@@ -58,8 +58,10 @@ The controller then calls `finish_mamba_state_eviction` or
 tree's mutex; both tree cores implement the same contract.
 
 Rust code compiled into this extension registers named native factories with
-`register_tree_component(name, kind, factory, replace)`. Factories support plain
-and bigram keys. Each binding snapshots its selected factories before construction;
+`register_tree_component(name, kind, factory, replace)`. A factory implements
+`TreeComponentFactory<K>::create` for both plain and bigram keys, which can share
+one generic `impl<K: ChildKeyType>`. Closures returning a component that supports
+both key types also work. Each binding snapshots its selected factories before construction;
 replacing a registration affects future bindings and preserves the registered kind.
 
 Both concrete binding constructors accept an optional

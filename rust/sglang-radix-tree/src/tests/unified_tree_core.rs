@@ -238,7 +238,7 @@ fn exercise_component_factory<K: TreeComponentKey>(key: K) {
             if component_type == SWA {
                 counter.clone()
             } else {
-                components::create_tree_component::<K>(component_type, params)
+                Arc::new(components::FullComponent)
             }
         },
     );

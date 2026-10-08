@@ -2,15 +2,14 @@
 #![allow(unused_variables)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use tch::Tensor;
 
 use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
-    IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
-    PoolTransfer, PoolTransferResult, UnifiedTreeCore,
+    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
+    InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
+    PoolTransferResult, UnifiedTreeCore,
 };
 
 mod full;
@@ -21,18 +20,6 @@ mod swa;
 pub use full::FullComponent;
 pub use mamba::MambaComponent;
 pub use swa::SwaComponent;
-
-/// Construct the built-in driver for one component kind.
-pub fn create_tree_component<K: ChildKeyType>(
-    component_type: ComponentType,
-    params: &CacheInitParams,
-) -> Arc<dyn TreeComponent<K> + Send + Sync> {
-    match component_type {
-        ComponentType::Full => Arc::new(FullComponent),
-        ComponentType::Swa => Arc::new(SwaComponent::new(params)),
-        ComponentType::Mamba => Arc::new(MambaComponent::new(params)),
-    }
-}
 
 /// Whether `node_id` holds the component's data on `target`, checking its
 /// device or host slot.

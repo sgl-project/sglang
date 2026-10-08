@@ -15,58 +15,55 @@ pub struct TreeComponentArgument<'a> {
     pub is_bigram: bool,
 }
 
-/// A native factory supporting both tree key representations.
-pub trait TreeComponentFactory: Send + Sync {
-    fn create_plain(&self, argument: &TreeComponentArgument<'_>)
-    -> TreeComponentInstance<Vec<i64>>;
-    fn create_bigram(
-        &self,
-        argument: &TreeComponentArgument<'_>,
-    ) -> TreeComponentInstance<Vec<(i64, i64)>>;
+/// A native factory for a tree's key representation.
+pub trait TreeComponentFactory<K: ChildKeyType>: Send + Sync {
+    fn create(&self, argument: &TreeComponentArgument<'_>) -> TreeComponentInstance<K>;
 }
 
-impl<F, C> TreeComponentFactory for F
+impl<K, F, C> TreeComponentFactory<K> for F
 where
+    K: ChildKeyType,
     F: Fn(&TreeComponentArgument<'_>) -> C + Send + Sync,
-    C: TreeComponent<Vec<i64>> + TreeComponent<Vec<(i64, i64)>> + Send + Sync + 'static,
+    C: TreeComponent<K> + Send + Sync + 'static,
 {
-    fn create_plain(
-        &self,
-        argument: &TreeComponentArgument<'_>,
-    ) -> TreeComponentInstance<Vec<i64>> {
+    fn create(&self, argument: &TreeComponentArgument<'_>) -> TreeComponentInstance<K> {
         Arc::new(self(argument))
     }
+}
 
-    fn create_bigram(
-        &self,
-        argument: &TreeComponentArgument<'_>,
-    ) -> TreeComponentInstance<Vec<(i64, i64)>> {
-        Arc::new(self(argument))
-    }
+/// One registered factory supports both concrete tree key representations.
+pub trait RegisteredTreeComponentFactory:
+    TreeComponentFactory<Vec<i64>> + TreeComponentFactory<Vec<(i64, i64)>>
+{
+}
+
+impl<F> RegisteredTreeComponentFactory for F where
+    F: TreeComponentFactory<Vec<i64>> + TreeComponentFactory<Vec<(i64, i64)>>
+{
 }
 
 pub trait TreeComponentKey: ChildKeyType {
     fn create(
-        factory: &dyn TreeComponentFactory,
+        factory: &dyn RegisteredTreeComponentFactory,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self>;
 }
 
 impl TreeComponentKey for Vec<i64> {
     fn create(
-        factory: &dyn TreeComponentFactory,
+        factory: &dyn RegisteredTreeComponentFactory,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self> {
-        factory.create_plain(argument)
+        TreeComponentFactory::<Self>::create(factory, argument)
     }
 }
 
 impl TreeComponentKey for Vec<(i64, i64)> {
     fn create(
-        factory: &dyn TreeComponentFactory,
+        factory: &dyn RegisteredTreeComponentFactory,
         argument: &TreeComponentArgument<'_>,
     ) -> TreeComponentInstance<Self> {
-        factory.create_bigram(argument)
+        TreeComponentFactory::<Self>::create(factory, argument)
     }
 }
 
@@ -90,14 +87,14 @@ pub enum TreeComponentRegistryError {
     },
 }
 
-type FactoryEntry = (ComponentType, Arc<dyn TreeComponentFactory>);
+type FactoryEntry = (ComponentType, Arc<dyn RegisteredTreeComponentFactory>);
 
 pub struct TreeComponentRegistry {
     factories: RwLock<HashMap<String, FactoryEntry>>,
 }
 
 pub struct TreeComponentFactorySnapshot {
-    factories: HashMap<ComponentType, Arc<dyn TreeComponentFactory>>,
+    factories: HashMap<ComponentType, Arc<dyn RegisteredTreeComponentFactory>>,
 }
 
 impl TreeComponentFactorySnapshot {
@@ -166,13 +163,13 @@ impl TreeComponentRegistry {
         &self,
         name: &str,
         component_type: ComponentType,
-        factory: impl TreeComponentFactory + 'static,
+        factory: impl RegisteredTreeComponentFactory + 'static,
         replace: bool,
     ) -> Result<(), TreeComponentRegistryError> {
         if name.trim().is_empty() {
             return Err(TreeComponentRegistryError::EmptyKey);
         }
-        let factory: Arc<dyn TreeComponentFactory> = Arc::new(factory);
+        let factory: Arc<dyn RegisteredTreeComponentFactory> = Arc::new(factory);
         let previous = {
             let mut factories = self.factories.write().unwrap();
             if let Some((registered_type, _)) = factories.get(name) {
@@ -249,7 +246,7 @@ fn tree_component_registry() -> &'static TreeComponentRegistry {
 pub fn register_tree_component(
     name: &str,
     component_type: ComponentType,
-    factory: impl TreeComponentFactory + 'static,
+    factory: impl RegisteredTreeComponentFactory + 'static,
     replace: bool,
 ) -> Result<(), TreeComponentRegistryError> {
     tree_component_registry().register_tree_component(name, component_type, factory, replace)

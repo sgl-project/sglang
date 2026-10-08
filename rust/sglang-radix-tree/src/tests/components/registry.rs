@@ -9,6 +9,42 @@ fn full_factory(_: &TreeComponentArgument<'_>) -> FullComponent {
     FullComponent
 }
 
+struct KeyedFactoryForTest {
+    key_modes: Arc<Mutex<Vec<bool>>>,
+}
+
+impl<K: ChildKeyType> TreeComponentFactory<K> for KeyedFactoryForTest {
+    fn create(&self, argument: &TreeComponentArgument<'_>) -> TreeComponentInstance<K> {
+        assert_eq!(argument.component_type, FULL);
+        assert_eq!(argument.is_bigram, K::IS_BIGRAM);
+        self.key_modes.lock().unwrap().push(K::IS_BIGRAM);
+        Arc::new(FullComponent)
+    }
+}
+
+#[test]
+fn one_generic_factory_registration_supports_both_key_types() {
+    let registry = TreeComponentRegistry::default();
+    let key_modes = Arc::new(Mutex::new(Vec::new()));
+    registry
+        .register_tree_component(
+            "keyed_full",
+            FULL,
+            KeyedFactoryForTest {
+                key_modes: Arc::clone(&key_modes),
+            },
+            false,
+        )
+        .unwrap();
+    let snapshot = registry
+        .snapshot(&[FULL], &HashMap::from([(FULL, "keyed_full".to_owned())]))
+        .unwrap();
+    let params = CacheInitParams::default();
+    snapshot.create::<Vec<i64>>(FULL, &params);
+    snapshot.create::<Vec<(i64, i64)>>(FULL, &params);
+    assert_eq!(*key_modes.lock().unwrap(), [false, true]);
+}
+
 #[test]
 fn registration_requires_explicit_replacement_and_preserves_kind() {
     let registry = TreeComponentRegistry::default();
