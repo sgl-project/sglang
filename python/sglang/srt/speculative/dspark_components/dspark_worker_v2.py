@@ -997,6 +997,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             draft_token_num=self.verify_num_draft_tokens,
             bs=bs,
+            greedy_mask=draft_block.greedy_mask,
         )
         if sampling_mask_capture is not None:
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(

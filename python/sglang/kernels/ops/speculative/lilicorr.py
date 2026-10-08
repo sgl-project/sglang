@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dflash import (
+    candidate_probs,
     sample_indices_from_probs,
-    selector_proposal_probs,
     selector_walk_triton,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 
 # Launch geometry tuned on H100 for a ~150k vocabulary; TILE * TPP is the load block.
 _TILE = 1024
@@ -183,31 +183,18 @@ def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Te
 def _selector_walk_torch(
     *,
     candidate_ids: torch.Tensor,
-    scores: torch.Tensor,
+    probs: torch.Tensor,
     uniforms: torch.Tensor,
-    temperatures: torch.Tensor,
-    greedy_mask: torch.Tensor,
-    scores_are_probs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _, num_slots, topk = candidate_ids.shape
-    temps = temperatures.view(-1, 1).to(torch.float32)
-    greedy = greedy_mask.view(-1)
-    previous = torch.zeros(greedy.shape[0], dtype=torch.int64, device=scores.device)
+    batch, num_slots, topk = candidate_ids.shape
+    previous = torch.zeros(batch, dtype=torch.int64, device=probs.device)
     tokens, q_rows = [], []
     for slot in range(num_slots):
-        node = torch.gather(
-            scores[:, slot].float(), 1, previous.view(-1, 1, 1).expand(-1, 1, topk)
+        q_row = torch.gather(
+            probs[:, slot], 1, previous.view(-1, 1, 1).expand(-1, 1, topk)
         ).squeeze(1)
-        probs = node if scores_are_probs else torch.softmax(node / temps, dim=-1)
-        sampled = sample_indices_from_probs(probs, uniforms[:, slot : slot + 1])
-        previous = torch.where(greedy, node.argmax(dim=-1), sampled)
-        q_rows.append(
-            torch.where(
-                greedy.unsqueeze(-1),
-                F.one_hot(previous, topk).to(torch.float32),
-                probs,
-            )
-        )
+        previous = sample_indices_from_probs(q_row, uniforms[:, slot : slot + 1])
+        q_rows.append(q_row)
         tokens.append(
             torch.gather(candidate_ids[:, slot], 1, previous.view(-1, 1)).squeeze(1)
         )
@@ -219,29 +206,10 @@ def lilicorr_sample_path(
     log_pair: torch.Tensor,
     candidate_tokens: torch.Tensor,
     uniforms: torch.Tensor,
-    temperatures: torch.Tensor,
-    greedy_mask: torch.Tensor,
-    top_ks: Optional[torch.Tensor] = None,
-    top_ps: Optional[torch.Tensor] = None,
+    params: Optional[DraftSamplingParams],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # No log-prob prior in the proposal: the head was trained without one. Greedy rows
     # report a point mass so min(1, p/q) stays the right acceptance test.
-    scores = _lattice_scores(log_start, log_pair)
-    use_truncation = top_ks is not None or top_ps is not None
-    if use_truncation:
-        scores = selector_proposal_probs(
-            scores=scores,
-            temperatures=temperatures,
-            greedy_mask=greedy_mask,
-            top_ks=top_ks,
-            top_ps=top_ps,
-        )
-    walk = selector_walk_triton if scores.is_cuda else _selector_walk_torch
-    return walk(
-        candidate_ids=candidate_tokens,
-        scores=scores,
-        uniforms=uniforms,
-        temperatures=temperatures,
-        greedy_mask=greedy_mask,
-        scores_are_probs=use_truncation,
-    )
+    probs = candidate_probs(_lattice_scores(log_start, log_pair), params)
+    walk = selector_walk_triton if probs.is_cuda else _selector_walk_torch
+    return walk(candidate_ids=candidate_tokens, probs=probs, uniforms=uniforms)

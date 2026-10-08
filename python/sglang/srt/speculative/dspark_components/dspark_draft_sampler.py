@@ -10,6 +10,7 @@ from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     _DRAFT_PROBS,
+    sample_with_exp_noise,
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -72,16 +73,14 @@ class DsparkDraftSampler:
         )
         self.folded_sampling = folded_sampling
         self._tp_sync = tp_sync
-        self.temperatures = None
+        self.sampling_params = None
         self.greedy_mask = None
         self.exp_noise = None
         self.corrected_out = None
         self.probs_out = None
-        self.sampling_params = None
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
-            self.sampling_params = DraftSamplingParams.create(max_bs, device)
-            self.temperatures = self.sampling_params.temperatures.view(-1)
+            self.sampling_params = DraftSamplingParams.greedy(max_bs, device)
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
@@ -101,9 +100,10 @@ class DsparkDraftSampler:
         if not self.folded_sampling:
             return
         self.sampling_params.copy_from(sampling_info, bs)
-        # Refresh the entire bucket so graph padding cannot retain parameters
-        # from a previous, larger batch.
-        self.greedy_mask.copy_(self.sampling_params.greedy_mask)
+        if sampling_info is None:
+            self.greedy_mask[:bs].fill_(True)
+            return
+        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -135,25 +135,17 @@ class DsparkDraftSampler:
 
         if draft_tokens is None:
             if self.folded_sampling:
+                params = self.sampling_params.slice(bs)
+                probs_out = self.probs_out[: bs * self.gamma].view(bs, self.gamma, -1)
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                    probs = expect(
-                        _DRAFT_PROBS,
-                        build_draft_probs(step_logits, self.sampling_params.slice(bs)),
-                    )
-                    self.probs_out[: bs * self.gamma].view(bs, self.gamma, -1)[
-                        :, step_idx
-                    ].copy_(probs)
+                    probs = expect(_DRAFT_PROBS, build_draft_probs(step_logits, params))
+                    probs_out[:, step_idx].copy_(probs)
                     # In-graph philox noise: each replay advances the generator
                     # and redraws.
-                    noise = (
-                        self.exp_noise[:bs]
-                        .exponential_()
-                        .clamp_min_(torch.finfo(torch.float32).tiny)
-                    )
                     return self._tp_sync.sync(
                         SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
-                        (probs / noise).argmax(dim=-1),
+                        sample_with_exp_noise(probs, self.exp_noise[:bs]),
                     )
 
             else:

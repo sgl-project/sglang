@@ -1,4 +1,4 @@
-"""Probability cutoffs shared by speculative proposals and verification."""
+"""Top-k / top-p renormalization shared by draft proposals and target verification."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def top_k_renorm_probs(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tenso
         from flashinfer.sampling import top_k_renorm_probs as renorm
 
         return renorm(probs, top_ks)
-    if probs.device.type == "musa":
+    if probs.device.type in ("musa", "xpu"):
         from sgl_kernel import top_k_renorm_prob
 
         return top_k_renorm_prob(probs, top_ks)
@@ -40,7 +40,7 @@ def top_p_renorm_probs(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tenso
         from flashinfer.sampling import top_p_renorm_probs as renorm
 
         return renorm(probs, top_ps)
-    if probs.device.type == "musa":
+    if probs.device.type in ("musa", "xpu"):
         from sgl_kernel import top_p_renorm_prob
 
         return top_p_renorm_prob(probs, top_ps)

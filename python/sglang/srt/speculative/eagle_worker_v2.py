@@ -671,12 +671,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return verify_input, parent_list, top_scores_index
         return verify_input
 
-    def draft_forward(
-        self,
-        forward_batch: ForwardBatch,
-        *,
-        draft_sampling_params: Optional[DraftSamplingParams] = None,
-    ):
+    def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         if forward_batch.forward_mode.is_idle():
@@ -713,10 +708,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
-            if draft_sampling_params is None:
-                draft_sampling_params = DraftSamplingParams.from_sampling_info(
-                    forward_batch.sampling_info
-                )
+            draft_sampling_params = DraftSamplingParams.from_sampling_info(
+                forward_batch.sampling_info
+            )
 
         topk1_chain_fits = (
             self.topk == 1
@@ -815,11 +809,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
                 else:
-                    probs = renorm_draft_probs(
-                        logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        needs_draft_probs,
-                    )
+                    probs = renorm_draft_probs(logits_output.next_token_logits)
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope:
@@ -1006,9 +996,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 DraftSamplingParams.from_sampling_info(batch.sampling_info),
             )
         else:
-            probs = renorm_draft_probs(
-                logits_output.next_token_logits, batch.sampling_info, False
-            )
+            probs = renorm_draft_probs(logits_output.next_token_logits)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1184,11 +1172,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
-            )
+            probs = renorm_draft_probs(draft_logits_output.next_token_logits)
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states

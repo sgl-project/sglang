@@ -148,28 +148,16 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     return sample_p, sample_index
 
 
-def renorm_draft_probs(
-    next_token_logits: torch.Tensor,
-    sampling_info,
-    use_rejection_sampling: bool,
-) -> torch.Tensor:
-    """Build q for rejection sampling; preserve deterministic tree scores otherwise."""
-    if not use_rejection_sampling or not next_token_logits.size(0):
-        return sampling_softmax(next_token_logits)
-    return build_draft_probs(
-        next_token_logits, DraftSamplingParams.from_sampling_info(sampling_info)
-    )
+def renorm_draft_probs(next_token_logits: torch.Tensor) -> torch.Tensor:
+    """Tree-search draft scores; rejection sampling uses sample_draft_proposal."""
+    return sampling_softmax(next_token_logits)
 
 
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     sampling_params: DraftSamplingParams,
 ):
-    """Return (q, q(X), X) for a proposal drawn from the final draft distribution.
-
-    Keep this exact q for acceptance and residual correction, including the
-    one-hot distribution used by greedy requests and draft temperature zero.
-    """
+    """Return (q, q(X), X) with X ~ q. Verification must use this exact q."""
     probs = build_draft_probs(next_token_logits, sampling_params)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
     return probs, topk_p, topk_index

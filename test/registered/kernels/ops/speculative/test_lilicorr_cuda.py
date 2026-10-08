@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.lilicorr import (
-    _lattice_scores,
-    _selector_walk_torch,
     _topk_lse_torch,
     lilicorr_sample_path,
     lilicorr_topk_lse,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
@@ -45,24 +45,22 @@ def test_tied_bf16_logits_return_a_valid_selection():
     torch.testing.assert_close(gathered.cpu(), vals.cpu())
 
 
-def _walk_reference(
-    log_start, log_pair, candidate_tokens, uniforms, temperatures, greedy_mask
-):
-    return _selector_walk_torch(
-        candidate_ids=candidate_tokens.cpu(),
-        scores=_lattice_scores(log_start.cpu(), log_pair.cpu()),
+def _walk_reference(log_start, log_pair, candidate_tokens, uniforms, params):
+    if params is not None:
+        params = DraftSamplingParams(
+            params.temperatures.cpu(), params.top_ks.cpu(), params.top_ps.cpu()
+        )
+    return lilicorr_sample_path(
+        log_start.cpu(),
+        log_pair.cpu(),
+        candidate_tokens.cpu(),
         uniforms=uniforms.cpu(),
-        temperatures=temperatures.cpu(),
-        greedy_mask=greedy_mask.cpu(),
+        params=params,
     )
 
 
 def _greedy_state(bs, slots, device):
-    return dict(
-        uniforms=torch.zeros(bs, slots, device=device),
-        temperatures=torch.ones(bs, device=device),
-        greedy_mask=torch.ones(bs, dtype=torch.bool, device=device),
-    )
+    return dict(uniforms=torch.zeros(bs, slots, device=device), params=None)
 
 
 def _greedy(log_start, log_pair, candidate_tokens):
@@ -143,8 +141,11 @@ def _sampled_inputs(bs, slots, k, *, seed=0):
         log_pair=torch.randn(bs, slots - 1, k, k, device="cuda"),
         candidate_tokens=torch.arange(bs * slots * k, device="cuda").view(bs, slots, k),
         uniforms=torch.rand(bs, slots, device="cuda"),
-        temperatures=torch.rand(bs, device="cuda") + 0.5,
-        greedy_mask=torch.zeros(bs, dtype=torch.bool, device="cuda"),
+        params=DraftSamplingParams(
+            torch.rand(bs, device="cuda") + 0.5,
+            torch.full((bs,), TOP_K_ALL, dtype=torch.int32, device="cuda"),
+            torch.ones(bs, device="cuda"),
+        ),
     )
 
 
@@ -160,21 +161,20 @@ def test_sampled_path_matches_the_reference(k):
 
 def test_truncated_path_graph_replay_uses_updated_sampling_params():
     inputs = _sampled_inputs(3, 4, 8, seed=11)
-    inputs["top_ks"] = torch.tensor([2, 4, 50], dtype=torch.int32, device="cuda")
-    inputs["top_ps"] = torch.tensor([0.8, 0.9, 1.0], device="cuda")
+    params = inputs["params"]
+    params.top_ks.copy_(torch.tensor([2, 4, 50], dtype=torch.int32))
+    params.top_ps.copy_(torch.tensor([0.8, 0.9, 1.0]))
     # Warm the shared renormalization kernels before graph capture.
     for _ in range(3):
         lilicorr_sample_path(**inputs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         tokens, q = lilicorr_sample_path(**inputs)
-    for temperatures, top_ks in [([0.0, 0.4, 1.3], [8, 2, 4]), ([0.7] * 3, [3] * 3)]:
-        inputs["temperatures"].copy_(torch.tensor(temperatures, device="cuda"))
-        inputs["top_ks"].copy_(torch.tensor(top_ks, dtype=torch.int32, device="cuda"))
+    for temperatures, top_ks in [([1.0, 0.4, 1.3], [1, 2, 4]), ([0.7] * 3, [3] * 3)]:
+        params.temperatures.copy_(torch.tensor(temperatures))
+        params.top_ks.copy_(torch.tensor(top_ks, dtype=torch.int32))
         graph.replay()
-        ref_tokens, ref_q = lilicorr_sample_path(
-            **{name: tensor.cpu() for name, tensor in inputs.items()}
-        )
+        ref_tokens, ref_q = _walk_reference(**inputs)
         assert torch.equal(tokens.cpu(), ref_tokens)
         torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
         assert torch.all(q.gather(-1, (tokens % 8).unsqueeze(-1)) > 0)
@@ -186,11 +186,8 @@ def test_truncated_walk_roundoff_fallback_stays_in_support():
     probs = torch.tensor([0.25, 0.0, 0.7499998, 0.0], device="cuda")
     tokens, q = selector_walk_triton(
         candidate_ids=torch.arange(8, device="cuda").reshape(1, 2, 4),
-        scores=probs.expand(1, 2, 4, 4),
+        probs=probs.expand(1, 2, 4, 4),
         uniforms=torch.full((1, 2), 0.9999999, device="cuda"),
-        temperatures=torch.ones(1, device="cuda"),
-        greedy_mask=torch.zeros(1, dtype=torch.bool, device="cuda"),
-        scores_are_probs=True,
     )
     assert tokens.tolist() == [[2, 6]]
     assert torch.all(q.gather(-1, (tokens % 4).unsqueeze(-1)) > 0)

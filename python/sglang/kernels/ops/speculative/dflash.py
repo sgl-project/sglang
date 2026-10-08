@@ -1,8 +1,24 @@
+from typing import Optional
+
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
+
+
+def candidate_probs(
+    scores: torch.Tensor, params: Optional[DraftSamplingParams]
+) -> torch.Tensor:
+    """q for every conditional row of a [bs, slots, K, K] candidate lattice.
+
+    ``params=None`` walks greedily: each row is a point mass at its argmax.
+    Draft top-k/top-p narrow the K candidates; they never add tokens.
+    """
+    if params is None:
+        return F.one_hot(scores.argmax(dim=-1), scores.shape[-1]).float()
+    return build_draft_probs(scores, params)
 
 
 def sample_indices_from_probs(
@@ -10,43 +26,9 @@ def sample_indices_from_probs(
 ) -> torch.Tensor:
     indices = uniforms.ge(probs.cumsum(dim=-1)).sum(dim=-1)
     offsets = torch.arange(probs.shape[-1], device=probs.device)
+    # Roundoff can leave the CDF just below one; fall back inside q's support.
     last_supported = torch.where(probs > 0, offsets, 0).amax(dim=-1)
-    # Renormalization can leave the CDF a fraction below one. A roundoff fallback
-    # must stay in the truncated support even when the final candidates have q=0.
     return torch.minimum(indices, last_supported)
-
-
-def selector_proposal_probs(
-    *,
-    scores: torch.Tensor,
-    temperatures: torch.Tensor,
-    greedy_mask: torch.Tensor,
-    top_ks: torch.Tensor | None = None,
-    top_ps: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Normalize each corrected conditional over the model's candidate support.
-
-    Request top-k/top-p narrow this support; they cannot add candidates that the
-    model's candidate selector omitted.
-    """
-    batch, _, _, candidate_count = scores.shape
-    temperatures = temperatures.reshape(batch, 1)
-    params = DraftSamplingParams(
-        temperatures=torch.where(greedy_mask.reshape(batch, 1), 0.0, temperatures),
-        top_ks=(
-            torch.full(
-                (batch,), candidate_count, dtype=torch.int32, device=scores.device
-            )
-            if top_ks is None
-            else top_ks
-        ),
-        top_ps=(
-            torch.ones(batch, dtype=torch.float32, device=scores.device)
-            if top_ps is None
-            else top_ps
-        ),
-    )
-    return build_draft_probs(scores, params)
 
 
 @triton.jit
@@ -294,82 +276,49 @@ def _prepare_dflash_draft_block_unchecked(
 
 @triton.jit
 def _selector_walk_kernel(
-    scores_ptr,
+    probs_ptr,
     candidate_ptr,
     uniforms_ptr,
-    temperatures_ptr,
-    greedy_ptr,
     tokens_ptr,
     q_ptr,
     slots: tl.constexpr,
     top_k: tl.constexpr,
-    scores_are_probs: tl.constexpr,
 ):
-    """One program per request: a slot's K scores stay in registers and the walk is a
-    loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
+    """One program per request: a slot's K probabilities stay in registers and the
+    walk is a loop, so the slot-to-slot dependency costs nothing instead of one
+    kernel each. Each slot draws by inverse CDF from the row its predecessor picked."""
     row = tl.program_id(0)
     offsets = tl.arange(0, top_k)
-    temperature = tl.load(temperatures_ptr + row)
-    greedy = tl.load(greedy_ptr + row) != 0
     previous = 0
     for slot in range(slots):
         base = (row * slots + slot) * top_k
-        scores = tl.load(scores_ptr + (base + previous) * top_k + offsets).to(
-            tl.float32
+        probabilities = tl.load(probs_ptr + (base + previous) * top_k + offsets)
+        uniform = tl.load(uniforms_ptr + row * slots + slot)
+        index = tl.sum(
+            tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
         )
-        if greedy:
-            # Same pick as torch.argmax: the first NaN if any, else the first max.
-            is_nan = scores != scores
-            best = tl.max(tl.where(is_nan, -float("inf"), scores), axis=0)
-            has_nan = tl.max(is_nan.to(tl.int32), axis=0) > 0
-            hit = tl.where(has_nan, is_nan, scores == best)
-            index = tl.min(tl.where(hit, offsets, top_k), axis=0)
-            probabilities = tl.where(offsets == index, 1.0, 0.0)
-        else:
-            if scores_are_probs:
-                # The caller applied temperature and request truncation to the
-                # corrected conditional rows with the target sampling kernels.
-                probabilities = scores
-            else:
-                scaled = scores / temperature
-                exponentials = tl.exp(scaled - tl.max(scaled, axis=0))
-                probabilities = exponentials / tl.sum(exponentials, axis=0)
-            uniform = tl.load(uniforms_ptr + row * slots + slot)
-            index = tl.sum(
-                tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
-            )
-            last_supported = tl.max(tl.where(probabilities > 0, offsets, 0), axis=0)
-            index = tl.minimum(index, last_supported)
+        # Same roundoff fallback as sample_indices_from_probs.
+        last_supported = tl.max(tl.where(probabilities > 0, offsets, 0), axis=0)
+        index = tl.minimum(index, last_supported)
         tl.store(q_ptr + base + offsets, probabilities)
         tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
         previous = index
 
 
-def selector_walk_triton(
-    *,
-    candidate_ids,
-    scores,
-    uniforms,
-    temperatures,
-    greedy_mask,
-    scores_are_probs=False,
-):
+def selector_walk_triton(*, candidate_ids, probs, uniforms):
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+    tokens = torch.empty((batch, slots), dtype=torch.int64, device=probs.device)
     q_rows = torch.empty(
-        (batch, slots, top_k), dtype=torch.float32, device=scores.device
+        (batch, slots, top_k), dtype=torch.float32, device=probs.device
     )
     _selector_walk_kernel[(batch,)](
-        scores.contiguous(),
+        probs.contiguous(),
         candidate_ids.contiguous(),
         uniforms.contiguous(),
-        temperatures.contiguous(),
-        greedy_mask.contiguous(),
         tokens,
         q_rows,
         slots=slots,
         top_k=top_k,
-        scores_are_probs=scores_are_probs,
         num_warps=1,
     )
     return tokens, q_rows

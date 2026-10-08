@@ -485,7 +485,7 @@ class BlockAcceptEstimateRecorder:
                 logits=corrected_logits.reshape(bs * gamma, -1),
                 row_indices=torch.arange(bs * gamma, device=device),
                 token_indices=draft_flat,
-                temps=draft_temps_full.clamp_min(1e-5),
+                temps=draft_temps_full,
             ).reshape(bs, gamma)
         target_diag = self._gather_logprobs(
             logits=target_logits,

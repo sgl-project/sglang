@@ -667,7 +667,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 and self.eagle_worker.use_rejection_sampling
                 and self.eagle_worker.topk == 1
             ):
-                sampling_params = DraftSamplingParams.create(max_bs, self.device)
+                sampling_params = DraftSamplingParams.greedy(max_bs, self.device)
                 draft_probs = torch.empty(
                     (max_bs, self.speculative_num_steps, vocab_size),
                     dtype=torch.float,

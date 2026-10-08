@@ -257,8 +257,7 @@ class _SelectorDraftSampler:
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
-        self.sampling_params = DraftSamplingParams.create(max_bs, device)
-        self.sampling_params.temperatures.zero_()
+        self.sampling_params = DraftSamplingParams.greedy(max_bs, device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
@@ -270,25 +269,20 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        self.sampling_params.copy_from(sampling_info, bs)
-        if not self.sampling_enabled:
-            self.sampling_params.temperatures.zero_()
+        if self.sampling_enabled:
+            self.sampling_params.copy_from(sampling_info, bs)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
-        params = self.sampling_params.slice(bs)
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=self.uniforms[:bs].uniform_(),
-            temperatures=params.temperatures,
-            greedy_mask=params.greedy_mask,
-            top_ks=params.top_ks if self.sampling_enabled else None,
-            top_ps=params.top_ps if self.sampling_enabled else None,
+            params=self.sampling_params.slice(bs) if self.sampling_enabled else None,
         )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
@@ -1419,19 +1413,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_model, pred_hidden, anchor_token_ids
         )
         device = pred_hidden.device
-        params = DraftSamplingParams.from_sampling_info(
-            sampling_info, batch_size=bs, device=device
-        )
-        if not self._selector_sampling_enabled:
-            params.temperatures = torch.zeros_like(params.temperatures)
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
-            temperatures=params.temperatures,
-            greedy_mask=params.greedy_mask,
-            top_ks=params.top_ks if self._selector_sampling_enabled else None,
-            top_ps=params.top_ps if self._selector_sampling_enabled else None,
+            params=(
+                DraftSamplingParams.from_sampling_info(
+                    sampling_info, batch_size=bs, device=device
+                )
+                if self._selector_sampling_enabled
+                else None
+            ),
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)

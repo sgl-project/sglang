@@ -118,27 +118,22 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _validate_draft_sampling(cfg) -> None:
+    # Negated comparisons also reject NaN.
+    temperature = cfg.speculative_draft_temperature
+    if temperature is not None and not 0 <= temperature < math.inf:
+        raise ValueError("--speculative-draft-temperature must be finite and >= 0")
+    top_k = cfg.speculative_draft_top_k
+    if top_k is not None and not (top_k == -1 or top_k >= 1):
+        raise ValueError("--speculative-draft-top-k must be -1 or a positive integer")
+    top_p = cfg.speculative_draft_top_p
+    if top_p is not None and not 0 < top_p <= 1:
+        raise ValueError("--speculative-draft-top-p must be in (0, 1]")
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    draft_temperature = cfg.speculative_draft_temperature
-    if draft_temperature is not None and (
-        not math.isfinite(draft_temperature) or draft_temperature < 0
-    ):
-        raise ValueError(
-            "--speculative-draft-temperature must be finite and non-negative"
-        )
-    draft_top_k = cfg.speculative_draft_top_k
-    if draft_top_k is not None and (
-        not isinstance(draft_top_k, int)
-        or isinstance(draft_top_k, bool)
-        or (draft_top_k != -1 and draft_top_k < 1)
-    ):
-        raise ValueError("--speculative-draft-top-k must be -1 or a positive integer")
-    draft_top_p = cfg.speculative_draft_top_p
-    if draft_top_p is not None and (
-        not math.isfinite(draft_top_p) or not 0 < draft_top_p <= 1
-    ):
-        raise ValueError("--speculative-draft-top-p must be finite and in (0, 1]")
+    _validate_draft_sampling(cfg)
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None

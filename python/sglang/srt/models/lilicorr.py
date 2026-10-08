@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
     parse_lilicorr_draft_config,
@@ -423,11 +424,8 @@ class LiLiCorrHead(nn.Module):
         anchor_hidden: torch.Tensor,
         anchor_valid: torch.Tensor,
         uniforms: torch.Tensor,
-        temperatures: torch.Tensor,
-        greedy_mask: torch.Tensor,
+        params: Optional[DraftSamplingParams],
         already_projected: bool = False,
-        top_ks: Optional[torch.Tensor] = None,
-        top_ps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),
@@ -443,10 +441,7 @@ class LiLiCorrHead(nn.Module):
             log_pair[:, 0],
             candidate_tokens,
             uniforms=uniforms,
-            temperatures=temperatures,
-            greedy_mask=greedy_mask,
-            top_ks=top_ks,
-            top_ps=top_ps,
+            params=params,
         )
 
     @torch.no_grad()

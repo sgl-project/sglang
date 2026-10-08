@@ -119,25 +119,19 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_draft_temperature: A[
         Optional[float],
-        "Temperature for stochastic draft proposals. Defaults to each request's target "
-        "temperature; 0 makes the proposal greedy. Applied after model correction, "
-        "before draft top-k/top-p, within the model's candidate support. "
-        "Target greedy requests remain greedy. "
-        "Does not enable sampling in greedy-only draft models or EAGLE tree search.",
+        "Draft proposal temperature; 0 makes proposals greedy. Defaults to each "
+        "request's temperature. Applies only where the draft samples its proposal "
+        "(see the speculative decoding docs).",
     ] = None
     speculative_draft_top_k: A[
         Optional[int],
-        "Top-k cutoff for stochastic draft proposals, after model correction. "
-        "Defaults to each request's target top-k; -1 disables the cutoff and "
-        "positive integers retain up to that many candidates. Target greedy "
-        "requests remain greedy. Does not expand the model's candidate support.",
+        "Draft proposal top-k; -1 disables it. Defaults to each request's top_k. "
+        "Greedy requests stay greedy.",
     ] = None
     speculative_draft_top_p: A[
         Optional[float],
-        "Top-p cutoff for stochastic draft proposals, after draft top-k. "
-        "Defaults to each request's target top-p; must be in (0, 1], with 1 "
-        "disabling the cutoff. Target greedy requests remain greedy. "
-        "Does not expand the model's candidate support.",
+        "Draft proposal top-p in (0, 1]; 1 disables it. Defaults to each "
+        "request's top_p.",
     ] = None
     speculative_use_block_verification: A[
         bool,

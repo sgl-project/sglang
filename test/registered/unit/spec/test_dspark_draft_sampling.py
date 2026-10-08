@@ -144,12 +144,13 @@ class TestDsparkDraftSampling(unittest.TestCase):
                     # Token 3 is outside the uncorrected top-2, yet the
                     # correction puts it inside the actual proposal support.
                     self.assertGreater(float(result.draft_probs[0, 0, 3]), 0)
+                    # greedy_mask selects the accept rule, so it stays the
+                    # target's even when the draft itself is greedy.
                     torch.testing.assert_close(
-                        result.greedy_mask,
-                        torch.tensor([override == 0.0 or top_k == 1] * 2 + [True]),
+                        result.greedy_mask, torch.tensor([False, False, True])
                     )
 
-    def test_folded_sampler_retains_q_and_resets_graph_padding(self):
+    def test_folded_sampler_retains_q_in_graph_buffers(self):
         base_logits = _base_logits()
         model = SimpleNamespace(
             sample_from_anchor=True,
@@ -183,13 +184,10 @@ class TestDsparkDraftSampling(unittest.TestCase):
                 top_k,
                 top_p,
             )
-        self.spec.speculative_draft_temperature = None
-        sampler.stage_sampling_params(bs=1, sampling_info=info)
+            torch.testing.assert_close(
+                sampler.greedy_mask, torch.tensor([False, False, True])
+            )
         self.assertEqual(sampler.probs_out.data_ptr(), probs_address)
-        torch.testing.assert_close(sampler.temperatures[1:], torch.ones(2))
-        torch.testing.assert_close(sampler.sampling_params.top_ps[1:], torch.ones(2))
-        self.assertTrue(bool((sampler.sampling_params.top_ks[1:] == TOP_K_ALL).all()))
-        self.assertFalse(bool(sampler.greedy_mask[1:].any()))
 
     def test_folded_memory_budget_includes_saved_probabilities(self):
         model = SimpleNamespace(
@@ -265,7 +263,7 @@ class TestDsparkDraftSampling(unittest.TestCase):
             out=torch.arange(6),
             corrected_out=torch.randn(6, 5),
             probs_out=torch.randn(6, 5).softmax(-1),
-            temperatures=torch.ones(3),
+            sampling_params=SimpleNamespace(temperatures=torch.ones(3)),
             greedy_mask=torch.zeros(3, dtype=torch.bool),
             confidence_out=None,
         )
@@ -300,15 +298,15 @@ class TestDsparkDraftSampling(unittest.TestCase):
             result.draft_block.draft_probs, sampler.probs_out[:4].view(2, 2, 5)
         )
 
-    def test_mixed_verification_uses_saved_q_and_target_greedy_mask(self):
+    def test_mixed_verification_uses_saved_q(self):
         info = _sampling_info()
         probs = torch.zeros(3, 2, 5)
         probs[:, :, 3] = 1.0
         draft = DraftBlockResult(
             draft_tokens=torch.full((3, 2), 3),
             corrected_logits=torch.zeros_like(probs),
-            greedy_mask=torch.ones(3, dtype=torch.bool),
-            temperatures=torch.zeros(3),
+            greedy_mask=torch.tensor([False, False, True]),
+            temperatures=torch.ones(3),
             draft_probs=probs,
         )
         zeros = torch.zeros(3, dtype=torch.int32)
@@ -322,7 +320,7 @@ class TestDsparkDraftSampling(unittest.TestCase):
             ) as sampling,
             mock.patch.object(
                 dspark_verify.SelectMixedAccept, "execute", return_value=selected
-            ) as select,
+            ),
         ):
             dspark_verify.accept_draft_tokens(
                 candidates=torch.zeros(3, 3, dtype=torch.long),
@@ -334,9 +332,6 @@ class TestDsparkDraftSampling(unittest.TestCase):
                 verify_num_draft_tokens=3,
             )
         self.assertIs(sampling.call_args.kwargs["draft_probs"], probs)
-        torch.testing.assert_close(
-            select.call_args.kwargs["greedy_mask"], torch.tensor([False, False, True])
-        )
 
 
 if __name__ == "__main__":

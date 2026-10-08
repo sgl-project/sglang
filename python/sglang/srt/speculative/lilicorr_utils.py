@@ -215,17 +215,15 @@ def propose_lilicorr_block(
         anchor_valid=anchor_valid,
     )
     device = draft_hidden.device
-    params = DraftSamplingParams.from_sampling_info(
-        sampling_info, batch_size=bs, device=device
-    )
-    if not sampling_enabled:
-        params.temperatures = torch.zeros_like(params.temperatures)
     selected, q_rows = head.select_with_proposal(
         uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
-        temperatures=params.temperatures,
-        greedy_mask=params.greedy_mask,
-        top_ks=params.top_ks if sampling_enabled else None,
-        top_ps=params.top_ps if sampling_enabled else None,
+        params=(
+            DraftSamplingParams.from_sampling_info(
+                sampling_info, batch_size=bs, device=device
+            )
+            if sampling_enabled
+            else None
+        ),
         **common,
     )
     if not sampling_enabled:
@@ -272,8 +270,7 @@ class LiLiCorrDraftSampler:
             assert token_table.shape[0] == embed_tokens.org_vocab_size_padded
         self.token_table = token_table
 
-        self.sampling_params = DraftSamplingParams.create(self.max_bs, device)
-        self.sampling_params.temperatures.zero_()
+        self.sampling_params = DraftSamplingParams.greedy(self.max_bs, device)
         self.uniforms = torch.zeros(
             (self.max_bs, self.slots), dtype=torch.float32, device=device
         )
@@ -298,9 +295,8 @@ class LiLiCorrDraftSampler:
             self.anchor_valid[count:].fill_(False)
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        self.sampling_params.copy_from(sampling_info, bs)
-        if not self.sampling_enabled:
-            self.sampling_params.temperatures.zero_()
+        if self.sampling_enabled:
+            self.sampling_params.copy_from(sampling_info, bs)
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids
@@ -338,13 +334,9 @@ class LiLiCorrDraftSampler:
         )
         if self.sampling_enabled:
             self.uniforms[:bs].uniform_()
-        params = self.sampling_params.slice(bs)
         selected, q_rows = self.head.select_with_proposal(
             uniforms=self.uniforms[:bs],
-            temperatures=params.temperatures,
-            greedy_mask=params.greedy_mask,
-            top_ks=params.top_ks if self.sampling_enabled else None,
-            top_ps=params.top_ps if self.sampling_enabled else None,
+            params=self.sampling_params.slice(bs) if self.sampling_enabled else None,
             **common,
         )
         if self.sampling_enabled:

@@ -20,8 +20,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.runtime_context import publish, reset_context
-from sglang.srt.sampling.draft_sampling import DraftSamplingParams
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -86,7 +84,6 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             seq_lens_cpu=torch.empty(CAPTURE_BS, dtype=torch.int32),
             dsa_seed_topk=None,
         )
-        runner.draft_sampling_params = DraftSamplingParams.create(CAPTURE_BS, "cpu")
         runner.capture_bs = [1, CAPTURE_BS]
         runner.captured_req_width = 1
         runner.speculative_num_steps = NUM_STEPS
@@ -196,26 +193,17 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
 
-    def test_replay_stages_draft_sampling_and_resets_padding(self):
+    def test_rejection_sampling_replay_stages_target_cutoffs(self):
+        # Draft overrides resolve inside the graph, so replay must stage every
+        # raw target cutoff it reads, including top_p.
         publish(
-            ServerArgs(
-                model_path="dummy",
-                speculative_use_rejection_sampling=True,
-                speculative_draft_temperature=0.4,
-                speculative_draft_top_k=-1,
-                speculative_draft_top_p=0.6,
-            ),
+            ServerArgs(model_path="dummy", speculative_use_rejection_sampling=True),
             role="tokenizer",
         )
         runner = self._build_runner(_RecordingDraftBackend())
-        params = runner.draft_sampling_params
-        addresses = [
-            t.data_ptr() for t in (params.temperatures, params.top_ks, params.top_ps)
-        ]
-        # Simulate leftover parameters from a previous full-sized replay.
-        params.temperatures.fill_(2.0)
-        params.top_ks.fill_(2)
-        params.top_ps.fill_(0.5)
+        runner.temperatures = torch.ones(CAPTURE_BS, 1)
+        runner.top_ks = torch.ones(CAPTURE_BS, dtype=torch.int32)
+        runner.top_ps = torch.ones(CAPTURE_BS)
         batch = self._build_forward_batch([10, 11], 21)
         batch.sampling_info = SimpleNamespace(
             temperatures=torch.tensor([[0.8], [1.2]]),
@@ -224,15 +212,9 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             is_all_greedy=False,
         )
         runner.execute(batch)
-        torch.testing.assert_close(
-            params.temperatures[:, 0], torch.tensor([0.4, 0.4, 1.0, 1.0])
-        )
-        self.assertEqual(params.top_ks.tolist(), [1, TOP_K_ALL, TOP_K_ALL, TOP_K_ALL])
-        torch.testing.assert_close(params.top_ps, torch.tensor([0.6, 0.6, 1.0, 1.0]))
-        self.assertEqual(
-            addresses,
-            [t.data_ptr() for t in (params.temperatures, params.top_ks, params.top_ps)],
-        )
+        torch.testing.assert_close(runner.temperatures[:2, 0], torch.tensor([0.8, 1.2]))
+        self.assertEqual(runner.top_ks[:2].tolist(), [1, 3])
+        torch.testing.assert_close(runner.top_ps[:2], torch.tensor([0.9, 0.7]))
 
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None

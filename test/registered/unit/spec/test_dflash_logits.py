@@ -9,6 +9,8 @@ from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     _grouped_conv,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import published_topology
@@ -21,6 +23,14 @@ def topology():
     # The worker reads its rank from the context.
     with published_topology():
         yield
+
+
+def _params(temperatures, top_ks, top_ps=None):
+    return DraftSamplingParams(
+        torch.tensor(temperatures, dtype=torch.float32),
+        torch.tensor(top_ks, dtype=torch.int32),
+        torch.ones(len(top_ks)) if top_ps is None else torch.tensor(top_ps),
+    )
 
 
 def test_dflash_unary_logit_transform():
@@ -57,15 +67,11 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
     candidate_ids = torch.randint(0, 16, (2, 3, 4))
     scores = torch.randn(2, 3, 4, 4)
     uniforms = torch.tensor([[0.2, 0.7, 0.4], [0.8, 0.1, 0.6]])
-    temperatures = torch.tensor([1.0, 0.7])
-    greedy_mask = torch.tensor([True, False])
+    temperatures, top_ks = [1.0, 0.7], [1, TOP_K_ALL]
+    params = _params(temperatures, top_ks)
 
     mixed_tokens, mixed_q = selector.sample_path(
-        candidate_ids=candidate_ids,
-        scores=scores,
-        uniforms=uniforms,
-        temperatures=temperatures,
-        greedy_mask=greedy_mask,
+        candidate_ids=candidate_ids, scores=scores, uniforms=uniforms, params=params
     )
     assert torch.all((mixed_q[0] == 0) | (mixed_q[0] == 1))
     for row in range(2):
@@ -73,26 +79,25 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
             candidate_ids=candidate_ids[row : row + 1],
             scores=scores[row : row + 1],
             uniforms=uniforms[row : row + 1],
-            temperatures=temperatures[row : row + 1],
-            greedy_mask=greedy_mask[row : row + 1],
+            params=_params(temperatures[row : row + 1], top_ks[row : row + 1]),
         )
         torch.testing.assert_close(mixed_tokens[row], tokens[0])
         torch.testing.assert_close(mixed_q[row], q_rows[0])
 
 
-def _sample_corrected_candidate_path(kind, scores, **sampling):
+def _sample_corrected_candidate_path(kind, scores, *, uniforms, params):
     candidate_ids = torch.arange(8).reshape(1, 2, 4)
     if kind == "selector":
         selector = CandidateSelector(
             hidden_size=4, vocab_size=16, state_rank=2, top_k=4
         )
         return selector.sample_path(
-            candidate_ids=candidate_ids, scores=scores, **sampling
+            candidate_ids=candidate_ids, scores=scores, uniforms=uniforms, params=params
         )
     from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 
     return lilicorr_sample_path(
-        scores[:, 0, 0], scores[:, 1:], candidate_ids, **sampling
+        scores[:, 0, 0], scores[:, 1:], candidate_ids, uniforms=uniforms, params=params
     )
 
 
@@ -110,10 +115,7 @@ def test_candidate_sampling_returns_the_truncated_realized_conditionals(
         kind,
         scores,
         uniforms=torch.tensor([[0.1, 0.95]]),
-        temperatures=torch.tensor([temperature]),
-        greedy_mask=torch.tensor([False]),
-        top_ks=torch.tensor([2]),
-        top_ps=torch.tensor([0.95]),
+        params=_params([temperature], [2], [0.95]),
     )
     low, high = torch.softmax(torch.tensor([2.0, 3.0]) / temperature, dim=-1)
     expected_q = torch.tensor([[[0.0, 0.0, low, high], [high, low, 0.0, 0.0]]])
@@ -126,14 +128,12 @@ def test_candidate_top_p_follows_correction_and_temperature(kind):
     scores = torch.zeros(1, 2, 4, 4)
     scores[:, 0, 0] = torch.tensor([1.0, 0.0, 2.0, 3.0])
     scores[:, 1, 3] = torch.tensor([0.0, 5.0, 6.0, 1.0])
-    sampling = dict(
+    tokens, q = _sample_corrected_candidate_path(
+        kind,
+        scores,
         uniforms=torch.tensor([[0.0, 0.0]]),
-        temperatures=torch.tensor([0.5]),
-        greedy_mask=torch.tensor([False]),
-        top_ks=torch.tensor([2]),
-        top_ps=torch.tensor([0.8]),
+        params=_params([0.5], [2], [0.8]),
     )
-    tokens, q = _sample_corrected_candidate_path(kind, scores, **sampling)
     assert tokens.tolist() == [[3, 6]]
     torch.testing.assert_close(
         q, torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]]])
@@ -141,7 +141,10 @@ def test_candidate_top_p_follows_correction_and_temperature(kind):
 
 
 @pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-def test_candidate_zero_draft_temperature_is_a_point_mass_for_sampled_target(kind):
+@pytest.mark.parametrize("greedy_params", [None, "top_k=1"])
+def test_greedy_candidate_walk_ignores_the_uniform_draw(kind, greedy_params):
+    # Greedy rows reach the walk as point masses (params=None for greedy-only
+    # models, top_k=1 otherwise); inverse-CDF sampling must return the argmax.
     scores = torch.zeros(1, 2, 4, 4)
     scores[:, 0, 0, 2] = 4.0
     scores[:, 1, 2, 1] = 5.0
@@ -149,10 +152,7 @@ def test_candidate_zero_draft_temperature_is_a_point_mass_for_sampled_target(kin
         kind,
         scores,
         uniforms=torch.tensor([[0.99, 0.0]]),
-        temperatures=torch.tensor([0.0]),
-        greedy_mask=torch.tensor([False]),
-        top_ks=torch.tensor([50]),
-        top_ps=torch.tensor([0.9]),
+        params=None if greedy_params is None else _params([1.0], [1], [0.9]),
     )
     assert tokens.tolist() == [[2, 5]]
     torch.testing.assert_close(
@@ -170,52 +170,16 @@ def test_candidate_sampling_roundoff_fallback_stays_in_truncated_support():
     assert indices.tolist() == [0, 2, 2]
     tokens, q = _selector_walk_torch(
         candidate_ids=torch.arange(8).reshape(1, 2, 4),
-        scores=probs.expand(1, 2, 4, 4),
+        probs=probs.expand(1, 2, 4, 4),
         uniforms=torch.tensor([[0.9999999, 0.9999999]]),
-        temperatures=torch.ones(1),
-        greedy_mask=torch.zeros(1, dtype=torch.bool),
-        scores_are_probs=True,
     )
     assert tokens.tolist() == [[2, 6]]
     assert torch.all(q.gather(-1, (tokens % 4).unsqueeze(-1)) > 0)
 
 
 @pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-def test_greedy_only_candidate_path_skips_lattice_normalization(kind, monkeypatch):
-    from sglang.kernels.ops.speculative import lilicorr as lilicorr_kernels
-    from sglang.srt.models import dflash as dflash_model
-
-    def unexpected_normalization(**kwargs):
-        pytest.fail("A greedy-only model must retain the raw-score walk")
-
-    monkeypatch.setattr(
-        lilicorr_kernels, "selector_proposal_probs", unexpected_normalization
-    )
-    monkeypatch.setattr(
-        dflash_model, "selector_proposal_probs", unexpected_normalization
-    )
-    scores = torch.zeros(1, 2, 4, 4)
-    scores[:, 0, 0, 2] = 4.0
-    scores[:, 1, 2, 1] = 5.0
-    tokens, q = _sample_corrected_candidate_path(
-        kind,
-        scores,
-        uniforms=torch.zeros(1, 2),
-        temperatures=torch.ones(1),
-        greedy_mask=torch.ones(1, dtype=torch.bool),
-    )
-    assert tokens.tolist() == [[2, 5]]
-    torch.testing.assert_close(
-        q, torch.tensor([[[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]])
-    )
-
-
-@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
-def test_candidate_graph_stages_independent_draft_temperature_and_cutoffs(
-    kind, topology
-):
+def test_candidate_graph_stages_draft_overrides(kind, topology):
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.sampling.draft_sampling import DraftSamplingParams
     from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
 
     if kind == "selector":
@@ -225,7 +189,7 @@ def test_candidate_graph_stages_independent_draft_temperature_and_cutoffs(
     else:
         sampler_class = LiLiCorrDraftSampler
     sampler = sampler_class.__new__(sampler_class)
-    sampler.sampling_params = DraftSamplingParams.create(3, "cpu")
+    sampler.sampling_params = DraftSamplingParams.greedy(3, "cpu")
     sampler.sampling_enabled = True
     sampling_info = SimpleNamespace(
         temperatures=torch.tensor([[0.7], [1.2]]),
@@ -239,18 +203,10 @@ def test_candidate_graph_stages_independent_draft_temperature_and_cutoffs(
         speculative_draft_top_p=0.6,
     ):
         sampler.stage_sampling_params(bs=2, sampling_info=sampling_info)
-    torch.testing.assert_close(
-        sampler.sampling_params.temperatures, torch.tensor([[0.25], [0.25], [1.0]])
-    )
-    assert bool((sampler.sampling_params.top_ks[:2] > 7).all())
-    torch.testing.assert_close(
-        sampler.sampling_params.top_ps, torch.tensor([0.6, 0.6, 1.0])
-    )
-    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
-    torch.testing.assert_close(
-        sampler.sampling_params.temperatures, torch.tensor([[0.7], [1.0], [1.0]])
-    )
-    assert sampler.sampling_params.top_ps[1:].tolist() == [1.0, 1.0]
+    staged = sampler.sampling_params.slice(2)
+    torch.testing.assert_close(staged.temperatures, torch.tensor([0.25, 0.25]))
+    assert staged.top_ks.tolist() == [TOP_K_ALL, TOP_K_ALL]
+    torch.testing.assert_close(staged.top_ps, torch.tensor([0.6, 0.6]))
 
 
 def test_selector_rejects_a_quantized_target_lm_head():
@@ -513,7 +469,6 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch, topol
 
 def test_disabled_selector_sampling_forces_greedy_draft(topology):
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.sampling.draft_sampling import DraftSamplingParams
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     sampling_info = SimpleNamespace(
@@ -524,7 +479,7 @@ def test_disabled_selector_sampling_forces_greedy_draft(topology):
     )
 
     sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
-    sampler.sampling_params = DraftSamplingParams.create(1, "cpu")
+    sampler.sampling_params = DraftSamplingParams.greedy(1, "cpu")
     sampler.sampling_enabled = False
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     assert sampler.sampling_params.greedy_mask.tolist() == [True]
@@ -532,7 +487,7 @@ def test_disabled_selector_sampling_forces_greedy_draft(topology):
     sampler.sampling_enabled = True
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     torch.testing.assert_close(
-        sampler.sampling_params.temperatures, torch.tensor([[0.7]])
+        sampler.sampling_params.temperatures, torch.tensor([0.7])
     )
     assert sampler.sampling_params.greedy_mask.tolist() == [False]
     observed = {}
@@ -571,9 +526,7 @@ def test_disabled_selector_sampling_forces_greedy_draft(topology):
         sampling_info=sampling_info,
     )
 
-    torch.testing.assert_close(observed["temperatures"], torch.zeros((1, 1)))
-    assert observed["greedy_mask"].tolist() == [True]
-    assert observed["top_ks"] is None and observed["top_ps"] is None
+    assert observed["params"] is None
     assert worker._selector_sample is None
 
     # A deterministic draft still needs proposal verification against a random
@@ -588,9 +541,8 @@ def test_disabled_selector_sampling_forces_greedy_draft(topology):
             anchor_token_ids=torch.zeros(1, dtype=torch.int64),
             sampling_info=sampling_info,
         )
-    assert observed["greedy_mask"].tolist() == [True]
-    assert observed["top_ks"].tolist() == [8]
-    torch.testing.assert_close(observed["top_ps"], torch.tensor([0.9]))
+    assert observed["params"].greedy_mask.tolist() == [True]
+    torch.testing.assert_close(observed["params"].top_ps, torch.tensor([0.9]))
     assert worker._selector_sample is not None
 
 

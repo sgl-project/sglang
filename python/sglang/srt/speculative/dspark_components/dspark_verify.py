@@ -861,6 +861,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
     if all_greedy:
@@ -872,10 +873,6 @@ def accept_draft_tokens(
             fused_argmax=fused_argmax,
         )
     draft_probs = draft_block.draft_probs
-    if draft_probs is None:
-        raise RuntimeError(
-            "DSpark sampling verification requires saved draft probabilities"
-        )
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
@@ -906,9 +903,7 @@ def accept_draft_tokens(
         cutoff_verify_lens=cutoff_verify_lens,
     )
     selected = SelectMixedAccept.execute(
-        # The draft can be deterministic while its target still samples
-        # (draft temperature zero). Only target rows select greedy acceptance.
-        greedy_mask=(sampling_info.top_ks <= 1).view(-1),
+        greedy_mask=greedy_mask,
         greedy_len=greedy_len,
         greedy_bonus=greedy_bonus,
         greedy_trim=greedy_trim,

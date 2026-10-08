@@ -22,12 +22,12 @@ class TestDraftSamplingCUDA(unittest.TestCase):
             with self.subTest(width=width):
                 logits = torch.randn(3, width, device="cuda")
                 params = DraftSamplingParams(
-                    torch.tensor([[0.7], [1.0], [1.5]], device="cuda"),
+                    torch.tensor([0.7, 1.0, 1.5], device="cuda"),
                     torch.tensor([7, 12, TOP_K_ALL], dtype=torch.int32, device="cuda"),
                     torch.tensor([0.7, 0.95, 1.0], device="cuda"),
                 )
                 info = SimpleNamespace(
-                    temperatures=params.temperatures,
+                    temperatures=params.temperatures[:, None],
                     top_ks=params.top_ks,
                     top_ps=params.top_ps,
                     need_top_k_sampling=True,
@@ -45,7 +45,7 @@ class TestDraftSamplingCUDA(unittest.TestCase):
                 torch.testing.assert_close(proposal, target, atol=1e-6, rtol=1e-5)
 
     def test_graph_replay_observes_new_cutoffs_and_zero_temperature(self):
-        params = DraftSamplingParams.create(4, "cuda")
+        params = DraftSamplingParams.greedy(4, "cuda")
         logits = torch.arange(64, device="cuda", dtype=torch.float32).reshape(4, 16)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())

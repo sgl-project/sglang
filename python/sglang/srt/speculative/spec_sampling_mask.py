@@ -71,6 +71,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         draft_input,
         draft_token_num: int,
         bs: int,
+        greedy_mask: torch.Tensor | None = None,
     ) -> SpeculativeSamplingMaskCapture | None:
         """Rebuild the verified target policy after acceptance; returns None
         when no request in the batch asked for sampling masks."""
@@ -90,9 +91,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
             target_probs=target_probs,
             batch_indices=sampling_info.sampling_mask_batch_indices,
             max_top_k=max(sampling_info.sampling_mask_top_ks),
-            # Draft overrides can make q deterministic while the target still
-            # samples. Capture the target policy regardless of the proposal.
-            greedy_mask=(sampling_info.top_ks <= 1).view(-1),
+            greedy_mask=greedy_mask,
             support_capture_indices=sampling_info.sampling_support_logprobs_capture_indices,
         )
 

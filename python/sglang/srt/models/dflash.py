@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import (
+    candidate_probs,
     sample_indices_from_probs,
-    selector_proposal_probs,
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -1147,48 +1148,15 @@ class CandidateSelector(nn.Module):
         candidate_ids: torch.Tensor,
         scores: torch.Tensor,
         uniforms: torch.Tensor,
-        temperatures: torch.Tensor,
-        greedy_mask: torch.Tensor,
-        top_ks: Optional[torch.Tensor] = None,
-        top_ps: Optional[torch.Tensor] = None,
+        params: Optional[DraftSamplingParams],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Walk one path, with q over the K candidates for the verify. greedy_mask
-        rows take the argmax, selected rather than branched, so one captured graph
+        """Walk one path, with q over the K candidates for the verify. Greedy rows
+        are point masses, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
-        use_truncation = top_ks is not None or top_ps is not None
-        if scores.is_cuda and not use_truncation:
-            # Greedy-only callers omit request cutoffs and keep the fused walk.
+        probs = candidate_probs(scores, params)
+        if probs.is_cuda:
             return selector_walk_triton(
-                candidate_ids=candidate_ids,
-                scores=scores,
-                uniforms=uniforms,
-                temperatures=temperatures,
-                greedy_mask=greedy_mask,
-            )
-        if use_truncation:
-            probs = selector_proposal_probs(
-                scores=scores,
-                temperatures=temperatures,
-                greedy_mask=greedy_mask,
-                top_ks=top_ks,
-                top_ps=top_ps,
-            )
-        else:
-            safe_temps = torch.where(greedy_mask, 1.0, temperatures.reshape(-1))
-            probs = torch.softmax(scores.float() / safe_temps[:, None, None, None], -1)
-            probs = torch.where(
-                greedy_mask[:, None, None, None],
-                F.one_hot(scores.argmax(dim=-1), self.top_k).float(),
-                probs,
-            )
-        if scores.is_cuda:
-            return selector_walk_triton(
-                candidate_ids=candidate_ids,
-                scores=probs,
-                uniforms=uniforms,
-                temperatures=temperatures,
-                greedy_mask=greedy_mask,
-                scores_are_probs=True,
+                candidate_ids=candidate_ids, probs=probs, uniforms=uniforms
             )
         top_k = self.top_k
         initial_probs = probs[:, 0, 0]
