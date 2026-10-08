@@ -1335,7 +1335,32 @@ class TestAnthropicServing(unittest.TestCase):
         )
         with self.assertRaises(ValueError) as ctx:
             serving._convert_to_chat_completion_request(request)
+
         self.assertIn("nonexistent", str(ctx.exception))
+
+    def test_custom_tool_constraints_are_forwarded(self):
+        for choice in ("auto", "any", "tool", "none"):
+            for enabled in (False, True):
+                with self.subTest(choice=choice, enabled=enabled):
+                    request = self._anthropic_request(
+                        tools=[
+                            {
+                                "name": "lookup",
+                                "input_schema": {"type": "object"},
+                                "strict": enabled,
+                            }
+                        ],
+                        tool_choice={
+                            "type": choice,
+                            "name": "lookup",
+                            "disable_parallel_tool_use": enabled,
+                        },
+                    )
+                    converted = self._serving()._convert_to_chat_completion_request(
+                        request
+                    )
+                    self.assertEqual(converted.tools[0].function.strict, enabled)
+                    self.assertEqual(converted.parallel_tool_calls, not enabled)
 
     def test_convert_response_non_streaming_empty_content_keeps_block(self):
         """Empty-string completion must still produce a content list of len 1."""

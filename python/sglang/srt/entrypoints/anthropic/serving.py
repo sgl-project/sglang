@@ -682,6 +682,7 @@ class AnthropicServing:
                             "name": tool.name,
                             "description": tool.description or "",
                             "parameters": tool.input_schema,
+                            "strict": tool.strict,
                         },
                     )
                 )
@@ -695,6 +696,9 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            chat_request.parallel_tool_calls = (
+                not anthropic_request.tool_choice.disable_parallel_tool_use
+            )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"

@@ -140,6 +140,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: bool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
@@ -252,6 +253,7 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: bool = False
 
 
 class AnthropicThinkingParam(BaseModel):
