@@ -184,6 +184,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
         # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
         readers = [
             MagicMock(
