@@ -15,12 +15,23 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 # _agg_kernel keeps a next_pow2(nvb) x next_pow2(H) fp32 tile in registers, and
 # that is the whole basis of its speed. Past this budget it spills and loses to
 # the 2-kernel Triton pipeline it replaces: measured at T=4 on MI355X,
 # next_pow2(nvb)=8 is 2.0x faster, 16 is 1.2x, 32 is 0.2x. K3 sits right at the
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
+# (num_warps, waves_per_eu) by the compile-time padded bank depth. Tuned at
+# T=2 under graph replay; every winner is bit-identical to the original 4/0.
+_LAUNCH_TUNING = {
+    1: (4, 3),
+    2: (4, 3),
+    4: (4, 1),
+    8: (8, 2),
+}
+_USE_TUNED_LAUNCH = envs.SGLANG_ROCM_K3_ATTN_RES_TUNED_LAUNCH.get()
 
 
 @cache
@@ -185,6 +196,8 @@ def attn_res_hip(
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
 
+    r_pad = triton.next_power_of_2(nvb)
+    num_warps, waves_per_eu = _LAUNCH_TUNING[r_pad] if _USE_TUNED_LAUNCH else (4, 0)
     _agg_kernel[(T,)](
         prefix_sum,
         addend_arg,
@@ -204,9 +217,10 @@ def attn_res_hip(
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
-        R_PAD=triton.next_power_of_2(nvb),
+        R_PAD=r_pad,
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )

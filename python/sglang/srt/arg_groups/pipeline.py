@@ -178,6 +178,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_cuda_graph_config, server_args)
 
+    from sglang.srt.arg_groups.kimi_k3_rocm_hook import disable_kimi_k3_rocm_symm_mem
+
+    run_hook(disable_kimi_k3_rocm_symm_mem, server_args)
+
     from sglang.srt.arg_groups.platform_hook import (
         handle_amd_specifics,
         handle_cpu_backends,

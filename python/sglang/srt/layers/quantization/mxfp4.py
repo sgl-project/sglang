@@ -198,7 +198,7 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = _use_aiter and envs.SGLANG_ROCM_K3_AITER_OPT.get()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 

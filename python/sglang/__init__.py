@@ -13,6 +13,24 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+# Kimi-K3 may opt into an SGLang-owned AITER tuning profile. Configure it
+# before any downstream import can initialize AITER_CONFIGS. Torch stays in
+# the ROCm module so CUDA imports of sglang do not pay for it here.
+import os as _os
+
+if (
+    _os.path.isdir("/opt/rocm")
+    or _os.environ.get("ROCM_PATH")
+    or "HIP_VISIBLE_DEVICES" in _os.environ
+):
+    from sglang.srt.models.kimi_k3_rocm_bootstrap import (
+        maybe_set_aiter_m16384_profile as _maybe_set_aiter_m16384_profile,
+    )
+
+    _maybe_set_aiter_m16384_profile()
+    del _maybe_set_aiter_m16384_profile
+del _os
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 

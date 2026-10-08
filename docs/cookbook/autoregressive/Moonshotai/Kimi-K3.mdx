@@ -215,7 +215,7 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
 
 <a id="amd-env" />
 
-**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
+**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_ROCM_K3_AITER_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
 
 | Env var | Default | Effect |
 |---|---|---|
