@@ -539,6 +539,20 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
             await pending
         self.assertEqual(self.store.cleanup_futures, [self.store.future])
 
+    async def test_disconnected_client_gets_no_ref_and_its_put_is_removed(self):
+        """A client that disconnects while the put runs never reads the ref, so the
+        stored object must be removed rather than left pinned in the store."""
+        state = self._state("gone_rid", via_store=True)
+        request = Mock(is_disconnected=AsyncMock(return_value=True))
+        stream = self.tm._wait_one_response(state.obj, request)
+        self.store.future.set_result({"handle": {"h": 1}, "fields": {}})
+
+        await self.tm._handle_batch_output(self._batch("gone_rid"))
+
+        with self.assertRaisesRegex(ValueError, "disconnected"):
+            await anext(stream)
+        self.assertEqual(self.store.cleanup_futures, [self.store.future])
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""

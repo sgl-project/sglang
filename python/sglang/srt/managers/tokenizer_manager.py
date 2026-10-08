@@ -1966,7 +1966,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return None
 
-    async def _put_token_output_stash(self, *, out: dict, state: ReqState) -> None:
+    async def _put_token_output_stash(
+        self, *, out: dict, state: ReqState, request: Optional[fastapi.Request]
+    ) -> None:
         stash = state.token_output_stash
         state.token_output_stash = None
         meta_info = out["meta_info"]
@@ -1986,6 +1988,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 detail=f"Failed to write outputs to the output store: {e}",
             ) from e
+        if (
+            request is not None
+            and not state.obj.background
+            and await request.is_disconnected()
+        ):
+            # Nobody can read this ref, and a client retry writes a new object.
+            self.output_store.cleanup_after(future)
+            raise ValueError(
+                "Request is disconnected from the client side after its output store "
+                f"put; removed the stored outputs of {state.obj.rid=}"
+            )
         meta_info[OUTPUT_STORE_REF_KEY] = output_store_ref
         meta_info.update(stash.inline_meta_info())
 
@@ -2068,7 +2081,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if finished:
                 if state.token_output_stash is not None:
-                    await self._put_token_output_stash(out=out, state=state)
+                    await self._put_token_output_stash(
+                        out=out, state=state, request=request
+                    )
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()

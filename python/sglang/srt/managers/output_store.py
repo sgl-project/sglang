@@ -15,10 +15,11 @@ Key assumptions:
   fails; SGLang keeps no copy of the ref.
 - Objects are hard-pinned, so Mooncake never evicts them; a full store fails the put,
   and with it the request.
-- SGLang removes an object only when its request is cancelled while the put runs. A
-  ref that is never read keeps its object until the Mooncake master restarts: the
-  client disconnects after the put, a sibling fails a batch or ``n>1`` request, a
-  chat response fails to build, or the reader crashes before reading.
+- SGLang removes an object only when its request is cancelled while the put runs, or
+  when its client has disconnected by the time the put lands. Any other ref that is
+  never read keeps its object until the Mooncake master restarts: the client
+  disconnects after that check, a sibling fails a batch or ``n>1`` request, a chat
+  response fails to build, or the reader crashes before reading.
 - SGLang is a pure Mooncake client and hosts none of the store's segments.
 """
 
