@@ -421,3 +421,20 @@ register_kernel(
         ),
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.qkv_norm_mrope",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.qkv_norm_mrope:qkv_norm_mrope",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            in_place=True,
+            description="M8 QKV projection, Q/K RMSNorm, MRoPE and HND page32 cache write.",
+        ),
+    )
+)

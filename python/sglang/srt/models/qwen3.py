@@ -41,7 +41,14 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_platform, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+    get_platform,
+    get_spec,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -177,6 +184,20 @@ class Qwen3Attention(nn.Module):
             and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
         )
+        self.use_qkv_norm_mrope = (
+            self.use_fused_qk_norm_mrope_cuda
+            and torch.cuda.get_device_capability() == (10, 3)
+            and hidden_size == 2560
+            and self.q_size == 4096
+            and self.kv_size == 1024
+            and attn_tp_size == 1
+            and quant_config is None
+            and not attention_bias
+            and self.q_norm.variance_epsilon == 1e-6
+            and self.k_norm.variance_epsilon == 1e-6
+            and self.attn.attn_type == AttentionType.DECODER
+            and not self.attn.is_cross_attention
+        )
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -190,7 +211,89 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
+    def _try_qkv_norm_mrope(self, positions, hidden_states, forward_batch):
+        if (
+            not self.use_qkv_norm_mrope
+            or tuple(hidden_states.shape) != (8, 2560)
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or not forward_batch.forward_mode.is_decode()
+            or forward_batch.spec_info is not None
+            or get_spec().speculative_algorithm is not None
+            or get_lora().enable_lora
+            or get_lora().lora_paths
+            or get_exec().kernel.disable_flashinfer_autotune
+            or get_exec().deterministic.enable_deterministic_inference
+            or get_exec().deterministic.rl_on_policy_target is not None
+            or get_parallel().attn_cp_size != 1
+            or get_parallel().attn_dcp_size != 1
+            or type(self.qkv_proj) is not QKVParallelLinear
+            or self.qkv_proj.bias is not None
+            or tuple(positions.shape) != (3, 8)
+            or positions.dtype != torch.int64
+            or forward_batch.out_cache_loc.numel() != 8
+        ):
+            return None
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnBackend,
+        )
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedLinearMethod,
+            get_bf16_gemm_backend,
+            use_bf16_splitk_gemm,
+        )
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
+
+        if (
+            type(self.qkv_proj.quant_method) is not UnquantizedLinearMethod
+            or not use_bf16_splitk_gemm(8, 6144, 2560)
+            or not get_bf16_gemm_backend().is_cutedsl()
+            or not envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+        ):
+            return None
+        pool = get_token_to_kv_pool()
+        backend = get_attn_backend()
+        if (
+            type(backend) is not TRTLLMHAAttnBackend
+            or backend.token_to_kv_pool is not pool
+            or backend.data_type != torch.bfloat16
+            or type(pool) is not MHATokenToKVPool
+        ):
+            return None
+        cache_args = pool.get_bf16_hnd_write_args(
+            self.attn, KVWriteLoc.for_batch(forward_batch)
+        )
+        if cache_args is None:
+            return None
+        try:
+            from sglang.kernels.ops.attention.qkv_norm_mrope import qkv_norm_mrope
+        except ImportError:
+            return None
+        self.rotary_emb._match_cos_sin_cache_dtype(hidden_states)
+        qkv = qkv_norm_mrope(
+            hidden_states,
+            self.qkv_proj.weight.detach(),
+            self.q_norm.weight.detach(),
+            self.k_norm.weight.detach(),
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.rotary_emb.axis_map,
+            cache_args[0].permute(0, 2, 1, 3),
+            cache_args[1].permute(0, 2, 1, 3),
+            cache_args[2],
+        )
+        if qkv is None:
+            return None
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return q, k, v, False
+
     def forward_prepare_native(self, positions, hidden_states, forward_batch):
+        if self.use_qkv_norm_mrope and hidden_states.shape[0] == 8:
+            fused = self._try_qkv_norm_mrope(positions, hidden_states, forward_batch)
+            if fused is not None:
+                return fused
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if (
