@@ -1322,6 +1322,27 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(chat_request.tool_choice.type, "function")
         self.assertEqual(chat_request.tool_choice.function.name, "lookup")
 
+    def test_tool_choice_disable_parallel_tool_use_is_forwarded(self):
+        """tool_choice.disable_parallel_tool_use=true must not be dropped;
+        it turns off parallel tool calls, and false keeps them on."""
+        serving = self._serving()
+        tools = [
+            {
+                "type": "custom",
+                "name": "lookup",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+        for disable, expected_parallel in ((True, False), (False, True)):
+            with self.subTest(disable_parallel_tool_use=disable):
+                request = self._anthropic_request(
+                    stream=False,
+                    tools=tools,
+                    tool_choice={"type": "any", "disable_parallel_tool_use": disable},
+                )
+                chat_request = serving._convert_to_chat_completion_request(request)
+                self.assertEqual(chat_request.parallel_tool_calls, expected_parallel)
+
     def test_tool_choice_named_unknown_tool_raises_400(self):
         """tool_choice={type:'tool', name:'X'} where X is missing must raise."""
         serving = self._serving()
