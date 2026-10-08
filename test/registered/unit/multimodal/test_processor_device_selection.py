@@ -11,6 +11,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from transformers import BaseImageProcessor
+
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -114,6 +116,54 @@ class TestFastImageProcessorDevice(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_token_space_media_devices_follow_the_process_mm_data_rule(self):
+        # explicit image device > fast-processor default; a model video device
+        # overrides both, as in process_mm_data.
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: True, device_type="cuda"
+            )
+        )
+        for images, videos, use_pil, kwargs, model_device, expected in (
+            (["image"], [], False, {}, None, ("cuda:3", None)),
+            (["image"], [], True, {}, None, (None, None)),
+            (["image"], [], False, {"image_device": "cpu"}, None, ("cpu", None)),
+            (
+                [],
+                ["video"],
+                False,
+                {"video_device": "cuda:5"},
+                None,
+                ("cuda:3", "cuda:5"),
+            ),
+            (
+                ["image"],
+                ["video"],
+                False,
+                {"image_device": "cuda:5"},
+                "cpu",
+                ("cpu", "cpu"),
+            ),
+        ):
+            with self.subTest(images=images, use_pil=use_pil, kwargs=kwargs):
+                processor = _make(base_gpu_id=3)
+                processor._processor = SimpleNamespace(
+                    image_processor=object.__new__(BaseImageProcessor)
+                )
+                processor.disable_fast_image_processor = use_pil
+                processor.video_preprocessing_device = model_device
+                with patch.multiple(
+                    BASE,
+                    platforms=platforms,
+                    _is_cpu=False,
+                    _is_xpu=False,
+                    _is_npu=False,
+                ):
+                    devices = processor._token_space_media_devices(
+                        images, videos, dict(kwargs)
+                    )
+                self.assertEqual(devices, expected)
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
