@@ -2424,8 +2424,6 @@ class DeepseekV4AttnBackend(
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
         tail = self.forward_metadata.late_layer_tail
-        request_layout = core_attn_metadata.request_window_layout
-        assert tail is None or request_layout is not None
         extend_seq_lens = forward_batch.extend_seq_lens
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         if tail is not None:
@@ -2438,6 +2436,9 @@ class DeepseekV4AttnBackend(
             f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
             "CP-local queries must use paged attention."
         )
+        # Reject undersized query buffers before accessing attention metadata.
+        request_layout = core_attn_metadata.request_window_layout
+        assert tail is None or request_layout is not None
         seq_lens_cpu_list = seq_lens_cpu.tolist()
         total_swa = sum(
             min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
