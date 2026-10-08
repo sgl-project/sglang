@@ -51,8 +51,8 @@ class ChunkCache(BasePrefixCache):
 
         self.protected_size_ = 0
 
-    def is_chunk_cache(self) -> bool:
-        return True
+    def supports_prefix_sharing(self) -> bool:
+        return False
 
     # NOTE (csy): this is to determine if a cache has prefix matching feature.
     # Chunk cache always return True to indicate no prefix matching.
@@ -76,18 +76,8 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        # The protected prefix is not this req's to free.
-        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-        self.unpin(req)
-
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_range.end
-        ]
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+    def checkpoint(self, req: Req, *, up_to: int):
+        pass
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

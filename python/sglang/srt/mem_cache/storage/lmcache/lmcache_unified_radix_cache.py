@@ -87,6 +87,20 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        # match_prefix may append loaded slots not yet published to the tree,
+        # so the path alone can be shorter than the prefix.
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        indices = path[: req.prefix_len]
+        missing = req.prefix_len - len(indices)
+        if missing > 0:
+            load = self._external_flows[req.rid].load
+            skip = max(len(indices) - load.local_hit_tokens, 0)
+            indices = torch.cat([indices, load.device_indices[skip : skip + missing]])
+        assert len(indices) == req.prefix_len, (req.rid, len(indices), req.prefix_len)
+        return indices
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Report LMCache hits through host fields until GPU slots are ready."""
         requested_key_len = len(params.key)
@@ -248,24 +262,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=len(req.get_fill_ids()))
-        super().cache_unfinished_req(req, chunked=chunked, **kwargs)
-        self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.get_fill_ids())
-
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        super().on_release(req, inserted=inserted)
-        if not inserted:
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        super().on_release(req, checkpointed=checkpointed)
+        if not checkpointed:
             self.release_aborted_request(req.cache_request_handle)
 
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=owned_kv_len)
-        super().cache_finished_req(req, owned_kv_len=owned_kv_len, **kwargs)
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        self._publish_external_loaded_prefix(req, token_ids_len=up_to)
+        super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-        self._submit_store(req, token_ids)
-        self._request_session_finish(req.rid)
+        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
+        if req.finished():
+            self._request_session_finish(req.rid)
 
     def check_hicache_events(self) -> None:
         """Poll LMCache retrieve/store futures at the scheduler safe point."""
@@ -769,7 +777,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
-            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, swa_missing_end)
+            req.kv.set_evicted_seqlen(
+                ComponentType.SWA,
+                max(req.kv.get_evicted_seqlen(ComponentType.SWA), swa_missing_end),
+            )
 
     def _publish_external_loaded_prefix(self, req: Req, *, token_ids_len: int) -> None:
         """Publish retrieved KV and immutable Mamba state into the device tree."""
@@ -807,8 +818,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
-                chunked=True,
+                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
+                inserted_len=len(key),
                 priority=req.priority or 0,
             )
         )
@@ -835,19 +846,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
         # Move the request lock to the published boundary.
-        if req.last_node is not None:
-            self._dec_req_lock(req)
-        lock_result = self.inc_lock_ref(matched.last_device_node)
-        if total_hit < token_ids_len:
-            req.prefix_indices = torch.cat(
-                [canonical, kv_indices[total_hit:].to(dtype=torch.int64, copy=True)]
-            )
-        else:
-            req.prefix_indices = canonical
+        self.unlock(req.lock)
+        req.lock = self.lock(matched.last_device_node)
         req.kv.cache_protected_len = total_hit
         req.last_node = matched.last_device_node
-        req.lock_receipt = lock_result.to_dec_params()
-        req.swa_prefix_lock_released = False
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None

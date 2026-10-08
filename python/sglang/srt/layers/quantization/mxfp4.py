@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
@@ -227,6 +227,20 @@ def _pad_hopper_mxfp4_scale(scale, k_size):
     return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
 
 
+@lru_cache(maxsize=1)
+def _mx_block_kwargs():
+    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
+    # absent in 3.7, which ROCm still ships, so probe before importing the value.
+    from triton_kernels.matmul import PrecisionConfig
+
+    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
+        return {}
+
+    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_details.opt_flags as opt_flags
@@ -253,6 +267,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
         k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
         scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
+        # No scale layout carries the warp count below Hopper, and the tile
+        # formula gives the batch-1 decode tile a single warp.
+        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -682,7 +700,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     check_mega_moe_shapes,
                 )
 
-                mma_type = _mega_moe_mma_type()
+                mma_type = _mega_moe_mma_type(layer)
                 check_mega_moe_shapes(
                     hidden=layer.w13_weight.shape[2] * 2,
                     intermediate=layer.w13_weight.shape[1] // 2,
@@ -1038,11 +1056,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            mx_block = _mx_block_kwargs()
             self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
             )
             self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
             )
 
             self.w13_weight_triton_tensor = w13_weight
@@ -1478,10 +1497,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
@@ -1525,10 +1540,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
