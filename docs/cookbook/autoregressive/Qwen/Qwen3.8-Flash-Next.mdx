@@ -218,3 +218,118 @@ Pending update — a sample transcript will be added here once the weights are p
 ```
 
 </Accordion>
+
+### 2.3 GB300 long-context serving with HiCache and MTP
+
+Use this single-GPU, aggregated TP1/EP1 configuration for long-context, multi-turn workloads on GB300. It combines the NVIDIA NVFP4 checkpoint's embedded MTP head, CPU DRAM KV offload through HiCache, and pinned-memory PLE embedding offload.
+
+This serving configuration comes from [InferenceX #3816](https://github.com/SemiAnalysisAI/InferenceX/pull/3816). [Run 37714835620, attempt 1](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37714835620) passed concurrency 1, 2, 4, 8, 16, 32, 48 and 64 on commit `e67ca6fc9ecf4cd57f27654bda8a3e9059923820`. Its [matching GSM8K eval](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/37714835620/job/113109083376) used real verification and scored 97.35% on 1,319 questions.
+
+The throughput sweep used InferenceX's simulated acceptance; the command below uses normal MTP verification and does not claim those throughput numbers for production traffic.
+
+#### Prerequisites and memory budget
+
+- Use a Linux ARM64 GB300 host with Docker, NVIDIA Container Toolkit, and a driver compatible with the image's CUDA 13.0 runtime. See [Docker installation](/docs/get-started/install#method-3-using-docker).
+- Reserve one GB300 GPU. The command selects GPU 0 and keeps TP, PP, DP and EP at 1.
+- Budget 224 GiB of CPU memory for the combined target/draft KV and Mamba HiCache host pool, plus approximately 48 GiB for the offloaded FP8 PLE table and additional headroom for checkpoint loading and host processes. `--hicache-size` sets the combined cache budget; it is separate from PLE weight offload. Keep sufficient free host memory for both.
+- The named Docker volume retains downloaded model files across restarts. The image digest and both target/draft checkpoint revisions are pinned to the validated configuration.
+
+#### Launch the server
+
+<Accordion title="GB300 TP1 launch (Docker)">
+
+```bash Command
+docker run --rm \
+  --gpus device=0 \
+  --network host \
+  --ipc host \
+  --ulimit memlock=-1 \
+  --mount type=volume,source=qwen38-model-cache,target=/root/.cache/huggingface \
+  -e PYTHONNOUSERSITE=1 \
+  -e PYTHONUNBUFFERED=1 \
+  -e NO_COLOR=1 \
+  -e SGLANG_TIMEOUT_KEEP_ALIVE=1800 \
+  -e SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE=0 \
+  lmsysorg/sglang:v0.5.21-cu130@sha256:1f176b3a1dd1205d2a462ab80ea9fc17769a32e53cb6f3c690efa2dc2c384977 \
+  sglang serve \
+  --model-path nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --served-model-name nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --speculative-draft-model-revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --trust-remote-code \
+  --quantization modelopt_mixed \
+  --context-length 262144 \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 1 \
+  --data-parallel-size 1 \
+  --expert-parallel-size 1 \
+  --attention-backend trtllm_mha \
+  --linear-attn-prefill-backend flashinfer \
+  --linear-attn-decode-backend flashinfer \
+  --linear-attn-verify-backend triton \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mamba-track-interval 256 \
+  --max-mamba-cache-size 480 \
+  --mem-fraction-static 0.88 \
+  --max-running-requests 96 \
+  --page-size 64 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
+  --moe-runner-backend flashinfer_trtllm \
+  --moe-a2a-backend none \
+  --disable-shared-experts-fusion \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-moe-runner-backend flashinfer_trtllm \
+  --enable-linear-replayssm-spec \
+  --cuda-graph-backend-prefill disabled \
+  --cuda-graph-backend-decode full \
+  --cuda-graph-max-bs-decode 96 \
+  --cuda-graph-bs-decode 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 \
+  --kv-cache-dtype bfloat16 \
+  --speculative-draft-kv-cache-dtype bfloat16 \
+  --enable-hierarchical-cache \
+  --hicache-size 224 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_back \
+  --ple-offload-embedding \
+  --ple-offload-backend pinned \
+  --enable-metrics \
+  --enable-cache-report \
+  --reasoning-parser auto \
+  --tokenizer-worker-num 1 \
+  --scheduler-recv-interval 1 \
+  --decode-log-interval 10 \
+  --stream-interval 20 \
+  --watchdog-timeout 1800 \
+  --random-seed 35 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+<Accordion title="Reference startup output">
+
+The validated run loaded the target and embedded draft through the stock image's mixed-precision loader. This excerpt is from the real-verification eval; timings and memory availability vary by host.
+
+```text Output
+[2026-10-08 02:22:36] Load weight end. elapsed=1011.56 s, type=Qwen4ExpForConditionalGeneration, quant=modelopt_mixed, quant_algo=MIXED_PRECISION, avail mem=202.03 GB, mem usage=73.64 GB.
+[2026-10-08 02:23:03] Load weight end. elapsed=25.97 s, type=Qwen4ExpForCausalLMMTP, quant=modelopt_mixed, quant_algo=MIXED_PRECISION, avail mem=197.09 GB, mem usage=4.89 GB.
+```
+
+</Accordion>
+
+#### Serving choices
+
+- **Draft precision:** revision `fc694b54` stores the MTP routed experts in block-scaled FP8 and the rest of the head in BF16. The pinned image, built from SGLang `e00930c5`, preserves this per-layer `modelopt_mixed` configuration. The draft uses the same checkpoint revision as the target. `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE=0` disables the optional draft precision conversion path; target and draft KV caches stay in BF16.
+- **Hybrid attention:** the recipe selects FlashInfer for linear-attention prefill/decode, Triton for linear verification, and `trtllm_mha` as the attention backend. ReplaySSM speculation, `extra_buffer_lazy`, a tracking interval of 256 and 480 Mamba cache slots retain the qualified state-cache configuration.
+- **Admission and graphs:** the server admits up to 96 requests, uses 16,384-token prefill chunks, and captures full decode graphs at the listed batch sizes up to 96. Prefill graphs remain disabled. The qualification varied client concurrency while retaining these server settings.
+- **CPU offload:** HiCache uses the `kernel` I/O backend, `page_first` layout and `write_back` policy. PLE uses a separate pinned-memory embedding table. See [HiCache design](/docs/advanced_features/hicache_design) for the cache tiers and policies.
+- **API and telemetry:** send requests through the chat-completions API at `http://localhost:30000/v1`, using model name `nvidia/Qwen3.8-Flash-Next-NVFP4`. `--reasoning-parser auto` separates reasoning from answer content. Engine metrics and cache reporting remain enabled.
+
+The recipe carries the serving environment and arguments from the qualified lane. InferenceX-only trace loading, simulated-acceptance controls, client concurrency overrides, result collection and Slurm allocation settings are excluded.
