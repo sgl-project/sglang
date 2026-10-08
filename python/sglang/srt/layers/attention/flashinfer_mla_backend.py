@@ -992,10 +992,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
-        # Kept ONLY for the spec-info branch (generate_attn_arg_prefill), which
-        # is static-pool-only: unified memory asserts spec off. The normal
-        # builder reads req_to_token through the translator.
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(
@@ -1085,10 +1081,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
         elif fast_verify_plan_kwargs is not None:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.attn_backend.kv_index_translator,
                     kv_indices_buf=fast_verify_plan_kwargs["kv_indices_buf"],
                 )
             )
@@ -1097,10 +1093,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.attn_backend.kv_index_translator,
                 )
             )
 

@@ -1840,10 +1840,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        # Kept ONLY for the spec-info branches (generate_attn_arg_prefill),
-        # which are static-pool-only: unified memory asserts spec off. The
-        # normal builders source from the per-batch KVIndexTable.
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
@@ -2202,20 +2198,22 @@ class FlashInferIndicesUpdaterPrefill:
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        translator=translator,
+                        sliding_window=use_swa_source,
                         kv_start_idx=kv_start_idx,
                     )
                 )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        translator=translator,
+                        sliding_window=use_swa_source,
                     )
                 )
 

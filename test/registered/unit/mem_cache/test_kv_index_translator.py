@@ -506,16 +506,75 @@ class _FakeForwardBatch:
         seq_lens_cpu=None,
         out_cache_loc=None,
         seq_lens_sum=-1,
+        spec_info=None,
     ):
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
         self.out_cache_loc = out_cache_loc
+        self.spec_info = spec_info
         self.seq_lens_sum = (
             (None if seq_lens is None else int(seq_lens.sum()))
             if seq_lens_sum == -1
             else seq_lens_sum
         )
+
+
+class TestWidenedTable(unittest.TestCase):
+    """`widened_index_table`: the whole-sequence verify view, `seq_len_delta`
+    columns past every row's live prefix."""
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _check(self, view, req_to_token, rows, lens, allocator, ps, width):
+        self.assertEqual(tuple(view.ids.shape), (rows.numel(), width))
+        want = _reference_table(
+            req_to_token, rows, lens, allocator.full_v2p_page_table, ps, width
+        )
+        self.assertTrue(torch.equal(view.ids, want), f"ps={ps}")
+
+    def test_width_comes_from_the_live_prefix(self):
+        """A DSPARK verify batch carries `seq_lens_cpu` already expanded by the
+        window and the live lens on `spec_info.live_seq_lens_cpu`; widening the
+        expanded lens would count the window twice."""
+        window = 3
+        for ps in (1, 4):
+            allocator = _build_composite(ps)
+            req_to_token, rows, live = _alloc_and_fill(
+                allocator, ps, lens=[5 * ps, 2 * ps, 3 * ps - 1]
+            )
+            src = _make_source(allocator, req_to_token, ps)
+            fb = _FakeForwardBatch(
+                req_pool_indices=rows,
+                seq_lens=live,
+                seq_lens_cpu=live + window,
+                spec_info=SimpleNamespace(live_seq_lens_cpu=live),
+            )
+            view = src.widened_index_table(fb, seq_len_delta=window)
+            width = -(-(int(live.max()) + window) // ps)
+            self._check(view, req_to_token, rows, live + window, allocator, ps, width)
+
+    def test_width_never_exceeds_the_request_row(self):
+        """Near the context limit the widened host bound can pass the end of
+        the `req_to_token` row; the table stops at the row instead of tripping
+        the read-table width assert."""
+        window = 6
+        ps = 1
+        allocator = _build_composite(ps)
+        req_to_token, rows, live = _alloc_and_fill(allocator, ps, lens=[6, 1])
+        row_pages = req_to_token.shape[1] // ps
+        src = _make_source(allocator, req_to_token, ps)
+        # No live lens on the spec info: the expanded mirror is all there is.
+        fb = _FakeForwardBatch(
+            req_pool_indices=rows, seq_lens=live, seq_lens_cpu=live + window
+        )
+        self.assertGreater(int(live.max()) + 2 * window, row_pages)
+        view = src.widened_index_table(fb, seq_len_delta=window)
+        self._check(view, req_to_token, rows, live + window, allocator, ps, row_pages)
 
 
 class TestViewMemo(unittest.TestCase):

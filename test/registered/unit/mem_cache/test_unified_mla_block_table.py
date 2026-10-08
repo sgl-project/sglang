@@ -145,6 +145,77 @@ class TestBlockTable(unittest.TestCase):
         v2p[0] = 0  # page 0 is the reserved sink
         return req_to_token, req_pool_indices, seq_lens, v2p
 
+    def test_seq_len_delta_matches_widened_lens(self):
+        """The kernel's ``seq_len_delta`` equals building with ``seq_lens + k``
+        (the two spellings of verify widening), and genuinely widens: the
+        widened columns overwrite the -1 sentinel the plain build leaves."""
+        from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            delta = page_size + 1
+            max_pages = int((sl.max().item() + delta + page_size - 1) // page_size)
+
+            def fill(seq_lens, seq_len_delta):
+                out = torch.full(
+                    (rpi.shape[0], max_pages), -1, dtype=torch.int32, device=_DEV
+                )
+                build_kv_read_table(
+                    req_to_token=rt,
+                    req_pool_indices=rpi,
+                    seq_lens=seq_lens.to(torch.int64),
+                    v2p=v2p,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=out,
+                    seq_len_delta=seq_len_delta,
+                )
+                return out
+
+            widened = fill(sl, delta)
+            by_lens = fill(sl + delta, 0)
+            plain = fill(sl, 0)
+            self.assertTrue(torch.equal(widened, by_lens), f"ps={page_size}")
+            self.assertFalse(torch.equal(widened, plain), f"ps={page_size}")
+
+    def test_rows_stop_at_the_table_width(self):
+        """A widened window longer than the table's row (a verify near the
+        context limit) is cut at ``max_pages`` instead of running into the
+        next row -- another request's page table -- or past the buffer. The
+        CUDA kernel must agree with the CPU path, which clamps per row."""
+        from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+
+        for page_size in (1, 32):
+            rt, rpi, sl, v2p = self._make_batch(page_size)
+            bs = rpi.shape[0]
+            delta = 2 * page_size
+            max_pages = 3
+            n_pages = (sl + delta + page_size - 1) // page_size
+            self.assertTrue(bool((n_pages > max_pages).any()), "no row overflows")
+
+            def fill(device):
+                # One guard row past the table catches a spill off the end.
+                out = torch.full(
+                    (bs + 1, max_pages), -1, dtype=torch.int32, device=device
+                )
+                build_kv_read_table(
+                    req_to_token=rt.to(device),
+                    req_pool_indices=rpi.to(device),
+                    seq_lens=sl.to(device=device, dtype=torch.int64),
+                    v2p=v2p.to(device),
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    out=out[:bs],
+                    seq_len_delta=delta,
+                )
+                return out.cpu()
+
+            gpu, cpu = fill(_DEV), fill("cpu")
+            self.assertTrue(torch.all(gpu[bs] == -1), f"ps={page_size}: {gpu}")
+            self.assertTrue(
+                torch.equal(gpu, cpu), f"ps={page_size}:\ngpu={gpu}\ncpu={cpu}"
+            )
+
     def test_static_kernel_matches_reference(self):
         """The stripped (id-space-free) flashmla kernel is byte-identical to the
         plain token//ps reference -- guards the v2p-arg removal itself."""

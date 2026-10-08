@@ -474,6 +474,44 @@ def handle_cache_compatibility(server_args: Any) -> None:
             )
 
 
+# Backends whose speculative verify id rails are translation-audited for
+# the unified pool.
+_SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
+    {
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "flashmla",
+        "flashinfer",
+        "fa3",
+    }
+)
+
+
+def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+    """Refuse target backends whose verify id rails are not translation-audited.
+
+    Only the target's prefill/decode pair is checked. A draft with a KV pool
+    of its own indexes that pool directly by virtual id, so its translator is
+    a passthrough and its backend has nothing to translate."""
+    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if resolving_view(server_args).dcp_size > 1:
+        # flashinfer's spec verify gathers its CSR args with no DCP read
+        # translation (`translate_dcp_read_ids`); the MLA verify family builds
+        # its DCP block table itself.
+        allowed = allowed - {"flashinfer"}
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= allowed, (
+        f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
+        f"attention backends {sorted(allowed)} for both prefill "
+        f"and decode; got {sorted(backends)}. Other backends do "
+        "not translate speculative verify indices to the unified "
+        "pool's physical ids yet."
+    )
+
+
 def handle_unified_memory_pool(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
@@ -540,25 +578,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "audited for the unified pool's virtual-to-physical loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    assert cfg.speculative_eagle_topk in (None, 1), (
+        "--enable-unified-memory supports a linear draft chain only "
+        "(--speculative-eagle-topk in {None, 1}); tree verify relocates "
+        "accepted tokens one at a time inside the target pool, which the "
+        "unified pool's page-granular move_kv_cache cannot express. Got "
+        f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+    )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's physical ids yet."
-        )
+        _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
         "TBO's replay split hands each child a view without the pre-translate "
