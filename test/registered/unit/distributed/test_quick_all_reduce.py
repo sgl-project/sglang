@@ -129,3 +129,7 @@ def test_factory_propagates_aiter_constructor_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="constructor failed"):
         quick_all_reduce_module.create_quick_allreduce(group=object(), device="cpu")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
