@@ -356,7 +356,7 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
-        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+        swa_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable SWA window. The branching
         # point is the last page-aligned position within the Full-KV hit that lies
