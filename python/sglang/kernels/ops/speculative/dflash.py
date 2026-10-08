@@ -2,6 +2,52 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
+
+
+def sample_indices_from_probs(
+    probs: torch.Tensor, uniforms: torch.Tensor
+) -> torch.Tensor:
+    indices = uniforms.ge(probs.cumsum(dim=-1)).sum(dim=-1)
+    offsets = torch.arange(probs.shape[-1], device=probs.device)
+    last_supported = torch.where(probs > 0, offsets, 0).amax(dim=-1)
+    # Renormalization can leave the CDF a fraction below one. A roundoff fallback
+    # must stay in the truncated support even when the final candidates have q=0.
+    return torch.minimum(indices, last_supported)
+
+
+def selector_proposal_probs(
+    *,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    top_ks: torch.Tensor | None = None,
+    top_ps: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize each corrected conditional over the model's candidate support.
+
+    Request top-k/top-p narrow this support; they cannot add candidates that the
+    model's candidate selector omitted.
+    """
+    batch, _, _, candidate_count = scores.shape
+    temperatures = temperatures.reshape(batch, 1)
+    params = DraftSamplingParams(
+        temperatures=torch.where(greedy_mask.reshape(batch, 1), 0.0, temperatures),
+        top_ks=(
+            torch.full(
+                (batch,), candidate_count, dtype=torch.int32, device=scores.device
+            )
+            if top_ks is None
+            else top_ks
+        ),
+        top_ps=(
+            torch.ones(batch, dtype=torch.float32, device=scores.device)
+            if top_ps is None
+            else top_ps
+        ),
+    )
+    return build_draft_probs(scores, params)
+
 
 @triton.jit
 def _dflash_accept_bonus_contig_kernel(
@@ -257,6 +303,7 @@ def _selector_walk_kernel(
     q_ptr,
     slots: tl.constexpr,
     top_k: tl.constexpr,
+    scores_are_probs: tl.constexpr,
 ):
     """One program per request: a slot's K scores stay in registers and the walk is a
     loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
@@ -279,14 +326,20 @@ def _selector_walk_kernel(
             index = tl.min(tl.where(hit, offsets, top_k), axis=0)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
-            scaled = scores / temperature
-            exponentials = tl.exp(scaled - tl.max(scaled, axis=0))
-            probabilities = exponentials / tl.sum(exponentials, axis=0)
+            if scores_are_probs:
+                # The caller applied temperature and request truncation to the
+                # corrected conditional rows with the target sampling kernels.
+                probabilities = scores
+            else:
+                scaled = scores / temperature
+                exponentials = tl.exp(scaled - tl.max(scaled, axis=0))
+                probabilities = exponentials / tl.sum(exponentials, axis=0)
             uniform = tl.load(uniforms_ptr + row * slots + slot)
             index = tl.sum(
                 tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
             )
-            index = tl.minimum(index, top_k - 1)
+            last_supported = tl.max(tl.where(probabilities > 0, offsets, 0), axis=0)
+            index = tl.minimum(index, last_supported)
         tl.store(q_ptr + base + offsets, probabilities)
         tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
         previous = index
@@ -299,6 +352,7 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    scores_are_probs=False,
 ):
     batch, slots, top_k = candidate_ids.shape
     tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
@@ -315,6 +369,7 @@ def selector_walk_triton(
         q_rows,
         slots=slots,
         top_k=top_k,
+        scores_are_probs=scores_are_probs,
         num_warps=1,
     )
     return tokens, q_rows

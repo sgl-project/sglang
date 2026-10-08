@@ -859,7 +859,12 @@ class DsparkStepObservers:
                 draft_tokens=draft_tokens,
                 corrected_logits=draft_block.corrected_logits,
                 draft_temperatures=draft_block.temperatures,
-                greedy_mask=draft_block.greedy_mask,
+                draft_probs=draft_block.draft_probs,
+                greedy_mask=(
+                    (sampling_info.top_ks <= 1).view(-1)
+                    if sampling_info is not None
+                    else draft_block.greedy_mask
+                ),
                 target_logits=target_logits,
                 target_temperatures=(
                     sampling_info.temperatures

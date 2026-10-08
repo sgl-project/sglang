@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash import (
+    sample_indices_from_probs,
+    selector_proposal_probs,
+    selector_walk_triton,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -1145,11 +1149,15 @@ class CandidateSelector(nn.Module):
         uniforms: torch.Tensor,
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
+        top_ks: Optional[torch.Tensor] = None,
+        top_ps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Walk one path, with q over the K candidates for the verify. greedy_mask
         rows take the argmax, selected rather than branched, so one captured graph
         serves greedy and sampling batches alike."""
-        if scores.is_cuda:
+        use_truncation = top_ks is not None or top_ps is not None
+        if scores.is_cuda and not use_truncation:
+            # Greedy-only callers omit request cutoffs and keep the fused walk.
             return selector_walk_triton(
                 candidate_ids=candidate_ids,
                 scores=scores,
@@ -1157,29 +1165,37 @@ class CandidateSelector(nn.Module):
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
             )
+        if use_truncation:
+            probs = selector_proposal_probs(
+                scores=scores,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                top_ks=top_ks,
+                top_ps=top_ps,
+            )
+        else:
+            safe_temps = torch.where(greedy_mask, 1.0, temperatures.reshape(-1))
+            probs = torch.softmax(scores.float() / safe_temps[:, None, None, None], -1)
+            probs = torch.where(
+                greedy_mask[:, None, None, None],
+                F.one_hot(scores.argmax(dim=-1), self.top_k).float(),
+                probs,
+            )
+        if scores.is_cuda:
+            return selector_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=probs,
+                uniforms=uniforms,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                scores_are_probs=True,
+            )
         top_k = self.top_k
-        temps = temperatures.view(-1, 1)
-        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
-        initial_indices = (
-            uniforms[:, :1]
-            .ge(initial_probs.cumsum(dim=-1))
-            .sum(dim=-1)
-            .clamp_max(top_k - 1)
-        )
-        transition_probs = torch.softmax(
-            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
-        )
-        local_maps = (
-            uniforms[:, 1:, None, None]
-            .ge(transition_probs.cumsum(dim=-1))
-            .sum(dim=-1)
-            .clamp_max(top_k - 1)
-        )
-        initial_indices = torch.where(
-            greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
-        )
-        local_maps = torch.where(
-            greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
+        initial_probs = probs[:, 0, 0]
+        initial_indices = sample_indices_from_probs(initial_probs, uniforms[:, :1])
+        transition_probs = probs[:, 1:]
+        local_maps = sample_indices_from_probs(
+            transition_probs, uniforms[:, 1:, None, None]
         )
         torch._dynamo.mark_static(local_maps, 1)
         torch._dynamo.mark_static(local_maps, 2)
@@ -1191,11 +1207,6 @@ class CandidateSelector(nn.Module):
             2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
         )[:, :, 0]
         q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
-        # Greedy rows walk the argmax, so their q is the point mass there, not
-        # the temperature-1 softmax above. The triton walk stores the same.
-        q_rows = torch.where(
-            greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
-        )
         return tokens, q_rows
 
 

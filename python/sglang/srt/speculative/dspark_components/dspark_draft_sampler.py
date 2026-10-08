@@ -5,15 +5,15 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    SampleStepTokens,
-)
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    _DRAFT_PROBS,
     select_draft_hidden_without_anchor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.utils.invariants import expect
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +76,12 @@ class DsparkDraftSampler:
         self.greedy_mask = None
         self.exp_noise = None
         self.corrected_out = None
+        self.probs_out = None
+        self.sampling_params = None
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
-            self.temperatures = torch.ones(
-                (max_bs,), dtype=torch.float32, device=device
-            )
+            self.sampling_params = DraftSamplingParams.create(max_bs, device)
+            self.temperatures = self.sampling_params.temperatures.view(-1)
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
@@ -90,22 +91,19 @@ class DsparkDraftSampler:
                 dtype=_base_logits_dtype(model),
                 device=device,
             )
+            self.probs_out = torch.empty(
+                (max_bs * self.gamma, vocab), dtype=torch.float32, device=device
+            )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
-        if sampling_info is None:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
+        self.sampling_params.copy_from(sampling_info, bs)
+        # Refresh the entire bucket so graph padding cannot retain parameters
+        # from a previous, larger batch.
+        self.greedy_mask.copy_(self.sampling_params.greedy_mask)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -139,18 +137,23 @@ class DsparkDraftSampler:
             if self.folded_sampling:
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                    del step_idx
+                    probs = expect(
+                        _DRAFT_PROBS,
+                        build_draft_probs(step_logits, self.sampling_params.slice(bs)),
+                    )
+                    self.probs_out[: bs * self.gamma].view(bs, self.gamma, -1)[
+                        :, step_idx
+                    ].copy_(probs)
                     # In-graph philox noise: each replay advances the generator
                     # and redraws.
-                    noise = self.exp_noise[:bs].exponential_()
+                    noise = (
+                        self.exp_noise[:bs]
+                        .exponential_()
+                        .clamp_min_(torch.finfo(torch.float32).tiny)
+                    )
                     return self._tp_sync.sync(
                         SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
-                        SampleStepTokens.execute(
-                            step_logits=step_logits,
-                            temperatures=self.temperatures[:bs],
-                            greedy_mask=self.greedy_mask[:bs],
-                            exp_noise=noise,
-                        ),
+                        (probs / noise).argmax(dim=-1),
                     )
 
             else:
@@ -201,7 +204,8 @@ def _resolve_folded_sampling(
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * _base_logits_dtype(model).itemsize
-    need_gb = (noise_bytes + logits_bytes) / (1 << 30)
+    probs_bytes = max_bs * gamma * vocab * 4
+    need_gb = (noise_bytes + logits_bytes + probs_bytes) / (1 << 30)
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:

@@ -80,6 +80,179 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
         torch.testing.assert_close(mixed_q[row], q_rows[0])
 
 
+def _sample_corrected_candidate_path(kind, scores, **sampling):
+    candidate_ids = torch.arange(8).reshape(1, 2, 4)
+    if kind == "selector":
+        selector = CandidateSelector(
+            hidden_size=4, vocab_size=16, state_rank=2, top_k=4
+        )
+        return selector.sample_path(
+            candidate_ids=candidate_ids, scores=scores, **sampling
+        )
+    from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
+
+    return lilicorr_sample_path(
+        scores[:, 0, 0], scores[:, 1:], candidate_ids, **sampling
+    )
+
+
+@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
+@pytest.mark.parametrize("temperature", [0.5, 1.0])
+def test_candidate_sampling_returns_the_truncated_realized_conditionals(
+    kind, temperature
+):
+    # Position one's correction depends on the sampled predecessor. The rows
+    # used by verify must be the two conditional distributions actually visited.
+    scores = torch.zeros(1, 2, 4, 4)
+    scores[:, 0, 0] = torch.tensor([1.0, 0.0, 2.0, 3.0])
+    scores[:, 1, 2] = torch.tensor([4.0, 3.0, 1.0, 0.0])
+    tokens, q = _sample_corrected_candidate_path(
+        kind,
+        scores,
+        uniforms=torch.tensor([[0.1, 0.95]]),
+        temperatures=torch.tensor([temperature]),
+        greedy_mask=torch.tensor([False]),
+        top_ks=torch.tensor([2]),
+        top_ps=torch.tensor([0.95]),
+    )
+    low, high = torch.softmax(torch.tensor([2.0, 3.0]) / temperature, dim=-1)
+    expected_q = torch.tensor([[[0.0, 0.0, low, high], [high, low, 0.0, 0.0]]])
+    assert tokens.tolist() == [[2, 5]]
+    torch.testing.assert_close(q, expected_q)
+
+
+@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
+def test_candidate_top_p_follows_correction_and_temperature(kind):
+    scores = torch.zeros(1, 2, 4, 4)
+    scores[:, 0, 0] = torch.tensor([1.0, 0.0, 2.0, 3.0])
+    scores[:, 1, 3] = torch.tensor([0.0, 5.0, 6.0, 1.0])
+    sampling = dict(
+        uniforms=torch.tensor([[0.0, 0.0]]),
+        temperatures=torch.tensor([0.5]),
+        greedy_mask=torch.tensor([False]),
+        top_ks=torch.tensor([2]),
+        top_ps=torch.tensor([0.8]),
+    )
+    tokens, q = _sample_corrected_candidate_path(kind, scores, **sampling)
+    assert tokens.tolist() == [[3, 6]]
+    torch.testing.assert_close(
+        q, torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]]])
+    )
+
+
+@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
+def test_candidate_zero_draft_temperature_is_a_point_mass_for_sampled_target(kind):
+    scores = torch.zeros(1, 2, 4, 4)
+    scores[:, 0, 0, 2] = 4.0
+    scores[:, 1, 2, 1] = 5.0
+    tokens, q = _sample_corrected_candidate_path(
+        kind,
+        scores,
+        uniforms=torch.tensor([[0.99, 0.0]]),
+        temperatures=torch.tensor([0.0]),
+        greedy_mask=torch.tensor([False]),
+        top_ks=torch.tensor([50]),
+        top_ps=torch.tensor([0.9]),
+    )
+    assert tokens.tolist() == [[2, 5]]
+    torch.testing.assert_close(
+        q, torch.tensor([[[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]])
+    )
+
+
+def test_candidate_sampling_roundoff_fallback_stays_in_truncated_support():
+    from sglang.kernels.ops.speculative.dflash import sample_indices_from_probs
+    from sglang.kernels.ops.speculative.lilicorr import _selector_walk_torch
+
+    probs = torch.tensor([0.25, 0.0, 0.7499998, 0.0])
+    uniforms = torch.tensor([[0.0], [0.5], [0.9999999]])
+    indices = sample_indices_from_probs(probs.expand(3, -1), uniforms)
+    assert indices.tolist() == [0, 2, 2]
+    tokens, q = _selector_walk_torch(
+        candidate_ids=torch.arange(8).reshape(1, 2, 4),
+        scores=probs.expand(1, 2, 4, 4),
+        uniforms=torch.tensor([[0.9999999, 0.9999999]]),
+        temperatures=torch.ones(1),
+        greedy_mask=torch.zeros(1, dtype=torch.bool),
+        scores_are_probs=True,
+    )
+    assert tokens.tolist() == [[2, 6]]
+    assert torch.all(q.gather(-1, (tokens % 4).unsqueeze(-1)) > 0)
+
+
+@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
+def test_greedy_only_candidate_path_skips_lattice_normalization(kind, monkeypatch):
+    from sglang.kernels.ops.speculative import lilicorr as lilicorr_kernels
+    from sglang.srt.models import dflash as dflash_model
+
+    def unexpected_normalization(**kwargs):
+        pytest.fail("A greedy-only model must retain the raw-score walk")
+
+    monkeypatch.setattr(
+        lilicorr_kernels, "selector_proposal_probs", unexpected_normalization
+    )
+    monkeypatch.setattr(
+        dflash_model, "selector_proposal_probs", unexpected_normalization
+    )
+    scores = torch.zeros(1, 2, 4, 4)
+    scores[:, 0, 0, 2] = 4.0
+    scores[:, 1, 2, 1] = 5.0
+    tokens, q = _sample_corrected_candidate_path(
+        kind,
+        scores,
+        uniforms=torch.zeros(1, 2),
+        temperatures=torch.ones(1),
+        greedy_mask=torch.ones(1, dtype=torch.bool),
+    )
+    assert tokens.tolist() == [[2, 5]]
+    torch.testing.assert_close(
+        q, torch.tensor([[[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]])
+    )
+
+
+@pytest.mark.parametrize("kind", ["selector", "lilicorr"])
+def test_candidate_graph_stages_independent_draft_temperature_and_cutoffs(
+    kind, topology
+):
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+    from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
+
+    if kind == "selector":
+        from sglang.srt.speculative.dflash_worker_v2 import _SelectorDraftSampler
+
+        sampler_class = _SelectorDraftSampler
+    else:
+        sampler_class = LiLiCorrDraftSampler
+    sampler = sampler_class.__new__(sampler_class)
+    sampler.sampling_params = DraftSamplingParams.create(3, "cpu")
+    sampler.sampling_enabled = True
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.7], [1.2]]),
+        top_ks=torch.tensor([2, 7]),
+        top_ps=torch.tensor([0.8, 0.95]),
+        is_all_greedy=False,
+    )
+    with get_context().override_server_args(
+        speculative_draft_temperature=0.25,
+        speculative_draft_top_k=-1,
+        speculative_draft_top_p=0.6,
+    ):
+        sampler.stage_sampling_params(bs=2, sampling_info=sampling_info)
+    torch.testing.assert_close(
+        sampler.sampling_params.temperatures, torch.tensor([[0.25], [0.25], [1.0]])
+    )
+    assert bool((sampler.sampling_params.top_ks[:2] > 7).all())
+    torch.testing.assert_close(
+        sampler.sampling_params.top_ps, torch.tensor([0.6, 0.6, 1.0])
+    )
+    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
+    torch.testing.assert_close(
+        sampler.sampling_params.temperatures, torch.tensor([[0.7], [1.0], [1.0]])
+    )
+    assert sampler.sampling_params.top_ps[1:].tolist() == [1.0, 1.0]
+
+
 def test_selector_rejects_a_quantized_target_lm_head():
     """The candidate matmuls read the lm_head weight directly, so a packed or
     absent weight would be read as if it were dense."""
@@ -338,27 +511,30 @@ def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch, topol
     assert len(warnings) == 1
 
 
-def test_disabled_selector_sampling_forces_greedy_draft():
+def test_disabled_selector_sampling_forces_greedy_draft(topology):
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.sampling.draft_sampling import DraftSamplingParams
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     sampling_info = SimpleNamespace(
         temperatures=torch.tensor([[0.7]]),
-        top_ks=torch.tensor([[8]]),
+        top_ks=torch.tensor([8]),
+        top_ps=torch.tensor([0.9]),
         is_all_greedy=False,
     )
 
     sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
-    sampler.temperatures = torch.zeros(1)
-    sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
+    sampler.sampling_params = DraftSamplingParams.create(1, "cpu")
     sampler.sampling_enabled = False
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
-    torch.testing.assert_close(sampler.temperatures, torch.ones(1))
-    assert sampler.greedy_mask.tolist() == [True]
+    assert sampler.sampling_params.greedy_mask.tolist() == [True]
 
     sampler.sampling_enabled = True
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
-    torch.testing.assert_close(sampler.temperatures, torch.tensor([0.7]))
-    assert sampler.greedy_mask.tolist() == [False]
+    torch.testing.assert_close(
+        sampler.sampling_params.temperatures, torch.tensor([[0.7]])
+    )
+    assert sampler.sampling_params.greedy_mask.tolist() == [False]
     observed = {}
 
     def sample_path(**kwargs):
@@ -395,9 +571,27 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         sampling_info=sampling_info,
     )
 
-    torch.testing.assert_close(observed["temperatures"], torch.ones(1))
+    torch.testing.assert_close(observed["temperatures"], torch.zeros((1, 1)))
     assert observed["greedy_mask"].tolist() == [True]
+    assert observed["top_ks"] is None and observed["top_ps"] is None
     assert worker._selector_sample is None
+
+    # A deterministic draft still needs proposal verification against a random
+    # target. Only the target's greedy status controls whether q is staged.
+    worker._selector_sampling_enabled = True
+    with get_context().override_server_args(speculative_draft_temperature=0.0):
+        worker_mod.DFlashWorkerV2._propose_selector_block(
+            worker,
+            draft_logits_output=draft_logits_output,
+            bs=1,
+            lm_head=object(),
+            anchor_token_ids=torch.zeros(1, dtype=torch.int64),
+            sampling_info=sampling_info,
+        )
+    assert observed["greedy_mask"].tolist() == [True]
+    assert observed["top_ks"].tolist() == [8]
+    torch.testing.assert_close(observed["top_ps"], torch.tensor([0.9]))
+    assert worker._selector_sample is not None
 
 
 def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch):

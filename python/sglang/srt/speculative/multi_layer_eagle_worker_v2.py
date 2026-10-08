@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -653,6 +654,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         topk_p_list = []
         topk_index_list = []
         draft_probs_list = []
+        draft_sampling_params = (
+            DraftSamplingParams.from_sampling_info(forward_batch.sampling_info)
+            if self.use_rejection_sampling and self.topk == 1
+            else None
+        )
         for step in range(self.speculative_num_steps):
             forward_batch.req_to_token_pool = self.draft_runner_list[
                 step
@@ -678,7 +684,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 # Rejection sampling (prefill): sample X ~ q and stash q for the first verify.
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
-                    forward_batch.sampling_info.temperatures,
+                    draft_sampling_params,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -846,6 +852,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ret_topk_index_list = []
         ret_draft_probs_list = []
         ret_draft_probs = None
+        draft_sampling_params = (
+            DraftSamplingParams.from_sampling_info(forward_batch.sampling_info)
+            if self.use_rejection_sampling and self.topk == 1
+            else None
+        )
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
         if can_run_decode_cuda_graph:
@@ -874,7 +885,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                             step_logits = _out.next_token_logits[sel]
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
-                            forward_batch.sampling_info.temperatures,
+                            draft_sampling_params,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -948,7 +959,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     ]
                 if self.use_rejection_sampling and self.topk == 1:
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        logits_sel, forward_batch.sampling_info.temperatures
+                        logits_sel,
+                        draft_sampling_params,
                     )
                     ret_draft_probs_list.append(probs)
                 else:

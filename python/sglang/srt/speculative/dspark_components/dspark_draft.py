@@ -6,9 +6,6 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    SampleStepTokens,
-)
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -18,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -41,7 +39,7 @@ def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
 
 
 # Draft step logits: NaN is a bug, but -inf is legitimate (masking). The data
-# layer lives downstream (probs one-hot below, or the fast kernel's clamp).
+# layer lives downstream (probs one-hot below).
 _DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN())
 # Draft sampling probs: SOFTEN (tolerate + count), matching the original
 # unconditional clamp; an all-NaN row would otherwise make multinomial raise.
@@ -67,6 +65,9 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    # The exact post-correction, post-truncation distribution used by the
+    # sampler. Reconstructing it from corrected_logits can change its support.
+    draft_probs: Optional[torch.Tensor] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -114,17 +115,6 @@ def make_next_draft_input(
     return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
 
-def resolve_greedy_mask(
-    *,
-    bs: int,
-    sampling_info,
-    device: torch.device,
-) -> torch.Tensor:
-    if sampling_info is None:
-        return torch.ones(bs, dtype=torch.bool, device=device)
-    return (sampling_info.top_ks <= 1).view(-1)
-
-
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
@@ -136,16 +126,18 @@ def sample_draft_block(
     tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
-    greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+    params = DraftSamplingParams.from_sampling_info(
+        sampling_info, batch_size=bs, device=device
+    )
+    greedy_mask = params.greedy_mask
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
-
-    if sampling_info is None:
-        temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-    else:
-        temperatures = (
-            sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
-        )
+    temperatures = params.temperatures.view(-1)
+    # Store q once, before random sampling mutates any temporary buffers.
+    # In particular, q must include the prefix-dependent Markov correction.
+    draft_probs = (
+        torch.empty_like(base_logits, dtype=torch.float32) if any_sampling else None
+    )
 
     if not any_sampling:
 
@@ -159,29 +151,27 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
+            probs = expect(_DRAFT_PROBS, build_draft_probs(step_logits, params))
+            draft_probs[:, step_idx].copy_(probs)
             if fast_sampling:
-                exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
+                exp_noise = (
+                    torch.empty(
+                        step_logits.shape,
+                        dtype=torch.float32,
+                        device=step_logits.device,
+                    )
+                    .exponential_(1)
+                    .clamp_min_(torch.finfo(torch.float32).tiny)
+                )
                 return tp_sync.sync(
                     SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
-                    SampleStepTokens.execute(
-                        step_logits=step_logits,
-                        temperatures=temperatures,
-                        greedy_mask=greedy_mask,
-                        exp_noise=exp_noise,
-                    ),
+                    (probs / exp_noise).argmax(dim=-1),
                 )
             else:
-                probs = torch.softmax(
-                    step_logits.float() / temperatures[:, None], dim=-1
-                )
-                probs = expect(_DRAFT_PROBS, probs)
-                argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return tp_sync.sync(
                     SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
-                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
+                    sampled_tokens,
                 )
 
     draft_tokens, corrected_logits = markov_head.sample_block(
@@ -195,6 +185,7 @@ def sample_draft_block(
         corrected_logits=corrected_logits,
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        draft_probs=draft_probs,
     )
 
 
@@ -287,26 +278,29 @@ class DraftBlockProposer:
                         bs, self.gamma, -1
                     )
                 )
+                draft_probs = (
+                    None
+                    if all_greedy
+                    else draft_sampler.probs_out[: bs * self.gamma].view(
+                        bs, self.gamma, -1
+                    )
+                )
             else:
                 # Greedy-only folding: the hook argmaxed every row and kept no
                 # sampling buffers, so derive the params on the fly.
-                greedy_mask = resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
+                params = DraftSamplingParams.from_sampling_info(
+                    sampling_info, batch_size=bs, device=device
                 )
-                if sampling_info is None:
-                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-                else:
-                    temperatures = (
-                        sampling_info.temperatures.view(-1)
-                        .to(torch.float32)
-                        .clamp_min(1e-5)
-                    )
+                greedy_mask = params.greedy_mask
+                temperatures = params.temperatures.view(-1)
                 corrected_logits = None
+                draft_probs = None
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=corrected_logits,
                 greedy_mask=greedy_mask,
                 temperatures=temperatures,
+                draft_probs=draft_probs,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]

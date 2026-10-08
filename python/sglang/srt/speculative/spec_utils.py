@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -152,57 +153,25 @@ def renorm_draft_probs(
     sampling_info,
     use_rejection_sampling: bool,
 ) -> torch.Tensor:
-    """Draft-side next-token distribution.
-
-    Plain softmax, except under rejection sampling where logits are
-    temperature-scaled so the draft proposal q tracks the target sampling
-    temperature (higher acceptance; correctness holds for any q).
-    """
+    """Build q for rejection sampling; preserve deterministic tree scores otherwise."""
     if not use_rejection_sampling or not next_token_logits.size(0):
         return sampling_softmax(next_token_logits)
-    return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
+    return build_draft_probs(
+        next_token_logits, DraftSamplingParams.from_sampling_info(sampling_info)
+    )
 
 
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_ks: Optional[torch.Tensor] = None,
+    sampling_params: DraftSamplingParams,
 ):
-    """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+    """Return (q, q(X), X) for a proposal drawn from the final draft distribution.
 
-    Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
-    only if q is exactly the distribution X was drawn from, so callers must hand
-    the returned q (not a recomputed one) to the verify.
-
-    A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
-    rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
-    tell a greedy request from a T=1 one, and sampling a sharp-but-not-
-    degenerate distribution proposes a non-argmax token often enough to cost
-    real accept length.
-
-    That row's X is then not drawn from the q returned beside it, which the
-    unbiasedness argument above otherwise rests on. It stays correct because
-    eagle_sample renormalises the target by the same per-row ``top_ks`` before
-    the accept test, so a greedy row's p is one-hot: X equal to the target
-    argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
-    (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
-    which is what greedy means. Drop that renorm and this stops holding.
+    Keep this exact q for acceptance and residual correction, including the
+    one-hot distribution used by greedy requests and draft temperature zero.
     """
-    probs = sampling_softmax(next_token_logits, temperatures=temperatures)
+    probs = build_draft_probs(next_token_logits, sampling_params)
     topk_p, topk_index = fast_sample(probs, num_samples=1)
-    if top_ks is not None:
-        # Assert rather than skip on a device mismatch: a host-side top_ks would
-        # make this correction silently vanish, and the symptom -- draft accept
-        # length quietly dropping about 20% -- reads as a model problem, not a
-        # plumbing one.
-        assert top_ks.device == probs.device, (
-            f"top_ks must be on {probs.device} to reach the draft proposal, "
-            f"got {top_ks.device}; the caller has to carry the real per-request "
-            "top_k, not a host placeholder"
-        )
-        greedy = (top_ks <= 1).view(-1, 1)
-        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
-        topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
 
 

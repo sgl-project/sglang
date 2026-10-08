@@ -42,8 +42,8 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -215,15 +215,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else None
             )
 
-            self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
-            # Real per-request top_k, for the same reason temperatures are
-            # carried: the draft proposal cannot tell a greedy request from a
-            # T=1 one by temperature alone, because SamplingParams rewrites
-            # temperature 0 to temperature=1.0 with top_k=1.
-            # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
-            # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
-            # greedy, for the padded rows and for a run that never copies in.
-            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
+            self.draft_sampling_params = DraftSamplingParams.create(
+                self.max_bs, self.device
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -445,9 +439,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
         sampling_info = SamplingBatchInfo(
-            temperatures=self.temperatures[:num_seqs],
-            top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=self.top_ks[:num_seqs],
+            temperatures=self.draft_sampling_params.temperatures[:num_seqs],
+            top_ps=self.draft_sampling_params.top_ps[:num_seqs],
+            top_ks=self.draft_sampling_params.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             is_any_greedy=False,
@@ -502,7 +496,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states_backup = forward_batch.spec_info.hidden_states
             dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(
+                forward_batch,
+                draft_sampling_params=self.draft_sampling_params.slice(num_seqs),
+            )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -658,16 +655,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
             else:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
-        # Only rejection sampling reads temperatures (renorm_draft_probs); skip
-        # the copy otherwise to keep the non-RS path free of extra work.
         if (
             get_spec().speculative_use_rejection_sampling
             and forward_batch.sampling_info is not None
         ):
-            self.temperatures[:raw_bs].copy_(
-                forward_batch.sampling_info.temperatures[:raw_bs]
-            )
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
+            self.draft_sampling_params.copy_from(forward_batch.sampling_info, raw_bs)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

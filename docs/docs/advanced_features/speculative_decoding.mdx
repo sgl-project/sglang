@@ -154,6 +154,43 @@ For further details please see the [EAGLE3 paper](https://arxiv.org/pdf/2503.018
 
 ---
 
+## Draft sampling parameters
+
+You can tune stochastic draft proposals independently of target sampling. Each
+omitted option inherits the corresponding setting from each request:
+
+| Option | Override |
+| --- | --- |
+| `--speculative-draft-temperature` | A finite, non-negative temperature; `0` makes proposals greedy |
+| `--speculative-draft-top-k` | A positive integer; `1` makes proposals greedy and `-1` disables this cutoff |
+| `--speculative-draft-top-p` | A finite probability in `(0, 1]`; `1` disables this cutoff |
+
+Setting `--speculative-draft-top-k -1 --speculative-draft-top-p 1` disables both
+draft cutoffs while preserving the request's target cutoffs. Target greedy
+requests (`temperature=0` or `top_k=1`) continue to use greedy draft proposals,
+even when you override the draft parameters.
+
+The draft applies its effective temperature, then `top_k`, then `top_p`, with
+renormalization after each cutoff. These operations run after the draft model's
+correction. Verification uses the resulting proposal probabilities, including
+zero probability outside the retained support.
+
+The proposal space depends on the draft model:
+
+| Draft path | Where sampling parameters apply |
+| --- | --- |
+| EAGLE/EAGLE3/MTP with rejection sampling | Draft vocabulary logits |
+| DSpark | Full-vocabulary logits after prefix-dependent correction |
+| DFlash2 selector and sampled LiLiCorr | Corrected conditional scores within the model's candidate set |
+
+For a selector with 16 candidates, draft `top_k=50` cannot introduce additional
+tokens, and draft `top_p=0.9` uses the probability mass within those 16 candidates.
+The model's candidate width and the draft sampling `top_k` are separate settings.
+
+These options do not enable stochastic proposals in plain DFlash, Domino, or
+unsampled LiLiCorr, and do not change deterministic EAGLE tree construction.
+Those paths keep their existing greedy or candidate-search behavior.
+
 ## EAGLE Decoding
 
 To enable EAGLE speculative decoding the following parameters are relevant:

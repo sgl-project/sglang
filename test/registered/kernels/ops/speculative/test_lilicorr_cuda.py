@@ -158,5 +158,43 @@ def test_sampled_path_matches_the_reference(k):
     torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
 
 
+def test_truncated_path_graph_replay_uses_updated_sampling_params():
+    inputs = _sampled_inputs(3, 4, 8, seed=11)
+    inputs["top_ks"] = torch.tensor([2, 4, 50], dtype=torch.int32, device="cuda")
+    inputs["top_ps"] = torch.tensor([0.8, 0.9, 1.0], device="cuda")
+    # Warm the shared renormalization kernels before graph capture.
+    for _ in range(3):
+        lilicorr_sample_path(**inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tokens, q = lilicorr_sample_path(**inputs)
+    for temperatures, top_ks in [([0.0, 0.4, 1.3], [8, 2, 4]), ([0.7] * 3, [3] * 3)]:
+        inputs["temperatures"].copy_(torch.tensor(temperatures, device="cuda"))
+        inputs["top_ks"].copy_(torch.tensor(top_ks, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        ref_tokens, ref_q = lilicorr_sample_path(
+            **{name: tensor.cpu() for name, tensor in inputs.items()}
+        )
+        assert torch.equal(tokens.cpu(), ref_tokens)
+        torch.testing.assert_close(q.cpu(), ref_q, atol=1e-6, rtol=1e-6)
+        assert torch.all(q.gather(-1, (tokens % 8).unsqueeze(-1)) > 0)
+
+
+def test_truncated_walk_roundoff_fallback_stays_in_support():
+    from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+
+    probs = torch.tensor([0.25, 0.0, 0.7499998, 0.0], device="cuda")
+    tokens, q = selector_walk_triton(
+        candidate_ids=torch.arange(8, device="cuda").reshape(1, 2, 4),
+        scores=probs.expand(1, 2, 4, 4),
+        uniforms=torch.full((1, 2), 0.9999999, device="cuda"),
+        temperatures=torch.ones(1, device="cuda"),
+        greedy_mask=torch.zeros(1, dtype=torch.bool, device="cuda"),
+        scores_are_probs=True,
+    )
+    assert tokens.tolist() == [[2, 6]]
+    assert torch.all(q.gather(-1, (tokens % 4).unsqueeze(-1)) > 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -911,19 +911,13 @@ def eagle_sample(
 
             sampling_fn = tree_speculative_sampling_target_only
 
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
+        if not _is_npu:
+            from sglang.srt.sampling.probability_transforms import (
+                top_k_renorm_probs as top_k_renorm_prob,
             )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
+            from sglang.srt.sampling.probability_transforms import (
+                top_p_renorm_probs as top_p_renorm_prob,
             )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0

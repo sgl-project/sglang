@@ -117,6 +117,28 @@ class Spec(msgspec.Struct):
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
     ] = False
+    speculative_draft_temperature: A[
+        Optional[float],
+        "Temperature for stochastic draft proposals. Defaults to each request's target "
+        "temperature; 0 makes the proposal greedy. Applied after model correction, "
+        "before draft top-k/top-p, within the model's candidate support. "
+        "Target greedy requests remain greedy. "
+        "Does not enable sampling in greedy-only draft models or EAGLE tree search.",
+    ] = None
+    speculative_draft_top_k: A[
+        Optional[int],
+        "Top-k cutoff for stochastic draft proposals, after model correction. "
+        "Defaults to each request's target top-k; -1 disables the cutoff and "
+        "positive integers retain up to that many candidates. Target greedy "
+        "requests remain greedy. Does not expand the model's candidate support.",
+    ] = None
+    speculative_draft_top_p: A[
+        Optional[float],
+        "Top-p cutoff for stochastic draft proposals, after draft top-k. "
+        "Defaults to each request's target top-p; must be in (0, 1], with 1 "
+        "disabling the cutoff. Target greedy requests remain greedy. "
+        "Does not expand the model's candidate support.",
+    ] = None
     speculative_use_block_verification: A[
         bool,
         "Use block verification for EAGLE/EAGLE3/NEXTN on CUDA or ROCm "

@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -106,7 +107,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -671,7 +671,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return verify_input, parent_list, top_scores_index
         return verify_input
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def draft_forward(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        draft_sampling_params: Optional[DraftSamplingParams] = None,
+    ):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         if forward_batch.forward_mode.is_idle():
@@ -708,6 +713,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            if draft_sampling_params is None:
+                draft_sampling_params = DraftSamplingParams.from_sampling_info(
+                    forward_batch.sampling_info
+                )
 
         topk1_chain_fits = (
             self.topk == 1
@@ -787,8 +796,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
-                        forward_batch.sampling_info.temperatures,
-                        forward_batch.sampling_info.top_ks,
+                        draft_sampling_params,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -992,14 +1000,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                DraftSamplingParams.from_sampling_info(batch.sampling_info),
+            )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1159,8 +1168,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
-                batch.sampling_info.top_ks,
+                DraftSamplingParams.from_sampling_info(batch.sampling_info),
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(

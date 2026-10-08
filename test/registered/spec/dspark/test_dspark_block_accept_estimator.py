@@ -64,6 +64,7 @@ def _observe(
     seq_len: int,
     cap_trim: int = 0,
     temperature: float = 1.0,
+    draft_probs: torch.Tensor | None = None,
 ) -> None:
     recorder.observe_verify_step(
         forward_ct=forward_ct,
@@ -71,6 +72,7 @@ def _observe(
         draft_tokens=torch.tensor([drafts], dtype=torch.int64),
         corrected_logits=corrected_logits.unsqueeze(0),
         draft_temperatures=torch.tensor([temperature], dtype=torch.float32),
+        draft_probs=draft_probs,
         greedy_mask=torch.tensor([False]),
         target_logits=target_logits,
         target_temperatures=torch.tensor([[temperature]], dtype=torch.float32),
@@ -89,6 +91,39 @@ def _read_records(path: Path) -> list[dict]:
 
 
 class TestBlockAcceptEstimateRecorder(CustomTestCase):
+    def test_censored_block_uses_saved_truncated_or_deterministic_q(self):
+        for deterministic in (False, True):
+            with (
+                self.subTest(deterministic=deterministic),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                recorder, path = _make_recorder(tmp)
+                drafts = [1, 2, 3]
+                probs = torch.zeros(1, _GAMMA, _VOCAB)
+                for step, token in enumerate(drafts):
+                    probs[0, step, token] = 1.0 if deterministic else 0.75
+                    if not deterministic:
+                        probs[0, step, 0] = 0.25
+                _observe(
+                    recorder,
+                    forward_ct=1,
+                    rid="r0",
+                    drafts=drafts,
+                    corrected_logits=torch.zeros(_GAMMA, _VOCAB),
+                    draft_probs=probs,
+                    target_logits=torch.zeros(_GAMMA + 1, _VOCAB),
+                    verify_len=2,
+                    correct_len=1,
+                    bonus=2,
+                    seq_len=10,
+                )
+                recorder._file.flush()
+                record = _read_records(path)[0]
+                expected = 0.0 if deterministic else math.log(0.75)
+                self.assertEqual(len(record["q_lp"]), 2)
+                for logprob in record["q_lp"]:
+                    self.assertAlmostEqual(logprob, expected, places=6)
+
     def test_exact_block_when_rejected_inside_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             recorder, path = _make_recorder(tmp)

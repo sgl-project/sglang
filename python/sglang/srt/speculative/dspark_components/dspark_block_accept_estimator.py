@@ -293,6 +293,7 @@ class BlockAcceptEstimateRecorder:
         bonus: torch.Tensor,
         prefix_lens: torch.Tensor,
         layout: Optional[RaggedVerifyLayout],
+        draft_probs: Optional[torch.Tensor] = None,
     ) -> None:
         if (
             self._delayed is not None
@@ -317,6 +318,7 @@ class BlockAcceptEstimateRecorder:
                 draft_tokens=draft_tokens,
                 corrected_logits=corrected_logits,
                 draft_temperatures=draft_temperatures,
+                draft_probs=draft_probs,
                 greedy_mask=greedy_mask,
                 target_logits=target_logits,
                 target_temperatures=target_temperatures,
@@ -445,6 +447,7 @@ class BlockAcceptEstimateRecorder:
         bonus: torch.Tensor,
         prefix_lens: torch.Tensor,
         layout: Optional[RaggedVerifyLayout],
+        draft_probs: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         gamma = self._gamma
         rows_per_request = gamma + 1
@@ -475,12 +478,15 @@ class BlockAcceptEstimateRecorder:
         )
         draft_flat = draft_tokens.reshape(-1)
 
-        q_all = self._gather_logprobs(
-            logits=corrected_logits.reshape(bs * gamma, -1),
-            row_indices=torch.arange(bs * gamma, device=device),
-            token_indices=draft_flat,
-            temps=draft_temps_full,
-        ).reshape(bs, gamma)
+        if draft_probs is not None:
+            q_all = draft_probs.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1).log()
+        else:
+            q_all = self._gather_logprobs(
+                logits=corrected_logits.reshape(bs * gamma, -1),
+                row_indices=torch.arange(bs * gamma, device=device),
+                token_indices=draft_flat,
+                temps=draft_temps_full.clamp_min(1e-5),
+            ).reshape(bs, gamma)
         target_diag = self._gather_logprobs(
             logits=target_logits,
             row_indices=self._diag_rows(bs=bs, rows_per_request=rows_per_request),

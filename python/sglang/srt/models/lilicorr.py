@@ -426,6 +426,8 @@ class LiLiCorrHead(nn.Module):
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         already_projected: bool = False,
+        top_ks: Optional[torch.Tensor] = None,
+        top_ps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         start_scores, pair_scores = self.score(
             token_embeddings=token_embeddings.unsqueeze(1),
@@ -443,6 +445,8 @@ class LiLiCorrHead(nn.Module):
             uniforms=uniforms,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
+            top_ks=top_ks,
+            top_ps=top_ps,
         )
 
     @torch.no_grad()
