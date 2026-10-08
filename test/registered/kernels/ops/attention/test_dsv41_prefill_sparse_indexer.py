@@ -2,6 +2,7 @@
 block selection and the dense implementation of the same protocol."""
 
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import msgspec
@@ -11,9 +12,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
-    DeepGEMMPrefillData,
-)
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DeepGEMMPrefillData
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -191,6 +190,31 @@ def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData
     )
 
 
+def case_rows(case: Case, rows: list[int], counts: list[int]) -> Case:
+    """Subset query rows while retaining the requests' global index-K pool."""
+    idx = torch.tensor(rows, device=case.lens.device, dtype=torch.int64)
+    data = msgspec.structs.replace(rows_of(case.data, idx), rows_per_request=counts)
+    return case._replace(
+        dense=case.dense[idx] if case.dense.numel() else case.dense,
+        lens=data.compress_lens,
+        data=data,
+        page_table=case.page_table[idx].contiguous(),
+    )
+
+
+def cp_rows(rows_per_request, rank, cp_size, tail=None):
+    """Global round-robin CP rows, optionally restricted to each request's tail."""
+    rows, counts, start = [], [], 0
+    for count in rows_per_request:
+        end = start + count
+        first = start if tail is None else max(start, end - tail)
+        selected = [row for row in range(first, end) if row % cp_size == rank]
+        rows.extend(selected)
+        counts.append(len(selected))
+        start = end
+    return rows, counts
+
+
 def reference_blocks(case: Case) -> torch.Tensor:
     """[rows, blocks] bool: the torch block selection of the dense scores."""
     j = torch.arange(case.dense.shape[1], device=case.dense.device)
@@ -237,7 +261,7 @@ def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
 
 
 def publish_dense(case: Case):
-    """(the CP implementation's block ids, the source layer's own top-k)."""
+    """(the dense fallback's block ids, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         _publish_prefill_blocks,
     )
@@ -290,6 +314,175 @@ def picks(positions: torch.Tensor, row: int) -> set:
     "DeepGEMM's paged sparse MQA logits need SM100",
 )
 class TestPrefillSparseIndexer(CustomTestCase):
+    def assert_cp_selection(self, table, case, got, dense_blocks):
+        from deep_gemm import fp8_fp4_mqa_logits
+
+        want = select_dense(dense_blocks, case)
+        want = torch.where(want >= 0, want - case.data.request_starts[:, None], -1)
+        dense = fp8_fp4_mqa_logits(
+            (case.data.q_fp4, case.data.q_sf),
+            case.kv,
+            case.data.weights,
+            case.data.request_starts,
+            case.data.request_starts + case.lens,
+            False,
+            -(-max(case.data.lens_per_request) // BLOCK) * BLOCK,
+        )
+        for row in range(case.data.num_rows):
+            selected, expected = picks(got, row), picks(want, row)
+            self.assertEqual(len(selected), len(expected), row)
+            self.assertGreaterEqual(
+                len(selected & expected), MIN_OVERLAP * len(expected), row
+            )
+            kept_blocks = set(table.blocks[row].tolist()) - {2147483647}
+            self.assertTrue(all(p // BLOCK in kept_blocks for p in selected), row)
+            self.assertTrue(all(0 <= p < int(case.lens[row]) for p in selected), row)
+            if expected:
+                floor = dense[row, sorted(expected)].min()
+                self.assertTrue(
+                    (
+                        dense[row, sorted(selected)]
+                        >= floor - floor.abs() * FLOOR_TOLERANCE
+                    ).all(),
+                    row,
+                )
+
+        # Attention's output rows may include CP padding. Map logical positions
+        # through the actual pool pages, not through request ids or pair ids.
+        raw = torch.full((got.shape[0] + 3, TOPK), -1, dtype=torch.int32, device="cuda")
+        raw[: got.shape[0]].copy_(got)
+        pages = torch.full_like(raw, -1)
+        case.data.write_page_indices(
+            SimpleNamespace(out_raw_indices=raw, out_page_indices=pages)
+        )
+        indices = got.clamp_min(0).long()
+        physical = case.page_table.gather(1, indices // PAGE) * PAGE + indices % PAGE
+        torch.testing.assert_close(
+            pages[: got.shape[0]], physical.masked_fill(got < 0, -1).to(torch.int32)
+        )
+        self.assertTrue((pages[got.shape[0] :] == -1).all())
+
+    @torch.inference_mode()
+    def test_cp4_interleaved_requests_and_tail(self):
+        # Odd request boundaries, a zero-row request and ranks that receive no
+        # row from the one-token requests exercise both row-pair and CP layouts.
+        counts = [129, 0, 141, 3, 1]
+        for ctx in (3001, 20003):
+            full = make_multi_case(counts, ctx, seed=ctx)
+            full.lens[0] = 0
+            full.lens[counts[0]] = 3  # partial block, fewer candidates than top-k
+            for rank in range(4):
+                with self.subTest(ctx=ctx, rank=rank):
+                    rows, local_counts = cp_rows(counts, rank, 4)
+                    case = case_rows(full, rows, local_counts)
+                    table, own = publish_sparse(case)
+                    blocks, dense_own = publish_dense(case)
+                    dense_own = torch.where(
+                        dense_own >= 0,
+                        dense_own - case.data.request_starts[:, None],
+                        -1,
+                    )
+                    for row in range(case.data.num_rows):
+                        self.assertEqual(picks(own, row), picks(dense_own, row), row)
+                        self.assertEqual(
+                            set(table.blocks[row].tolist()) - {2147483647},
+                            set(blocks[row].tolist()) - {-1},
+                            row,
+                        )
+                    got = select_sparse(table, case.data, case.k_cache)
+                    self.assert_cp_selection(table, case, got, blocks)
+
+                    tail_rows, tail_counts = cp_rows(counts, rank, 4, tail=128)
+                    local_rows = {global_row: i for i, global_row in enumerate(rows)}
+                    idx = [local_rows[row] for row in tail_rows]
+                    subcase = case_rows(case, idx, tail_counts)
+                    sub = table.tail(tail_counts)
+                    torch.testing.assert_close(sub.blocks, table.blocks[idx])
+                    torch.testing.assert_close(sub.page_table, case.page_table[idx])
+                    torch.testing.assert_close(sub.request_ids, table.request_ids[idx])
+                    torch.testing.assert_close(sub.compress_lens, subcase.lens)
+                    self.assertNotEqual(
+                        sub.schedule.data_ptr(), table.schedule.data_ptr()
+                    )
+                    part = select_sparse(sub, subcase.data, subcase.k_cache)
+                    self.assert_cp_selection(sub, subcase, part, blocks[idx])
+                    # A multi-request tail can change BLOCK_Q pairing at each
+                    # request boundary. Check against the same tail's fp32
+                    # reference above, not a bitwise full-table selection.
+
+    @torch.inference_mode()
+    def test_cp_tail_consumer_graph_replay_reads_live_queries(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+            select_prefill_table,
+        )
+
+        counts = [133, 0, 141, 7, 1]
+        full = make_multi_case(counts, 20003, seed=19)
+        rows, local_counts = cp_rows(counts, 2, 4)
+        case = case_rows(full, rows, local_counts)
+        table, _ = publish_sparse(case)
+        tail_rows, tail_counts = cp_rows(counts, 2, 4, tail=128)
+        local_rows = {global_row: i for i, global_row in enumerate(rows)}
+        tail = case_rows(case, [local_rows[row] for row in tail_rows], tail_counts)
+        sub = table.tail(tail_counts)
+        out = tail.data.empty_selection(TOPK)
+
+        def consume():
+            select_prefill_table(
+                table=sub, data=tail.data, k_cache=tail.k_cache, out_positions=out
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                consume()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            consume()
+        initial = None
+        for shift in (0, 1):
+            if shift:
+                # Same addresses and shapes, different runtime query values.
+                tail.data.q_fp4.copy_(tail.data.q_fp4.roll(1, dims=0))
+                tail.data.q_sf.copy_(tail.data.q_sf.roll(1, dims=0))
+                tail.data.weights.copy_(tail.data.weights.roll(1, dims=0))
+            logits = logits_of(sub, tail.data, tail.k_cache)
+            col = torch.arange(logits.shape[1], device="cuda")
+            logits = logits.masked_fill(
+                col[None, :] >= sub.valid_lens[:, None], -torch.inf
+            )
+            expected_scores = logits.topk(TOPK, dim=1).values.sort(1).values
+            out.fill_(-2)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(((out >= 0) & (out < tail.lens[:, None])).all())
+            self.assertTrue((out.sort(1).values.diff(dim=1) > 0).all())
+            block_columns = torch.searchsorted(sub.blocks, out // BLOCK)
+            torch.testing.assert_close(
+                sub.blocks.gather(1, block_columns), out // BLOCK
+            )
+            columns = block_columns * BLOCK + out % BLOCK
+            self.assertTrue((columns < sub.valid_lens[:, None]).all())
+            # Unordered top-k may choose different indices tied at the bf16
+            # floor, even between two eager calls. Compare score multisets.
+            torch.testing.assert_close(
+                logits.gather(1, columns).sort(1).values,
+                expected_scores,
+                rtol=0,
+                atol=0,
+            )
+            if initial is None:
+                initial = out.clone()
+            else:
+                overlap = sum(
+                    len(picks(out, row) & picks(initial, row))
+                    for row in range(out.shape[0])
+                )
+                self.assertLess(overlap, out.numel() // 2, "replay used stale queries")
+
     @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
         """The published blocks equal `select_candidate_block_ids` block for block
@@ -410,9 +603,7 @@ class TestPrefillSparseIndexer(CustomTestCase):
     def test_block_ids_tail_does_not_sync_the_host(self):
         """The late-layer tail of published block ids is cut on the device
         without a host sync while earlier work is still queued."""
-        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
-            BlockIds,
-        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
 
         busy = torch.randn(4096, 4096, device="cuda")
         for _ in range(8):
