@@ -728,9 +728,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
-
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
         shard_size = self.base_layer.output_partition_sizes[0]
@@ -749,9 +746,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         snapshot_base: bool = True,
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
@@ -786,9 +780,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         snapshot_base: bool = True,
     ) -> None:
         super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
 
     def slice_lora_b_weights(
         self, B: list[torch.Tensor]
@@ -890,9 +881,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         end_idx = (tp_rank + 1) * shard_size
         A = A[:, start_idx:end_idx].contiguous()
         return A
-
-    def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
-        return B
 
 
 class LinearWithLoRA(BaseLayerWithLoRA):
