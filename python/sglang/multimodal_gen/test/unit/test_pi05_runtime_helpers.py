@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.vla.prompt_bucketing import (
     effective_token_length,
     select_prompt_token_bucket,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.runtime_context import get_context
 
@@ -560,8 +561,8 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     assert vision_model.embeddings.position_embedding.tp_size == 1
     assert layer.self_attn.tp_size == 1
     assert layer.self_attn.qkv_backend.flatten_batch is False
-    assert layer.mlp.fc1.tp_size == 1
-    assert layer.mlp.fc2.tp_size == 1
+    assert get_group_rank_size(layer.mlp.fc1.tp_group) == (0, 1)
+    assert get_group_rank_size(layer.mlp.fc2.tp_group) == (0, 1)
     assert isinstance(layer.mlp.act, nn.GELU)
     assert layer.mlp.act.approximate == "tanh"
     assert model.device == vision_model.embeddings.patch_embedding.weight.device
