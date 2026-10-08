@@ -1041,6 +1041,47 @@ class TestChunkedPagedDecode(CustomTestCase):
 
 
 class TestCandidateIndexerGating(CustomTestCase):
+    def test_cp_prefill_uses_the_sparse_candidate_backend(self):
+        from sglang.srt.layers.attention.dsv4 import v41_indexer
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+            SparseTableBackend,
+        )
+
+        flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
+        for cp_size, torch_prefill in product((1, 4), (False, True)):
+            with self.subTest(cp_size=cp_size, torch_prefill=torch_prefill):
+                v41_indexer._use_deep_gemm_prefill.cache_clear()
+                try:
+                    with (
+                        get_parallel().override(attn_cp_size=cp_size),
+                        envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(torch_prefill),
+                        patch.object(
+                            v41_indexer, "is_sm100_or_newer", return_value=True
+                        ),
+                        patch.object(
+                            v41_indexer, "has_dense_fp4_indexer", return_value=True
+                        ),
+                        patch(flag, True),
+                        patch("torch.cuda.Stream"),
+                    ):
+                        prefill, decode = v41_indexer.make_candidate_indexer(
+                            token_to_kv_pool=None,
+                            req_to_token=torch.zeros((1, 1), dtype=torch.int32),
+                            page_size=256,
+                            candidate_topk_blocks=2048,
+                            candidate_block_size=8,
+                        )
+                    self.assertIsInstance(decode, SparseTableBackend)
+                    if cp_size == 1 and torch_prefill:
+                        self.assertIsInstance(prefill, DenseBlocksBackend)
+                    else:
+                        self.assertIs(prefill, decode)
+                finally:
+                    v41_indexer._use_deep_gemm_prefill.cache_clear()
+
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (

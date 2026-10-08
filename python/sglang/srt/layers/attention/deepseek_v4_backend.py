@@ -697,7 +697,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+            shape_mismatch = dst_val.shape != src_val.shape
+            assert not shape_mismatch or field_name in self._CP_GLOBAL_FIELDS, (
+                f"Only CP-global replay metadata may use a shorter live prefix, "
+                f"got {field_name=} {src_val.shape=} {dst_val.shape=}"
+            )
+            _copy_tensor_allowing_storage_alias(
+                dst_val, src_val, pad_value=0 if shape_mismatch else None
+            )
 
         # Safe to replace: captured kernels read only the per-replay objects, or
         # the field is produced in-graph before the attention graph break reads it.
@@ -915,6 +922,7 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     local_lens_cpu: Optional[List[int]] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
+    global_token_indices: Optional[torch.Tensor] = None
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -927,12 +935,22 @@ class LateLayerTail(msgspec.Struct, frozen=True):
             t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
         )
 
+    def global_rows(self, t: torch.Tensor) -> torch.Tensor:
+        indices = (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
+        return _tail_rows(
+            t, token_indices=indices, contiguous_start=self.contiguous_start
+        )
+
 
 def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
 
 
@@ -945,6 +963,27 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
+
+
+def _copy_tensor_allowing_storage_alias(
+    dst: torch.Tensor, src: torch.Tensor, *, pad_value: Optional[int] = None
+) -> None:
+    """Copy replay metadata while preserving capture-stable destination addresses."""
+    if dst is src:
+        return
+    if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        src = src.clone()
+    if dst.shape == src.shape:
+        dst.copy_(src)
+        return
+    assert (
+        pad_value is not None
+        and dst.ndim == src.ndim
+        and dst.shape[0] >= src.shape[0]
+        and dst.shape[1:] == src.shape[1:]
+    ), f"Cannot copy replay metadata from {src.shape=} to {dst.shape=}"
+    dst.fill_(pad_value)
+    dst[: src.shape[0]].copy_(src)
 
 
 @dataclass
@@ -1619,6 +1658,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
@@ -1676,6 +1716,12 @@ class DeepseekV4AttnBackend(
             per_rank_logical_token=counts,
             gather_index=gather_index,
             local_index=local_metadata_rows,
+            # Prepare an independent tail count before replaying the front graph.
+            # Lazy pageable H2D in the first tail MoE would wait for that graph;
+            # sharing its count buffer would also race with graph execution.
+            moe_local_token_count=async_h2d(
+                [counts[cp_rank]], dtype=torch.int32, device=device
+            ).squeeze(0),
         )
         return dict(
             cp_metadata=cp_metadata,
@@ -1738,6 +1784,10 @@ class DeepseekV4AttnBackend(
             local_dp_buffer_len,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
+        if self.token_to_kv_pool.request_window is not None:
+            self.token_to_kv_pool.request_window.activate(
+                self.forward_metadata.core_attn_metadata.request_window_layout
+            )
 
     def init_forward_metadata_target_verify(
         self,
@@ -2358,6 +2408,13 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
+        if (
+            self.tail_forward_metadata is not None
+            and self.token_to_kv_pool.request_window is not None
+        ):
+            self.token_to_kv_pool.request_window.activate(
+                self.forward_metadata.core_attn_metadata.request_window_layout
+            )
 
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2586,12 +2643,25 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self._prepare_bounded_tail_for_prefill_graph(forward_batch)
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
                 self._source_projection_buffers(
                     forward_batch.out_cache_loc.shape[0], ratio
                 )
         return self.forward_metadata
+
+    def _prepare_bounded_tail_for_prefill_graph(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        # The tail is request-shaped, not bucket-shaped. Build it afresh for
+        # capture and every replay; only the full-sequence metadata is captured.
+        self.tail_forward_metadata = (
+            self._build_late_layer_tail_metadata(forward_batch)
+            if self.enable_decoder_swa_bounded_replay
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            else None
+        )
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2643,6 +2713,7 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        self._prepare_bounded_tail_for_prefill_graph(metadata_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[

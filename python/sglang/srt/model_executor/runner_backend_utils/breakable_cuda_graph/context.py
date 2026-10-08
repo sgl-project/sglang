@@ -33,6 +33,18 @@ def is_in_breakable_cuda_graph() -> bool:
 
 
 @contextmanager
+def suspend_breakable_cuda_graph():
+    """Run an eager break with ordinary model kernels and live batch metadata."""
+    global _in_breakable_cuda_graph
+    previous = _in_breakable_cuda_graph
+    _in_breakable_cuda_graph = False
+    try:
+        yield
+    finally:
+        _in_breakable_cuda_graph = previous
+
+
+@contextmanager
 def enable_breakable_cuda_graph():
     """Mark the enclosed scope as inside a BCG capture/replay. Any exception
     raised inside is logged with the BCG-specific failure hint, then re-raised

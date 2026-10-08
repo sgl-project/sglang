@@ -97,14 +97,14 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
-    scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    # MegaMoE schedules two 128-column CTAs per cluster. L1 has 2 *
+    # intermediate columns (gate + up), while L2 has hidden columns.
+    # Scale rows are not TMA-aligned in the current DeepGEMM layout; applying
+    # the old 16-byte scale-row restriction rejects valid DSV4.1 shapes.
+    if hidden % 256 != 0 or intermediate % 128 != 0:
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            "moe_intermediate_size to be multiples of 256 and 128 respectively; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -255,20 +255,35 @@ def _run_mega_routed(
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
+        if isinstance(
+            getattr(moe.gate, "e_score_correction_bias_vl", None), torch.Tensor
+        ):
+            # V4.1 uses a different correction bias for image-token rows. The
+            # MegaMoE transport consumes the same routed ids/weights as TopK.
+            from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+            )
+        else:
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=moe.layer_id,
+                ),
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -505,9 +520,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         build_flydsl_mega_moe_weights(experts)
         return
 
-    from deep_gemm import (
-        transform_sf_into_required_layout,
-    )
+    from deep_gemm import transform_sf_into_required_layout
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
