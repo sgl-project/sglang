@@ -64,7 +64,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
@@ -653,7 +652,7 @@ def _insert(tree, tokens, rotation_base=None, value=None):
 
 def _match_len(tree, tokens):
     res = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-    return len(res.device_indices)
+    return res.device_prefix_len
 
 
 class _TreeCoreBackendCase(CustomTestCase):
@@ -775,7 +774,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
 
 
 class _GraftReq:
-    """Minimal Req stand-in for insert_req."""
+    """Minimal Req stand-in for checkpoint."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
@@ -785,18 +784,20 @@ class _GraftReq:
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
-        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.prefix_len = 0
         self.last_node = None
         self.priority = 0
         self.kv_rotation_base = None
-        self.lock_receipt = DecLockRefParams()
-        self.swa_prefix_lock_released = False
+        self.lock = None
         self.finished_reason = None
         self.session = None
         self.session_id = None
 
     def get_fill_ids(self):
         return array("q", self.fill_ids)
+
+    def refresh_fill_ids(self):
+        pass  # fill ids are fixed for the stand-in
 
     def finished(self):
         return self.finished_reason is not None
@@ -914,16 +915,17 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.insert_req(req, up_to=len(req.fill_ids))
+        tree.checkpoint(req, up_to=len(req.fill_ids))
         # No dedup free, no rebind: the request keeps its own locs whole.
         self.assertEqual([t.tolist() for t in freed], [])
-        self.assertTrue(torch.equal(req.prefix_indices, own_locs))
+        row = tree.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :12]
+        self.assertTrue(torch.equal(row.to(dtype=torch.int64), own_locs))
         self.assertEqual(req.kv.cache_protected_len, 0)
         self.assertTrue(
             torch.equal(tree.req_to_token_pool.req_to_token[0, :12], own_locs)
         )
 
-    def test_insert_req_decline_frees_duplicates_and_suffix(self):
+    def test_checkpoint_decline_frees_duplicates_and_suffix(self):
         tree, freed = self._tree_with_spy()
         self._seed_chain(tree, list(range(8)), base=1)
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
@@ -937,7 +939,7 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         self.assertEqual(set(released.tolist()), set(own_locs.tolist()))
         self.assertEqual(_match_len(tree, req.fill_ids), 8)
 
-    def test_insert_req_same_base_keeps_the_tail_cached(self):
+    def test_checkpoint_same_base_keeps_the_tail_cached(self):
         """Control for the decline test: with an agreeing base the tail is
         grafted and only the matched duplicates are freed."""
         tree, freed = self._tree_with_spy()

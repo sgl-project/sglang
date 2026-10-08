@@ -817,40 +817,20 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
-        "SGLANG_ENABLE_THINKING=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-        "SGLANG_HICACHE_DEBUG_LOG=1",
-        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
-        "SGLANG_MOE_NVFP4_DISPATCH=1",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
-        "--kv-cache-dtype fp8_e4m3",
-        "--dsa-prefill-backend trtllm",
-        "--dsa-decode-backend trtllm",
-        "--moe-runner-backend flashinfer_trtllm",
-        "--fp4-gemm-backend flashinfer_trtllm",
-        "--disable-shared-experts-fusion",
-        "--flashinfer-allreduce-fusion-backend auto",
-        // MTP 4-1-5 and HiCache (write_back, --hicache-size 135) match the InferenceX
-        // GB300 AgentX low-concurrency recipe (SemiAnalysisAI/InferenceX#3178).
         "--speculative-algorithm EAGLE",
-        "--speculative-num-steps 4",
+        "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 5",
+        "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
-        "--max-prefill-tokens 8192",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.85",
         "--max-running-requests 16",
         "--cuda-graph-max-bs-decode 16",
-        "--enable-hierarchical-cache",
-        "--hicache-size 135",
-        "--hicache-write-policy write_back",
-        "--hicache-io-backend direct",
+        "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -858,14 +838,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
-        "SGLANG_ENABLE_THINKING=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-        "SGLANG_HICACHE_DEBUG_LOG=1",
-        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
-        "SGLANG_MOE_NVFP4_DISPATCH=1",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -887,14 +860,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1",
-        "SGLANG_ENABLE_THINKING=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-        "SGLANG_HICACHE_DEBUG_LOG=1",
-        "SGLANG_HICACHE_DEBUG_SAMPLE_RATE=16384",
-        "SGLANG_MOE_NVFP4_DISPATCH=1",
-      ],
+      env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -1034,12 +1000,13 @@ sgl-eval run aime25 \\
     // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
     // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
-    // DSA backend: triton (SGLang's ROCm default).
+    // DSA backend: triton (SGLang's ROCm default). Five-step MTP cells select
+    // the top-k v2 indexer kernel, matching InferenceX PR #3724.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1082,7 +1049,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",

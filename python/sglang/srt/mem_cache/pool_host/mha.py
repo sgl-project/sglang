@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -276,7 +277,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
         # The staged kernel reads whole device pages, so it needs packed rows.
-        if self.layout != "page_first" or not self.device_rows_packed:
+        if (
+            self.layout != "page_first"
+            or not self.device_rows_packed
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
         page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         staging = prepare_mha_write_back_staging(
@@ -823,6 +828,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
+        # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
+        self.can_use_write_back_jit = False
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer

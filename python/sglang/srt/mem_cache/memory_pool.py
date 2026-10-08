@@ -28,6 +28,7 @@ import dataclasses
 import logging
 import math
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -45,6 +46,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
+    set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -57,6 +59,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -78,7 +81,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -268,6 +270,98 @@ def _set_kv_buffer_prefix_valid_impl(
         num_warps=num_warps,
         num_stages=2,
     )
+
+
+def _set_kv_buffer_prefix_valid_impl_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    k_scale_is_tensor: bool = False,
+    v_scale_is_tensor: bool = False,
+) -> None:
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    if row_dim <= 0:
+        return
+
+    if row_dim >= 4096:
+        elems_per_tile = 256
+        num_warps = 8
+    elif row_dim >= 2048:
+        elems_per_tile = 128
+        num_warps = 4
+    else:
+        elems_per_tile = 64
+        num_warps = 4
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_dim, elems_per_tile),
+    )
+    set_kv_buffer_prefix_valid_tiled_fp8[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        k_scale,
+        v_scale,
+        int(k.stride(0)),
+        int(v.stride(0)),
+        int(k_cache.stride(0)),
+        int(v_cache.stride(0)),
+        int(loc_2d.shape[1]),
+        ROW_ELEMS=row_dim,
+        ELEMS_PER_TILE=elems_per_tile,
+        K_SCALE_IS_TENSOR=k_scale_is_tensor,
+        V_SCALE_IS_TENSOR=v_scale_is_tensor,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
+def _resolve_fused_scale(
+    scale,
+    layer_scale,
+    layer_scale_float,
+) -> Optional[float]:
+    if isinstance(scale, (float, int)):
+        return float(scale)
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.device.type == "cpu"
+    ):
+        return float(scale.item())
+
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.is_cuda
+        and scale is layer_scale
+        and isinstance(layer_scale_float, (float, int))
+    ):
+        return float(layer_scale_float)
+
+    return None
 
 
 class ReqToTokenPool:
@@ -962,6 +1056,7 @@ class MambaPool:
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
         self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
+        self._warmup_fused_copy_slot_kernel()
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -995,6 +1090,21 @@ class MambaPool:
 
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
+
+    def _warmup_fused_copy_slot_kernel(self) -> None:
+        """Warm the cache-hit-only fused COW kernel during pool initialization."""
+        if not self._should_fuse_slot_ops() or self.mamba_cache.conv[0].shape[1] < 2:
+            return
+        from sglang.srt.mem_cache.mamba_slot_fused import (
+            warmup_fused_copy_conv_slots,
+        )
+
+        started = time.perf_counter()
+        warmup_fused_copy_conv_slots(self._conv_slot_desc)
+        logger.info(
+            "Warmed fused Mamba slot copy kernel in %.3f ms",
+            (time.perf_counter() - started) * 1000,
+        )
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
@@ -1034,8 +1144,8 @@ class MambaPool:
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
         (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
         an un-flushed source would drop its last ``write_pos`` updates. Callers
-        comply: COW copies radix checkpoints; a checkpoint ``insert_req`` copies an
-        active slot only during prefill (ring empty); ``insert_req``
+        comply: COW copies radix checkpoints; a ``checkpoint`` copies an
+        active slot only during prefill (ring empty); ``checkpoint``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
@@ -1258,7 +1368,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        self.mamba_ping_pong_track_buffer_size = get_mamba_tracking_slots(
+            extra_buffer=True, overlap=enable_overlap_schedule
+        )
+        self.mamba_initial_tracking_slots = get_mamba_tracking_slots(
+            extra_buffer=enable_mamba_extra_buffer,
+            overlap=enable_overlap_schedule,
+            lazy=enable_mamba_extra_buffer_lazy,
+        )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
@@ -1545,6 +1662,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        # Read once per forward, BEFORE the decoder-layer loop, so unlike
+        # short_conv_layer_cache it has no per-layer barrier of its own. The
+        # host tier restores side state on the first Mamba layer's transfer, so
+        # wait for that layer before reading the history.
+        if (
+            self.layer_transfer_counter is not None
+            and self.layer_transfer_counter.consumer_index >= 0
+            and self.mamba_map
+        ):
+            first_mamba_layer = min(self.mamba_map)
+            self.layer_transfer_counter.wait_until(first_mamba_layer - self.start_layer)
         return self.ngram_pool.get_context(ngram_indices)
 
     def set_ngram_context(
@@ -1601,11 +1729,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         Lazy mode allocates 1 slot with the second set to -1 (allocated
         on demand at track boundaries). Normal mode allocates all slots upfront.
         """
-        n = (
-            1
-            if self.enable_mamba_extra_buffer_lazy
-            else self.mamba_ping_pong_track_buffer_size
-        )
+        n = self.mamba_initial_tracking_slots
         slots = self.mamba_allocator.alloc(n)
         assert slots is not None, (
             "Not enough space for mamba ping pong idx, "
@@ -1747,26 +1871,21 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
-      PHYSICAL on every pool: by allocation on non-unified pools,
-      rebound at ForwardBatch construction (``rebind_write_loc``) on
-      the unified pool.
+      PHYSICAL on every pool: by allocation on non-unified pools, the
+      iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise); under the unified pool the translator derives it from the
-      same rebound loc (``sliding_window_write_loc_for``).
-    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
-      construction-time rebind it is the SAME id space as ``loc``, so pools
-      fall back to ``loc`` when it is ``None`` -- only triton's captured path
-      still passes its capture-stable
-      ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
-      same-space alias slated for collapse).
+      otherwise): the same plan's write ids in the sliding-window sub-pool
+      (``KVIndexTranslator.write_ids``).
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
+      space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
 
-    ``physical`` marks the locs as physical token ids: the batch's write loc
-    after ``rebind_write_loc``, or ids a backend translated itself. A unified
+    ``physical`` marks the locs as physical token ids: the write ids a plan
+    bound to the batch, or ids produced separately and marked so. A unified
     pool's write door refuses a loc not marked physical; other pools do not
     check.
     """
@@ -1786,9 +1905,9 @@ class KVWriteLoc:
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
         physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
-        the same mark, so it must be derived from that rebound loc (as
-        ``sliding_window_write_loc_for`` does); a loc produced separately
-        states its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        the same mark, so it must come from the same plan (as
+        ``KVIndexTranslator.write_ids`` does); a loc produced separately states
+        its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
             swa_loc,
@@ -1971,9 +2090,9 @@ class KVCache(abc.ABC):
         if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
             raise ValueError(
                 f"{where}: write loc is not marked physical. Hand the pool "
-                "KVWriteLoc.for_batch(forward_batch) after "
-                "KVIndexTranslator.rebind_write_loc, or KVWriteLoc(loc, "
-                "physical=True) for ids translated separately."
+                "KVWriteLoc.for_batch(forward_batch) for a batch bound to a "
+                "plan (KVLocPlan.bind), or KVWriteLoc(loc, physical=True) for "
+                "ids translated separately."
             )
 
     @abc.abstractmethod
@@ -2428,6 +2547,11 @@ class MHATokenToKVPool(KVCache):
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
+    def _kv_tokens_per_row(self) -> int:
+        # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
+        # a single token slot for the plain NHD [slots, ...] layout.
+        return 1 if self.kv_cache_layout == "nhd" else self.page_size
+
     def _build_kv_buffer_descs(self):
         """Per-buffer layout descriptors, k0..k(L-1) then v0..v(L-1). Drives both the
         CUDA-VMM post-capture backing and PD-transfer registration
@@ -2441,12 +2565,17 @@ class MHATokenToKVPool(KVCache):
             v_shape = tuple(self.v_buffer[0].shape)
         else:
             k_shape, v_shape = self._kv_buffer_shapes()
-        # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
-        # a single token slot for the plain NHD [slots, ...] layout.
         num_slots = self.size + self.page_size
-        tokens_per_row = (
-            self.page_size if k_shape[0] * self.page_size == num_slots else 1
-        )
+        tokens_per_row = self._kv_tokens_per_row()
+        expected_rows = num_slots // tokens_per_row
+        for shape in (k_shape, v_shape):
+            if shape[0] != expected_rows:
+                raise ValueError(
+                    f"KV buffer shape {shape} does not lead with {expected_rows} rows of "
+                    f"{tokens_per_row} token(s) ({self.kv_cache_layout!r} layout); a pool "
+                    "whose leading axis is not tokens or pages must override "
+                    "_build_kv_buffer_descs."
+                )
         descs = []
         for prefix, shape in (("k", k_shape), ("v", v_shape)):
             row_bytes = int(np.prod(shape[1:])) * itemsize
@@ -3076,21 +3205,6 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
-
         if loc_2d.device != self.k_buffer[0].device:
             loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
         if commit_lens.device != self.k_buffer[0].device:
@@ -3127,6 +3241,54 @@ class MHATokenToKVPool(KVCache):
                 "prefix-valid commit requires equal-width K/V rows, got "
                 f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
             )
+
+        fused_k_scale = _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
+        fused_v_scale = _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
+        # fuse quantization and writing into the same kernel
+        if (
+            cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and fused_k_scale is not None
+            and fused_v_scale is not None
+        ):
+            _set_kv_buffer_prefix_valid_impl_fp8(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                fused_k_scale,
+                fused_v_scale,
+                loc_2d,
+                commit_lens,
+                row_dim=self.row_dim,
+                k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
+                v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
+            )
+            return
+
+        # fallback: eager quantization
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
 
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
@@ -3989,30 +4151,11 @@ class HybridLinearKVPool(KVCache):
             # aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
-            quant_method_kwarg = {"quant_method": quant_method}
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
-                quant_method_kwarg = {}
-            elif _is_npu:
-                assert not is_float4_e2m1fn_x2(dtype), (
-                    "FP4 is not supported on NPU yet."
-                )
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMHATokenToKVPool
-                quant_method_kwarg = {}
-            elif full_kv_pool_class is not None:
-                # Caller-selected MHA layout variant (e.g. the page-major
-                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
-                # priority since they don't understand alternate layouts.
-                TokenToKVPoolClass = full_kv_pool_class
-            else:
-                TokenToKVPoolClass = MHATokenToKVPool
-
+            TokenToKVPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else MHATokenToKVPool
+            )
             post_capture_kwargs = (
                 {"post_capture_active": True} if post_capture_active else {}
             )
@@ -4026,7 +4169,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
-                **quant_method_kwarg,
+                quant_method=quant_method,
                 **post_capture_kwargs,
             )
         elif use_dsa:
@@ -4036,7 +4179,12 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            self.full_kv_pool = DSATokenToKVPool(
+            DSAPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else DSATokenToKVPool
+            )
+            self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -4054,18 +4202,12 @@ class HybridLinearKVPool(KVCache):
                 skip_topk_layers=skip_topk_layers,
             )
         else:
-            TokenToKVPoolClass = MLATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMLATokenToKVPool
-
-            self.full_kv_pool = TokenToKVPoolClass(
+            MLAPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else MLATokenToKVPool
+            )
+            self.full_kv_pool = MLAPoolClass(
                 size=size,
                 page_size=self.page_size,
                 dtype=dtype,
@@ -4132,8 +4274,8 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "tail_extra_slots", 0)
 
     @property
-    def slots_per_page(self) -> int:
-        return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
+    def index_page_size(self) -> int:
+        return getattr(self.full_kv_pool, "index_page_size", self.page_size)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -4587,7 +4729,7 @@ class MLATokenToKVPool(KVCache):
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
     # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this.
+    # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
 
     @property
@@ -4992,7 +5134,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
-        self.slots_per_page = self.page_size
+        assert self.page_size % index_kpool == 0, (
+            f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
+        )
+        self.index_page_size = self.page_size // index_kpool
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
@@ -5006,22 +5151,26 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         assert len(self.skip_topk_layers) == layer_num
 
+        physical_page_size = self.page_size // index_kpool
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert self.page_size % 16 == 0, (
-                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert physical_page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {physical_page_size}"
                 )
             else:
-                assert self.page_size == 1, (
-                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert physical_page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {physical_page_size}"
                 )
         elif is_xpu():
-            assert self.page_size in (
+            assert physical_page_size in (
                 64,
                 128,
-            ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
+            ), f"XPU DSA requires page_size 64 or 128, got {physical_page_size}"
         else:
-            assert self.page_size == 64
+            assert physical_page_size == 64, (
+                f"DSA requires 64-token physical pages, got page_size={self.page_size} "
+                f"with index_kpool={index_kpool}"
+            )
         self.index_key_cache = self._create_index_key_cache()
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
