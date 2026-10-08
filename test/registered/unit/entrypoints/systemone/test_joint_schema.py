@@ -2,11 +2,15 @@
 decision layout, and answers built from the joint schema head's option logits."""
 
 import asyncio
+import base64
 import json
 import math
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
+from unittest import mock
 
+from PIL import Image
 from transformers import AutoTokenizer
 
 from sglang.srt.entrypoints import http_server
@@ -21,8 +25,10 @@ from sglang.srt.layers.joint_schema_head import (
     parse_decision_layout,
 )
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
     get_context,
+    get_schedule,
     publish,
     restore_context,
     snapshot_context,
@@ -59,8 +65,39 @@ REQUEST = {
 }
 
 
+class PatchCounter:
+    """Stands in for the multimodal processor: one image token per 28x28 patch."""
+
+    @staticmethod
+    def resolve_image_token_counts(images):
+        return [(image.height // 28) * (image.width // 28) for image in images]
+
+
+def _png_bytes(width, height):
+    buffer = BytesIO()
+    Image.new("RGB", (width, height), "red").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _png(width, height):
+    return (
+        "data:image/png;base64," + base64.b64encode(_png_bytes(width, height)).decode()
+    )
+
+
+def _expanded_length(request):
+    images = [
+        Image.open(BytesIO(base64.b64decode(image.url.split(",", 1)[1])))
+        for image in request.image_data or []
+    ]
+    counts = PatchCounter.resolve_image_token_counts(images)
+    return len(request.input_ids) + sum(count - 1 for count in counts)
+
+
 class HeadManager:
-    """Replace model execution with option logits 0, 1, 2, ... per question, in head order."""
+    """Replace model execution with option logits 0, 1, 2, ... per question, in head order,
+    after expanding images and refusing prompts that the tokenizer manager, the
+    scheduler, or the memory reserved for one prefill cannot take."""
 
     def __init__(self, tokenizer):
         self.server_args = ServerArgs(model_path="dummy")
@@ -78,6 +115,9 @@ class HeadManager:
         self.allow_auto_truncate = False
         self.context_len = 4096
         self.num_reserved_tokens = 0
+        # min(context_len - 1, kv_capacity - 1) - 5, as the scheduler reports it.
+        self.max_req_input_len = 4090
+        self.mm_processor = PatchCounter()
         self.request_logger = SimpleNamespace(log_requests=False)
         self.served_model_name = "served-model"
         self.requests = []
@@ -87,13 +127,18 @@ class HeadManager:
 
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
-        questions = parse_decision_layout(
-            request.decision_layout, len(request.input_ids)
-        )
+        num_tokens = _expanded_length(request)
+        if num_tokens + self.num_reserved_tokens >= self.context_len:
+            raise ValueError(f"The input ({num_tokens} tokens) is too long")
+        if num_tokens >= self.max_req_input_len:
+            raise ValueError(f"The scheduler refuses a prompt of {num_tokens} tokens")
+        if num_tokens > get_schedule().max_prefill_tokens:
+            raise ValueError(f"A prefill of {num_tokens} tokens outgrows its memory")
+        questions = parse_decision_layout(request.decision_layout, num_tokens)
         logits = [float(i) for q in questions for i in range(len(q.option_spans))]
         yield {
             "embedding": logits,
-            "meta_info": {"prompt_tokens": len(request.input_ids)},
+            "meta_info": {"prompt_tokens": num_tokens},
         }
 
 
@@ -244,7 +289,7 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         input_ids, layout = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**REQUEST),
-            max_length=4095,
+            max_length=4089,
             image_token_counts=[],
         )
         (sent,) = manager.requests
@@ -277,6 +322,11 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
                 SystemOneServing,
                 SystemOneRequest(**{**REQUEST, "model": "clef:a"}),
             ),
+            # Its 5329 image tokens leave no room for the questions.
+            "before the state": (
+                SystemOneServing,
+                SystemOneRequest(**{**REQUEST, "images": [_png(2048, 2048)]}),
+            ),
             "requires a generation model": (
                 OpenAIServingDecisions,
                 DecisionRequest(
@@ -296,11 +346,45 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.requests, [])
 
 
+def _admission_manager(joint_head_config):
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.model_config = SimpleNamespace(joint_head_config=joint_head_config)
+    manager.is_generation = joint_head_config is None
+    manager.context_len = 4096
+    manager.num_reserved_tokens = 0
+    manager.max_req_input_len = 4090
+    # A layout must be refused before auto-truncation could cut its prompt.
+    manager.allow_auto_truncate = True
+    manager.validate_total_tokens = False
+    manager._validate_token_ids_logprob = mock.Mock()
+    return manager
+
+
 class TestJointSchemaAdmission(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
+
+    def test_tokenizer_refuses_prompts_past_one_prefill(self):
+        clef = _admission_manager({"hidden_size": 4096})
+        layout = [LayoutQuestion(0, (10, 12), ((13, 14), (15, 16)))]
+
+        def embedding(length):
+            return EmbeddingReqInput(
+                input_ids=[1] * length,
+                decision_layout=pack_decision_layout(length, layout),
+                sampling_params={},
+            )
+
+        refused = {
+            # 4095 tokens pass the context check, but the scheduler takes 4089.
+            "past one prefill": (embedding(4095), "at most 4089"),
+        }
+        for name, (obj, message) in refused.items():
+            with self.subTest(name), self.assertRaisesRegex(ValueError, message):
+                clef._validate_one_request(obj, obj.input_ids)
+        clef._validate_one_request(embedding(4089), [1] * 4089)
 
     def test_client_decision_layouts_are_refused_at_encode_and_classify(self):
         manager = SimpleNamespace(requests=[])

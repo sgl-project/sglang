@@ -43,7 +43,9 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneScoreAnswer,
     SystemOneUsage,
 )
+from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
@@ -137,14 +139,14 @@ class SystemOneServing(OpenAIServingDecisions):
         self, adapted_request: EmbeddingReqInput, request: SystemOneRequest
     ) -> None:
         tokenizer_manager = self.tokenizer_manager
-        # The longest prompt the tokenizer manager accepts.
-        max_length = (
-            tokenizer_manager.context_len - tokenizer_manager.num_reserved_tokens - 1
+        max_length = max_joint_prompt_tokens(
+            context_len=tokenizer_manager.context_len,
+            num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+            max_req_input_len=tokenizer_manager.max_req_input_len,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
         )
         image_token_counts = []
         if adapted_request.image_data:
-            # The scheduler refuses a multimodal prompt of max_req_input_len or more.
-            max_length = min(max_length, tokenizer_manager.max_req_input_len - 1)
             adapted_request.image_data, image_token_counts = await self._read_images(
                 adapted_request.image_data
             )

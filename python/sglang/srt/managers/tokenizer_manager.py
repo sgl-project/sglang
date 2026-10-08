@@ -64,7 +64,10 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.joint_schema_head import parse_decision_layout
+from sglang.srt.layers.joint_schema_head import (
+    max_joint_prompt_tokens,
+    parse_decision_layout,
+)
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -1292,6 +1295,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay cannot return cached prompt logprobs"
                 )
+        # A decision layout indexes the whole prompt, so it is checked before any
+        # truncation below could cut the prompt.
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_decision_layout(obj, input_ids)
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1349,7 +1356,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate Matryoshka embeddings
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
-            self._validate_decision_layout(obj, input_ids)
 
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
@@ -1413,6 +1419,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return
             raise ValueError(
                 "This checkpoint answers schema decisions, send them to /v1/systemone"
+            )
+        limit = max_joint_prompt_tokens(
+            context_len=self.context_len,
+            num_reserved_tokens=self.num_reserved_tokens,
+            max_req_input_len=self.max_req_input_len,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+        )
+        if len(input_ids) > limit:
+            raise ValueError(
+                f"The prompt has {len(input_ids)} tokens, but this server scores "
+                f"at most {limit} in one prefill"
             )
         parse_decision_layout(obj.decision_layout, len(input_ids))
 

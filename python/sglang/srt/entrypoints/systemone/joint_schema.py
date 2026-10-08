@@ -116,7 +116,7 @@ def encode_joint_schema(
     if fixed_length > max_length:
         raise ValueError(
             f"the questions need {fixed_length} prompt tokens before the state, "
-            f"but at most {max_length} fit the context length"
+            f"but the prompt holds at most {max_length}"
         )
     state = tokens(_render(request.state))[: max_length - fixed_length]
     offset = len(prefix) + len(state)
