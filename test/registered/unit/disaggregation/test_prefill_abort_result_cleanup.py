@@ -95,7 +95,6 @@ def _result():
 
 
 def _free_req(req, _tree_cache, *, checkpoint):
-    assert checkpoint is False
     req.kv.req_pool_idx = None
     req.kv.mark_kv_released()
     req.kv.mamba_pool_idx = None
@@ -308,9 +307,7 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
         hidden_states_dtype=torch.float32,
         max_sampling_mask_tokens=1,
     )
-    release_kv_cache.side_effect = lambda req, cache, checkpoint: _free_req(
-        req, cache, checkpoint=checkpoint
-    )
+    release_kv_cache.side_effect = _free_req
     poll.return_value = [KVPoll.Failed]
 
     for index, payload in enumerate((value, 0.5)):
@@ -343,7 +340,7 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
             assert req.finished_reason is finish_reason
             scheduler._release_aborted_request.assert_called_once_with(req)
             release_kv_cache.assert_called_once_with(
-                req, scheduler.tree_cache, checkpoint=False
+                req, scheduler.tree_cache, checkpoint=True
             )
             scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(
                 0
@@ -427,6 +424,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
