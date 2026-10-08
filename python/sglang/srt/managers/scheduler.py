@@ -296,6 +296,7 @@ from sglang.srt.mem_cache.common import (
     discard_kv_cache_backup,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -562,6 +563,9 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        # LoRA adapter names that KV events namespace LoRA blocks by.
+        self.kv_event_lora_names = KvEventLoraNames()
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -576,6 +580,7 @@ class Scheduler(
                 and get_parallel().attn_tp_rank == 0
                 and get_parallel().attn_cp_rank == 0
             ),
+            kv_event_lora_names=self.kv_event_lora_names,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             hicache_draft_plan=(
                 self.draft_worker.hicache_draft_plan
@@ -2720,6 +2725,15 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
+        # Keyed by the final extra_key, so it must run after elastic namespacing.
+        # Only a cache whose events are taken prunes the table.
+        if (
+            self.kv_events_publisher.enable_kv_cache_events
+            and self.tree_cache.supports_prefix_sharing()
+        ):
+            self.kv_event_lora_names.register(req, lora_name)
+
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
             get_exec().moe.elastic_ep_backend is None
@@ -2914,6 +2928,7 @@ class Scheduler(
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3466,6 +3481,7 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
+        self._record_kv_event_lora_name(req, recv_req.lora_name)
 
         if mm_input_error is not None:
             req.set_finish_with_abort(

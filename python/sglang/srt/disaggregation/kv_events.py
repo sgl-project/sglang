@@ -289,6 +289,9 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
+    # LoRA adapter that stored these blocks. Block hashes are namespaced by it,
+    # so the same tokens under different adapters never share a hash.
+    lora_name: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):

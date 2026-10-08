@@ -326,6 +326,11 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded["cache_salt"], "tenant-a")
         self.assertEqual(decoded["session_id"], "session-a")
 
+    def test_lora_name_is_a_named_field(self):
+        event = self._event(lora_name="adapter-a")
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+        self.assertEqual(decoded["lora_name"], "adapter-a")
+
     def test_one_decoder_reads_a_mixed_batch(self):
         batch = KVEventBatch(
             ts=1.0,
