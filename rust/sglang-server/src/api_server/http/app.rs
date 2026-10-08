@@ -29,7 +29,7 @@ pub(super) struct AppState {
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
 /// and a failed or timed-out warmup shuts the server down.
-async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
+async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>, listen_addr: String) {
     if core.is_ready() {
         return;
     }
@@ -41,10 +41,10 @@ async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
     match core.warm_up(server_args.skip_tokenizer_init, timeout).await {
         Ok(()) => {
             core.mark_ready();
-            tracing::info!("The server is fired up and ready to roll!");
+            tracing::info!(%listen_addr, "The server is fired up and ready to roll!");
         }
         Err(e) => {
-            tracing::error!(error = %e, "startup warmup failed; shutting down");
+            tracing::error!(%listen_addr, error = %e, "startup warmup failed; shutting down");
             // Same path as a scheduler exception: the parent tears down the
             // process tree on SIGQUIT, matching Python's warmup failure.
             if let Some(parent) = rustix::process::getppid() {
@@ -70,8 +70,16 @@ pub async fn serve(
         server_args: server_args.clone(),
         chat_formatter,
     });
+    let listen_addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     // Cancelled with the api runtime on shutdown.
-    tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
+    tokio::spawn(startup_warmup(
+        state.core.clone(),
+        server_args.clone(),
+        listen_addr,
+    ));
 
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
