@@ -37,6 +37,15 @@ del _mod, _fn
 # Host launch APIs; importing this inventory does not import their implementations.
 _ENGINE_TRITON_KERNELS = [
     ("common.routing", "build_route", "build_route"),
+    ("common.lora_a", "grouped_lora_a", "grouped_lora_a"),
+    ("common.lora_a", "per_row_lora_a", "per_row_lora_a"),
+    ("common.lora_b", "grouped_lora_b", "grouped_lora_b"),
+    ("common.lora_b", "per_row_lora_b", "per_row_lora_b"),
+    (
+        "dense.embedding_lora_a",
+        "embedding_lora_a_tokens_fwd",
+        "embedding_lora_a_tokens_fwd",
+    ),
 ]
 for _mod, _fn, _op in _ENGINE_TRITON_KERNELS:
     register_kernel(
