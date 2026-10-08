@@ -957,6 +957,13 @@ class HybridLayerType(enum.Enum):
 
 
 class Qwen3NextForCausalLM(nn.Module):
+    @staticmethod
+    def _is_unused_checkpoint_weight(name: str, is_mtp: bool) -> bool:
+        return "rotary_emb.inv_freq" in name or ("mtp" in name) != is_mtp
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=False)
+
     fall_back_to_pt_during_load = False
 
     # Map fused module names to their checkpoint (unfused) counterparts.
@@ -1114,10 +1121,9 @@ class Qwen3NextForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if self._is_unused_checkpoint_weight(name, is_mtp):
+                continue
             if is_mtp:
-                if "mtp" not in name:
-                    continue
-
                 if name in [
                     "mtp.fc.weight",
                     "mtp.pre_fc_norm_embedding.weight",
@@ -1126,12 +1132,6 @@ class Qwen3NextForCausalLM(nn.Module):
                     name = name.replace("mtp.", "")
                 else:
                     name = name.replace("mtp", "model")
-
-            if not is_mtp and "mtp" in name:
-                continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")

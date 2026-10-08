@@ -165,6 +165,13 @@ class GlmOcrForConditionalGenerationNextN(GlmOcrForConditionalGeneration):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if getattr(self.config, "num_nextn_predict_layers", None) != 1:
+            return False
+        return self._is_unused_checkpoint_weight(
+            self._checkpoint_weight_name(name), is_nextn=True
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 

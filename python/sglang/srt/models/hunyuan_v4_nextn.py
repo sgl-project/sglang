@@ -216,12 +216,16 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return not name.startswith("model.mtp_layers.0.")
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         layer_prefix = f"model.layers.{self.config.num_hidden_layers}"
 
         def mapped_weights():
             for name, loaded_weight in weights:
-                if not name.startswith("model.mtp_layers.0."):
+                if self.is_unused_checkpoint_weight(name):
                     continue
                 name = name.replace("model.mtp_layers.0", layer_prefix)
                 if name.endswith(".final_layernorm.weight"):

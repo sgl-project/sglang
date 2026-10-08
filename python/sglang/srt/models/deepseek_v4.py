@@ -4723,6 +4723,39 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
+    def _is_unused_checkpoint_weight(self, name: str, is_nextn: bool) -> bool:
+        # `name` is already in the format used by load_weights. Keep the
+        # role-specific skip rule here so pre-read selection and loading agree.
+        if "rotary_emb.inv_freq" in name:
+            return True
+        if is_nextn:
+            nextn_layer_id = (
+                0
+                if self.config.num_hidden_layers == 1
+                else self.config.num_hidden_layers
+            )
+            return (
+                "shared_head.head" in name
+                or "embed_tokens" in name
+                or not name.startswith(f"model.layers.{nextn_layer_id}")
+            )
+
+        if not hasattr(self.config, "num_nextn_predict_layers"):
+            return False
+        if name.startswith("mtp"):
+            return True
+        if self.config.num_nextn_predict_layers > 0 and name.startswith("model.layers"):
+            parts = name.split(".")
+            if len(parts) >= 3:
+                return int(parts[2]) >= self.config.num_hidden_layers
+        return False
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        name = self.remap_weight_name_to_dpsk_hf_format(
+            name, num_hidden_layers=self.config.num_hidden_layers
+        )
+        return self._is_unused_checkpoint_weight(name, is_nextn=False)
+
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.
 
@@ -4922,27 +4955,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
                     weight_names.append(name)
 
-                    if not is_nextn:
-                        if hasattr(self.config, "num_nextn_predict_layers"):
-                            num_nextn_layers = self.config.num_nextn_predict_layers
-                            if num_nextn_layers > 0 and name.startswith("model.layers"):
-                                name_list = name.split(".")
-                                if (
-                                    len(name_list) >= 3
-                                    and int(name_list[2])
-                                    >= self.config.num_hidden_layers
-                                ):
-                                    continue
-
-                            if name.startswith("mtp"):
-                                continue
-                    else:
-                        if "shared_head.head" in name or "embed_tokens" in name:
-                            continue
-
-                        if not name.startswith(nextn_layer_prefix):
-                            continue
-
+                    if self._is_unused_checkpoint_weight(name, is_nextn):
+                        continue
+                    if is_nextn:
                         in_decoder = True
                         for weight_name in nextn_spec_weight_names_out_of_layer:
                             if weight_name in name:
@@ -4953,8 +4968,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         if in_decoder:
                             name = name.replace(nextn_layer_prefix, "model.decoder")
 
-                    if "rotary_emb.inv_freq" in name:
-                        continue
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name not in name:
                             continue

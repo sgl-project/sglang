@@ -100,5 +100,8 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
     ):
         super().load_weights(weights, is_mtp=True)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=True)
+
 
 EntryClass = ExaoneMoEForCausalLMMTP

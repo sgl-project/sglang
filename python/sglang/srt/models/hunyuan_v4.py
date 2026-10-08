@@ -784,10 +784,14 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return name.startswith("model.mtp_layers.")
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         def mapped_weights():
             for name, loaded_weight in weights:
-                if name.startswith("model.mtp_layers."):
+                if self.is_unused_checkpoint_weight(name):
                     continue
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config

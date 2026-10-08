@@ -157,6 +157,12 @@ class HYV3ForCausalLMNextN(nn.Module):
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        nextn_prefix = f"model.layers.{self.config.num_hidden_layers}."
+        return "rotary_emb.inv_freq" in name or not (
+            name.startswith(nextn_prefix) or name == "model.shared_head.norm.weight"
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         nextn_layer_id = self.config.num_hidden_layers
         nextn_prefix = f"model.layers.{nextn_layer_id}."
@@ -180,6 +186,8 @@ class HYV3ForCausalLMNextN(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if self.is_unused_checkpoint_weight(name):
+                continue
             if name.startswith(nextn_prefix):
                 subname = name[len(nextn_prefix) :]
                 if any(subname.startswith(s) for s in spec_weight_names):
@@ -190,20 +198,6 @@ class HYV3ForCausalLMNextN(nn.Module):
                     name = "model.shared_head.norm.weight"
                 else:
                     name = f"model.decoder.{subname}"
-            elif name == "model.shared_head.norm.weight":
-                pass
-            elif (
-                "embed_tokens" in name
-                or "shared_head.head" in name
-                or "lm_head" in name
-            ):
-                continue
-            else:
-                continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-
             if "router.gate." in name:
                 name = name.replace("router.", "")
 

@@ -96,6 +96,16 @@ class MiMoForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return (
+            "rotary_emb.inv_freq" in name
+            or "projector" in name
+            or "mtp_layers" in name
+            or "rotary_emb.cos_cached" in name
+            or "rotary_emb.sin_cached" in name
+            or (self.config.tie_word_embeddings and "lm_head.weight" in name)
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -108,17 +118,7 @@ class MiMoForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if (
-                "rotary_emb.inv_freq" in name
-                or "projector" in name
-                or "mtp_layers" in name
-            ):
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue

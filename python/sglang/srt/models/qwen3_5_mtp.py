@@ -91,7 +91,19 @@ def _mtp_quant_config(quant_config):
     return quant_config
 
 
+_EMBEDDING_WEIGHT_NAMES = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+)
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        if name in _EMBEDDING_WEIGHT_NAMES:
+            return False
+        return "rotary_emb.inv_freq" in name or "mtp" not in name
+
     # The loader reads this off the model class and hands it to the quant
     # config, which needs it to expand fused module names (qkv_proj ->
     # q/k/v_proj) before matching them against an exclude list. Without it an
@@ -341,10 +353,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             # The last-stage MTP draft cannot share the target embedding on PP0.
             # Load the checkpoint embedding into its retained local copy instead
             # of leaving the torch.empty() allocation uninitialized.
-            if name in (
-                "model.embed_tokens.weight",
-                "model.language_model.embed_tokens.weight",
-            ):
+            if name in _EMBEDDING_WEIGHT_NAMES:
                 param_name = "model.embed_tokens.weight"
                 if param_name in params_dict:
                     param = params_dict[param_name]
@@ -355,11 +364,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     loaded_params.add(param_name)
                 continue
 
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            # Only process MTP branch weights
-            if "mtp" not in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
 
             if name.startswith("mtp."):
