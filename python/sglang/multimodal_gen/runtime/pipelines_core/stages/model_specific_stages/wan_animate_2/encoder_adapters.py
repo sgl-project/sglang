@@ -56,15 +56,15 @@ class WanAnimate2TextEncoderAdapter:
             return torch.device(self.device)
         return next(self.model.parameters()).device
 
-    def _tokenize(self, text: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize(self, text: str) -> tuple[torch.Tensor, torch.Tensor, int]:
         ids, mask = self.tokenizer([text])  # the tokenizer batches; batch of one
+        num_tokens = int(mask[0].gt(0).sum())
         device = self._resolve_device()
-        return ids.to(device), mask.to(device)
+        return ids.to(device), mask.to(device), num_tokens
 
     @torch.no_grad()
     def __call__(self, text: str) -> torch.Tensor:
-        ids, mask = self._tokenize(text)
-        num_tokens = int(mask[0].gt(0).sum())
+        ids, mask, num_tokens = self._tokenize(text)
 
         # sglang-native encoders need an active forward context; harmless for plain HF.
         with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -168,7 +168,7 @@ class WanAnimate2ImageEncoderAdapter:
 
 
 class WanAnimate2VaeAdapter(nn.Module):
-    """Wan latent scaling folded over a diffusers ``AutoencoderKLWan``; registered as the pipeline's ``"vae"``.
+    """Stage-local latent-scaling adapter over the pipeline's native ``AutoencoderKLWan``.
     ``encode`` takes ``list[torch.Tensor]`` (or ``[B, C, T, H, W]``) and returns ``list[torch.Tensor]`` of
     ``[16, T', H', W']`` fp32, ``(mode() - latents_mean) / latents_std``; ``decode`` inverts that and returns
     ``[B, C, T, H, W]`` fp32 in [-1, 1], which is why ``Wan_Animate_2_14B_Config.get_decode_scale_and_shift``

@@ -94,6 +94,16 @@ approximate timestep-skipping cache.
 Clips containing only padding that would be removed from the final video are not
 denoised. The padding and conditioning of every retained clip are unchanged.
 
+Measured on one H200, with a 576×1024 budget, 8 steps, CFG 3, seed 42,
+`clip_len=37`, text-encoder CPU offload, and MP4 plus raw-frame output, the initial
+reuse changes reduced warm request latency from 42.30s to 41.34s (two requests
+per variant). With `clip_len=17`, omitting a fully cropped trailing clip reduced
+59.60s to 40.45s (one warm request per variant). Raw RGB frames were bit-identical
+and peak allocated VRAM did not increase. These are workload-specific results,
+not general speedup claims; both comparisons used PyTorch 2.13.0+cu130,
+Transformers 5.12.1, and Diffusers 0.37.0. The baseline was the initial native
+implementation, not the official Diffusers implementation.
+
 ## 2. SGLang-diffusion Installation
 
 SGLang-diffusion offers multiple installation methods. You can choose the most

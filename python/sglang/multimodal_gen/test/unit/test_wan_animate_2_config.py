@@ -75,6 +75,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     get_sampling_sigmas,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
+    WanAnimate2TextEncoderAdapter,
     WanAnimate2VaeAdapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.preprocess import (
@@ -100,6 +101,56 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 
 # Wan_Animate_2_14B_Config
+
+
+def test_text_encoder_counts_tokens_before_device_transfer():
+    ids = torch.tensor([[1, 2, 0, 0]])
+    mask = torch.tensor([[1, 1, 0, 0]])
+    adapter = WanAnimate2TextEncoderAdapter(
+        SimpleNamespace(), SimpleNamespace(), device="meta"
+    )
+    adapter.tokenizer = lambda texts: (ids, mask)
+    transferred_ids, transferred_mask, num_tokens = adapter._tokenize("prompt")
+    assert transferred_ids.device.type == transferred_mask.device.type == "meta"
+    assert num_tokens == 2
+
+
+def test_pipeline_keeps_native_modules_visible_to_memory_managers():
+    path = "sglang.multimodal_gen.runtime.pipelines.wan_animate_2_pipeline"
+    vae = torch.nn.Identity()
+    vae.latents_mean, vae.latents_std = [0.0], [1.0]
+    modules = {
+        "text_encoder": torch.nn.Identity(),
+        "image_encoder": torch.nn.Identity(),
+        "vae": vae,
+        "tokenizer": object(),
+        "image_processor": SimpleNamespace(
+            crop_size={"height": 224, "width": 224},
+            image_mean=(0.5, 0.5, 0.5),
+            image_std=(0.5, 0.5, 0.5),
+        ),
+        "transformer": object(),
+        "scheduler": object(),
+    }
+    stub = SimpleNamespace(
+        get_module=modules.__getitem__,
+        add_stage=lambda **kwargs: None,
+        add_stage_factory=lambda *args: None,
+    )
+    with (
+        patch(f"{path}.get_local_torch_device", return_value=torch.device("cpu")),
+        patch(f"{path}.WanAnimate2BeforeDenoisingStage") as before,
+        patch(f"{path}.WanAnimate2DenoisingStage") as denoise,
+    ):
+        WanAnimate2Pipeline.create_pipeline_stages(
+            stub, SimpleNamespace(pipeline_config=Wan_Animate_2_14B_Config())
+        )
+    args = before.call_args.kwargs
+    assert "load_modules" not in vars(WanAnimate2Pipeline)
+    assert args["text_encoder"].model is modules["text_encoder"]
+    assert args["image_encoder"].model is modules["image_encoder"]
+    assert args["vae"].vae is vae
+    assert denoise.call_args.kwargs["vae"] is args["vae"]
 
 
 def test_single_expert_has_no_boundary_switching():

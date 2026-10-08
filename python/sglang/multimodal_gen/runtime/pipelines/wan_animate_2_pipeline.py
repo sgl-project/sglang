@@ -8,8 +8,6 @@ the registry detector (Wan_Animate_2_14B_Config). Every component loads through 
 standard component loaders; the encoders are then wrapped in the ``encoder_adapters``.
 """
 
-from typing import Any
-
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
@@ -60,41 +58,28 @@ class WanAnimate2Pipeline(ComposedPipelineBase):
     ]
     component_loaders = {"transformer": WanAnimate2TransformerLoader}
 
-    def load_modules(
-        self,
-        server_args: ServerArgs,
-        loaded_modules: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        modules = super().load_modules(server_args, loaded_modules)
-        device = get_local_torch_device()
-        # text_len comes from transformer/config.json through the DiT arch config.
-        text_encoder = modules["text_encoder"]
-        if not isinstance(text_encoder, WanAnimate2TextEncoderAdapter):
-            modules["text_encoder"] = WanAnimate2TextEncoderAdapter(
-                text_encoder,
-                modules["tokenizer"],
-                text_len=server_args.pipeline_config.dit_config.arch_config.text_len,
-                device=device,
-            )
-        image_encoder = modules["image_encoder"]
-        if not isinstance(image_encoder, WanAnimate2ImageEncoderAdapter):
-            modules["image_encoder"] = WanAnimate2ImageEncoderAdapter.from_loaded(
-                image_encoder,
-                image_processor=modules["image_processor"],
-                device=device,
-            )
-        vae = modules["vae"]
-        if not isinstance(vae, WanAnimate2VaeAdapter):
-            modules["vae"] = WanAnimate2VaeAdapter(vae)
-        return modules
-
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        # Keep native modules visible to residency and layerwise-offload management;
+        # adapters only translate the model-specific stage API.
+        device = get_local_torch_device()
+        text_encoder = WanAnimate2TextEncoderAdapter(
+            self.get_module("text_encoder"),
+            self.get_module("tokenizer"),
+            text_len=server_args.pipeline_config.dit_config.arch_config.text_len,
+            device=device,
+        )
+        image_encoder = WanAnimate2ImageEncoderAdapter.from_loaded(
+            self.get_module("image_encoder"),
+            image_processor=self.get_module("image_processor"),
+            device=device,
+        )
+        vae = WanAnimate2VaeAdapter(self.get_module("vae"))
         self.add_stage(
             stage_name="wan_animate_2_before_denoising",
             stage=WanAnimate2BeforeDenoisingStage(
-                vae=self.get_module("vae"),
-                image_encoder=self.get_module("image_encoder"),
-                text_encoder=self.get_module("text_encoder"),
+                vae=vae,
+                image_encoder=image_encoder,
+                text_encoder=text_encoder,
                 pipeline_config=server_args.pipeline_config,
                 scheduler=self.get_module("scheduler"),
             ),
@@ -106,8 +91,8 @@ class WanAnimate2Pipeline(ComposedPipelineBase):
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 pipeline=self,
-                vae=self.get_module("vae"),
-                image_encoder=self.get_module("image_encoder"),
+                vae=vae,
+                image_encoder=image_encoder,
             ),
         )
         # Replaces the standard DecodingStage: frames are already decoded in the loop.

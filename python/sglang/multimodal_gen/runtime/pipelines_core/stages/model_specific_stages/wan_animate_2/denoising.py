@@ -392,10 +392,9 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                 output_frames_for_clip = (
                     rearrange(((decoded_frames + 1) * 127.5), "1 c t h w -> t h w c")
                     .detach()
+                    .to(torch.uint8)
                     .cpu()
-                    .float()
                     .numpy()
-                    .astype(np.uint8)
                 )
 
                 # Drop the overlap frames the previous clip already emitted; 0 for clip 0.

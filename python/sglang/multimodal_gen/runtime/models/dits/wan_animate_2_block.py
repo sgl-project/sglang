@@ -494,6 +494,8 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         attn_output_valid = attn_output_valid.reshape(
             batch_size, num_latent_frames * latent_hw, num_heads, head_dim
         )
+        if q_padding.shape[1] == 0:
+            return attn_output_valid
         return torch.cat([attn_output_valid, q_padding], dim=1)  # [B, seq_len, N, C]
 
 
