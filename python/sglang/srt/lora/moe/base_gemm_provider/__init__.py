@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # The first vendor is the default for each weight family.
 VENDORS = {
     "bf16": ("cutedsl", "triton"),
-    "fp8": ("triton",),
+    "fp8": ("cutedsl", "triton"),
 }
 
 
@@ -52,6 +52,17 @@ def select_provider_cls(
                 CuteDslBf16MaskedProvider
                 if expert_major
                 else CuteDslBf16ContiguousProvider
+            )
+        case "cutedsl", "fp8":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_fp8 import (
+                CuteDslFp8ContiguousProvider,
+                CuteDslFp8MaskedProvider,
+            )
+
+            return (
+                CuteDslFp8MaskedProvider
+                if expert_major
+                else CuteDslFp8ContiguousProvider
             )
         case "triton", "bf16":
             from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
