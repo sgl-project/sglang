@@ -49,7 +49,8 @@ def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
         ]
         if hidden is not None:
             logits_output.hidden_states = hidden[keep]
-    elif hidden is not None and hidden.shape[0] == folded.num_rows:
+    elif hidden is not None and hidden.shape[0] >= folded.num_rows:
+        # MLP-sync padding rows, if any, follow the real rows and are dropped too.
         logits_output.hidden_states = hidden[folded.keep_rows]
 
 
@@ -214,6 +215,12 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
+    if batch.global_num_tokens is not None:
+        # The MLP-sync gather counted the scheduled rows. Logprob and draft counts
+        # keep that meaning: the fold shifts extend and logprob starts alike.
+        folded.global_num_tokens = _folded_global_num_tokens(
+            batch.global_num_tokens, scheduled=batch.extend_num_tokens, folded=fold_off
+        )
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -234,3 +241,13 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         replay_lens=replay,
         num_rows=fold_off,
     )
+
+
+def _folded_global_num_tokens(global_num_tokens, *, scheduled, folded):
+    # The flag rejects attention DP, so the gather holds only this rank's count.
+    if len(global_num_tokens) != 1 or global_num_tokens[0] != scheduled:
+        raise ValueError(
+            "encoder SWA replay fold expects one MLP-sync count equal to the "
+            f"scheduled extend ({scheduled}), got {global_num_tokens}"
+        )
+    return [folded]
