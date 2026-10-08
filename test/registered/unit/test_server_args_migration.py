@@ -178,9 +178,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 
-        Only `DeprecatedStoreTrueAction` has a registration in `ServerArgs`
-        today (`--disable-cuda-graph`, covered above). The other three are kept
-        for the next flag that needs them, which makes this the only thing
+        Only `DeprecatedStoreTrueAction` has registrations in `ServerArgs`
+        today (`--disable-cuda-graph`, covered above, and
+        `--enable-dp-attention`). The other three are kept for the next flag
+        that needs them, which makes this the only thing
         standing between them and silent rot -- and it doubles as the worked
         example of which shape to reach for.
         """

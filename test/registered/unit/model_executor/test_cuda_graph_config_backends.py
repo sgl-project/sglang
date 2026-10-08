@@ -1,6 +1,7 @@
 """Validate backend retirement without importing accelerator backends."""
 
 import argparse
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -41,3 +42,7 @@ def test_removed_compiler_option_is_rejected():
 def test_prefill_defaults_do_not_enable_unvalidated_platforms(cuda, expected):
     with patch("sglang.srt.utils.is_cuda", return_value=cuda):
         assert default_prefill_backend() == expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

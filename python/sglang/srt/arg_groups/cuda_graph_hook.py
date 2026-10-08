@@ -22,7 +22,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
-from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -129,11 +128,6 @@ def apply_cuda_graph_compatibility(server_args: Any):
             ),
         )
         return
-
-    # Breakable is the CUDA default but not multimodal-compatible;
-    # piecewise-allowlisted archs run their validated decoder prefill
-    # there instead. Archs also on the breakable allowlist keep it --
-    # this runs first, so piecewise would otherwise silently win.
 
     if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
         disable_breakable_cudagraph_if_incompatible(server_args)
@@ -275,24 +269,6 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         ),
     )
-
-
-def apply_glm5_chunked_prefill_default(server_args: Any):
-    """Set the opted-in GLM BCG chunk default before memory budgeting."""
-    cfg = resolving_view(server_args)
-    if (
-        get_platform().is_cuda
-        and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
-        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and cfg.chunked_prefill_size is None
-        and "Glm5NextForConditionalGeneration"
-        in model_config_of(server_args).hf_config.architectures
-    ):
-        declare_resolution(
-            server_args,
-            "_apply_glm5_chunked_prefill_default",
-            chunked_prefill_size=4096,
-        )
 
 
 def apply_glm5_prefill_cuda_graph_policy(server_args: Any):

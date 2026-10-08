@@ -79,6 +79,35 @@ Each answer contains:
 
 Questions are answered independently and scored together in one batch. To route the ticket in this example, send it to the chosen team, and hand it to a person when the top probability falls below a threshold you validate on your own labeled tickets.
 
+## Image inputs
+
+Both `/v1/decisions` and `/v1/systemone` accept an optional top-level `images` list. Each item uses the same image URL object as `image_url` in [vision chat requests](/docs/basic_usage/openai_api_vision), with `url` and optional `detail`, or is a string holding the `url` alone, such as a data URL or base64 image bytes. Use a vision-capable generation model with its vision encoder loaded and a Jinja template that accepts image parts. Some vision models serve text only unless the server is launched with `--enable-multimodal`. The native processor must expose image marker metadata, and a custom chat template is refused if it fails to preserve one complete marker per image. The server uses SGLang's existing image processor and vision encoder, placing the images in list order before the existing text in every question's user message.
+
+Save an image as `screenshot.png` and send it to the server launched above:
+
+```python Example
+import base64
+from pathlib import Path
+
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/decisions",
+    json={
+        "input": "Use the screenshot to answer the question.",
+        "images": [{"url": base64.b64encode(Path("screenshot.png").read_bytes()).decode("ascii")}],
+        "questions": [{"id": "menu", "type": "yes_no", "question": "A menu is visible."}],
+    },
+    timeout=60,
+)
+response.raise_for_status()
+print(response.json()["answers"]["menu"])
+```
+
+You can also supply an image URL. On `/v1/systemone`, send the same `images` field over HTTP alongside `state` and its question map. Images are shared by all questions. Objects and arrays in `input` or `state` remain JSON text, and text-only prompt wording stays at version 1. Image requests are refused when `--allow-auto-truncate` is enabled because truncation could remove the answer position. `return_prompt_token_ids` is unsupported with images because token IDs alone cannot replay vision conditioning through `/v1/score`.
+
+Image requests are also refused when `input`, `state` or a question contains the model's own image, video or audio marker text, because the processor would read that text as media. Each question of an image request is prepared and scheduled on its own, so a probability near a tie can differ slightly between identical requests. Launch the server with `--enable-deterministic-inference` when image answers must repeat exactly, as described in [deterministic inference](/docs/advanced_features/deterministic_inference).
+
 ## How answers are computed
 
 The server renders each question as one user message with the model's chat template and thinking turned off, and labels the answers `A` to `Z` for options, `0` to `9` for levels, and `yes` and `no`. It checks that each label is one distinct token at the answer position, then runs one prefill pass per question through the scoring path of `/v1/score` and reads the next-token log-probabilities of the labels over the full vocabulary. For a yes or no question with log-probabilities `lp_yes` and `lp_no` and request temperature `T`:
@@ -95,11 +124,12 @@ Request fields:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `input` | string, object, or array | What the questions are about. Objects and arrays are rendered as compact JSON. Must not be blank. |
+| `images` | list of image URL objects, default empty | Images shared by all questions, in list order. See [Image inputs](#image-inputs). |
 | `questions` | list of questions | At least one. Each question has a unique `id`, which keys its answer. |
 | `temperature` | number above 0, default 1 | Divides the label logits before the softmax over the labels. It does not change `label_mass`. |
 | `chat_template_kwargs` | object, default empty | Extra chat template arguments, applied after `--default-chat-template-kwargs`. The thinking toggle that the chat template or its reasoning parser names stays off in either case. |
 | `prompt_format_version` | integer, optional | Pins the prompt wording. A server that serves another version returns 400. |
-| `return_prompt_token_ids` | boolean, default false | Adds `prompt_token_ids` and `label_token_ids` to each answer. |
+| `return_prompt_token_ids` | boolean, default false | Adds `prompt_token_ids` and `label_token_ids` to each text-only answer. Unsupported with images. |
 | `model` | string, optional | Echoed in the response, as `default` when omitted. It does not select a LoRA adapter, and the `base:adapter` form returns 400. |
 
 Question fields:
@@ -129,6 +159,7 @@ The request fails with HTTP 400 for:
 - a server launched with `--enable-mis` or `--dllm-algorithm`, or one that uses a built-in conversation template, whether named with `--chat-template`, loaded from a JSON template file, or inferred from the model path
 - a model whose chat route uses a built-in encoder instead of a chat template, a tokenizer that does not encode the rendered chat text back to the same ids, or a model that is not a generation model
 - a chat template that raises an error for the question message, or a server launched with `--skip-tokenizer-init`
+- a decision checkpoint such as [PPLX-Decider-v1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B), which answers through `/v1/systemone`
 
 Errors about one question name its id or its position in `questions`.
 
@@ -136,7 +167,7 @@ Errors about one question name its id or its position in `questions`.
 
 The server owns the prompt wording of `/v1/decisions` and versions it. Every response carries `prompt_format_version`, and a change to the wording ships as a new version. Send `prompt_format_version` to fail loudly instead of receiving answers from different wording after a server upgrade.
 
-To keep an answer reproducible independently of the server's wording, ask for the scored ids and replay them through `/v1/score`, which only scores the ids you send:
+To keep a text-only answer reproducible independently of the server's wording, ask for the scored ids and replay them through `/v1/score`, which only scores the ids you send:
 
 ```python Example
 import requests
@@ -176,7 +207,7 @@ These models mix full and linear attention. Answer probabilities can move by up 
 
 ## System One compatible API
 
-`POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. The route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below.
+`POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. The route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below. A decision checkpoint such as [PPLX-Decider-v1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B) instead gets the prompt, answer codes, and calibrated temperature it was trained with. When its `decision_config.json` sets `attention_mode` to `noncausal_full_attention`, as [PPLX-Decider-v1.1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B) does, its full-attention layers read the whole prompt, and the server turns off the radix cache and chunked prefill, which would show those layers only part of it.
 
 ```bash Command
 pip install typesafe-sdk
@@ -210,11 +241,11 @@ What to expect from this route:
 - Any `model` name is accepted, including the SDK default `jev-latest`, unless it names a LoRA adapter after a colon, as in `base:adapter`. The response `model` is always the served model.
 - A `noul` answer is the probability of yes. A `choice` answer has the most probable option and a `score` answer the probability-weighted mean level, each with `probabilities` and `confidence`, and a score answer echoes its levels in `legend`.
 - `confidence` follows the formulas TypeSafe publishes for its adapter. It is a statistic of the returned probabilities, which are renormalized over the answer labels and ignore probability outside them. It is not calibrated, it can read 0 for a score split between distant levels, and thresholds tuned on another provider may not transfer.
-- Each answer also carries `x_label_mass`, the full-vocabulary probability of its labels, which `/v1/decisions` returns as `label_mass`. The Python SDK drops fields it does not define, so read it from `result.raw_http_response.json()`.
+- Each answer also carries `x_label_mass`, the full-vocabulary probability of its labels, which `/v1/decisions` returns as `label_mass`. The Python SDK drops fields it does not define, so read it from `result.raw_http_response.json()`. Decision checkpoints omit it, because their readout has no full-vocabulary distribution.
 - A choice takes 1 to 255 options and a score 1 to 10 levels. Option names that are blank, contain control or line break characters, or repeat another name after trimming and case folding are refused, and so are blank or null levels, as on `/v1/decisions`.
 - Beyond 26 options, every option gets a two-letter label (`AA`, `AB`, and so on) checked to be one token for the served tokenizer. These labels include common words and have unequal priors, so answers above 26 options can depend on option order. More than 26 options also need a Hugging Face tokenizer that reports its added tokens, and a chat template with an added token between the message and the answer position whose following text tokenizes the same on its own, as the Qwen models do with `</think>`. Without them, a choice is limited to 26 options.
 - `instructions` are optional. A choice or score question without them drops its question line, and a `noul` question is answered from its `true` and `false` descriptions. A `noul` question with neither, such as the SDK's bare `Noul()`, is refused.
-- Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `chat_template_kwargs` is accepted as an SGLang extension.
+- Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `chat_template_kwargs` and `images` are accepted as SGLang extensions.
 - Unlike `/v1/decisions`, an empty `state` and empty or blank question ids are accepted, as the System One schema allows.
 - Invalid requests return 422 with the location of the error, other refusals return 400, and neither is retried by the SDKs.
 - `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, and `usage.output_tokens` is 0.

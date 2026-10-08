@@ -90,11 +90,11 @@ ALLOWED_KEYS_PER_PHASE = {
 class PhaseConfig:
     """Per-phase CUDA graph settings."""
 
-    # Internal compatibility only; rejected by both configuration parsers.
-    tc_compiler: str = "eager"
     backend: str = Backend.DISABLED
     max_bs: Optional[int] = None
     bs: Optional[List[int]] = None
+    # Internal compatibility only; rejected by both configuration parsers.
+    tc_compiler: str = "eager"
     # Effective for both full and breakable backends and currently only DSV4:
     # fixed maximum context length used by context-shaped prefill graph metadata.
     # Every token bucket shares this size; larger live contexts run eagerly.

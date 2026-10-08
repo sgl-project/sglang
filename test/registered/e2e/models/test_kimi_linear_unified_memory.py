@@ -24,7 +24,7 @@ class TestKimiLinearUnifiedMemoryFlashMLA(
     GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     """flashmla at its ps=64 snap: the block-table route
-    (KVIndexTranslator.fill_read_table into flashmla's padded tables) plus the
+    (the plan's page table copied into flashmla's padded tables) plus the
     ps=64 sub-pool sizing (64-token sink floor, per-layer-view tail pad).
     Hopper-only, like the rest of this nightly suite."""
 
