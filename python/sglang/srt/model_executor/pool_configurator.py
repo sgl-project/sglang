@@ -1054,6 +1054,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        # Rows one 128-token page needs for the c4 state; A5 spans two windows so
+        # that the decode window (coff*cmpRatio + 1 positions) maps to distinct
+        # rows. Must match NPUCompressStatePool.translate_from_swa_loc_to_state_loc.
+        self.c4_state_span = self.c4_ring_size
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            if is_npu_arch35():
+                self.c4_state_span = 2 * self.c4_ring_size
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
@@ -1252,7 +1261,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
-        c4_state_ratio = self.c4_ring_size / self.swa_page_size
+        c4_state_ratio = self.c4_state_span / self.swa_page_size
         return (
             self.kv_bytes * self.num_layers_total
             + c4_state_ratio
@@ -1340,7 +1349,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_state_pool_size=(
                 0
                 if self._unified
-                else swa_tokens // self.swa_page_size * self.c4_ring_size
+                else swa_tokens // self.swa_page_size * self.c4_state_span
             ),
             c128_state_pool_size=0,
         )
