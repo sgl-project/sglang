@@ -356,8 +356,7 @@ class AnthropicCountTokensRequest(BaseModel):
     thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
-    # Claude 4.7 / SDK-compatibility fields. output_config is counted as Messages
-    # renders it; betas is a no-op.
+    # Claude 4.7 / SDK-compatibility fields; betas is accepted but ignored.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 

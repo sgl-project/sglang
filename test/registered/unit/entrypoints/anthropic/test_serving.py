@@ -917,8 +917,6 @@ class TestAnthropicServing(unittest.TestCase):
                 self.assertEqual(chat_request.reasoning_effort, openai_effort)
 
     def test_json_output_reaches_sampling_constraints(self):
-        """output_config.format must constrain decoding to its JSON schema rather
-        than be ignored."""
         schema = {
             "type": "object",
             "properties": {"answer": {"type": "integer", "enum": [42]}},
@@ -934,9 +932,7 @@ class TestAnthropicServing(unittest.TestCase):
         )
 
     def test_invalid_json_output_format_is_rejected(self):
-        """A format other than json_schema, or one without a schema, must be
-        rejected rather than silently ignored."""
-        for output_format in ({"type": "text"}, {"type": "json_schema"}):
+        for output_format in ({"type": "text", "schema": {}}, {"type": "json_schema"}):
             with (
                 self.subTest(output_format=output_format),
                 self.assertRaises(ValueError),
@@ -944,8 +940,6 @@ class TestAnthropicServing(unittest.TestCase):
                 self._anthropic_request(output_config={"format": output_format})
 
     def test_count_tokens_renders_output_config_like_messages(self):
-        """count_tokens must count the prompt Messages renders, so output_config
-        reaches the Chat request on both routes."""
         rendered = []
 
         class _CountingOpenAI(_FakeOpenAIServingChat):
