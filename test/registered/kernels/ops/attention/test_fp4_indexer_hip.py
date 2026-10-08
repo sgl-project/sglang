@@ -25,6 +25,14 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+    candidate_page8_table,
+    select_candidate_blocks_hip,
+    slice_candidate_blocks,
+    topk_within_candidate_blocks_hip,
+    topk_within_candidate_blocks_page8,
+    with_candidate_page8_table,
+)
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -938,6 +946,141 @@ def test_page8_full_scoring_matches_page64(
             rtol=2.0e-3,
             atol=2.0e-3,
         )
+
+
+def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:
+    return [sorted(v for v in row if v >= 0) for row in page_indices.tolist()]
+
+
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request,topk_blocks,topk",
+    [(2, 1024, 1, 32, 64), (3, 2048, 6, 64, 128), (4, 4096, 2, 128, 256)],
+)
+def test_page8_candidates_match_gather(
+    batch, seq_len, rows_per_request, topk_blocks, topk
+) -> None:
+    """A consumer scoring only its candidate blocks on the page8 pool selects what top-k over
+    the full context's logits gathered to those blocks selects."""
+    torch.manual_seed(batch * 500 + seq_len)
+    ctx = [seq_len - 3 * b for b in range(batch)]
+    case = _page8_case(batch, seq_len, rows_per_request, ctx_lens=ctx)
+    seq_lens = case["c4_seq_lens"]
+    full = _rowgroup_logits(case, rows_per_request, page8=False, is_decode=True)
+    candidates = select_candidate_blocks_hip(
+        full, seq_lens, topk_blocks=topk_blocks, block_size=8
+    )
+    rows = full.shape[0]
+
+    def run(page8: bool):
+        page_indices = torch.full(
+            (rows, topk), -7, dtype=torch.int32, device=get_device()
+        )
+        raw = torch.full_like(page_indices, -7)
+        common = dict(
+            page_table=case["page_table"],
+            page_size=PAGE_SIZE,
+            page_indices=page_indices,
+            raw_indices=raw,
+        )
+        if page8:
+            topk_within_candidate_blocks_page8(
+                q_fp4=case["q_fp4"],
+                q_scale=case["q_scale"],
+                weights=case["weights"],
+                k_payload=case["payload8"],
+                k_scale=case["scale8"],
+                candidates=candidates,
+                seq_lens=seq_lens,
+                **common,
+            )
+        else:
+            topk_within_candidate_blocks_hip(full, seq_lens, candidates, **common)
+        return page_indices, raw
+
+    ref_pages, ref_raw = run(False)
+    got_pages, got_raw = run(True)
+    assert _selected_slots(got_pages) == _selected_slots(ref_pages)
+    assert _selected_slots(got_raw) == _selected_slots(ref_raw)
+    for row in range(rows):
+        n = int((ref_pages[row] >= 0).sum())
+        assert (got_pages[row, :n] >= 0).all() and (got_pages[row, n:] == -1).all()
+
+
+def test_sliced_page8_table_matches_rebuilt() -> None:
+    """A row chunk of candidates carrying their page8 table selects what the chunk with the
+    table rebuilt from its own rows selects."""
+    torch.manual_seed(11)
+    case = _page8_case(2, 2048, 6, ctx_lens=[2048, 1500])
+    seq_lens = case["c4_seq_lens"]
+    full = _rowgroup_logits(case, 6, page8=False, is_decode=True)
+    candidates = with_candidate_page8_table(
+        select_candidate_blocks_hip(full, seq_lens, topk_blocks=64, block_size=8),
+        seq_lens,
+        case["page_table"],
+        page_size=PAGE_SIZE,
+    )
+    rows = slice(3, 10)
+
+    def run(cands):
+        page_indices = torch.full((7, 128), -7, dtype=torch.int32, device=get_device())
+        topk_within_candidate_blocks_page8(
+            q_fp4=case["q_fp4"][rows],
+            q_scale=case["q_scale"][rows],
+            weights=case["weights"][rows],
+            k_payload=case["payload8"],
+            k_scale=case["scale8"],
+            candidates=cands,
+            seq_lens=seq_lens[rows],
+            page_table=case["page_table"][rows],
+            page_size=PAGE_SIZE,
+            page_indices=page_indices,
+            raw_indices=None,
+        )
+        return page_indices
+
+    sliced = slice_candidate_blocks(candidates, rows)
+    assert sliced.page8 is not None
+    rebuilt = candidate_page8_table(
+        sliced.ids,
+        seq_lens[rows],
+        case["page_table"][rows],
+        block_size=8,
+        page_size=PAGE_SIZE,
+    )
+    for got, ref in zip(sliced.page8, rebuilt):
+        assert torch.equal(got, ref)
+    # the top-k leaves its selection in no fixed order
+    assert _selected_slots(run(sliced)) == _selected_slots(
+        run(sliced._replace(page8=None))
+    )
+
+
+def test_candidate_page8_table_moves_newest_block_last() -> None:
+    """The newest block trades places with the last kept id; each id maps to its 8-slot page
+    through the 64-slot page table; the compact length counts the full blocks plus the newest
+    block's reachable part; query_start_loc is one row per sequence."""
+    page_table = torch.tensor(
+        [[5, 2, 9], [7, 0, 0], [4, 6, 0]], dtype=torch.int32, device="cuda"
+    )
+    ids = torch.tensor(
+        [[3, 17, 8, 0, -1], [-1, -1, -1, -1, -1], [9, 2, 15, -1, -1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([140, 0, 128], dtype=torch.int32, device="cuda")
+    out_ids, pages, lens, qsl = candidate_page8_table(
+        ids, seq_lens, page_table, block_size=8, page_size=64
+    )
+    assert out_ids.tolist() == [[3, 0, 8, 17, -1], [-1] * 5, [9, 2, 15, -1, -1]]
+    # block b lives in 64-slot page page_table[b // 8], 8-slot sub-page b % 8
+    assert pages.tolist() == [
+        [5 * 8 + 3, 5 * 8 + 0, 2 * 8 + 0, 9 * 8 + 1, 0],
+        [0] * 5,
+        [6 * 8 + 1, 4 * 8 + 2, 6 * 8 + 7, 0, 0],
+    ]
+    # 140 positions: block 17 covers 136..143, 4 reachable; 128: newest block 15 is full
+    assert lens.tolist() == [3 * 8 + 4, 0, 3 * 8]
+    assert qsl.tolist() == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("is_decode", [True, False])
