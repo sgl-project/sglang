@@ -438,14 +438,6 @@ def normalize_flat_modelopt_quant_config(
     return normalized
 
 
-def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
-    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    return _infer_nvfp4_group_size_from_shapes(
-        getattr(weight, "shape", ()),
-        getattr(scale, "shape", ()),
-    )
-
-
 def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
     weight_shape = tuple(weight_shape or ())
     scale_shape = tuple(scale_shape or ())

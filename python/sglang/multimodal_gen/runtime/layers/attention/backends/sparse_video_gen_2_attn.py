@@ -106,14 +106,6 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     max_seqlen_k: int | None = None
 
 
-def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
-    if name not in kwargs:
-        raise ValueError(
-            f"Missing required argument for SparseVideoGen2Attention: {name}"
-        )
-    return kwargs[name]
-
-
 class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self) -> None:
         pass
