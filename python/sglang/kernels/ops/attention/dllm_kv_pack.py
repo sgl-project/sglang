@@ -28,6 +28,9 @@ def _pack_kv(
     KBH: tl.constexpr,
     VBS: tl.constexpr,
     VBH: tl.constexpr,
+    KPS: tl.constexpr,
+    VPS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
     TILE: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -41,8 +44,14 @@ def _pack_kv(
     offsets = tl.program_id(1).to(tl.int64) * TILE + tl.arange(0, TILE)
     token, head, channel = offsets // (H * D), offsets // D % H, offsets % D
     slot = tl.load(IDS + ps + token, token < prefix, other=0).to(tl.int64)
-    kp = tl.load(KB + slot * KBS + head * KBH + channel, token < prefix, other=0)
-    vp = tl.load(VB + slot * VBS + head * VBH + channel, token < prefix, other=0)
+    if PAGE_SIZE > 1:
+        ko = (slot // PAGE_SIZE) * KPS + (slot % PAGE_SIZE) * KBS
+        vo = (slot // PAGE_SIZE) * VPS + (slot % PAGE_SIZE) * VBS
+    else:
+        ko = slot * KBS
+        vo = slot * VBS
+    kp = tl.load(KB + ko + head * KBH + channel, token < prefix, other=0)
+    vp = tl.load(VB + vo + head * VBH + channel, token < prefix, other=0)
     current = qs + token - prefix
     kc = tl.load(
         K + current * KS + head * KH + channel,
@@ -66,8 +75,23 @@ def _pack_kv(
             tl.store(CU + row + 1, pe + qe)
 
 
-def pack_prefix_current(k, v, kb, vb, qo, ki, ids, kd, vd, cu, max_length):
+def pack_prefix_current(
+    k, v, kb, vb, qo, ki, ids, kd, vd, cu, max_length, *, page_size=1
+):
     h, d = k.shape[1:]
+    if page_size > 1:
+        if (
+            kb.ndim != 4
+            or vb.ndim != 4
+            or kb.shape[1:] != (h, page_size, d)
+            or vb.shape[1:] != (h, page_size, d)
+            or kb.stride(-1) != 1
+            or vb.stride(-1) != 1
+        ):
+            raise ValueError("Paged prefix caches must have HND layout")
+        kbs, vbs = kb.stride(2), vb.stride(2)
+    else:
+        kbs, vbs = kb.stride(0), vb.stride(0)
     _pack_kv[(qo.numel() - 1, triton.cdiv(max_length * h * d, 1024))](
         k,
         v,
@@ -85,9 +109,12 @@ def pack_prefix_current(k, v, kb, vb, qo, ki, ids, kd, vd, cu, max_length):
         k.stride(1),
         v.stride(0),
         v.stride(1),
-        kb.stride(0),
+        kbs,
         kb.stride(1),
-        vb.stride(0),
+        vbs,
         vb.stride(1),
+        kb.stride(0),
+        vb.stride(0),
+        page_size,
         TILE=1024,
     )
