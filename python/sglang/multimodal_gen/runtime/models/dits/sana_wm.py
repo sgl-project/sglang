@@ -428,7 +428,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for i in range(depth)
             if arch.softmax_every_n > 0 and (i + 1) % arch.softmax_every_n == 0
         )
-        self.softmax_block_indices = tuple(sorted(softmax_idx))
 
         self.blocks = nn.ModuleList(
             [

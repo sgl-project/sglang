@@ -386,7 +386,6 @@ class FlashAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
-        self.attention_metadata = FlashAttentionMetadata()
 
     def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
         params = get_request_skip_softmax_params()
