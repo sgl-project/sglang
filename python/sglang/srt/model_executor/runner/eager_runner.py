@@ -370,7 +370,8 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            # Under CP-TP group sharing the model owns the CP row layout.
+            elif cp_active and not get_parallel().enable_cp_tp_group_sharing:
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
