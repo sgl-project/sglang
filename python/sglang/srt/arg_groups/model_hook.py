@@ -938,7 +938,7 @@ def handle_model_capability_adjustments(server_args: Any):
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
     # also puts the FA backend on its raw K/V path, which skips the KV pool.
-    if getattr(model_config, "joint_head_config", None) is not None:
+    if model_config.joint_head_config is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "

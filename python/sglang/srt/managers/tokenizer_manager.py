@@ -1401,7 +1401,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: EmbeddingReqInput, input_ids: List[int]
     ) -> None:
         """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
-        if getattr(self.model_config, "joint_head_config", None) is None:
+        if self.model_config.joint_head_config is None:
             if obj.decision_layout is not None:
                 raise ValueError(
                     "decision_layout needs a checkpoint with a joint schema head"
