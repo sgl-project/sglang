@@ -163,13 +163,44 @@ def test_online_adaln_admission_capacity_boundary(admission):
 
 
 @pytest.mark.parametrize(
-    "params_class,steps", [(FastH3SamplingParams, 4), (VDNH3SamplingParams, 8)]
+    "params_class,steps", [(FastH3SamplingParams, 8), (VDNH3SamplingParams, 8)]
 )
 def test_distilled_models_keep_their_trained_grid(params_class, steps):
     request = Req(sampling_params=params_class(prompt="step contract"))
     assert request.num_inference_steps == steps
     with pytest.raises(ValueError):
         params_class(prompt="step contract", num_inference_steps=steps + 1)
+
+
+def test_fasth3_trained_rungs_preserve_serving_and_warmup_counts(admission):
+    sampling = FastH3SamplingParams(
+        prompt="step contract",
+        task="t2va",
+        conditions=[],
+        target={"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+        flow_shift=10.0,
+        audio_flow_shift=3.0,
+    )
+    request = Req(sampling_params=sampling, extra=sampling.build_request_extra())
+    admission.forward(request, SimpleNamespace(minimax_h3_adaln_online=False))
+    preparation = MiniMaxH3TimestepPreparationStage(
+        dmd_denoising_steps=(999, 874, 749, 624, 500, 375, 250, 125)
+    )
+    warmup_requests = [request.copy_as_warmup(steps) for steps in (1, 2, 8)]
+    preparation.forward(request, SimpleNamespace())
+    assert len(request.timesteps) == 8
+    assert all(
+        len(schedule) == 9 and schedule[-1] == 0.0
+        for schedule in request.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY].values()
+    )
+    for steps, warmup in zip((1, 2, 8), warmup_requests):
+        preparation.forward(warmup, SimpleNamespace())
+        assert len(warmup.timesteps) == steps
+        for modality, schedule in warmup.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY].items():
+            assert (
+                schedule
+                == request.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY][modality][: steps + 1]
+            )
 
 
 @pytest.mark.parametrize("steps", [1, 2, 10, 50])

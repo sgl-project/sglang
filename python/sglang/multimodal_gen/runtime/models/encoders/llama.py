@@ -51,7 +51,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    default_weight_loader,
+    load_stacked_weight,
     maybe_remap_kv_scale_name,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
@@ -400,17 +400,6 @@ class LlamaModel(TextEncoder):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            # if (self.quant_config is not None and
-            #     (scale_name := self.quant_config.get_cache_scale(name))):
-            #     # Loading kv cache quantization scales
-            #     param = params_dict[scale_name]
-            #     weight_loader = getattr(param, "weight_loader",
-            #                             default_weight_loader)
-            #     loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
-            #                      loaded_weight[0])
-            #     weight_loader(param, loaded_weight)
-            #     loaded_params.add(scale_name)
-            #     continue
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
                 kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
@@ -418,37 +407,14 @@ class LlamaModel(TextEncoder):
                     continue
                 else:
                     name = kv_scale_name
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name,
+                loaded_weight,
+                params_dict,
+                self.config.arch_config.stacked_params_mapping,
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 

@@ -271,7 +271,11 @@ class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
     Attributes:
-        device_indices  :   Indices of the KV cache on the device matched by common prefix.
+        device_prefix_len:  Length of the device-resident matched prefix. Its KV
+                            indices lie on the path to ``last_device_node``, except
+                            slots LMCache loaded but has not published (which
+                            ``prefix_device_indices`` appends) and a streaming
+                            session's match, which lives in the lent row.
         last_device_node:   The last TreeNode on the device that was matched.
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
@@ -299,7 +303,7 @@ class MatchResult(NamedTuple):
                             host, independent of other components.
     """
 
-    device_indices: torch.Tensor
+    device_prefix_len: int
     last_device_node: Any
     last_host_node: Any
     best_match_node: Any
@@ -322,9 +326,7 @@ def zero_match_result(
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
-        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
-        # without allocating a fresh empty tensor.
-        device_indices=match_result.device_indices[:0],
+        device_prefix_len=0,
         last_device_node=root,
         last_host_node=root,
         best_match_node=root,
@@ -528,6 +530,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if lock is not None:
             self.dec_lock_ref(lock.node, lock.receipt)
 
+    def path_device_indices(self, node: Any) -> torch.Tensor:
+        """Device KV indices on the path from the root to ``node``; valid until
+        the next allocation or eviction unless the path is locked."""
+        raise NotImplementedError
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        """KV indices of req's matched prefix, read off the path to its locked
+        match node; valid from match until allocation writes them into the row."""
+        path = self.path_device_indices(req.last_node)
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
+
     def maybe_hand_to_session(self, req: Req) -> None:
         """A cache that keeps records across requests (a streaming session) takes
         the just-allocated row and the request's tree lock; the request borrows it."""
@@ -572,11 +586,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[Tuple[torch.Tensor, Any]]:
-        """
-        Prepare host-to-device loading. None means retry admission; an empty
-        tensor can be a successful auxiliary-only load or a recompute fallback.
-        """
+    ) -> Optional[Tuple[int, Any]]:
+        """Prepare host-to-device loading; returns (loaded FULL tokens, new last
+        node). None means retry admission; zero can be a successful
+        auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
