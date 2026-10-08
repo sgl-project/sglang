@@ -19,21 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-if "sinc" in dir(torch):
-    sinc = torch.sinc
-else:
-    # This code is adopted from adefossez's julius.core.sinc under the MIT License
-    # https://adefossez.github.io/julius/julius/core.html
-    def sinc(x: torch.Tensor):
-        """
-        Implementation of sinc, i.e. sin(pi * x) / (pi * x)
-        __Warning__: Different to julius.sinc, the input is multiplied by `pi`!
-        """
-        return torch.where(
-            x == 0,
-            torch.tensor(1.0, device=x.device, dtype=x.dtype),
-            torch.sin(math.pi * x) / math.pi / x,
-        )
+sinc = torch.sinc
 
 
 # This code is adopted from adefossez's julius.lowpass.LowPassFilters under the MIT License
