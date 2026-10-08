@@ -1033,6 +1033,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_indexer_topk and not request.return_meta_info:
             return "return_indexer_topk requires return_meta_info=true."
 
+        if request.return_outputs_via_store and not request.return_meta_info:
+            return "return_outputs_via_store requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1269,6 +1272,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             return_indexer_topk=request.return_indexer_topk,
+            return_outputs_via_store=request.return_outputs_via_store,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,

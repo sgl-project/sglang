@@ -45,6 +45,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizer
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_device,
+    get_exec,
     get_model,
     get_observability,
     get_serving,
@@ -155,6 +156,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             get_serving().disable_tokenizer_batch_decode
         )
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.output_store_enabled = get_exec().features.output_store_backend != "none"
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -456,8 +458,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
-        indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+        # Requests that put these into the output store need the tensors, so the
+        # tokenizer encodes the remaining ones itself.
+        if self.output_store_enabled:
+            routed_experts = indexer_topk = None
+            routed_experts_raw = recv_obj.routed_experts
+            indexer_topk_raw = recv_obj.indexer_topk
+        else:
+            routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+            indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
+            routed_experts_raw = indexer_topk_raw = None
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -499,6 +509,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             indexer_topk_num_layers=recv_obj.indexer_topk_num_layers,
+            routed_experts_raw=routed_experts_raw,
+            indexer_topk_raw=indexer_topk_raw,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

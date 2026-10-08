@@ -106,6 +106,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.output_store import (
+    OUTPUT_STORE_REF_KEY,
+    OutputStoreWriter,
+    TokenOutputStash,
+    maybe_create_output_store,
+)
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
@@ -263,6 +269,9 @@ class ReqState:
     # For streaming output
     last_output_offset: int = 0
 
+    # Unencoded token outputs of a request that returns them via the output store.
+    token_output_stash: Optional[TokenOutputStash] = None
+
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
     text: str = ""
@@ -345,6 +354,37 @@ def _slice_streaming_output_meta_info(
         streaming_meta_info_keys.update(customized_info_keys)
     for key in meta_info.keys() & streaming_meta_info_keys:
         meta_info[key] = meta_info[key][last_output_offset:]
+
+
+def _is_failing_abort(finish_reason: Dict[str, Any]) -> bool:
+    return finish_reason.get("type") == "abort" and finish_reason.get(
+        "status_code"
+    ) in (
+        HTTPStatus.BAD_REQUEST,
+        HTTPStatus.SERVICE_UNAVAILABLE,
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+
+
+def _replay_output_at(
+    *,
+    raw: Optional[List[Optional[torch.Tensor]]],
+    encoded: Optional[List[Optional[Union[str, torch.Tensor]]]],
+    i: int,
+) -> Optional[Union[str, torch.Tensor]]:
+    if raw is not None:
+        return raw[i]
+    if encoded:
+        return encoded[i]
+    return None
+
+
+def _encode_replay_output(value: Union[str, torch.Tensor]) -> str:
+    # The detokenizer pre-encodes unless the output store is enabled; the
+    # skip_tokenizer_init path bypasses the detokenizer entirely.
+    if isinstance(value, torch.Tensor):
+        return pybase64.b64encode(value.numpy().tobytes()).decode("utf-8")
+    return value
 
 
 def _build_flat_input_top_logprobs_fields(
@@ -433,6 +473,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
+    # Set by maybe_init_output_store; None without --output-store-backend.
+    output_store: Optional[OutputStoreWriter] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
@@ -544,10 +586,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Init output store
+        self.maybe_init_output_store()
+
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
+        )
+
+    def maybe_init_output_store(self):
+        """Connect to the replay-output store if --output-store-backend is set."""
+        self.output_store = maybe_create_output_store(
+            backend=get_exec().features.output_store_backend,
+            extra_config=get_exec().features.output_store_backend_extra_config,
+            disaggregation_mode=get_disagg().disaggregation_mode,
         )
 
     def init_model_config(self):
@@ -1406,6 +1459,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+            if obj.return_outputs_via_store:
+                if self.output_store is None:
+                    raise ValueError(
+                        "The server is not configured with an output store. "
+                        "Please set `--output-store-backend mooncake`."
+                    )
+                if obj.stream:
+                    raise ValueError(
+                        "return_outputs_via_store does not support streaming yet."
+                    )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1903,6 +1966,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return None
 
+    async def _put_token_output_stash(
+        self, *, out: dict, state: ReqState, request: Optional[fastapi.Request]
+    ) -> None:
+        stash = state.token_output_stash
+        state.token_output_stash = None
+        meta_info = out["meta_info"]
+        if stash.is_empty() or _is_failing_abort(meta_info["finish_reason"]):
+            return
+
+        future = self.output_store.submit_put(stash)
+        try:
+            output_store_ref = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # A running put keeps going after cancellation; remove what it writes.
+            self.output_store.cleanup_after(future)
+            raise
+        except Exception as e:
+            logger.error(f"Output store put failed for rid={state.obj.rid}: {e!r}")
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                detail=f"Failed to write outputs to the output store: {e}",
+            ) from e
+        if (
+            request is not None
+            and not state.obj.background
+            and await request.is_disconnected()
+        ):
+            # Nobody can read this ref, and a client retry writes a new object.
+            self.output_store.cleanup_after(future)
+            raise ValueError(
+                "Request is disconnected from the client side after its output store "
+                f"put; removed the stored outputs of {state.obj.rid=}"
+            )
+        meta_info[OUTPUT_STORE_REF_KEY] = output_store_ref
+        meta_info.update(stash.inline_meta_info())
+
     def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1981,6 +2080,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out = build_beam_search_out(out)
 
             if finished:
+                if state.token_output_stash is not None:
+                    await self._put_token_output_stash(
+                        out=out, state=state, request=request
+                    )
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
@@ -2092,6 +2195,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
+                # The warmup response is discarded, so it must not write to the store.
+                tmp_obj.return_outputs_via_store = False
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -2491,7 +2596,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                if output_sampling_mask is not None:
+                stash = state.token_output_stash
+                if output_sampling_mask is not None and stash is not None:
+                    stash.add_sampling_mask(output_sampling_mask[i])
+                elif output_sampling_mask is not None:
                     masks, logprobs = output_sampling_mask[i].to_lists(
                         support_logprobs=state.obj.sampling_logprobs_mode == "support"
                     )
@@ -2557,23 +2665,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
                     meta_info["hidden_states"] = hidden_states
-            if getattr(recv_obj, "routed_experts", None):
-                val = recv_obj.routed_experts[i]
-                if val is not None:
-                    # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["routed_experts"] = val
-            if getattr(recv_obj, "indexer_topk", None):
-                val = recv_obj.indexer_topk[i]
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["indexer_topk"] = val
-                    n = getattr(recv_obj, "indexer_topk_num_layers", None)
-                    if n is not None:
-                        meta_info["indexer_topk_num_layers"] = n
+            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+                is_str_output = isinstance(recv_obj, BatchStrOutput)
+                routed_experts = _replay_output_at(
+                    raw=recv_obj.routed_experts_raw if is_str_output else None,
+                    encoded=recv_obj.routed_experts,
+                    i=i,
+                )
+                if routed_experts is not None and state.token_output_stash is not None:
+                    state.token_output_stash.routed_experts = routed_experts
+                elif routed_experts is not None:
+                    meta_info["routed_experts"] = _encode_replay_output(routed_experts)
+                indexer_topk = _replay_output_at(
+                    raw=recv_obj.indexer_topk_raw if is_str_output else None,
+                    encoded=recv_obj.indexer_topk,
+                    i=i,
+                )
+                if indexer_topk is not None and state.token_output_stash is not None:
+                    state.token_output_stash.indexer_topk = indexer_topk
+                elif indexer_topk is not None:
+                    meta_info["indexer_topk"] = _encode_replay_output(indexer_topk)
+                    if recv_obj.indexer_topk_num_layers is not None:
+                        meta_info["indexer_topk_num_layers"] = (
+                            recv_obj.indexer_topk_num_layers
+                        )
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
@@ -3705,6 +3820,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    def _uses_output_store(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        return (
+            self.output_store is not None
+            and isinstance(obj, GenerateReqInput)
+            and obj.return_outputs_via_store
+        )
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -3745,6 +3869,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if self._uses_output_store(sub_obj):
+                state.token_output_stash = TokenOutputStash()
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
