@@ -1492,6 +1492,8 @@ class Envs:
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
     # ===================================================================
+    # Routed expert response encoding (int32, uint16, or uint8).
+    SGLANG_ROUTED_EXPERTS_DTYPE = EnvStr("int32")
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)

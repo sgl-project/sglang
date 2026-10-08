@@ -1670,6 +1670,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
+    # Actual dtype of each base64 routing payload; None entries have no capture.
+    routed_experts_dtype: Optional[List[Optional[str]]] = None
+
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 

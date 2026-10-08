@@ -5,7 +5,7 @@ import numpy as np
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -100,7 +100,31 @@ def _make_batch_str_output() -> BatchStrOutput:
     )
 
 
-class TestMultiTokenizerMixin(unittest.TestCase):
+class TestMultiTokenizerMixin(CustomTestCase):
+    def test_batch_str_output_keeps_routing_payload_and_dtype_aligned(self):
+        """Worker splitting must not separate compact bytes from their dtype."""
+        output = _make_batch_str_output()
+        output.routed_experts = ["AAH+/w==", "AADA/w=="]
+        output.routed_experts_dtype = ["uint8", "uint16"]
+        for index in (0, 1):
+            with self.subTest(index=index):
+                single = _handle_output_by_index(output, index)
+                self.assertEqual(single.routed_experts, [output.routed_experts[index]])
+                self.assertEqual(
+                    single.routed_experts_dtype, [output.routed_experts_dtype[index]]
+                )
+
+        output.routed_experts[0] = None
+        output.routed_experts_dtype[0] = None
+        self.assertEqual(
+            _handle_output_by_index(output, 0).routed_experts_dtype, [None]
+        )
+        self.assertEqual(
+            _handle_output_by_index(output, 1).routed_experts_dtype, ["uint16"]
+        )
+        output.routed_experts_dtype = None
+        self.assertIsNone(_handle_output_by_index(output, 1).routed_experts_dtype)
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
