@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 
 import psutil
@@ -30,6 +31,7 @@ from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_rank_to_dp_rank,
     physical_ep_size_to_dp_size,
+    validate_matching_attention_topology,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -87,6 +89,13 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+
+
+@dataclass(frozen=True)
+class WorkerPortHandshake:
+    worker_ports: list[int]
+    attn_tp_size: int
+    attn_cp_size: int
 
 
 class LoadBalanceMethod(Enum):
@@ -484,7 +493,16 @@ class DataParallelController:
             )
         else:
             # Other nodes: Receive worker ports from node 0
-            return self._receive_ports_as_client(endpoint)
+            return self._receive_ports_as_client(endpoint).worker_ports
+
+    @staticmethod
+    def _make_worker_port_handshake(worker_ports: list[int]) -> WorkerPortHandshake:
+        parallel = get_parallel()
+        return WorkerPortHandshake(
+            worker_ports=worker_ports,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=parallel.attn_cp_size,
+        )
 
     def _broadcast_ports_as_server(
         self, endpoint: str, expected_clients: int, worker_ports: list[int]
@@ -492,6 +510,7 @@ class DataParallelController:
         """Broadcast worker ports to all client nodes."""
         logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
         logger.debug(f"Worker ports: {worker_ports}")
+        handshake = self._make_worker_port_handshake(worker_ports)
 
         rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
 
@@ -503,7 +522,7 @@ class DataParallelController:
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                sock_send(rep_socket, wrap_as_pickle(worker_ports))
+                sock_send(rep_socket, wrap_as_pickle(handshake))
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -517,14 +536,14 @@ class DataParallelController:
             else:
                 threading.Thread(
                     target=self._reply_ports_as_server,
-                    args=(rep_socket, worker_ports),
+                    args=(rep_socket, handshake),
                     daemon=True,
                 ).start()
 
-    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: list[int]):
-        """Background thread: serve the pre-bound worker-port list to
-        late-arriving elastic joiners. Publishes port numbers only; the primary
-        keeps ownership of every socket."""
+    def _reply_ports_as_server(
+        self, rep_socket: zmq.Socket, handshake: WorkerPortHandshake
+    ):
+        """Serve pre-bound worker ports and topology to elastic joiners."""
         while True:
             try:
                 client_rank = sock_recv(rep_socket)
@@ -536,10 +555,10 @@ class DataParallelController:
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client
-            sock_send(rep_socket, wrap_as_pickle(worker_ports))
+            sock_send(rep_socket, wrap_as_pickle(handshake))
             logger.debug(f"Sent worker ports to node {client_rank}")
 
-    def _receive_ports_as_client(self, endpoint: str) -> list[int]:
+    def _receive_ports_as_client(self, endpoint: str) -> WorkerPortHandshake:
         """Receive worker ports from the server node."""
         logger.debug("Connecting to node 0 to receive worker ports")
         node_rank = get_parallel().node_rank
@@ -553,9 +572,13 @@ class DataParallelController:
             sock_send(req_socket, wrap_as_pickle(str(node_rank)))
 
             # Receive worker ports
-            worker_ports = sock_recv(req_socket)
-            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
-            return worker_ports
+            handshake = sock_recv(req_socket)
+            if not isinstance(handshake, WorkerPortHandshake):
+                raise RuntimeError("Invalid worker-port handshake from node 0")
+            logger.debug(
+                f"Received {len(handshake.worker_ports)} worker ports from node 0"
+            )
+            return handshake
         except zmq.Again:
             logger.error("Timeout waiting for worker ports from node 0")
             raise RuntimeError(
@@ -579,13 +602,29 @@ class DataParallelController:
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
             ).to_tcp()
-            all_ports = self._receive_ports_as_client(primary_endpoint)
+            handshake = self._receive_ports_as_client(primary_endpoint)
             parallel = get_parallel()
+            validate_matching_attention_topology(
+                primary_attn_tp_size=handshake.attn_tp_size,
+                primary_attn_cp_size=handshake.attn_cp_size,
+                joining_attn_tp_size=parallel.attn_tp_size,
+                joining_attn_cp_size=parallel.attn_cp_size,
+            )
+            primary_replica_size = handshake.attn_tp_size * handshake.attn_cp_size
             offset = physical_ep_rank_to_dp_rank(
                 parallel.ep_join_rank_offset,
-                self.attn_replica_size,
+                primary_replica_size,
             )
-            broadcasted_ports = all_ports[offset : offset + parallel.num_dp_ranks]
+            broadcasted_ports = handshake.worker_ports[
+                offset : offset + parallel.num_dp_ranks
+            ]
+            if len(broadcasted_ports) != parallel.num_dp_ranks:
+                raise ValueError(
+                    "Primary has insufficient reserved attention-DP worker ports "
+                    f"for join offset {parallel.ep_join_rank_offset} "
+                    f"(requested {parallel.num_dp_ranks}, got "
+                    f"{len(broadcasted_ports)})."
+                )
         elif get_parallel().node_rank == 0:
             # Elastic primaries reserve sockets for the maximum DP size.
             bind_count = (

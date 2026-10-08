@@ -63,18 +63,15 @@ def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
 
 
 def validate_scale_cohort_topology(cohort: ScaleCohort) -> None:
+    from sglang.srt.elastic_ep.topology import validate_matching_attention_topology
+
     parallel = get_parallel()
-    primary_topology = (parallel.attn_tp_size, parallel.attn_cp_size)
-    joining_topology = (cohort.attn_tp_size, cohort.attn_cp_size)
-    if joining_topology != primary_topology:
-        raise ValueError(
-            "Primary and joining cohort must use the same attention topology "
-            "for Elastic EP scale-up "
-            f"(primary attn_tp_size={primary_topology[0]}, "
-            f"attn_cp_size={primary_topology[1]}; joining "
-            f"attn_tp_size={joining_topology[0]}, "
-            f"attn_cp_size={joining_topology[1]})."
-        )
+    validate_matching_attention_topology(
+        primary_attn_tp_size=parallel.attn_tp_size,
+        primary_attn_cp_size=parallel.attn_cp_size,
+        joining_attn_tp_size=cohort.attn_tp_size,
+        joining_attn_cp_size=cohort.attn_cp_size,
+    )
 
 
 def update_dp_attention_for_elastic_ep(

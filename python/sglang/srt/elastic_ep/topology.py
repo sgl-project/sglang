@@ -11,6 +11,26 @@ def attn_replica_size() -> int:
     return parallel.attn_tp_size * parallel.attn_cp_size
 
 
+def validate_matching_attention_topology(
+    *,
+    primary_attn_tp_size: int,
+    primary_attn_cp_size: int,
+    joining_attn_tp_size: int,
+    joining_attn_cp_size: int,
+) -> None:
+    primary_topology = (primary_attn_tp_size, primary_attn_cp_size)
+    joining_topology = (joining_attn_tp_size, joining_attn_cp_size)
+    if joining_topology != primary_topology:
+        raise ValueError(
+            "Primary and joining cohort must use the same attention topology "
+            "for Elastic EP scale-up "
+            f"(primary attn_tp_size={primary_topology[0]}, "
+            f"attn_cp_size={primary_topology[1]}; joining "
+            f"attn_tp_size={joining_topology[0]}, "
+            f"attn_cp_size={joining_topology[1]})."
+        )
+
+
 def physical_ep_size_to_dp_size(ep_size: int, attn_replica_size: int) -> int:
     if ep_size <= 0 or attn_replica_size <= 0 or ep_size % attn_replica_size != 0:
         raise ValueError(
