@@ -681,6 +681,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +701,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
