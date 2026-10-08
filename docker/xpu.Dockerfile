@@ -22,8 +22,8 @@ USER root
 
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
-ARG IGC_VERSION=2.41.5+22716
+ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
+ARG IGC_VERSION=2.38.2+22051
 ARG GMM_VERSION=22.10.0
 
 RUN apt-get update && apt-get install -y software-properties-common curl && \
