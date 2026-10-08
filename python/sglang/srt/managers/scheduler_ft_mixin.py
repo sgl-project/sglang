@@ -139,6 +139,8 @@ class SchedulerFaultToleranceMixin:
         )
 
     def _check_ft_pause_deadline(self: Scheduler) -> None:
+        if not get_parallel().enable_fault_tolerance:
+            return
         deadline = self._ft_pause_deadline
         if deadline is None or time.monotonic() < deadline:
             return

@@ -14,6 +14,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 @pytest.fixture
 def scheduler(monkeypatch):
     parallel = SimpleNamespace(
+        enable_fault_tolerance=True,
         dp_rank=0,
         attn_tp_rank=0,
         attn_cp_rank=0,
