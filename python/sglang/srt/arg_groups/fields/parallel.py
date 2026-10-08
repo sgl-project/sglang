@@ -245,7 +245,9 @@ class Parallel(msgspec.Struct):
         "for unquantized BF16 Llama 3.1 70B with TP8 on SM100/SM103 or TP4 on SM103. "
         "The route handles 4096-row extend batches and requires --disable-cuda-graph, "
         "--disable-radix-cache, --disable-overlap-schedule, "
-        "--chunked-prefill-size 4096, and --max-running-requests 1.",
+        "--chunked-prefill-size 4096, and --max-running-requests 1. It selects torch "
+        "symmetric memory's NVSHMEM backend for the server processes "
+        "(TORCH_SYMMMEM=NVSHMEM unless the environment sets another value).",
     ] = False
     enable_p2p_check: A[
         bool,
