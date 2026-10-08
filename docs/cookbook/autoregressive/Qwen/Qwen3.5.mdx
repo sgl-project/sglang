@@ -5,6 +5,7 @@ metatags:
 ---
 
 import { Qwen35Deployment } from '/src/snippets/autoregressive/qwen35-deployment.jsx'
+import { Qwen35AgenticCommands, qwen35AgenticRecipes } from '/src/snippets/autoregressive/qwen35-agentic.jsx'
 
 ## 1. Model Introduction
 
@@ -119,7 +120,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
 
-<Qwen35Deployment />
+<Qwen35Deployment AgenticCommands={Qwen35AgenticCommands} agenticRecipes={qwen35AgenticRecipes} />
 
 ### 3.2 Configuration Tips
 
@@ -231,6 +232,159 @@ This section provides deployment configurations optimized for different hardware
 </Warning>
 
 - **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+### 3.3 B300 NVFP4 agentic aggregated serving with HiCache and MTP
+
+Use these recipes to serve long-context agentic coding traffic with
+[`nvidia/Qwen3.5-397B-A17B-NVFP4`](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)
+on one 8-GPU B300 node. Each variant runs one aggregated SGLang worker (TP2, TP2 with EP2,
+or TP4) with MTP speculative decoding through the checkpoint's NEXTN head and a HiCache
+host-DRAM tier, behind the SGLang router. Prefill and decode are not disaggregated, and the
+commands use `sglang serve` and `sglang_router.launch_router`, not `dynamo.sglang` or
+`dynamo.frontend`.
+
+The settings below come from five executed variants in
+[InferenceX PR #2978](https://github.com/SemiAnalysisAI/InferenceX/pull/2978), at commit
+`6b7dcd07ab0c8c0805ac7fbec2f2ded38d450c20`. The InferenceX lane carries a `dynamo-sglang`
+label, but its executed worker command was `python3 -m sglang.launch_server` and its front
+door was `python -m sglang_router.launch_router`.
+[Run 34548026742, attempt 1](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/34548026742)
+executed five agentic benchmarks and four GSM8K evaluations (every variant except
+`tp4-mtp6-c4`); strict exact match was 0.9735 to 0.9788 on 1319 samples. The harness
+executed these serving settings; the standalone Docker, worker, and router commands below
+have not been independently executed on B300. Select **Agentic aggregated + router (B300
+NVFP4)** in the deployment selector above to generate the worker and router commands for
+any of the five variants.
+
+<Warning>
+These variants trade capacity for latency. `--max-running-requests` is 1 to 8 on the four
+variants without EP, so higher client concurrency queues behind a small running batch; the
+TP2/EP2 variant allows 224. FP8 E4M3 KV cache can affect accuracy, so validate your workload before
+adopting it. `--enable-linear-replayssm-spec` with a BF16 Mamba state can drift over long
+sequences; the server logs this at startup. The long `--watchdog-timeout` delays detection of
+an unhealthy worker. The TP2/EP2 variant adds `--allow-auto-truncate`, which silently
+truncates prompts that exceed the context length.
+</Warning>
+
+#### Prerequisites and versions
+
+- One B300 node with eight GPUs. The executed fingerprint reported driver `580.159.03`,
+  CUDA `13.0`, and Python `3.12.3`. TP2 variants use two GPUs and the TP4 variant uses four.
+- Container: `lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729`. Preserve this tag; the
+  flags and environment variables below were validated on it. Its fingerprint reported
+  SGLang `0.0.0.dev1+g07c8f7294`.
+- Checkpoint: the NVFP4 repository above, not the NVFP4-V2 repository used by the other
+  B200 and B300 aggregated commands. The executed revision was
+  `12b28061efd8145b11226e4fab2528ee4f39ef09`, loaded with `--quantization modelopt_fp4`.
+- Free host DRAM for the HiCache pool: `--hicache-size 128` on the TP2 variants, `32` on the
+  TP4 variant, and `--hicache-ratio 1.8` on the TP2/EP2 variant. Check the free memory on the
+  node before launch.
+
+On the B300 host, choose writable directories, download the checkpoint, and start the
+container. `hf` is the Hugging Face CLI; authenticate with it if your environment requires
+credentials.
+
+```bash Stage the checkpoint and start the container
+export MODEL_DIR=/srv/models/Qwen3.5-397B-A17B-NVFP4
+export CACHE_DIR=/var/tmp/qwen35-agentic-cache
+mkdir -p "$MODEL_DIR" "$CACHE_DIR/deepgemm-cache" "$CACHE_DIR/flashinfer-cache" "$CACHE_DIR/sglang-cache"
+hf download nvidia/Qwen3.5-397B-A17B-NVFP4 \
+  --revision 12b28061efd8145b11226e4fab2528ee4f39ef09 \
+  --local-dir "$MODEL_DIR"
+docker run --rm -it --gpus all --network host --ipc host \
+  --ulimit memlock=-1:-1 \
+  --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly" \
+  --mount "type=bind,src=$CACHE_DIR,dst=/configs" \
+  lmsysorg/sglang:nightly-dev-cu13-20260901-07c8f729 bash
+```
+
+#### Choose a serving variant
+
+The `c` suffix identifies the client concurrency the variant was measured at; it is not a
+server admission limit. The scheduler, microbatch, prefill, and CUDA graph limits move
+together in each generated command, so change them as a set.
+
+<table>
+  <thead><tr><th>Variant</th><th>GPUs, TP/EP</th><th>MTP steps / draft tokens</th><th>Max running requests</th><th>HiCache host pool</th><th>MoE runner</th></tr></thead>
+  <tbody>
+    <tr><td><code>tp4-mtp6-c4</code></td><td>4, TP4/EP1</td><td>6 / 7</td><td>1</td><td>32 GB</td><td><code>flashinfer_cutedsl</code></td></tr>
+    <tr><td><code>tp2-mtp7-c36</code></td><td>2, TP2/EP1</td><td>7 / 8</td><td>4</td><td>128 GB</td><td><code>flashinfer_trtllm</code></td></tr>
+    <tr><td><code>tp2-mtp5-c40</code></td><td>2, TP2/EP1</td><td>5 / 6</td><td>2</td><td>128 GB</td><td><code>flashinfer_trtllm</code></td></tr>
+    <tr><td><code>tp2-mtp7-c44</code></td><td>2, TP2/EP1</td><td>7 / 8</td><td>8</td><td>128 GB</td><td><code>flashinfer_trtllm</code></td></tr>
+    <tr><td><code>tp2-ep2-mtp3-c64</code></td><td>2, TP2/EP2</td><td>3 / 4</td><td>224</td><td>1.8x device KV pool</td><td><code>flashinfer_cutedsl</code></td></tr>
+  </tbody>
+</table>
+
+Choose a variant in the deployment selector above, then choose **Worker** or **Router**.
+The TP4 variant sets `--disable-prefill-cuda-graph` and the TP2/EP2 variant sets
+`SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS=2` and `SGLANG_ENABLE_JIT_DEEPGEMM=false`; the
+generated commands carry these differences. The generated commands use `/model` and
+`/configs` inside the container above.
+
+The generated commands set `--hicache-io-backend kernel` together with
+`--hicache-mem-layout page_first_direct`. On the tested image the server logged that the
+kernel IO backend does not support that layout and switched to the direct IO backend, so
+the effective backend was `direct`. HiCache extends the radix cache, so the commands do
+not set `--disable-radix-cache`.
+
+The recipes do not pass `--reasoning-parser` or `--tool-call-parser`. The tested image
+logged the `qwen3` reasoning parser and `qwen3_coder` tool-call parser as auto-detected from
+the chat template. Add the flags explicitly, as in the aggregated commands above, if you
+need parsed output on a different build.
+
+#### Launch the worker and router
+
+Run the generated worker command inside the container and wait for the server to log that
+it is ready on port `6100`. Run the generated router command in a second shell of the same
+container or on another host. It listens on port `8000`, uses the router's default
+`cache_aware` policy, and has one worker.
+
+```bash Submit a chat request through the router
+curl --fail "http://127.0.0.1:8000/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+    "messages": [{"role": "user", "content": "Explain prefill and decode in two sentences."}],
+    "max_tokens": 256
+  }'
+```
+
+No standalone response output is claimed here. To compare this serving translation with the
+tested deployment, preserve the container tag, checkpoint revision, worker flags, and
+environment, and run an applicable accuracy and workload check on your target host.
+
+<Accordion title="Settings excluded from the serving commands">
+
+The generated commands omit settings that configure the benchmark harness or have no effect
+on the tested image:
+
+- Harness plumbing: the agentic load generator and its dataset, trace and mmap-cache paths,
+  Slurm allocation and health-check retry loops, result directories, and log formatting
+  variables. The harness also injected synthetic speculative acceptance
+  (`SGLANG_SIMULATE_ACC_*`) at run time; it is a measurement control, not a serving setting.
+- Dynamo discovery and request-plane variables (`DYN_*`, `ETCD_ENDPOINTS`, `NATS_SERVER`).
+  The tested worker and router did not use them.
+- Environment variables that the tested image removed or reported as deprecated:
+  `SGLANG_ENABLE_SPEC_V2` (speculative decoding always uses the V2 worker),
+  `SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH` (replaced by `SGLANG_MOE_NVFP4_DISPATCH`, which is
+  set), and `SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK` (the generated command sets the
+  replacement `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0`). `SGLANG_ENABLE_FLASHINFER_GEMM`,
+  `SGLANG_FLASHINFER_FP4_GEMM_BACKEND`, and `TORCH_DISTRIBUTED_DEFAULT_TIMEOUT` are not
+  read by current SGLang; the tested server logged `fp4_gemm_runner_backend: auto`.
+- Multi-node fabric settings copied from the GB200 recipes (`NCCL_MNNVL_ENABLE`,
+  `MC_FORCE_MNNVL`, `NVSHMEM_REMOTE_TRANSPORT`, `MC_TE_METRIC`). The B300 recipes run on a
+  single node without the Mooncake transfer path.
+- The fixed NCCL port (`--nccl-port 17500`), which the harness allocated.
+- `--cuda-graph-max-bs 224` in the TP2/EP2 recipe, which the tested image reports as
+  deprecated; the generated command uses `--cuda-graph-max-bs-decode 224`.
+
+Source for the five variants:
+[checked-in recipes at the tested commit](https://github.com/SemiAnalysisAI/InferenceX/tree/6b7dcd07ab0c8c0805ac7fbec2f2ded38d450c20/benchmarks/multi_node/srt-slurm-recipes/sglang/qwen3.5/b300-fp4/agentic).
+The executed worker commands and server arguments are in that run's `multinode_server_logs_*`
+artifacts. This qualification proves execution through the original harness; it does not
+prove an independently executed standalone launch.
+
+</Accordion>
 
 ## 4. Model Invocation
 
