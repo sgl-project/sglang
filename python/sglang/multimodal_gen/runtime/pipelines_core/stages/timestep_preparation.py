@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -70,10 +69,6 @@ class TimestepPreparationStage(PipelineStage):
         self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.REPLICATED
 
     def forward(
         self,
@@ -228,10 +223,6 @@ class DMDTimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler) -> None:
         super().__init__()
         self.scheduler = scheduler
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.REPLICATED
 
     def forward(
         self,

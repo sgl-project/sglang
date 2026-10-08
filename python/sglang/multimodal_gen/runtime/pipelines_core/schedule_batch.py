@@ -82,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -156,7 +157,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
@@ -347,7 +348,8 @@ class Req:
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
@@ -487,6 +489,12 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # The effective fps the worker actually produced ``output`` at (e.g. a model whose input
+    # stage resamples / resolves the request's nominal fps to a source-derived one, such as
+    # Kandinsky6 SR). ``None`` means the worker did not resolve its own fps; callers that save
+    # ``output`` client-side (return_file_paths_only=False) then fall back to the originating
+    # request's own fps field, as before this field existed.
+    fps: int | None = None
     action_pred: torch.Tensor | None = None
     action_mode: str | None = None
     action_domain_id: int | None = None
@@ -503,7 +511,7 @@ class OutputBatch:
     metrics_list: Optional[list[Optional[RequestMetrics]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
-    noise_pred: torch.Tensor | None = None
+    noise_pred: torch.Tensor | list | tuple | None = None
     peak_memory_mb: float = 0.0
     usage: dict[str, Any] | None = None
 

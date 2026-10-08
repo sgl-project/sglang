@@ -20,6 +20,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
+    FLUX3_ACTION_CI_sampling_params,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_VIDEO_T2V_CI_sampling_params,
@@ -117,6 +118,18 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
         perf_warmup_requests=1,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "flux3_action_http",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/flux-3-action-droid",
+        ),
+        FLUX3_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        perf_warmup_requests=1,
+        # No Diffusers counterpart to compare components against.
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -302,6 +315,27 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
             extras={"enable_teacache": True},
         ),
+    ),
+    # The text encoder's resident set placed at load and never released. The
+    # guard is TextEncodingStage: with the set on the device the stage is
+    # compute only, and if the layers ever go back to being transferred per
+    # request the stage regains that whole transfer, well past the
+    # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
+    # it also pins that the placement happens at load, not on the first use.
+    # The encoder is already layerwise under the default component set.
+    # No consistency check: the lifetime moves weights, not math, so the
+    # output is the base case's and that case already guards it.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_encoder_permanent_residents",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--layerwise-resident-layers text_encoder=0.8 "
+                "--layerwise-residency-lifetime text_encoder=permanent",
+            ],
+        ),
+        DiffusionSamplingParams(prompt=T2V_PROMPT),
+        run_consistency_check=False,
     ),
     # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
@@ -796,14 +830,12 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
         "fasth3_t2va_vsa_4gpu_h100",
         DiffusionServerArgs(
-            model_path="FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+            model_path="FastVideo/FastVideo-FastH3-8-Step-V2",
             modality="video",
             num_gpus=4,
             extras=[
-                "--attention-backend",
-                "video_sparse_attn_h3",
-                "--attention-backend-config",
-                '{"VSA_sparsity": 0.9}',
+                "--component-attention-backends",
+                "transformer=video_sparse_attn_h3",
                 "--enable-torch-compile",
                 "false",
             ],
@@ -826,7 +858,7 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 5.0,
                 },
-                "num_inference_steps": 5,
+                "num_inference_steps": 9,
                 "seed": 42,
             },
         ),
@@ -1224,6 +1256,8 @@ TWO_GPU_CASES = [
             ulysses_degree=1,
             ring_degree=2,
         ),
+        # Keeps the pre-rename spelling of "lossless" so the compatibility
+        # alias is covered end to end; the case id is also a perf-baseline key.
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
         run_component_accuracy_check=False,
         run_models_api_check=False,

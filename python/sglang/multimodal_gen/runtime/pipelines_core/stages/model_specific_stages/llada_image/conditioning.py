@@ -67,7 +67,10 @@ class LLaDAImageTextEncoderRunner:
     ) -> None:
         import sglang.srt.distributed.parallel_state as srt_parallel_state
         from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.distributed.bootstrap import init_parallel_runtime
+        from sglang.srt.distributed.bootstrap import (
+            init_layer_runtime,
+            init_parallel_runtime,
+        )
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -123,10 +126,10 @@ class LLaDAImageTextEncoderRunner:
                 srt_parallel_state._ATTN_TP = None
                 init_parallel_runtime(
                     server_args=srt_args,
-                    model_config=ModelConfig.from_server_args(srt_args),
                     device=device.type,
                     dist_port=nccl_port,
                 )
+                init_layer_runtime(model_config=ModelConfig.from_server_args(srt_args))
                 self.worker = TpModelWorker(
                     server_args=srt_args,
                     gpu_id=gpu_id,
@@ -366,7 +369,7 @@ class LLaDAImageTextEncoderRunner:
         finally:
             for req in reqs:
                 if req.kv is not None:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
                 elif req.req_pool_idx is not None:
                     # KV alloc failed after the slot grab. Freeing the bare
                     # slot avoids the release_kv_cache lifecycle assert.

@@ -200,3 +200,21 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     def post_denoising_loop(self, latents, batch):
         del batch
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.llada_image import (
+        LLaDAImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LLaDAImageSamplingParams,
+        pipeline_config_cls=LLaDAImagePipelineConfig,
+        hf_model_paths=["inclusionAI/LLaDA-Image"],
+        model_detectors=[
+            lambda hf_id: (
+                "lladaimagepipeline" in hf_id.lower() or "llada-image" in hf_id.lower()
+            )
+        ],
+    )

@@ -13,7 +13,6 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 
 partial_json_parser = types.ModuleType("partial_json_parser")
@@ -59,8 +58,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import (
     ComfyFp8Config,
     ComfyFullPrecisionFp8LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -71,12 +70,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+    ConvRotInt8ComfyKitchenLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
-    KitchenInt8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -85,7 +84,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import (
+    ComfyMXFP8LinearMethod,
+    MXFP8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
@@ -142,6 +144,13 @@ from sglang.srt.layers.quantization.bitsandbytes import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod as SRTFp8LinearMethod
 
+# convrot_int8 picks its kernel backend from the GPU; pin comfy_kitchen so these
+# cases do not depend on the runner.
+_CONVROT_JIT_AVAILABLE = (
+    "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config."
+    "_jit_available"
+)
+
 
 class _FakeFluxTransformer:
     pass
@@ -167,42 +176,53 @@ def _make_quant_config(name: str, **attrs):
 
 class TestTransformerQuantHelpers(unittest.TestCase):
     def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
-        method = ModelOptFp8LinearMethod(
-            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        )
-        method.cutlass_fp8_supported = True
-        layer = torch.nn.Module()
-        layer.logical_widths = [2, 2, 2]
-        weight = (
-            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
-        )
-        layer.register_parameter(
-            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
-        )
-        layer.register_parameter(
-            "weight_scale",
-            torch.nn.Parameter(
-                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
-                requires_grad=False,
-            ),
-        )
-        layer.register_parameter(
-            "input_scale",
-            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
-        )
+        for fnuz in (False, True):
+            with (
+                self.subTest(fnuz=fnuz),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization."
+                    "modelopt_quant.is_fp8_fnuz",
+                    return_value=fnuz,
+                ),
+            ):
+                method = ModelOptFp8LinearMethod(
+                    ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+                )
+                method.cutlass_fp8_supported = True
+                layer = torch.nn.Module()
+                layer.logical_widths = [2, 2, 2]
+                values = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+                values[0, 0] = -0.0
+                weight = values.to(torch.float8_e4m3fn)
+                scales = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+                layer.register_parameter(
+                    "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+                )
+                layer.register_parameter(
+                    "weight_scale",
+                    torch.nn.Parameter(scales.clone(), requires_grad=False),
+                )
+                layer.register_parameter(
+                    "input_scale",
+                    torch.nn.Parameter(torch.ones(3), requires_grad=False),
+                )
 
-        method.process_weights_after_loading(layer)
+                method.process_weights_after_loading(layer)
 
-        scale_factor = 2 if is_fp8_fnuz() else 1
-        expected_weight = weight
-        if is_fp8_fnuz():
-            expected_weight = (weight.float() / 2).to(torch.float8_e4m3fnuz)
-        torch.testing.assert_close(layer.weight, expected_weight.t(), rtol=0, atol=0)
-        torch.testing.assert_close(
-            layer.weight_scale,
-            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]) * scale_factor,
-        )
-        torch.testing.assert_close(layer.input_scale, torch.tensor(float(scale_factor)))
+                factor = 2 if fnuz else 1
+                expected_dtype = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
+                self.assertEqual(layer.weight.dtype, expected_dtype)
+                expected_scales = scales.repeat_interleave(2).view(-1, 1)
+                torch.testing.assert_close(layer.weight_scale, expected_scales * factor)
+                torch.testing.assert_close(
+                    layer.input_scale, torch.tensor(float(factor))
+                )
+                torch.testing.assert_close(
+                    layer.weight.t().float() * layer.weight_scale,
+                    weight.float() * expected_scales,
+                    atol=0,
+                    rtol=0,
+                )
 
     def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
         method = ModelOptFp8LinearMethod(
@@ -712,10 +732,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
     @patch(
-        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config."
+        "_comfy_kitchen_available",
+        return_value=True,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
-    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self, _load):
+    def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(
+        self, _load, _available
+    ):
         marker = json.dumps(
             {
                 "format": "int8_tensorwise",
@@ -852,13 +879,26 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             }
         )
 
-        self.assertIsInstance(config, KitchenInt8Config)
+        self.assertIsInstance(config, ConvRotInt8Config)
         self.assertTrue(config.is_checkpoint_int8_serialized)
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
-        self.assertFalse(KitchenInt8Config().checkpoint_uses_native_qkv_layout)
+        self.assertFalse(ConvRotInt8Config().checkpoint_uses_native_qkv_layout)
         self.assertFalse(_needs_device_weight_postprocess(config))
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 6400))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 3200))
+
+    @patch(_CONVROT_JIT_AVAILABLE, return_value=False)
+    def test_online_convrot_int8_loads_on_the_host_under_offload(self, _jit):
+        """Online convrot_int8 quantizes each layer through its own CUDA round
+        trip, so the loader must not require the whole BF16 DiT on the GPU
+        (an offloaded 62 GB H3 DiT has to stay on the host during load)."""
+        config = ConvRotInt8Config()
+
+        self.assertFalse(config.is_checkpoint_int8_serialized)
+        self.assertFalse(_needs_device_weight_postprocess(config))
+        spec = TransformerQuantLoadSpec([], config, None, None)
+        self.assertTrue(spec.is_convrot_int8)
+        self.assertFalse(spec.is_serialized_convrot_int8)
 
     def test_minimax_h3_w4a8_metadata_resolves_serialized_kitchen(self):
         metadata = {
@@ -1008,9 +1048,10 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 new=object(),
             ),
             patch(
-                "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+                "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
                 "_load_comfy_kitchen"
             ),
+            patch(_CONVROT_JIT_AVAILABLE, return_value=False),
         ):
             config = resolve_minimax_h3_checkpoint_quantization(markers)
             w4a4 = ReplicatedLinear(
@@ -1035,12 +1076,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(int8.weight.shape, (3, 256))
         self.assertEqual(set(config.selected), {"w4a4", "int8"})
 
+    @patch(_CONVROT_JIT_AVAILABLE, return_value=False)
     @patch(
-        "sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8."
+        "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen."
         "_load_comfy_kitchen"
     )
-    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load):
-        config = KitchenInt8Config(
+    def test_serialized_kitchen_constructs_int8_weight_and_row_scale(self, _load, _jit):
+        config = ConvRotInt8Config(
             layer_markers={
                 "proj": {
                     "format": "int8_tensorwise",
@@ -1155,6 +1197,68 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertIsInstance(method, NPUMXFP8LinearMethod)
+
+    def test_comfy_mxfp8_scales_are_not_interleaved_twice(self):
+        config = MXFP8Config(
+            is_checkpoint_fp8_serialized=True,
+            layer_markers={"blocks.0.attn.out_proj": {"format": "mxfp8"}},
+        )
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+        self.assertIsInstance(method, SRTFp8LinearMethod)
+        # Renaming the SRT hook would silently restore the double interleave.
+        self.assertTrue(
+            hasattr(SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale")
+        )
+
+        checkpoint_scale = torch.arange(64, dtype=torch.uint8).reshape(32, 2)
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            checkpoint_scale.clone(), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+
+        method._process_mxfp8_linear_weight_scale(layer)
+
+        self.assertEqual(layer.weight_scale_inv_swizzled.shape, torch.Size([64]))
+        torch.testing.assert_close(
+            layer.weight_scale_inv_swizzled.data, checkpoint_scale.flatten()
+        )
+
+        # scales converted from block-FP8 are row-major, so SRT still interleaves them
+        converted = torch.zeros(32, 2, dtype=torch.uint8)
+        with patch.object(
+            SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale"
+        ) as srt_hook:
+            method._process_mxfp8_linear_weight_scale(layer, scale_u8=converted)
+        srt_hook.assert_called_once_with(layer, scale_u8=converted)
+
+    def test_config_driven_mxfp8_keeps_srt_scale_processing(self):
+        config = MXFP8Config(is_checkpoint_fp8_serialized=True)
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsNone(config.layer_markers)
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.arange(64, dtype=torch.uint8).reshape(32, 2), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+        with patch.object(
+            SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale"
+        ) as srt_hook:
+            method._process_mxfp8_linear_weight_scale(layer)
+        srt_hook.assert_called_once_with(layer, scale_u8=None)
 
     def test_comfy_full_precision_fp8_dequantizes_before_linear(self):
         layer = torch.nn.Module()
@@ -1736,16 +1840,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
                 ModelOptFp4LinearMethod,
             )
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.quantization."
-            "kitchen_int8._load_comfy_kitchen"
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization."
+                "convrot_int8_comfy_kitchen._load_comfy_kitchen"
+            ),
+            patch(_CONVROT_JIT_AVAILABLE, return_value=False),
         ):
             self.assertIsInstance(
                 config.get_quant_method(
                     LinearBase(input_size=256, output_size=32),
                     "blocks.0.attn.out_proj",
                 ),
-                KitchenInt8LinearMethod,
+                ConvRotInt8ComfyKitchenLinearMethod,
             )
         self.assertIsInstance(
             config.get_quant_method(
