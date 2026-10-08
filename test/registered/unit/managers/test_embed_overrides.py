@@ -77,6 +77,31 @@ class TestPositionalEmbeds(CustomTestCase):
         self.assertEqual(pe.embeds.shape[0], 0)
 
 
+class TestValidatePositionalEmbedOverridesHiddenDim(CustomTestCase):
+    def _validate(self, value):
+        tm = MagicMock()
+        tm.model_config.hidden_size = HIDDEN_DIM
+        TokenizerManager._validate_positional_embed_overrides_hidden_dim(tm, value)
+
+    def test_valid_overrides_and_none(self):
+        self._validate(None)
+        self._validate(PositionalEmbeds(embeds=[_vec()], positions=[0]))
+
+    def test_hidden_dimension_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "hidden_dim.*hidden_size"):
+            self._validate(
+                PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 1)], positions=[0])
+            )
+
+    def test_non_scalar_or_raw_json_overrides(self):
+        # Tokenization has already split batches, so only one typed object (or
+        # None) is valid here, including when the upstream body field is Any.
+        for value in ([None], [], {}, "bad", {"embeds": [[1]], "positions": [0]}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "PositionalEmbeds"):
+                    self._validate(value)
+
+
 # ========================================================================
 # convert_embeds_to_tensors
 # ========================================================================
