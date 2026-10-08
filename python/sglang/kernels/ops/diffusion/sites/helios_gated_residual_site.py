@@ -7,8 +7,8 @@ The shared ``residual_gate_add`` kernel computes ``residual + update * gate``
 in a single pass but requires one dtype, so the gate and update are first cast
 to BF16. That reordering of the FP32 multiply is numerically equivalent only at
 half-precision rounding level (not bit-exact), so the fusion is opt-in:
-``quality="extra-high"`` and ``quality="high"`` mount it, while the default
-``quality="lossless"`` keeps the reference FP32-multiply form bit-for-bit.
+``quality="lossless"`` and ``quality="high"`` mount it, while the default
+``quality="exact"`` keeps the reference FP32-multiply form bit-for-bit.
 """
 
 from __future__ import annotations

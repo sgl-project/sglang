@@ -68,25 +68,6 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         )
 
     # ------------------------------------------------------------------
-    # Pack / Unpack overrides  (Wan latent is already [B, C, T, H, W])
-    # ------------------------------------------------------------------
-
-    def _unpack_latent(
-        self, latent: torch.Tensor, h_lat: int, w_lat: int
-    ) -> torch.Tensor:
-        return latent
-
-    def _repack_latent(
-        self,
-        x_spatial: torch.Tensor,
-        h_lat: int,
-        w_lat: int,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> torch.Tensor:
-        return x_spatial
-
-    # ------------------------------------------------------------------
     # Resolution-change hook  (no-op for Wan T2V)
     # ------------------------------------------------------------------
 
