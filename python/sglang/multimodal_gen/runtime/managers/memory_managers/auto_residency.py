@@ -1,25 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup-calibrated automatic component residency placement.
+"""Warmup memory, timing and layer-use estimates for the default workload.
 
-Under ``--performance-mode auto`` with server warmup, each rank measures the
-peak GPU memory of bounded synthetic warmup requests and a low-step probe at
-the complete default serving shape, then selects a complete serving placement
-for every eligible component under the measured memory constraints.
-
-When no full-shape measurement is available, the fallback estimate splits the
-measured peak into persistent weights and workload-scaled activations. Scaling
-the whole peak would multiply resident weights by the video frame/area cap
-ratio (~16x for Wan-class defaults) and residency adjustment would never trigger.
-
-The planner targets the model default workload only (default resolution,
-default frames, batch=1). Larger shapes, batches, or multi-image inputs need
-explicit ``--component-residency``.
-
-Loading and serving are deliberately separate placement states. The existing
-auto policy provides the initial state; when that state can complete loading
-and calibration, this module optimizes the long-lived serving state and
-validates the transition with a post-placement warmup. It does not force a
-single placement to serve two different lifecycle objectives.
+Peak-memory extrapolation separates persistent weights from workload-scaled
+activations. Phase and layer-use estimates account for stage-specific iteration
+counts rather than scaling every stage by the request's denoising steps.
 """
 
 from __future__ import annotations
@@ -29,53 +13,15 @@ from typing import Iterable, Mapping
 
 import msgspec
 
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    LAYERWISE_OFFLOAD,
-    RESIDENT,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     is_dit_component_name,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 GIB_BYTES = 1024**3
 
 # Activation memory rarely scales perfectly linearly with workload units;
 # pad the extrapolated activation part before checking the budget.
 ACTIVATION_EXTRAPOLATION_MARGIN = 1.2
-# A target-shape measurement plus the mandatory post-placement warmup justifies
-# a tighter reserve than an extrapolated estimate. Both retain an absolute
-# floor for allocator slack, shape variance, and CUDA graph or compile pools.
-MEASURED_VRAM_RESERVE_FRACTION = 0.05
-EXTRAPOLATED_VRAM_RESERVE_FRACTION = 0.10
-MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
-# The absolute floor is sized for datacenter cards, where either fraction can
-# dominate. On a 12 GiB card a flat 4 GiB would fence off a third of the device,
-# so cap the floor as a share of what is actually there.
-MAX_VRAM_RESERVE_FRACTION = 0.20
-
-# A feasible placement is not automatically useful. Predictions inside this
-# interval are treated as latency-equivalent. The joint optimizer then avoids
-# changing strategy, minimizes device memory, preserves the faster estimate,
-# and finally minimizes HostPin. The raw estimate is already an upper bound:
-# transfer time is capped by the measured request.
-ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
-MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
-MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
-LATENCY_EQUIVALENCE_FRACTION = 0.01
-# The transfer model ranks feasible placements; the mandatory warmup is the
-# authority on whether a selected placement actually helped. Allow normal
-# measurement noise, but undo a round whose calibrated request is materially
-# slower than the original layout.
-POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
-
-PLACEMENT_STATUS_SKIPPED = "skipped"
-PLACEMENT_STATUS_ADJUSTED = "adjusted"
-PLACEMENT_STATUS_VALIDATED = "validated"
-PLACEMENT_STATUS_ROLLED_BACK = "rolled_back"
-PLACEMENT_STATUS_ROLLBACK_FAILED = "rollback_failed"
 
 
 class WarmupMemoryRecord(msgspec.Struct, frozen=True):
@@ -103,80 +49,6 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
 
     def workload_units(self) -> int:
         return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)
-
-
-class ResidencyTarget(msgspec.Struct, frozen=True):
-    """One complete target state for an auto-managed component."""
-
-    component_name: str
-    residency_mode: str
-    target_resident_weight_bytes: int
-    # Estimated per-request host-to-device traffic this target removes.
-    h2d_bytes_per_request: int
-    # Layerwise candidates jointly choose stage-scoped GPU residency and host
-    # pinning. None is used by ordinary component placement.
-    target_layerwise_resident_layers: tuple[int, ...] | None = None
-    target_layerwise_pinned_layers: tuple[tuple[int, ...], ...] | None = None
-    pinned_host_delta_bytes: int = 0
-    host_unpin_scratch_bytes: int = 0
-    host_pin_scratch_bytes: int = 0
-    host_materialize_scratch_bytes: int = 0
-    # Signed device-memory delta while applying the placement before the
-    # validation warmup. Layerwise -> resident materializes every managed
-    # layer immediately; a demotion can release those bytes first and fund a
-    # later materialization in the same transaction.
-    device_transition_delta_bytes: int = 0
-    permanent_residency: bool = False
-    # Device-memory delta relative to the measured placement. A component
-    # already loaded for its own phase has a different delta from phases where
-    # it is absent; keeping both avoids adding the same weights twice.
-    active_device_delta_bytes: int = 0
-    # Delta when the component is already present because of async prefetch,
-    # but is not the semantic owner of this phase.
-    present_device_delta_bytes: int = 0
-    inactive_device_delta_bytes: int = 0
-    # None preserves the historical derived target for hand-built callers:
-    # partial layerwise targets remain layerwise, every other option is
-    # resident. Generated complete-state frontiers set this explicitly.
-    target_residency_mode: str | None = None
-    current_placement: bool = False
-    target_device_weight_bytes: int = 0
-    target_pinned_host_bytes: int = 0
-
-    def target_mode(self) -> str:
-        if self.target_residency_mode is not None:
-            return self.target_residency_mode
-        if (
-            self.target_layerwise_resident_layers is not None
-            and not self.permanent_residency
-        ):
-            return LAYERWISE_OFFLOAD
-        return RESIDENT
-
-
-class RankResidencyReport(msgspec.Struct, frozen=True):
-    """One rank's inputs to the replica-wide placement decision."""
-
-    rank: int
-    budget_bytes: int
-    estimated_peak_bytes: int | None
-    target_workload_measured: bool = False
-    observed_reserved_bytes: int = 0
-    estimated_peak_bytes_by_phase: dict[str, int] = {}
-    active_components_by_phase: dict[str, tuple[str, ...]] = {}
-    used_components_by_phase: dict[str, tuple[str, ...]] = {}
-    full_weight_transition_components_by_phase: dict[str, tuple[str, ...]] = {}
-    current_device_weight_bytes_by_component: dict[str, int] = {}
-    node_rank: int = 0
-    pinned_host_bytes: int = 0
-    host_pin_capacity_bytes: int = 0
-    host_transition_headroom_bytes: int = 0
-    device_transition_allocated_bytes: int = 0
-    estimated_request_duration_ns: int = 0
-    measured_request_duration_ns: int = 0
-    candidate_latency_savings_ns: dict[str, int] = {}
-    candidates: list[ResidencyTarget] = []
-    skip_reason: str | None = None
 
 
 def estimate_layerwise_layer_uses(
