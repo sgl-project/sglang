@@ -35,7 +35,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import (
+    _GFX1250_CLUSTER_WORKSPACES,
+    _gfx1250_cluster_workspace,
     plan_topk_v2,
+    topk_v2_plan_is_written,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -50,6 +53,15 @@ PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
+
+
+def _is_gfx1250() -> bool:
+    if not is_hip():
+        return False
+    return "gfx1250" in getattr(
+        torch.cuda.get_device_properties(0), "gcnArchName", ""
+    )
+
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -291,7 +303,8 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "batch,seq", [(8, 256), (8, 8192), (4, 32768), (2, 131072), (31, 131072)]
+    "batch,seq",
+    [(8, 256), (8, 8192), (4, 32768), (2, 131072), (1, 262144), (31, 131072)],
 )
 @torch.inference_mode()
 def test_topk_v2_dual_output(batch: int, seq: int) -> None:
@@ -633,6 +646,184 @@ def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> Non
 
     for row in range(batch):
         _assert_topk_values(scores[row], out[row], k)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_distinct_bin_overflow(monkeypatch) -> None:
+    """More than 2,048 distinct values in one coarse bin must not truncate."""
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    seq = 65537
+    k = 2048
+    width = (seq + 3) & ~3
+    bits = torch.arange(width, dtype=torch.int32, device="cuda") + 0x3F800000
+    scores = bits.view(torch.float32).unsqueeze(0).expand(2, -1).contiguous()
+    scores[:, seq:] = -torch.inf
+    seq_lens = torch.full((2,), seq, dtype=torch.int32, device="cuda")
+
+    observed = _run_raw(scores, seq_lens, k)
+    expected = torch.topk(scores[0], k, sorted=False).indices.cpu().tolist()
+    for row in observed:
+        assert set(row) == set(expected)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@pytest.mark.parametrize("width", [2, 4, 8, 15])
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_width_override(monkeypatch, width: int) -> None:
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER_SIZE", str(width))
+    batch, seq, k = 2, 65537, 512
+    padded = (seq + 3) & ~3
+    scores = torch.randn(batch, padded, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    observed = _run_raw(scores, lengths, k)
+    expected = _reference(scores, lengths.cpu(), k)
+    _assert_topk_close(scores.cpu(), expected, observed, batch, lengths.cpu(), k)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@torch.inference_mode()
+def test_topk_v2_gfx1250_direct_route_skips_plan(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    lengths = torch.full((31,), 131073, dtype=torch.int32, device="cuda")
+    assert not topk_v2_plan_is_written(lengths)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_concurrent_streams(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    batch, seq, k = 2, 65537, 512
+    width = (seq + 3) & ~3
+    torch.manual_seed(123)
+    scores = [
+        torch.randn(batch, width, dtype=torch.float32, device="cuda")
+        for _ in range(2)
+    ]
+    lengths = [
+        torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+        for _ in range(2)
+    ]
+    metadata = [_plan(length) for length in lengths]
+    outputs = [
+        torch.full((batch, k), -1, dtype=torch.int32, device="cuda")
+        for _ in range(2)
+    ]
+    streams = [torch.cuda.Stream() for _ in range(2)]
+
+    # Allocate stable scratch on each stream before overlap or graph capture.
+    for stream, score, length, plan, output in zip(
+        streams, scores, lengths, metadata, outputs
+    ):
+        with torch.cuda.stream(stream):
+            topk_transform_paged_v2(
+                score, length, None, output, PAGE_SIZE, plan
+            )
+    torch.cuda.synchronize()
+
+    for output in outputs:
+        output.fill_(-1)
+    for stream, score, length, plan, output in zip(
+        streams, scores, lengths, metadata, outputs
+    ):
+        with torch.cuda.stream(stream):
+            topk_transform_paged_v2(
+                score, length, None, output, PAGE_SIZE, plan
+            )
+    torch.cuda.synchronize()
+
+    for score, output in zip(scores, outputs):
+        expected = torch.topk(score[0, :seq], k, sorted=False).indices.cpu().tolist()
+        assert set(output[0].cpu().tolist()) == set(expected)
+    workspace_streams = {key[1] for key in _GFX1250_CLUSTER_WORKSPACES}
+    assert {int(stream.cuda_stream) for stream in streams} <= workspace_streams
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_graph_replay(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    batch, seq, k = 2, 65537, 512
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    metadata = _plan(lengths)
+    output = torch.full((batch, k), -1, dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(stream):
+        topk_transform_paged_v2(
+            scores, lengths, None, output, PAGE_SIZE, metadata
+        )
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        topk_transform_paged_v2(
+            scores, lengths, None, output, PAGE_SIZE, metadata
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = torch.topk(scores[0, :seq], k, sorted=False).indices.cpu().tolist()
+    assert set(output[0].cpu().tolist()) == set(expected)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@pytest.mark.parametrize(
+    "batch,seq,eligible",
+    [
+        (1, 32768, False),
+        (1, 32769, False),
+        (1, 131073, False),
+        (15, 65536, True),
+        (16, 65536, False),
+        (16, 65537, True),
+        (30, 131072, True),
+        (31, 131073, True),
+        (512, 65537, True),
+        (513, 65537, False),
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_workspace_boundaries(
+    monkeypatch, batch: int, seq: int, eligible: bool
+) -> None:
+    monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+    scores = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+    workspace = _gfx1250_cluster_workspace(scores)
+    assert (workspace is not None) == eligible
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 cooperative cluster")
+@torch.inference_mode()
+def test_topk_v2_gfx1250_cluster_route_is_observable(monkeypatch) -> None:
+    batch, seq, k = 2, 65537, 512
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    output = torch.full((batch, k), -1, dtype=torch.int32, device="cuda")
+    metadata = _plan(lengths)
+
+    def profile(enabled: bool) -> set[str]:
+        if enabled:
+            monkeypatch.setenv("SGLANG_GFX1250_TOPK_CLUSTER", "1")
+        else:
+            monkeypatch.delenv("SGLANG_GFX1250_TOPK_CLUSTER", raising=False)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            topk_transform_paged_v2(
+                scores, lengths, None, output, PAGE_SIZE, metadata
+            )
+            torch.cuda.synchronize()
+        return {event.key for event in profiler.key_averages()}
+
+    off_kernels = profile(False)
+    on_kernels = profile(True)
+    assert not any("topk_small_batch_cluster_kernel" in name for name in off_kernels)
+    assert any("topk_small_batch_cluster_kernel" in name for name in on_kernels)
 
 
 if __name__ == "__main__":

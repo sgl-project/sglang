@@ -472,7 +472,15 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(USE_ROCM) && defined(SGL_ROCM_ARCH_GFX1250)
+    // y-oriented (1, 8, 1). An x-oriented {8, 1, 1} launch was rejected on gfx1250.
+    // dim3{1, N} value-initializes z to 0; HIP cluster dims must be positive.
+    const unsigned int z = cluster_dim.z == 0 ? 1u : cluster_dim.z;
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = hipLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, z};
+    m_config.attrs = m_attrs;
+#elif defined(USE_ROCM)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -507,14 +515,19 @@ struct LaunchKernel {
   auto operator()(T&& kernel, Args&&... args) const -> void {
     if (m_prefer_l1) apply_prefer_l1(kernel);
 #ifdef USE_ROCM
-    hipLaunchKernelGGL(
-        std::forward<T>(kernel),
-        m_config.gridDim,
-        m_config.blockDim,
-        m_config.dynamicSmemBytes,
-        m_config.stream,
-        std::forward<Args>(args)...);
-    RuntimeDeviceCheck(m_location);
+    if (m_config.numAttrs > 0) {
+      RuntimeDeviceCheck(
+          ::hipLaunchKernelEx(&m_config, std::forward<T>(kernel), std::forward<Args>(args)...), m_location);
+    } else {
+      hipLaunchKernelGGL(
+          std::forward<T>(kernel),
+          m_config.gridDim,
+          m_config.blockDim,
+          m_config.dynamicSmemBytes,
+          m_config.stream,
+          std::forward<Args>(args)...);
+      RuntimeDeviceCheck(m_location);
+    }
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
