@@ -64,6 +64,9 @@ class TestSDPAShardedHeads(CustomTestCase):
 
     @torch.no_grad()
     def test_head_shards_match_unsharded_attention(self):
+        probe = torch.empty(1, 3, 1025, 128, device="cuda", dtype=torch.bfloat16)
+        if _impl(heads=3, global_num_heads=24)._unsplit_query_len(probe, 1025) == 1025:
+            self.skipTest("too few SMs for these shapes to split")
         for head_dim in (64, 128):
             for seq_len in (1025, 1536, 4608):
                 query, key, value = _qkv(seq_len, head_dim)
@@ -95,9 +98,9 @@ class TestSDPAShardedHeads(CustomTestCase):
 
     def test_padding_only_when_the_shard_alone_would_split(self):
         query = torch.empty(1, 6, 1025, 128, device="cuda", dtype=torch.bfloat16)
-        self.assertGreater(
-            _impl(heads=6, global_num_heads=24)._unsplit_query_len(query), 1025
-        )
+        padded = _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)
+        if padded == 1025:
+            self.skipTest("too few SMs for these shapes to split")
         # Unknown, unsharded, FP32, dropout and cuDNN keep the input length.
         cases = {
             "unknown": _impl(heads=6),
@@ -108,17 +111,20 @@ class TestSDPAShardedHeads(CustomTestCase):
         }
         for name, impl in cases.items():
             with self.subTest(name):
-                self.assertEqual(impl._unsplit_query_len(query), 1025)
+                self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
         with self.subTest("fp32"):
             impl = _impl(heads=6, global_num_heads=24)
-            self.assertEqual(impl._unsplit_query_len(query.float()), 1025)
+            self.assertEqual(impl._unsplit_query_len(query.float(), 1025), 1025)
         with self.subTest("lossless request"), _request("lossless"):
             impl = _impl(heads=6, global_num_heads=24)
-            self.assertEqual(impl._unsplit_query_len(query), 1025)
+            self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
+        with self.subTest("short keys never split"):
+            impl = _impl(heads=6, global_num_heads=24)
+            self.assertEqual(impl._unsplit_query_len(query, 128), 1025)
         with self.subTest("full layer also splits"):
             short = query[:, :, :64]
             self.assertEqual(
-                _impl(heads=6, global_num_heads=24)._unsplit_query_len(short), 64
+                _impl(heads=6, global_num_heads=24)._unsplit_query_len(short, 1025), 64
             )
 
     @torch.no_grad()

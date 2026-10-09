@@ -273,6 +273,7 @@ class ErnieImageSelfAttention(nn.Module):
         # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=num_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
             skip_sequence_parallel=True,
