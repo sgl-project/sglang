@@ -82,7 +82,7 @@ class TestDisaggregationInklingMXFP8(PDDisaggregationServerBase, GSM8KMixin):
 
     @classmethod
     def start_prefill(cls):
-        # HiCache rides the prefill role only: the decode role forces chunk cache,
+        # HiCache rides the prefill role only: the decode role disables radix cache,
         # and its radix opt-in is refused for sliding-window models.
         prefill_args = [
             "--trust-remote-code",

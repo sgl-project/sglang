@@ -904,6 +904,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def max_shared_logits_buffer_rows(self) -> int:
@@ -1258,6 +1259,7 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        current_platform.post_load_model(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
@@ -1755,7 +1757,7 @@ class ModelRunner:
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
-            rank_id = self.gpu_id if get_parallel().attn_dp_size > 1 else None
+            rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span

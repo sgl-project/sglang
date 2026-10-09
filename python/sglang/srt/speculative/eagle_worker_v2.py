@@ -41,6 +41,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -394,6 +395,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Boot guard: every backend a draft forward reaches must carry its
+        # runner's translator or the index builders emit virtual ids.
+        translator = self.draft_runner.kv_index_translator
+        if translator.is_translating:
+            backends = [self.draft_attn_backend, self.draft_extend_attn_backend]
+            if self.draft_attn_backend is not None:
+                backends += self.draft_attn_backend.attn_backends
+            translator.bind_and_verify_backends(backends)
+
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""
@@ -602,7 +612,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -610,6 +620,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            target_translator=self.target_worker.model_runner.kv_index_translator,
+            num_draft_tokens=self.speculative_num_draft_tokens,
         )
         if (
             can_run_decode_cuda_graph
@@ -669,6 +681,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if kv_loc_plan is not None:
+            # Verify and draft extend write the window the draft planned.
+            verify_input.kv_loc_plan = kv_loc_plan
+            verify_input.prepared_out_cache_loc = kv_loc_plan.write_virtual
         if with_topology:
             # PP+spec relays the tree so every stage rebuilds the same verify
             # input; the mask build needs the topology this one was built from.
@@ -896,6 +912,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -904,6 +921,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            kv_loc_plan: The target prefill's plan; the draft writes the same
+                slots.
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
@@ -955,6 +974,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            kv_loc_plan=kv_loc_plan,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -1031,7 +1051,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        *,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -1089,6 +1113,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                kv_loc_plan=kv_loc_plan,
             )
 
         if self.plan_stream:
@@ -1408,7 +1433,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._draft_extend_for_decode(
+                        batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
+                    )
 
             if (
                 get_parallel().pp_size > 1
@@ -1464,7 +1491,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
+            return_kv_loc_plan=self._draft_worker is not None,
         )
+        kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
         # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1501,6 +1530,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
                 batch_output.logits_output.mm_input_embeds,
+                kv_loc_plan=kv_loc_plan,
             )
             return batch_output
 

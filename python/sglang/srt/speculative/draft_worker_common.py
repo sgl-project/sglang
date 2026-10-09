@@ -29,12 +29,15 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
-def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
-    """The draft's attention backend, from the published leaves.
+def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
+    """The attention backend `build_draft_tp_worker` gives a draft worker when
+    the caller names none, from the published leaves.
 
     `spec.speculative_draft_attention_backend` when the operator named one,
     otherwise the process's prefill backend. Both are resolution's answers, so
-    they come from the bags.
+    they come from the bags. A backend the draft worker does not support falls
+    back to the platform default, with a warning when ``algo_label`` names the
+    caller.
     """
     # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
     platform_fallback = (
@@ -47,14 +50,15 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
         return platform_fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
-        logger.warning(
-            "%s draft worker only supports attention_backend in %s for now, "
-            "but got %r. Falling back to '%s'.",
-            algo_label,
-            DRAFT_ATTENTION_BACKEND_CHOICES,
-            draft_backend,
-            fallback,
-        )
+        if algo_label is not None:
+            logger.warning(
+                "%s draft worker only supports attention_backend in %s for now, "
+                "but got %r. Falling back to '%s'.",
+                algo_label,
+                DRAFT_ATTENTION_BACKEND_CHOICES,
+                draft_backend,
+                fallback,
+            )
         return fallback
     return draft_backend
 
@@ -75,7 +79,7 @@ def build_draft_tp_worker(
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
     draft_backend = attention_backend_override or (
-        _resolve_draft_attention_backend_fallback(algo_label=algo_label)
+        resolve_draft_worker_attention_backend(algo_label=algo_label)
     )
     from sglang.srt.layers.moe.utils import draft_model_build_scope
 

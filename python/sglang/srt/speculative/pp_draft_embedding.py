@@ -77,11 +77,21 @@ def _weight_or_none(module: Optional[nn.Module]) -> Optional[torch.Tensor]:
 
 
 def resolve_target_embed_and_head(
-    target_model: nn.Module,
+    target_model: nn.Module, *, draft_model: Optional[nn.Module] = None
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """PP-safe getter: a PPMissingLayer embedding maps to ``embed=None``; any
     other AttributeError propagates."""
     try:
+        if draft_model is not None and hasattr(
+            target_model, "get_embed_and_head_for_draft"
+        ):
+            found = _find_draft_embedding_module(draft_model, allow_replicated=True)
+            if found is None:
+                raise ValueError(
+                    f"Draft model {draft_model.__class__.__name__} has no single "
+                    "input embedding for target embedding sharing."
+                )
+            return target_model.get_embed_and_head_for_draft(found[1])
         return target_model.get_embed_and_head()
     except AttributeError:
         if not _target_input_embedding_is_missing(target_model):
@@ -89,22 +99,36 @@ def resolve_target_embed_and_head(
         return None, _weight_or_none(target_model.lm_head)
 
 
-def find_draft_embedding_param(
-    draft_model: nn.Module,
-) -> Optional[Tuple[str, nn.Parameter]]:
-    """The draft's own input embedding: its single ``VocabParallelEmbedding``."""
+def _find_draft_embedding_module(
+    draft_model: nn.Module, *, allow_replicated: bool = False
+) -> Optional[Tuple[str, nn.Module]]:
+    """Find a single vocab-parallel or named replicated input embedding."""
     from sglang.srt.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
     )
 
     found = [
-        (f"{name}.weight", module.weight)
+        (f"{name}.weight", module)
         for name, module in draft_model.named_modules()
-        if isinstance(module, VocabParallelEmbedding)
+        if (
+            isinstance(module, VocabParallelEmbedding)
+            or (
+                allow_replicated
+                and isinstance(module, nn.Embedding)
+                and name.rsplit(".", 1)[-1] in _EMBED_ATTR_NAMES
+            )
+        )
         and not isinstance(module, ParallelLMHead)
     ]
     return found[0] if len(found) == 1 else None
+
+
+def find_draft_embedding_param(
+    draft_model: nn.Module,
+) -> Optional[Tuple[str, nn.Parameter]]:
+    found = _find_draft_embedding_module(draft_model)
+    return (found[0], found[1].weight) if found is not None else None
 
 
 def _is_input_embedding_key(key: str) -> bool:
@@ -234,7 +258,7 @@ def resolve_draft_embed_and_head(
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Embed/head to bind into a draft; a stage without the target embedding
     loads the draft's own from the checkpoint."""
-    embed, head = resolve_target_embed_and_head(target_model)
+    embed, head = resolve_target_embed_and_head(target_model, draft_model=draft_model)
     if embed is None:
         embed = load_draft_embedding_from_checkpoint(
             draft_model, model_path, revision=revision, load_config=load_config
