@@ -1457,7 +1457,7 @@ class MoriKVManager(CommonKVManager):
             )
 
             if st == "mamba":
-                if peer_info.decode_tp_size != self.attn_tp_size and 0 in src_dims:
+                if peer_info.decode_tp_size != self.state_tp_size and 0 in src_dims:
                     raise RuntimeError(
                         "Replicated Mamba PD state transfer currently requires "
                         "matching prefill/decode attention TP sizes"
@@ -1519,7 +1519,7 @@ class MoriKVManager(CommonKVManager):
                 f"got src={src_state_indices.size}, dst={dst_state_indices.size}"
             )
 
-        tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
+        tp_mismatch = peer_info.decode_tp_size != self.state_tp_size
 
         # If dim info missing, silently degrade to whole-item copy (Mooncake compat)
         if tp_mismatch and (
@@ -1530,7 +1530,7 @@ class MoriKVManager(CommonKVManager):
         if tp_mismatch:
             logger.warning_once(
                 "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
-                f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={peer_info.decode_tp_size}. "
+                f"Prefill attn_tp_size={self.state_tp_size}, Decode attn_tp_size={peer_info.decode_tp_size}. "
                 "Performance may be affected."
             )
 
@@ -1538,7 +1538,7 @@ class MoriKVManager(CommonKVManager):
         dst_idx = int(dst_state_indices[0])
         statuses: List[TransferStatus] = []
 
-        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        local_tp_rank = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
 
         for i, src_desc in enumerate(src_state_mem_descs):
@@ -1558,10 +1558,10 @@ class MoriKVManager(CommonKVManager):
 
                 src_bytes_per_dim = src_item_len // src_dim
 
-                if self.attn_tp_size > peer_info.decode_tp_size:
+                if self.state_tp_size > peer_info.decode_tp_size:
                     src_dim_start = 0
                     num_dims_to_send = src_dim
-                    writers_per_decode = self.attn_tp_size // peer_info.decode_tp_size
+                    writers_per_decode = self.state_tp_size // peer_info.decode_tp_size
                     local_writer_idx = local_tp_rank % writers_per_decode
                     dst_dim_start = local_writer_idx * src_dim
                 else:
@@ -1627,7 +1627,13 @@ class MoriKVManager(CommonKVManager):
                     "PP>1 needs peer state_layer_ids for global-layer descriptor "
                     "pairing."
                 )
-            if peer_info.decode_tp_size != self.attn_tp_size:
+            # QSA state is whole on every rank, so it pairs by state TP.
+            src_tp_size = (
+                self.state_tp_size
+                if state_type in ("qsa_pending", "qsa_compressed")
+                else self.attn_tp_size
+            )
+            if peer_info.decode_tp_size != src_tp_size:
                 raise RuntimeError(
                     f"PD disagg: heterogeneous TP not supported for {state_type} yet."
                 )

@@ -49,13 +49,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "moe-a2a-backend": view.moe_a2a_backend != "none",
         "enable-waterfill": cfg.enable_waterfill,
         "pp-size > 1": cfg.pp_size > 1,
-        # Prefill only: a decode node serves plain TP. Only mooncake sends each
-        # CP rank's linear-attention state shard to its decode rank.
+        # Prefill only: a decode node serves plain TP.
         "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
-        "disaggregation-transfer-backend other than mooncake": (
-            cfg.disaggregation_mode == "prefill"
-            and cfg.disaggregation_transfer_backend != "mooncake"
-        ),
     }
     for flag, enabled in unsupported.items():
         if enabled:

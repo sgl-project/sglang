@@ -320,9 +320,11 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
-        # The mamba state's head partition: attention TP, or the TP group under
-        # CP-TP group sharing.
-        self.linear_attn_tp_size = linear_attn_tp_size()
+        # The TP width the transferred state is laid out over, which decode
+        # pairs with: attention TP, or the TP group under CP-TP group sharing,
+        # where the GDN heads are partitioned over it and QSA/PLE state is whole
+        # on every rank. KV heads keep following attention TP.
+        self.state_tp_size = linear_attn_tp_size()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
