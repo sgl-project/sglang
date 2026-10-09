@@ -605,6 +605,9 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
+
     def evictable_size(self):
         return self.evictable_size_
 
