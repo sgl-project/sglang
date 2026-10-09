@@ -13,7 +13,12 @@ class IndexKeyFormat(Enum):
     DSA_FP8 = "dsa_fp8"
 
     def page_bytes(self, key_count: int) -> int:
-        return key_count * (128 + 4)
+        # Each physical format owns its sizing, including scales and padding.
+        if self is IndexKeyFormat.DSA_FP8:
+            key_data_bytes = key_count * 128
+            scale_bytes = key_count * 4
+            return key_data_bytes + scale_bytes
+        raise ValueError(f"unsupported index key format {self}")
 
 
 class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
@@ -96,7 +101,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 f"page coverage {self.page_size} must be divisible by "
                 f"compression ratio {self.compress_ratio}"
             )
-        if self.format is not IndexKeyFormat.DSA_FP8:
+        if not isinstance(self.format, IndexKeyFormat):
             raise ValueError(f"unsupported index key format {self.format}")
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")

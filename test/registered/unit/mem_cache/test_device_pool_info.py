@@ -174,6 +174,30 @@ class TestDevicePoolInfo(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "index pages of 33792 bytes"):
             wrong.validate()
 
+    def test_index_pages_require_scale_bytes(self):
+        from msgspec.structs import replace
+
+        for ratio in (1, 4):
+            info = _pool_infos(ratio=ratio)[1].buffer_info
+            info.validate()
+            keys_only = torch.empty(
+                (4, info.page_size // ratio * 128), dtype=torch.uint8
+            )
+            with (
+                self.subTest(compress_ratio=ratio),
+                self.assertRaisesRegex(ValueError, "index pages of"),
+            ):
+                replace(info, buffers=(keys_only,)).validate()
+
+    def test_unknown_index_format_has_no_default_page_size(self):
+        from enum import Enum
+
+        class OtherFormat(Enum):
+            OTHER = "other"
+
+        with self.assertRaisesRegex(ValueError, "unsupported index key format"):
+            IndexKeyFormat.page_bytes(OtherFormat.OTHER, 64)
+
     def test_linker_preserves_heterogeneous_draft_page_metadata(self):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
             _build_legacy_dsa_device_pool_group,
