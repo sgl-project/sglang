@@ -9,7 +9,6 @@
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
-use dynamo_parsers::reasoning::{ReasoningParser as _, ReasoningParserWrapper};
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -21,13 +20,17 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
+use crate::think::ReasoningOptions;
 
-mod aliases;
+mod reasoning;
 mod tools;
 
-use self::aliases::build_reasoning_parser;
-pub use self::aliases::dynamo_tool_parser_name;
-pub use self::tools::chat_tool_definitions;
+pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
+pub use self::tools::{
+    ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
+    tool_constraint,
+};
+use self::tools::{post_tool_terminal_markers, tool_call_delta};
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +119,10 @@ impl ChatResponseProcessor {
             parallel_tool_calls,
             choices: (0..choice_count)
                 .map(|_| ChoiceResponseProcessor {
-                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), None),
+                    reasoning: ReasoningStreamSplitter::new(
+                        reasoning_parser.as_deref(),
+                        ReasoningOptions::default(),
+                    ),
                 })
                 .collect(),
         }
@@ -124,7 +130,7 @@ impl ChatResponseProcessor {
 
     pub fn with_reasoning_state(mut self, reasoning_state: Option<bool>) -> Self {
         for choice in &mut self.choices {
-            choice.reasoning.initial_reasoning = reasoning_state;
+            choice.reasoning.options.force_reasoning = reasoning_state;
         }
         self
     }
@@ -255,13 +261,7 @@ impl ChatResponseProcessor {
             yield annotated_usage(prompt_tokens, completion_tokens);
         };
 
-        let post_tool_terminal_markers = self.tool_parser.as_deref().map_or(&[][..], |parser| {
-            match dynamo_tool_parser_name(parser) {
-                "qwen25" => &["<|im_end|>"],
-                "glm47" => &["<|user|>", "<|endoftext|>", "<|observation|>"],
-                _ => &[],
-            }
-        });
+        let post_tool_terminal_markers = post_tool_terminal_markers(self.tool_parser.as_deref());
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
@@ -421,18 +421,6 @@ fn annotated_usage(
     }
 }
 
-fn tool_call_delta(call: ChatCompletionMessageToolCallChunk) -> ChatToolCallDelta {
-    ChatToolCallDelta {
-        index: call.index,
-        id: call.id,
-        name: call
-            .function
-            .as_ref()
-            .and_then(|function| function.name.clone()),
-        arguments: call.function.and_then(|function| function.arguments),
-    }
-}
-
 fn to_dynamo_finish_reason(reason: ChatFinishReason) -> FinishReason {
     match reason {
         ChatFinishReason::Stop => FinishReason::Stop,
@@ -448,50 +436,6 @@ fn from_dynamo_finish_reason(reason: FinishReason) -> ChatFinishReason {
         FinishReason::Length => ChatFinishReason::Length,
         FinishReason::ContentFilter => ChatFinishReason::ContentFilter,
         FinishReason::ToolCalls | FinishReason::FunctionCall => ChatFinishReason::ToolCalls,
-    }
-}
-
-struct ReasoningStreamSplitter {
-    name: Option<String>,
-    parser: Option<ReasoningParserWrapper>,
-    initial_reasoning: Option<bool>,
-}
-
-impl ReasoningStreamSplitter {
-    fn new(name: Option<&str>, initial_reasoning: Option<bool>) -> Self {
-        Self {
-            name: name.map(str::to_owned),
-            parser: None,
-            initial_reasoning,
-        }
-    }
-
-    fn split(&mut self, text: &str, token_ids: &[i32]) -> (String, String) {
-        let Some(name) = self.name.as_deref() else {
-            return (String::new(), text.to_owned());
-        };
-        let initial_reasoning = self.initial_reasoning;
-        let parser = self.parser.get_or_insert_with(|| {
-            let mut parser = build_reasoning_parser(name);
-            if let Some(initial_reasoning) = initial_reasoning {
-                parser.set_in_reasoning(initial_reasoning);
-            }
-            parser
-        });
-        let token_ids = token_ids
-            .iter()
-            .filter_map(|&id| u32::try_from(id).ok())
-            .collect::<Vec<_>>();
-        let split = parser.parse_reasoning_streaming_incremental(text, &token_ids);
-        (split.reasoning_text, split.normal_text)
-    }
-
-    fn finish(&mut self) -> (String, String) {
-        let Some(parser) = self.parser.as_mut() else {
-            return (String::new(), String::new());
-        };
-        let tail = parser.finish_reasoning_stream();
-        (tail.reasoning_text, tail.normal_text)
     }
 }
 

@@ -377,7 +377,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.transformer_2 = transformer_2
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         # Per-request Cache-DiT overrides for the batch being executed
         # (stashed by _maybe_enable_cache_dit; read by the config builders).
         self._cache_dit_request_overrides: dict[str, Any] = {}
@@ -431,7 +430,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -850,7 +848,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             disable_cache_on_transformer(transformer)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
@@ -1206,7 +1203,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
 
         self._cache_dit_enabled = True
-        self._cached_num_steps = num_inference_steps
         self._cache_dit_active_key = desired_key
 
     @lru_cache(maxsize=8)
@@ -2088,11 +2084,40 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 neg_cond_kwargs=ctx.neg_cond_kwargs,
                 guidance=ctx.guidance,
             )
+        timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
+
+        # collect rollout outputs before finalization gathers or replaces latents
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=ctx.latents,
+                num_inference_steps=len(timesteps_cpu),
+                final_timestep=timesteps_cpu.new_zeros(()),
+                server_args=server_args,
+            )
+        self._finalize_denoising_loop(ctx, batch, server_args)
+        return batch
+
+    def _run_denoising_loop(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        collect_trajectory: bool = True,
+    ) -> torch.Tensor:
+        """Run a prepared loop, including profiling and DiT residency.
+
+        Clip-based models can reuse this without finalizing the entire request.
+        """
         denoising_start_time = time.time()
         self._before_denoising_loop(ctx, batch, server_args)
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        progress_step_interval = ctx.extra.get(
+            "progress_step_interval", ctx.scheduler.order
+        )
         # Re-resolve the explicit-range gate so the per-step markers
         # below honor this request's is_warmup state. Layer hooks are
         # registered by the residency manager at the use-site.
@@ -2136,7 +2161,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         # BEFORE _run_denoising_step so ctx.latents is still the
                         # pre-step value. Gated on batch.rollout to keep the
                         # non-rollout path strictly untouched.
-                        if batch.rollout:
+                        if collect_trajectory and batch.rollout:
                             batch._rollout_loop_step_index = step_index
                             self._maybe_append_dit_trajectory_step(
                                 batch=batch,
@@ -2145,11 +2170,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                                 step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
-                        self._record_trajectory(ctx, step, batch, server_args)
+                        if collect_trajectory:
+                            self._record_trajectory(ctx, step, batch, server_args)
 
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
-                            and (step_index + 1) % ctx.scheduler.order == 0
+                            and (step_index + 1) % progress_step_interval == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -2169,20 +2195,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             del step
         self._finish_active_component_use()
 
-        # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
-        # the final scheduler.step output (ctx.latents) is still SP-sharded and
-        # can be gathered uniformly alongside the per-step dit_trajectory via
-        # gather_stacked_latents_for_sp.
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=ctx.latents,
-                num_inference_steps=num_timesteps,
-                final_timestep=timesteps_cpu.new_zeros(()),
-                server_args=server_args,
-            )
-        self._finalize_denoising_loop(ctx, batch, server_args)
-        return batch
+        return timesteps_cpu
 
     def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:
         import functools

@@ -78,6 +78,8 @@ class IpcA2AState:
         self.calls = 0
         self.rank = None
         self.group = None
+        # global ranks of the pair the peer mappings connect
+        self.ranks = None
         self.failed = False
         self.inited = False
 
@@ -135,6 +137,7 @@ class IpcA2AState:
 
         self.rank = dist.get_rank(group=group)
         self.group = group
+        self.ranks = dist.get_process_group_ranks(group)
         dev = torch.cuda.current_device()
         peer_dev = _peer_cuda_device(group, self.rank, dev)
         # Peer access alone also admits PCIe pairs, where this NVLink transport
@@ -265,7 +268,13 @@ def ipc_a2a_ready(group) -> bool:
 
     if not envs.SGLANG_DIFFUSION_IPC_A2A:
         return False
-    if IPC_A2A.group is not None and IPC_A2A.group is not group:
+    # AllToAll4D passes the SP device group and USP the Ulysses group: distinct
+    # handles over one pair, so only a different pair invalidates the mappings.
+    if (
+        IPC_A2A.group is not None
+        and group is not IPC_A2A.group
+        and dist.get_process_group_ranks(group) != IPC_A2A.ranks
+    ):
         IPC_A2A.reset()
     if IPC_A2A.failed:
         return False
