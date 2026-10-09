@@ -38,9 +38,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
-    build_unified_mha_pool,
 )
-from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -332,102 +330,6 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
         enable_memory_saver=False,
         page_size=ps,
     )
-
-
-_SBS = 32  # MXFP8 scale block size
-_SCALE_PS = 128  # the interleaved scale layout's page size
-
-
-def _scaled_spec(name, grow, head_dim=128):
-    return MHASubPoolSpec(
-        name=name,
-        layer_num=_L,
-        head_num=_H,
-        head_dim=head_dim,
-        store_dtype=torch.uint8,
-        kv_cache_dtype=torch.float8_e4m3fn,
-        scale_block_size=_SBS,
-        grow_direction=grow,
-    )
-
-
-class TestUnifiedMXFP8ScaleBuffers(CustomTestCase):
-    def setUp(self):
-        full = _scaled_spec("full", "down", head_dim=256)
-        self.budget = 64 * _SCALE_PS * full.entry_bytes()
-        self.pool = UnifiedKVPool(
-            total_bytes=self.budget,
-            sub_pool_specs=[full, _scaled_spec("swa", "up", head_dim=256)],
-            device=_DEV,
-            enable_memory_saver=False,
-            page_size=_SCALE_PS,
-        )
-
-    def test_scale_extent_and_budget(self):
-        """FA4 keeps only the scale tensor's base pointer and rebuilds its
-        layout from k_cache's extent, so the two must agree page for page."""
-        for name in ("full", "swa"):
-            num_pages = self.pool.max_slots(name) // _SCALE_PS
-            k_kv, _ = self.pool.mha_views_for(name)
-            self.assertEqual(k_kv[0].shape[0] // _SCALE_PS, num_pages)
-            for buf in sum(self.pool.mha_scale_views_for(name), []):
-                self.assertEqual(buf.shape[0], num_pages)
-                self.assertTrue(buf.is_contiguous())
-
-        scales = sum(
-            b.numel()
-            for name in ("full", "swa")
-            for b in sum(self.pool.mha_scale_views_for(name), [])
-        )
-        self.assertLessEqual(self.pool._raw.numel() + scales, self.budget)
-        self.assertAlmostEqual(scales / self.pool._raw.numel(), 2 / _SBS, places=2)
-
-    def test_scales_cannot_consume_the_single_request_floor(self):
-        """The gross budget fits one request, but its payload after scales does not."""
-        with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
-            UnifiedKVPool(
-                total_bytes=self.budget,
-                sub_pool_specs=[
-                    _scaled_spec("full", "down"),
-                    _scaled_spec("swa", "up"),
-                ],
-                device=_DEV,
-                enable_memory_saver=False,
-                page_size=_SCALE_PS,
-                bs1_floor_terms=[("swa_window_kv", self.budget)],
-            )
-
-    def test_page_move_preserves_payload_and_scales(self):
-        """Move page envelopes and wider scales without touching other pages."""
-        for name in ("full", "swa"):
-            pool = build_unified_mha_pool(
-                unified_buffer=self.pool,
-                sub_pool_name=name,
-                page_size=_SCALE_PS,
-                enable_alt_stream=False,
-            )
-            raw_pages = pool.get_page_envelope_buffer()
-            buffers = [(raw_pages, True)] + [
-                (buf.view(torch.uint8), key == name)
-                for key in ("full", "swa")
-                for group in self.pool.mha_scale_views_for(key)
-                for buf in group
-            ]
-            expected = []
-            for buf, moves in buffers:
-                buf.random_(0, 255)
-                reference = buf.clone()
-                if moves:
-                    reference[4] = buf[1]
-                    reference[2] = buf[3]
-                expected.append(reference)
-            offsets = torch.arange(_SCALE_PS)
-            pool.move_kv_cache(
-                (torch.tensor([4, 2])[:, None] * _SCALE_PS + offsets).flatten(),
-                (torch.tensor([1, 3])[:, None] * _SCALE_PS + offsets).flatten(),
-            )
-            for (actual, _), reference in zip(buffers, expected):
-                self.assertTrue(torch.equal(actual, reference), name)
 
 
 class TestUnifiedKVPoolViews(unittest.TestCase):

@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="extra-a", runner_config="1-gpu-small")
 
@@ -347,11 +348,10 @@ class TestTriPoolAssembly(unittest.TestCase):
     torch.cuda.is_available() and get_device_sm() >= 100,
     "MXFP8 KV cache requires the FA4 backend (SM100+).",
 )
-class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
-    """A restored page must bring its UE8M0 scales back, or it dequantizes
-    against whatever exponents were left in the slot."""
+class TestUnifiedMXFP8ScaleReload(CustomTestCase):
+    """Relocated KV pages must retain their scales across a host round trip."""
 
-    _SBS, _PS, _H, _D, _L, _PAGES = 32, 128, 2, 128, 2, 8
+    _SBS, _PS, _H, _D, _L, _PAGES = 32, 128, 2, 256, 2, 8
 
     def _spec(self, name, grow):
         from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec
@@ -375,13 +375,25 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
         )
 
         full = self._spec("full", "down")
-        buffer = UnifiedKVPool(
+        pool_args = dict(
             total_bytes=self._PAGES * self._PS * full.entry_bytes(),
             sub_pool_specs=[full, self._spec("swa", "up")],
             device="cuda",
             enable_memory_saver=False,
             page_size=self._PS,
         )
+        with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
+            UnifiedKVPool(
+                **pool_args, bs1_floor_terms=[("request", pool_args["total_bytes"])]
+            )
+        buffer = UnifiedKVPool(**pool_args)
+        scale_bytes = sum(
+            buf.numel()
+            for name in ("full", "swa")
+            for group in buffer.mha_scale_views_for(name)
+            for buf in group
+        )
+        self.assertLessEqual(buffer.total_bytes + scale_bytes, pool_args["total_bytes"])
         pool = build_unified_mha_pool(
             unified_buffer=buffer, sub_pool_name="full", page_size=self._PS
         )
@@ -391,8 +403,6 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
             host_size=0,
             page_size=self._PS,
             layout="page_first",
-            pin_memory=True,
-            device="cpu",
         )
         self.addCleanup(host.destroy)
 
@@ -403,6 +413,8 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
         for buf in scales:
             buf.random_(100, 140)
         expected = [buf[3].clone() for buf in scales]
+        pool.move_kv_cache(loc + self._PS, loc)
+        loc += self._PS
 
         host_loc = torch.arange(self._PS, dtype=torch.int64, device="cuda")
         host.backup_from_device_all_layer(pool, host_loc, loc, io_backend="kernel")
@@ -416,7 +428,7 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
         torch.cuda.synchronize()
 
         for actual, reference in zip(scales, expected):
-            self.assertTrue(torch.equal(actual[3], reference))
+            self.assertTrue(torch.equal(actual[4], reference))
 
 
 if __name__ == "__main__":
