@@ -1,0 +1,58 @@
+[package]
+name = "sglang-bench"
+description = "Serving benchmark client: the Rust port of python/sglang/benchmark/serving.py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module
+# of the main sglang wheel at the given import path. debug = false keeps
+# editable installs on release builds, since a debug client cannot keep up with
+# the server it is measuring.
+# features: the wheel build needs the PyO3 bindings, which are NOT default (see
+# [features] below).
+[package.metadata.sglang]
+python-module = "sglang.srt.rust_extensions._bench"
+debug = false
+features = ["python"]
+
+[lib]
+# Unique per-crate artifact name: the shared workspace target/ dir cannot hold
+# two cdylibs of the same name. The importable Python module is `_bench`, named
+# by the `#[pymodule]` entry point, and setuptools-rust renames the artifact.
+name = "sglang_bench_core"
+# cdylib: the PyO3 module (`sglang.srt.rust_extensions._bench`).
+# rlib:   the pyo3-free core, so tests and any future standalone bin link it.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Not default: `extension-module` tells PyO3 not to link libpython, which is
+# right for a module Python loads and wrong for anything that must run on its
+# own. A plain `cargo test` therefore builds the core without PyO3.
+python = ["dep:pyo3"]
+
+[dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+
+# Declared here rather than in [workspace.dependencies]: no other member uses
+# them, and a benchmark client's dependency choices should not constrain the
+# server's graph. The versions match what sibling crates already resolve to,
+# so this adds no package to Cargo.lock.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Cache lookups only (same shape as sglang-server); the Hub download itself
+# goes through this crate's own reqwest client.
+hf-hub = { version = "0.4", default-features = false }
+indicatif = "0.17"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
