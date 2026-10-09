@@ -17,7 +17,10 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
-from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    DPBalanceStats,
+    SchedulerMetricsCollector,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
 )
@@ -29,11 +32,9 @@ class _FakeReq:
         self,
         prompt_len: int,
         output_len: int = 0,
-        prefix_len: int = 0,
     ):
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = list(range(output_len))
-        self.prefix_indices = list(range(prefix_len))
         self.seqlen = prompt_len + output_len
 
 
@@ -153,6 +154,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             forward_mode=_FakeForwardMode(),
             reqs=[],
             decoding_reqs=[],
+            prefix_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
             fpm_start_time=100.0,
@@ -164,13 +166,14 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler._fpm_dp_rank = 3
         self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]
 
-        prefill_a = _FakeReq(10, prefix_len=2)
-        prefill_b = _FakeReq(14, prefix_len=3)
+        prefill_a = _FakeReq(10)
+        prefill_b = _FakeReq(14)
         decode_req = _FakeReq(8, output_len=3)
         batch = self._make_batch(
             forward_mode=_FakeForwardMode(is_mixed=True, is_extend=True),
             reqs=[prefill_a, prefill_b, decode_req],
             decoding_reqs=[decode_req],
+            prefix_lens=[2, 3, decode_req.seqlen - 1],
             prefill_stats=PrefillStats(
                 log_input_tokens=12,
                 log_hit_tokens=5,
@@ -343,6 +346,191 @@ class TestForwardPassMetrics(unittest.TestCase):
             reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
+
+
+def _dp_balance_stats(
+    *,
+    local_tokens: int,
+    global_num_tokens: list,
+    sync_wait_seconds: float,
+    local_attention_pairs: int | None = None,
+    global_attention_pairs: list | None = None,
+):
+    """One-token rows unless the pairs are given explicitly."""
+    return DPBalanceStats.create(
+        local_tokens=local_tokens,
+        global_num_tokens=global_num_tokens,
+        local_attention_pairs=(
+            local_tokens if local_attention_pairs is None else local_attention_pairs
+        ),
+        global_attention_pairs=(
+            global_num_tokens
+            if global_attention_pairs is None
+            else global_attention_pairs
+        ),
+        sync_wait_seconds=sync_wait_seconds,
+    )
+
+
+class TestDPBalanceMetrics(CustomTestCase):
+    def _reporter_with_collector(self, attn_dp_rank: int):
+        scheduler = types.SimpleNamespace(
+            running_batch=types.SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            grammar_manager=[],
+            enable_priority_scheduling=False,
+            disaggregation_mode=DisaggregationMode.NULL,
+        )
+        scheduler.server_args = _publish_server_args(
+            self,
+            enable_metrics=False,
+            enable_metrics_for_all_schedulers=False,
+            kv_events_config=None,
+            enable_mfu_metrics=False,
+            enable_forward_pass_metrics=False,
+        )
+        enter_scope(
+            self,
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=attn_dp_rank,
+                attn_dp_size=2,
+                attn_dp_rank=attn_dp_rank,
+                moe_tp_size=2,
+            ),
+        )
+        reporter = _make_reporter(self, scheduler)
+
+        registry = prometheus_client.CollectorRegistry()
+        labels = {"model_name": "test", "moe_ep_rank": 0, "dp_rank": attn_dp_rank}
+        with patch.multiple(
+            prometheus_client,
+            **{
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
+                for kind in ("Counter", "Gauge", "Histogram", "Summary")
+            },
+        ):
+            reporter.metrics_collector = SchedulerMetricsCollector(
+                labels=labels, server_args=scheduler.server_args
+            )
+        reporter.current_scheduler_metrics_enabled = True
+        return reporter, registry, {k: str(v) for k, v in labels.items()}
+
+    def test_step_stats_exported_once_per_step(self):
+        reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=0)
+        get = registry.get_sample_value
+        # Pre-seeded, so ratio charts have both operands before the first idle step.
+        self.assertEqual(
+            get("sglang:dp_attention_steps_total", {**labels, "rank_state": "idle"}), 0
+        )
+
+        batch = types.SimpleNamespace(
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4,
+                global_num_tokens=[8, 4],
+                sync_wait_seconds=0.002,
+                local_attention_pairs=4000,
+                global_attention_pairs=[800, 4000],
+            )
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+        batch.dp_balance_stats = _dp_balance_stats(
+            local_tokens=0, global_num_tokens=[8, 0], sync_wait_seconds=0.004
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+        batch.dp_balance_stats = None
+        reporter.log_batch_result_stats(batch, result=object())
+
+        self.assertEqual(
+            get("sglang:dp_attention_tokens_total", {**labels, "kind": "scheduled"}), 4
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_tokens_total", {**labels, "kind": "imbalance"}),
+            12,
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_steps_total", {**labels, "rank_state": "active"}),
+            1,
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_steps_total", {**labels, "rank_state": "idle"}), 1
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_token_imbalance_ratio_count", labels), 2
+        )
+        self.assertAlmostEqual(
+            get("sglang:dp_attention_token_imbalance_ratio_sum", labels),
+            8 * 2 / 12 + 2.0,
+        )
+        # Pairs: the first step's long-context rank is the pair-busiest
+        # despite having fewer rows; the idle step adds the peer's 8.
+        self.assertEqual(
+            get("sglang:dp_attention_pairs_total", {**labels, "kind": "scheduled"}),
+            4000,
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_pairs_total", {**labels, "kind": "imbalance"}),
+            8,
+        )
+        self.assertAlmostEqual(
+            get("sglang:dp_attention_sync_wait_seconds_sum", labels), 0.006
+        )
+
+    def test_ratio_ladder_keeps_widely_supported_boundaries(self):
+        # Downstream metrics gateways with a fixed bucket preset drop the series
+        # when a boundary is not in it; pin the ladder so an edit cannot regress that.
+        reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=0)
+        batch = types.SimpleNamespace(
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
+            )
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+
+        bounds = [
+            float(sample.labels["le"])
+            for metric in registry.collect()
+            if metric.name == "sglang:dp_attention_token_imbalance_ratio"
+            for sample in metric.samples
+            if sample.name.endswith("_bucket") and sample.labels["le"] != "+Inf"
+        ]
+        self.assertEqual(
+            bounds,
+            [
+                1.0,
+                1.5,
+                2.0,
+                2.5,
+                3.0,
+                4.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
+            ],
+        )
+
+    def test_engine_ratio_reported_by_dp_rank_zero_only(self):
+        reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=1)
+        batch = types.SimpleNamespace(
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
+            )
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+
+        get = registry.get_sample_value
+        self.assertEqual(
+            get("sglang:dp_attention_steps_total", {**labels, "rank_state": "active"}),
+            1,
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_token_imbalance_ratio_count", labels), 0
+        )
 
 
 class TestIdleMetrics(CustomTestCase):
