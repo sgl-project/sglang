@@ -186,6 +186,37 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
+    def test_instanttensor_requires_cuda_device(self):
+        for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
+            with (
+                self.subTest(device=device),
+                self.assertRaisesRegex(
+                    ValueError, "InstantTensor requires a CUDA-compatible device"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    device=device,
+                    load_format="instanttensor",
+                    chunked_prefill_size=-1,
+                ).check_server_args()
+
+    def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
+        for device, load_format in (
+            ("cuda", "instanttensor"),
+            ("cpu", "auto"),
+            ("cpu", "safetensors"),
+        ):
+            with self.subTest(device=device, load_format=load_format):
+                ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    device=device,
+                    load_format=load_format,
+                    chunked_prefill_size=-1,
+                ).check_server_args()
+
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

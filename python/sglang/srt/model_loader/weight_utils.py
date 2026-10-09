@@ -12,6 +12,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -40,7 +41,11 @@ from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     REQUANTIZATION_METHODS,
     ModelConfig,
@@ -59,6 +64,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -1176,6 +1182,183 @@ def safetensors_weights_iterator(
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
         prefetch_handle.stop()
+
+
+def get_pp_stage_load_group() -> LoadGroup:
+    """Select a group for stage-local loads, not all-rank cold startup.
+
+    Call before draft contexts override the target's parallel topology.
+    """
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.pp_size > 1 else _DEFAULT_LOAD_GROUP
+
+
+class SafetensorsRowSource:
+    """A row-major safetensors tensor that is read by row range on demand.
+
+    A rank's rows are one contiguous byte range of the file, so a row-sharded
+    host-resident weight can fill its own destination with positioned reads
+    instead of copying out of a memory map page by page.
+    """
+
+    def __init__(
+        self, path: str, offset: int, shape: Tuple[int, ...], dtype: torch.dtype
+    ):
+        self.path = path
+        self.offset = offset
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.row_bytes = math.prod(self.shape[1:]) * dtype.itemsize
+
+    def read_rows_into(
+        self,
+        dst: torch.Tensor,
+        row_start: int,
+        drop_page_cache: bool = False,
+        num_threads: int = 8,
+        chunk_bytes: int = 64 << 20,
+    ) -> None:
+        """Read rows ``[row_start, row_start + len(dst))`` into ``dst``.
+
+        With ``drop_page_cache``, ask the kernel to evict each range once read.
+        """
+        rows = dst.shape[0]
+        if dst.device.type != "cpu" or not dst.is_contiguous():
+            raise ValueError("SafetensorsRowSource reads into contiguous CPU tensors")
+        if (
+            dst.dtype != self.dtype
+            or tuple(dst.shape[1:]) != self.shape[1:]
+            or row_start < 0
+            or row_start + rows > self.shape[0]
+        ):
+            raise ValueError(
+                f"rows {row_start}:{row_start + rows} of {self.dtype} {self.shape} "
+                f"do not fit {dst.dtype} {tuple(dst.shape)}"
+            )
+        total = rows * self.row_bytes
+        if total == 0:
+            return
+        view = memoryview(dst.view(-1).view(torch.uint8).numpy())
+        base = self.offset + row_start * self.row_bytes
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+
+            def read(start: int) -> None:
+                end = min(start + chunk_bytes, total)
+                done = start
+                while done < end:
+                    n = os.preadv(fd, [view[done:end]], base + done)
+                    if n <= 0:
+                        raise EOFError(f"short read from {self.path} at {base + done}")
+                    done += n
+                # The bytes now live in dst; ask the kernel to drop the cached copy.
+                if drop_page_cache and hasattr(os, "posix_fadvise"):
+                    try:
+                        os.posix_fadvise(
+                            fd, base + start, end - start, os.POSIX_FADV_DONTNEED
+                        )
+                    except OSError as e:
+                        logger.debug("posix_fadvise failed for %s: %s", self.path, e)
+
+            with concurrent.futures.ThreadPoolExecutor(num_threads) as pool:
+                list(pool.map(read, range(0, total, chunk_bytes)))
+        finally:
+            os.close(fd)
+
+
+def host_resident_weights_iterator(
+    hf_weights_files: List[str], patterns: Tuple[str, ...]
+) -> Generator[Tuple[str, Union[torch.Tensor, SafetensorsRowSource]], None, None]:
+    """Iterate over safetensors weights, yielding a SafetensorsRowSource
+    instead of a tensor for names that contain one of ``patterns``."""
+    for path in hf_weights_files:
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                # A memory-mapped view: no data is read here.
+                tensor = f.get_tensor(name)
+                if any(p in name for p in patterns):
+                    begin, _ = header[name]["data_offsets"]
+                    tensor = SafetensorsRowSource(
+                        path, 8 + header_len + begin, tensor.shape, tensor.dtype
+                    )
+                yield name, tensor
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+    extra_config: Optional[dict] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over Safetensors weights with InstantTensor."""
+    if current_platform.device_type != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {current_platform.device_type!r}."
+        )
+
+    unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
+    if unsupported_files:
+        raise ValueError(
+            "InstantTensor only supports .safetensors checkpoints; "
+            f"unsupported files: {unsupported_files}"
+        )
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
+        ) from e
+
+    kwargs = dict(extra_config or {})
+    backend = kwargs.get("backend")
+    if backend is not None:
+        names = [backend] if isinstance(backend, str) else backend
+        if not isinstance(names, list) or not names:
+            raise ValueError(
+                "InstantTensor backend must be a name or a non-empty list of names"
+            )
+        available = {
+            **instanttensor.Backend.__members__,
+            **instanttensor.BackendPolicy.__members__,
+        }
+        if any(not isinstance(name, str) or name not in available for name in names):
+            raise ValueError(
+                f"Invalid InstantTensor backend {backend!r}; expected names from {sorted(available)}"
+            )
+        kwargs["backend"] = [available[name] for name in names]
+
+    distributed = torch.distributed.is_initialized()
+    if load_group is _DEFAULT_LOAD_GROUP:
+        load_group = get_parallel().world_group if distributed else None
+    process_group = (
+        load_group.device_group
+        if load_group is not None and load_group.world_size > 1
+        else None
+    )
+
+    device = current_platform.get_device(torch.cuda.current_device())
+    enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    with instanttensor.safe_open(
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=True,
+        **kwargs,
+    ) as f:
+        yield from tqdm(
+            f.tensors(),
+            total=len(f.keys()),
+            desc="Loading safetensors using InstantTensor",
+            disable=not enable_tqdm,
+            mininterval=1,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        )
 
 
 def fastsafetensors_weights_iterator(

@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -117,8 +118,10 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    host_resident_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -356,9 +359,49 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _split_host_resident_files(
+    files: List[str], patterns: Optional[Tuple[str, ...]]
+) -> Tuple[List[str], List[str]]:
+    """Split safetensors files into (device, host) groups, keeping their order.
+
+    A file goes to the host group when any tensor name in its header contains
+    one of ``patterns``. Only headers are read.
+    """
+    if not patterns:
+        return list(files), []
+    from safetensors.torch import safe_open
+
+    device_files, host_files = [], []
+    for path in files:
+        host = False
+        # Other files stay in the device group; InstantTensor rejects them.
+        if path.endswith(".safetensors"):
+            with safe_open(path, framework="pt") as f:
+                host = any(p in name for name in f.keys() for p in patterns)
+        (host_files if host else device_files).append(path)
+    return device_files, host_files
+
+
+def _to_device_unless_host_resident(
+    weights: Iterable[Tuple[str, torch.Tensor]], patterns: Tuple[str, ...]
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Move tensors that are not host-resident to the current device, where
+    InstantTensor puts every other tensor, so tensors that are combined
+    during loading share a device."""
+    for name, tensor in weights:
+        if not any(p in name for p in patterns):
+            tensor = tensor.to(current_platform.get_device(torch.cuda.current_device()))
+        yield name, tensor
+
+
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
+    if load_format == LoadFormat.INSTANTTENSOR:
+        # Pass extra config directly to InstantTensor and let it report invalid
+        # options, so newer versions can add parameters without a SGLang update.
+        return
+
     allowed_keys = {"enable_multithread_load", "num_threads"}
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
@@ -411,6 +454,13 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        host_resident_weight_patterns: Optional[Tuple[str, ...]] = None
+        """Substrings of checkpoint tensor names the model keeps in host memory.
+
+        Device-direct loaders (InstantTensor) load the files containing them on
+        the host and yield matching tensors as ``SafetensorsRowSource``, which
+        the parameters' weight loaders must accept."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -422,6 +472,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                host_resident_weight_patterns=getattr(
+                    model, "host_resident_weight_patterns", None
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -490,9 +543,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif (
-            load_format == LoadFormat.SAFETENSORS
-            or load_format == LoadFormat.FASTSAFETENSORS
+        elif load_format in (
+            LoadFormat.SAFETENSORS,
+            LoadFormat.FASTSAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -631,6 +685,34 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_folder,
                 hf_weights_files,
             )
+        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            device_files, host_files = _split_host_resident_files(
+                hf_weights_files, source.host_resident_weight_patterns
+            )
+            weights_iterator = (
+                instanttensor_weights_iterator(
+                    device_files,
+                    extra_config=extra_config,
+                    load_group=self.load_config.load_group,
+                )
+                if device_files
+                else iter(())
+            )
+            if host_files:
+                logger.info(
+                    "Loading %d checkpoint file(s) with host-resident weights "
+                    "through positioned reads.",
+                    len(host_files),
+                )
+                host_weights = host_resident_weights_iterator(
+                    host_files, source.host_resident_weight_patterns
+                )
+                weights_iterator = itertools.chain(
+                    weights_iterator,
+                    _to_device_unless_host_resident(
+                        host_weights, source.host_resident_weight_patterns
+                    ),
+                )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints
