@@ -630,8 +630,8 @@ class CompressorAscendBackendMixin:
             _sp_list = _sp.tolist()
 
             _positions = []
-            if 16384 in _sp_list:
-                _positions.extend(range(16380, 16384))
+            _positions.extend(range(16380, 16384))
+            _positions.extend(range(17516, 17523))
             if _tag == "post" and any(
                 _p in (17532, 17533, 17534, 17535) for _p in _sp_list
             ):
