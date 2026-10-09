@@ -1287,7 +1287,16 @@ class BufferModePipeline:
         if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
-            self._resolve_device_covered(req)
+            self._drop_staged_hit(req, reason="device_covered")
+            return True
+        mamba_slots = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.MAMBA and t.host_indices is not None
+        )
+        if not mamba_slots and ComponentType.MAMBA in self._cache.components:
+            # A span is reusable only up to the recurrent state ending it.
+            self._drop_staged_hit(req, reason="no_mamba_state")
             return True
         key = RadixKey(
             f.key_tokens,
@@ -1316,26 +1325,28 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.SWA and t.host_indices is not None
         )
-        if full_tokens == 0 and swa_tokens == 0:
-            self._resolve_device_covered(req)
+        if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
+            self._drop_staged_hit(req, reason="device_covered")
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
+        req.mamba_host_hit_length = mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
         req.storage_hit_length = f.matched_len + f.num_tokens - joint_len
         req.storage_hit_start = joint_len
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, swa_tokens
+            f.operation_id, key, matched_len, full_tokens, swa_tokens, mamba_slots
         )
         return True
 
-    def _resolve_device_covered(self, req: Req) -> None:
+    def _drop_staged_hit(self, req: Req, reason: str) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
-        self.release_staged_hold(req.cache_request_handle, reason="device_covered")
+        self.release_staged_hold(req.cache_request_handle, reason=reason)
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1443,8 +1454,9 @@ class BufferModePipeline:
 
         Ownership contract: cc.load queues the H2D before insert adjudicates
         ownership, so the prepared boundary must ensure the insert can only
-        ADD nodes — a dedup would free slots the in-flight copy still
-        targets (queued use-after-free)."""
+        ADD FULL nodes — a dedup would free slots the in-flight copy still
+        targets (queued use-after-free). Redundant aux destinations live
+        until the transfer ack."""
         cache = self._cache
         req = params.req
         assert req is not None
@@ -1459,9 +1471,14 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (req.host_hit_length, req.swa_host_hit_length) == (
+        assert (
+            req.host_hit_length,
+            req.swa_host_hit_length,
+            req.mamba_host_hit_length,
+        ) == (
             plan.full_tokens,
             plan.swa_tokens,
+            plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
         def _defer_for_capacity(pool: str) -> None:
@@ -1532,6 +1549,16 @@ class BufferModePipeline:
             ),
             0,
         )
+        shares = []
+        for component in cache.components.values():
+            share = component.prepare_buffer_load_back(req, f.aux_xfers)
+            if share is None:
+                for prepared in shares:
+                    prepared.finish(success=False)
+                return _defer_for_capacity(component.component_type.name.lower())
+            shares.append(share)
+            # Not staging, so these stay out of the aux_xfers the ack frees.
+            load_xfers.extend(share.load_xfers)
         swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
         binds_swa_to_full = (
             swa_entry is not None
@@ -1583,6 +1610,8 @@ class BufferModePipeline:
             node_id=load_back_id,
             extra_pools=load_xfers or None,
         )
+        for share in shares:
+            share.finish(success=device_indices is not None)
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
@@ -1667,6 +1696,9 @@ class BufferModePipeline:
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
         # prev_prefix_len covers the already-device-resident head.
+        insert_fields = {}
+        for share in shares:
+            insert_fields.update(share.insert_fields())
         insert_result = cache.insert(
             InsertParams(
                 key=key,
@@ -1675,8 +1707,11 @@ class BufferModePipeline:
                 component_evicted_seqlens={
                     ComponentType.SWA: (span_end - staged_swa) if staged_swa else 0
                 },
+                **insert_fields,
             )
         )
+        for share in shares:
+            aux_device_releases.extend(share.redundant_destinations(insert_result))
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(
             request=f.request,
             num_tokens=load_tokens,
