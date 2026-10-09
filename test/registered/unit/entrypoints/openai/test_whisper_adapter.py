@@ -7,9 +7,12 @@ should keep buffering, non-streaming callers should fall back to a
 best-effort scrub".
 """
 
+import asyncio
 import re
 import unittest
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock, patch
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
@@ -22,6 +25,116 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestWhisperTranslation(CustomTestCase):
+    """Translation must select the task token in both decoder-prefix paths."""
+
+    def test_task_survives_adapter_and_processor(self):
+        from sglang.srt.multimodal.processors.whisper import WhisperProcessor
+
+        token_ids = {
+            "<|es|>": 50262,
+            "<|transcribe|>": 50359,
+            "<|translate|>": 50358,
+            "<|notimestamps|>": 50363,
+            "<|0.00|>": 50364,
+        }
+        for task in ("transcribe", "translate"):
+            for fused in (False, True):
+                for timestamps in (None, ["segment"]):
+                    with self.subTest(task=task, fused=fused, timestamps=timestamps):
+                        request = TranscriptionRequest(
+                            model="whisper",
+                            task=task,
+                            language=None if fused else "es",
+                            timestamp_granularities=timestamps,
+                        )
+                        adapter = WhisperAdapter()
+                        params = (
+                            adapter.build_fused_autodetect_params(request)
+                            if fused
+                            else adapter.build_sampling_params(request)
+                        )
+                        if fused:
+                            sentinel = "<|0.00|>" if timestamps else "<|notimestamps|>"
+                            prefix = f"<|es|><|{task}|>{sentinel} Hello"
+                            self.assertIsNotNone(re.fullmatch(params["regex"], prefix))
+                            other_task = (
+                                "transcribe" if task == "translate" else "translate"
+                            )
+                            self.assertIsNone(
+                                re.fullmatch(
+                                    params["regex"], prefix.replace(task, other_task)
+                                )
+                            )
+                        proc = WhisperProcessor.__new__(WhisperProcessor)
+                        proc.hf_config = SimpleNamespace(decoder_start_token_id=50258)
+                        proc._tokenizer = Mock(unk_token_id=-1)
+                        proc._tokenizer.convert_tokens_to_ids.side_effect = (
+                            token_ids.get
+                        )
+                        proc._processor = Mock()
+                        proc._processor.feature_extractor.return_value = {
+                            "input_features": [[1.0]]
+                        }
+                        internal = SimpleNamespace(sampling_params=params)
+                        with patch(
+                            "sglang.srt.multimodal.processors.whisper.load_audio",
+                            return_value=[0.0],
+                        ):
+                            output = asyncio.run(
+                                proc.process_mm_data_async(
+                                    None, [b"audio"], "", internal
+                                )
+                            )
+                        expected = [50258]
+                        if not fused:
+                            expected += [
+                                token_ids["<|es|>"],
+                                token_ids[f"<|{task}|>"],
+                                token_ids[
+                                    "<|0.00|>" if timestamps else "<|notimestamps|>"
+                                ],
+                            ]
+                        self.assertEqual(output.input_ids, expected)
+                        self.assertNotIn("task", internal.sampling_params)
+
+    def test_translation_fused_prefix_and_verbose_task(self):
+        from sglang.srt.entrypoints.openai.protocol import TranscriptionUsage
+
+        adapter = WhisperAdapter()
+        request = TranscriptionRequest(model="whisper", task="translate", language="es")
+        for timestamps in (False, True):
+            with self.subTest(timestamps=timestamps):
+                prefix = "<|es|><|translate|>"
+                if not timestamps:
+                    prefix += "<|notimestamps|>"
+                self.assertEqual(
+                    adapter.parse_fused_output(
+                        prefix + " Hello<|endoftext|>",
+                        task="translate",
+                        ts_variant=timestamps,
+                    ),
+                    ("es", "Hello"),
+                )
+                self.assertEqual(
+                    adapter.parse_fused_output(
+                        prefix.replace("translate", "transcribe") + " Hello",
+                        task="translate",
+                        ts_variant=timestamps,
+                    ),
+                    (None, None),
+                )
+        usage = TranscriptionUsage(seconds=1)
+        single = adapter.build_verbose_response(
+            request, "Hello", {}, _FakeTokenizer(), usage
+        )
+        chunked = adapter.build_verbose_response_chunked(
+            request, "Hello", [{}], [0.0], _FakeTokenizer(), usage
+        )
+        self.assertEqual(single.task, "translate")
+        self.assertEqual(chunked.task, "translate")
 
 
 class TestWhisperParseFusedOutput(CustomTestCase):
@@ -311,6 +424,7 @@ class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
         # Fields the processor pops before SamplingParams(**kwargs).
         params.pop("_detect_language", None)
         params.pop("timestamp_granularities", None)
+        params.pop("task", None)
         SamplingParams(**params)
 
 
