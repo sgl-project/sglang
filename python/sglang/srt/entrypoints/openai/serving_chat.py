@@ -23,6 +23,7 @@ class ThinkingMode(str, Enum):
 
 
 import jinja2
+import jsonschema_rs
 import orjson
 from fastapi import Request
 
@@ -38,7 +39,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import Draft202012Validator
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -125,6 +126,9 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+_TOOL_SCHEMA_VALIDATOR = jsonschema_rs.Draft202012Validator(
+    Draft202012Validator.META_SCHEMA
+)
 
 
 def normalize_tool_content(role: str, content):
@@ -1085,8 +1089,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
-            except SchemaError as e:
+                _TOOL_SCHEMA_VALIDATOR.validate(tool.function.parameters)
+            except jsonschema_rs.ValidationError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
                 return (
