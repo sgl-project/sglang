@@ -97,6 +97,18 @@ if _is_cuda:
         linear_with_fused_a_gemm,
     )
 
+_MLP_ACT_FNS = {"relu2": ReLU2, "silu": nn.SiLU}
+
+
+def _get_mlp_act_fn(name: str) -> nn.Module:
+    try:
+        return _MLP_ACT_FNS[name.lower()]()
+    except KeyError:
+        raise ValueError(
+            f"Unsupported NemotronH mlp_hidden_act {name!r}; "
+            f"expected one of {sorted(_MLP_ACT_FNS)}"
+        ) from None
+
 
 class NemotronHMLP(nn.Module):
     def __init__(
@@ -131,7 +143,7 @@ class NemotronHMLP(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.down_proj",
         )
-        self.act_fn = ReLU2()
+        self.act_fn = _get_mlp_act_fn(config.mlp_hidden_act)
 
     def forward(
         self,
