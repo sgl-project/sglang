@@ -38,9 +38,11 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
 # PyTorch's flash forward splits the keys across thread blocks when
 # batch * heads * ceil(query_len / 128) falls below 80% of the SMs
-# (num_splits_heuristic in ATen's flash_api.cpp). Measured on sm100 for
-# head_dim 64 and 128.
+# (num_splits_heuristic in ATen's flash_api.cpp); keys of at most 128 rows
+# are never split. The block sizes are measured on sm100 (B200) for
+# head_dim 64 and 128, where they reproduce every split boundary.
 _FLASH_QUERY_BLOCK = 128
+_FLASH_UNSPLIT_KEY_LEN = 128
 _FLASH_SPLIT_OCCUPANCY = 0.8
 
 
@@ -98,7 +100,7 @@ class SDPAImpl(AttentionImpl):
         # Heads of the unsharded layer; set when TP or Ulysses shards them.
         self.global_num_heads = extra_impl_args.get("global_num_heads")
 
-    def _unsplit_query_len(self, query: torch.Tensor) -> int:
+    def _unsplit_query_len(self, query: torch.Tensor, key_len: int) -> int:
         """Query length that keeps sharded heads on the full layer's kernel.
 
         Fewer local heads can push a short sequence onto PyTorch's split-KV
@@ -106,7 +108,7 @@ class SDPAImpl(AttentionImpl):
         the softmax sums. Query rows attend independently, so padding them
         past the split threshold restores the unsharded kernel exactly.
         Applies to "exact" quality requests only.
-        ``query`` is [B, H, S, D].
+        ``query`` is [B, H, S, D]; ``key_len`` is the key sequence length.
         """
         batch, heads, query_len, head_dim = query.shape
         if (
@@ -118,6 +120,7 @@ class SDPAImpl(AttentionImpl):
             or not query.is_cuda
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
+            or key_len <= _FLASH_UNSPLIT_KEY_LEN
             or not _request_quality_is_exact()
         ):
             return query_len
@@ -170,7 +173,7 @@ class SDPAImpl(AttentionImpl):
             attn_kwargs["enable_gqa"] = True
         query_len = query.shape[-2]
         if attn_mask is None and not is_causal:
-            padded_len = self._unsplit_query_len(query)
+            padded_len = self._unsplit_query_len(query, key.shape[-2])
             if padded_len > query_len:
                 query = torch.cat(
                     [

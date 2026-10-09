@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.test_utils import CustomTestCase
 
 _WORLD = 2
+_ALL_SKIPPED = 77
 # (heads, sequence): the unsharded layer stays unsplit, half the heads split.
 _CASES = ((24, 1024), (12, 1536))
 
@@ -34,7 +35,8 @@ def _worker() -> int:
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -45,11 +47,19 @@ def _worker() -> int:
     )
 
     import sglang.multimodal_gen.runtime.layers.attention.layer as L
-
-    L.get_forward_context = lambda: SimpleNamespace(attn_metadata=None)
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
+
+    set_global_server_args(
+        SimpleNamespace(
+            attention_backend="torch_sdpa",
+            attention_backend_config=None,
+            kv_gather_degree=1,
+            sp_split_auto=False,
+        )
+    )
+    torch.set_default_dtype(torch.bfloat16)
 
     request = set_forward_context(
         current_timestep=0,
@@ -62,6 +72,7 @@ def _worker() -> int:
     scale = D**-0.5
     dev = torch.device(f"cuda:{rank}")
     failures = []
+    checked = 0
     for heads, seq in _CASES:
         torch.manual_seed(heads + seq)
         qf, kf, vf = (
@@ -72,25 +83,19 @@ def _worker() -> int:
             qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2), scale=scale
         ).transpose(1, 2)
 
-        attn = L.USPAttention.__new__(L.USPAttention)
-        attn.causal = False
-        attn.softmax_scale = scale
-        attn.attn_impl = SDPAImpl(
+        # global_num_heads defaults to num_heads, the Ulysses-only case.
+        attn = L.USPAttention(
             num_heads=heads,
             head_size=D,
             causal=False,
-            softmax_scale=scale,
-            global_num_heads=heads,
+            required_attention_backend=AttentionBackendEnum.TORCH_SDPA,
         )
-        attn.skip_sequence_parallel = False
-        attn.enable_packed_qkv_input_a2a = False
-        attn.allow_cudnn_sdp = False
-        attn.backend = L.AttentionBackendEnum.TORCH_SDPA
-        attn.dtype = torch.bfloat16
-        attn.dropout_p = 0.0
-        attn.sp_attention_mode = "ulysses"
-        attn.sp_attention_mode_is_auto = False
+        local = qf[:, :, : heads // world].transpose(1, 2)
+        if attn.attn_impl._unsplit_query_len(local, seq) == seq:
+            print(f"SKIP: heads={heads} seq={seq} does not split here", flush=True)
+            continue
 
+        checked += 1
         shard = seq // world
         sl = slice(rank * shard, (rank + 1) * shard)
         out = attn.forward(qf[:, sl], kf[:, sl], vf[:, sl])
@@ -103,7 +108,9 @@ def _worker() -> int:
 
     for f in failures:
         print(f"FAILURE rank{rank}: {f}", flush=True)
-    return 1 if failures else 0
+    if failures:
+        return 1
+    return 0 if checked else _ALL_SKIPPED
 
 
 class TestUSPSDPAShardedHeads(CustomTestCase):
@@ -112,6 +119,9 @@ class TestUSPSDPAShardedHeads(CustomTestCase):
             self.skipTest("CUDA-only test")
         if torch.cuda.device_count() < _WORLD:
             self.skipTest(f"needs {_WORLD} GPUs")
+        from sglang.srt.utils.network import get_free_port_below_ephemeral
+
+        port = str(get_free_port_below_ephemeral())
         procs = []
         for rank in range(_WORLD):
             env = os.environ.copy()
@@ -121,7 +131,7 @@ class TestUSPSDPAShardedHeads(CustomTestCase):
                     "LOCAL_RANK": str(rank),
                     "WORLD_SIZE": str(_WORLD),
                     "MASTER_ADDR": "127.0.0.1",
-                    "MASTER_PORT": "29753",
+                    "MASTER_PORT": port,
                 }
             )
             procs.append(
@@ -135,6 +145,8 @@ class TestUSPSDPAShardedHeads(CustomTestCase):
             )
         outputs = [p.communicate(timeout=300)[0] for p in procs]
         codes = [p.returncode for p in procs]
+        if all(code == _ALL_SKIPPED for code in codes):
+            self.skipTest("this GPU has enough SMs that no case splits")
         if any(codes):
             self.fail("worker failed:\n" + "\n".join(outputs))
 

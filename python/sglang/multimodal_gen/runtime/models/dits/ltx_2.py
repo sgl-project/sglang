@@ -858,6 +858,7 @@ class LTX2Attention(nn.Module):
         else:
             self.attn = USPAttention(
                 num_heads=self.local_heads,
+                global_num_heads=self.heads,
                 head_size=self.dim_head,
                 num_kv_heads=self.local_heads,
                 dropout_rate=0,

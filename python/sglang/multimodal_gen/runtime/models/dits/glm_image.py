@@ -600,6 +600,7 @@ class GlmImageAttention(torch.nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=self.heads,
             head_size=dim_head,
             num_kv_heads=self.num_local_kv_heads,
             dropout_rate=0,
