@@ -21,6 +21,7 @@ import torch
 from sglang.srt.layers.attn_residual import AttnResidual
 from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
+from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
@@ -186,6 +187,22 @@ class AttnBankState:
             ffn_readout=_FfnReadout(self),
             ffn_update=PLAIN_ADD,
         )
+
+    @classmethod
+    def facts(cls, *, reads_slices: bool = False) -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of) for a layer whose bank
+        stays on each rank's attention-TP slice when ``reads_slices``. It does
+        not depend on the bank or the layer's modules, so the stages of a
+        layer that is not built declare it too."""
+        state = cls(
+            bank=None,
+            attn_score_proj=None,
+            attn_score_norm=None,
+            ffn_score_proj=None,
+            ffn_score_norm=None,
+            reads_slices=reads_slices,
+        )
+        return residual_facts(state.residual_ops())
 
 
 class _BankReadout:

@@ -26,8 +26,13 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+# A latent MoE on every layer after the first.
 CONFIG = SimpleNamespace(
-    is_moe=True, num_experts=8, first_k_dense_replace=1, moe_layer_freq=1
+    is_moe=True,
+    num_experts=8,
+    first_k_dense_replace=1,
+    moe_layer_freq=1,
+    routed_expert_hidden_size=2,
 )
 
 
@@ -37,11 +42,8 @@ def moe_layer(*, bank, sp_moe, all_reduce_fusion):
     nn.Module.__init__(layer)
     layer.use_attn_residuals = bank
     layer.is_block_write_layer = False
-    layer._is_moe_layer = True
     layer._sp_moe = sp_moe
     layer.all_reduce_fusion = all_reduce_fusion
-    layer._ffn_writes_stream = bank
-    layer.mlp = SimpleNamespace(use_latent_moe=True, _ep_a2a=sp_moe)
     layer.input_layernorm = fixture.Norm()
     layer.post_attention_layernorm = fixture.Norm()
     for name in (
@@ -60,6 +62,11 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
     model's final read of the bank, which gathers an SP-MoE layer's rows in
     K3's tuned all-gather."""
     bank = AttnBank()
+    has_bank = any(layer.use_attn_residuals for layer in layers.values())
+    # Every layer of a model with a bank block size carries the bank.
+    config = SimpleNamespace(
+        **{**vars(config), "attn_res_block_size": 4 if has_bank else None}
+    )
     final_read = (
         AttnBankOutputRead(
             bank,
@@ -69,7 +76,7 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
             attn_tp_gather=k3_sp_collective.all_gather if sp_moe else None,
             reads_attn_tp_slices=carries,
         )
-        if any(layer.use_attn_residuals for layer in layers.values())
+        if has_bank
         else None
     )
     with (
@@ -204,7 +211,6 @@ class TestKimiK3BankOnShards(CustomTestCase):
                     moe_layer_freq=moe_layer_freq,
                 ),
                 patch.object(kimi_k3, "_shards_moe_rows", return_value=True),
-                patch.object(k3_sp_collective, "enabled", return_value=True),
                 envs.SGLANG_K3_SP_ATTN_RES.override(True),
                 patch.object(
                     kimi_k3, "get_parallel", lambda: SimpleNamespace(pp_size=pp_size)
@@ -215,7 +221,9 @@ class TestKimiK3BankOnShards(CustomTestCase):
                     lambda: SimpleNamespace(speculative_algorithm=algorithm),
                 ),
             ):
-                self.assertEqual(kimi_k3._carries_bank_slices(config), carries)
+                self.assertEqual(
+                    kimi_k3._carries_bank_slices(config, sp_collective=True), carries
+                )
 
 
 if __name__ == "__main__":
