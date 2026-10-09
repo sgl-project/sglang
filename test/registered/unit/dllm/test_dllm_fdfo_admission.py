@@ -4,11 +4,12 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestDllmFdfoAdmission(unittest.TestCase):
+class TestDllmFdfoAdmission(CustomTestCase):
     def test_retained_block_uses_existing_extend_range(self):
         for fdfo, incomplete in (
             (False, False),

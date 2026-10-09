@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.io_struct import AbortReq
@@ -17,11 +18,12 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestFdfoAbort(unittest.TestCase):
+class TestFdfoAbort(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(weight_version="default")
         override.install()

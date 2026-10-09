@@ -21,7 +21,9 @@ _is_npu = is_npu()
 class DllmRunOutput(NamedTuple):
     logits_output: Union[LogitsProcessorOutput, torch.Tensor]
     block_tokens: torch.Tensor  # [batch_size, block_size]
-    block_done: Optional[torch.Tensor] # [batch_size] bool; FDFO only, true means block KV is ready to commit.
+    block_done: Optional[
+        torch.Tensor
+    ]  # [batch_size] bool; FDFO only, true means block KV is ready to commit.
     algo_states: Optional[List[Any]]
     can_run_cuda_graph: bool
 
@@ -154,7 +156,9 @@ class DllmAlgorithm:
         self.prepare_inputs(model_runner, forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
-        done = torch.as_tensor(done, dtype=torch.bool, device=forward_batch.input_ids.device)
+        done = torch.as_tensor(
+            done, dtype=torch.bool, device=forward_batch.input_ids.device
+        )
         # Clone so a later in-place step cannot race the async D2H of this result.
         block_tokens = forward_batch.input_ids.view(batch_size, self.block_size).clone()
 

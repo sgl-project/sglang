@@ -58,7 +58,7 @@ class GenerationBatchResult:
     num_cap_tokens: int = 0
     dllm_block_ids: Optional[tuple[int, ...]] = None
     dllm_algo_state: Optional[List[Any]] = None
-    dllm_block_done: Optional[torch.Tensor] = None # FDFO only
+    dllm_block_done: Optional[torch.Tensor] = None  # FDFO only
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

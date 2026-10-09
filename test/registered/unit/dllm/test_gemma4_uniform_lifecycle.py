@@ -6,18 +6,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -124,7 +126,7 @@ def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
     )
 
 
-class TestGemma4ContextLifecycle(unittest.TestCase):
+class TestGemma4ContextLifecycle(CustomTestCase):
     def test_scheduler_uses_standard_extend_for_context_only(self):
         scheduler = SimpleNamespace(
             dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
@@ -391,7 +393,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 )
 
 
-class TestGemma4RequestValidation(unittest.TestCase):
+class TestGemma4RequestValidation(CustomTestCase):
     def _validate(
         self,
         sampling_params=None,

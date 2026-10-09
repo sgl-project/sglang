@@ -572,7 +572,9 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         block_ids = (
-            tuple(req.dllm_block_id for req in batch.reqs) if batch is not None else None
+            tuple(req.dllm_block_id for req in batch.reqs)
+            if batch is not None
+            else None
         )
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:

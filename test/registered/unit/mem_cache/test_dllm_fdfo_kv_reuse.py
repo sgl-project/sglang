@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -126,7 +128,7 @@ def _seed_retained_block(pool, req, values):
     )
 
 
-class TestDllmFdfoKvReuse(unittest.TestCase):
+class TestDllmFdfoKvReuse(CustomTestCase):
     def setUp(self):
         self.block_size = 4
         self.pool = ReqToTokenPool(
@@ -504,7 +506,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(manager.staging_queue, [])
 
 
-class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
+class TestDllmFdfoResolvedBlockKeepsRow(CustomTestCase):
     def test_resolved_block_keeps_row_until_next_block(self):
         """A resolved FDFO block used to hand its row back to the pool while the
         request kept running. An abort before the next block then skipped

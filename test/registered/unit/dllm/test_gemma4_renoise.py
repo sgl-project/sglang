@@ -15,6 +15,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,7 +99,7 @@ class _FakeRunner:
         )
 
 
-class TestGemma4Renoise(unittest.TestCase):
+class TestGemma4Renoise(CustomTestCase):
     def _initialize(self, algorithm, batch, vocab_size=4, hidden_size=3):
         weight = torch.arange(vocab_size * hidden_size, dtype=torch.float32).view(
             vocab_size, hidden_size

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -21,6 +22,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -87,7 +89,7 @@ def _get_empty_dllm_batch(manager):
     return SchedulerDllmMixin.get_new_batch_dllm(scheduler, SimpleNamespace(reqs=[]))
 
 
-class TestDllmResultSnapshot(unittest.TestCase):
+class TestDllmResultSnapshot(CustomTestCase):
     def test_queue_snapshot_preserves_dllm_dispatch(self):
         config = SimpleNamespace(
             first_done_first_out_mode=True, requires_separate_context_encoding=False
@@ -100,7 +102,7 @@ class TestDllmResultSnapshot(unittest.TestCase):
         self.assertEqual(snapshot.batch_size(), 1)
 
 
-class TestFdfoLowConfidenceOverlap(unittest.TestCase):
+class TestFdfoLowConfidenceOverlap(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             attention_backend="torch_native", dcp_size=1
@@ -309,7 +311,7 @@ class TestFdfoLowConfidenceOverlap(unittest.TestCase):
         self.assertIsNone(result.dllm_block_ids)
 
 
-class TestDllmResultProcessing(unittest.TestCase):
+class TestDllmResultProcessing(CustomTestCase):
     def _process(
         self,
         *,
