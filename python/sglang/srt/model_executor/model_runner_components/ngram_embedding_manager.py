@@ -119,6 +119,9 @@ class NgramEmbeddingManager:
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
+        # The skip mask is per-forward: an extend batch that becomes the running
+        # decode batch must not carry it, or it no longer matches the batch size.
+        batch.ne_skip_token_table_update = None
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
             column_starts = []

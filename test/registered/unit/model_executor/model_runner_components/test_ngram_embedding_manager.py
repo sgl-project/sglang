@@ -11,7 +11,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ForwardMode  # noqa: E402
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E402
+    NgramEmbeddingManager,
     update_ngram_token_table_after_sampling,
 )
 
@@ -122,6 +124,24 @@ class TestNgramTokenTableUpdate(CustomTestCase):
             torch.equal(info.out_req_lens, torch.ones(3, dtype=torch.int32))
         )
         self.assertIsNone(kwargs["ignore_tokens"])
+
+    def test_decode_batch_drops_stale_chunked_prefill_mask(self):
+        # An extend batch with a chunked req becomes the running decode batch
+        # after the chunked req is filtered out; its old mask must not survive.
+        manager = NgramEmbeddingManager(
+            enabled=True, table=torch.zeros((8, 16), dtype=torch.int32), n=3
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[object(), object()],
+            ne_token_table=None,
+            ne_skip_token_table_update=torch.tensor([False, False, True]),
+        )
+
+        manager.prepare_for_forward(batch, chunked_req=None)
+
+        self.assertIs(batch.ne_token_table, manager.table)
+        self.assertIsNone(batch.ne_skip_token_table_update)
 
 
 if __name__ == "__main__":
