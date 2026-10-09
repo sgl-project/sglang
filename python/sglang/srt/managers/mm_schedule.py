@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -678,11 +679,34 @@ def _count_mm_tokens_in_extend(
     return num_mm_tokens
 
 
+def _check_exact_embedding_length(
+    embedding: torch.Tensor, num_mm_tokens_in_input_ids: int
+) -> torch.Tensor:
+    # Chunk extraction has already selected the rows for this extend window, so
+    # any mismatch means rows would land on the wrong placeholder tokens.
+    num_mm_tokens_in_embedding = _embedding_token_count(embedding)
+    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+        hint = ""
+        if get_schedule().chunked_prefill_size != -1:
+            hint = (
+                " Chunked prefill is enabled; check that embedding chunks match "
+                "the requested token spans."
+            )
+        raise RuntimeError(
+            "Multimodal embedding length does not match the placeholder tokens in "
+            f"the input text: {num_mm_tokens_in_input_ids=} vs "
+            f"{num_mm_tokens_in_embedding=}.{hint}"
+        )
+    return embedding
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
     num_mm_tokens_in_input_ids: int,
     logger,
 ) -> torch.Tensor:
+    if envs.SGLANG_ENABLE_STRICT_MM_EMBEDDING_LENGTH.get():
+        return _check_exact_embedding_length(embedding, num_mm_tokens_in_input_ids)
     num_mm_tokens_in_embedding = embedding.shape[0]
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
