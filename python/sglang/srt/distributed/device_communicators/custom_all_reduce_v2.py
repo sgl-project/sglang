@@ -25,6 +25,7 @@ the kernel captured in the graph dereferences its row at replay time.
 """
 
 import logging
+import math
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
@@ -52,10 +53,11 @@ from sglang.srt.utils.cuda_vmm_utils import (
 )
 
 from .configs.custom_all_reduce_v2 import (
-    Row,
+    MC,
+    PULL2,
+    PUSH1,
     get_all_reduce_config,
     get_supported_world_sizes,
-    pick,
 )
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
@@ -139,23 +141,16 @@ class CustomAllReduceV2:
         self.world_size = dist.get_world_size(group=self.group)
         base_config = get_all_reduce_config(self.world_size)
         if max_pull_size is None:
-            max_pull_size = min(base_config.max_pull_bytes, max_size)
+            max_pull_size = min(base_config.max_bytes(push=False), max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_bytes(push=True), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
             max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
-        # forced sizes bypass the tuned NCCL crossover: lift each direction's
-        # ceiling to the forced workspace capacity (the clip() below only
-        # ever lowers it)
-        if _FORCE_PULL_SIZE_KB is not None:
-            base_config = base_config.with_pull_fallback(max_pull_size)
-        if _FORCE_PUSH_SIZE_KB is not None:
-            base_config = base_config.with_push_max(max_push_size)
         # Zero on either pull knob opts out of the pull half entirely: no
-        # pull plane at all, and every pull algo disabled below by clipping
-        # its rows to 0. Push-only callers (the fused qk-norm instances)
+        # pull plane at all, and every pull algo disabled by its zero
+        # capacity in _pick_config. Push-only callers (the fused qk-norm instances)
         # take this path rather than allocating a placeholder buffer just to
         # satisfy a constructor.
         self.pull_enabled = max_pull_blocks != 0 and max_pull_size > 0
@@ -172,9 +167,15 @@ class CustomAllReduceV2:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
-        self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
-        )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
+        self.config = base_config._replace(
+            num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks
+        )
+        # forced sizes bypass the tuned NCCL crossover: fill each forced
+        # workspace up to its capacity
+        if _FORCE_PUSH_SIZE_KB is not None:
+            self._add_rows(head=((math.inf, PUSH1),))
+        if _FORCE_PULL_SIZE_KB is not None:
+            self.uncap_pull_thresholds()
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
@@ -270,7 +271,11 @@ class CustomAllReduceV2:
                 mc_semaphore=mc_at(sem_offset),
             )
         if not self.has_multicast or not self.pull_enabled:
-            self.config = self.config.without_multicast()._replace(num_mc_blocks=None)
+            self.config = self.config._replace(
+                graph=tuple(r for r in self.config.graph if r[1] != MC),
+                eager=tuple(r for r in self.config.eager if r[1] != MC),
+                num_mc_blocks=None,
+            )
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)
         if self.config.num_mc_blocks is not None:
@@ -297,8 +302,13 @@ class CustomAllReduceV2:
         and tests that must keep every sweep size on the custom-AR path can
         extend them with ``2shot_pull`` up to ``max_pull_size``.
         """
-        if self.pull_enabled:
-            self.config = self.config.with_pull_fallback(self.max_pull_size)
+        self._add_rows(tail=((math.inf, PULL2),))
+
+    def _add_rows(self, head: tuple = (), tail: tuple = ()) -> None:
+        self.config = self.config._replace(
+            graph=head + self.config.graph + tail,
+            eager=head + self.config.eager + tail,
+        )
 
     def _can_use_graph(self) -> bool:
         # `_graph_mode_allowed` is only set inside `capture()`, so the eager
@@ -311,8 +321,15 @@ class CustomAllReduceV2:
             and torch.cuda.is_current_stream_capturing()
         )
 
-    def _pick_config(self, nbytes: int, can_use_graph: bool) -> Optional[Row]:
-        return pick(self.config.graph if can_use_graph else self.config.eager, nbytes)
+    def _pick_config(
+        self, nbytes: int, can_use_graph: bool
+    ) -> Optional[Tuple[AllReduceAlgo, bool]]:
+        table = self.config.graph if can_use_graph else self.config.eager
+        for max_bytes, (algo, use_multicast) in table:
+            cap = self.max_push_size if algo.is_push() else self.max_pull_size
+            if nbytes <= min(max_bytes, cap):
+                return algo, use_multicast
+        return None
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
@@ -339,9 +356,9 @@ class CustomAllReduceV2:
             # TODO: enhance this override pattern
             algo, use_multicast = self.override_algo, False
         else:
-            row = self._pick_config(nbytes, can_use_graph)
-            assert row is not None, f"No config for {nbytes = }"
-            algo, use_multicast = row.algo, row.multicast
+            config = self._pick_config(nbytes, can_use_graph)
+            assert config is not None, f"No config for {nbytes = }"
+            algo, use_multicast = config
         use_graph = can_use_graph and not algo.is_push() and not use_multicast
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(

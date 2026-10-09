@@ -7,7 +7,7 @@ arch and world size.
 """
 
 from functools import cache
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -16,230 +16,131 @@ from sglang.kernels.ops.communication.all_reduce import AllReduceAlgo
 KB, MB = 1024, 1024 * 1024
 
 
-class Row(NamedTuple):
-    """One dispatch-table entry: run ``algo`` for ``min_bytes..max_bytes``."""
-
-    algo: AllReduceAlgo
-    max_bytes: int
-    multicast: bool = False
-    min_bytes: int = 0
-
-    def contains(self, nbytes: int) -> bool:
-        return self.min_bytes <= nbytes <= self.max_bytes
-
-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> "Row":
-        cap = max_push_bytes if self.algo.is_push() else max_pull_bytes
-        return self._replace(
-            max_bytes=min(self.max_bytes, cap), min_bytes=min(self.min_bytes, cap)
-        )
-
-
-# A table is tried in order and the first row containing ``nbytes`` wins; past
-# the last row the caller falls back to NCCL. ``multicast`` rows are dropped
-# when the group has no multicast.
-Table = Tuple[Row, ...]
-
-
-def pick(table: Table, nbytes: int) -> Optional[Row]:
-    return next((row for row in table if row.contains(nbytes)), None)
-
-
-def push1(max_bytes: float) -> Row:
-    return Row(AllReduceAlgo.ONE_SHOT_PUSH, int(max_bytes))
-
-
-def pull1(max_bytes: float) -> Row:
-    return Row(AllReduceAlgo.ONE_SHOT_PULL, int(max_bytes))
-
-
-def pull2(max_bytes: float) -> Row:
-    return Row(AllReduceAlgo.TWO_SHOT_PULL, int(max_bytes))
-
-
-def mc(max_bytes: float, min_bytes: float = 0) -> Row:
-    return Row(AllReduceAlgo.TWO_SHOT_PULL, int(max_bytes), True, int(min_bytes))
+# Algos as (AllReduceAlgo, use_multicast).
+PUSH1 = (AllReduceAlgo.ONE_SHOT_PUSH, False)
+PULL1 = (AllReduceAlgo.ONE_SHOT_PULL, False)
+PULL2 = (AllReduceAlgo.TWO_SHOT_PULL, False)
+MC = (AllReduceAlgo.TWO_SHOT_PULL, True)
 
 
 class AllReduceConfig(NamedTuple):
     """All tuning knobs for a single (arch, world_size).
 
     ``graph`` / ``eager`` are the dispatch tables for CUDA-graph capture and
-    eager mode. Block-count knobs apply to the kernel grid:
+    eager mode: ``(max_bytes, algo)`` rows tried in order, the first with
+    ``nbytes <= max_bytes`` wins, NCCL past the end. ``MC`` rows are skipped
+    when multicast is unavailable. Block-count knobs apply to the kernel grid:
       - ``num_push_blocks``: 1shot_push grid (bound to the counter array)
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
     """
 
-    graph: Table
-    eager: Table
+    graph: tuple
+    eager: tuple
     num_push_blocks: int
     num_pull_blocks: int
     num_mc_blocks: Optional[int]
 
-    def _max_bytes(self, push: bool) -> int:
+    def max_bytes(self, push: bool) -> int:
         rows = self.graph + self.eager
-        return max((r.max_bytes for r in rows if r.algo.is_push() == push), default=0)
-
-    @property
-    def max_push_bytes(self) -> int:
-        return self._max_bytes(push=True)
-
-    @property
-    def max_pull_bytes(self) -> int:
-        return self._max_bytes(push=False)
-
-    def map_tables(self, fn: Callable[[Table], Table]) -> "AllReduceConfig":
-        return self._replace(graph=fn(self.graph), eager=fn(self.eager))
-
-    def clip(self, **kwargs) -> "AllReduceConfig":
-        return self.map_tables(lambda t: tuple(r.clip(**kwargs) for r in t))
-
-    def without_multicast(self) -> "AllReduceConfig":
-        return self.map_tables(lambda t: tuple(r for r in t if not r.multicast))
-
-    def with_push_max(self, max_bytes: int) -> "AllReduceConfig":
-        def replace(row: Row) -> Row:
-            if row.algo is AllReduceAlgo.ONE_SHOT_PUSH:
-                return row._replace(max_bytes=max_bytes)
-            return row
-
-        return self.map_tables(lambda t: tuple(map(replace, t)))
-
-    def with_pull_fallback(self, max_bytes: int) -> "AllReduceConfig":
-        return self.map_tables(lambda t: t + (pull2(max_bytes),))
-
-
-def _config_builder(num_push_blocks, num_pull_blocks, num_mc_blocks):
-    def config(world_size: int, *, graph: Table, eager: Optional[Table] = None):
-        return AllReduceConfig(
-            graph=graph,
-            eager=graph if eager is None else eager,
-            num_push_blocks=num_push_blocks,
-            num_pull_blocks=num_pull_blocks(world_size),
-            num_mc_blocks=num_mc_blocks(world_size),
-        )
-
-    return config
+        return int(max((b for b, (a, _) in rows if a.is_push() == push), default=0))
 
 
 # SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.
 @cache
 def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
-    config = _config_builder(
-        num_sm, lambda ws: num_sm if ws == 2 else 96, mc_blocks.get
-    )
 
+    def config(world_size: int, graph: tuple, eager: tuple = ()) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=graph,
+            eager=eager or graph,
+            num_push_blocks=num_sm,
+            num_pull_blocks=num_sm if world_size == 2 else 96,
+            num_mc_blocks=mc_blocks.get(world_size),
+        )
+
+    # fmt: off
     return {
-        2: config(
-            2,
-            graph=(push1(8 * MB), pull1(32 * MB), pull2(128 * MB)),
-            eager=(push1(16 * MB), pull1(128 * MB), pull2(128 * MB)),
-        ),
-        3: config(
-            3,
-            graph=(push1(4 * MB), pull2(128 * MB)),
-            eager=(push1(8 * MB), pull2(32 * MB)),
-        ),
-        4: config(
-            4,
-            graph=(push1(2.25 * MB), pull2(128 * MB)),
-            eager=(push1(3 * MB), pull2(32 * MB)),
-        ),
-        5: config(
-            5,
-            graph=(push1(1.5 * MB), pull2(128 * MB)),
-            eager=(push1(2 * MB), mc(32 * MB), pull2(32 * MB)),
-        ),
-        6: config(
-            6,
-            graph=(push1(1 * MB), pull2(128 * MB)),
-            eager=(push1(1.25 * MB), mc(64 * MB), pull2(64 * MB)),
-        ),
-        7: config(
-            7,
-            graph=(push1(640 * KB), pull2(128 * MB)),
-            eager=(push1(1 * MB), mc(64 * MB), pull2(64 * MB)),
-        ),
-        8: config(
-            8,
-            graph=(push1(512 * KB), mc(128 * MB, 8 * MB), pull2(128 * MB)),
-            eager=(push1(768 * KB), mc(128 * MB), pull2(128 * MB)),
-        ),
-        16: config(16, graph=(push1(256 * KB), mc(128 * MB), pull2(128 * MB))),
+        2: config(2, graph=((8 * MB, PUSH1), (32 * MB, PULL1), (128 * MB, PULL2)),
+                     eager=((16 * MB, PUSH1), (128 * MB, PULL1))),
+        3: config(3, graph=((4 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((8 * MB, PUSH1), (32 * MB, PULL2))),
+        4: config(4, graph=((2.25 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((3 * MB, PUSH1), (32 * MB, PULL2))),
+        5: config(5, graph=((1.5 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((2 * MB, PUSH1), (32 * MB, MC), (32 * MB, PULL2))),
+        6: config(6, graph=((1 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((1.25 * MB, PUSH1), (64 * MB, MC), (64 * MB, PULL2))),
+        7: config(7, graph=((640 * KB, PUSH1), (128 * MB, PULL2)),
+                     eager=((1 * MB, PUSH1), (64 * MB, MC), (64 * MB, PULL2))),
+        8: config(8, graph=((512 * KB, PUSH1), (8 * MB - 1, PULL2), (128 * MB, MC), (128 * MB, PULL2)),
+                     eager=((768 * KB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        16: config(16, graph=((256 * KB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
     }
+    # fmt: on
 
 
 # SM107 (Rubin, VR)
 @cache
 def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {4: 128, 5: 128, 6: 128, 7: 128, 8: 96, 16: 32}
-    config = _config_builder(num_sm, lambda ws: min(192, num_sm), mc_blocks.get)
 
+    def config(world_size: int, graph: tuple, eager: tuple = ()) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=graph,
+            eager=eager or graph,
+            num_push_blocks=num_sm,
+            num_pull_blocks=min(192, num_sm),
+            num_mc_blocks=mc_blocks.get(world_size),
+        )
+
+    # fmt: off
     return {
-        2: config(2, graph=(push1(128 * MB), pull2(128 * MB))),
-        3: config(
-            3,
-            graph=(push1(19.625 * MB), pull2(128 * MB)),
-            eager=(push1(39.188 * MB), pull2(128 * MB)),
-        ),
-        4: config(
-            4,
-            graph=(push1(6.938 * MB), pull2(128 * MB)),
-            eager=(push1(9.812 * MB), mc(128 * MB), pull2(128 * MB)),
-        ),
-        5: config(5, graph=(push1(6.938 * MB), mc(128 * MB), pull2(128 * MB))),
-        6: config(6, graph=(push1(4.875 * MB), mc(128 * MB), pull2(128 * MB))),
-        7: config(7, graph=(push1(3.438 * MB), mc(128 * MB), pull2(128 * MB))),
-        8: config(8, graph=(push1(2.438 * MB), mc(128 * MB), pull2(128 * MB))),
-        16: config(16, graph=(push1(832 * KB), mc(128 * MB), pull2(128 * MB))),
+        2: config(2, graph=((128 * MB, PUSH1), (128 * MB, PULL2))),
+        3: config(3, graph=((19.625 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((39.188 * MB, PUSH1), (128 * MB, PULL2))),
+        4: config(4, graph=((6.938 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((9.812 * MB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        5: config(5, graph=((6.938 * MB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        6: config(6, graph=((4.875 * MB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        7: config(7, graph=((3.438 * MB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        8: config(8, graph=((2.438 * MB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
+        16: config(16, graph=((832 * KB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
     }
+    # fmt: on
 
 
 # SM90 (Hopper, H100/H200). Tuned on H200.
 @cache
 def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
-    config = _config_builder(
-        num_sm, lambda ws: 64, lambda ws: None if ws < 4 else 128 // ws
-    )
+    def config(world_size: int, graph: tuple, eager: tuple = ()) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=graph,
+            eager=eager or graph,
+            num_push_blocks=num_sm,
+            num_pull_blocks=64,
+            num_mc_blocks=None if world_size < 4 else 128 // world_size,
+        )
 
+    # fmt: off
     return {
-        2: config(
-            2,
-            graph=(push1(16 * MB), pull1(128 * MB), pull2(128 * MB)),
-            eager=(push1(32 * MB), pull1(128 * MB), pull2(128 * MB)),
-        ),
-        3: config(
-            3,
-            graph=(push1(1.25 * MB), pull2(128 * MB)),
-            eager=(push1(3 * MB), pull2(16 * MB)),
-        ),
-        4: config(
-            4,
-            graph=(push1(384 * KB), pull2(128 * MB)),
-            eager=(push1(896 * KB), mc(32 * MB), pull2(32 * MB)),
-        ),
-        5: config(
-            5,
-            graph=(push1(192 * KB), pull2(32 * MB)),
-            eager=(push1(384 * KB), mc(32 * MB), pull2(32 * MB)),
-        ),
-        6: config(
-            6,
-            graph=(push1(128 * KB), mc(32 * MB, 8 * MB), pull2(32 * MB)),
-            eager=(push1(192 * KB), mc(32 * MB), pull2(32 * MB)),
-        ),
-        7: config(
-            7,
-            graph=(push1(128 * KB), mc(32 * MB, 1 * MB), pull2(32 * MB)),
-            eager=(push1(128 * KB), mc(32 * MB), pull2(32 * MB)),
-        ),
-        8: config(
-            8,
-            graph=(push1(128 * KB), mc(128 * MB, 512 * KB), pull2(32 * MB)),
-            eager=(push1(128 * KB), mc(128 * MB), pull2(128 * MB)),
-        ),
+        2: config(2, graph=((16 * MB, PUSH1), (128 * MB, PULL1)),
+                     eager=((32 * MB, PUSH1), (128 * MB, PULL1))),
+        3: config(3, graph=((1.25 * MB, PUSH1), (128 * MB, PULL2)),
+                     eager=((3 * MB, PUSH1), (16 * MB, PULL2))),
+        4: config(4, graph=((384 * KB, PUSH1), (128 * MB, PULL2)),
+                     eager=((896 * KB, PUSH1), (32 * MB, MC), (32 * MB, PULL2))),
+        5: config(5, graph=((192 * KB, PUSH1), (32 * MB, PULL2)),
+                     eager=((384 * KB, PUSH1), (32 * MB, MC), (32 * MB, PULL2))),
+        6: config(6, graph=((128 * KB, PUSH1), (8 * MB - 1, PULL2), (32 * MB, MC), (32 * MB, PULL2)),
+                     eager=((192 * KB, PUSH1), (32 * MB, MC), (32 * MB, PULL2))),
+        7: config(7, graph=((128 * KB, PUSH1), (1 * MB - 1, PULL2), (32 * MB, MC), (32 * MB, PULL2)),
+                     eager=((128 * KB, PUSH1), (32 * MB, MC), (32 * MB, PULL2))),
+        8: config(8, graph=((128 * KB, PUSH1), (512 * KB - 1, PULL2), (128 * MB, MC), (32 * MB, PULL2)),
+                     eager=((128 * KB, PUSH1), (128 * MB, MC), (128 * MB, PULL2))),
     }
+    # fmt: on
 
 
 @cache
@@ -254,8 +155,8 @@ def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
         return _sm100_configs(num_sm)
 
     default = AllReduceConfig(
-        graph=(push1(1 * MB), pull2(16 * MB)),
-        eager=(push1(1 * MB), pull2(16 * MB)),
+        graph=((1 * MB, PUSH1), (16 * MB, PULL2)),
+        eager=((1 * MB, PUSH1), (16 * MB, PULL2)),
         num_push_blocks=num_sm,
         num_pull_blocks=num_sm,
         num_mc_blocks=None,
