@@ -98,7 +98,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     @abstractmethod
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
@@ -153,13 +153,13 @@ class VanillaMarkov(BaseDSparkMarkovHead):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids)), state
+        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
     def sample_block_greedy_fused(
         self,
@@ -247,13 +247,13 @@ class GatedMarkovHead(VanillaMarkov):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        gate = self.compute_gate(token_ids, hidden_states).to(
+        prev_embeddings = self.get_prev_embeddings(prev_tokens)
+        gate = self.compute_gate(prev_tokens, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
         return self.project_bias(gate * prev_embeddings), state
@@ -304,12 +304,12 @@ class RNNHead(VanillaMarkov):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        prev_emb = self.get_prev_embeddings(token_ids)
+        prev_emb = self.get_prev_embeddings(prev_tokens)
         state, bias = self._rnn_step(state, prev_emb, hidden_states)
         return bias, state
 
