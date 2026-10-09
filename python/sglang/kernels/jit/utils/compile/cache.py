@@ -219,8 +219,10 @@ def _target_tag() -> str:
         return f"sm{arch.major}{arch.minor}{arch.suffix}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
-    arch = get_jit_cuda_arch()
-    return f"mp{arch.major}{arch.minor}{arch.suffix}"
+    if is_musa_runtime():
+        arch = get_jit_cuda_arch()
+        return f"mp{arch.major}{arch.minor}{arch.suffix}"
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 @cache_once

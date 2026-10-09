@@ -92,7 +92,9 @@ def device_compiler_path() -> str:
         return os.path.join(cuda_home(), "bin", "nvcc")
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
-    return os.path.join(musa_home(), "bin", "mcc")
+    if is_musa_runtime():
+        return os.path.join(musa_home(), "bin", "mcc")
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 @cache_once
@@ -124,18 +126,20 @@ def gpu_arch_name() -> str:
                 "Cannot detect ROCm gcnArchName; the JIT cache target degrades."
             )
             return "unknown"
-    configured = os.environ.get("MTGPU_TARGET")
-    if configured:
-        return configured
-    try:
-        device = torch.musa.current_device()
-        properties = torch.musa.get_device_properties(device)
-        return f"mp_{int(properties.major)}{int(properties.minor)}"
-    except Exception:
-        logger.warning(
-            "Cannot detect MUSA architecture; the JIT cache target degrades."
-        )
-        return "unknown"
+    if is_musa_runtime():
+        configured = os.environ.get("MTGPU_TARGET")
+        if configured:
+            return configured
+        try:
+            device = torch.musa.current_device()
+            properties = torch.musa.get_device_properties(device)
+            return f"mp_{int(properties.major)}{int(properties.minor)}"
+        except Exception:
+            logger.warning(
+                "Cannot detect MUSA architecture; the JIT cache target degrades."
+            )
+            return "unknown"
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 @cache_once
@@ -171,7 +175,9 @@ def target_flags() -> List[str]:
         return [f"-gencode=arch=compute_{target},code=sm_{target}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
-    return [f"--offload-arch={gpu_arch_name()}"]
+    if is_musa_runtime():
+        return [f"--offload-arch={gpu_arch_name()}"]
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 def base_cxx_flags() -> List[str]:
@@ -189,7 +195,9 @@ def base_cuda_flags() -> List[str]:
         return ["-Xcompiler", "-fPIC"]
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
-    return ["-fPIC", "-x", "musa"]
+    if is_musa_runtime():
+        return ["-fPIC", "-x", "musa"]
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 def base_include_paths() -> List[str]:
@@ -198,7 +206,9 @@ def base_include_paths() -> List[str]:
         return list(includes)
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
-    return [*includes, f"{musa_home()}/include"]
+    if is_musa_runtime():
+        return [*includes, f"{musa_home()}/include"]
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 def base_link_flags(*, with_device: bool) -> List[str]:
@@ -216,7 +226,9 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{musa_home()}/lib", "-lmusa", "-lmusart"]
+    if is_musa_runtime():
+        return flags + [f"-L{musa_home()}/lib", "-lmusa", "-lmusart"]
+    raise RuntimeError("Unsupported JIT runtime")
 
 
 def compilers() -> Tuple[str, str]:

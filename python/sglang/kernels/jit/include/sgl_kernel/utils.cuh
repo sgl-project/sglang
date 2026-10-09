@@ -65,12 +65,12 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #endif
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
-#else
+#else // USE_MUSA
 #include <musa_bf16.h>
 #include <musa_fp16.h>
 #include <musa_fp8.h>
 #include <musa_runtime.h>
-#endif
+#endif // USE_MUSA
 
 #if defined(USE_MUSA)
 #ifndef __grid_constant__

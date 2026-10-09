@@ -81,8 +81,8 @@ def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
         )
     )
 
-    assert "device_compiler = /opt/musa/bin/mcc" in build_file
-    assert "command = $device_compiler " in build_file
+    assert "compiler = /opt/musa/bin/mcc" in build_file
+    assert "command = $compiler " in build_file
     assert "--offload-arch=mp_31" in build_file
     assert "-x musa" in build_file
     assert "nvcc =" not in build_file
