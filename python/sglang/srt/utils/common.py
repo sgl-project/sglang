@@ -657,9 +657,32 @@ def is_device_stream_capturing(device: torch.device) -> bool:
     return torch.get_device_module(device).is_current_stream_capturing()
 
 
+def _amdgpu_memory_mib_from_torch() -> float:
+    """VRAM capacity in MiB from the live HIP devices.
+
+    rocminfo on some hosts aborts before it prints pool sizes. Callers compare
+    this value with ``N * 1024`` MiB.
+    """
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        raise RuntimeError(
+            "rocminfo returned no GPU memory and no HIP device is visible."
+        )
+    totals = [
+        torch.cuda.get_device_properties(i).total_memory / (1024 * 1024)
+        for i in range(torch.cuda.device_count())
+    ]
+    capacity = min(totals)
+    logger.warning(
+        "rocminfo returned no GPU memory size; using %.0f MiB from the live HIP device",
+        capacity,
+    )
+    return capacity
+
+
 def get_amdgpu_memory_capacity():
     try:
-        # Run rocm-smi and capture the output
+        # Run rocminfo and capture the output. The command name in older logs
+        # said rocm-smi; the pipeline still reads rocminfo pool sizes.
         result = subprocess.run(
             [
                 "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
@@ -669,20 +692,20 @@ def get_amdgpu_memory_capacity():
             shell=True,
             text=True,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
-
         # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
+        memory_values = []
+        for mem in result.stdout.splitlines():
+            token = mem.split("(")[0].strip()
+            if not token:
+                continue
+            try:
+                memory_values.append(float(token) / 1024)
+            except ValueError:
+                continue
 
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
+        if memory_values:
+            return min(memory_values)
+        return _amdgpu_memory_mib_from_torch()
 
     except FileNotFoundError:
         raise RuntimeError(
