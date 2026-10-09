@@ -1043,6 +1043,7 @@ class Req(ReqDllmMixin):
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
@@ -1053,7 +1054,6 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        encoding_format: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid

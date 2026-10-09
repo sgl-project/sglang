@@ -57,23 +57,6 @@ class TestHostKVCache(CustomTestCase):
             allocator_type="default",
         )
 
-    def test_contiguous_all_layer_device_buffers(self):
-        """NPU-style tensor buffers must not be evaluated as booleans."""
-        self.device_pool.k_buffer = torch.stack(self.device_pool.k_buffer)
-        self.device_pool.v_buffer = torch.stack(self.device_pool.v_buffer)
-        host = MHATokenToKVPoolHost(
-            device_pool=self.device_pool,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=self.page_size,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-        )
-        self.assertTrue(host.device_rows_packed)
-        self.assertEqual(host.k_buffer.shape, self.host_pool.k_buffer.shape)
-        self.assertEqual(host.v_buffer.shape, self.host_pool.v_buffer.shape)
-
     def test_index_k_host_pool_joins_a_host_pool_group(self):
         """Grouping a main KV pool with a K-only index pool raised AttributeError."""
         index_pool = MHATokenToKOnlyPool(

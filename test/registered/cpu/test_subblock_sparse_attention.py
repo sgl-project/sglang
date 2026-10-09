@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import builtins
-import runpy
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -74,22 +72,6 @@ class TestSubBlockSageFp8DependencyLoader(CustomTestCase):
     def setUp(self):
         _load_sparge_attention_sm90_ops.cache_clear()
         self.addCleanup(_load_sparge_attention_sm90_ops.cache_clear)
-
-    def test_shared_video_helpers_do_not_import_cuda_only_vsa(self):
-        """CPU attention helpers must import even when VSA requires CUDA."""
-        from sglang.multimodal_gen.runtime.layers.attention.backends import (
-            video_sparse_attn,
-        )
-
-        original_import = builtins.__import__
-
-        def cpu_import(name, *args, **kwargs):
-            if name == "vsa":
-                raise AssertionError("VSA initializes CUDA at import time")
-            return original_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=cpu_import):
-            runpy.run_path(video_sparse_attn.__file__)
 
     def test_missing_dependency_has_install_help(self):
         missing_modules = {

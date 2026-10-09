@@ -869,14 +869,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
-        if isinstance(obj, EmbeddingReqInput) and obj.encoding_format == "tensor":
-            if request is not None:
-                raise ValueError(
-                    "encoding_format='tensor' is only supported by Engine.encode/"
-                    "async_encode, not HTTP endpoints"
-                )
-            if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-                raise ValueError("encoding_format='tensor' requires dense embeddings")
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)

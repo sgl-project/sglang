@@ -478,8 +478,6 @@ class ORJSONRoute(APIRoute):
 
 app = FastAPI(
     lifespan=lifespan,
-    # SGLang owns tracing; native FastAPI spans bypass its trace-level controls.
-    telemetry={"tracing": False},
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
 app.router.route_class = ORJSONRoute

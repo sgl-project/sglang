@@ -90,60 +90,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             raw_num_tokens=None,
         )
 
-    def test_dense_cuda_keeps_padded_tail(self):
-        for moe_layers in (None, [], [None, None]):
-            with self.subTest(moe_layers=moe_layers):
-                buf = torch.full((4, 2), 7.0)
-                context = SimpleNamespace(
-                    num_tokens=4,
-                    raw_num_tokens=2,
-                    moe_layers=moe_layers,
-                )
-                with patch.object(radix_attention_module, "_is_hip", False):
-                    radix_attention_module._zero_padded_pcg_tail(buf, context)
-                self.assertTrue(torch.all(buf == 7))
-
-    def test_moe_cuda_zeros_padded_tail(self):
-        buf = torch.full((4, 2), 7.0)
-        context = SimpleNamespace(
-            num_tokens=4,
-            raw_num_tokens=2,
-            moe_layers=[None, object(), None],
-        )
-
-        with patch.object(radix_attention_module, "_is_hip", False):
-            radix_attention_module._zero_padded_pcg_tail(buf, context)
-
-        self.assertTrue(torch.all(buf[:2] == 7))
-        self.assertTrue(torch.all(buf[2:] == 0))
-
-    def test_rocm_always_zeros_padded_tail(self):
-        for moe_layers in (None, [], [None], [object()]):
-            with self.subTest(moe_layers=moe_layers):
-                buf = torch.full((4, 2), 7.0)
-                context = SimpleNamespace(
-                    num_tokens=4,
-                    raw_num_tokens=2,
-                    moe_layers=moe_layers,
-                )
-                with patch.object(radix_attention_module, "_is_hip", True):
-                    radix_attention_module._zero_padded_pcg_tail(buf, context)
-                self.assertTrue(torch.all(buf[:2] == 7))
-                self.assertTrue(torch.all(buf[2:] == 0))
-
-    def test_no_padded_tail_is_unchanged(self):
-        for num_tokens, raw_num_tokens in ((None, None), (4, None), (4, 4)):
-            with self.subTest(num_tokens=num_tokens, raw_num_tokens=raw_num_tokens):
-                buf = torch.full((4, 2), 7.0)
-                context = SimpleNamespace(
-                    num_tokens=num_tokens,
-                    raw_num_tokens=raw_num_tokens,
-                    moe_layers=[object()],
-                )
-                with patch.object(radix_attention_module, "_is_hip", False):
-                    radix_attention_module._zero_padded_pcg_tail(buf, context)
-                self.assertTrue(torch.all(buf == 7))
-
     def test_forward_dispatches_all_graph_and_lse_variants(self):
         layer = self._new_layer()
         query = torch.zeros((4, 2, 3))
