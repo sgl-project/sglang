@@ -1239,7 +1239,8 @@ class Req(ReqDllmMixin):
         # stamp new tree nodes. Allocation itself must NOT read it back when
         # a tree node is available (the checkpoint dedup rebind
         # would make it stale); the only allocation-time reader is the
-        # ChunkCache fallback, which has no tree nodes and no rebind.
+        # radix-disabled fallback, which keeps no nodes past the root and has
+        # no rebind.
         self.kv_rotation_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever

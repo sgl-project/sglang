@@ -32,7 +32,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 
 logger = logging.getLogger(__name__)
 
-register_xpu_ci(est_time=3600, suite="nightly-xpu-4-gpu", nightly=True)
+register_xpu_ci(est_time=3600, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 XPU_FLUX2_CASES = [
     DiffusionTestCase(
