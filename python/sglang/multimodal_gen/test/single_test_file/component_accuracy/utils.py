@@ -358,6 +358,8 @@ def build_accuracy_server_args(
 
     if case.server_args.tp_size is not None:
         kwargs["tp_size"] = case.server_args.tp_size
+    if case.server_args.ep_size is not None:
+        kwargs["ep_size"] = case.server_args.ep_size
     if case.server_args.ulysses_degree is not None:
         kwargs["ulysses_degree"] = case.server_args.ulysses_degree
     if case.server_args.ring_degree is not None:
