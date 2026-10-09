@@ -108,6 +108,16 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _safe_zeros(shape, dtype, device):
+    try:
+        return torch.zeros(shape, dtype=dtype, device=device)
+    except (NotImplementedError, RuntimeError):
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        buf.view(torch.uint8).zero_()
+        return buf
+
 _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
@@ -2404,7 +2414,7 @@ class MHATokenToKVPool(KVCache):
                     x = self._kv_vector_x
                     # K: (num_blocks, H, D_k // X, page, X)
                     self.k_buffer = [
-                        torch.zeros(
+                        _safe_zeros(
                             (
                                 num_blocks,
                                 self.head_num,
@@ -2419,7 +2429,7 @@ class MHATokenToKVPool(KVCache):
                     ]
                     # V: (num_blocks, H, page // X, D_v, X)
                     self.v_buffer = [
-                        torch.zeros(
+                        _safe_zeros(
                             (
                                 num_blocks,
                                 self.head_num,
@@ -2435,11 +2445,11 @@ class MHATokenToKVPool(KVCache):
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
+                        _safe_zeros(k_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
                     self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
+                        _safe_zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
 
