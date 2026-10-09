@@ -57,7 +57,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         else:
             continue
         if ".." in relative.parts[:1]:
-            raise ValueError(f"Resolved cgroup memory path is outside of readable namespace: {membership}")
+            raise RuntimeError(f"Resolved cgroup memory path is outside of readable namespace: {membership}")
         if ".." in relative.parts:
             raise ValueError(f"Cannot resolve cgroup memory path: {membership}")
         directory = mount / relative
