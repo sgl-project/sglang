@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
@@ -76,6 +77,27 @@ def _late_kv_store(attention, x, positions, qkv_a) -> None:
 
 
 bcg_late_kv_store = eager_on_graph(True)(_late_kv_store)
+
+
+def _replay_checked(graph: BreakableCUDAGraph, rows: int) -> None:
+    for i, seg in enumerate(graph._segments):
+        for what, step in (("segment", seg.replay), ("break", None)):
+            if what == "break":
+                if i >= len(graph._break_fns):
+                    continue
+                step = graph._break_fns[i]
+            try:
+                step()
+                torch.cuda.synchronize()
+            except Exception:
+                logger.error(
+                    "Decoder replay graph %d rows: %s %d of %d segments faulted",
+                    rows,
+                    what,
+                    i,
+                    len(graph._segments),
+                )
+                raise
 
 
 def _flatten_state(state: HcState):
@@ -164,7 +186,10 @@ class DecoderReplayGraphs:
                     buf[:num_rows].copy_(t)
                 if graph.num_token_non_padded is not None:
                     graph.num_token_non_padded.fill_(num_rows)
-            graph.graph.replay()
+            if envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get():
+                _replay_checked(graph.graph, rows)
+            else:
+                graph.graph.replay()
         pre = None if graph.pre is None else graph.pre[:num_rows]
         return graph.residual[:num_rows], pre
 
