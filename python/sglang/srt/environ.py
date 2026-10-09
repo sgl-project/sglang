@@ -811,7 +811,10 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    # KV-cache allocator for PD transfer; shared by the Mooncake and NIXL backends.
+    SGLANG_CUSTOM_MEM_POOL = EnvStrWithAlias(
+        None, deprecated_name="SGLANG_MOONCAKE_CUSTOM_MEM_POOL"
+    )
     # Opt-in limit for the number of KV cache indices represented by one
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
@@ -1959,7 +1962,7 @@ class _DeprecatedEnv:
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
-# descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
+# descriptor, use EnvBoolWithAlias / EnvIntWithAlias / EnvStrWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
         note=(

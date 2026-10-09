@@ -25,7 +25,7 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
+        os.environ["SGLANG_CUSTOM_MEM_POOL"] = "true"
         os.environ["MC_FORCE_MNNVL"] = "true"
         cls.model = QWEN3_8B_MODEL_PATH
 
@@ -41,7 +41,7 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+        os.environ.pop("SGLANG_CUSTOM_MEM_POOL")
         os.environ.pop("MC_FORCE_MNNVL")
         super().tearDownClass()
 
