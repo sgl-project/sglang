@@ -12,20 +12,26 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
 )
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers import dp_attention
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
 )
+from sglang.srt.managers.scheduler_components import dp_attn
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
+    _check_folded_counts,
     _fold_batch,
+    _replay_spans,
     drop_folded_rows,
+    encoder_swa_fold_rows,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,12 +88,18 @@ class _Fixture:
             # Slot 3 asks for input logprobs from its 6th new token on.
             extend_logprob_start_lens=[40, 30, 5],
             engram_history=None,
-            global_num_tokens=[self.extend_num_tokens],
+            forward_mode=ForwardMode.EXTEND,
+            # Every request is new to the batch, so each window resets.
+            encoder_swa_reset=[True] * len(REQS),
             global_num_tokens_for_logprob=[1 + 1 + 15],
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
             dp_spec_prefill_coordination_applied=False,
         )
+        # The scheduler's MLP-sync count already includes the rows the fold adds.
+        self.batch.global_num_tokens = [
+            self.extend_num_tokens + encoder_swa_fold_rows(self.batch)
+        ]
         self.folded = _fold_batch(
             batch=self.batch,
             runner=self.runner,
@@ -293,9 +305,9 @@ class TestFoldMlpSync(CustomTestCase):
             fb.prepare_mlp_sync_batch(runner)
 
     def test_folded_rows_count_in_mlp_sync_totals(self):
-        """The scheduler's gathered count covers the scheduled rows only. A folded
-        batch must sync its folded row count, or the padding to that count
-        shrinks input_ids (a negative pad); logprob rows keep their count."""
+        """The scheduler's gathered count covers the folded rows, so the padding to
+        that count never shrinks input_ids (a negative pad); logprob rows keep
+        their count."""
         fx = _Fixture()
         fb = self._forward_batch(fx.folded.batch)
         self._mlp_sync(fb)
@@ -371,6 +383,145 @@ class TestFoldMlpSync(CustomTestCase):
         )
         # One sampled row per replayed request, as the scheduler would count it.
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
+
+
+class TestFoldUnderDpAttention(CustomTestCase):
+    """Attention DP gathers every rank's row count before the forward, so the
+    scheduler must count the replay rows the worker folds in afterwards."""
+
+    DP = 4
+    RANK = 1
+    PEERS = {0: 4096, 2: 0, 3: 130}  # an 4K extend, an idle rank, a 130-row extend
+
+    def test_fold_rows_are_the_rows_the_fold_adds(self):
+        fx = _Fixture()
+        self.assertEqual(_replay_spans(fx.batch), HITS)
+        self.assertEqual(
+            encoder_swa_fold_rows(fx.batch), fx.folded.num_rows - fx.extend_num_tokens
+        )
+        self.assertEqual(encoder_swa_fold_rows(fx.batch), 128 + 64)
+
+    def test_no_fold_rows_without_window_resets(self):
+        fx = _Fixture()
+        for reset, mode in (
+            (None, ForwardMode.EXTEND),  # flag off
+            (
+                [False] * len(REQS),
+                ForwardMode.EXTEND,
+            ),  # later chunks of running requests
+            ([True] * len(REQS), ForwardMode.DECODE),
+            ([True] * len(REQS), ForwardMode.IDLE),
+        ):
+            batch = SimpleNamespace(
+                **{**vars(fx.batch), "encoder_swa_reset": reset, "forward_mode": mode}
+            )
+            self.assertEqual(encoder_swa_fold_rows(batch), 0, (reset, mode))
+
+    def _gather(self, batch, *, folds):
+        """The real scheduler gather on DP rank RANK; the peers report PEERS."""
+
+        def fake_all_gather_single(output, local, group, **_):
+            rows = []
+            for r in range(self.DP):
+                row = local.clone()
+                if r != self.RANK:
+                    row[0] = row[1] = self.PEERS[r]
+                rows.append(row)
+            output.copy_(torch.stack(rows).flatten())
+
+        tbo = MagicMock()
+        tbo.prepare_all_gather.return_value = (False, ForwardMode.EXTEND.value)
+        tbo.compute_output.return_value = (None, ForwardMode.EXTEND)
+        parallel = SimpleNamespace(
+            num_dp_ranks=self.DP,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_group=SimpleNamespace(
+                device_group=object(),
+                device="cpu",
+                cpu_group=object(),
+                active_ranks_cpu=torch.ones(self.DP, dtype=torch.int64),
+            ),
+        )
+        with (
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn, "should_skip_scheduler_all_gather", return_value=False
+            ),
+            patch.object(dp_attn, "get_parallel", return_value=parallel),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                dp_attn, "all_gather_single", side_effect=fake_all_gather_single
+            ),
+        ):
+            return dp_attn.prepare_mlp_sync_batch_raw(
+                batch,
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=None,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=object(),
+                    attn_backend=SimpleNamespace(folds_encoder_swa_replay=folds),
+                ),
+                get_idle_batch=MagicMock(side_effect=AssertionError("has a batch")),
+                disable_cuda_graph=True,
+                require_mlp_tp_gather=True,
+                disable_overlap_schedule=True,
+                offload_tags=set(),
+            )
+
+    def _scheduled_batch(self):
+        fx = _Fixture()
+        batch = SimpleNamespace(
+            **vars(fx.batch),
+            return_logprob=True,
+            batch_size=lambda: len(REQS),
+            spec_info=None,
+            seq_lens_cpu=None,
+            dp_balance_stats=None,
+        )
+        batch.reqs = [
+            SimpleNamespace(rid=f"r{i}", **vars(r)) for i, r in enumerate(batch.reqs)
+        ]
+        return fx, batch
+
+    def test_dp_gather_carries_this_ranks_folded_rows(self):
+        """Every rank sizes its DP gather and scatter buffers from this count; it
+        must be the folded row count the worker will run, not the scheduled one."""
+        fx, batch = self._scheduled_batch()
+        out = self._gather(batch, folds=True)
+        self.assertEqual(out.global_num_tokens, [4096, fx.folded.num_rows, 0, 130])
+        self.assertEqual(fx.folded.num_rows, 282)
+        # The fold leaves each request's sampled-row count unchanged.
+        self.assertEqual(out.global_num_tokens_for_logprob, [4096, 17, 0, 130])
+
+    def test_dp_gather_keeps_scheduled_rows_without_the_fold(self):
+        # Backends that replay in a separate forward keep the scheduled count.
+        _, batch = self._scheduled_batch()
+        out = self._gather(batch, folds=False)
+        self.assertEqual(out.global_num_tokens, [4096, 90, 0, 130])
+
+    def test_folded_batch_checks_its_own_dp_slot(self):
+        """The worker's folded batch must match its slot of the gathered counts;
+        a scheduled-only count there would desync the DP gather, so it raises."""
+        fx = _Fixture()
+        good = [4096, 282, 0, 130]
+        stale = [4096, 90, 0, 130]
+        with (
+            patch.object(dp_attention, "dp_gather_width", return_value=self.DP),
+            patch.object(dp_attention, "dp_gather_slot", return_value=self.RANK),
+        ):
+            _check_folded_counts(
+                folded=SimpleNamespace(
+                    **{**vars(fx.folded.batch), "global_num_tokens": good}
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "does not cover the 282"):
+                _check_folded_counts(
+                    folded=SimpleNamespace(
+                        **{**vars(fx.folded.batch), "global_num_tokens": stale}
+                    )
+                )
 
 
 if __name__ == "__main__":

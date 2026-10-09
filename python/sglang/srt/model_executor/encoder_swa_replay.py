@@ -93,20 +93,34 @@ def run_encoder_swa_replay(worker, batch):
     runner.forward(fb)
 
 
+def encoder_swa_fold_rows(batch) -> int:
+    """Replay rows the worker will fold into this scheduled extend."""
+    if (
+        batch.encoder_swa_reset is None
+        or not batch.forward_mode.is_extend_without_speculative()
+    ):
+        return 0
+    return sum(end - start for _, start, end in _replay_spans(batch))
+
+
+def _replay_spans(batch):
+    # (batch row, replay start, cached-prefix end) of each hit whose window resets.
+    return [
+        (i, max(0, end - 128), end)
+        for i, (reset, end) in enumerate(
+            zip(batch.encoder_swa_reset, batch.prefix_lens)
+        )
+        if reset and end
+    ]
+
+
 def _reset_windows_and_collect_hits(*, batch, window):
-    rows = []
     for i, reset in enumerate(batch.encoder_swa_reset):
-        if not reset:
-            continue
-        window.reset(batch.req_pool_indices[i : i + 1])
-        end = batch.prefix_lens[i]
-        if not end:
-            continue
-        if end % 2:
-            raise ValueError(
-                "encoder SWA replay requires an even cached-prefix boundary"
-            )
-        rows.append((i, max(0, end - 128), end))
+        if reset:
+            window.reset(batch.req_pool_indices[i : i + 1])
+    rows = _replay_spans(batch)
+    if any(end % 2 for _, _, end in rows):
+        raise ValueError("encoder SWA replay requires an even cached-prefix boundary")
     return rows
 
 
@@ -216,7 +230,7 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
-    _set_execution_counts(batch=folded, scheduled=batch)
+    _check_folded_counts(folded=folded)
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -239,11 +253,26 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     )
 
 
+def _check_folded_counts(*, folded) -> None:
+    # The scheduler's MLP-sync gather already counted the folded rows of every
+    # DP rank (encoder_swa_fold_rows); the logprob rows are unchanged by the fold.
+    counts = folded.global_num_tokens
+    if counts is None:
+        return
+    from sglang.srt.layers.dp_attention import dp_slot_in
+
+    if counts[dp_slot_in(counts)] != folded.extend_num_tokens:
+        raise ValueError(
+            f"MLP-sync count {counts} of this rank does not cover the "
+            f"{folded.extend_num_tokens} folded extend rows"
+        )
+
+
 def _set_execution_counts(*, batch, scheduled) -> None:
-    """MLP-sync counts of a batch copied from `scheduled` with different rows."""
+    """MLP-sync counts of the separate batched replay forward."""
     if scheduled.global_num_tokens is None:
         return
-    # The flag rejects attention DP, so the gather holds only this rank's count.
+    # The batched replay runs on hitting ranks only, so attention DP needs the fold.
     if (
         len(scheduled.global_num_tokens) != 1
         or scheduled.global_num_tokens[0] != scheduled.extend_num_tokens

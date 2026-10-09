@@ -233,7 +233,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # Only the CUDA backend folds the replay into the extend; a separate
+            # replay forward would run its MLP sync on the hitting DP ranks alone.
+            (
+                "DP attention on ROCm",
+                attn_dp_enabled_of(cfg) and get_platform().is_hip,
+            ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
