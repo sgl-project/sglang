@@ -6,7 +6,6 @@ from sglang.test.ascend.test_ascend_utils import (
     QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH,
     write_results_to_github_step_summary,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
     run_bench_one_batch,
