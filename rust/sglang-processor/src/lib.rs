@@ -7,6 +7,8 @@
 
 mod error;
 mod model_files;
+#[cfg(feature = "openai")]
+pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
 #[cfg(feature = "render")]
@@ -19,7 +21,8 @@ pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    chat_tool_definitions, dynamo_tool_parser_name,
+    ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
+    dynamo_tool_parser_name, split_reasoning, tool_constraint,
 };
 #[cfg(feature = "render")]
 pub use render::{

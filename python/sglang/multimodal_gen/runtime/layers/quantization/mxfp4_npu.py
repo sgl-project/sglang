@@ -44,9 +44,6 @@ logger = init_logger(__name__)
 class NPUMXFP4Config(QuantizationConfig):
     """Config for online MXFP4 quantization on NPU (Diffusion)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-
     @classmethod
     def get_name(cls) -> str:
         return "mxfp4_npu"

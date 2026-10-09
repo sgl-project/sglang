@@ -29,10 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -138,10 +135,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
-
-    @property
-    def parallelism_type(self):
-        return StageParallelismType.REPLICATED
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
