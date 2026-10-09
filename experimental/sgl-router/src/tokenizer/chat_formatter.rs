@@ -3,19 +3,22 @@
 
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
-//! Engine-specific request normalization is not replicated here. The forwarding
-//! guard omits IDs for request shapes whose engine rendering has not been verified.
+//! Mirrors SGLang reasoning controls, assistant continuations, and DeepSeek-V4
+//! task selection before rendering. Forwarding remains guarded until parity
+//! has been verified for each request shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dynamo_renderer::{
-    deepseek_formatter_for, may_be_fix_tool_schema, ChatTemplate, ContextMixins,
-    OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter,
+    deepseek_formatter_for, kimi_k3_formatter_for, may_be_fix_tool_schema, ChatTemplate,
+    ContextMixins, OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt,
 };
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
+use sglang_processor::DeepSeekV4Profile;
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -36,20 +39,43 @@ pub struct ChatFormatter {
     formatter: Arc<dyn OAIPromptFormatter>,
     /// Template context defaults; request `chat_template_kwargs` override them.
     defaults: ChatTemplateKwargs,
+    /// Stripped from a separately tokenized continuation prefix, as SGLang does.
+    bos_token: Option<String>,
+    deepseek: Option<super::deepseek::Encoder>,
+    is_kimi_k3: bool,
+    /// Worker defaults, merged before model-specific effort conversion.
+    worker_defaults: ChatTemplateKwargs,
 }
 
 impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
-        let files = super::adapter::ModelFiles::open(tokenizer_path);
-        let model_type = files
-            .json("config.json")?
-            .and_then(|cfg| cfg["model_type"].as_str().map(str::to_owned));
+        Self::load_from(model_id, &super::adapter::ModelFiles::open(tokenizer_path))
+    }
+
+    /// [`Self::load`] over already opened model files.
+    pub fn load_from(model_id: &str, files: &super::adapter::ModelFiles) -> Result<Option<Self>> {
+        let config = files.json("config.json")?.unwrap_or_default();
+        let mut model_type = config["model_type"].as_str().map(str::to_owned);
+        // SGLang also recognizes V4.1 checkpoints that retain a V4 model_type.
+        if config["architectures"][0]
+            .as_str()
+            .is_some_and(|a| a.contains("DeepseekV41"))
+        {
+            model_type = Some("deepseek_v41".into());
+        }
+        if let Some(kimi) = Self::kimi_native(model_type.as_deref(), model_id) {
+            return Ok(Some(kimi));
+        }
         match model_type.as_deref() {
             // These require tokenization paths not yet supported by this adapter.
-            Some("inkling_mm_model" | "kimi_k3") => return Ok(None),
+            Some("inkling_mm_model") => return Ok(None),
             Some(t) if t.starts_with("deepseek_v4") => {
-                return Ok(Self::deepseek_native(model_type.as_deref(), model_id));
+                let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
+                if let Some(formatter) = &mut formatter {
+                    formatter.configure_deepseek(files, &config)?;
+                }
+                return Ok(formatter);
             }
             _ => {}
         }
@@ -57,8 +83,33 @@ impl ChatFormatter {
             .json("tokenizer_config.json")?
             .unwrap_or_else(|| serde_json::json!({}));
         let jinja = files.text("chat_template.jinja")?;
-        Ok(Self::from_tokenizer_config(cfg, jinja.as_deref())?
-            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id)))
+        let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
+            .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
+        if let Some(formatter) = &mut formatter {
+            formatter.configure_deepseek(files, &config)?;
+        }
+        Ok(formatter)
+    }
+
+    fn configure_deepseek(
+        &mut self,
+        files: &super::adapter::ModelFiles,
+        config: &JsonValue,
+    ) -> Result<()> {
+        if let Some(super::deepseek::Encoder::V4(profile)) = &mut self.deepseek {
+            let profile_override = config
+                .get("dsv4_reasoning_effort_profile")
+                .filter(|v| !v.is_null())
+                .map(|v| v.as_str().context("invalid dsv4_reasoning_effort_profile"))
+                .transpose()?;
+            let encoder = match profile_override {
+                Some(_) => None,
+                None => files.text("encoding/encoding_dsv4.py")?,
+            };
+            *profile = DeepSeekV4Profile::from_checkpoint(profile_override, encoder.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
 
     /// HF Jinja template from `tokenizer_config.json`, overridden by a sibling
@@ -119,73 +170,320 @@ impl ChatFormatter {
         if template.chat_template.is_none() {
             return Ok(None);
         }
+        let bos_token = template.bos_tok();
         let PromptFormatter::OAI(formatter) =
             PromptFormatter::from_parts(template, ContextMixins::default(), true)
                 .context("compile chat template")?;
         Ok(Some(Self {
             formatter,
             defaults,
+            bos_token,
+            deepseek: None,
+            is_kimi_k3: false,
+            worker_defaults: ChatTemplateKwargs::new(),
         }))
     }
 
-    /// dynamo-render's code-based DeepSeek encoders, for V4 (including variants
-    /// such as V4.1) and V3.2 non-Exp: the only built-in formatters verified
-    /// against the engine. `model_type` (from `config.json`) is authoritative;
-    /// the model id's last path segment is the fallback.
+    /// dynamo-render's native Kimi-K3 XTML formatter, wrapped in SGLang's request
+    /// semantics (`kimi::normalize`) and the checkpoint's chunked tokenization.
+    pub fn kimi_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
+        let model_type = model_type.map(str::to_lowercase);
+        let PromptFormatter::OAI(formatter) =
+            kimi_k3_formatter_for(&model_type, &model_name(model_id), false)?;
+        Some(Self {
+            formatter,
+            defaults: HashMap::new(),
+            bos_token: Some("[BOS]".into()),
+            deepseek: None,
+            is_kimi_k3: true,
+            worker_defaults: ChatTemplateKwargs::new(),
+        })
+    }
+
+    /// Native DeepSeek encoders; V4.1 uses its own wire format.
     pub fn deepseek_native(model_type: Option<&str>, model_id: &str) -> Option<Self> {
-        let name = model_id
-            .rsplit('/')
-            .next()
-            .unwrap_or(model_id)
-            .to_lowercase();
-        // The engine treats every `deepseek_v4*` variant (e.g. V4.1) as V4.
-        let model_type = model_type.map(str::to_lowercase).map(|t| {
-            if t.starts_with("deepseek_v4") {
-                "deepseek_v4".into()
-            } else {
-                t
-            }
-        });
+        let name = model_name(model_id);
+        let model_type = model_type.map(str::to_lowercase);
+        if model_type.as_deref().is_some_and(|t| {
+            t.starts_with("deepseek_v4") && !matches!(t, "deepseek_v4" | "deepseek_v41")
+        }) {
+            return None;
+        }
         let PromptFormatter::OAI(formatter) = deepseek_formatter_for(&model_type, &name)?;
-        // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
-        // reasoning-effort preamble; dynamo-render defaults to thinking at high effort.
+        // Same rule dynamo-render applies for the name fallback: `deepseek` + one
+        // separator + a `v4` segment.
+        let version = name.strip_prefix("deepseek").unwrap_or("");
+        let version = version.strip_prefix(['-', '_', '.']).unwrap_or(version);
+        let is_deepseek_v4 = model_type
+            .as_deref()
+            .map_or(version.split(['-', '_', '.']).next() == Some("v4"), |t| {
+                t == "deepseek_v4"
+            });
+        let is_deepseek_v41 = model_type
+            .as_deref()
+            .map_or(name.contains("v4.1") || name.contains("v41"), |t| {
+                t == "deepseek_v41"
+            });
+        // Engine defaults: `SGLANG_DEFAULT_THINKING` and no reasoning-effort
+        // preamble; dynamo-render defaults to thinking at high effort.
+        let thinking = std::env::var("SGLANG_DEFAULT_THINKING")
+            .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()));
         let defaults = HashMap::from([
-            ("thinking".into(), false.into()),
+            ("thinking".into(), thinking.into()),
             ("reasoning_effort".into(), "low".into()),
         ]);
         Some(Self {
             formatter,
             defaults,
+            bos_token: Some("<｜begin▁of▁sentence｜>".into()),
+            deepseek: if is_deepseek_v41 {
+                Some(super::deepseek::Encoder::V41)
+            } else {
+                is_deepseek_v4.then_some(super::deepseek::Encoder::V4(DeepSeekV4Profile::Preview))
+            },
+            is_kimi_k3: false,
+            worker_defaults: ChatTemplateKwargs::new(),
         })
     }
 
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 stays disabled.
+    pub fn forwarding_scope(&self) -> super::ForwardingScope {
+        match self.deepseek {
+            Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
+            Some(super::deepseek::Encoder::V41) => super::ForwardingScope::Never,
+            None => super::ForwardingScope::Guarded,
+        }
+    }
+
+    /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
+    /// request leaves unset, and a default `reasoning_effort` acts as the request's.
+    pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
+        self.worker_defaults = defaults.clone();
+        self
+    }
+
+    fn effective_effort(&self, request: &JsonValue) -> Option<JsonValue> {
+        super::deepseek::request_effort(request).or_else(|| {
+            self.worker_defaults
+                .get("reasoning_effort")
+                .filter(|v| !v.is_null())
+                .cloned()
+        })
+    }
+
+    /// Request kwargs plus the thinking/effort defaults SGLang derives from
+    /// `reasoning` / `reasoning_effort` (`protocol.py::normalize_reasoning_inputs`).
     fn template_kwargs(&self, request: &JsonValue) -> Result<ChatTemplateKwargs> {
         let mut kwargs: ChatTemplateKwargs = match request.get("chat_template_kwargs") {
             None | Some(JsonValue::Null) => ChatTemplateKwargs::new(),
             Some(v) => serde_json::from_value(v.clone()).context("chat_template_kwargs")?,
         };
+        // `reasoning.effort` overrides top-level `reasoning_effort`; `enabled`
+        // alone turns thinking on; any effort decides thinking by `!= "none"`.
+        // Explicit kwargs keep their values (the engine uses setdefault).
+        let reasoning = &request["reasoning"];
+        let mut thinking = None;
+        if reasoning.is_object() {
+            let enabled = match reasoning
+                .get("enabled")
+                .filter(|v| !v.is_null())
+                .or_else(|| reasoning.get("enable"))
+            {
+                Some(JsonValue::Bool(enabled)) => *enabled,
+                Some(JsonValue::String(s)) => {
+                    ["1", "true", "yes", "y", "on"].contains(&s.trim().to_lowercase().as_str())
+                }
+                _ => false,
+            };
+            if enabled {
+                thinking = Some(true);
+            }
+        }
+        let effort = [
+            reasoning.get("effort"),
+            reasoning.get("reasoning_effort"),
+            request.get("reasoning_effort"),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_null())
+        .cloned();
+        if let Some(effort) = &effort {
+            thinking = Some(effort != "none");
+        }
+        if let Some(thinking) = thinking {
+            kwargs.entry("thinking".into()).or_insert(thinking.into());
+            kwargs
+                .entry("enable_thinking".into())
+                .or_insert(thinking.into());
+        }
+        // serving_chat first pops the request kwarg into request.reasoning_effort,
+        // then merges worker defaults. Jinja receives those merged kwargs over
+        // the effective effort; Kimi derives thinking_effort only if still absent.
+        kwargs.remove("reasoning_effort");
+        for (key, value) in &self.worker_defaults {
+            kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        if let Some(effort) = self.effective_effort(request) {
+            if self.is_kimi_k3 {
+                if matches!(effort.as_str(), Some("low" | "high" | "max")) {
+                    kwargs.entry("thinking_effort".into()).or_insert(effort);
+                }
+            } else {
+                kwargs.entry("reasoning_effort".into()).or_insert(effort);
+            }
+        }
         for (key, value) in &self.defaults {
             kwargs.entry(key.clone()).or_insert_with(|| value.clone());
         }
         Ok(kwargs)
     }
 
-    /// Render the prompt text dynamo-render produces for `request`.
-    pub fn render(&self, request: &JsonValue) -> Result<String> {
-        anyhow::ensure!(request["messages"].is_array(), "messages must be an array");
-        let kwargs = self.template_kwargs(request)?;
-        self.formatter
-            .render(&ChatRequest { request, kwargs })
-            .context("render chat template")
+    /// Rendered prompt plus the assistant continuation prefix SGLang tokenizes
+    /// separately (`_handle_last_assistant_message`).
+    fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
+        if let Some(super::deepseek::Encoder::V4(profile)) = self.deepseek {
+            let (prompt, prefix) = sglang_processor::ChatFormatter::DeepSeekV4(profile)
+                .render_request(request.clone(), &self.worker_defaults)
+                .context("render DeepSeek-V4 chat")?;
+            return Ok((RenderedPrompt::text(prompt), prefix));
+        }
+        let mut kwargs = self.template_kwargs(request)?;
+        let continuing = request["continue_final_message"] == true;
+        let mut messages: Vec<JsonValue> = request["messages"]
+            .as_array()
+            .context("messages must be an array")?
+            .iter()
+            .map(engine_message)
+            .collect();
+        if self.is_kimi_k3 {
+            super::kimi::normalize(request, &mut messages, &mut kwargs)?;
+        }
+        // Past the V4 return above, `deepseek` is V4.1.
+        if self.deepseek.is_some() {
+            super::deepseek::normalize_messages(&mut messages)?;
+        }
+        let mut prefix = String::new();
+        if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
+            if let Some(content) = last["content"].as_str() {
+                if continuing {
+                    prefix = content.to_owned();
+                    messages.pop();
+                } else if !self.is_kimi_k3 {
+                    *last = serde_json::json!({"role": "user", "content": content});
+                }
+            }
+        }
+        if self.deepseek.is_some() {
+            if let Some(task) = request.get("task").filter(|v| !v.is_null()).cloned() {
+                // V4.1 also treats a mid-conversation system turn as the task target.
+                let message = messages
+                    .iter_mut()
+                    .enumerate()
+                    .rev()
+                    .find(|(i, m)| match m["role"].as_str() {
+                        Some("user" | "developer") => true,
+                        Some("system") => *i > 0,
+                        _ => false,
+                    })
+                    .map(|(_, m)| m)
+                    .context("task requires a user or developer message")?;
+                message["task"] = task;
+            }
+        }
+        if self.deepseek.is_some() {
+            let effort = self.effective_effort(request);
+            return Ok((
+                RenderedPrompt::text(super::deepseek::render_v41(
+                    request, messages, &kwargs, effort,
+                )?),
+                prefix,
+            ));
+        }
+        let prompt = self
+            .formatter
+            .render_prompt(&ChatRequest {
+                request,
+                messages,
+                kwargs,
+                is_kimi_k3: self.is_kimi_k3,
+            })
+            .context("render chat template")?;
+        Ok((prompt, prefix))
     }
 
-    pub fn encode(
-        &self,
-        tokenizer: &dynamo_tokenizers::Tokenizer,
-        request: &JsonValue,
-    ) -> Result<Vec<u32>> {
-        super::adapter::encode(tokenizer, &self.render(request)?)
+    pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+        let (prompt, prefix) = self.render_parts(request)?;
+        let mut ids = match prompt.encode_segments() {
+            Some(segments) if self.is_kimi_k3 => super::kimi::encode(tokenizer, &segments)?,
+            Some(segments) => tokenizer.encode_segments(&segments)?.token_ids().to_vec(),
+            None => super::adapter::encode(tokenizer, prompt.as_str())?,
+        };
+        if !prefix.is_empty() {
+            // SGLang encodes the assistant prefix separately and removes its leading BOS.
+            let mut suffix = if self.is_kimi_k3 {
+                super::kimi::encode(tokenizer, &[EncodeSegment::control(&prefix)])?
+            } else {
+                super::adapter::encode(tokenizer, &prefix)?
+            };
+            if let Some(bos) = self.bos_token.as_deref().filter(|s| !s.is_empty()) {
+                let bos = super::adapter::encode(tokenizer, bos)?;
+                if bos.len() == 1 && suffix.first() == bos.first() {
+                    suffix.remove(0);
+                }
+            }
+            ids.extend(suffix);
+        }
+        Ok(ids)
     }
+
+    /// Use `encode` for token ids to preserve continuation boundaries.
+    pub fn render(&self, request: &JsonValue) -> Result<String> {
+        let (prompt, prefix) = self.render_parts(request)?;
+        Ok(prompt.into_text() + &prefix)
+    }
+}
+
+/// Message fields the engine's request schema keeps for non-user roles.
+const GENERIC_MESSAGE_KEYS: [&str; 7] = [
+    "role",
+    "content",
+    "tool_call_id",
+    "name",
+    "reasoning_content",
+    "tool_calls",
+    "tools",
+];
+
+/// Normalize a message as SGLang's pydantic dump does before rendering: roles
+/// lowercased, unknown and null fields dropped, `user` reduced to role and
+/// content, null content blanked.
+fn engine_message(message: &JsonValue) -> JsonValue {
+    let role = message["role"].as_str().unwrap_or_default().to_lowercase();
+    let mut out = serde_json::Map::new();
+    if role != "user" {
+        for key in GENERIC_MESSAGE_KEYS {
+            if let Some(v) = message.get(key).filter(|v| !v.is_null()) {
+                out.insert(key.into(), v.clone());
+            }
+        }
+    }
+    let content = match &message["content"] {
+        JsonValue::Null => "".into(),
+        content => content.clone(),
+    };
+    out.insert("role".into(), role.into());
+    out.insert("content".into(), content);
+    out.into()
+}
+
+/// Lowercased last path segment of a model id, dynamo-render's name fallback.
+fn model_name(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_lowercase()
 }
 
 /// `content` of an HF `AddedToken` object (`{"content": "<s>", "lstrip": ...}`).
@@ -199,10 +497,12 @@ fn added_token_content(token: &JsonValue) -> Option<String> {
 
 struct ChatRequest<'a> {
     request: &'a JsonValue,
+    /// Normalized copy of `request["messages"]`.
+    messages: Vec<JsonValue>,
     kwargs: ChatTemplateKwargs,
+    is_kimi_k3: bool,
 }
 
-/// Mirrors dynamo-render's own impl for its wire type: request fields pass through.
 impl OAIChatLikeRequest for ChatRequest<'_> {
     fn model(&self) -> String {
         self.request["model"]
@@ -211,7 +511,7 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
             .to_owned()
     }
     fn messages(&self) -> Value {
-        Value::from_serialize(&self.request["messages"])
+        Value::from_serialize(&self.messages)
     }
     fn tools(&self) -> Option<Value> {
         let tools = self.request.get("tools")?;
@@ -221,21 +521,37 @@ impl OAIChatLikeRequest for ChatRequest<'_> {
         if tools.as_array().is_none_or(|t| t.is_empty()) {
             return None;
         }
-        may_be_fix_tool_schema(tools.clone())
+        if self.is_kimi_k3 {
+            return Some(Value::from_serialize(tools));
+        }
+        let mut tools = tools.clone();
+        // SGLang renders only the named tool for a function `tool_choice`.
+        if let Some(name) = self.request["tool_choice"]["function"]["name"].as_str() {
+            tools
+                .as_array_mut()?
+                .retain(|tool| tool["function"]["name"] == name);
+        }
+        may_be_fix_tool_schema(tools)
     }
     fn tool_choice(&self) -> Option<Value> {
-        self.request.get("tool_choice").map(Value::from_serialize)
+        if self.is_kimi_k3 {
+            self.kwargs.get("tool_choice").map(Value::from_serialize)
+        } else {
+            self.request.get("tool_choice").map(Value::from_serialize)
+        }
     }
     fn reasoning_effort(&self) -> Option<Value> {
-        self.request
+        self.kwargs
             .get("reasoning_effort")
             .map(Value::from_serialize)
     }
-    /// Withheld: the engine enforces `response_format` by constrained decoding
-    /// and never renders it, while dynamo-render's DeepSeek formatters would
-    /// append a "## Response Format" schema preamble to the system turn.
+    /// Only Kimi-K3 renders `response_format`; elsewhere the engine enforces
+    /// it by constrained decoding and never renders it.
     fn response_format(&self) -> Option<Value> {
-        None
+        self.is_kimi_k3
+            .then(|| self.kwargs.get("response_format"))
+            .flatten()
+            .map(Value::from_serialize)
     }
     fn should_add_generation_prompt(&self) -> bool {
         true
@@ -432,6 +748,7 @@ mod tests {
         assert!(ChatFormatter::deepseek_native(None, "deepseek-v4-tiny").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").is_some());
+        assert!(ChatFormatter::deepseek_native(None, "deepseek-ai/DeepSeek-V4.1-Flash").is_some());
         assert!(ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2").is_some());
         assert!(ChatFormatter::deepseek_native(Some("inkling_mm_model"), "inkling").is_none());
         assert!(ChatFormatter::deepseek_native(Some("llama"), "deepseek-v4").is_none());
@@ -468,13 +785,320 @@ mod tests {
         );
     }
 
-    /// Request kwargs override the chat-mode default.
+    /// The engine's V4 encoder reads only `chat_template_kwargs.thinking`
+    /// (`serving_chat.py`); `enable_thinking` alone leaves chat mode, while
+    /// `reasoning_effort` sets both keys through the normalization above.
     #[test]
     fn v4_thinking_kwarg_overrides_chat_default() {
         let mut req = request(json!([{"role":"user","content":"ABCD"}]));
         req["chat_template_kwargs"] = json!({"thinking": true});
         let out = deepseek_v4().render(&req).unwrap();
         assert!(out.ends_with("<｜Assistant｜><think>"), "got: {out}");
+        req["chat_template_kwargs"] = json!({"enable_thinking": true});
+        let out = deepseek_v4().render(&req).unwrap();
+        assert!(out.ends_with("<｜Assistant｜></think>"), "got: {out}");
+        req["chat_template_kwargs"] = JsonValue::Null;
+        req["reasoning_effort"] = json!("high");
+        let out = deepseek_v4().render(&req).unwrap();
+        assert!(out.contains("<｜Assistant｜><think>"), "got: {out}");
+    }
+
+    #[test]
+    fn request_controls_reach_dynamo() {
+        let formatter = jinja(
+            json!({"chat_template": "{{ tools | tojson }} {{ thinking }} {{ reasoning_effort }}"}),
+        );
+        let mut req = request(json!([{"role":"user","content":"hi"}]));
+        req["tools"] = json!([
+            {"type":"function","function":{"name":"first"}},
+            {"type":"function","function":{"name":"second"}}
+        ]);
+        req["tool_choice"] = json!({"type":"function","function":{"name":"second"}});
+        req["reasoning"] = json!({"effort":"high"});
+        let out = formatter.render(&req).unwrap();
+        assert!(out.contains("second") && !out.contains("first"));
+        assert!(out.contains("high") || out.contains("Reasoning Effort:"));
+        req["tool_choice"] = json!("none");
+        req["reasoning_effort"] = json!("none");
+        req["reasoning"] = JsonValue::Null;
+        let out = formatter.render(&req).unwrap();
+        assert!(!out.contains("first") && !out.contains("second"));
+        assert!(out.contains("False none") || out.ends_with("</think>"));
+    }
+
+    /// Mirrors `protocol.py::normalize_reasoning_inputs`: effort decides both
+    /// thinking keys via setdefault, so explicit kwargs win.
+    #[test]
+    fn reasoning_effort_sets_thinking_defaults_with_explicit_kwargs_winning() {
+        let enc = jinja(json!({
+            "chat_template": "{{ reasoning_effort }}:{{ thinking }}:{{ enable_thinking }}"
+        }));
+        let mut req = request(json!([{"role": "user", "content": "hi"}]));
+        req["reasoning_effort"] = json!("none");
+        assert_eq!(enc.render(&req).unwrap(), "none:False:False");
+        req["reasoning_effort"] = json!("high");
+        assert_eq!(enc.render(&req).unwrap(), "high:True:True");
+        req["chat_template_kwargs"] = json!({"enable_thinking": false});
+        assert_eq!(enc.render(&req).unwrap(), "high:True:False");
+        req["reasoning"] = json!({"effort": "low"});
+        assert_eq!(enc.render(&req).unwrap(), "low:True:False");
+        req["reasoning"] = json!({"enabled": "yes"});
+        req["reasoning_effort"] = JsonValue::Null;
+        req["chat_template_kwargs"] = JsonValue::Null;
+        assert_eq!(enc.render(&req).unwrap(), ":True:True");
+    }
+
+    #[test]
+    fn worker_defaults_preserve_jinja_effort_precedence() {
+        // The engine pops request kwargs.reasoning_effort before merging defaults,
+        // then overlays merged kwargs on the effective request effort for Jinja.
+        for (defaults, controls, expected) in [
+            (json!({"reasoning_effort":"low"}), json!({}), json!("low")),
+            (
+                json!({"reasoning_effort":"low"}),
+                json!({"reasoning_effort":"high"}),
+                json!("low"),
+            ),
+            (
+                json!({"reasoning_effort":"low"}),
+                json!({"chat_template_kwargs":{"reasoning_effort":"high"}}),
+                json!("low"),
+            ),
+            (
+                json!({"reasoning_effort":null}),
+                json!({"reasoning_effort":"high"}),
+                JsonValue::Null,
+            ),
+            (json!({}), json!({"reasoning_effort":"high"}), json!("high")),
+            (
+                json!({}),
+                json!({"reasoning_effort":"low", "chat_template_kwargs":{"reasoning_effort":"high"}}),
+                json!("high"),
+            ),
+        ] {
+            let enc = jinja(json!({"chat_template":"{{ reasoning_effort | tojson }}"}))
+                .with_defaults(&serde_json::from_value(defaults.clone()).unwrap());
+            let mut req = request(json!([{"role":"user","content":"hi"}]));
+            req.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            assert_eq!(
+                enc.render(&req).unwrap(),
+                expected.to_string(),
+                "defaults={defaults}, request={req}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_worker_defaults_reach_thinking_effort() {
+        for (defaults, controls, expected) in [
+            (json!({"reasoning_effort":"low"}), json!({}), "low"),
+            (
+                json!({"reasoning_effort":"low"}),
+                json!({"reasoning_effort":"high"}),
+                "high",
+            ),
+            (
+                json!({"reasoning_effort":"low"}),
+                json!({"chat_template_kwargs":{"reasoning_effort":"high"}}),
+                "high",
+            ),
+            (
+                json!({"thinking_effort":"high"}),
+                json!({"reasoning_effort":"low"}),
+                "high",
+            ),
+            (
+                json!({"reasoning_effort":"low", "thinking_effort":"high"}),
+                json!({"chat_template_kwargs":{"thinking_effort":"max"}}),
+                "max",
+            ),
+        ] {
+            let enc = ChatFormatter::kimi_native(Some("kimi_k3"), "kimi-k3")
+                .unwrap()
+                .with_defaults(&serde_json::from_value(defaults.clone()).unwrap());
+            let mut req = request(json!([{"role":"user","content":"hi"}]));
+            req.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let prompt = enc.render(&req).unwrap();
+            assert!(
+                prompt.contains(&format!("thinking_effort={expected}")),
+                "defaults={defaults}, request={req}, prompt={prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_effort_does_not_derive_thinking_flags() {
+        let enc = jinja(json!({"chat_template":"{{ thinking | default('unset') }}:{{ enable_thinking | default('unset') }}"}))
+            .with_defaults(&serde_json::from_value(json!({"reasoning_effort":"high"})).unwrap());
+        let req = request(json!([{"role":"user","content":"hi"}]));
+        assert_eq!(enc.render(&req).unwrap(), "unset:unset");
+    }
+
+    #[test]
+    fn null_worker_effort_preserves_deepseek_env_fallback() {
+        // Set process-wide envs only in a child so parallel formatter tests retain
+        // their normal defaults.
+        const CHILD: &str = "SGL_ROUTER_TEST_NULL_WORKER_EFFORT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tokenizer::chat_formatter::tests::null_worker_effort_preserves_deepseek_env_fallback", "--nocapture"])
+                .env(CHILD, "1")
+                .env("SGLANG_DSV4_REASONING_EFFORT", "max")
+                .env("SGLANG_DSV41_REASONING_EFFORT", "low")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for (model_type, effort) in [("deepseek_v4", "max"), ("deepseek_v41", "low")] {
+            let enc = ChatFormatter::deepseek_native(Some(model_type), model_type)
+                .unwrap()
+                .with_defaults(
+                    &serde_json::from_value(json!({"thinking":true, "reasoning_effort":null}))
+                        .unwrap(),
+                );
+            let mut req = request(json!([{"role":"user","content":"hi"}]));
+            let actual = enc.render(&req).unwrap();
+            req["reasoning_effort"] = json!(effort);
+            assert_eq!(actual, enc.render(&req).unwrap(), "{model_type}");
+        }
+    }
+
+    #[test]
+    fn v41_thinking_env_uses_engine_budgets() {
+        // Isolate the environment so other formatter tests keep their defaults.
+        const CHILD: &str = "SGL_ROUTER_TEST_V41_BUDGET_CHILD";
+        let Ok(default_budget) = std::env::var(CHILD) else {
+            for (effort, budget) in [
+                (None, 75),
+                (Some("low"), 50),
+                (Some("high"), 75),
+                (Some("xhigh"), 75),
+                (Some("max"), 100),
+                (Some("42"), 42),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "tokenizer::chat_formatter::tests::v41_thinking_env_uses_engine_budgets",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, budget.to_string())
+                    .env("SGLANG_DEFAULT_THINKING", "1")
+                    .env_remove("SGLANG_DSV41_REASONING_EFFORT");
+                if let Some(effort) = effort {
+                    child.env("SGLANG_DSV41_REASONING_EFFORT", effort);
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "effort={effort:?}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let enc = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").unwrap();
+        for (effort, budget) in [
+            (None, default_budget.as_str()),
+            (Some("unsupported"), default_budget.as_str()),
+            (Some("low"), "50"),
+            (Some("high"), "75"),
+            (Some("xhigh"), "75"),
+            (Some("max"), "100"),
+        ] {
+            let mut req = request(json!([{"role":"user","content":"hi"}]));
+            if let Some(effort) = effort {
+                req["reasoning_effort"] = json!(effort);
+            }
+            let prompt = enc.render(&req).unwrap();
+            assert!(
+                prompt.contains(&format!("Reasoning Effort: {budget} (range 1-100,")),
+                "request={req}, prompt={prompt}"
+            );
+            assert!(prompt.ends_with("<think>"), "{prompt}");
+        }
+    }
+
+    /// Messages reach the template shaped like the engine's request schema.
+    #[test]
+    fn messages_match_engine_schema() {
+        let enc = jinja(json!({"chat_template": "{{ messages | tojson }}"}));
+        let out = enc
+            .render(&request(json!([
+                {"role": "User", "content": "hi", "name": "bob", "extra": 1},
+                {"role": "assistant", "name": "a", "tool_calls": null, "tool_call_id": "c1"},
+                {"role": "user", "content": "again"}
+            ])))
+            .unwrap();
+        let rendered: JsonValue = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            rendered,
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "name": "a", "tool_call_id": "c1"},
+                {"role": "user", "content": "again"}
+            ])
+        );
+    }
+
+    #[test]
+    fn v4_task_uses_dynamo_task_tokens() {
+        let mut req = request(json!([{"role":"user","content":"example.com"}]));
+        for (task, suffix) in [
+            ("domain", "<｜domain｜>"),
+            ("action", "<｜Assistant｜></think><｜action｜>"),
+        ] {
+            req["task"] = json!(task);
+            assert_eq!(
+                deepseek_v4().render(&req).unwrap(),
+                format!("<｜begin▁of▁sentence｜><｜User｜>example.com{suffix}")
+            );
+        }
+        req["messages"] = json!([{"role":"system","content":"hi"}]);
+        assert!(deepseek_v4().render(&req).is_err());
+    }
+
+    #[test]
+    fn continuation_preserves_token_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: JsonValue =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        cfg["model"]["vocab"]["ab"] = json!(257);
+        cfg["model"]["merges"] = json!(["a b"]);
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        let tokenizer = super::super::adapter::load(path.to_str().unwrap()).unwrap();
+        let formatter = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}));
+        let mut req = request(json!([
+            {"role":"user","content":"hi"}, {"role":"assistant","content":"b"}
+        ]));
+        req["continue_final_message"] = json!(true);
+        assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
+        assert_eq!(
+            super::super::adapter::encode(&tokenizer, "ab").unwrap(),
+            vec![257]
+        );
+        req["messages"][1]["content"] = json!("<|endoftext|>b");
+        assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
+        req["continue_final_message"] = json!(false);
+        req["messages"][1]["content"] = json!("b");
+        let out = deepseek_v4().render(&req).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜><｜User｜>hi\n\nb<｜Assistant｜></think>"
+        );
     }
 
     /// The engine never renders `response_format` into the prompt.

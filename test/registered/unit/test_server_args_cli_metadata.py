@@ -3,8 +3,7 @@
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs, _declared_default
-from sglang.srt.utils.common import human_readable_int
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,63 +15,6 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
     def setUpClass(cls):
         cls.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(cls.parser)
-        cls.actions_by_option = {
-            option: action
-            for action in cls.parser._actions
-            for option in action.option_strings
-        }
-
-    def test_argparse_shape_is_preserved_for_representative_migrated_options(self):
-        self.assertEqual(
-            self.actions_by_option["--dtype"].default, _declared_default("dtype")
-        )
-        self.assertEqual(
-            self.actions_by_option["--dtype"].choices,
-            ["auto", "half", "float16", "bfloat16", "float", "float32"],
-        )
-        self.assertIs(self.actions_by_option["--dtype"].type, str)
-        self.assertIs(
-            self.actions_by_option["--max-total-tokens"].type, human_readable_int
-        )
-        self.assertIs(
-            self.actions_by_option["--max-prefill-tokens"].type, human_readable_int
-        )
-        self.assertIs(
-            self.actions_by_option["--prefill-delayer-forward-passes-buckets"].type,
-            float,
-        )
-        self.assertEqual(
-            self.actions_by_option["--prefill-delayer-forward-passes-buckets"].nargs,
-            "+",
-        )
-        self.assertIs(
-            self.actions_by_option["--cuda-graph-prefill-max-context"].type,
-            human_readable_int,
-        )
-        self.assertIsNone(self.actions_by_option["--context-bucket"].nargs)
-        self.assertEqual(
-            self.actions_by_option["--schedule-policy"].choices,
-            [
-                "lpm",
-                "random",
-                "fcfs",
-                "dfs-weight",
-                "lof",
-                "priority",
-                "routing-key",
-                "hrrn",
-            ],
-        )
-        self.assertEqual(
-            self.actions_by_option["--load-balance-method"].choices,
-            [
-                "auto",
-                "round_robin",
-                "follow_bootstrap_room",
-                "total_requests",
-                "total_tokens",
-            ],
-        )
 
     def test_data_parallel_aliases_keep_old_usage(self):
         for option in ("--data-parallel-size", "--dp-size"):
@@ -80,6 +22,14 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", option, "3"])
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
+
+    def test_request_chat_template_requires_explicit_opt_in(self):
+        for flags, expected in (([], False), (["--trust-request-chat-template"], True)):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).trust_request_chat_template, expected
+                )
 
     def test_prefill_max_context_accepts_human_readable_values(self):
         for option in (

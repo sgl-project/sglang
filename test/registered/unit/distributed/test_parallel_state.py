@@ -26,9 +26,9 @@ then figures out which specific group(s) it belongs to.
 
 Our tests:
 1. Mock the distributed backend (no real GPUs needed)
-2. Mock init_model_parallel_group to capture the group_ranks parameter
+2. Mock GroupCoordinator construction to capture the effective group configuration
 3. Call the real initialize_model_parallel()
-4. Verify group_ranks contains the expected complete group structure
+4. Verify the resulting group structure and policies
 
 We only need to simulate rank 0 because we're testing the group creation logic,
 not the per-rank group membership logic.
@@ -44,6 +44,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -171,7 +172,8 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
-def test_parallel_group_construction_tp8_attn_cp2():
+@pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
+def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """
     Test parallel group construction for 8 GPU configuration with:
     - tensor_model_parallel_size = 8
@@ -186,8 +188,8 @@ def test_parallel_group_construction_tp8_attn_cp2():
     This test calls the ACTUAL initialize_model_parallel() and verifies the groups.
 
     Note: We simulate only rank 0 here, but initialize_model_parallel() creates
-    ALL groups for ALL ranks in a single call. We capture these groups via mocking
-    and verify the complete group structure.
+    ALL groups for ALL ranks in a single call. We capture GroupCoordinator
+    construction and verify the complete group structure and effective policy.
     """
     world_size = 8
 
@@ -200,28 +202,35 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch.object(parallel_state, "_ATTN_CP", None),
         patch.object(parallel_state, "_ATTN_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(
+            parallel_state,
+            "_ENABLE_CUSTOM_ALL_REDUCE",
+            custom_allreduce_enabled,
+        ),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-        # Mock init_model_parallel_group to capture the groups being created
+        # Capture the effective configuration after init_model_parallel_group
+        # has resolved inherited policies.
         created_groups = {}
 
-        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
-            group_name = kwargs.get("group_name", "unknown")
+        def mock_group_coordinator(
+            *, group_ranks, group_name, use_custom_allreduce, **kwargs
+        ):
             created_groups[group_name] = group_ranks
 
-            # Create a mock group object
             mock_group = Mock()
             mock_group.device_group = Mock()
+            mock_group.use_custom_allreduce = use_custom_allreduce
             return mock_group
 
         with (
             patch.object(
                 parallel_state,
-                "init_model_parallel_group",
-                side_effect=mock_init_model_parallel_group,
+                "GroupCoordinator",
+                side_effect=mock_group_coordinator,
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
@@ -232,11 +241,8 @@ def test_parallel_group_construction_tp8_attn_cp2():
             mock_world_group.return_value = mock_world
 
             # Call the actual function
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                pipeline_model_parallel_size=1,
-                attention_context_model_parallel_size=2,
-            )
+            publish_build_topology(tp_size=8, pp_size=1, attn_cp_size=2)
+            parallel_state.initialize_model_parallel()
 
             # Verify TP groups
             tp_groups = created_groups.get("tp", [])
@@ -265,6 +271,13 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ]
             assert attn_cp_groups == expected_attn_cp, (
                 f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            )
+
+            # Derived attention-TP groups inherit the effective global policy;
+            # the communicator performs the final per-group capability check.
+            assert (
+                parallel_state.get_attn_tp_group().use_custom_allreduce
+                is custom_allreduce_enabled
             )
 
             print("TP=8, Attn CP=2 group construction verified")
@@ -330,12 +343,8 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             mock_world_group.return_value = mock_world
 
             # Call the actual function
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                expert_model_parallel_size=4,
-                pipeline_model_parallel_size=1,
-                moe_data_model_parallel_size=2,
-            )
+            publish_build_topology(tp_size=8, ep_size=4, pp_size=1, moe_dp_size=2)
+            parallel_state.initialize_model_parallel()
 
             # Verify TP groups
             tp_groups = created_groups.get("tp", [])
@@ -416,7 +425,7 @@ def _read_group_descs(group_name):
             local_rank=0,
             torch_distributed_backend="gloo",
             use_pynccl=False,
-            use_pymscclpp=False,
+            use_mscclpp=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_all_reduce=False,
             use_hpu_communicator=False,
@@ -458,7 +467,8 @@ if __name__ == "__main__":
     import sys
 
     try:
-        test_parallel_group_construction_tp8_attn_cp2()
+        test_parallel_group_construction_tp8_attn_cp2(False)
+        test_parallel_group_construction_tp8_attn_cp2(True)
         test_parallel_group_construction_tp8_moe_ep4_cp2()
         test_group_desc_propagated_via_real_new_group("tp")
         test_group_desc_propagated_via_real_new_group("pp")
