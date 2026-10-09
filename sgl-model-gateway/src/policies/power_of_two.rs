@@ -10,7 +10,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::core::Worker;
+use crate::core::{ConnectionMode, Worker};
 
 /// Power-of-two choices policy
 ///
@@ -43,6 +43,33 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             return None;
         }
 
+        // An HTTP DP virtual worker must have a rank-specific token load from
+        // the latest successful monitor poll. Its Router-local request counter
+        // cannot reveal scheduler or KV backlog already present on that rank.
+        // Apply this per worker so mixed DP/non-DP pools remain well-defined.
+        // Non-HTTP DP workers keep the existing request-count fallback because
+        // the load monitor currently polls only HTTP endpoints.
+        let loads_guard = self.cached_loads.read().ok();
+        let healthy_indices = healthy_indices
+            .into_iter()
+            .filter(|idx| {
+                let worker = &workers[*idx];
+                if !worker.is_dp_aware()
+                    || !matches!(worker.connection_mode(), ConnectionMode::Http)
+                {
+                    return true;
+                }
+                loads_guard
+                    .as_ref()
+                    .and_then(|loads| loads.get(worker.url()))
+                    .is_some_and(|load| *load >= 0)
+            })
+            .collect::<Vec<_>>();
+
+        if healthy_indices.is_empty() {
+            return None;
+        }
+
         if healthy_indices.len() == 1 {
             return Some(healthy_indices[0]);
         }
@@ -59,16 +86,15 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let worker1 = &workers[worker_idx1];
         let worker2 = &workers[worker_idx2];
 
-        // Access cached loads safely
-        let loads_guard = self.cached_loads.read().ok();
-
         // Try to get high-fidelity token loads for BOTH workers
         let load1_tokens = loads_guard
             .as_ref()
-            .and_then(|m| m.get(worker1.url()).copied());
+            .and_then(|m| m.get(worker1.url()).copied())
+            .filter(|load| *load >= 0);
         let load2_tokens = loads_guard
             .as_ref()
-            .and_then(|m| m.get(worker2.url()).copied());
+            .and_then(|m| m.get(worker2.url()).copied())
+            .filter(|load| *load >= 0);
 
         // If either worker is missing token data (e.g. monitor failure),
         // we must degrade BOTH to request counts to ensure fairness.
@@ -130,7 +156,7 @@ impl Default for PowerOfTwoPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, WorkerType};
 
     #[tokio::test]
     async fn test_power_of_two_selection() {
@@ -206,6 +232,140 @@ mod tests {
 
         // Worker2 should be selected significantly more often
         assert!(w2_selected > 35); // Should win most of the time
+    }
+
+    #[tokio::test]
+    async fn test_power_of_two_does_not_treat_unknown_token_load_as_zero() {
+        let policy = PowerOfTwoPolicy::new();
+        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        for _ in 0..5 {
+            worker1.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        let loads = HashMap::from([
+            ("http://w1:8000".to_string(), -1),
+            ("http://w2:8000".to_string(), 100_000),
+        ]);
+        policy.update_loads(&loads);
+
+        // The unknown token load forces a fair fallback to local request counts,
+        // where worker2 is idle. It must not win by looking like a negative load.
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            Some(1)
+        );
+    }
+
+    fn dp_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(
+                DPAwareWorkerBuilder::new("http://dp-worker:8000", 0, 2)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ),
+            Arc::new(
+                DPAwareWorkerBuilder::new("http://dp-worker:8000", 1, 2)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_dp_power_of_two_fails_closed_when_rank_loads_are_missing() {
+        let policy = PowerOfTwoPolicy::new();
+
+        assert_eq!(
+            policy
+                .select_worker(&dp_workers(), &SelectWorkerInfo::default())
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dp_power_of_two_fails_closed_for_negative_rank_loads() {
+        let policy = PowerOfTwoPolicy::new();
+        policy.update_loads(&HashMap::from([
+            ("http://dp-worker:8000@0".to_string(), -1),
+            ("http://dp-worker:8000@1".to_string(), -1),
+        ]));
+
+        assert_eq!(
+            policy
+                .select_worker(&dp_workers(), &SelectWorkerInfo::default())
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dp_power_of_two_uses_the_only_rank_with_valid_load() {
+        let policy = PowerOfTwoPolicy::new();
+        policy.update_loads(&HashMap::from([(
+            "http://dp-worker:8000@1".to_string(),
+            100_000,
+        )]));
+
+        assert_eq!(
+            policy
+                .select_worker(&dp_workers(), &SelectWorkerInfo::default())
+                .await,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dp_filter_applies_in_mixed_worker_pool() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                DPAwareWorkerBuilder::new("http://dp-worker:8000", 0, 1)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://regular-worker:8000")
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            ),
+        ];
+
+        for _ in 0..20 {
+            assert_eq!(
+                policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .await,
+                Some(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dp_grpc_worker_keeps_existing_request_count_fallback() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            DPAwareWorkerBuilder::new("grpc://dp-worker", 0, 1)
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc { port: Some(50051) })
+                .build(),
+        )];
+
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            Some(0)
+        );
     }
 
     #[tokio::test]
