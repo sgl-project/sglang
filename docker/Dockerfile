@@ -514,10 +514,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Keep SGLang's pins and resolve inflect with Dynamo's typeguard dependency.
 # grpcio-tools 1.82.0rc2 emits Protobuf 7 code despite allowing Protobuf 6.
+ARG INSTALL_DYNAMO=1
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
-        --pre --extra-index-url https://pypi.nvidia.com/ \
-        ai-dynamo inflect "grpcio-tools==1.81.1"
+    set -- "grpcio-tools==1.81.1" \
+    && if [ "$INSTALL_DYNAMO" = "1" ]; then set -- "$@" ai-dynamo inflect; fi \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
+        --pre --extra-index-url https://pypi.nvidia.com/ "$@"
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
