@@ -1495,6 +1495,13 @@ class Envs:
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
+    # Breakable prefill CUDA graphs capture the Triton KDA extend instead of
+    # breaking the graph at every KDA layer (layers/attention/linear/
+    # kda_prefill_graph.py); this kill-switch restores the eager break.
+    SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND = EnvBool(False)
+    # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
+    # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
+    SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

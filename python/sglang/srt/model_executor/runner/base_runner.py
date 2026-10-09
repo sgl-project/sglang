@@ -48,7 +48,10 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.model_executor.runner_utils import cp_extend_forward
+from sglang.srt.model_executor.runner_utils import (
+    cp_extend_forward,
+    runner_owns_cp_boundary,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -759,7 +762,7 @@ class BaseRunner(ABC):
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
-            if cp_active and not get_parallel().enable_cp_tp_group_sharing:
+            if cp_active and runner_owns_cp_boundary(mr.model):
                 return cp_extend_forward(
                     model=mr.model, forward_batch=forward_batch, kwargs=kwargs
                 )

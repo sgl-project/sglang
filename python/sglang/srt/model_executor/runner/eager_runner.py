@@ -55,6 +55,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils import (
     cp_extend_forward,
     maybe_publish_prefill_shared_read_done,
+    runner_owns_cp_boundary,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -369,8 +370,7 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            # Under CP-TP group sharing the model owns the CP row layout.
-            elif cp_active and not get_parallel().enable_cp_tp_group_sharing:
+            elif cp_active and runner_owns_cp_boundary(model_runner.model):
                 ret = cp_extend_forward(
                     model=model_runner.model, forward_batch=forward_batch, kwargs=kwargs
                 )

@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: F401
 )
 from sglang.srt.model_executor.runner_utils.cp_extend import (  # noqa: F401
     cp_extend_forward,
+    runner_owns_cp_boundary,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (  # noqa: F401
     DeepEPCudaGraphRunnerAdapter,

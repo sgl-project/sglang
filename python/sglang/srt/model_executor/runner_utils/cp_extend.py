@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Union
 import torch
 
 from sglang.srt.layers.cp.utils import cp_gather_after_forward, cp_shard_model_inputs
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -14,24 +15,38 @@ if TYPE_CHECKING:
     )
 
 
+def runner_owns_cp_boundary(model) -> bool:
+    # GLM delegates its CP boundary to the runner via prepare_cp_inputs.
+    # Other group-sharing models keep owning the layout in forward().
+    return (
+        not get_parallel().enable_cp_tp_group_sharing
+        or getattr(model, "prepare_cp_inputs", None) is not None
+    )
+
+
 def cp_extend_forward(
     *, model, forward_batch: ForwardBatch, kwargs: dict
 ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
     """CP extend: shard inputs at the model boundary, run the body on the
     rank-local slice, then gather hidden states before the logits step.
     """
-    input_embeds = kwargs.get("input_embeds")
-    if input_embeds is None:
-        input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+    if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
+        input_embeds, positions, model_kwargs = prepare_inputs(forward_batch, **kwargs)
+    else:
+        input_embeds = kwargs.get("input_embeds")
+        if input_embeds is None:
+            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        positions = forward_batch.positions
+        model_kwargs = {}
+        if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
     with cp_shard_model_inputs(
         input_embeds,
-        forward_batch.positions,
+        positions,
         forward_batch,
         forward_batch.input_ids,
     ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-        model_kwargs = {"input_embeds": sharded_input_embeds}
-        if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
-            model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        model_kwargs["input_embeds"] = sharded_input_embeds
         hidden_states = model.model(
             model_input_ids,
             sharded_positions,
