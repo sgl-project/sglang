@@ -127,8 +127,10 @@ def saturate_to_fp8_range(value: torch.Tensor, dtype: torch.dtype) -> torch.Tens
     eager rounds to 240.0 down a step and lose precision.
     """
     limit = torch.finfo(dtype).max
-    # Comparisons against NaN are false, so NaN survives the clamp unchanged.
-    return torch.where(value.isnan(), value, value.clamp(-limit, limit))
+    # clamp propagates NaN rather than folding it onto a bound: the CUDA/ROCm
+    # kernel returns the input early for NaN, and the CPU one leaves it to
+    # std::min/std::max, which return the NaN operand.
+    return value.clamp(-limit, limit)
 
 
 @triton.jit
