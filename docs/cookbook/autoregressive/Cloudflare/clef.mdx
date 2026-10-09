@@ -152,3 +152,14 @@ Usage: {'input_tokens': 334, 'output_tokens': 0}
 ```
 
 </Accordion>
+
+## 4. GSM8K accuracy
+
+[Decision Index 0.2.1](https://github.com/apolinario/decision-index/blob/9eb2dbe2a358004c8782c66e40a83ac07b953fec/docs/suite.md) evaluates all 1,319 GSM8K test problems with both four-choice and ten-choice questions, for 2,638 requests per configuration. These scores measure combined answer-selection accuracy through `/v1/systemone`.
+
+| Model | [Cloudflare](https://huggingface.co/Cloudflare/clef#results) | H200 | B300 |
+|---|---:|---:|---:|
+| Clef | 80.8% | 80.71% | 80.59% |
+| Clef Flash | 67.3% | 67.32% | 67.36% |
+
+H200 and B300 results use the Docker image above, with BF16 and TP=1 on one GPU.
