@@ -64,7 +64,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams, check_n
+from sglang.srt.sampling.sampling_params import SamplingParams, validate_sample_count
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
@@ -518,21 +518,6 @@ class GenerateReqInput:
             return 1
         return self.parallel_sample_num
 
-    @staticmethod
-    def _coerce_parallel_n(n):
-        # An explicit null matches SamplingParams.__post_init__: missing and
-        # null both mean one sample. .get("n", 1) does not, because the key
-        # is present.
-        return 1 if n is None else n
-
-    def _validated_parallel_n(self, sampling_params):
-        # Read n once. Beam width is per request: the first item's beam_width
-        # must not choose the bound for a later non-beam request.
-        n = sampling_params.get("n", 1)
-        n = self._coerce_parallel_n(n)
-        check_n(n, sampling_params.get("beam_width"))
-        return n
-
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -546,17 +531,18 @@ class GenerateReqInput:
 
         # Bound every request before any list replication. verify() runs
         # later, after this method has already copied the prompt.
-        ns = [
-            self._validated_parallel_n(sampling_params)
-            for sampling_params in sampling_params_list
-        ]
-        n = ns[0]
-        for other in ns[1:]:
-            if other != n:
-                raise ValueError(
-                    "The parallel_sample_num should be the same for all samples in sample params."
-                )
-        self.parallel_sample_num = n
+        ns = []
+        for sampling_params in sampling_params_list:
+            # A missing or null n means one sample, as in SamplingParams.__post_init__.
+            n = sampling_params.get("n")
+            n = 1 if n is None else n
+            validate_sample_count(n, sampling_params.get("beam_width"))
+            ns.append(n)
+        if len(set(ns)) > 1:
+            raise ValueError(
+                "The parallel_sample_num should be the same for all samples in sample params."
+            )
+        self.parallel_sample_num = ns[0]
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 

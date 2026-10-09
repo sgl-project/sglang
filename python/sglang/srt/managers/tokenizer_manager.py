@@ -154,7 +154,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
-from sglang.srt.sampling.sampling_params import SamplingParams, check_top_logprobs_num
+from sglang.srt.sampling.sampling_params import (
+    SamplingParams,
+    validate_top_logprobs_num,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -1464,7 +1467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # must be a width torch.topk can serve for this vocabulary.
         if obj.top_logprobs_num is None:
             return
-        check_top_logprobs_num(obj.top_logprobs_num, self.model_config.vocab_size)
+        validate_top_logprobs_num(obj.top_logprobs_num, self.model_config.vocab_size)
 
     def _create_tokenized_object(
         self,

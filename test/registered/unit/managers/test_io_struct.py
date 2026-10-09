@@ -28,7 +28,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
-from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
+from sglang.srt.sampling.sampling_params import MAX_PARALLEL_SAMPLES, SamplingParams
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
@@ -705,7 +705,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         """A huge n must 400 before text is replicated."""
         req = GenerateReqInput(
             text="Hello",
-            sampling_params={"n": MAX_N + 1},
+            sampling_params={"n": MAX_PARALLEL_SAMPLES + 1},
         )
         with self.assertRaisesRegex(ValueError, r"n must be an integer in \[1,"):
             req.normalize_batch_and_arguments()
@@ -721,7 +721,10 @@ class TestGenerateReqInputNormalization(CustomTestCase):
     def test_beam_n_above_max_parallel_does_not_fan_out(self):
         req = GenerateReqInput(
             text="Hello",
-            sampling_params={"n": MAX_N + 1, "beam_width": MAX_N + 8},
+            sampling_params={
+                "n": MAX_PARALLEL_SAMPLES + 1,
+                "beam_width": MAX_PARALLEL_SAMPLES + 8,
+            },
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.text, "Hello")
@@ -744,14 +747,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
     def test_parallel_sampling_validates_every_request_n(self):
         """A later request is bounded on its own, not by the first item.
 
-        The first item is beam search, so its n may exceed MAX_N. The second
+        The first item is beam search, so its n may exceed MAX_PARALLEL_SAMPLES. The second
         is not, and the same n must 400 before either prompt is copied.
         """
         req = GenerateReqInput(
             text=["Hello", "World"],
             sampling_params=[
-                {"n": MAX_N + 1, "beam_width": MAX_N + 8},
-                {"n": MAX_N + 1},
+                {"n": MAX_PARALLEL_SAMPLES + 1, "beam_width": MAX_PARALLEL_SAMPLES + 8},
+                {"n": MAX_PARALLEL_SAMPLES + 1},
             ],
         )
         with self.assertRaisesRegex(ValueError, r"n must be an integer in \[1,"):
