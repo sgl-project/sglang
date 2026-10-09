@@ -1846,33 +1846,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 out = native_out if uses_native_fp4 else forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
-                m = self.forward_metadata
-                R, P = m.mixed_prefill_reqs, m.mixed_prefill_tokens
+                metadata = self.forward_metadata
+                prefix_reqs = metadata.mixed_prefill_reqs
+                prefix_tokens = metadata.mixed_prefill_tokens
                 if (
-                    R
+                    prefix_reqs
                     and q.dtype == self.data_type == torch.bfloat16
                     and layer.attn_type == AttentionType.DECODER
                 ):
                     out = torch.empty_like(q) if out is None else out
                     _trtllm_context_attn(
-                        q[:P],
-                        m.cu_seqlens_q[: R + 1],
-                        m.cache_seqlens_int32[:R],
-                        m.max_seq_len_q,
-                        cu_seqlens_kv=m.cu_seqlens_k[: R + 1],
-                        out=out[:P],
-                        page_table_override=page_table[:R],
+                        q[:prefix_tokens],
+                        metadata.cu_seqlens_q[: prefix_reqs + 1],
+                        metadata.cache_seqlens_int32[:prefix_reqs],
+                        metadata.max_seq_len_q,
+                        cu_seqlens_kv=metadata.cu_seqlens_k[: prefix_reqs + 1],
+                        out=out[:prefix_tokens],
+                        page_table_override=page_table[:prefix_reqs],
                     )
                     self._run_fixed_q_len_decode(
-                        q[P:],
+                        q[prefix_tokens:],
                         kv_cache,
-                        page_table[R:],
-                        m.cache_seqlens_int32[R:],
+                        page_table[prefix_reqs:],
+                        metadata.cache_seqlens_int32[prefix_reqs:],
                         bmm1_scale=bmm1_scale,
                         bmm2_scale=bmm2_scale,
                         window_left=layer.sliding_window_size,
                         sinks=attention_sink,
-                        out=out[P:],
+                        out=out[prefix_tokens:],
                     )
                     o = out
                 else:
