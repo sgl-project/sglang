@@ -9,9 +9,9 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -28,6 +28,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
+    core::{response_cache_key, CacheLookup, CachedResponse, RESPONSE_CACHE_HEADER},
     observability::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
@@ -145,6 +146,151 @@ pub async fn auth_middleware(
     }
 
     Ok(next.run(request).await)
+}
+
+/// Cache exact responses for explicitly greedy, non-streaming generation requests.
+///
+/// Authentication runs outside this layer. Callers opt in with an explicit
+/// cache scope; the key also includes the authorization and routing-selector
+/// headers. The body is hashed byte-for-byte so request normalization cannot
+/// accidentally merge two distinct calls. Hits replay the exact original body,
+/// including response identity and usage fields.
+pub async fn response_cache_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(cache) = state.context.response_cache.as_ref() else {
+        return next.run(request).await;
+    };
+
+    let config = &state.context.router_config;
+    if config.enable_igw
+        || config.api_key.is_none()
+        || !matches!(&config.mode, crate::config::RoutingMode::Regular { .. })
+        || !matches!(&config.connection_mode, crate::core::ConnectionMode::Http)
+    {
+        return next.run(request).await;
+    }
+
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    if method != Method::POST
+        || !matches!(
+            path.as_str(),
+            "/generate" | "/v1/completions" | "/v1/chat/completions"
+        )
+    {
+        return next.run(request).await;
+    }
+
+    let (parts, body) = request.into_parts();
+    let request_size = http_body::Body::size_hint(&body).exact();
+    if request_size
+        .map(|size| size as usize > cache.max_response_bytes())
+        .unwrap_or(true)
+    {
+        let request = Request::from_parts(parts, body);
+        let mut response = next.run(request).await;
+        response
+            .headers_mut()
+            .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("BYPASS"));
+        return response;
+    }
+    let body = match to_bytes(body, cache.max_response_bytes()).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let key = response_cache_key(
+        &config.response_cache.namespace,
+        &method,
+        &path,
+        &parts.headers,
+        &body,
+    );
+    let request = Request::from_parts(parts, Body::from(body));
+
+    let Some(key) = key else {
+        let mut response = next.run(request).await;
+        response
+            .headers_mut()
+            .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("BYPASS"));
+        return response;
+    };
+
+    match cache.begin(key) {
+        CacheLookup::Hit(response) => response.into_response("HIT"),
+        CacheLookup::Wait(receiver) => match cache.wait(receiver).await {
+            Some(response) => response.into_response("COALESCED"),
+            None => {
+                let mut response = next.run(request).await;
+                response
+                    .headers_mut()
+                    .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("BYPASS"));
+                response
+            }
+        },
+        CacheLookup::Bypass => {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("BYPASS"));
+            response
+        }
+        CacheLookup::Owner { sender, epoch } => {
+            let response = next.run(request).await;
+            let (mut parts, response_body) = response.into_parts();
+            let response_size = http_body::Body::size_hint(&response_body).exact();
+            if response_size
+                .map(|size| size as usize > cache.max_response_bytes())
+                .unwrap_or(true)
+            {
+                cache.abandon(key, epoch, sender);
+                parts
+                    .headers
+                    .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("MISS"));
+                return Response::from_parts(parts, response_body);
+            }
+
+            let body = match to_bytes(response_body, cache.max_response_bytes()).await {
+                Ok(body) => body,
+                Err(error) => {
+                    let cached = Arc::new(CachedResponse::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        HeaderMap::new(),
+                        Bytes::from(format!(
+                            "Failed to buffer response for exact caching: {error}"
+                        )),
+                    ));
+                    cache.complete(key, epoch, sender, cached.clone(), false);
+                    return cached.into_response("MISS");
+                }
+            };
+
+            parts.headers.remove(RESPONSE_CACHE_HEADER);
+            let mut cached_headers = HeaderMap::new();
+            for name in [header::CONTENT_TYPE, header::CONTENT_ENCODING] {
+                if let Some(value) = parts.headers.get(&name) {
+                    cached_headers.insert(name, value.clone());
+                }
+            }
+            let cached = Arc::new(CachedResponse::new(
+                parts.status,
+                cached_headers,
+                body.clone(),
+            ));
+            let persist = cached.status().is_success();
+            cache.complete(key, epoch, sender, cached, persist);
+
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = parts.status;
+            *response.headers_mut() = parts.headers;
+            response
+                .headers_mut()
+                .insert(RESPONSE_CACHE_HEADER, HeaderValue::from_static("MISS"));
+            response
+        }
+    }
 }
 
 /// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
@@ -981,7 +1127,111 @@ pub async fn wasm_middleware(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use axum::{routing::post, Router};
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{
+        app_context::AppContext, config::ResponseCacheConfig, routers::RouterTrait,
+        server::AppState,
+    };
+
+    #[derive(Debug)]
+    struct TestRouter;
+
+    #[async_trait]
+    impl RouterTrait for TestRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "test"
+        }
+
+        async fn route_chat(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _body: &crate::protocols::chat::ChatCompletionRequest,
+            _model_id: Option<&str>,
+        ) -> Response {
+            StatusCode::NOT_IMPLEMENTED.into_response()
+        }
+    }
+
+    fn cache_request(temperature: f64) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer secret")
+            .header("x-response-cache-scope", "test-scope")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"test","messages":[],"temperature":{temperature}}}"#
+            )))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_cache_middleware_hits_and_bypasses() {
+        let config = crate::config::RouterConfig {
+            api_key: Some("secret".to_string()),
+            response_cache: ResponseCacheConfig {
+                max_entries: 8,
+                namespace: "test-revision".to_string(),
+                ttl_secs: 60,
+                max_response_bytes: 1024,
+            },
+            ..Default::default()
+        };
+        let context = Arc::new(AppContext::from_config(config, 30).await.unwrap());
+        let state = Arc::new(AppState {
+            router: Arc::new(TestRouter),
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+            mesh_handler: None,
+            mesh_sync_manager: None,
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post({
+                    let calls = calls.clone();
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, Json(json!({"answer": "stable"})))
+                        }
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                state,
+                response_cache_middleware,
+            ));
+
+        let miss = app.clone().oneshot(cache_request(0.0)).await.unwrap();
+        assert_eq!(miss.headers()[RESPONSE_CACHE_HEADER], "MISS");
+        let miss_body = to_bytes(miss.into_body(), 1024).await.unwrap();
+
+        let hit = app.clone().oneshot(cache_request(0.0)).await.unwrap();
+        assert_eq!(hit.headers()[RESPONSE_CACHE_HEADER], "HIT");
+        let hit_body = to_bytes(hit.into_body(), 1024).await.unwrap();
+        assert_eq!(miss_body, hit_body);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for _ in 0..2 {
+            let bypass = app.clone().oneshot(cache_request(0.7)).await.unwrap();
+            assert_eq!(bypass.headers()[RESPONSE_CACHE_HEADER], "BYPASS");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn test_normalize_path_no_ids() {
