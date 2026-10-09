@@ -79,6 +79,112 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
             self.backend._build_npu_compress_metadata(batch)
         return self.backend.forward_metadata
 
+    def prefilled_batch(self, prefix_lens, extend_lens, max_context=4096):
+        lengths = [prefix + extend for prefix, extend in zip(prefix_lens, extend_lens)]
+        batch = self.batch(lengths, max_context)
+        num_tokens = sum(extend_lens)
+        batch.input_ids = torch.zeros(num_tokens, dtype=torch.int64)
+        batch.positions = torch.cat(
+            [
+                torch.arange(prefix, length)
+                for prefix, length in zip(prefix_lens, lengths)
+            ]
+        )
+        batch.extend_seq_lens = torch.tensor(extend_lens, dtype=torch.int32)
+        batch.extend_seq_lens_cpu = list(extend_lens)
+        batch.extend_prefix_lens = torch.tensor(prefix_lens, dtype=torch.int64)
+        batch.extend_prefix_lens_cpu = list(prefix_lens)
+        batch.out_cache_loc = torch.arange(num_tokens)
+
+        def completed_groups(ratio):
+            return sum(
+                (prefix + extend) // ratio - prefix // ratio
+                for prefix, extend in zip(prefix_lens, extend_lens)
+            )
+
+        batch.out_cache_loc_dsv4 = SimpleNamespace(
+            out_c4_loc=torch.arange(completed_groups(4)) + 128,
+            out_c128_loc=torch.arange(completed_groups(128)) + 256,
+        )
+        return batch
+
+    def test_cached_chunked_and_mixed_prefill_are_eligible(self):
+        self.backend._dsv4_prefill_capture_num_tokens = (128, 256, 384, 512)
+        for prefix_lens, extend_lens in (
+            ([0], [256]),
+            ([512], [384]),
+            ([2048], [256]),
+            ([2048], [192]),
+            ([2048, 0], [128, 256]),
+            ([2048, 2048], [128, 128]),
+        ):
+            with self.subTest(prefix_lens=prefix_lens, extend_lens=extend_lens):
+                batch = self.prefilled_batch(prefix_lens, extend_lens)
+                self.assertTrue(self.backend.can_run_prefill_cuda_graph(batch))
+
+    def test_prefill_rejects_invalid_prefix_and_unsupported_modes(self):
+        self.backend._dsv4_prefill_capture_num_tokens = (128, 256, 384, 512)
+        for change in (
+            {"extend_prefix_lens_cpu": None},
+            {"extend_prefix_lens_cpu": [2048]},
+            {"extend_prefix_lens_cpu": [-1, 0]},
+            {"attn_cp_metadata": object()},
+            {"out_cache_loc_dsv4": None},
+            {"forward_mode": ForwardMode.TARGET_VERIFY},
+            {"forward_mode": ForwardMode.DECODE},
+        ):
+            with self.subTest(change=change):
+                batch = self.prefilled_batch([2048, 0], [128, 256])
+                batch.__dict__.update(change)
+                self.assertFalse(self.backend.can_run_prefill_cuda_graph(batch))
+        batch = self.prefilled_batch([2048], [600])
+        self.assertFalse(self.backend.can_run_prefill_cuda_graph(batch))
+
+    def test_prefix_replay_metadata_keeps_live_query_and_history_lengths(self):
+        runner = SimpleNamespace(
+            _is_full_backend=False,
+            use_captured_attn_metadata=False,
+            model_runner=SimpleNamespace(attn_backend=self.backend),
+        )
+        batch = self.prefilled_batch([2048, 0], [256, 128], max_context=None)
+        with (
+            patch.object(
+                self.backend, "init_forward_metadata", side_effect=self.init_metadata
+            ) as init_metadata,
+            patch.object(self.backend, "prepare_prefill_shared_read_snapshot"),
+        ):
+            PrefillCudaGraphRunner._prepare_forward_metadata_for_replay(
+                runner,
+                batch,
+                SimpleNamespace(max_seq_len_override=4096),
+                SimpleNamespace(size=512),
+            )
+        metadata_batch = init_metadata.call_args.args[0]
+        self.assertIsNot(metadata_batch, batch)
+        self.assertIsNone(batch.max_seq_len_override)
+        self.assertEqual(metadata_batch.extend_prefix_lens_cpu, [2048, 0])
+        self.assertIs(metadata_batch.extend_prefix_lens, batch.extend_prefix_lens)
+        metadata = self.backend.forward_metadata
+        self.assertEqual(metadata.block_tables.shape, (2, 32))
+        self.assertEqual(metadata.c4_page_table.shape, (2, 32))
+        self.assertEqual(metadata.c128_page_table.shape, (2, 2))
+        self.assertEqual(metadata.seq_lens.tolist(), [2304, 128])
+        self.assertEqual(metadata.extend_seq_lens.tolist(), [256, 128])
+
+    def test_prefix_compressor_emits_only_newly_completed_groups(self):
+        batch = self.prefilled_batch([255, 2048], [2, 3])
+        self.backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa=torch.tensor([0, 2, 5], dtype=torch.int32)
+        )
+        self.backend._build_npu_compress_metadata_prefill(batch)
+        metadata = self.backend.forward_metadata
+        self.assertEqual(metadata.start_pos.tolist(), [255, 2048])
+        self.assertEqual(metadata.seqused.tolist(), [2, 3])
+        self.assertEqual(metadata.positions_cmp_padding_c4.tolist(), [252, 0, 0])
+        self.assertEqual(metadata.positions_cmp_padding_c128.tolist(), [128, 0])
+        self.assertEqual(metadata.c4_loc.tolist(), [128])
+        self.assertEqual(metadata.c128_loc.tolist(), [256])
+
     def test_fixed_tables_keep_live_lengths(self):
         for seq_len in (64, 128, 300, 1024):
             with self.subTest(seq_len=seq_len):
@@ -192,6 +298,7 @@ class TestDsv4PrefillMaxContext(unittest.TestCase):
         runner.capture_num_tokens = [128, 256, 384, 512]
         for lengths, prefix_lengths, num_tokens, expected in (
             ([384], [0], 384, True),
+            ([384], [128], 256, True),
             ([385], [0], 385, False),
             ([300, 212], [0, 0], 512, True),
             ([385, 127], [0, 0], 512, False),

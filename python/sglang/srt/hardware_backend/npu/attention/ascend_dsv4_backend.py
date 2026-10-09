@@ -918,6 +918,8 @@ class DeepseekV4AscendAttnBackend(
     # Request-dependent cache stores, indexer and compressors run at an eager
     # BCG boundary. Rebuild metadata for the real batch, as on CUDA, rather
     # than binding it to the synthetic capture request layout.
+    # Cached prefixes and subsequent prefill chunks use this same live-batch
+    # path; the graph's token bucket contains only the new query tokens.
     use_captured_forward_metadata_for_breakable_cuda_graph = False
     supports_prefill_cuda_graph_max_context_size = True
 
@@ -935,7 +937,7 @@ class DeepseekV4AscendAttnBackend(
             and has_compatible_bucket
             and prefix_lens is not None
             and len(prefix_lens) == forward_batch.batch_size
-            and all(int(length) == 0 for length in prefix_lens)
+            and all(int(length) >= 0 for length in prefix_lens)
             and forward_batch.out_cache_loc_dsv4 is not None
             and getattr(forward_batch, "attn_cp_metadata", None) is None
         )
