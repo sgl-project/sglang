@@ -2535,8 +2535,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
                     if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                        from sglang.srt.state_capturer.routed_experts_wire import (
+                            encode_routed_experts_for_wire,
+                        )
+
+                        val, dtype_name = encode_routed_experts_for_wire(val)
+                    else:
+                        dtype_names = getattr(recv_obj, "routed_experts_dtype", None)
+                        dtype_name = (
+                            dtype_names[i]
+                            if dtype_names and dtype_names[i] is not None
+                            else "int32"
+                        )
                     meta_info["routed_experts"] = val
+                    meta_info["routed_experts_dtype"] = dtype_name
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

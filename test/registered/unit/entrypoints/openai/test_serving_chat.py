@@ -3438,6 +3438,7 @@ class ServingChatTestCase(CustomTestCase):
                     "completion_tokens": 2,
                     "cached_tokens": index,
                     "routed_experts": routed_experts,
+                    "routed_experts_dtype": "uint8",
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                 },
@@ -3579,6 +3580,64 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
         self.assertEqual(dumped_choice["response_token_ids"], [21, 22])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
+
+    def test_routed_experts_dtype_survives_native_to_openai_response(self):
+        """Dtype must accompany the same routing payload in both response modes."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    stream=stream,
+                    return_routed_experts=True,
+                )
+                ret = {
+                    "text": "Response",
+                    "meta_info": {
+                        "id": "chatcmpl-routing",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "routed_experts": "AAH+/w==",
+                        "routed_experts_dtype": "uint8",
+                        "finish_reason": {"type": "stop", "matched": None},
+                        "weight_version": "default",
+                    },
+                    "index": 0,
+                }
+                if stream:
+
+                    async def generate():
+                        yield ret
+
+                    self.tm.generate_request.return_value = generate()
+
+                    async def collect():
+                        return [
+                            chunk
+                            async for chunk in self.chat._generate_chat_stream(
+                                GenerateReqInput(text="Hi"), req, self.fastapi_request
+                            )
+                        ]
+
+                    chunks = get_or_create_event_loop().run_until_complete(collect())
+                    responses = [
+                        json.loads(chunk[len("data: ") :])
+                        for chunk in chunks
+                        if chunk.strip() != "data: [DONE]"
+                    ]
+                    extensions = [
+                        item["sglext"] for item in responses if "sglext" in item
+                    ]
+                    self.assertEqual(len(extensions), 1)
+                    extension = extensions[0]
+                else:
+                    response = self.chat._build_chat_response(req, [ret], 1234567890)
+                    extension = response.model_dump()["sglext"]
+                self.assertEqual(
+                    extension,
+                    {"routed_experts": "AAH+/w==", "routed_experts_dtype": "uint8"},
+                )
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming chat responses emit cached token details in sglext."""
