@@ -22,6 +22,13 @@ declare -A ENV_MAP=(
   # exception.
   [SGLANG_ENABLE_ASYNC_ASSERT]=0
   [SGLANG_USE_AITER]=1
+  # Multimodal preprocessing / media-fetch wait timeout (seconds). Default in code
+  # is 3-10s, which is too tight on AMD CI: the first aiter kernel JIT compile can
+  # block the server long enough that LLaVA image preprocessing hits
+  # asyncio.wait_for() and returns HTTP 500 (e.g. test_vision_chunked_prefill).
+  # Bumping it here is conservative (it only extends how long we wait, never changes
+  # numeric behavior) and stays scoped to AMD CI via docker exec -e.
+  [REQUEST_TIMEOUT]=30
 )
 
 # Conditionally add GPU_ARCHS only for mi35x
