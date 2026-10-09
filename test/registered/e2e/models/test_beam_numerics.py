@@ -12,6 +12,7 @@ path against the eager oracle.
 import copy
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -346,24 +347,22 @@ class TestBeamNumerics(CustomTestCase):
                                 q.float() * compute_ssmax_scale(positions)[:, None]
                             ).to(q.dtype)
                         attention.gate_bias.zero_()
+
+                        def project_output(x, *, skip_all_reduce=False):
+                            self.assertFalse(skip_all_reduce)
+                            return x, None
+
                         with (
-                            patch.object(
-                                attention.qkv_proj, "forward", return_value=(qkv, None)
-                            ),
+                            ExitStack() as projection_patches,
                             patch.object(
                                 attention.attn,
                                 "forward",
                                 side_effect=lambda q, k, v, b: q,
                             ),
                             patch.object(
-                                attention.gate_proj,
-                                "forward",
-                                return_value=(torch.zeros_like(q), None),
-                            ),
-                            patch.object(
                                 attention.o_proj,
                                 "forward",
-                                side_effect=lambda x: (x, None),
+                                side_effect=project_output,
                             ),
                             patch(
                                 "sglang.srt.models.beam.fused_inplace_qknorm_rope",
@@ -382,6 +381,33 @@ class TestBeamNumerics(CustomTestCase):
                                 side_effect=AssertionError("forced Torch called SSMax"),
                             ),
                         ):
+                            gate = torch.zeros_like(q)
+                            if hasattr(attention, "qkv_gate_proj"):
+                                projection_patches.enter_context(
+                                    patch.object(
+                                        attention.qkv_gate_proj,
+                                        "forward",
+                                        return_value=(
+                                            torch.cat((qkv, gate), dim=-1),
+                                            None,
+                                        ),
+                                    )
+                                )
+                            else:
+                                projection_patches.enter_context(
+                                    patch.object(
+                                        attention.qkv_proj,
+                                        "forward",
+                                        return_value=(qkv, None),
+                                    )
+                                )
+                                projection_patches.enter_context(
+                                    patch.object(
+                                        attention.gate_proj,
+                                        "forward",
+                                        return_value=(gate, None),
+                                    )
+                                )
                             actual = attention(
                                 positions,
                                 torch.zeros(2, self.config.hidden_size),

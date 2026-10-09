@@ -21,6 +21,22 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.beam_decode_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.beam_decode_gemv:beam_decode_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="single-token interleaved Beam MoE with FP32 routing weights",
+        ),
+        description="SM103 Beam TP4/EP1 weighted expert outputs; caller owns reduction.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
