@@ -68,6 +68,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
+        || name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("host"))
 }
 
@@ -295,5 +296,25 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+    }
+
+    #[test]
+    fn test_preserve_response_headers_drops_stale_framing() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert("content-length", HeaderValue::from_static("688"));
+        upstream.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        upstream.insert("content-encoding", HeaderValue::from_static("gzip"));
+        upstream.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream.insert("x-request-id", HeaderValue::from_static("abc123"));
+
+        let preserved = preserve_response_headers(&upstream);
+
+        assert!(!preserved.contains_key("content-length"));
+        assert!(!preserved.contains_key("transfer-encoding"));
+        assert!(!preserved.contains_key("content-encoding"));
+        assert!(!preserved.contains_key("connection"));
+        assert_eq!(preserved.get("content-type").unwrap(), "application/json");
+        assert_eq!(preserved.get("x-request-id").unwrap(), "abc123");
     }
 }
