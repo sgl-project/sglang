@@ -2758,10 +2758,12 @@ class DeepseekV4AscendAttnBackend(
                 actual_q = actual_seq_lengths_q_pa[1:].clone()
             else:
                 actual_q = actual_seq_lengths_kv
-            # S174: ops-transformer README passes batch_size/max_seqlen_q/max_seqlen_k to
-            # this metadata op; sglang omits them (schema default 0). Fill them only when
-            # SGLANG_DSV4_LI_META_MAXSEQ is set, so default behaviour is unchanged (A/B).
-            _li_meta_kwargs = dict(
+            # NOTE (S175): ops-transformer README also passes batch_size/max_seqlen_q/
+            # max_seqlen_k, but the analogous AICPU metadata op treats those as FALLBACKS
+            # used only when the seq-length tensors are absent (GetS1SeqSize prefers
+            # seqUsedQ/cu_seqlens_q). sglang passes the tensors, so those attrs are
+            # unused -> omitting them is a no-op. Reverted S174 gated fill.
+            li_quant_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
                 device=str(actual_q.device),
                 actual_seq_lengths_query=actual_q,
                 actual_seq_lengths_key=actual_seq_lengths_kv,
@@ -2776,27 +2778,42 @@ class DeepseekV4AscendAttnBackend(
                 num_heads_k=1,
                 head_dim=self._dsv4_index_head_dim,
             )
-            _fill_maxseq = bool(os.environ.get("SGLANG_DSV4_LI_META_MAXSEQ"))
-            if _fill_maxseq:
-                _li_meta_kwargs["batch_size"] = int(actual_q.numel())
-                _li_meta_kwargs["max_seqlen_q"] = int(actual_q.max().item())
-                _li_meta_kwargs["max_seqlen_k"] = int(actual_seq_lengths_kv.max().item())
-            _li_meta = torch.ops.custom.npu_quant_lightning_indexer_metadata(
-                **_li_meta_kwargs
-            )
-            kernel_metadata["li_quant_metadata"] = _li_meta
+            kernel_metadata["li_quant_metadata"] = li_quant_metadata
             if os.environ.get("DSV4_DUMP_LIMETA"):
+                # S176 one-shot locator: decode the [1024] core-partition so a single
+                # run shows WHICH LI/LD core owns each M/S2 range. If the absolute row
+                # of block 134/135 lands in a DIFFERENT core/workspace on hit vs miss,
+                # the topk split is the (metadata-driven) op core-partition / merge
+                # order -- not framework state. Layout per ops-transformer
+                # quant_lightning_indexer_metadata.h:
+                #   LI [36][8] @ 8*c : ENABLE,BN2_START,M_START,S2_START,BN2_END,M_END,
+                #                      S2_END,FIRST_LD_WS
+                #   LD [72][8] @ 288+8*c : ENABLE,BN2_IDX,M_IDX,WS_IDX,WS_NUM,M_START,M_NUM
                 try:
-                    _xc = _li_meta.detach().to("cpu").contiguous()
-                    if _xc.dtype != torch.int32:
-                        _xc = _xc.to(torch.int32)
-                    _h = hashlib.md5(_xc.numpy().tobytes()).hexdigest()[:16]
+                    _x = li_quant_metadata.detach().to("cpu").reshape(-1).tolist()
+                    _AIC, _AIV, _LI, _LD = 36, 72, 8, 8
+                    _slq = int(actual_q.max().item())
+                    _slk = int(actual_seq_lengths_kv.max().item())
+                    _li = []
+                    for _c in range(_AIC):
+                        _r = _x[_LI * _c : _LI * _c + _LI]
+                        if len(_r) == _LI and _r[0]:
+                            _li.append(
+                                f"c{_c}(bn2 {_r[1]}-{_r[4]} M {_r[2]}-{_r[5]} "
+                                f"S2 {_r[3]}-{_r[6]} ws{_r[7]})"
+                            )
+                    _ld = []
+                    for _c in range(_AIV):
+                        _o = _LI * _AIC + _LD * _c
+                        _r = _x[_o : _o + _LD]
+                        if len(_r) == _LD and _r[0]:
+                            _ld.append(
+                                f"c{_c}(bn2 {_r[1]} mi {_r[2]} M {_r[5]}+{_r[6]} "
+                                f"ws {_r[3]}x{_r[4]})"
+                            )
                     print(
-                        f"[LIMETA] maxseq={1 if _fill_maxseq else 0} "
-                        f"slq=({int(actual_q.min())},{int(actual_q.max())},{actual_q.numel()}) "
-                        f"slk=({int(actual_seq_lengths_kv.min())},{int(actual_seq_lengths_kv.max())},"
-                        f"{actual_seq_lengths_kv.numel()}) md5={_h} "
-                        f"shape={tuple(_li_meta.shape)} head={_xc.reshape(-1)[:24].tolist()}",
+                        f"[LIMETA] bs={bs} slq={_slq} slk={_slk} base={_slk - _slq} "
+                        f"nLI={len(_li)} nLD={len(_ld)} LI={_li[:6]} LD={_ld[:10]}",
                         flush=True,
                     )
                 except Exception as exc:
