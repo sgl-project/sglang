@@ -1544,8 +1544,10 @@ def _single_clip_schedule(inputs: _WanAnimate2Inputs) -> list[int]:
 
 def test_reference_video_url_uses_native_media_loading(tmp_path):
     path = tmp_path / "reference.mp4"
-    write_reference_video(str(path), np.full((5, 16, 16, 3), 128, dtype=np.uint8), 16)
+    # keep the tiny fixture's width aligned for decord's RGB frame buffer
+    write_reference_video(str(path), np.full((5, 32, 64, 3), 128, dtype=np.uint8), 16)
     expected = read_reference_video_frames(str(path), 8)
+    assert expected.shape == (2, 32, 64, 3)
     with patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
         "wan_animate_2.preprocess.get_video_bytes",
