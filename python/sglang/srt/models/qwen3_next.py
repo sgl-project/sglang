@@ -1,5 +1,6 @@
 import enum
 import logging
+import re
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -496,6 +497,21 @@ def _apply_qwen3_next_mlp(
     hidden_states = layer.ffn_boundary.finish(hidden_states, forward_batch)
 
     return hidden_states
+
+
+def _match_weight_name(name: str, weight_name: str) -> bool:
+    """Check that ``weight_name`` occurs in ``name`` on path-segment boundaries.
+
+    A plain substring check would treat a checkpoint that already ships a
+    fused weight (e.g. ``gate_up_proj``) as containing ``up_proj`` and
+    double-fuse it into ``gate_gate_up_proj``
+    (see https://github.com/sgl-project/sglang/issues/13214). Anchoring the
+    match to ``.``-separated path segments keeps pre-fused checkpoint names
+    intact while still matching multi-segment names such as
+    ``experts.3.gate_proj``.
+    """
+    pattern = r"(^|\.)" + re.escape(weight_name.rstrip(".")) + r"(\.|$)"
+    return re.search(pattern, name) is not None
 
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
@@ -1151,7 +1167,7 @@ class Qwen3NextForCausalLM(nn.Module):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if not _match_weight_name(name, weight_name):
                     continue
 
                 # TODO(fix mtp loading)
@@ -1175,7 +1191,7 @@ class Qwen3NextForCausalLM(nn.Module):
             else:
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
+                    if not _match_weight_name(name, weight_name):
                         continue
                     replaced_name = name.replace(weight_name, param_name)
                     # Skip layers on other devices.
