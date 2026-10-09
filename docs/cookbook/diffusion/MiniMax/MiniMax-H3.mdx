@@ -1014,8 +1014,9 @@ levels:
 - `"exact"`: the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
 - `"lossless"` (default): includes the global fusion-only tier but does not enable
-  Cache-DiT or another approximate optimization. The denoise path is the same
-  as `exact`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
+  Cache-DiT or another approximate optimization. Each DiT block runs its
+  RMSNorm and AdaLN modulation as one kernel that rounds once instead of after
+  every op, and VAE decode fuses the ViT decoder's per-head QK RMSNorm and
   RoPE into one launch and runs its attention on cuDNN SDPA (rounding-level
   differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
@@ -1064,9 +1065,10 @@ quality-gated VAE fusions.
 
 <Tab title="lossless (default)">
 
-The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-follows the same H3 denoise path as `exact`; only the VAE decoder's fused
-QK RMSNorm + RoPE and cuDNN SDPA attention differ.
+The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT. It
+differs from `exact` only in rounding: the DiT blocks' fused RMSNorm + AdaLN
+modulation, and the VAE decoder's fused QK RMSNorm + RoPE and cuDNN SDPA
+attention.
 Omitting the field selects this level.
 
 ```json Request field

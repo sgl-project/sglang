@@ -348,6 +348,30 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
 
+def _dp_balance_stats(
+    *,
+    local_tokens: int,
+    global_num_tokens: list,
+    sync_wait_seconds: float,
+    local_attention_pairs: int | None = None,
+    global_attention_pairs: list | None = None,
+):
+    """One-token rows unless the pairs are given explicitly."""
+    return DPBalanceStats.create(
+        local_tokens=local_tokens,
+        global_num_tokens=global_num_tokens,
+        local_attention_pairs=(
+            local_tokens if local_attention_pairs is None else local_attention_pairs
+        ),
+        global_attention_pairs=(
+            global_num_tokens
+            if global_attention_pairs is None
+            else global_attention_pairs
+        ),
+        sync_wait_seconds=sync_wait_seconds,
+    )
+
+
 class TestDPBalanceMetrics(CustomTestCase):
     def _reporter_with_collector(self, attn_dp_rank: int):
         scheduler = types.SimpleNamespace(
@@ -401,10 +425,18 @@ class TestDPBalanceMetrics(CustomTestCase):
         )
 
         batch = types.SimpleNamespace(
-            dp_balance_stats=DPBalanceStats.create(4, [8, 4], 0.002)
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4,
+                global_num_tokens=[8, 4],
+                sync_wait_seconds=0.002,
+                local_attention_pairs=4000,
+                global_attention_pairs=[800, 4000],
+            )
         )
         reporter.log_batch_result_stats(batch, result=object())
-        batch.dp_balance_stats = DPBalanceStats.create(0, [8, 0], 0.004)
+        batch.dp_balance_stats = _dp_balance_stats(
+            local_tokens=0, global_num_tokens=[8, 0], sync_wait_seconds=0.004
+        )
         reporter.log_batch_result_stats(batch, result=object())
         batch.dp_balance_stats = None
         reporter.log_batch_result_stats(batch, result=object())
@@ -430,14 +462,64 @@ class TestDPBalanceMetrics(CustomTestCase):
             get("sglang:dp_attention_token_imbalance_ratio_sum", labels),
             8 * 2 / 12 + 2.0,
         )
+        # Pairs: the first step's long-context rank is the pair-busiest
+        # despite having fewer rows; the idle step adds the peer's 8.
+        self.assertEqual(
+            get("sglang:dp_attention_pairs_total", {**labels, "kind": "scheduled"}),
+            4000,
+        )
+        self.assertEqual(
+            get("sglang:dp_attention_pairs_total", {**labels, "kind": "imbalance"}),
+            8,
+        )
         self.assertAlmostEqual(
             get("sglang:dp_attention_sync_wait_seconds_sum", labels), 0.006
+        )
+
+    def test_ratio_ladder_keeps_widely_supported_boundaries(self):
+        # Downstream metrics gateways with a fixed bucket preset drop the series
+        # when a boundary is not in it; pin the ladder so an edit cannot regress that.
+        reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=0)
+        batch = types.SimpleNamespace(
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
+            )
+        )
+        reporter.log_batch_result_stats(batch, result=object())
+
+        bounds = [
+            float(sample.labels["le"])
+            for metric in registry.collect()
+            if metric.name == "sglang:dp_attention_token_imbalance_ratio"
+            for sample in metric.samples
+            if sample.name.endswith("_bucket") and sample.labels["le"] != "+Inf"
+        ]
+        self.assertEqual(
+            bounds,
+            [
+                1.0,
+                1.5,
+                2.0,
+                2.5,
+                3.0,
+                4.0,
+                5.0,
+                7.5,
+                10.0,
+                15.0,
+                20.0,
+                30.0,
+                45.0,
+                60.0,
+            ],
         )
 
     def test_engine_ratio_reported_by_dp_rank_zero_only(self):
         reporter, registry, labels = self._reporter_with_collector(attn_dp_rank=1)
         batch = types.SimpleNamespace(
-            dp_balance_stats=DPBalanceStats.create(4, [8, 4], 0.002)
+            dp_balance_stats=_dp_balance_stats(
+                local_tokens=4, global_num_tokens=[8, 4], sync_wait_seconds=0.002
+            )
         )
         reporter.log_batch_result_stats(batch, result=object())
 
