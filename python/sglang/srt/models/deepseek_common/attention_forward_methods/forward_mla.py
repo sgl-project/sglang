@@ -47,6 +47,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _is_xpu,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -560,7 +561,8 @@ class DeepseekMLAForwardMixin:
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
             elif self.w_kc.dtype == torch.float8_e4m3fn:
-                if _is_cpu:
+                if _is_cpu or _is_xpu:
+                    # bmm_fp8 is CUDA-only; XPU upcasts to bf16 like CPU.
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
@@ -887,7 +889,7 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
                     self.w_vc.to(torch.bfloat16) * self.w_scale,
