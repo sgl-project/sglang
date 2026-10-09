@@ -11,11 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import (
-    candidate_probs,
-    sample_indices_from_probs,
-    selector_walk_triton,
-)
+from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -42,7 +38,11 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.sampling.draft_sampling import DraftSamplingParams
+from sglang.srt.sampling.draft_sampling import (
+    DraftSamplingParams,
+    candidate_probs,
+    sample_indices_from_probs,
+)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,

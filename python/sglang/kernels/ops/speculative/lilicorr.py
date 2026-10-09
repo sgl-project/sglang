@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
-
-from sglang.kernels.ops.speculative.dflash import (
-    candidate_probs,
-    sample_indices_from_probs,
-    selector_walk_triton,
-)
-from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 
 # Launch geometry tuned on H100 for a ~150k vocabulary; TILE * TPP is the load block.
 _TILE = 1024
@@ -171,45 +164,3 @@ def lilicorr_topk_lse(
         num_warps=_NUM_WARPS,
     )
     return ov, oi, _combine_lse(pm, ps)
-
-
-def _lattice_scores(log_start: torch.Tensor, log_pair: torch.Tensor) -> torch.Tensor:
-    # The walk reads only scores[:, 0, 0, :] at slot 0, so broadcasting is sound.
-    topk = int(log_start.shape[-1])
-    start = log_start.float()[:, None, None, :].expand(-1, 1, topk, topk)
-    return torch.cat([start, log_pair.float()], dim=1)
-
-
-def _selector_walk_torch(
-    *,
-    candidate_ids: torch.Tensor,
-    probs: torch.Tensor,
-    uniforms: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    batch, num_slots, topk = candidate_ids.shape
-    previous = torch.zeros(batch, dtype=torch.int64, device=probs.device)
-    tokens, q_rows = [], []
-    for slot in range(num_slots):
-        q_row = torch.gather(
-            probs[:, slot], 1, previous.view(-1, 1, 1).expand(-1, 1, topk)
-        ).squeeze(1)
-        previous = sample_indices_from_probs(q_row, uniforms[:, slot : slot + 1])
-        q_rows.append(q_row)
-        tokens.append(
-            torch.gather(candidate_ids[:, slot], 1, previous.view(-1, 1)).squeeze(1)
-        )
-    return torch.stack(tokens, dim=-1).to(torch.int64), torch.stack(q_rows, dim=1)
-
-
-def lilicorr_sample_path(
-    log_start: torch.Tensor,
-    log_pair: torch.Tensor,
-    candidate_tokens: torch.Tensor,
-    uniforms: torch.Tensor,
-    params: Optional[DraftSamplingParams],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # No log-prob prior in the proposal: the head was trained without one. Greedy rows
-    # report a point mass so min(1, p/q) stays the right acceptance test.
-    probs = candidate_probs(_lattice_scores(log_start, log_pair), params)
-    walk = selector_walk_triton if probs.is_cuda else _selector_walk_torch
-    return walk(candidate_ids=candidate_tokens, probs=probs, uniforms=uniforms)

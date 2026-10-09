@@ -3,11 +3,8 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.speculative.lilicorr import (
-    _topk_lse_torch,
-    lilicorr_sample_path,
-    lilicorr_topk_lse,
-)
+from sglang.kernels.ops.speculative.lilicorr import _topk_lse_torch, lilicorr_topk_lse
+from sglang.srt.models.lilicorr import lilicorr_sample_path
 from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.test.ci.ci_register import register_cuda_ci

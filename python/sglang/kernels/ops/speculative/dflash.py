@@ -1,34 +1,6 @@
-from typing import Optional
-
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-
-from sglang.srt.sampling.draft_sampling import DraftSamplingParams, build_draft_probs
-
-
-def candidate_probs(
-    scores: torch.Tensor, params: Optional[DraftSamplingParams]
-) -> torch.Tensor:
-    """q for every conditional row of a [bs, slots, K, K] candidate lattice.
-
-    ``params=None`` walks greedily: each row is a point mass at its argmax.
-    Draft top-k/top-p narrow the K candidates; they never add tokens.
-    """
-    if params is None:
-        return F.one_hot(scores.argmax(dim=-1), scores.shape[-1]).float()
-    return build_draft_probs(scores, params)
-
-
-def sample_indices_from_probs(
-    probs: torch.Tensor, uniforms: torch.Tensor
-) -> torch.Tensor:
-    indices = uniforms.ge(probs.cumsum(dim=-1)).sum(dim=-1)
-    offsets = torch.arange(probs.shape[-1], device=probs.device)
-    # Roundoff can leave the CDF just below one; fall back inside q's support.
-    last_supported = torch.where(probs > 0, offsets, 0).amax(dim=-1)
-    return torch.minimum(indices, last_supported)
 
 
 @triton.jit
@@ -297,7 +269,7 @@ def _selector_walk_kernel(
         index = tl.sum(
             tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
         )
-        # Same roundoff fallback as sample_indices_from_probs.
+        # Roundoff can leave the CDF just below one; fall back inside q's support.
         last_supported = tl.max(tl.where(probabilities > 0, offsets, 0), axis=0)
         index = tl.minimum(index, last_supported)
         tl.store(q_ptr + base + offsets, probabilities)

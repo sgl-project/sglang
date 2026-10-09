@@ -94,7 +94,7 @@ def _sample_corrected_candidate_path(kind, scores, *, uniforms, params):
         return selector.sample_path(
             candidate_ids=candidate_ids, scores=scores, uniforms=uniforms, params=params
         )
-    from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
+    from sglang.srt.models.lilicorr import lilicorr_sample_path
 
     return lilicorr_sample_path(
         scores[:, 0, 0], scores[:, 1:], candidate_ids, uniforms=uniforms, params=params
@@ -142,14 +142,16 @@ def test_greedy_candidate_walk_ignores_the_uniform_draw(kind, greedy_params):
 
 
 def test_candidate_sampling_roundoff_fallback_stays_in_truncated_support():
-    from sglang.kernels.ops.speculative.dflash import sample_indices_from_probs
-    from sglang.kernels.ops.speculative.lilicorr import _selector_walk_torch
+    from sglang.srt.sampling.draft_sampling import (
+        sample_candidate_path,
+        sample_indices_from_probs,
+    )
 
     probs = torch.tensor([0.25, 0.0, 0.7499998, 0.0])
     uniforms = torch.tensor([[0.0], [0.5], [0.9999999]])
     indices = sample_indices_from_probs(probs.expand(3, -1), uniforms)
     assert indices.tolist() == [0, 2, 2]
-    tokens, q = _selector_walk_torch(
+    tokens, q = sample_candidate_path(
         candidate_ids=torch.arange(8).reshape(1, 2, 4),
         probs=probs.expand(1, 2, 4, 4),
         uniforms=torch.tensor([[0.9999999, 0.9999999]]),

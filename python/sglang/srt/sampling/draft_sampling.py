@@ -7,10 +7,14 @@ exact q a proposal was drawn from, so callers keep the q built here.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.sampling.probability_transforms import (
     top_k_renorm_probs,
     top_p_renorm_probs,
@@ -114,3 +118,47 @@ def build_draft_probs(
         -1, flat.argmax(dim=-1, keepdim=True), greedy.float()
     )
     return probs.view(logits.shape)
+
+
+def candidate_probs(
+    scores: torch.Tensor, params: Optional[DraftSamplingParams]
+) -> torch.Tensor:
+    """q for every conditional row of a [bs, slots, K, K] candidate lattice.
+
+    ``params=None`` walks greedily: each row is a point mass at its argmax.
+    Draft top-k/top-p narrow the K candidates; they never add tokens.
+    """
+    if params is None:
+        return F.one_hot(scores.argmax(dim=-1), scores.shape[-1]).float()
+    return build_draft_probs(scores, params)
+
+
+def sample_indices_from_probs(
+    probs: torch.Tensor, uniforms: torch.Tensor
+) -> torch.Tensor:
+    indices = uniforms.ge(probs.cumsum(dim=-1)).sum(dim=-1)
+    offsets = torch.arange(probs.shape[-1], device=probs.device)
+    # Roundoff can leave the CDF just below one; fall back inside q's support.
+    last_supported = torch.where(probs > 0, offsets, 0).amax(dim=-1)
+    return torch.minimum(indices, last_supported)
+
+
+def sample_candidate_path(
+    *, candidate_ids: torch.Tensor, probs: torch.Tensor, uniforms: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Walk a [bs, slots, K, K] lattice: each slot samples from the q row its
+    predecessor picked. Returns the tokens and the realized q rows."""
+    if probs.is_cuda:
+        return selector_walk_triton(
+            candidate_ids=candidate_ids, probs=probs, uniforms=uniforms
+        )
+    batch, num_slots, topk = candidate_ids.shape
+    previous = torch.zeros(batch, dtype=torch.int64, device=probs.device)
+    tokens, q_rows = [], []
+    for slot in range(num_slots):
+        q_row = probs[:, slot].gather(1, previous.view(-1, 1, 1).expand(-1, 1, topk))
+        q_row = q_row.squeeze(1)
+        previous = sample_indices_from_probs(q_row, uniforms[:, slot : slot + 1])
+        q_rows.append(q_row)
+        tokens.append(candidate_ids[:, slot].gather(1, previous.view(-1, 1)).squeeze(1))
+    return torch.stack(tokens, dim=-1).to(torch.int64), torch.stack(q_rows, dim=1)
