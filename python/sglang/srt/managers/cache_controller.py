@@ -43,7 +43,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -705,6 +705,13 @@ class HiCacheController:
     ):
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
+        # Read here, not at a call site: every attach builds its config through this.
+        if self.storage_backend_type == "file":
+            file_storage_path = get_serving().file_storage_path
+            if file_storage_path:
+                storage_backend_extra_config.setdefault(
+                    "file_storage_path", file_storage_path
+                )
 
         parallel = get_parallel()
         if is_dp_attention_enabled():

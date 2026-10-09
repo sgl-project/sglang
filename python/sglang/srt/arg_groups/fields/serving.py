@@ -185,7 +185,7 @@ class Serving(msgspec.Struct):
     ] = None
     file_storage_path: A[
         Optional[str],
-        "The path of the file storage in backend.",
+        "Directory of the HiCache `file` storage backend (default /tmp/hicache). Takes precedence over SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR; a `file_storage_path` key in --hicache-storage-backend-extra-config takes precedence over this flag.",
     ] = None
     enable_cache_report: A[
         bool,
