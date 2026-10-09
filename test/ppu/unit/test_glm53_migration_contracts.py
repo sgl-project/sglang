@@ -99,7 +99,9 @@ class TestW8A8Int8MoEDispatcherSelection(unittest.TestCase):
 
             cls.ct_mod = ct_mod
             cls.skip_reason = None
-        except ImportError as e:
+        except (ImportError, TypeError) as e:
+            # TypeError: py<3.10 hosts fail on PEP 604 unions at import time
+            # (e.g. environ.py's `str | None`), which is a skip, not an error.
             cls.ct_mod = None
             cls.skip_reason = f"Cannot import compressed_tensors dispatcher: {e}"
 
@@ -486,6 +488,104 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
             _SHOULD_IGNORE_LAYER("visual.blocks.0.attn.qkv_proj", remapped),
             "should_ignore_layer must match after remap",
         )
+
+
+# ===================================================================
+# Part 5: MHC + attention-CP gather guard contract (layer_boundary)
+# ===================================================================
+class TestMhcAttentionCpGuardContract(unittest.TestCase):
+    """AST contract for construction._bind_stage's MHC + attention-CP guard.
+
+    v0.5.21 upstream raised NotImplementedError for any at-producer update
+    whose producer layout is sharded over ATTN_CP (commit 49b5e76e45). For
+    the GLM-5.3-Flash DSA prefill-CP path this blocked server startup with
+    a full token shard over ATTN_CP, even though the transport is
+    implemented (input gather in boundary._select_input_steps L415-430 /
+    prepare._mlp_input_gather_attention_cp; at-producer update after the
+    output move in exit._complete_ffn_output_now L269-272).
+
+    The migrated branch relaxes the guard to raise only when the gather
+    difference also contains axes other than ATTN_CP. Because
+    Layout.sharded_over() omits size-one axes, ATTN_CP can only appear on
+    the CONTEXT_PARALLEL batch variant, so non-CP batches keep their old
+    (permissive) behavior and the relaxation cannot tighten anything.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        rel = "sglang/srt/layers/layer_boundary/construction.py"
+        cls.source = _PYTHON_ROOT + "/" + rel
+        with open(cls.source, "r") as fh:
+            cls.source_text = fh.read()
+        cls.tree = ast.parse(cls.source_text, filename=cls.source)
+
+    def _guard_ifs(self):
+        """If nodes whose body raises the MHC attention-CP error."""
+        found = []
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.If):
+                continue
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Raise):
+                    continue
+                exc = stmt.exc
+                if (
+                    isinstance(exc, ast.Call)
+                    and isinstance(exc.func, ast.Name)
+                    and exc.func.id == "NotImplementedError"
+                    and exc.args
+                    and isinstance(exc.args[0], ast.Constant)
+                    and exc.args[0].value == "MHC with a gather over attention CP"
+                ):
+                    found.append(node)
+        return found
+
+    def test_guard_present_exactly_once(self):
+        self.assertEqual(len(self._guard_ifs()), 1)
+
+    def test_guard_requires_attn_cp_membership(self):
+        """The raise condition must still contain `ATTN_CP in gathers_over_cp`."""
+        guard = self._guard_ifs()[0]
+        compares = [n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)]
+        membership = [
+            c
+            for c in compares
+            if any(isinstance(op, ast.In) for op in c.ops)
+            and isinstance(c.left, ast.Attribute)
+            and c.left.attr == "ATTN_CP"
+            and isinstance(c.comparators[0], ast.Name)
+            and c.comparators[0].id == "gathers_over_cp"
+        ]
+        self.assertTrue(membership, "guard must require ATTN_CP in gathers_over_cp")
+
+    def test_guard_relaxes_exactly_attn_cp(self):
+        """The raise condition must also require gathers_over_cp != {ATTN_CP}."""
+        guard = self._guard_ifs()[0]
+        compares = [n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)]
+        relaxed = [
+            c
+            for c in compares
+            if any(isinstance(op, ast.NotEq) for op in c.ops)
+            and isinstance(c.left, ast.Name)
+            and c.left.id == "gathers_over_cp"
+            and isinstance(c.comparators[0], ast.Set)
+            and len(c.comparators[0].elts) == 1
+            and isinstance(c.comparators[0].elts[0], ast.Attribute)
+            and c.comparators[0].elts[0].attr == "ATTN_CP"
+        ]
+        self.assertTrue(
+            relaxed,
+            "guard must relax the ATTN_CP-only gather case "
+            "(gathers_over_cp != {TokenAxis.ATTN_CP})",
+        )
+
+    def test_original_guard_kept_as_comment(self):
+        """The upstream condition is retained as a comment (change trace)."""
+        self.assertIn(
+            '#     raise NotImplementedError("MHC with a gather over attention CP")',
+            self.source_text,
+        )
+        self.assertIn("# if (", self.source_text)
 
 
 if __name__ == "__main__":

@@ -262,8 +262,27 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
+        # [patch GLM5.3-Flash v18 e4364e2d49 迁移补缺 - KDA state prefill-CP shard] 旧代码：
+        # shape = KimiLinearStateShape.create(
+        #     tp_world_size=get_parallel().attn_tp_size,
+        #     num_heads=self.linear_attn_config["num_heads"],
+        #     head_dim=self.linear_attn_config["head_dim"],
+        #     conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
+        # )
+        # 为什么：prefill CP 下 attn_tp_size = tp // attn_cp / attn_dp 会塌缩为 1，
+        # 导致 mamba/KDA 状态按整机尺寸求解（CP rank 间重复），D2 (tp8/cp8)
+        # 会直接把 KV cache 预算吃穿：ValueError "Loaded weights leave no GPU
+        # memory for the KV cache"。KDA 状态在 prefill-CP 下按 attn_cp_size 分片。
+        from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+        head_shard_size = (
+            get_parallel().attn_cp_size
+            if is_dsa_enable_prefill_cp()
+            else get_parallel().attn_tp_size
+        )
+
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=head_shard_size,
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

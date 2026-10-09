@@ -1503,9 +1503,19 @@ async def benchmark(
     for _ in range(warmup_requests):
         warmup_tasks.append(
             asyncio.create_task(
+                # [fix 0.5.21 upstream bench warmup TypeError] 旧代码（warmup 调用
+                # 缺 task_id，运行必抛 TypeError: limited_request_func() missing
+                # 1 required positional argument: 'task_id'）：
+                # limited_request_func(
+                #     request_func_input=test_input,
+                #     pbar=None,
+                # )
                 limited_request_func(
                     request_func_input=test_input,
                     pbar=None,
+                    # warmup 不参与 active profiling 计数：
+                    # 避免命中 task_id == 1 / == 2 * max_concurrency 触发点
+                    task_id=-1,
                 )
             )
         )

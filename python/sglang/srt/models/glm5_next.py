@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL,
@@ -1699,7 +1700,27 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                if is_dsa_prefill_cp_round_robin_split():
+                # [patch GLM5.3-Flash v21 PPU dormant-CP 补缺] PPU 上 CP-v2 strategy 恒休眠
+                # （cp/base.py init_cp_strategy 的 is_ppu 守卫 → get_cp_strategy() 返回 None），
+                # 且 PPU DSA backend 无 core_attn_metadata/apply_cp_reindex；PPU 由 dsa_backend.py
+                # 内部 V1 回退完成 round-robin 切分（对齐 v0.5.18）。此外 glm5_next 为 hybrid 模型，
+                # get_attn_backend() 返回 HybridLinearAttnBackend wrapper，其 forward_metadata 会
+                # 落到 ABC 类属性 None。故仅在 CP-v2 strategy 存在（非 PPU）时执行 reindex。
+                # 旧代码：
+                # if is_dsa_prefill_cp_round_robin_split():
+                #     attn_backend = get_attn_backend()
+                #     metadata = attn_backend.forward_metadata
+                #     core_meta = metadata.core_attn_metadata
+                #     core_meta.apply_cp_reindex()
+                #     core_meta.init_flashmla_related(is_prefill=True)
+                #     if metadata.indexer_metadata is not None:
+                #         metadata.indexer_metadata = (
+                #             attn_backend.init_forward_metadata_indexer(core_meta)
+                #         )
+                if (
+                    is_dsa_prefill_cp_round_robin_split()
+                    and get_cp_strategy() is not None
+                ):
                     attn_backend = get_attn_backend()
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata

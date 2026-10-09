@@ -288,10 +288,24 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         raise ValueError("incoming and outgoing batch variants disagree")
     variants = {}
     for variant, edge in incoming.entries.items():
+        # [glm5.3-flash-migrate-0521] Relaxed for MHC + attention-CP prefill: the
+        # producer->stage gather over ATTN_CP alone is implemented transport
+        # (input gather in boundary._select_input_steps / prepare
+        # _mlp_input_gather_attention_cp; the at-producer update runs after the
+        # output move in exit._complete_ffn_output_now). Only combinations that
+        # also gather over other axes remain unsupported. sharded_over() omits
+        # size-one axes, so ATTN_CP appears here only on the CP batch variant.
+        gathers_over_cp = edge.produced.layout.sharded - edge.need.layout.sharded
+        # if (
+        #     declaration.update.at_producer
+        #     and TokenAxis.ATTN_CP
+        #     in edge.produced.layout.sharded - edge.need.layout.sharded
+        # ):
+        #     raise NotImplementedError("MHC with a gather over attention CP")
         if (
             declaration.update.at_producer
-            and TokenAxis.ATTN_CP
-            in edge.produced.layout.sharded - edge.need.layout.sharded
+            and TokenAxis.ATTN_CP in gathers_over_cp
+            and gathers_over_cp != {TokenAxis.ATTN_CP}
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         handoff = None

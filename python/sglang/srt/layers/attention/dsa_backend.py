@@ -70,9 +70,10 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
-from sglang.srt.layers.attention.dsa.utils import (
+from sglang.srt.layers.attention.dsa.utils import (  # [patch GLM5.3-Flash v21 PPU dormant-CP 补缺] 新增导入：V1 round-robin 切分回退所需
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
+    dsa_cp_round_robin_split_data,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
@@ -1098,6 +1099,12 @@ class DeepseekSparseAttnBackend(
             # runtimes (non-interleave CP on PPU keeps the strategy dormant, see
             # init_cp_strategy) run prefill CP with the batch already CP-sharded
             # upstream -- this rewrite must stay off there.
+            #
+            # NOTE(rebase onto 1a0c0fbe6b): the fork-local V1 round-robin fallback
+            # that used to sit in the `strategy is None` arm is dropped here.
+            # can_dsa_prefill_cp_interleave() requires cp_strategy == "interleave",
+            # and init_cp_strategy now binds InterleaveCPStrategy on PPU for exactly
+            # that kind, so the fallback was unreachable on PPU.
             strategy = (
                 get_cp_strategy()
                 if can_dsa_prefill_cp_interleave(forward_batch)
@@ -1320,7 +1327,15 @@ class DeepseekSparseAttnBackend(
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
             assert can_dsa_prefill_cp_interleave(forward_batch)
-            split_per_token = get_cp_strategy().shard_local_tokens
+            # 旧代码：
+            # split_per_token = get_cp_strategy().shard_local_tokens
+            # [patch GLM5.3-Flash v21 PPU dormant-CP 补缺] strategy 休眠时回退 V1 逐 token 切分
+            _cp_strategy = get_cp_strategy()
+            split_per_token = (
+                _cp_strategy.shard_local_tokens
+                if _cp_strategy is not None
+                else dsa_cp_round_robin_split_data
+            )
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
