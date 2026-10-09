@@ -21,6 +21,11 @@ a fixed permuted order, which is why V^T is stored in that order. PV accumulates
 FP32 O registers that are rescaled to the new max on every tile and normalized by l at
 the end.
 
+QK and PV use the block-scaled MMA encoding (kind::mxf8f6f4) with every UE8M0 scale set
+to 1.0 when the compile target has it. It computes the same E4M3 x E4M3 product with FP32
+accumulation as the plain encoding, bit for bit; GeForce SM120 runs the plain encoding at
+half rate.
+
 Non-causal only. No dropout, no autograd. Inputs must be finite.
 """
 
@@ -29,6 +34,8 @@ import math
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm120_utils
+from cutlass.cutlass_dsl import BaseDSL
 
 
 def _make_gmem_tiled_copy(atom_copy, dtype, copy_bits, minor_size, num_threads):
@@ -39,6 +46,37 @@ def _make_gmem_tiled_copy(atom_copy, dtype, copy_bits, minor_size, num_threads):
     )
     value_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+
+
+def _block_scaled_mma_supported():
+    # MmaMXF8Op assembles only for the SM120 / SM121 "a" and "f" targets.
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch in cute.nvgpu.warp.MmaMXF8Op.admissible_archs
+
+
+# UE8M0 scale byte: 2^(byte - 127), so 0x7F is exactly 1.0.
+UNIT_SCALE_BYTE = 0x7F
+
+
+def _make_unit_scale_fragment_A(thr_mma, tidx, tile_mk):
+    # The reference tensor only carries the (M, K) tile shape; stride 0, nothing is read.
+    reference = cute.make_rmem_tensor(
+        cute.make_layout(tile_mk, stride=(0, 0)),
+        cutlass.Float8E8M0FNU,
+    )
+    fragment = sm120_utils.partition_fragment_SFA(reference, thr_mma, tidx)
+    cute.recast_tensor(fragment, cutlass.Uint8).fill(UNIT_SCALE_BYTE)
+    return fragment
+
+
+def _make_unit_scale_fragment_B(thr_mma, tidx, tile_nk):
+    reference = cute.make_rmem_tensor(
+        cute.make_layout(tile_nk, stride=(0, 0)),
+        cutlass.Float8E8M0FNU,
+    )
+    fragment = sm120_utils.partition_fragment_SFB(reference, thr_mma, tidx)
+    cute.recast_tensor(fragment, cutlass.Uint8).fill(UNIT_SCALE_BYTE)
+    return fragment
 
 
 def _make_smem_layout_fp8(dtype, copy_bits, smem_tiler):
@@ -74,6 +112,7 @@ def _fp8_attention_sm120(
     tiled_copy_V: cute.TiledCopy,
     tiled_mma: cute.TiledMma,
     cta_tiler: cutlass.Constexpr = (128, 32, 128),
+    block_scaled_mma: cutlass.Constexpr = True,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, bidz = cute.arch.block_idx()
@@ -139,6 +178,13 @@ def _fp8_attention_sm120(
     tCrQ = tiled_mma.make_fragment_A(tCsQ[None, None, None, 0])
     tCrK = tiled_mma.make_fragment_B(tCsK[None, None, None, 0])
     tCrV = tiled_mma.make_fragment_B(tCsV[None, None, None, 0])
+
+    # Scale fragments: A is (value, m_tile, k_block), B is (value, (n_tile, k_block)).
+    if cutlass.const_expr(block_scaled_mma):
+        tCrSFQ = _make_unit_scale_fragment_A(thr_mma, tidx, (128, 128))
+        tCrSFK = _make_unit_scale_fragment_B(thr_mma, tidx, (32, 128))
+        tCrSFP = _make_unit_scale_fragment_A(thr_mma, tidx, (128, 32))
+        tCrSFV = _make_unit_scale_fragment_B(thr_mma, tidx, (128, 32))
 
     acc_shape = thr_mma.partition_shape_C((128, 32))
     tCrC = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
@@ -236,13 +282,28 @@ def _fp8_attention_sm120(
                 tCsK_p[None, None, k_block],
                 tCrK_copy_view[None, None, k_block],
             )
-            cute.gemm(
-                tiled_mma,
-                tCrC,
-                tCrQ[None, None, k_block],
-                tCrK[None, None, k_block],
-                tCrC,
-            )
+            if cutlass.const_expr(block_scaled_mma):
+                cute.gemm(
+                    tiled_mma,
+                    tCrC,
+                    [
+                        tCrQ[None, None, k_block],
+                        tCrSFQ[None, None, k_block],
+                    ],
+                    [
+                        tCrK[None, None, k_block],
+                        tCrSFK[None, (None, k_block)],
+                    ],
+                    tCrC,
+                )
+            else:
+                cute.gemm(
+                    tiled_mma,
+                    tCrC,
+                    tCrQ[None, None, k_block],
+                    tCrK[None, None, k_block],
+                    tCrC,
+                )
 
         for m_tile in cutlass.range_constexpr(2):
             for row in cutlass.range_constexpr(2):
@@ -319,13 +380,28 @@ def _fp8_attention_sm120(
                 tCsV_p[None, None, k_block],
                 tCrV_copy_view[None, None, k_block],
             )
-            cute.gemm(
-                tiled_mma,
-                tCrO,
-                tCrP[None, None, k_block],
-                tCrV[None, None, k_block],
-                tCrO,
-            )
+            if cutlass.const_expr(block_scaled_mma):
+                cute.gemm(
+                    tiled_mma,
+                    tCrO,
+                    [
+                        tCrP[None, None, k_block],
+                        tCrSFP[None, None, k_block],
+                    ],
+                    [
+                        tCrV[None, None, k_block],
+                        tCrSFV[None, (None, k_block)],
+                    ],
+                    tCrO,
+                )
+            else:
+                cute.gemm(
+                    tiled_mma,
+                    tCrO,
+                    tCrP[None, None, k_block],
+                    tCrV[None, None, k_block],
+                    tCrO,
+                )
 
     warp_id = tidx // 32
     lane_id = tidx % 32
@@ -374,6 +450,7 @@ def fp8_attention_host(
     mScales: cute.Tensor,
     softmax_scale: cutlass.Float32,
     stream,
+    block_scaled_mma: cutlass.Constexpr = True,
 ):
     mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
     mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, mode=[1, 2, 0]))
@@ -381,11 +458,20 @@ def fp8_attention_host(
     mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=[1, 2, 0]))
     mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[1, 0]))
 
-    mma_op = cute.nvgpu.warp.MmaFP8Op(
-        mQ.element_type,
-        cutlass.Float32,
-        (16, 8, 32),
-    )
+    # block_scaled_mma=False keeps the plain encoding; the unit test compares the two.
+    block_scaled_mma = block_scaled_mma and _block_scaled_mma_supported()
+    if cutlass.const_expr(block_scaled_mma):
+        mma_op = cute.nvgpu.warp.MmaMXF8Op(
+            mQ.element_type,
+            cutlass.Float32,
+            cutlass.Float8E8M0FNU,
+        )
+    else:
+        mma_op = cute.nvgpu.warp.MmaFP8Op(
+            mQ.element_type,
+            cutlass.Float32,
+            (16, 8, 32),
+        )
     tiled_mma = cute.make_tiled_mma(
         mma_op,
         (4, 1, 1),
@@ -456,6 +542,7 @@ def fp8_attention_host(
         tiled_copy_K,
         tiled_copy_V,
         tiled_mma,
+        block_scaled_mma=block_scaled_mma,
     ).launch(
         grid=(cute.ceil_div(mQ.shape[0], 128), 1, mQ.shape[2]),
         block=(num_threads, 1, 1),

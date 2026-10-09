@@ -192,6 +192,20 @@ def test_prep_defines_every_padded_byte():
         assert not ((raw == 0xFF) | (raw == 0x7F)).any()
 
 
+def test_block_scaled_mma_is_bit_equal():
+    """Unit UE8M0 scales must not move one output bit; S=1052 also covers the key mask."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _fp8_attention
+
+    for sequence in (1052, 4096):
+        q, k, v = _fused_qkv_views(sequence)
+        output, lse = _fp8_attention(q, k, v, SOFTMAX_SCALE, block_scaled_mma=False)
+        scaled_output, scaled_lse = _fp8_attention(
+            q, k, v, SOFTMAX_SCALE, block_scaled_mma=True
+        )
+        assert torch.equal(output.view(torch.int16), scaled_output.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), scaled_lse.view(torch.int32))
+
+
 def test_causal_falls_back_to_cudnn():
     ours, reference = _make_impls(causal=True)
     q, k, v = _fused_qkv_views(1024)
