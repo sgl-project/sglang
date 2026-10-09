@@ -3,9 +3,10 @@
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -40,6 +41,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    flatten_extra_params,
+    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -70,6 +73,51 @@ def _resolve_image_output_format(
     if output_format is not None:
         return output_format
     return sampling_params_cls.default_image_output_format()
+
+
+def _parse_form_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _multipart_image_model_kwargs(
+    raw_form: Any,
+    sampling_params_cls: type[SamplingParams],
+    *,
+    extra_body: str | None,
+    extra_params: str | None,
+) -> dict[str, Any]:
+    """Collect the model-declared image fields sent with a multipart request.
+
+    Mirrors what /generations reads from JSON extras, so edits accept the same
+    model-specific fields as form fields, `extra_body`, or `extra_params`.
+    """
+    extras: dict[str, Any] = {}
+    for name, payload in (("extra_body", extra_body), ("extra_params", extra_params)):
+        if not payload:
+            continue
+        try:
+            parsed = json.loads(payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"{name} is not valid JSON"
+            ) from exc
+        if name == "extra_params":
+            parsed = {"extra_params": parsed}
+        extras.update(flatten_extra_params(parsed))
+    declared = get_sampling_request_extra_fields(sampling_params_cls, "image")
+    for key in declared:
+        if key in raw_form:
+            extras[key] = _parse_form_value(raw_form[key])
+    return {
+        key: value
+        for key, value in extras.items()
+        if key in declared and value is not None
+    }
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -411,10 +459,18 @@ async def edits(
     upscaling_scale: Optional[int] = Form(4),
     perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
+    extra_body: Optional[str] = Form(None),
+    extra_params: Optional[str] = Form(None),
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = _multipart_image_model_kwargs(
+        await raw_request.form(),
+        sampling_params_cls,
+        extra_body=extra_body,
+        extra_params=extra_params,
+    )
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
@@ -484,6 +540,7 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             perf_dump_path=perf_dump_path,
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

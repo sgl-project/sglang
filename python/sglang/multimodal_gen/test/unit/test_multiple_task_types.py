@@ -401,3 +401,70 @@ def test_capability_discovery(monkeypatch):
         assert info["task_type"] == "T2V"
         assert info["output_types"] == ["IMAGE", "VIDEO"]
         assert info["has_image_understanding"] is True
+
+
+@dataclass
+class EditExtrasSamplingParams(SamplingParams):
+    style_strength: float = 1.0
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"style_strength"})
+
+
+@pytest.mark.parametrize(
+    "http_client", [(MultiConfig, EditExtrasSamplingParams)], indirect=True
+)
+@pytest.mark.parametrize(
+    "form, expected",
+    [
+        ({}, 1.0),
+        ({"style_strength": "0.25"}, 0.25),
+        ({"extra_body": '{"style_strength": 0.5}'}, 0.5),
+        ({"extra_params": '{"style_strength": 0.75}'}, 0.75),
+        # a direct form field wins over the JSON containers
+        ({"style_strength": "0.25", "extra_body": '{"style_strength": 0.5}'}, 0.25),
+    ],
+)
+def test_image_edits_pass_model_declared_fields(http_client, form, expected):
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "edit", "size": "64x64", "response_format": "b64_json", **form},
+        files={"image": ("image.png", png_bytes(), "image/png")},
+    )
+    assert response.status_code == 200, response.text
+    assert admitted[-1].sampling_params.style_strength == expected
+
+
+def test_image_edits_ignore_undeclared_fields(http_client):
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "edit",
+            "size": "64x64",
+            "response_format": "b64_json",
+            "style_strength": "0.25",
+            "extra_body": '{"style_strength": 0.5}',
+        },
+        files={"image": ("image.png", png_bytes(), "image/png")},
+    )
+    assert response.status_code == 200, response.text
+    assert not hasattr(admitted[-1].sampling_params, "style_strength")
+
+
+@pytest.mark.parametrize(
+    "http_client", [(MultiConfig, EditExtrasSamplingParams)], indirect=True
+)
+@pytest.mark.parametrize("field", ["extra_body", "extra_params"])
+def test_image_edits_reject_malformed_extras_json(http_client, field):
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "edit", field: "{not json"},
+        files={"image": ("image.png", png_bytes(), "image/png")},
+    )
+    assert response.status_code == 400
+    assert field in response.json()["detail"]
+    assert admitted == []
