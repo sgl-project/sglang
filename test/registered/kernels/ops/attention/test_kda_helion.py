@@ -1228,19 +1228,59 @@ def test_target_verify_contract(dtype, lower_bound, tree):
         prefill_backend=LinearAttnKernelBackend.TRITON,
         verify_backend=LinearAttnKernelBackend.HELION,
     )
-    expected = TritonKDAKernel().target_verify(**args)
+    reference = TritonKDAKernel()
+    reference_args = args.copy()
+    expected = reference.target_verify(**reference_args)
+    actual_state = state.clone()
+    args["ssm_states"] = actual_state
     args["intermediate_states_buffer"] = actual_snapshots
     actual = dispatcher.target_verify(**args)
     torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
     torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
     torch.testing.assert_close(state, initial, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, initial, atol=0, rtol=0)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = dispatcher.target_verify(**args)
+    actual_snapshots.fill_(-99.0)
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+    torch.testing.assert_close(captured, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_state, initial, atol=0, rtol=0)
+
+    # Accept two tokens from row 0 and one from row 1. The path 0 -> 1
+    # is also valid for the tree case. Commit each backend's own snapshots.
+    state[3].copy_(snapshots[2, 1])
+    state[5].copy_(snapshots[4, 0])
+    actual_state[3].copy_(actual_snapshots[2, 1])
+    actual_state[5].copy_(actual_snapshots[4, 0])
+    torch.testing.assert_close(actual_state, state, atol=0.003, rtol=0.02)
+    committed = state.clone()
+    actual_committed = actual_state.clone()
+
+    # Keep captured addresses fixed while changing inputs and reusing the
+    # state/snapshot slots in a different request order for the next round.
+    qkv.copy_(torch.randn_like(qkv))
+    args["a"].copy_(torch.randn_like(args["a"]))
+    args["b"].copy_(torch.randn_like(args["b"]))
+    args["cache_indices"].copy_(
+        torch.tensor([5, 3, 6, -1], device="cuda", dtype=torch.int32)
+    )
+    args["intermediate_state_indices"].copy_(
+        torch.tensor([4, 2, 7, -1], device="cuda", dtype=torch.int64)
+    )
+    snapshots.fill_(-99.0)
+    actual_snapshots.fill_(-99.0)
+    expected = reference.target_verify(**reference_args)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(state, committed, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, actual_committed, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
