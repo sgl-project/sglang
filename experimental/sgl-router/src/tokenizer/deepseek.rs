@@ -137,6 +137,13 @@ pub(super) fn render_v41(
         !messages.iter().any(|m| m["role"] == "developer"),
         "V4.1 developer messages require engine-side rendering"
     );
+    // Dynamo renders V4.1 images, but only the worker expands them into media tokens.
+    ensure!(
+        !messages.iter().any(|m| m["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|p| p["type"] != "text"))),
+        "V4.1 media requires engine-side rendering"
+    );
     if let Some(tools) = request["tools"].as_array().filter(|t| !t.is_empty()) {
         if messages[0]["role"] != "system" {
             messages.insert(0, json!({"role":"system", "content":""}));
