@@ -214,20 +214,26 @@ def fit_auto_residency_probe(
     floor_units = min((record.workload_units() for record in records), default=0)
     fitted, steps = req, 0
     while True:
-        units = (
-            max(1, int(fitted.width or 1))
-            * max(1, int(fitted.height or 1))
-            * max(1, int(fitted.num_frames or 1))
-        )
+        units = _probe_workload_units(fitted)
         estimate = estimate_default_workload_peak_bytes(
             records=records, target_units=units
         )
         if estimate is None or estimate <= budget or units <= floor_units:
             return fitted, estimate, steps
         lighter = lighten_warmup_req(server_args, fitted)
-        if lighter is None:
+        # Sampling params that pin the frame count (Wan-Animate-2 mirrors clip_len
+        # in __post_init__) hand back an equal-size req; treat that as the floor.
+        if lighter is None or _probe_workload_units(lighter) >= units:
             return fitted, estimate, steps
         fitted, steps = lighter, steps + 1
+
+
+def _probe_workload_units(req: Req) -> int:
+    return (
+        max(1, int(req.width or 1))
+        * max(1, int(req.height or 1))
+        * max(1, int(req.num_frames or 1))
+    )
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):

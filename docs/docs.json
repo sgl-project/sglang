@@ -944,6 +944,7 @@
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",
               "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/thinking_budget",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
@@ -1339,6 +1340,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1488,6 +1490,12 @@
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
                     ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
+                    ]
                   }
                 ]
               },
@@ -1517,7 +1525,8 @@
                     "group": "Wan",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
-                      "cookbook/diffusion/Wan/Wan2.2"
+                      "cookbook/diffusion/Wan/Wan2.2",
+                      "cookbook/diffusion/Wan/Wan-Animate-2"
                     ]
                   },
                   {

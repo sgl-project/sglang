@@ -710,6 +710,9 @@ class WeightOverrideComponentLoader(ComponentLoader):
     """Base for loaders that consume an exact weights-only override."""
 
     ignored_checkpoint_prefixes: tuple[str, ...] = ()
+    # True: a checkpoint key that maps to no model parameter fails the load instead
+    # of being logged and skipped.
+    strict_checkpoint_keys: bool = False
 
     def load_state_dict_model(
         self,
@@ -738,7 +741,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
             fsdp_inference=server_args.should_use_fsdp_for_component(component_name),
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            strict=False,
+            strict=self.strict_checkpoint_keys,
             weight_load_plan=weight_load_plan,
             checkpoint_key_filter=checkpoint_key_filter,
             weights_iterator=weights_iterator,
