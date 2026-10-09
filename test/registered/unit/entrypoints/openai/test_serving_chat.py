@@ -1114,7 +1114,7 @@ class ServingChatTestCase(CustomTestCase):
         """JSON output must not skip the answer opener, while a forced tool array stays
         bare JSON."""
         self._use_delimited_response_template("beam")
-        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"a": 1}</call>'
+        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"city": "Paris"}</call>'
         for prompt, from_start, texts in (
             (
                 "<assistant>",

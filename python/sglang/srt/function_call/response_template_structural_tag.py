@@ -908,16 +908,18 @@ def tool_call_structural_tag(
     grammar_requires_reasoning: bool = False,
     undeclared_names: bool = False,
     sorted_arguments: bool = False,
+    strict_arguments: bool = False,
 ) -> dict[str, Any] | None:
     """Derive native calls, respecting strict arguments, count and reasoning.
 
     An `answer` field lets the model answer instead, in `answer_format` if
-    given; without tools, only the answer is derived. With `undeclared_names`,
-    calls may also name any other tool the template can spell, with any
-    arguments, where its name pattern lets the grammar tell strict tools
-    apart. Strict `xml-inline` arguments come in declared order, or also
-    alphabetical with `sorted_arguments`. Raises `ValueError` for names the
-    template cannot encode."""
+    given; without tools, only the answer is derived. `strict_arguments`
+    holds the arguments of every tool as strict where they can be. With
+    `undeclared_names`, calls may also name any other tool the template can
+    spell, with any arguments, where its name pattern lets the grammar tell
+    held tools apart. Strict `xml-inline` arguments come in declared order,
+    or also alphabetical with `sorted_arguments`. Raises `ValueError` for
+    names the template cannot encode."""
     if not tools and answer is not None:
 
         def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
@@ -933,7 +935,7 @@ def tool_call_structural_tag(
     closer_literals = _closers(field)
     if opener is None or closer_literals is None:
         return None
-    arguments = []
+    arguments, held = [], []
     for tool in tools:
         function = tool["function"]
         # Like the generic JSON schema, a tool without parameters takes none.
@@ -941,13 +943,23 @@ def tool_call_structural_tag(
             function.get("parameters") or {"type": "object", "properties": {}}
         )
         strict = bool(function.get("strict"))
-        arguments.append(
-            _arguments_format(
-                field, parameters, strict=strict, sorted_arguments=sorted_arguments
+        tool_arguments = None
+        if strict or strict_arguments:
+            try:
+                tool_arguments = _arguments_format(
+                    field, parameters, strict=True, sorted_arguments=sorted_arguments
+                )
+            except ValueError:
+                if strict:
+                    raise
+        held.append(tool_arguments is not None)
+        if tool_arguments is None and not strict:
+            tool_arguments = _arguments_format(
+                field, parameters, strict=False, sorted_arguments=sorted_arguments
             )
-        )
-        if arguments[-1] is None:
+        if tool_arguments is None:
             return None
+        arguments.append(tool_arguments)
     names = []
     for tool in tools:
         name = tool["function"]["name"]
@@ -955,13 +967,12 @@ def tool_call_structural_tag(
             raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
         names.append(_escape(name))
     if undeclared_names:
-        held = [bool(tool["function"].get("strict")) for tool in tools]
         others = _other_names(
             opener[1], [tool["function"]["name"] for tool, h in zip(tools, held) if h]
         )
-        loose = _arguments_format(field, {}, strict=False)
+        loose = _arguments_format(field, {}, strict=False, sorted_arguments=False)
         if others is not None and loose is not None:
-            # Calls to tools that are not strict all take the same arguments.
+            # Calls to tools that are not held all take the same arguments.
             names = [name for name, h in zip(names, held) if h] + [f"(?:{others})"]
             arguments = [args for args, h in zip(arguments, held) if h] + [loose]
     closers = _const_strings(closer_literals) if closer_literals else None

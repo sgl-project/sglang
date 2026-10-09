@@ -104,4 +104,6 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
             undeclared_names=undeclared_names,
             # Beam also writes arguments sorted by name.
             sorted_arguments=True,
+            # Unheld, Beam's arguments drift from their schemas.
+            strict_arguments=True,
         )

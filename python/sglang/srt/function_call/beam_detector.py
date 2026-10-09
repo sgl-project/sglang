@@ -57,6 +57,8 @@ class BeamDetector(ResponseTemplateToolDetector):
             undeclared_names=tool_choice == "auto" and self.admits_undeclared_tools(),
             # Beam also writes arguments sorted by name.
             sorted_arguments=True,
+            # Unheld, Beam's arguments drift from their schemas.
+            strict_arguments=True,
         )
         if tag is None:
             return None
