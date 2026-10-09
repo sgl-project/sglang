@@ -119,15 +119,11 @@ def _build_explicit_state_block_table(
     valid = (seqused[:, None] > 0) & within_capacity & (positions >= 0)
 
     if compress_ratio == 4:
-        # Address the c4 compress-state ring by REQUEST-SCOPED absolute position
-        # (req_pool_idx*ring_size + pos%ring_size), NOT via swa_loc. The
-        # full->swa map is not position-stable on a cache hit (the SWA window
-        # drifts ~3 pages), so the old full->swa->state chain read a different
-        # ring row for the same logical position on hit vs miss -> indexer c4
-        # state / index-K / cmp_sparse_indices diverged (hit != miss).
-        state_locs = state_pool.translate_from_req_position_to_state_loc(
-            req_pool_indices[:, None], positions
-        )
+        # Masked history/ragged columns are still indexed before torch.where.
+        safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
+        full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
+        swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
+        state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
     else:
         state_locs = state_pool.translate_from_req_position_to_state_loc(
             req_pool_indices[:, None], positions
