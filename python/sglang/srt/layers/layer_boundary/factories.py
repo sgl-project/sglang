@@ -22,6 +22,7 @@ from sglang.srt.layers.layer_boundary.construction import (
     _bind_stage,
     _input_scattered_possible,
     _reject_unsupported_cp_moe,
+    _unpadded_possible,
     _use_ag_after_qlora,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
@@ -64,6 +65,8 @@ def _active_variants():
         yield BatchVariant.INPUT_SCATTERED
     if layernorm_sp.layernorm_sp_enabled():
         yield BatchVariant.SEQUENCE_PARALLEL
+    if _unpadded_possible():
+        yield BatchVariant.UNPADDED
 
 
 def _row_layouts(variant):
@@ -99,8 +102,11 @@ def _resolve_ffn(
     output_complete=False,
 ):
     parallel = get_parallel()
-    if dense_tp_size not in (None, 1, parallel.tp_size):
-        raise ValueError("dense FFN rows support local compute or the full TP group")
+    if dense_tp_size not in (None, 1, parallel.attn_tp_size, parallel.tp_size):
+        raise ValueError(
+            "dense FFN rows support local compute, the attention TP group or the "
+            "full TP group"
+        )
     strategy = get_exec().comm.boundary_reduction
     if strategy not in ("ar", "rs", "rsv", "rs+rsv"):
         raise ValueError(
@@ -114,13 +120,36 @@ def _resolve_ffn(
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
     if parallel.attn_cp_size > 1 and sparse:
         _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
+    if variant is BatchVariant.UNPADDED and on_rank_rows:
+        # Rows that do not divide over attention TP stay whole: the FFN runs on
+        # the attention's rows (an a2a MoE dispatches them from every
+        # attention-TP rank) and its output is complete, as a2a's combine or
+        # local compute leaves it.
+        return (
+            StageContract(
+                InputContract(attention, read=read),
+                OutputContract(attention, update=update, transform=output_transform),
+            ),
+            attention,
+            attention,
+        )
     on_cp_shards = (
         sparse
         and parallel.attn_cp_size > 1
         and parallel.moe_dp_size == parallel.attn_cp_size
         and not _cp_gathers_over_attn_cp()
     )
-    group = SumGroup.MOE_OUTPUT if sparse else SumGroup.TP
+    # Over attention TP, short of the full TP group: the FFN owes only the
+    # attention-TP sum, and nothing moves over DP.
+    on_attention_rows = (
+        not sparse
+        and dense_tp_size == parallel.attn_tp_size
+        and dense_tp_size not in (1, parallel.tp_size)
+    )
+    if sparse:
+        group = SumGroup.MOE_OUTPUT
+    else:
+        group = SumGroup.ATTN_TP if on_attention_rows else SumGroup.TP
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageContract(
@@ -160,13 +189,16 @@ def _resolve_ffn(
         may_leave = may_scatter = parallel.attn_cp_size == 1 or on_cp_shards
     else:
         may_leave = may_scatter = True
-    rows = (
-        local
-        if on_rank_rows
-        else Layout.sharded_over(
+    if on_rank_rows:
+        rows = local
+    elif on_attention_rows:
+        rows = attention
+        # The output is already on the residual's rows: nothing to scatter.
+        use_reduce_scatter = use_reduce_scatterv = False
+    else:
+        rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
-    )
     # An FFN that writes the next stream itself hands on a complete output.
     complete = on_rank_rows or update is REPLACE_AT_EXIT or output_complete
     produced = (
@@ -219,7 +251,9 @@ class StageDeclaration:
         tp_group: Group partitioning attention heads. Full TP consumers require
             full token rows, including when TP shares the prefill CP group.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
-            1 means local compute, and the full TP size means TP compute.
+            1 means local compute, the attention TP size means compute on the
+            attention's rows over attention TP, and the full TP size means TP
+            compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
         writes_at_handoff: Whether this FFN writes its output into the residual
             at its exit because the next stage is on another pipeline rank.
@@ -346,7 +380,7 @@ def declare_ffn(
         next_layer_sparse: Whether the next decoder layer's FFN is sparse; used only
             to derive the TBO exit rows when exit_rows is not supplied.
         dense_tp_size: Dense compute width: None for configuration, 1 for local
-            compute, or the full TP size.
+            compute, the attention TP size, or the full TP size.
         exit_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,

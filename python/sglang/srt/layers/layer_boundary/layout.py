@@ -83,6 +83,18 @@ def is_dense_ffn_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
 
 
+def batches_are_unpadded() -> bool:
+    """Whether batches may reach the stages without padding to a multiple of
+    attention TP: --disable-attn-tp-gather skips that padding unless attention
+    DP is on."""
+    parallel = get_parallel()
+    return (
+        parallel.attn_tp_size > 1
+        and not parallel.attn_dp_enabled
+        and parallel.disable_attn_tp_gather
+    )
+
+
 def _prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()

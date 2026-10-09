@@ -52,6 +52,9 @@ class BatchVariant(Enum):
     CONTEXT_PARALLEL = auto()
     INPUT_SCATTERED = auto()
     SEQUENCE_PARALLEL = auto()
+    # A batch whose rows do not divide over attention TP, which only arrives
+    # unpadded (--disable-attn-tp-gather without attention DP).
+    UNPADDED = auto()
 
 
 class InputContract(msgspec.Struct, frozen=True):

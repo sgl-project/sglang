@@ -262,7 +262,7 @@ Common errors and their usual cause:
 | `start the layer stack before entering a stage` | The forward path, a split-prefill segment, or an MTP head skipped `residual_batch.start()` |
 | `output does not belong to this residual stream; change layer outputs through boundary accessors` | The model replaced a layer's output object (for example rebinding it to a new tensor) or passed another microbatch's output. This check compares object identity, so it does not catch in-place changes; the interface still forbids modifying layer outputs in place |
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
-| `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel) is not supported by this stage; add a server-argument check that rejects the configuration |
+| `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel, unpadded) is not supported by this stage; add a server-argument check that rejects the configuration |
 | `append_stages needs an open layer stack` | The layers are built outside `make_layers()`; wrap their construction in `layer_stack()` |
 | `a prepared branch must enter through branch_input, not prepare` | A `prepared_from` stage was entered with `prepare()` |
 | `snapshot requires a plain residual update` | A snapshot was taken on a nonlinear (for example MHC) update |
@@ -323,7 +323,7 @@ Models normally use factories, `StageBoundary`, and `residual.batch`. Keep row a
 
 ### Batch variants
 
-`StagePlan` preconstructs ordinary, CP, input-scattered, and sequence-parallel variants when supported by the configured topology. A forward selects a path from active runtime facts. An absent active variant raises an error rather than silently using ordinary token rows.
+`StagePlan` preconstructs ordinary, CP, input-scattered, sequence-parallel, and unpadded variants when supported by the configured topology. The unpadded variant serves batches whose rows do not divide over attention TP, which `--disable-attn-tp-gather` lets through without attention DP: an FFN that would run on this rank's attention-TP slice stays on the attention's rows instead. A forward selects a path from active runtime facts. An absent active variant raises an error rather than silently using ordinary token rows.
 
 Configuration validation rejects unsupported model/parallel combinations. Boundary construction also rejects transitions without a correct implementation. Adding an enum value or a layout does not by itself provide a new collective path.
 

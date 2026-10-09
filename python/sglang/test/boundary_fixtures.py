@@ -95,6 +95,7 @@ def stub_plan():
     plan.fusions = None
     plan._publish_lora_layout = False
     plan._next_input_rows = None
+    plan._unpadded_attn_tp_size = None
     plan.paths = {}
     plan.enters_stack = False
     return plan
