@@ -25,7 +25,7 @@ export const config = {
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/systemone \\
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","state":"My Stripe integration keeps failing. Please help ASAP.","questions":{"urgency":{"type":"noul","instructions":"Does this message express urgency?"}}}'`,
-  dockerImages: { h200: "lmsysorg/sglang:dev", b200: "lmsysorg/sglang:dev" },
+  dockerImages: { h200: "lmsysorg/sglang:dev-clef", b200: "lmsysorg/sglang:dev-clef" },
   github: { cookbookModel: "Cloudflare/clef" },
   cells: [
     {

@@ -10,9 +10,9 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Clef support is introduced in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use a build containing that change; v0.5.21 does not include it. Once the PR is merged, use a [nightly build](/docs/get-started/install#nightly-builds) built after the merge until a release includes it. For all installation methods, see the [SGLang installation guide](/docs/get-started/install).
+Clef support merged in [#42721](https://github.com/sgl-project/sglang/pull/42721), after v0.5.21. Until a release includes it, use a [nightly build](/docs/get-started/install#nightly-builds) built after that merge. For all installation methods, see the [SGLang installation guide](/docs/get-started/install).
 
-The Python and Docker installation paths below require a build containing #42721. Before the merge, check out that PR and install SGLang from source using the installation guide above.
+The Python installation below requires a nightly wheel containing #42721. The Docker image below is built from the merge commit.
 
 <Tabs>
 
@@ -33,10 +33,10 @@ Run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev
+docker pull lmsysorg/sglang:dev-clef
 ```
 
-Use an image built after #42721 merges, then run the **Docker** output of the command panel below. Both checkpoints are public and do not require a Hugging Face token.
+The [Clef image build](https://github.com/sgl-project/sglang/actions/runs/37893990016) publishes `lmsysorg/sglang:dev-clef` from the #42721 merge commit. Run the **Docker** output of the command panel below. Both checkpoints are public and do not require a Hugging Face token.
 
 </Tab>
 
