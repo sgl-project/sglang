@@ -286,11 +286,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    # The draft pool is replicated and consumes the widened
-                    # allocator-global slot space on NPU DCP.
-                    if _is_npu and dcp_size > 1:
-                        draft_kv_size *= dcp_size
-                        draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     self._cell_size = int(

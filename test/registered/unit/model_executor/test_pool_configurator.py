@@ -906,6 +906,55 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_dcp_replicated_draft_is_priced_once(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The DSA draft term scales by attn_dcp_size exactly once on every platform."""
+        num_layers = 8
+        dcp_size = 4
+
+        def _draft_bytes_per_token(dcp, is_npu):
+            cell_sizes = []
+            for draft_num_layers in (0, 1):
+                mr = _make_model_runner(
+                    self, num_layers=num_layers, use_mla_backend=True
+                )
+                _configure_dsa_model(mr)
+                mr.spec_algorithm.is_eagle.return_value = True
+                mr.spec_algorithm.is_none.return_value = False
+                mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+                # TP=8 makes the DCP topology valid.
+                with (
+                    mock_cpu_env(kv_size=1, tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp),
+                    patch(
+                        "sglang.srt.model_executor.pool_configurator._is_npu",
+                        is_npu,
+                    ),
+                    patch(
+                        "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                        return_value=False,
+                    ),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        DefaultPoolConfigurator,
+                    )
+
+                    cell_sizes.append(DefaultPoolConfigurator(mr)._cell_size)
+            return cell_sizes[1] - cell_sizes[0]
+
+        for is_npu in (False, True):
+            with self.subTest(is_npu=is_npu):
+                self.assertEqual(
+                    _draft_bytes_per_token(dcp_size, is_npu),
+                    _draft_bytes_per_token(1, is_npu) * dcp_size,
+                )
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000
