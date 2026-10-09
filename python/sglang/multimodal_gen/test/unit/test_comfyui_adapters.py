@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
@@ -120,15 +121,24 @@ def test_batched_forward_slices_only_batched_values() -> None:
     adapter = _KwargsAdapter()
     ex = _RecordingExecutor(adapter)
     shared_ref = torch.ones(1, 16, 4, 4)
-    options = {"cond_or_uncond": [0, 1]}
+    sample_sigmas = torch.linspace(1.0, 0.0, 5)
+    patches = {"attn": [object()]}
+    timestep = torch.tensor([0.5, 0.25])
+    options = {
+        "cond_or_uncond": [0, 1],
+        "sigmas": timestep,
+        "sample_sigmas": sample_sigmas,
+        "patches": patches,
+    }
     ex(
         torch.zeros(2, 16, 4, 4),
-        torch.tensor([0.5, 0.5]),
+        timestep,
         torch.zeros(2, 3, 8),
         ref_latents=[
             torch.stack([torch.zeros(16, 4, 4), torch.ones(16, 4, 4)]),
             shared_ref,
         ],
+        control={"input": [torch.stack([torch.zeros(4), torch.ones(4)]), None]},
         transformer_options=options,
     )
     assert len(adapter.calls) == 2
@@ -136,7 +146,48 @@ def test_batched_forward_slices_only_batched_values() -> None:
         per_row, shared = kwargs["ref_latents"]
         assert per_row.shape == (1, 16, 4, 4) and torch.all(per_row == row)
         assert shared is shared_ref
-        assert kwargs["transformer_options"] is options
+        control, missing = kwargs["control"]["input"]
+        assert control.shape == (1, 4) and torch.all(control == row)
+        assert missing is None
+        row_options = kwargs["transformer_options"]
+        assert row_options["cond_or_uncond"] == [row]
+        assert torch.equal(row_options["sigmas"], timestep[row : row + 1])
+        assert row_options["sample_sigmas"] is sample_sigmas
+        assert row_options["patches"] is patches
+    assert options["cond_or_uncond"] == [0, 1]
+
+
+def test_batched_forward_slices_per_chunk_options() -> None:
+    # batch_size=2 with CFG: two cond chunks of two rows each.
+    adapter = _KwargsAdapter()
+    ex = _RecordingExecutor(adapter)
+    sigmas = torch.tensor([0.5, 0.25])
+    ex(
+        torch.zeros(4, 16, 4, 4),
+        torch.cat([sigmas, sigmas]),
+        torch.zeros(4, 3, 8),
+        transformer_options={
+            "cond_or_uncond": [0, 1],
+            "uuids": ["pos", "neg"],
+            "sigmas": sigmas,
+        },
+    )
+    seen = [kwargs["transformer_options"] for *_, kwargs in adapter.calls]
+    assert [o["cond_or_uncond"] for o in seen] == [[0], [0], [1], [1]]
+    assert [o["uuids"] for o in seen] == [["pos"], ["pos"], ["neg"], ["neg"]]
+    for row, options in enumerate(seen):
+        assert torch.equal(options["sigmas"], sigmas[row % 2 : row % 2 + 1])
+
+
+def test_batched_forward_rejects_ambiguous_leading_dim() -> None:
+    ex = _RecordingExecutor(_KwargsAdapter())
+    with pytest.raises(ValueError, match="cannot split a batch of 2"):
+        ex(
+            torch.zeros(2, 16, 4, 4),
+            torch.tensor([0.5, 0.5]),
+            torch.zeros(2, 3, 8),
+            guidance=torch.zeros(3),
+        )
 
 
 def test_unbatched_forward_is_a_single_request() -> None:
