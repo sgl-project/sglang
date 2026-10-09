@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
@@ -110,6 +111,22 @@ class GatedResidualState:
             ffn_readout=_FfnReadout(self),
             ffn_update=_FfnUpdate(self),
         )
+
+    @classmethod
+    def facts(cls, *, attn_reads_every_row: bool = False) -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of) for a layer whose
+        attention read needs every row when ``attn_reads_every_row``. It does
+        not depend on the layer's modules, so the stages of a layer that is
+        not built declare it too."""
+        state = cls(
+            expand=None,
+            attn_mix=None,
+            ffn_mix=None,
+            attn_combine=None,
+            ffn_combine=None,
+            attn_reads_every_row=attn_reads_every_row,
+        )
+        return residual_facts(state.residual_ops())
 
 
 class _AttnReadout:

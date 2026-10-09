@@ -81,6 +81,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
+    _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
@@ -1449,31 +1450,45 @@ def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
-def _build_qwen4_exp_stages(residual, *, sparse):
-    """The attention and FFN stage boundaries of one gated hyper-connection layer.
+def _qwen4_exp_stage_facts(config, layer_id, *, residual=None):
+    """The attention and FFN stages a gated hyper-connection layer of either
+    kind declares: the model's shared declaration function (see make_layers),
+    which the layer declares itself with. ``residual`` is the layer's own
+    reads and updates of the streams; without it, the stages declare what
+    those do. A PLE layer's attention read needs every row, for the PLE
+    embedding is computed for all of them."""
+    if residual is None:
+        residual = GatedResidualState.facts(
+            attn_reads_every_row=_has_ple(layer_id, config)
+        )
+    sparse = _qwen3_5_is_moe(config)
+    return (
+        declare_attn(read=residual.attn_readout, update=residual.attn_update),
+        declare_ffn(
+            sparse=sparse,
+            next_layer_sparse=sparse,
+            read=residual.ffn_readout,
+            update=residual.ffn_update,
+        ),
+    )
+
+
+def _build_qwen4_exp_stages(config, layer_id, residual):
+    """The attention and FFN stage boundaries of one gated hyper-connection
+    layer, declared by _qwen4_exp_stage_facts with the layer's own reads and
+    updates (``residual``).
 
     Each read normalizes the streams itself, so neither stage binds a norm, and
     the writes are gated injections, so neither stage offers a fused
     add-and-norm candidate.
     """
-    return append_stages(
-        (
-            declare_attn(read=residual.attn_readout, update=residual.attn_update),
-            None,
-        ),
-        (
-            declare_ffn(
-                sparse=sparse,
-                next_layer_sparse=sparse,
-                read=residual.ffn_readout,
-                update=residual.ffn_update,
-            ),
-            None,
-        ),
-    )
+    attn, ffn = _qwen4_exp_stage_facts(config, layer_id, residual=residual)
+    return append_stages((attn, None), (ffn, None))
 
 
 class Qwen4ExpLayerExtensionMixin:
+    stage_facts = staticmethod(_qwen4_exp_stage_facts)
+
     def _init_qwen4_exp_layer_extensions(
         self,
         config: Qwen4ExpTextConfig,
@@ -1529,6 +1544,8 @@ class Qwen4ExpLayerExtensionMixin:
             use_combine=True,
         )
         self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
+            config,
+            layer_id,
             GatedResidualState(
                 expand=self._widen_streams,
                 attn_mix=self._attn_mix,
@@ -1536,9 +1553,8 @@ class Qwen4ExpLayerExtensionMixin:
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
                 # The PLE embedding is computed for every row.
-                attn_reads_every_row=self.ple is not None,
+                attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
-            sparse=isinstance(self.mlp, Qwen2MoeSparseMoeBlock),
         )
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
