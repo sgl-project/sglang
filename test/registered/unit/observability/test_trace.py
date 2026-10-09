@@ -40,6 +40,27 @@ _get_host_id = getattr(mod, "_get_host_id")
 
 
 class TestTraceFunctions(unittest.TestCase):
+    @unittest.skipUnless(_has_otel, "opentelemetry not installed")
+    def test_trace_level_zero_does_not_export_framework_spans(self):
+        """Native framework instrumentation must not bypass SGLang trace levels."""
+        from fastapi.testclient import TestClient
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        from sglang.srt.entrypoints import http_server
+
+        provider = TracerProvider()
+        exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        self.addCleanup(provider.shutdown)
+        self.addCleanup(set_global_trace_level, get_global_trace_level())
+        with patch.object(otel_trace, "_TRACER_PROVIDER", provider):
+            response = TestClient(http_server.app).get("/set_trace_level?level=0")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(exporter.get_finished_spans(), ())
+
     def test_extract_trace_headers(self):
         headers = {"traceparent": "abc", "tracestate": "xyz", "other": "skip"}
         result = extract_trace_headers(headers)

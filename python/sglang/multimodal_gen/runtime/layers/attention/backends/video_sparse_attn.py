@@ -7,11 +7,6 @@ from dataclasses import dataclass
 
 import torch
 
-try:
-    from vsa import video_sparse_attn
-except ImportError:
-    video_sparse_attn = None
-
 from typing import Any
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
@@ -235,6 +230,11 @@ class VideoSparseAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        try:
+            from vsa import video_sparse_attn
+        except ImportError as exc:
+            raise NotImplementedError("video_sparse_attn is not installed") from exc
+        self._video_sparse_attn = video_sparse_attn
         self.prefix = prefix
         sp_group = get_sp_group()
         self.sp_size = sp_group.world_size
@@ -304,9 +304,7 @@ class VideoSparseAttentionImpl(AttentionImpl):
 
         cur_topk = _compute_cur_topk(attn_metadata)
 
-        if video_sparse_attn is None:
-            raise NotImplementedError("video_sparse_attn is not installed")
-        hidden_states = video_sparse_attn(
+        hidden_states = self._video_sparse_attn(
             query,
             key,
             value,
