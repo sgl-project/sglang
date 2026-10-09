@@ -324,10 +324,12 @@ def main(path):
         if tag == "IDXK":
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
             report_blkx(rows, "IDXK", keep=_is_prefill)
+            report_uniq(rows, "IDXK.ptab", ("ptab",))
             # fall through to the whole-logical segment compare below as well
         if tag == "C4KV":
             print("\n== [C4KV] c4 attention-KV (per-logical-page, prefill) ==")
             report_blkx(rows, "C4KV", keep=_is_prefill)
+            report_uniq(rows, "C4KV.ptab", ("ptab",))
             # fall through to the whole-logical segment compare below as well
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")

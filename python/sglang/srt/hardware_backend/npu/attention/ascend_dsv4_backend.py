@@ -1287,25 +1287,26 @@ class C4IndexerAscendBackendMixin:
                 # LOGICAL content the request reads (via its c4 page table), not
                 # fixed physical pages (which hold other requests' data).
                 logical = _read_page_table_md5(buf, tbl, pages)
-                # S179: per-LOGICAL-PAGE breakdown. c4_page_table column j maps to
-                # absolute token block j (entry j <-> position j*128), so a hit!=miss
-                # on the index-K localizes to a specific block. hash the physical page
-                # the request is pointed at (its LOGICAL content), so a page that was
-                # rebound/not-restored on the hit shows up as a differing hash.
-                blkx = []
+                # S179/S184: per-LOGICAL-PAGE breakdown. c4_page_table column j maps
+                # to absolute token block j (entry j <-> position j*128). ``blkx`` =
+                # hash of the page the request is pointed at; ``ptab`` = the raw
+                # physical page id (reveals a suffix whose entries are 0/constant).
+                blkx, ptab = [], []
                 if torch.is_tensor(tbl) and tbl.numel():
                     _row = tbl.reshape(1, -1).to(torch.int64)[0]
                     _buf_cpu = buf.detach().to("cpu")
                     for _j in range(int(_row.numel())):
                         _pid = int(_row[_j])
+                        ptab.append(f"{_j}:{_pid}")
                         if _pid < 0 or _pid >= pages:
                             continue
                         blkx.append(f"{_j}:{_md5(_buf_cpu[_pid])}")
                     blkx = blkx[-8:]
+                    ptab = ptab[-8:]
                 print(
                     f"[IDXK] layer={layer_id} mode={forward_batch.forward_mode} "
                     f"lastpos={lastpos} pages={pages} "
-                    f"logical={logical} blkx={blkx}",
+                    f"logical={logical} blkx={blkx} ptab={ptab}",
                     flush=True,
                 )
             except Exception as exc:
@@ -1317,23 +1318,25 @@ class C4IndexerAscendBackendMixin:
                 pages = int(buf.shape[0])
                 tbl = getattr(self.forward_metadata, "c4_page_table", None)
                 logical = _read_page_table_md5(buf, tbl, pages)
-                # S181: per-LOGICAL-PAGE breakdown (key = c4 page-table column j =
-                # absolute token block j), same as [IDXK]. Covers the c4 ATTENTION
+                # S181/S184: per-LOGICAL-PAGE breakdown (key = c4 page-table column j
+                # = absolute token block j), same as [IDXK]. Covers the c4 ATTENTION
                 # KV, which block 134 (same top-k, different output) actually reads.
-                blkx = []
+                blkx, ptab = [], []
                 if torch.is_tensor(tbl) and tbl.numel():
                     _row = tbl.reshape(1, -1).to(torch.int64)[0]
                     _buf_cpu = buf.detach().to("cpu")
                     for _j in range(int(_row.numel())):
                         _pid = int(_row[_j])
+                        ptab.append(f"{_j}:{_pid}")
                         if _pid < 0 or _pid >= pages:
                             continue
                         blkx.append(f"{_j}:{_md5(_buf_cpu[_pid])}")
                     blkx = blkx[-8:]
+                    ptab = ptab[-8:]
                 print(
                     f"[C4KV] layer={layer_id} mode={forward_batch.forward_mode} "
                     f"lastpos={lastpos} pages={pages} "
-                    f"logical={logical} blkx={blkx}",
+                    f"logical={logical} blkx={blkx} ptab={ptab}",
                     flush=True,
                 )
             except Exception as exc:
