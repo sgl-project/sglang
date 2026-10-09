@@ -82,6 +82,8 @@ struct TopKPagedParams {
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
+  // Row stride of `page_indices` in elements; > topk when writing a column slice of a wider table.
+  int64_t out_stride;
   uint32_t topk;
   uint32_t page_bits;
   uint32_t static_cluster_floor;  // only used in small batch variant
@@ -97,7 +99,7 @@ struct TopKPagedParams {
     return metadata[1 + i];
   }
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
-    return page_indices + batch_id * static_cast<int64_t>(topk);
+    return page_indices + batch_id * out_stride;
   }
   SGL_DEVICE PageTransform get_transform(uint32_t batch_id) const {
     return {
@@ -106,10 +108,9 @@ struct TopKPagedParams {
         raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk)};
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
-    const auto k = static_cast<int64_t>(topk);
     return TopKProblem{
         .in = scores + batch_id * score_stride,
-        .out = page_indices + batch_id * k,
+        .out = get_output_ptr(batch_id),
         .topk = topk,
         .seq_len = seq_len,
     };
@@ -1020,7 +1021,10 @@ struct TopKKernel {
       page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
       page_table_stride = (page_table.value()).stride(0);
     }
+    // page_indices may be a column slice of a wider table; rows stay unit-stride.
+    auto O = SymbolicSize{"out_stride"};
     TensorMatcher({B, K})  // page_indices
+        .with_strides({O, 1})
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(page_indices);
@@ -1071,6 +1075,7 @@ struct TopKKernel {
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = page_table_stride,
+        .out_stride = O.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
         // only used in small batch variant

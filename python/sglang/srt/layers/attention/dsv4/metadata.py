@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
 )
+from sglang.srt.mem_cache.dsv41_request_window import WindowLayout
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -137,7 +138,9 @@ def copy_metadata(
         if src_val is None and dst_val is None:
             continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        if hasattr(dst_val, "copy_"):
+        if isinstance(dst_val, torch.Tensor) and isinstance(src_val, torch.Tensor):
+            copy_unless_aliased(dst_val, src_val)
+        elif isinstance(dst_val, (WindowLayout, UnifiedKvMetadata)):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
@@ -382,6 +385,115 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+
+
+def copy_unless_aliased(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.copy_(src)`` unless both already name the same storage.
+
+    Fields backed by persistent backend-owned storage (the trtllm
+    TrtllmSparseTablePool) hand out the same view in producer and consumer;
+    the content is already in place, so the self-copy is skipped."""
+    if (
+        dst.data_ptr() == src.data_ptr()
+        and dst.shape == src.shape
+        and dst.stride() == src.stride()
+    ):
+        return
+    dst.copy_(src)
+
+
+@dataclass
+class UnifiedKvMetadata:
+    # SWA ring write target (req_slot*ring + pos%ring)
+    swa_loc: Optional[torch.Tensor] = None
+
+    # ragged decode index streams
+    swa_indices: Optional[torch.Tensor] = None
+    swa_indptr: Optional[torch.Tensor] = None
+    hca_indices: Optional[torch.Tensor] = None
+    hca_indptr: Optional[torch.Tensor] = None
+    csa_indices: Optional[torch.Tensor] = None
+    csa_indptr: Optional[torch.Tensor] = None
+
+    # Grouped target-verify streams for the asm decode: one per (request,
+    # draft group), laid out [compressed tail][that group's window slice] so
+    # the kernel's own causal bound and band mask land on each draft's real
+    # cutoff.
+    gasm_indices: Optional[torch.Tensor] = None
+    gasm_kv_indptr: Optional[torch.Tensor] = None
+    gasm_qo_indptr: Optional[torch.Tensor] = None
+
+    # prefill/extend per-token mapping
+    pf_state_slot: Optional[torch.Tensor] = None
+    pf_chunk_start: Optional[torch.Tensor] = None
+    pf_cu_q: Optional[torch.Tensor] = None
+    pf_final_pos: Optional[torch.Tensor] = None
+
+    # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
+    # tokens); unused by plain decode, whose store reads req_pool_indices live.
+    verify_store_state_slot: Optional[torch.Tensor] = None
+
+    # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
+    # precomputed once per step to drop the per-layer int add in the store path.
+    c4_out_loc: Optional[torch.Tensor] = None
+    c128_out_loc: Optional[torch.Tensor] = None
+
+    def copy_(self, other: UnifiedKvMetadata) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+                "c4_out_loc",
+                "c128_out_loc",
+                # Captured store_cache reads swa_loc by address, and the eager
+                # target-verify path builds it outside the graph.
+                "swa_loc",
+            ],
+            assign_fields=[],
+        )
+
+    def refresh_for_breakable_cuda_graph_replay_(
+        self, other: UnifiedKvMetadata
+    ) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_loc",
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+                "c4_out_loc",
+                "c128_out_loc",
+            ],
+        )
 
 
 def maybe_copy_inplace(dst, *, src) -> None:
