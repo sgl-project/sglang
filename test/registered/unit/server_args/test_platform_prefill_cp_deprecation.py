@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     validate_prefill_cp_platform,
@@ -117,6 +118,50 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
     @override_platform(is_hip=False, is_npu=False, is_musa=False)
     def test_cuda_deepseek_v4_cp_allows_multiple_nodes(self):
         validate_deepseek_v4_cp(_cp_args(nnodes=2))
+
+    @override_platform(is_hip=False, is_npu=False, is_musa=False)
+    def test_cuda_deepseek_v4_zigzag_configuration(self):
+        args = _cp_args(cp_strategy="zigzag")
+        validate_deepseek_v4_cp(args)
+        self.assertEqual(resolved_view(args).attn_cp_size, 2)
+        for feature, model_attrs, arg_attrs in (
+            ("DeepSeek-V4.1", {"model_type": "deepseek_v41"}, {}),
+            ("compression ratios", {"compress_ratios": [0, 1, 4]}, {}),
+            ("compression ratios", {"compress_ratios": [2, 128]}, {}),
+            ("Engram", {"engram_layer_ids": [3]}, {}),
+            ("bounded replay", {}, {"enable_decoder_swa_bounded_replay": True}),
+        ):
+            with self.subTest(feature=feature):
+                args = _cp_args(cp_strategy="zigzag", **arg_attrs)
+                for key, value in model_attrs.items():
+                    setattr(args._model_config.hf_config, key, value)
+                with self.assertRaisesRegex(ValueError, feature):
+                    validate_deepseek_v4_cp(args)
+                # Existing interleave configurations remain accepted.
+                args.cp_strategy = "interleave"
+                validate_deepseek_v4_cp(args)
+
+    def test_deepseek_v4_zigzag_platform_policy(self):
+        with override_platform(is_hip=True, is_npu=False, is_musa=False):
+            with self.assertRaisesRegex(ValueError, "HIP"):
+                validate_deepseek_v4_cp(_cp_args(cp_strategy="zigzag"))
+        with (
+            override_platform(is_hip=False, is_npu=True, is_musa=False),
+            mock.patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.is_npu", return_value=True
+            ),
+        ):
+            args = _cp_args(cp_strategy="zigzag", model_type="deepseek_v41")
+            validate_deepseek_v4_cp(args)
+            self.assertEqual(resolved_view(args).attn_cp_size, 2)
+        with override_platform(is_hip=False, is_npu=False, is_musa=False):
+            validate_deepseek_v4_cp(
+                _cp_args(
+                    cp_strategy="zigzag",
+                    enable_prefill_cp=False,
+                    model_type="deepseek_v41",
+                )
+            )
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
