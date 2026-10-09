@@ -1140,6 +1140,10 @@ class C4IndexerAscendBackendMixin:
             _want_idxin == "all" or str(getattr(c4_indexer, "layer_id", -1)) == _want_idxin
         ):
             try:
+                # S188: read at the OP-INPUT point, synchronized, so there is NO
+                # ordering/async artifact (unlike buffer reads elsewhere). Decides
+                # the last fork: key(index-K)/metadata identical? -> op-partition.
+                torch.npu.synchronize()
 
                 def _md5_in(t: torch.Tensor) -> str:
                     x = t.detach().to("cpu").contiguous()
@@ -1179,16 +1183,26 @@ class C4IndexerAscendBackendMixin:
                             return "?"
 
                 _ptab = fm.c4_page_table
+                _k = kwargs.get("key")
+                _klog = (
+                    _read_page_table_md5(_k, _ptab, int(_k.shape[0]))
+                    if _k is not None
+                    else "None"
+                )
+                _meta = kwargs.get("metadata")
+                _bt = kwargs.get("block_table")
                 print(
                     f"[IDXIN] layer={getattr(c4_indexer, 'layer_id', -1)} "
                     f"mode={forward_batch.forward_mode} "
                     f"qblk={_blk_in(q_quant)} wblk={_blk_in(kwargs['weights'])} "
                     f"slq={_seq(fm.actual_seq_lengths_q)} "
                     f"slk={_seq(fm.actual_seq_lengths_kv)} "
+                    f"klog={_klog} "
+                    f"kraw={_md5_in(_k) if _k is not None else 'None'} "
+                    f"meta={_md5_in(_meta) if _meta is not None else 'None'} "
+                    f"bt={_md5_in(_bt) if _bt is not None else 'None'} "
                     f"qshape={tuple(q_quant.shape)} wshape={tuple(kwargs['weights'].shape)} "
-                    f"#-diag-notcomparable: kshape={tuple(k.shape)} "
-                    f"ptab_shape={tuple(_ptab.shape) if _ptab is not None and hasattr(_ptab, 'shape') else None} "
-                    f"ptab_head={_ptab.reshape(-1)[:8].tolist() if _ptab is not None and getattr(_ptab, 'numel', lambda: 0)() else []}",
+                    f"kshape={tuple(_k.shape) if _k is not None else None}",
                     flush=True,
                 )
             except Exception as exc:

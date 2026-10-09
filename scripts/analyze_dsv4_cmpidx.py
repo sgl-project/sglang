@@ -297,7 +297,8 @@ def main(path):
             print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")
             report_blkx(rows, "IDXIN.q_quant", field="qblk", keep=_is_prefill)
             report_blkx(rows, "IDXIN.weights", field="wblk", keep=_is_prefill)
-            report_uniq(rows, "IDXIN", ("slq", "slk", "qshape", "wshape"))
+            report_uniq(rows, "IDXIN.seq", ("slq", "slk", "qshape", "wshape"))
+            report_uniq(rows, "IDXIN.keymeta", ("klog", "kraw", "meta", "bt"))
             continue
         if tag == "LIMETA":
             print("\n== [LIMETA] metadata core-partition ==")
