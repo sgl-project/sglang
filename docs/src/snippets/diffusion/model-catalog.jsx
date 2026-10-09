@@ -219,9 +219,9 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "FastH3",
       modelIds: [
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
       ],
-      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
       name: "VDN-H3",
@@ -243,6 +243,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "SANA-Video",
       modelIds: ["Efficient-Large-Model/SANA-Video_2B_480p_diffusers"],
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
+    },
+    {
+      name: "SANA-Video 2.0",
+      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
+      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
     },
     {
       name: "LingBot Video MoE",

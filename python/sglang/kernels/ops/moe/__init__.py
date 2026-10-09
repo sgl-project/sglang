@@ -21,6 +21,16 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.shared_expert_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        description="FP32 sigmoid gate from a single BF16 row of width 2560, with PDL.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",

@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 BUILD_AND_RUN_TIMEOUT_S = 900
 RUST_WORKSPACE = Path(__file__).resolve().parents[3] / "rust"
-GRPC_TYPES_PACKAGE = "sglang-grpc-types"
+GRPC_TYPES_PACKAGE = "sglang-api-types"
 register_cpu_ci(est_time=170, suite="base-a-test-cpu")
 
 
@@ -57,6 +57,9 @@ class TestCargoWorkspace(CustomTestCase):
         )
 
         self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
+        # `openai` is off by default; its OpenAI-parity fixtures run offline.
+        processor = ["-p", "sglang-processor", "--features", "openai"]
+        self._run_cargo(["test", *processor], cwd=RUST_WORKSPACE)
         # Verify that the public crate builds with only its packaged inputs.
         self._run_cargo(
             [
