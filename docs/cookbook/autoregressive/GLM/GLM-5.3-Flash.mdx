@@ -130,7 +130,7 @@ For agentic MXFP4 serving on MI355X, select **Low Latency** with **L1 + L2**. Th
 
 ### Multimodal memory
 
-All strategies enable multimodal serving. Image and video input need a Transformers build that ships `Glm5NextProcessor` (the MI355X checks used commit `e4052f55`, which also requires `tokenizers>=0.23.1`). With the pinned `transformers==5.12.1`, the server loads only the tokenizer and silently answers image requests from the text alone. On MI355X, text, image, and an image-bearing follow-up were qualified with that build; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+All strategies enable multimodal serving. Image and video input need a Transformers build that ships `Glm5NextProcessor` (the current `transformers==5.17.0` dependency includes it and requires `tokenizers>=0.23.1`). With older `transformers==5.12.1`, the server loads only the tokenizer and silently answers image requests from the text alone. On MI355X, text, image, and an image-bearing follow-up were qualified with Transformers commit `e4052f55`; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
@@ -202,7 +202,38 @@ This topology served image requests and videos up to 238,080 visual tokens. In a
 
 Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/advanced_features/epd_disaggregation) for the generic architecture and operational model.
 
-### 3.5 PD disaggregation (preview)
+### 3.5 Prefill Context Parallelism
+
+Use prefill context parallelism (CP) to distribute DSA prefill computation for long prompts, including multimodal inputs. This hybrid model uses **interleave CP for DSA layers** and **head-wise tensor parallelism for KDA layers**, sharing the same communication group. Layer boundaries all-gather the context shards before KDA and reduce-scatter its output back onto those shards. The mHC residual streams and their coefficients stay local, with each output's reduction completed before the residual update.
+
+<Accordion title="Example of launching with Prefill CP on Blackwell GPU">
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 4 \
+  --attn-cp-size 4 \
+  --enable-prefill-cp \
+  --cp-strategy interleave \
+  --moe-dense-tp-size 4 \
+  --ep-size 1 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend flashinfer_trtllm \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+### 3.6 PD disaggregation (preview)
 
 PD splits prefill and decode into separate server groups behind a router. For this hybrid model, the transfer moves both the paged DSA KV and the KDA recurrent state.
 
