@@ -131,8 +131,10 @@ __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params)
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, bool kUsePDL, uint32_t kVecSize = device::kMaxVecBytes / sizeof(T), uint32_t kBlockSize = 256>
+template <typename T, bool kUsePDL, uint32_t kVecSize = device::kMaxVecBytes / sizeof(T)>
 struct ActivationKernel {
+  static constexpr auto kBlockSize = 256u;
+
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
 
