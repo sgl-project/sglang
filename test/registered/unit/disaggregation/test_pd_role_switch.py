@@ -573,7 +573,7 @@ def _radix_scheduler(disable_radix_cache):
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
 class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
+    + KV pools when radix is on, and is a no-op on the radix-disabled path."""
 
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)
