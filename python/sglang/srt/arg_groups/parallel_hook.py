@@ -431,6 +431,17 @@ def handle_dwdp(server_args: Any):
         "DWDP's prefetch event protocol does not support two-batch overlap"
     )
 
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.dwdp.manager import validate_dwdp_args
+
+        validate_dwdp_args(cfg)
+        # DP-attention gives each rank different tokens, so a separate shared
+        # expert must be fully resident on every rank as well.
+        envs.SGLANG_SHARED_EXPERT_TP1.set(True)
+        declare_resolution(
+            server_args, "_handle_dwdp", disable_shared_experts_fusion=True
+        )
+
     if cfg.disaggregation_mode == "null":
         logger.warning(
             "DWDP with --disaggregation-mode null: decode steps re-fetch all "

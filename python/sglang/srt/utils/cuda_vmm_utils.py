@@ -15,6 +15,8 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils.alignment import align_down as align_down
+from sglang.srt.utils.alignment import align_up as align_up
 
 logger = logging.getLogger(__name__)
 
@@ -325,16 +327,6 @@ def get_device_granularity(device_id: int) -> int:
     maps into it."""
     device_id = int(device_id)
     return get_allocation_granularity(make_device_allocation_prop(device_id))
-
-
-def align_up(value: int, alignment: int) -> int:
-    """Round ``value`` up to a positive byte ``alignment``."""
-    return (int(value) + alignment - 1) // alignment * alignment
-
-
-def align_down(value: int, alignment: int) -> int:
-    """Round ``value`` down to a positive byte ``alignment``."""
-    return int(value) // alignment * alignment
 
 
 # Bump allocator over caller-provided extents: malloc first-fits an extent and
