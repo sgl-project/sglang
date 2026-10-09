@@ -9,6 +9,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
@@ -976,7 +977,9 @@ class LTX2DenoisingStage(DenoisingStage):
         valid = int(valid)
         # all SP ranks must agree on mask presence to preserve collective order
         # a locally all-valid shard still needs a mask when another rank has padding
-        if not has_padding:
+        # eliding an all-valid mask changes attention kernel rounding
+        # exact requests must keep the reference masked path
+        if not has_padding and quality_allows(batch.quality, "lossless"):
             return None
         mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.bool)
         if valid < int(seq_len):

@@ -15,8 +15,12 @@ from sglang.test.test_utils import CustomTestCase
 class TestLTX2SPPaddingMask(CustomTestCase):
     KEY = "sp_valid_len"
 
-    def _build(self, valid, *, seq_len, batch_size=2, has_padding=True):
-        batch = SimpleNamespace(**({self.KEY: valid} if valid is not None else {}))
+    def _build(
+        self, valid, *, seq_len, batch_size=2, has_padding=True, quality="lossless"
+    ):
+        batch = SimpleNamespace(
+            quality=quality, **({self.KEY: valid} if valid is not None else {})
+        )
         return LTX2DenoisingStage._build_ltx2_sp_padding_mask(
             batch,
             seq_len=seq_len,
@@ -34,6 +38,13 @@ class TestLTX2SPPaddingMask(CustomTestCase):
         # valid == seq_len: an all-True mask would be a no-op, so return None
         # to keep the fused (unmasked) attention path.
         self.assertIsNone(self._build(8, seq_len=8, has_padding=False))
+
+    def test_exact_no_padding_preserves_reference_mask(self):
+        mask = self._build(8, seq_len=8, has_padding=False, quality="exact")
+        self.assertTrue(torch.equal(mask, torch.ones(2, 8, dtype=torch.bool)))
+
+    def test_high_no_padding_returns_none(self):
+        self.assertIsNone(self._build(8, seq_len=8, has_padding=False, quality="high"))
 
     def test_valid_greater_than_seq_len_returns_none(self):
         # Defensive: valid > seq_len still means no padding.
