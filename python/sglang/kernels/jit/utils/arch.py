@@ -95,14 +95,16 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
 def _init_jit_cuda_arch_once():
     global _CUDA_ARCH
     try:
-        # CUDA and HIP share the torch.cuda capability query; MUSA is last.
-        if not is_musa_runtime():
+        if is_hip_runtime():
             device = torch.cuda.current_device()
             major, minor = torch.cuda.get_device_capability(device)
-        else:
+        elif is_musa_runtime():
             device = torch.musa.current_device()
             properties = torch.musa.get_device_properties(device)
             major, minor = int(properties.major), int(properties.minor)
+        else:
+            device = torch.cuda.current_device()
+            major, minor = torch.cuda.get_device_capability(device)
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
@@ -132,16 +134,17 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
-    if is_musa_runtime():
+    elif is_musa_runtime():
         return ["-DUSE_MUSA", "-std=c++20", "-O3"]
-    if arch is None:
-        arch = get_jit_cuda_arch()
-    return [
-        arch.jit_flag,
-        "-std=c++20",
-        "-O3",
-        "--expt-relaxed-constexpr",
-    ]
+    else:
+        if arch is None:
+            arch = get_jit_cuda_arch()
+        return [
+            arch.jit_flag,
+            "-std=c++20",
+            "-O3",
+            "--expt-relaxed-constexpr",
+        ]
 
 
 def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:
