@@ -998,15 +998,17 @@ def validate_mesh_correctness(
     generated_mesh_path: str,
     reference_url: str = HUNYUAN3D_REFERENCE_URL,
     num_sample_points: int = 4096,
-    cd_threshold_ratio: float = 0.01,
+    cd_threshold_ratio: float = 0.003,
     random_seed: int = 42,
 ):
     """Validate mesh similarity using a scale-invariant squared Chamfer score.
 
     With D the reference bounding-box diagonal, the score is the sum of the
     two directional mean squared nearest-neighbor distances divided by D**2.
-    It must be <= cd_threshold_ratio: 0.01 is a normalized squared-distance
-    sum, not a 1% RMS distance. Neither mesh is independently aligned or scaled.
+    It must be <= cd_threshold_ratio, a normalized squared-distance sum rather
+    than an RMS distance. The 0.003 default keeps the previous strictness on
+    the Hunyuan3D reference (D ~= 3, where the old limit sum <= 0.01 * D equals
+    0.0034 after normalization). Neither mesh is independently aligned or scaled.
     Sampling uses independent local RNGs seeded with random_seed and seed + 1.
     The reference download is cached. Success returns None.
     """

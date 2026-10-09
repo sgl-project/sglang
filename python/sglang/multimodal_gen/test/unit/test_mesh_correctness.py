@@ -9,11 +9,7 @@ import numpy as np
 import trimesh
 
 from sglang.multimodal_gen.test.server import test_server_utils as mesh_utils
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-
-# CPU geometry checks; this diffusion environment already provides trimesh.
-register_cuda_ci(est_time=10, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class TestMeshCorrectness(CustomTestCase):
