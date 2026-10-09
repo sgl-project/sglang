@@ -559,7 +559,7 @@ def get_hf_text_config(config: PretrainedConfig):
     # Some models (e.g. DeepSeek-OCR) store sub-configs as plain dicts.
     # Convert to PretrainedConfig early so hasattr() checks and asserts work.
     parent_dtype = getattr(config, "dtype", None)
-    for _attr in ("text_config", "llm_config", "language_config", "thinker_config"):
+    for _attr in ("text_config", "llm_config", "language_config", "thinker_config", "transformer_layer_config"):
         _sub = getattr(config, _attr, None)
         if isinstance(_sub, dict):
             _converted = PretrainedConfig(**_sub)
@@ -575,7 +575,7 @@ def get_hf_text_config(config: PretrainedConfig):
             if getattr(_sub, "dtype", None) is None:
                 _sub.dtype = parent_dtype
 
-    # Priority: thinker_config > llm_config > language_config > text_config
+    # Priority: thinker_config > llm_config > language_config > text_config > transformer_layer_config
     if hasattr(config, "thinker_config"):
         # qwen2.5 omni
         thinker_config = config.thinker_config
@@ -600,6 +600,9 @@ def get_hf_text_config(config: PretrainedConfig):
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
         text_config = config.text_config
+    elif hasattr(config, "transformer_layer_config"):
+        assert hasattr(config.transformer_layer_config, "num_attention_heads")
+        text_config = config.transformer_layer_config
 
     # Ensure rope_scaling dicts have "type" for remote-code compat (v5).
     normalize_rope_scaling_compat(config)
