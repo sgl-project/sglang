@@ -44,6 +44,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     _batch_shards_over_cp,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.prepare import (
@@ -53,6 +54,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.runtime_context import (
     get_forward,
@@ -89,6 +91,20 @@ def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None
                 "a MoE on the TP group with moe_dp_size == attn_cp_size under "
                 "attention DP and attention CP"
             )
+
+
+def _unpadded_possible() -> bool:
+    """Whether a batch whose rows do not divide over attention TP may reach an
+    FFN that would run on this rank's attention-TP slice, so that FFN needs a
+    variant that stays on the attention's rows."""
+    return batches_are_unpadded() and (
+        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
+    )
+
+
+def _rows_indivisible_over_attn_tp(forward_batch, attn_tp_size: int) -> bool:
+    """Whether this batch arrived with rows that do not divide over attention TP."""
+    return forward_batch.input_ids.shape[0] % attn_tp_size != 0
 
 
 def _input_scattered_possible() -> bool:
@@ -142,11 +158,16 @@ class StagePlan:
         is_branch: Branch reusing an already-read input; requires branch_input
             instead of a normal prepare to avoid repeating the read/update.
         terminal: Whether the stage ends the model's layer stack.
+        writes_at_handoff: Whether the stage, an FFN handing off to another
+            pipeline rank, writes its output into the residual at its exit.
         finishes_directly: Attention can publish its output with finish instead of
             an exit scope and output transport.
         qkv_latent_func: Optional hook for prepared attention input.
-        fusions: Optional backend provider of ordered consumer fusion candidates
-            and the producer deferral policies (see make_attn_stage).
+        fusions: Optional backend provider. Consumer side: ordered
+            attention_input(plan) and ffn_input(plan) candidates. Producer side
+            (FFN exit): can_defer_finalize(plan, batch), called on every exit,
+            and can_defer_all_reduce(plan, batch), called when LoRA or TP1
+            shared experts are enabled.
 
     The plan owns static paths, not per-forward tensors or a neighbour's norm.
     Runtime residual state belongs to the ForwardBatch's ResidualStream.
@@ -161,12 +182,20 @@ class StagePlan:
         enters_stack=False,
         is_branch=False,
         terminal=False,
+        writes_at_handoff=False,
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
+        attn_tp_gather=None,
+        exit_gather=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
+        # The attention TP size an unpadded batch's rows are checked against,
+        # when such a batch may arrive (see BatchVariant.UNPADDED).
+        self._unpadded_attn_tp_size = (
+            get_parallel().attn_tp_size if BatchVariant.UNPADDED in self.edges else None
+        )
         self.enters_stack = enters_stack
         self.terminal = terminal
         self.finishes_directly = finishes_directly
@@ -202,11 +231,16 @@ class StagePlan:
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                     attn_input_adapter=edges.attn_input_adapter,
+                    attn_tp_gather=attn_tp_gather,
                 )
             out = (
                 ExitMove()
                 if finishes_directly
-                else bind_exit(edges.outgoing, cp_moves=edges.cp_moves)
+                else bind_exit(
+                    edges.outgoing,
+                    cp_moves=edges.cp_moves,
+                    attn_tp_gather=exit_gather,
+                )
             )
             self.paths[variant] = StagePath(
                 entry=entry,
@@ -214,6 +248,7 @@ class StagePlan:
                 output_move=out.output_move,
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
+                writes_at_handoff=writes_at_handoff,
             )
 
     @property
@@ -233,6 +268,10 @@ class StagePlan:
             return BatchVariant.INPUT_SCATTERED
         if _batch_shards_over_cp(forward_batch):
             return BatchVariant.CONTEXT_PARALLEL
+        if self._unpadded_attn_tp_size is not None and _rows_indivisible_over_attn_tp(
+            forward_batch, self._unpadded_attn_tp_size
+        ):
+            return BatchVariant.UNPADDED
         return BatchVariant.ORDINARY
 
     def path_for(self, forward_batch):
@@ -268,7 +307,7 @@ class StagePlan:
         )
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, **options):
+def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **options):
     if incoming.consumer != declaration or outgoing.producer != declaration:
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
@@ -279,6 +318,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
             declaration.update.applied_at_exit
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
+            and not _cp_gathers_over_attn_cp()
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         attn_input_adapter = None
@@ -300,6 +340,15 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         enters_stack=incoming.producer is None,
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
+        writes_at_handoff=declaration.writes_at_handoff,
+        attn_tp_gather=declaration.attn_tp_gather,
+        # The exit runs its consumer's gather: the next stage's, or the
+        # final read's.
+        exit_gather=getattr(
+            outgoing.consumer if outgoing.consumer is not None else final_read,
+            "attn_tp_gather",
+            None,
+        ),
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
         **options,

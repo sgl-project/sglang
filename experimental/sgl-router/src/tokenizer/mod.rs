@@ -11,6 +11,7 @@ use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use sglang_processor::openai::{OpenAiTokenizer, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -66,6 +67,24 @@ pub struct TokenizerRegistry {
     stats: Arc<stats::TokenizerStats>,
     /// Special tokens the engine adds around a raw prompt; `None` if unknown.
     prompt_affixes: Option<adapter::PromptAffixes>,
+    /// What SGLang's OpenAI layer asks of the tokenizer; needs `tokenizer.json`.
+    openai: Option<Arc<dyn OpenAiTokenizer>>,
+}
+
+/// The served model's tokenizer as SGLang's OpenAI layer uses it.
+struct OpenAiTokens {
+    tokenizer: Arc<Tokenizer>,
+    pieces: TokenPieces,
+}
+
+impl OpenAiTokenizer for OpenAiTokens {
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        adapter::decode_complete(&self.tokenizer, ids, true).ok()
+    }
+
+    fn byte_level_piece(&self, id: u32) -> Option<String> {
+        self.pieces.byte_level_piece(id).map(str::to_owned)
+    }
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -88,9 +107,15 @@ impl TokenizerRegistry {
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
             l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
             "tokenizer loaded");
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        if let Ok(Some(json)) = files.json("tokenizer.json") {
+            me.openai = Some(Arc::new(OpenAiTokens {
+                tokenizer: Arc::clone(&t),
+                pieces: TokenPieces::from_tokenizer_json(&json),
+            }));
+        }
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
-        let files = adapter::ModelFiles::open(tokenizer_path);
         me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
             .map_err(|e| {
                 tracing::warn!(model = %m.id, error = %format!("{e:#}"),
@@ -136,6 +161,10 @@ impl TokenizerRegistry {
             }
         }
         Ok(me)
+    }
+
+    pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
+        self.openai.clone()
     }
 
     pub fn stats(&self) -> &stats::TokenizerStats {
@@ -245,6 +274,8 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,

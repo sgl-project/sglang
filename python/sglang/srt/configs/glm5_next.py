@@ -4,7 +4,6 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
-from sglang.srt.runtime_context import get_parallel
 
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "architectures",
@@ -262,8 +261,10 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
+        from sglang.srt.runtime_context import linear_attn_tp_size
+
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=linear_attn_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

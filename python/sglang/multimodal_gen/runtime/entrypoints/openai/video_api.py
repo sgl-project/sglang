@@ -44,11 +44,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     flatten_extra_params,
     get_declared_request_extra_fields,
-    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -94,31 +96,6 @@ async def shutdown_video_jobs() -> None:
     for task in tasks:
         with suppress(asyncio.CancelledError):
             await task
-
-
-def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
-    return request_extra_value(request, name)
-
-
-def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
-    value = getattr(request, name, None)
-    if value is not None:
-        return value
-    return _extra_value(request, name)
-
-
-def _video_request_model_kwargs(
-    request: VideoGenerationsRequest,
-    sampling_params_cls: type[SamplingParams],
-) -> dict[str, Any]:
-    """Extract fields owned and declared by the active model contract."""
-
-    kwargs = {}
-    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "video"):
-        value = _extra_value(request, field_name)
-        if value is not None:
-            kwargs[field_name] = value
-    return kwargs
 
 
 def _parse_form_extra_value(value: Any) -> Any:
@@ -228,15 +205,17 @@ def _is_probably_video_source(source: Any) -> bool:
 
 
 def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
-    video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
+    video_path = request_field_value(req, "video_path") or request_field_value(
+        req, "video_url"
+    )
     if video_path:
         return str(video_path)
 
-    input_reference = _request_value(req, "input_reference")
+    input_reference = request_field_value(req, "input_reference")
     if _is_probably_video_source(input_reference):
         return str(input_reference)
 
-    reference_url = _request_value(req, "reference_url")
+    reference_url = request_field_value(req, "reference_url")
     if _is_probably_video_source(reference_url):
         return str(reference_url)
 
@@ -246,7 +225,7 @@ def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
 def _resolve_image_path(
     req: VideoGenerationsRequest, video_path: str | None
 ) -> str | None:
-    image_path = _request_value(req, "input_reference")
+    image_path = request_field_value(req, "input_reference")
     if video_path and image_path == video_path:
         return None
     if _is_probably_video_source(image_path):
@@ -291,14 +270,14 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "max_sequence_length": request.max_sequence_length,
         "flow_shift": request.flow_shift,
         "enable_teacache": request.enable_teacache,
-        "use_diffusion_decoder": _extra_value(request, "use_diffusion_decoder"),
-        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
-        "cache_dit_params": _extra_value(request, "cache_dit_params"),
-        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
-        "attention_backend_override": _extra_value(
+        "use_diffusion_decoder": request_extra_value(request, "use_diffusion_decoder"),
+        "enable_cache_dit": request_extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": request_extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": request_extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": request_extra_value(
             request, "attention_backend_override"
         ),
-        "skip_softmax_params": _extra_value(request, "skip_softmax_params"),
+        "skip_softmax_params": request_extra_value(request, "skip_softmax_params"),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -307,7 +286,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "upscaling_model_path": request.upscaling_model_path,
         "upscaling_scale": request.upscaling_scale,
         "output_path": request.output_path,
-        "quality": _extra_value(request, "quality"),
+        "quality": request_extra_value(request, "quality"),
         "output_compression": request.output_compression,
         "x264_preset": request.x264_preset,
         "output_quality": request.output_quality,
@@ -316,7 +295,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "num_profiled_timesteps": request.num_profiled_timesteps,
         "profile_all_stages": request.profile_all_stages,
         "diffusers_kwargs": request.diffusers_kwargs,
-        **_video_request_model_kwargs(request, sampling_params_cls),
+        **request_model_kwargs(request, sampling_params_cls, "video"),
     }
 
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
@@ -371,9 +350,13 @@ async def _save_first_input_image(
     os.makedirs(uploads_dir, exist_ok=True)
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
-    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    safe_name = sanitize_upload_filename(filename, "url_image")
+    target_path = os.path.join(uploads_dir, f"{request_id}_{safe_name}")
     return await save_image_to_path(
-        image, target_path, prefer_remote_source=prefer_remote_source
+        image,
+        target_path,
+        prefer_remote_source=prefer_remote_source,
+        uploads_root=uploads_dir,
     )
 
 
@@ -485,6 +468,8 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
@@ -521,14 +506,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.prompt_optional:
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -606,9 +592,15 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        width_val = form_value("width", width)
+        height_val = form_value("height", height)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # ``prompt`` is a required str field on VideoGenerationsRequest; it is only
+            # ``None`` here for a prompt-optional pipeline (the gate above already
+            # rejected a missing prompt for every other one), so an empty string is the
+            # correct substitute, not a real (ignored) prompt value.
+            prompt=prompt or "",
             enhance_prompt=form_value("enhance_prompt", enhance_prompt) or False,
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
@@ -623,6 +615,8 @@ async def create_video(
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
+            width=width_val,
+            height=height_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_text_value("negative_prompt", negative_prompt),
@@ -705,6 +699,8 @@ async def create_video(
                         detail=f"Failed to process image source: {str(e)}",
                     )
                 payload["input_reference"] = input_path
+            if resolve_sampling_params_cls(server_args).prompt_optional:
+                payload.setdefault("prompt", "")
             req = VideoGenerationsRequest(**payload)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")

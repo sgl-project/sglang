@@ -13,9 +13,6 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary import exit as exits
-from sglang.srt.layers.layer_boundary import (
-    make_stages,
-)
 from sglang.srt.layers.layer_boundary import stage as stages
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
@@ -25,6 +22,7 @@ from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
@@ -59,7 +57,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
             attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
         )
         with fixture.planning(parallel):
-            attn, _ = make_stages(
+            attn, _ = build_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), fixture.Norm()),
                 previous=declare_ffn(),
@@ -84,7 +82,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
             patch_communicator("tp_reduce_scatter", reduce_scatter),
         ):
             # Rebind the path with the numerical collective stand-in.
-            attn, _ = make_stages(
+            attn, _ = build_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), fixture.Norm()),
                 previous=declare_ffn(),
@@ -124,7 +122,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     return_value=parallel,
                 ),
             ):
-                _, ffn = make_stages(
+                _, ffn = build_stages(
                     (declare_attn(), fixture.Norm()),
                     (declare_ffn(sparse=True), fixture.Norm(), {"fusions": fusion}),
                     terminal=True,
@@ -207,7 +205,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
             ):
                 for sparse in (False, True):
-                    _, ffn = make_stages(
+                    _, ffn = build_stages(
                         (declare_attn(), fixture.Norm()),
                         (
                             declare_ffn(sparse=sparse, update=REPLACE_AT_EXIT),
@@ -219,6 +217,33 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         self.assertIsNone(path.output.group, (sparse, variant))
                         self.assertFalse(path.output.may_defer_to_next)
 
+    def test_an_ffn_that_completes_its_own_sum_owes_none(self):
+        # Its compute completes the sum, so the exit neither sums nor defers it,
+        # under DP too.
+        for attn_dp in (1, 2):
+            with (
+                self.subTest(attn_dp=attn_dp),
+                fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
+            ):
+                for sparse in (False, True):
+                    stages = {
+                        complete: build_stages(
+                            (declare_attn(), fixture.Norm()),
+                            (
+                                declare_ffn(sparse=sparse, output_complete=complete),
+                                fixture.Norm(),
+                            ),
+                            previous=declare_ffn(sparse=sparse),
+                        )[1]
+                        for complete in (False, True)
+                    }
+                    owed = stages[False].plan.paths[BatchVariant.ORDINARY].output
+                    self.assertIsNotNone(owed.group, sparse)
+                    for variant, path in stages[True].plan.paths.items():
+                        self.assertIsNone(path.output.group, (sparse, variant))
+                        self.assertFalse(path.output.may_defer_to_next)
+                        self.assertFalse(path.output.may_reduce_scatter)
+
     def test_only_an_ffn_writing_the_next_stream_sums_its_parts(self):
         summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
         fb = SimpleNamespace()
@@ -227,7 +252,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
             patch.object(stages, "sum_output", summed),
         ):
             for update in (PLAIN_ADD, REPLACE_AT_EXIT):
-                _, ffn = make_stages(
+                _, ffn = build_stages(
                     (declare_attn(), fixture.Norm()),
                     (declare_ffn(update=update), fixture.Norm()),
                 )

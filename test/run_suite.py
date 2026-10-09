@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "mps": HWBackend.MPS,
     "ppu": HWBackend.PPU,
 }
 
@@ -125,6 +126,11 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.MPS: [
+        "stage-a-unit-test-mps",
+        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
+        "stage-b-e2e-mps",
+    ],
     # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
     # the runner preflight until the PPU SRT platform and AOT kernels land.
     # Declaring a name here before a workflow dispatches it would let a test
@@ -206,10 +212,11 @@ NIGHTLY_SUITES = {
         "full-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
-        "nightly-xpu-1-gpu",
-        "nightly-xpu-2-gpu",
-        "nightly-xpu-4-gpu",
-        "nightly-xpu-8-gpu",
+        "nightly-xpu-kernel-main-1-gpu",
+        "nightly-xpu-kernel-main-2-gpu",
+        "nightly-xpu-kernel-main-4-gpu",
+        "nightly-xpu-kernel-main-8-gpu",
+        "nightly-xpu-kernel-wheel-1-gpu",
     ],
 }
 
@@ -241,6 +248,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.MPS,
     HWBackend.PPU,
 }
 

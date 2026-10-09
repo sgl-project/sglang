@@ -208,6 +208,24 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_speculative_w4a4_mxfp4_megamoe_is_tri_state(self):
+        # Unset must stay None, not False: None is what lets the draft inherit
+        # --enable-w4a4-mxfp4-megamoe.
+        for flag, expected in (
+            ([], None),
+            (["--speculative-enable-w4a4-mxfp4-megamoe"], True),
+            (["--no-speculative-enable-w4a4-mxfp4-megamoe"], False),
+        ):
+            with self.subTest(flag=flag):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe", *flag]
+                )
+                args.resolve_once()
+                self.assertIs(
+                    resolution_result(args, "speculative_enable_w4a4_mxfp4_megamoe"),
+                    expected,
+                )
+
     def test_megamoe_rejects_two_batch_overlap(self):
         # The fused kernel has no dispatch/combine split for the TBO ops to call.
         with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
@@ -1119,7 +1137,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             handle_pd_disaggregation(server_args)
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
-    def test_pd_decode_dcp_forces_chunk_cache(self):
+    def test_pd_decode_dcp_disables_radix_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake",
@@ -2088,6 +2106,32 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_buffer_only_resolves_write_back_to_write_through(self):
+        """buffer_only has no retained host tier for write_back to defer
+        writes into, so the mode resolves that policy to write_through
+        instead of rejecting the launch. The rewrite is that narrow: an
+        explicit write_through_selective stays as given, and the cache
+        mode keeps write_back.
+        """
+        cases = [
+            ("buffer_only", "write_back", "write_through"),
+            ("buffer_only", "write_through", "write_through"),
+            ("buffer_only", "write_through_selective", "write_through_selective"),
+            ("cache", "write_back", "write_back"),
+        ]
+        for mode, policy, expected in cases:
+            with self.subTest(mode=mode, policy=policy):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_host_memory_mode=mode,
+                    hicache_storage_backend="file",
+                    hicache_write_policy=policy,
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_write_policy"), expected
+                )
+
     def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
         common = {
             "enable_hierarchical_cache": True,
@@ -2971,6 +3015,9 @@ class TestDeepEPv2Args(CustomTestCase):
             "DeepseekV3ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
+            "Glm5NextForConditionalGeneration",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
             args._model_config.hf_config.architectures = [architecture]
@@ -2995,6 +3042,17 @@ class TestDeepEPv2Args(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
+
+    def test_direct_mode_rejected_across_nodes(self):
+        # direct is NVLink-only; multi-node must ask for hybrid up front.
+        args = self._args(moe_runner_backend="deep_gemm", nnodes=2)
+        with self.assertRaisesRegex(ValueError, "--deepep-v2-mode hybrid"):
+            handle_a2a_moe(args)
+        handle_a2a_moe(
+            self._args(
+                moe_runner_backend="deep_gemm", nnodes=2, deepep_v2_mode="hybrid"
+            )
+        )
 
     def test_deterministic_inference_accepted(self):
         args = self._args(
@@ -3141,6 +3199,65 @@ class TestDeepEPv2Args(CustomTestCase):
         with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(1024):
             with self.assertRaisesRegex(ValueError, "required=1280"):
                 validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_divides_by_scatter_ranks(self):
+        # Budget divides by tp_size // attn_dp_size; dp=2 -> 2048/(16/2)=256.
+        # Pin the exact required value: a looser cap would pass for a wrong divisor.
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            attn_dp_size=2,
+            max_running_requests=16,
+        )
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
+            with self.assertRaisesRegex(ValueError, "required=256"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(256):
+            validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_divides_under_pure_tp(self):
+        # Pure TP still scatters the dispatch input across all tp_size ranks, so
+        # the budget divides by tp_size: 2048/16=128, cap 127 must raise.
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            attn_dp_size=1,
+            max_running_requests=16,
+        )
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
+            with self.assertRaisesRegex(ValueError, "required=128"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
+            validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_prefill_budget_model_policy_receives_undivided_ceiling(self):
+        # A registered policy owns the whole per-rank computation, so it gets
+        # the prefill-buffer ceiling, not the generic scatter quotient.
+        from sglang.srt.configs import moe_model_registry
+
+        seen = []
+
+        def prefill_dispatch_tokens(cfg, tokens):
+            seen.append(tokens)
+            return -(-tokens // (cfg.tp_size // cfg.attn_dp_size))
+
+        moe_model_registry.register_deepep_v2_model(
+            "TestPrefillPolicyMoe", prefill_dispatch_tokens=prefill_dispatch_tokens
+        )
+        self.addCleanup(
+            moe_model_registry._DEEPEP_V2_MODELS.pop, "TestPrefillPolicyMoe"
+        )
+        args = self._args(
+            chunked_prefill_size=2048,
+            tp_size=16,
+            attn_dp_size=2,
+            max_running_requests=16,
+        )
+        args._model_config.hf_config.architectures = ["TestPrefillPolicyMoe"]
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(255):
+            with self.assertRaisesRegex(ValueError, "required=256"):
+                validate_deepep_v2_dispatch_token_budget(args)
+        self.assertEqual(seen, [2048])
 
     def test_disabled_chunking_uses_max_prefill_tokens(self):
         for disabled in (None, 0, -1):

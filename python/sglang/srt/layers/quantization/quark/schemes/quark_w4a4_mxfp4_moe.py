@@ -59,6 +59,42 @@ if _use_aiter:
     from aiter.utility.fp4_utils import e8m0_shuffle
 
 
+def _pad_tp_chunks(
+    loaded_weight: torch.Tensor, *, dim: int, tp_size: int, padded: int
+) -> torch.Tensor:
+    """Zero-pad each of the tp_size equal chunks of loaded_weight along dim to padded."""
+    real = loaded_weight.shape[dim] // tp_size
+    if real == padded:
+        return loaded_weight
+    assert real * tp_size == loaded_weight.shape[dim] and real < padded
+    chunks = loaded_weight.unflatten(dim, (tp_size, real))
+    pad_shape = list(chunks.shape)
+    pad_shape[dim + 1] = padded - real
+    return torch.cat([chunks, chunks.new_zeros(pad_shape)], dim=dim + 1).flatten(
+        dim, dim + 1
+    )
+
+
+def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
+    """FusedMoE's padded loader slices rank r at r * padded_width, but aiter treats
+    the last intermediate_pad channels of each rank as padding; pad every rank's
+    checkpoint chunk to match aiter's assumption."""
+
+    def loader(param, loaded_weight, weight_name, shard_id, expert_id, *args, **kw):
+        if shard_id in ("w1", "w2", "w3") and loaded_weight.dim() == 2:
+            # Intermediate axis: rows of w1/w3 (into half of w13), cols of w2.
+            dim = 1 if shard_id == "w2" else 0
+            padded = param.shape[dim + 1] // (1 if shard_id == "w2" else 2)
+            loaded_weight = _pad_tp_chunks(
+                loaded_weight, dim=dim, tp_size=tp_size, padded=padded
+            )
+        return weight_loader(
+            param, loaded_weight, weight_name, shard_id, expert_id, *args, **kw
+        )
+
+    return loader
+
+
 # gfx1250's grouped MoE GEMM reads weight scales in the n32k4 layout
 # (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
@@ -220,6 +256,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
         layer.hidden_pad = 0
         layer.intermediate_pad = w13_up_dim // 2 - intermediate_size_per_partition
+        if layer.intermediate_pad and not layer.use_presharded_weights:
+            original_weight_loader = _rank_chunk_padding_loader(
+                original_weight_loader, tp_size=layer.moe_tp_size
+            )
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -980,6 +1020,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            aiter_swiglu_oai_limit,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1015,7 +1056,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            swiglu_limit=(
+                aiter_swiglu_oai_limit(self.moe_runner_config)
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)

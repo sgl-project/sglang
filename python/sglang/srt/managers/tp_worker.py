@@ -604,6 +604,7 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -649,6 +650,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                kv_loc_plan=forward_batch.kv_loc_plan if return_kv_loc_plan else None,
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
