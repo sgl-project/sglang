@@ -743,8 +743,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
             )
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        self.is_layer_sparse = self._is_layer_sparse(
+            config, layer_id, is_nextn=is_nextn
+        )
 
         if self.is_layer_sparse:
             self.mlp = Glm5NextMoE(
@@ -795,9 +796,9 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
-        residual = PLAIN_RESIDUAL_OPS
+        mhc = None
         if self.config.mhc:
-            residual = MHCState(
+            mhc = MHCState(
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
@@ -809,15 +810,10 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(
-                    read=residual.attn_readout,
-                    update=residual.attn_update,
-                    tp_group=SumGroup.TP
-                    if self.is_linear_attn and get_parallel().enable_cp_tp_group_sharing
-                    else SumGroup.ATTN_TP,
-                ),
+                attn,
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.self_attn.prepare_qkv_latent
@@ -825,14 +821,37 @@ class Glm5NextDecoderLayer(nn.Module):
                     else None,
                 },
             ),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                    read=residual.ffn_readout,
-                    update=residual.ffn_update,
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config, layer_id, *, is_nextn=False, mhc=None):
+        """The attention and FFN stages the layer at ``layer_id`` declares:
+        the model's shared declaration function (see make_layers), which the
+        layer declares itself with. The config selects the residual: a plain
+        one, or hyper-connection streams, read and updated by ``mhc``, the
+        layer's own reads and updates of them; without it, the stages
+        declare what those do."""
+        if config.mhc:
+            residual = MHCState.facts() if mhc is None else mhc
+        else:
+            residual = PLAIN_RESIDUAL_OPS
+        return (
+            declare_attn(
+                read=residual.attn_readout,
+                update=residual.attn_update,
+                tp_group=SumGroup.TP
+                if config.is_kda_layer(layer_id)
+                and get_parallel().enable_cp_tp_group_sharing
+                else SumGroup.ATTN_TP,
+            ),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
                 ),
-                self.post_attention_layernorm,
+                read=residual.ffn_readout,
+                update=residual.ffn_update,
             ),
         )
 
@@ -924,11 +943,12 @@ class Glm5NextDecoderLayer(nn.Module):
             hc_mult=self.config.hc_mult,
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @staticmethod
+    def _is_layer_sparse(config, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     def forward(
@@ -1035,6 +1055,7 @@ class Glm5NextModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
