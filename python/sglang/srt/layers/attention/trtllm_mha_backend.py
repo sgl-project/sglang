@@ -428,16 +428,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Build (qkv, block_tables) for trtllm_fmha_v2_prefill.
 
         The kernel addresses K and V blocks from k_cache's base pointer via
-        int32 block offsets. When V sits at a block-aligned offset from K
-        (the fused pool halves), pass the views with pre-expanded [B, 2, M]
-        offsets, avoiding an expensive copy of KV caches.
+        int32 block offsets. When K and V are contiguous and V sits at a
+        block-aligned offset from K (the fused pool halves), pass them with
+        pre-expanded [B, 2, M] offsets, avoiding an expensive copy of KV caches.
         """
         block_bytes = k_cache.stride(0) * k_cache.element_size()
         delta, rem = divmod(v_cache.data_ptr() - k_cache.data_ptr(), block_bytes)
-        if rem != 0 or not 0 < delta < torch.iinfo(torch.int32).max // 2:
+        if (
+            rem != 0
+            or not 0 < delta < torch.iinfo(torch.int32).max // 2
+            or not (k_cache.is_contiguous() and v_cache.is_contiguous())
+        ):
             logger.warning_once(
-                "fmha_v2 prefill: KV pool is not fused block-aligned, so the forward "
-                "copies the full per-layer KV pool on every prefill call (slow)."
+                "fmha_v2 prefill: K/V caches are not contiguous block-aligned halves "
+                "of one allocation, so every prefill copies the per-layer KV pool (slow)."
             )
             return (q, torch.stack([k_cache, v_cache], dim=1)), page_table
 
@@ -1676,18 +1680,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
             k_cache, v_cache = kv_cache
         else:
-            # Native pool format is NHD:
-            # [num_pages, page_size, num_kv_heads, head_dim].
             k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            # Same test as paged_kv_view: SGLANG_USE_HND_KVCACHE pools are
+            # [pages, heads, page, dim]; NHD pools are per-slot rows.
+            kv_pool_is_hnd = k_cache_raw.dim() == 4
             if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(
                     k_cache_raw, v_cache_raw, layer, layer.head_dim
                 )
-            elif k_cache_raw.dim() == 4:
-                # HND pool buffers are already contiguous [pages, heads, page, dim].
+            elif kv_pool_is_hnd:
+                # fmha_v2 reads HND pool buffers as-is; they are already contiguous.
                 k_cache, v_cache = k_cache_raw, v_cache_raw
             else:
                 k_cache = paged_kv_view(
@@ -1796,9 +1801,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 qkv,
-                input_layout=(
-                    "Q_PAGED_KV_HND" if k_cache_raw.dim() == 4 else "Q_PAGED_KV_NHD"
-                ),
+                input_layout="Q_PAGED_KV_HND" if kv_pool_is_hnd else "Q_PAGED_KV_NHD",
                 workspace_buffer=self._fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,

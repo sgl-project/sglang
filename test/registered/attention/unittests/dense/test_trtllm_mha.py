@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -248,11 +249,28 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         "fmha_v2 prefill runs only on SM90/SM120",
     )
     def test_fmha_v2_extend_cases(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnBackend,
+        )
+
+        # Records whether each prefill passed K/V without copying the pool.
+        build_inputs = TRTLLMHAAttnBackend._fmha_v2_paged_inputs
+        no_copy = []
+
+        def spy(backend, **kwargs):
+            qkv, block_tables = build_inputs(backend, **kwargs)
+            no_copy.append(isinstance(qkv[1], tuple))
+            return qkv, block_tables
+
         for hnd in (False, True):
             for case in self.FMHA_V2_EXTEND_CASES:
+                no_copy.clear()
                 with (
                     self.subTest(case=case.name, hnd=hnd),
                     envs.SGLANG_USE_HND_KVCACHE.override(hnd),
+                    mock.patch.object(
+                        TRTLLMHAAttnBackend, "_fmha_v2_paged_inputs", spy
+                    ),
                     # The HND pool writes K/V by index assignment, which autograd rejects.
                     torch.no_grad(),
                 ):
@@ -263,6 +281,7 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                         hidden_size=self.HIDDEN_SIZE,
                         max_context_len=128,
                     )
+                    self.assertEqual(no_copy, [True], "fell back to the KV copy")
 
     @unittest.skipUnless(
         is_sm90_supported() or is_sm120_supported(),
