@@ -83,7 +83,14 @@ class ProfileMerger:
 
     def _discover_trace_files(self) -> List[str]:
         """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
-        patterns = [f"{self.profile_id}*.trace.json.gz"]
+        # Files are named "<profile_id>-<ranks>.trace.json.gz" by default, but
+        # when a profile_prefix is set they become
+        # "<profile_prefix>-<profile_id>-<ranks>.trace.json.gz". Match both so
+        # that merge_profiles still works together with profile_prefix.
+        patterns = [
+            f"{self.profile_id}*.trace.json.gz",
+            f"*-{self.profile_id}*.trace.json.gz",
+        ]
 
         trace_files = []
         for pattern in patterns:
