@@ -2629,18 +2629,12 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
+        # the gfx950 wo_a fork already returned [T, G * R], so only the plain
+        # tensor needs flattening
         o_in = o.flatten(1) if isinstance(o, torch.Tensor) else o
-        # ROCm gfx950 TP-only: wo_b's GEMM and its all-reduce can overlap. The
-        # helper returns None whenever it does not apply -- decode, ragged
-        # chunks, no SDMA -- and disables itself for the process on any failure.
-        # A deferred all-reduce (mHC owns it) and a non-tensor operand (wo_a
-        # fused an MXFP8 quantization into its epilogue) each keep the ordinary
-        # path, which owns the collective itself.
-        fused_o = (
-            None
-            if (defer_all_reduce or not isinstance(o, torch.Tensor))
-            else fused_wo_b(self.wo_b, o_in)
-        )
+        # Fusing *performs* the all-reduce, where a deferred one is skipped so
+        # the mHC post can fold it in -- a correctness constraint, not a gap.
+        fused_o = None if defer_all_reduce else fused_wo_b(self.wo_b, o_in)
         if fused_o is not None:
             o = fused_o
         else:

@@ -1630,29 +1630,21 @@ class Envs:
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
-    # ROCm gfx950 TP-only: replace wo_b's `GEMM then all-reduce` pair with mori
-    # cco's fused GEMM+reduce-scatter, which overlaps the scatter with the GEMM.
-    # Measured 1297us against 1617 per layer at [16384, 7168] K=2048 on 8 ranks.
-    # Off by default: it needs a ~700 MiB symmetric window outside torch's
-    # allocator, and it only engages for large M (ragged M is zero-padded up to
-    # a multiple of tp_size*128).
+    # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
+    # cco. Off by default: it reserves a symmetric window outside torch's
+    # allocator, so a run that enables it wants a lower --mem-fraction-static.
     SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
     # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
-    # halving its bytes. That leg is ~40% of a fused layer and already runs at
-    # the xGMI ceiling, so it is worth about -10% on the layer -- but it costs
-    # accuracy: relL2 goes from 2.35e-3 to 2.49e-2 at the model's shape, which
-    # is e4m3's 3-bit mantissa and not a granularity that can be tuned away. It
-    # also needs a larger window (812 MiB against 700) for the staging region.
+    # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
+    # mantissa width rather than a granularity that can be tuned away.
     SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
     # Which transport carries the fused wo_b's all-gather leg, "lsa" or "sdma".
     # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
-    # second kernel, and it wins in both places (951us against SDMA's 1011 on
-    # the layer). Only read when the fused path is on.
+    # second kernel. Only read when the fused path is on.
     SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
-    # Debug: log the distribution of M the fused wo_b is offered, and how much
-    # of it clears the fusing thresholds. M is the token count of one forward,
-    # not of one request, so this is the only way to see what the scheduler
-    # actually batches.
+    # Debug: log the distribution of M the fused wo_b is offered. M is the token
+    # count of one forward, not of one request, so this is the only way to see
+    # what the scheduler actually batches.
     SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
     # Debug: run both the fused and the unfused wo_b and log their relative L2.
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
