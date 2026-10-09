@@ -29,8 +29,11 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
+from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+    WeightOnlyFP8Linear,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     write_dense_weight,
@@ -120,6 +123,16 @@ class BaseLayerWithLoRA(nn.Module):
     def bias(self):
         return getattr(self.base_layer, "bias", None)
 
+    @staticmethod
+    def _runtime_lora_scale() -> float:
+        context = get_forward_context_or_none()
+        if context is None:
+            return 1.0
+        forward_batch = context.forward_batch
+        if forward_batch is None:
+            return 1.0
+        return float(forward_batch.runtime_lora_scale)
+
     @property
     def can_merge_base_weight(self) -> bool:
         """Whether a LoRA delta may safely replace the stored base weight."""
@@ -148,6 +161,10 @@ class BaseLayerWithLoRA(nn.Module):
             lora_A = self.lora_A.to_local()
 
         # TODO: Support multiple LoRA adapters when use not merged mode
+        runtime_lora_scale = self._runtime_lora_scale()
+        if runtime_lora_scale == 0.0:
+            return self.base_layer(x)
+
         lora_dtype = lora_A.dtype
         x_lora = x.to(dtype=lora_dtype)
         lora_A_sliced = self.slice_lora_a_weights(
@@ -161,7 +178,7 @@ class BaseLayerWithLoRA(nn.Module):
             delta = delta * (
                 self.lora_alpha / self.lora_rank  # type: ignore
             )  # type: ignore
-        delta = delta * self.strength
+        delta = delta * self.strength * runtime_lora_scale
         out, output_bias = self.base_layer(x)
         out = out + delta.to(dtype=out.dtype)
         return self._add_lora_output_offset(out), output_bias
@@ -208,6 +225,8 @@ class BaseLayerWithLoRA(nn.Module):
         offset = self._active_lora_output_offset()
         if offset is None:
             return output
+        if not self.merged:
+            offset = offset * self._runtime_lora_scale()
         return output + offset.to(device=output.device, dtype=output.dtype)
 
     @staticmethod
@@ -329,7 +348,7 @@ class BaseLayerWithLoRA(nn.Module):
         """An in-place merge is about to write the base storage; if the
         snapshot is a zero-copy view into it, materialize the clone now."""
         if self._base_is_view:
-            self.cpu_weight = self.cpu_weight.clone()
+            self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
             self._base_is_view = False
 
     @torch.no_grad()
@@ -473,11 +492,10 @@ class BaseLayerWithLoRA(nn.Module):
         if self.disable_lora:
             return
 
-        # Zero-copy views unmerge by subtracting B@A; do not clone the base.
-        if not self._base_is_view:
-            self._ensure_base_snapshot_owned()
         if self.merged:
             self.unmerge_lora_weights()
+        # Only layers actually merged need a snapshot of the mutable backing store.
+        self._ensure_base_snapshot_owned()
 
         lora_list = self._active_lora_list()
         if not lora_list:
@@ -590,66 +608,13 @@ class BaseLayerWithLoRA(nn.Module):
             )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
-        elif self._base_is_view:
-            self._unmerge_by_inverse()
         else:
-            current_device = self.base_layer.weight.data.device
-            cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            if self.base_layer.weight.data.is_inference():
-                self.base_layer.weight.data = self._as_mutable_tensor(
-                    cpu_weight_on_device
-                )
-            else:
-                self.base_layer.weight.data.copy_(cpu_weight_on_device)
-            if (
-                cpu_weight_on_device.data_ptr()
-                != self.base_layer.weight.data.data_ptr()
-            ):
-                del cpu_weight_on_device
+            # Update the offload backing store too, not a transient GPU placeholder.
+            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
+            restored = self.cpu_weight.clone()
+            write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
 
         self.merged = False
-
-    @torch.no_grad()
-    def _unmerge_by_inverse(self) -> None:
-        lora_list = self._active_lora_list()
-        if not lora_list:
-            raise ValueError(
-                "LoRA weights not set; cannot unmerge a zero-copy view by inverse."
-            )
-        src, current_device = self._materialized_weight_src()
-        data = self._as_mutable_tensor(src.to(get_local_torch_device()))
-        target_dtype = data.dtype
-        if (
-            self._should_merge_in_fp32(lora_list)
-            and data.is_floating_point()
-            and data.dtype != torch.float32
-        ):
-            data = data.to(torch.float32)
-        inverted = [
-            (
-                lora_A,
-                lora_B,
-                lora_path,
-                -lora_strength,
-                lora_rank,
-                lora_alpha,
-                output_offset,
-            )
-            for (
-                lora_A,
-                lora_B,
-                lora_path,
-                lora_strength,
-                lora_rank,
-                lora_alpha,
-                output_offset,
-            ) in reversed(lora_list)
-        ]
-        self._merge_lora_into_data(data, inverted)
-        write_dense_weight(
-            self.base_layer,
-            self._as_mutable_tensor(data.to(dtype=target_dtype)),
-        )
 
     @torch.no_grad()
     def commit_merged_as_base(self) -> None:
@@ -683,39 +648,13 @@ class BaseLayerWithLoRA(nn.Module):
         self.strength = 1.0
 
 
-class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
-    """
-    Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
-
-    Note: The current version does not yet implement the LoRA functionality.
-    This class behaves exactly the same as the base VocabParallelEmbedding.
-    Future versions will integrate LoRA functionality to support efficient parameter fine-tuning.
-    """
-
-    def __init__(
-        self,
-        base_layer: VocabParallelEmbedding,
-    ) -> None:
-        super().__init__(base_layer)
-
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(
-            "We don't support VocabParallelEmbeddingWithLoRA yet."
-        )
-
-
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: ColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
+            return self.base_layer(input_)
+
+        runtime_lora_scale = self._runtime_lora_scale()
+        if runtime_lora_scale == 0.0:
             return self.base_layer(input_)
 
         lora_A = self.lora_A
@@ -744,7 +683,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
+            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -756,9 +695,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
-
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
         shard_size = self.base_layer.output_partition_sizes[0]
@@ -769,18 +705,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: MergedColumnParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
-
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
         if B.dim() == 3:
@@ -806,18 +730,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def __init__(
-        self,
-        base_layer: QKVParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
-    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A
-
     def slice_lora_b_weights(
         self, B: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -839,17 +751,12 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def __init__(
-        self,
-        base_layer: RowParallelLinear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
-
     def forward(self, input_: torch.Tensor):
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
+            return self.base_layer(input_)
+
+        runtime_lora_scale = self._runtime_lora_scale()
+        if runtime_lora_scale == 0.0:
             return self.base_layer(input_)
 
         lora_A = self.lora_A
@@ -885,7 +792,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta_parallel = delta_parallel * self.strength
+            delta_parallel = delta_parallel * self.strength * runtime_lora_scale
             output_parallel = output_parallel + delta_parallel.to(
                 dtype=output_parallel.dtype
             )
@@ -915,9 +822,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         A = A[:, start_idx:end_idx].contiguous()
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
-        return B
-
 
 class LinearWithLoRA(BaseLayerWithLoRA):
     """
@@ -925,15 +829,6 @@ class LinearWithLoRA(BaseLayerWithLoRA):
     Unlike custom LinearBase classes, nn.Linear.forward() returns a single tensor,
     not a tuple of (output, bias).
     """
-
-    def __init__(
-        self,
-        base_layer: nn.Linear,
-        lora_rank: int | None = None,
-        lora_alpha: int | None = None,
-        snapshot_base: bool = True,
-    ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -944,6 +839,11 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             lora_A = self.lora_A.to_local()
 
         # TODO: Support multiple LoRA adapters when use not merged mode
+        runtime_lora_scale = self._runtime_lora_scale()
+        if runtime_lora_scale == 0.0:
+            # nn.Linear.forward() returns a single tensor
+            return self.base_layer(x)
+
         if not self.merged and not self.disable_lora:
             lora_dtype = lora_A.dtype
             x_lora = x.to(dtype=lora_dtype)
@@ -958,7 +858,7 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta = delta * self.strength
+            delta = delta * self.strength * runtime_lora_scale
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             out = out + delta.to(dtype=out.dtype)
@@ -976,6 +876,39 @@ def _use_owned_base_snapshot(
     return snapshot_base or device_type not in ("cpu", "meta")
 
 
+class WeightOnlyFP8LinearWithLoRA(LinearWithLoRA):
+    """
+    Dynamic-only LoRA wrapper for storage-only FP8 linear layers.
+
+    Merging LoRA into FP8 storage weights requires dequantizing, applying the
+    delta, and requantizing weight_scale consistently. Keep the first FP8 path
+    explicit and only support dynamic LoRA.
+    """
+
+    @property
+    def can_merge_base_weight(self) -> bool:
+        return False
+
+    def set_lora_weights(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        lora_path: str | None = None,
+        strength: float = 1.0,
+        clear_existing: bool = False,
+        merge_weights: bool = True,
+        output_offset: torch.Tensor | None = None,
+    ) -> None:
+        if merge_weights:
+            raise ValueError(
+                "Weight-only FP8 LoRA only supports dynamic mode; "
+                "please use --lora-merge-mode dynamic."
+            )
+        super().set_lora_weights(
+            A, B, lora_path, strength, clear_existing, False, output_offset
+        )
+
+
 def wrap_with_lora_layer(
     layer: nn.Module,
     lora_rank: int | None = None,
@@ -985,11 +918,11 @@ def wrap_with_lora_layer(
     """
     transform the given layer to its corresponding LoRA layer
     """
-    supported_layer_types: dict[
-        type[LinearBase] | type[nn.Linear], type[BaseLayerWithLoRA]
-    ] = {
+    supported_layer_types: dict[type[nn.Module], type[BaseLayerWithLoRA]] = {
         # the order matters
-        # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
+        # Weight-only FP8 LoRA is currently dynamic-only and intended for
+        # single-GPU deployments.
+        WeightOnlyFP8Linear: WeightOnlyFP8LinearWithLoRA,
         QKVParallelLinear: QKVParallelLinearWithLoRA,
         MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
