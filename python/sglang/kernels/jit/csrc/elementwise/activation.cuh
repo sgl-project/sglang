@@ -199,8 +199,7 @@ struct ActivationKernel {
     // only get once to avoid overhead
     const auto num_total_items = num_tokens * (hidden_size / kVecSize);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
-    const auto block_size = num_tokens <= 32 ? 128u : 256u;
-    const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), block_size);
+    const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
     const auto params = ActivationParams{
         .input = input.data_ptr(),
         .out = kReuseInput ? nullptr : out.data_ptr(),
@@ -214,14 +213,14 @@ struct ActivationKernel {
       RuntimeCheck(type == "silu" && expert_ids == nullptr, "clamping requires unfiltered SiLU");
       const auto kernel =
           act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kRoundActivation, kReuseInput, true>;
-      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     } else if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
       const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
-      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     } else {
       const auto kernel = select_kernel<false, kRoundActivation, kReuseInput>(type);
-      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     }
   }
 

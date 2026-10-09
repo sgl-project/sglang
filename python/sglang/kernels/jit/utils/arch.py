@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils.common import (
     is_hip_runtime,
     is_musa_runtime,
 )
+from sglang.srt.utils.common import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +183,6 @@ def is_arch_support_pdl() -> bool:
 
 
 def get_activation_cuda_cflags() -> list[str]:
-    from sglang.srt.utils.common import is_cuda
-
     if is_cuda():
         return ["--use_fast_math"]
     return []
