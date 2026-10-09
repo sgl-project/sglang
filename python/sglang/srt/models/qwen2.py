@@ -23,17 +23,24 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_QUANT_READOUT
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -49,9 +56,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
+    supports_quantized_rl_reload,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
@@ -68,6 +77,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -82,23 +92,45 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        if get_global_server_args().rl_on_policy_target is not None:
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with centralized gate_up_proj stacked dispatch."""
+        from sglang.srt.model_loader.auto_loader import STANDARD_GATE_UP_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_GATE_UP_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            # Direct params: down_proj, scales, etc.
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
 
 
 class Qwen2Attention(nn.Module):
@@ -118,7 +150,7 @@ class Qwen2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -156,6 +188,7 @@ class Qwen2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -190,21 +223,47 @@ class Qwen2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with centralized qkv_proj stacked dispatch."""
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_QKV_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            # Direct params: o_proj, scales, biases
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+            elif not (name.endswith(".bias") or name.endswith(".kv_scale")):
+                # Don't warn for optional bias or legacy kv_scale
+                pass
+        return loaded
+
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.start_layer = start_layer
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-        head_dim = getattr(config, "head_dim", None)
+        if hasattr(config, "original_num_attention_heads"):
+            head_dim = config.hidden_size // config.original_num_attention_heads
+        else:
+            head_dim = getattr(config, "head_dim", None)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
@@ -227,25 +286,36 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
+        self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(read=self._attn_readout(layer_id)), self.input_layernorm),
+            (
+                declare_ffn(sparse=False, next_layer_sparse=False),
+                self.post_attention_layernorm,
+            ),
+        )
+
+    def _attn_readout(self, layer_id: int):
+        return NORM_QUANT_READOUT
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        capture_output=None,
+    ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -253,9 +323,10 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class Qwen2Model(nn.Module):
@@ -271,7 +342,8 @@ class Qwen2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -282,7 +354,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_exec().deterministic.rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -291,17 +363,21 @@ class Qwen2Model(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
+                start_layer=pp_start_layer,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -312,7 +388,7 @@ class Qwen2Model(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
+                if get_exec().deterministic.rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(
@@ -347,38 +423,29 @@ class Qwen2Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-            layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states = self.layers[i](
                 positions,
                 hidden_states,
                 forward_batch,
-                residual,
+                capture_output=aux_hidden_states.capture
+                if i in self.layers_to_capture
+                else None,
             )
+
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm, skip_empty=True
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -389,8 +456,7 @@ class Qwen2Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -405,7 +471,7 @@ class Qwen2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -436,7 +502,7 @@ class Qwen2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2Model(
@@ -516,6 +582,7 @@ class Qwen2ForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -523,19 +590,17 @@ class Qwen2ForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -553,7 +618,15 @@ class Qwen2ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @supports_quantized_rl_reload
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -623,6 +696,52 @@ class Qwen2ForCausalLM(nn.Module):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """AutoWeightsLoader-based weight loading.
+
+        Stacked params (qkv_proj, gate_up_proj) are handled by module-local
+        load_weights on Qwen2Attention and Qwen2MLP via walker delegation.
+        Quantization is handled entirely inside param.weight_loader.
+        """
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        # 1. PP layer filter — drop layers outside this rank's range.
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        # 2. Tied embeddings — skip lm_head from walker; we copy from
+        #    embed_tokens after loading completes.
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        # 3. Walk the module tree.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        loaded = loader.load_weights(weights)
+
+        # 4. Tied embedding post-copy: replicate embed_tokens → lm_head.
+        if self.config.tie_word_embeddings:
+            params_dict = dict(self.named_parameters())
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -631,8 +750,8 @@ class Qwen2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

@@ -1,4 +1,4 @@
-# Copyright 2025-2026 SGLang Team
+# Copyright 2026-2027 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,11 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights"""
+"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
 import logging
 import re
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -24,25 +24,33 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    get_attn_tp_context,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    LinearParallelGroup,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -50,40 +58,38 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import (
+    filter_moe_weight_param_global_expert,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2AttentionMLA,
-    DeepseekV2DecoderLayer,
-    DeepseekV2ForCausalLM,
-    DeepseekV2Model,
-    DeepseekV2MoE,
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_device_sm,
-    is_cuda,
-    log_info_on_rank0,
-    make_layers,
+    is_npu,
+    make_pp_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-_is_cuda = is_cuda()
-_device_sm = get_device_sm()
-
-if _is_cuda:
-    from sgl_kernel import dsv3_router_gemm
-
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 class Glm4MoeLiteMLP(nn.Module):
@@ -95,11 +101,11 @@ class Glm4MoeLiteMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -107,8 +113,7 @@ class Glm4MoeLiteMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -117,8 +122,7 @@ class Glm4MoeLiteMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -130,37 +134,13 @@ class Glm4MoeLiteMLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-        gemm_output_zero_allocator: BumpAllocator = None,
     ):
-        # Keep parity with DeepseekV2MLP.forward signature since DeepseekV2DecoderLayer
-        # invokes MLP modules with these extra arguments.
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
-
-        # Some quantization wrappers store the underlying parameter as `weight_packed`.
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
-
-        if (
-            gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
-        ):
-            y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
-            x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -174,33 +154,20 @@ class Glm4MoeLiteGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=torch.float32
+            )
         )
         self.e_score_correction_bias = nn.Parameter(
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
 
-    def forward(self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None):
-        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
-        if (
-            _is_cuda
-            and not self.is_nextn
-            and hidden_states.shape[0] < 4
-            and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
-            and _device_sm >= 90
-        ):
-
-            logits = dsv3_router_gemm(hidden_states, self.weight).to(
-                hidden_states.dtype
-            )
-        else:
-            logits = F.linear(hidden_states, self.weight, None)
-
+    def forward(self, hidden_states):
+        logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
         return logits
 
 
-class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
+class Glm4MoeLiteSparseMoeBlock(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -210,14 +177,12 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
     ):
-        nn.Module.__init__(self)
-        self.tp_size = get_tensor_model_parallel_world_size()
+        super().__init__()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
-            0
-            if get_global_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
         self.config = config
         self.layer_id = layer_id
@@ -243,7 +208,7 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -269,11 +234,13 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            **({"scoring_func": "sigmoid"} if _is_npu else {}),
         )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
-        # self.shared_experts_weight_block_size = None
+        self.shared_experts_weight_block_size = None
+        self._shared_expert_tp1 = False
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -284,13 +251,11 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else {}
-                ),
+                parallel_group="replicated"
+                if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                else "tp",
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
@@ -308,10 +273,9 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -327,8 +291,124 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
-class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        if not self._enable_a2a_moe:
+            if (
+                self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
+                and get_is_capture_mode()
+            ):
+                return self.forward_normal_dual_stream(hidden_states)
+            else:
+                return self.forward_normal(hidden_states)
+        else:
+            return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states)
+
+        with torch.cuda.stream(self.alt_stream):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+                final_hidden_states *= self.routed_scaling_factor
+
+        current_stream.wait_stream(self.alt_stream)
+        final_hidden_states += shared_output
+        return final_hidden_states
+
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] > 0:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        if not _is_cuda and not _use_aiter:
+            final_hidden_states *= self.routed_scaling_factor
+        if shared_output is not None:
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states_out = torch.empty_like(final_hidden_states)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+            final_hidden_states = final_hidden_states_out
+        return final_hidden_states
+
+    def forward_deepep(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+
+        if shared_output is not None:
+            x = shared_output
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                final_hidden_states *= self.routed_scaling_factor
+
+        return final_hidden_states
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            return self.shared_experts(hidden_states)
+        else:
+            return None
+
+
+class Glm4MoeLiteDecoderLayer(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -338,13 +418,16 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        nn.Module.__init__(self)
+
+        super().__init__()
+        # Required for MTP: Glm4MoeLiteModelNextN bypasses Glm4MoeLiteForCausalLM.__init__
+        config.moe_layer_freq = 1
         self.hidden_size = config.hidden_size
         self.config = config
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
 
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -365,16 +448,7 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
 
         if self.is_layer_sparse:
             self.mlp = Glm4MoeLiteSparseMoeBlock(
@@ -386,18 +460,15 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
                 is_nextn=is_nextn,
             )
         else:
-            if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm4MoeLiteMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -407,36 +478,93 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(),
+                self.input_layernorm,
+                {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
             ),
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
+    def _detect_gfx95_quant_format(self) -> str:
+        from sglang.srt.models.deepseek_common.utils import _is_gfx95_supported
 
-class Glm4MoeLiteModel(DeepseekV2Model):
+        if not _is_gfx95_supported:
+            return ""
+        weight = getattr(
+            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
+        )
+        if weight is None:
+            return ""
+        if weight.dtype == torch.uint8:
+            return "mxfp4"
+        if weight.dtype == getattr(torch, "float8_e4m3fn", None):
+            return "fp8"
+        return ""
+
+    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+        return is_nextn or (
+            self.config.n_routed_experts is not None
+            and layer_id >= self.config.first_k_dense_replace
+            and layer_id % self.config.moe_layer_freq == 0
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        capture_output=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=getattr(self, "_gfx95_quant_format", ""),
+            capture=capture_output,
+        )
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+            input_on_attn_tp_slices=(self.attn_boundary.input_on_attn_tp_slices),
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        get_attn_tp_context().clear_attn_inputs()
+
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+
+        return hidden_states
+
+
+class Glm4MoeLiteModel(nn.Module):
+    fall_back_to_pt_during_load = False
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        nn.Module.__init__(self)
+        super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
-
-        # DeepseekV2Model.forward expects these attributes to exist.
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
-        self.gemm_output_zero_allocator_size = 0
-        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -447,8 +575,8 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.alt_stream = get_stream("alt") if _is_cuda else None
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
                 config=config,
@@ -457,8 +585,6 @@ class Glm4MoeLiteModel(DeepseekV2Model):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
@@ -467,21 +593,100 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
 
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
 
-class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        total_num_layers = self.end_layer - self.start_layer
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual_batch.start(forward_batch)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
+        device = hidden_states.device
+        zero_allocator = BumpAllocator(
+            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        normal_start_layer = self.start_layer
+        normal_end_layer = self.end_layer
+        if forward_batch.can_run_tbo:
+            if (
+                self.first_k_dense_replace > normal_start_layer
+                and self.first_k_dense_replace < normal_end_layer
+            ):
+                normal_end_layer = self.first_k_dense_replace
+            elif self.first_k_dense_replace < normal_start_layer:
+                normal_end_layer = normal_start_layer = 0
+        aux_hidden_states = AuxHiddenStateList()
+        for i in range(normal_start_layer, normal_end_layer):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    capture_output=aux_hidden_states.capture
+                    if i in self.layers_to_capture
+                    else None,
+                )
+
+        if normal_end_layer != self.end_layer:
+            hidden_states = model_forward_stages(
+                layers=self.layers[normal_end_layer : self.end_layer],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                zero_allocator=zero_allocator,
+            )
+
+        if not self.pp_group.is_last_rank:
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
+
+
+class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+    # for quark model load
+    packed_modules_mapping = {}
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         config.moe_layer_freq = 1
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
-        self.determine_num_fused_shared_experts("Glm4MoeLiteForCausalLM")
+        self.pp_group = get_parallel().pp_group
+        self.determine_num_fused_shared_experts()
         self.model = Glm4MoeLiteModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -490,7 +695,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -503,41 +708,117 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
-        else:
-            self.cp_rank = self.cp_size = None
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
-    def determine_num_fused_shared_experts(
-        self, architecture: str = "Glm4MoeLiteForCausalLM"
-    ):
-        self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
-            return
+    # The architecture this class fuses shared experts for; the NextN draft
+    # reports its own name.
+    fused_shared_experts_architecture = "Glm4MoeLiteForCausalLM"
 
-        disable_reason = None
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built."""
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
-            or self.config.n_shared_experts != 1
+            or hf_config.architectures[0] != cls.fused_shared_experts_architecture
+            or hf_config.n_shared_experts != 1
         ):
-            disable_reason = "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "GLM-4.5 or GLM-4.6 cannot use shared experts fusion optimization under expert parallelism."
+            return "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
+        if get_parallel().moe_ep_size > 1:
+            return "GLM-4.5 or GLM-4.6 cannot use shared experts fusion optimization under expert parallelism."
+        return None
 
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
+    def determine_num_fused_shared_experts(self):
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_group,
+        )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
             return
 
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # TODO (Qiaolin-Yu): check if other draft models need similar layer id
+            # adjustment
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(
         self,

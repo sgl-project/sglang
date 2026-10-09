@@ -36,9 +36,8 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -54,9 +53,9 @@ class TestDeepseekV32DPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(
@@ -81,7 +80,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -146,9 +145,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(
@@ -173,7 +172,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             num_questions=1400,
             parallel=1400,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

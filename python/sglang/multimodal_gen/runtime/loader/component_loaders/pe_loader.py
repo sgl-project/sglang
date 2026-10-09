@@ -2,12 +2,21 @@
 import json
 import os
 
+import requests
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch import nn
+from transformers import AutoTokenizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import (
+    Ministral3ForCausalLM,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -32,9 +41,12 @@ def _read_model_max_length(model_path: str) -> int | None:
     return None
 
 
-class PEModelWrapper:
+class PEModelWrapper(nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.model.layers"]
 
     def __init__(self, model, tokenizer, device, model_max_length: int):
+        super().__init__()
         self.model = model
         self.pe_tokenizer = tokenizer
         self.device = device
@@ -63,7 +75,8 @@ class PEModelWrapper:
             generate_kwargs["top_p"] = top_p
 
         with torch.no_grad():
-            output_ids = self.model.generate(**generate_kwargs)
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                output_ids = self.model.generate(**generate_kwargs)
 
         new_tokens = output_ids[0, input_len:]
         text = self.pe_tokenizer.decode(new_tokens, skip_special_tokens=True)
@@ -71,11 +84,34 @@ class PEModelWrapper:
 
     def to(self, *args, **kwargs):
         """Move underlying model to device."""
-        self.model = self.model.to(*args, **kwargs)
-        if args:
-            device = args[0]
-            if isinstance(device, (str, torch.device)):
-                self.device = torch.device(device)
+        super().to(*args, **kwargs)
+        device = args[0] if args else kwargs.get("device")
+        if isinstance(device, (str, torch.device)):
+            self.device = torch.device(device)
+        return self
+
+
+class SGLangPEModelWrapper:
+    def __init__(self, model_url):
+        self.model_url = model_url.rstrip("/")
+        # Tokenizer is initialized separately during pipeline setup
+        self.pe_tokenizer = None
+
+    def generate(self, prompt: str, sampling_params: dict) -> dict:
+        response = requests.post(
+            self.model_url + "/generate",
+            json={
+                "text": prompt,
+                "sampling_params": sampling_params,
+            },
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    def to(self, *args, **kwargs):
+        logger.debug("Ignoring .to() because PE model is served externally")
         return self
 
 
@@ -88,6 +124,12 @@ class PELoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
+        if server_args.pe_server_url is not None:
+            logger.info(
+                f"Using external SGLang server for PE: {server_args.pe_server_url}"
+            )
+            return SGLangPEModelWrapper(server_args.pe_server_url)
+
         logger.info("Loading PE model from %s ...", component_model_path)
 
         pe_tokenizer_dir = os.path.join(
@@ -125,33 +167,23 @@ class PELoader(ComponentLoader):
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        attn_impl = "flash_attention_2"
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                component_model_path,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=server_args.trust_remote_code,
-                attn_implementation=attn_impl,
-            )
-            logger.info("PE model: using Flash Attention 2")
-        except (ValueError, ImportError):
-            logger.warning("Flash Attention 2 not available, falling back to SDPA")
-            attn_impl = "sdpa"
-            model = AutoModelForCausalLM.from_pretrained(
-                component_model_path,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=server_args.trust_remote_code,
-                attn_implementation=attn_impl,
-            )
+        model = Ministral3ForCausalLM.from_pretrained(
+            component_model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=server_args.trust_remote_code,
+        )
 
-        device = get_local_torch_device()
+        device = (
+            torch.device("cpu")
+            if server_args.should_start_component_on_cpu(component_name)
+            else get_local_torch_device()
+        )
         model = model.to(device).eval()
 
         logger.info(
-            "PE model loaded on %s: %s (attn=%s)",
+            "PE model loaded on %s: %s",
             device,
             model.__class__.__name__,
-            attn_impl,
         )
 
         return PEModelWrapper(

@@ -5,6 +5,7 @@ import functools
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _to_tuple(x: int | tuple[int, ...], dim: int = 2) -> tuple[int, ...]:
@@ -67,6 +68,116 @@ def get_1d_rotary_pos_embed(
     freqs_cos = freqs.cos()  # [S, D/2]
     freqs_sin = freqs.sin()  # [S, D/2]
     return freqs_cos, freqs_sin
+
+
+def qwen3_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Qwen3-style RoPE to q/k tensors shaped [B, S, H, D]."""
+    half = q.shape[-1] // 2
+    q1 = q[..., :half]
+    q2 = q[..., half:]
+    q_embed = torch.empty_like(q)
+    q_embed[..., :half] = q1 * cos[..., :half] - q2 * sin[..., :half]
+    q_embed[..., half:] = q2 * cos[..., half:] + q1 * sin[..., half:]
+
+    half = k.shape[-1] // 2
+    k1 = k[..., :half]
+    k2 = k[..., half:]
+    k_embed = torch.empty_like(k)
+    k_embed[..., :half] = k1 * cos[..., :half] - k2 * sin[..., :half]
+    k_embed[..., half:] = k2 * cos[..., half:] + k1 * sin[..., half:]
+    return q_embed, k_embed
+
+
+class Qwen3VLTextRotaryEmbedding(torch.nn.Module):
+    """Qwen3-VL multi-dimensional rotary embedding with interleaved mRoPE."""
+
+    def __init__(
+        self,
+        head_dim: int = 128,
+        rope_theta: float = 5_000_000.0,
+        mrope_section: tuple[int, int, int] | list[int] = (24, 20, 20),
+    ):
+        super().__init__()
+        self.rope_type = "default"
+        self.max_seq_len_cached = 262144
+        self.mrope_section = list(mrope_section)
+        self.head_dim = head_dim
+
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.attention_scaling = 1.0
+
+    def apply_interleaved_mrope(
+        self, freqs: torch.Tensor, mrope_section: list[int]
+    ) -> torch.Tensor:
+        freqs_t = freqs[0].clone()
+        for dim, offset in enumerate((1, 2), start=1):
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+    def _normalize_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
+        if position_ids.ndim == 3 and position_ids.shape[-1] == 3:
+            position_ids = position_ids.permute(2, 0, 1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        elif position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError(
+                "Qwen3 mRoPE position_ids must have shape [3, B, S], [B, S, 3], "
+                f"or [B, S], got {tuple(position_ids.shape)}"
+            )
+        return position_ids
+
+    def _compute_interleaved_freqs(self, position_ids: torch.Tensor) -> torch.Tensor:
+        position_ids = self._normalize_position_ids(position_ids)
+
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+            .to(position_ids.device)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+        return self.apply_interleaved_mrope(freqs, self.mrope_section)
+
+    @torch.no_grad()
+    def build_rope_cache_inputs(
+        self, position_ids: torch.Tensor, *, cache_dtype: torch.dtype | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        freqs = self._compute_interleaved_freqs(position_ids)
+        cos = freqs.cos() * self.attention_scaling
+        sin = freqs.sin() * self.attention_scaling
+        if cache_dtype is not None and cache_dtype != torch.float32:
+            cos = cos.to(cache_dtype).float()
+            sin = sin.to(cache_dtype).float()
+        cos_sin_cache = torch.cat((cos, sin), dim=-1).reshape(-1, self.head_dim)
+        cos_sin_cache = cos_sin_cache.contiguous()
+        cache_positions = torch.arange(
+            cos_sin_cache.shape[0], device=cos_sin_cache.device, dtype=torch.long
+        )
+        return cos_sin_cache, cache_positions
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cos/sin for position IDs shaped [3, B, S], [B, S, 3], or [B, S]."""
+        freqs = self._compute_interleaved_freqs(position_ids)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class OneDRotaryEmbedding(torch.nn.Module):
@@ -188,9 +299,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.theta_rescale_factor = [theta_rescale_factor[0]] * self.ndim
         else:
             self.theta_rescale_factor = theta_rescale_factor
-        assert (
-            len(self.theta_rescale_factor) == self.ndim
-        ), "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        assert len(self.theta_rescale_factor) == self.ndim, (
+            "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        )
 
         if isinstance(interpolation_factor, (int, float)):
             self.interpolation_factor = [interpolation_factor] * self.ndim
@@ -198,9 +309,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.interpolation_factor = [interpolation_factor[0]] * self.ndim
         else:
             self.interpolation_factor = interpolation_factor
-        assert (
-            len(self.interpolation_factor) == self.ndim
-        ), "len(interpolation_factor) should equal to len(rope_dim_list)"
+        assert len(self.interpolation_factor) == self.ndim, (
+            "len(interpolation_factor) should equal to len(rope_dim_list)"
+        )
 
         self.rope_generators: list[OneDRotaryEmbedding] = torch.nn.ModuleList()
         _config_to_gen_idx: dict[tuple, int] = {}
@@ -255,6 +366,26 @@ class NDRotaryEmbedding(torch.nn.Module):
         device = torch.device(device_str)
         positions = torch.tensor(pos_tuple, dtype=torch.long, device=device)
         return self.forward_uncached(pos=positions)
+
+    def forward_3d_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed a contiguous shard of a flattened (time, height, width) grid."""
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start, token_start + local_len, device=device, dtype=torch.long
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.forward_uncached(positions)
 
     def forward_uncached(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -390,3 +521,27 @@ class NDRotaryEmbedding(torch.nn.Module):
             col_offset += dim_i_half
 
         return cos.float(), sin.float()
+
+
+class FluxPosEmbed(torch.nn.Module):
+    """uncached FLUX-family RoPE with contiguous float32 outputs"""
+
+    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
+    def __init__(self, theta: int, axes_dim: list[int]):
+        super().__init__()
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=axes_dim,
+            rope_theta=theta,
+            use_real=False,
+            repeat_interleave_real=False,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
+
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = ids.float()
+        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
+        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()

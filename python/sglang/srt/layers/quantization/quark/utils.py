@@ -2,18 +2,28 @@
 
 import re
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Optional
+
+
+@dataclass
+class Nvfp4SourceConfig:
+    """Dispatch marker for online NVFP4 -> MXFP4 re-quantization, carried on
+    `QuarkConfig.dequantization_config` to represent an NVFP4 source
+    Only ModelOpt / AMD Quark NVFP4 (per-tensor `weight_scale_2`
+    that multiplies the per-block scale) is supported."""
+
 
 import torch
 
 try:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
-except ImportError as err:
+except ImportError:
 
     def raise_aiter_import_error(*args, **kwargs):
         raise ImportError(
-            "Failed to import aiter. " "Make sure AITER is installed and accessible."
+            "Failed to import aiter. Make sure AITER is installed and accessible."
         )
 
     dynamic_mxfp4_quant = raise_aiter_import_error
@@ -45,6 +55,19 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # a fused module can be excluded under its fused name, so match it before expanding
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
+    # excludes may name experts individually, so an excluded expert excludes the module
+    if layer_name.endswith(".experts"):
+        expert_prefix = layer_name + "."
+        if any(
+            isinstance(target, str) and target.startswith(expert_prefix)
+            for target in ignore
+        ):
+            return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
@@ -72,17 +95,14 @@ def should_ignore_layer(
             # If shard_idx=1+ confirm scheme matches prior shards.
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
-                    f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"Found different quantization schemes for "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
 
-    # Unfused layers like down_proj and o_proj will match
-    # the safetensors checkpoint already.
+    # an unfused name was already tried by the direct check above
     else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=layer_name, targets=ignore
-        )
+        should_ignore_layer = False
 
     assert should_ignore_layer is not None
 
@@ -161,16 +181,12 @@ def mxfp4_to_f32(x, is_3d):
 
 
 def e8m0_to_f32(x):
-    # Convert the input tensor `x` (assumed to be in e8m0 format) to float32.
-    # e8m0 is a custom 8-bit floating point format with 8 bits for exponent, 0 for mantissa.
-    # This means the value is essentially 2^(exponent - 127), similar to how IEEE-754 stores floats.
-
-    # Convert x to float32 for computation, and compute the power of 2 by subtracting the bias (127).
+    # Per OCP MX-format v1.0: encoded 0..254 -> 2^(x-127); encoded 255 -> NaN.
+    # Detect the sentinel on the raw integer encoding, not on the float result
+    # (in float32, 2^128 overflows to +inf, so the old `x_f32 == 128` predicate
+    # both missed x=255 and wrongly NaN'd legitimate scale 128.0 at x=134).
     x_f32 = 2 ** ((x.to(torch.float32)) - 127)
-
-    # If the exponent value was 255 (i.e., 2^(128)), this is a special case usually used to represent NaN or Inf.
-    # Since this custom format has no mantissa, treat 2^128 as NaN.
-    x_f32[x_f32 == 128] = float("nan")
+    x_f32[x == 255] = float("nan")
     return x_f32
 
 
@@ -210,5 +226,9 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_vc, w_s_vc = b_dynamic_mxfp4_quant(w_vc)
             w_s_kc = w_s_kc.transpose(1, 2).contiguous().transpose(1, 2)
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
+        else:
+            raise ValueError(
+                f"Unexpected w.dtype: {w.dtype} (should be bfloat16 or uint8)"
+            )
 
         return w_kc, w_s_kc, w_vc, w_s_vc

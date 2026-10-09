@@ -7,9 +7,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
-    _is_transformer_layer,
-)
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 
 FLUX_2_SYSTEM_MESSAGE = (
     "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object\n"
@@ -40,9 +38,7 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
             ("qkv_proj", "v_proj", "v"),
         ]
     )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
 
     def __post_init__(self) -> None:
         self.tokenizer_kwargs = {

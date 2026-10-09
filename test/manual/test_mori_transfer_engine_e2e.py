@@ -130,7 +130,7 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_generate_smoke(self):
+    def test_generate_basic(self):
         resp = requests.post(
             self.lb_url + "/generate",
             json={
@@ -273,7 +273,7 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_generate_smoke_tp_mismatch(self):
+    def test_generate_with_tp_mismatch(self):
         resp = requests.post(
             self.lb_url + "/generate",
             json={

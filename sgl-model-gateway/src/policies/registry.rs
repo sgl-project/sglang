@@ -369,6 +369,31 @@ impl PolicyRegistry {
         }
     }
 
+    /// Remove a PD worker from the matching pool's cache-aware policy (lock-free).
+    ///
+    /// `prefill_policy` and `decode_policy` are separate `CacheAwarePolicy` instances
+    /// from `model_policies`, so the regular `remove_worker_from_cache_aware` does not
+    /// touch them. This dispatches to the right pool based on `worker.worker_type()`.
+    pub fn remove_pd_worker_from_cache_aware(&self, worker: &dyn Worker) {
+        let policy = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => self.prefill_policy.get(),
+            crate::core::WorkerType::Decode => self.decode_policy.get(),
+            crate::core::WorkerType::Regular => return,
+        };
+        if let Some(policy) = policy {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.remove_worker(worker);
+                    debug!(
+                        "Removed PD worker {} ({}) from cache-aware policy",
+                        worker.url(),
+                        worker.worker_type()
+                    );
+                }
+            }
+        }
+    }
+
     /// Initialize bucket policies for PD mode - lock-free
     pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Initialize prefill policy if it's bucket (lock-free via OnceLock::get)

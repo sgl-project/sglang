@@ -1,4 +1,4 @@
-"""Test for ComfyUIFluxPipeline with pass-through scheduler."""
+"""Test for FluxPipeline with pass-through scheduler."""
 
 import os
 import sys
@@ -6,13 +6,16 @@ import sys
 import pytest
 import torch
 
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.test.passthrough import (
+    check_passthrough_output,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_flux_pipeline_direct() -> None:
-    """Test ComfyUIFluxPipeline with custom inputs."""
+    """Test FluxPipeline with custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_FLUX_MODEL_PATH",
         "black-forest-labs/FLUX.1-dev",  # Supports both safetensors file and diffusers format
@@ -20,7 +23,8 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIFluxPipeline",
+        model_id="FLUX.1-dev",
+        pipeline_class_name="FluxPipeline",
         num_gpus=2,
         comfyui_mode=True,
     )
@@ -68,6 +72,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
         width=width,
         num_frames=1,
         num_inference_steps=1,
+        guidance_scale=1.0,
         save_output=True,
         return_trajectory_latents=True,
     )
@@ -82,14 +87,11 @@ def test_comfyui_flux_pipeline_direct() -> None:
     req.raw_latent_shape = torch.tensor(hidden_states.shape, dtype=torch.long)
 
     clip_dim = 768
-    dummy_clip_embedding = torch.zeros(
-        batch_size,
-        77,
-        clip_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
     req.prompt_embeds = [pooled_projections, encoder_hidden_states]
+    req.prompt_seq_lens = [
+        [int(pooled_projections.shape[0])],
+        [encoder_seq_len],
+    ]
 
     if req.guidance_scale > 1.0:
         dummy_neg_clip_embedding = torch.zeros(
@@ -110,11 +112,15 @@ def test_comfyui_flux_pipeline_direct() -> None:
             dummy_neg_clip_embedding,
             negative_encoder_hidden_states,
         ]
+        req.negative_prompt_seq_lens = [
+            [int(dummy_neg_clip_embedding.shape[0])],
+            [encoder_seq_len],
+        ]
     else:
         req.negative_prompt_embeds = None
 
     req.pooled_embeds = [pooled_projections]
-    req.neg_pooled_embeds = []
+    req.neg_pooled_embeds = [torch.zeros_like(pooled_projections)]
 
     if (
         req.guidance_scale > 1.0
@@ -137,25 +143,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
         ]
 
-    output_batch = generator._send_to_scheduler_and_wait_for_response([req])
-    noise_pred = output_batch.noise_pred
-
-    assert noise_pred is not None, "noise_pred should not be None in OutputBatch"
-    assert isinstance(noise_pred, torch.Tensor), "noise_pred should be a torch.Tensor"
-    assert (
-        noise_pred.device.type == "cuda"
-    ), f"noise_pred should be on cuda, got {noise_pred.device}"
-    assert (
-        noise_pred.dtype == torch.bfloat16
-    ), f"noise_pred should be bfloat16, got {noise_pred.dtype}"
-
-    print(f"✓ Successfully retrieved noise_pred from OutputBatch!")
-    print(f"  noise_pred shape: {noise_pred.shape}")
-    print(f"  noise_pred dtype: {noise_pred.dtype}")
-    print(f"  noise_pred device: {noise_pred.device}")
-
-    latents = output_batch.output if output_batch.output is not None else req.latents
-    assert latents is not None, "latents should not be None"
+    latents = check_passthrough_output(generator, req)
     print(f"latents.shape: {latents.shape}")
 
 

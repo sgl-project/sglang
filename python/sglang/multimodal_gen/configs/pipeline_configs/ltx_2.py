@@ -11,15 +11,26 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+    LTXVideoVAEConfig,
+    get_ltx_video_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+
+# Distilled 3-step stage-2 sigma schedule. Single source of truth shared by
+# LTX2TwoStagePipeline and the SANA-WM refiner stages (matches NVlabs
+# `inference_sana_wm.py` / the LTX-2 distilled refiner).
+STAGE_2_DISTILLED_SIGMA_VALUES: tuple[float, ...] = (0.909375, 0.725, 0.421875, 0.0)
 
 
 def pack_text_embeds(
@@ -128,6 +139,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
@@ -168,6 +181,10 @@ class LTX2PipelineConfig(PipelineConfig):
     generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
+    # Distilled checkpoints are trained against one fixed sigma schedule rather
+    # than a step count. When set, it replaces the derived schedule.
+    default_sigmas: tuple[float, ...] | None = None
+
     # Model architecture
     in_channels: int = 128
     out_channels: int = 128
@@ -176,8 +193,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     # Audio VAE configuration
     vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     @property
     def vae_scale_factor(self):
@@ -186,6 +204,13 @@ class LTX2PipelineConfig(PipelineConfig):
     @property
     def vae_temporal_compression(self):
         return self.vae_config.arch_config.temporal_compression_ratio
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+            auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
+        )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         """Return unpacked latent shape [B, C, F, H, W]."""
@@ -291,6 +316,9 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size,
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        # Deliberately left non-contiguous: both flattens are views, so this
+        # keeps the permuted strides. Normalising here would change which GEMM
+        # kernel runs and move bf16 output. The fp8 path makes its own copy.
         return latents
 
     def _infer_video_latent_frames_and_tokens_per_frame(
@@ -369,6 +397,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
+        batch.sp_video_has_padding = pad_frames > 0
         if pad_frames:
             pad_tokens = int(pad_frames) * int(tokens_per_frame)
             pad = torch.zeros(
@@ -418,6 +447,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_orig_num_frames = int(seq_len)
 
         pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        batch.sp_audio_has_padding = pad_frames > 0
         if pad_frames:
             pad = torch.zeros(
                 (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
@@ -537,36 +567,9 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-
-        scaling_factor = (
-            getattr(getattr(vae, "config", None), "scaling_factor", None)
-            or getattr(vae, "scaling_factor", None)
-            or getattr(self.vae_config.arch_config, "scaling_factor", None)
-            or 1.0
+        return get_ltx_video_decode_scale_and_shift(
+            device, dtype, vae, self.vae_config.arch_config
         )
-        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
-            scaling_factor = 1.0
-
-        if isinstance(latents_mean, torch.Tensor) and isinstance(
-            latents_std, torch.Tensor
-        ):
-            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            latents_std = latents_std.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-                1, 1, 1, 1, 1
-            )
-            return sf / latents_std, latents_mean
-
-        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-            1, 1, 1, 1, 1
-        )
-        return sf, None
 
     @staticmethod
     def _unpack_latents(
@@ -598,29 +601,6 @@ class LTX2PipelineConfig(PipelineConfig):
             .flatten(2, 3)
         )
         return latents
-
-    @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor,
-        latents_mean: torch.Tensor,
-        latents_std: torch.Tensor,
-        scaling_factor: float = 1.0,
-    ) -> torch.Tensor:
-        # Denormalize latents across the channel dimension [B, C, F, H, W]
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
-    ):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
 
     @staticmethod
     def _unpack_audio_latents(
@@ -696,5 +676,42 @@ class LTX2PipelineConfig(PipelineConfig):
 
 
 @dataclasses.dataclass
-class LTX2I2VPipelineConfig(LTX2PipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.TI2V
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""
+
+    # original-mode lora swaps invalidate post-warmup timing calibration
+    supports_auto_residency: bool = False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ltx_2 import (
+        LTX2SamplingParams,
+        LTX23HQSamplingParams,
+        LTX23SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX23PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
+        ],
+        pipeline_config_registry_entries={
+            "LTX2TwoStageHQPipeline": (LTX2PipelineConfig, LTX23HQSamplingParams),
+        },
+    )

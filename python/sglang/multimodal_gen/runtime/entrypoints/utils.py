@@ -8,73 +8,157 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import atexit
+import json
+import mmap
 import os
-import shutil
+import queue
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 import imageio
+import imageio_ffmpeg
 import numpy as np
 import torch
+from PIL import Image
 
 try:
     import scipy.io.wavfile as scipy_wavfile
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
-try:
-    import imageio_ffmpeg as _imageio_ffmpeg
-except ImportError:  # pragma: no cover
-    _imageio_ffmpeg = None
-
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs as expand_request_outputs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    normalize_output_seeds as normalize_output_seeds,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
 
-
-@dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0
+_MAX_CACHED_CUDA_VIDEO_BUFFER_BYTES = 1024 * 1024 * 1024
+_MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES = 128 * 1024 * 1024
+_MAX_PARALLEL_CUDA_VIDEO_SAVES = 2
+_cuda_video_buffer_cache_lock = threading.Lock()
+_cached_cuda_video_buffer: "_CudaMemfdVideoBuffer | None" = None
 
 
-@dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"
-    strength: float = 1.0
+class _CudaMemfdVideoBuffer:
+    """CUDA-registered memfd mapping that stages raw frames for ffmpeg."""
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+        self.nbytes = int(np.prod(shape, dtype=np.int64))
+        self.fd = -1
+        self.mapping: mmap.mmap | None = None
+        self.array: np.ndarray | None = None
+        self.tensor: torch.Tensor | None = None
+        self._registered = False
+
+        try:
+            self.fd = os.memfd_create(
+                "sglang-video-frames",
+                flags=getattr(os, "MFD_CLOEXEC", 0),
+            )
+            os.ftruncate(self.fd, self.nbytes)
+            self.mapping = mmap.mmap(
+                self.fd,
+                self.nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+            self.array = np.ndarray(shape, dtype=np.uint8, buffer=self.mapping)
+            error = torch.cuda.cudart().cudaHostRegister(
+                self.array.ctypes.data,
+                self.nbytes,
+                0,
+            )
+            if error != 0:
+                raise RuntimeError(f"cudaHostRegister failed: {error}")
+            self._registered = True
+            self.tensor = torch.from_numpy(self.array)
+            if not self.tensor.is_pinned():
+                raise RuntimeError("CUDA-registered memfd is not pinned")
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._registered and self.array is not None:
+            try:
+                torch.cuda.cudart().cudaHostUnregister(self.array.ctypes.data)
+            except Exception:
+                pass
+            self._registered = False
+        self.tensor = None
+        self.array = None
+        if self.mapping is not None:
+            self.mapping.close()
+            self.mapping = None
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
 
 
-@dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"
+@contextmanager
+def _acquire_cuda_video_buffer(shape: tuple[int, ...]):
+    global _cached_cuda_video_buffer
+
+    buffer = None
+    stale_buffer = None
+    with _cuda_video_buffer_cache_lock:
+        if _cached_cuda_video_buffer is not None:
+            if _cached_cuda_video_buffer.shape == shape:
+                buffer = _cached_cuda_video_buffer
+            else:
+                stale_buffer = _cached_cuda_video_buffer
+            _cached_cuda_video_buffer = None
+
+    if stale_buffer is not None:
+        stale_buffer.close()
+
+    if buffer is None:
+        buffer = _CudaMemfdVideoBuffer(shape)
+
+    try:
+        yield buffer
+    finally:
+        with _cuda_video_buffer_cache_lock:
+            if (
+                buffer.nbytes <= _MAX_CACHED_CUDA_VIDEO_BUFFER_BYTES
+                and _cached_cuda_video_buffer is None
+            ):
+                _cached_cuda_video_buffer = buffer
+                buffer = None
+        if buffer is not None:
+            buffer.close()
 
 
-@dataclass
-class ListLorasReq:
-    pass
+def _close_cached_cuda_video_buffer() -> None:
+    global _cached_cuda_video_buffer
+
+    with _cuda_video_buffer_cache_lock:
+        buffer = _cached_cuda_video_buffer
+        _cached_cuda_video_buffer = None
+    if buffer is not None:
+        buffer.close()
 
 
-@dataclass
-class ShutdownReq:
-    pass
-
-
-@dataclass
-class GetDisaggStatsReq:
-    """Request to get disagg pipeline metrics from the scheduler."""
-
-    pass
+atexit.register(_close_cached_cuda_video_buffer)
 
 
 def format_lora_message(
@@ -109,6 +193,7 @@ class GenerationResult:
     samples: Any = None
     frames: Any = None
     audio: Any = None
+    action: Any = None  # [T, raw_action_dim] predicted action (policy/inverse_dynamics)
     prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0
@@ -120,6 +205,39 @@ class GenerationResult:
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
+
+
+@dataclass
+class MaterializedOutput:
+    sample: Any
+    frames: list[Any]
+    audio: Any = None
+    fps: int = 0
+
+
+@dataclass(frozen=True)
+class RequestOutput:
+    """Map one final sample to its request, metrics and output filename."""
+
+    request: Req
+    request_index: int
+    sample_index: int
+    sample_count: int
+
+    def output_file_path(self):
+        return self.request.output_file_path(self.sample_count, self.sample_index)
+
+
+def map_request_outputs(requests: list[Req]) -> list[RequestOutput]:
+    outputs = []
+    for request_index, req in enumerate(requests):
+        count = req.sampling_params.num_samples_per_request
+        if count < 1:
+            raise ValueError(f"num_samples_per_request must be positive, got {count}")
+        outputs.extend(
+            RequestOutput(req, request_index, index, count) for index in range(count)
+        )
+    return outputs
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
@@ -177,25 +295,493 @@ def _pick_audio_sample_rate(
 
 
 def _resolve_ffmpeg_exe() -> str:
-    ffmpeg_exe = "ffmpeg"
-    ffmpeg_on_path = shutil.which("ffmpeg")
-    if ffmpeg_on_path:
-        ffmpeg_exe = ffmpeg_on_path
-    try:
-        if _imageio_ffmpeg is not None:
-            ffmpeg_exe = _imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
+    # keep the pinned encoder binary: x264 upgrades change lossy video pixels
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
-    ffmpeg_ok = False
-    if ffmpeg_exe:
-        if os.path.isabs(ffmpeg_exe):
-            ffmpeg_ok = os.path.exists(ffmpeg_exe)
-        else:
-            ffmpeg_ok = shutil.which(ffmpeg_exe) is not None
-    if not ffmpeg_ok:
-        raise RuntimeError("ffmpeg not found")
-    return ffmpeg_exe
+
+# ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
+# both quicker and measurably closer to the frames the model produced.
+X264_PRESET = "fast"
+
+
+def _x264_auto_thread_count(height: int) -> int:
+    """Match x264's auto frame-thread count for progressive video."""
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpu_count = os.cpu_count() or 1
+    cpu_limit = max(1, cpu_count * 3 // 2)
+    macroblock_rows = max(1, (height + 15) // 16)
+    row_limit = max(1, macroblock_rows // 2)
+    return min(cpu_limit, row_limit, 128)
+
+
+def _conversion_chunk_frames(
+    num_frames: int, height: int, width: int, element_size: int
+) -> int:
+    temporary_bytes_per_frame = 3 * height * width * (element_size + 2)
+    return min(
+        num_frames,
+        max(1, _MAX_CUDA_VIDEO_CONVERSION_CHUNK_BYTES // temporary_bytes_per_frame),
+    )
+
+
+def _cuda_video_conversion_chunk_frames(video: torch.Tensor) -> int:
+    _, num_frames, height, width = video.shape
+    return _conversion_chunk_frames(num_frames, height, width, video.element_size())
+
+
+def _write_all(fd: int, data: memoryview) -> None:
+    while data:
+        data = data[os.write(fd, data) :]
+
+
+def _remove_quietly(path: Optional[str]) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _cuda_video_ffmpeg_command(
+    save_file_path: str,
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    crf: int,
+    x264_preset: Optional[str],
+    wav_path: Optional[str],
+) -> list[str]:
+    command = [
+        _resolve_ffmpeg_exe(),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{width}x{height}",
+        "-pix_fmt",
+        "rgb24",
+        "-r",
+        f"{fps:.02f}",
+        "-i",
+        "pipe:0",
+    ]
+    if wav_path is None:
+        command += ["-an"]
+    else:
+        command += ["-i", wav_path]
+    command += [
+        "-vcodec",
+        "libx264",
+        "-preset",
+        x264_preset or X264_PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(crf),
+    ]
+
+    macro_block_size = 16
+    if width % macro_block_size or height % macro_block_size:
+        output_width = (
+            width
+            if width % macro_block_size == 0
+            else width + macro_block_size - width % macro_block_size
+        )
+        output_height = (
+            height
+            if height % macro_block_size == 0
+            else height + macro_block_size - height % macro_block_size
+        )
+        command += ["-vf", f"scale={output_width}:{output_height}"]
+
+    command += ["-threads", str(_x264_auto_thread_count(height))]
+    if wav_path is not None:
+        command += [
+            "-acodec",
+            "aac",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+        ]
+    command += ["-v", "warning", save_file_path]
+    return command
+
+
+class CudaVideoEncoder:
+    """Encode [3, T, H, W] CUDA frames in [0, 1] to an MP4 as they arrive.
+
+    ``write`` only queues the uint8 conversion on the current stream; a writer
+    thread stages each chunk in registered host memory and pipes it to ffmpeg,
+    so a caller that produces frames in pieces keeps its own GPU work going.
+    """
+
+    @classmethod
+    def open(
+        cls,
+        save_file_path: str,
+        *,
+        device: torch.device,
+        height: int,
+        width: int,
+        fps: int,
+        num_frames: int,
+        element_size: int = 4,
+        audio: Any = None,
+        audio_sample_rate: Optional[int] = None,
+        output_compression: Optional[int] = None,
+        x264_preset: Optional[str] = None,
+        max_queued_frames: int = 0,
+    ) -> "CudaVideoEncoder | None":
+        """Start ffmpeg, or return None when this output cannot use the path."""
+        if not hasattr(os, "memfd_create") or device.type != "cuda":
+            return None
+        if os.path.splitext(save_file_path)[1].lower() != ".mp4":
+            return None
+        quality = output_compression / 10 if output_compression is not None else 5
+        if not 1 <= quality <= 10:
+            return None
+        crf = int((1 - quality / 10.0) * 51)
+        audio_np = _normalize_audio_to_numpy(audio)
+        if audio_np is not None and scipy_wavfile is None:
+            return None
+
+        wav_path = None
+        try:
+            if audio_np is not None:
+                selected_sr = _pick_audio_sample_rate(
+                    audio_np=audio_np,
+                    audio_sample_rate=audio_sample_rate,
+                    fps=fps,
+                    num_frames=num_frames,
+                )
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    wav_path = f.name
+                scipy_wavfile.write(wav_path, selected_sr, audio_np)
+            command = _cuda_video_ffmpeg_command(
+                save_file_path,
+                width=width,
+                height=height,
+                fps=fps,
+                crf=crf,
+                x264_preset=x264_preset,
+                wav_path=wav_path,
+            )
+            chunk_frames = _conversion_chunk_frames(
+                max(1, num_frames), height, width, element_size
+            )
+            return cls(
+                command,
+                save_file_path,
+                device=device,
+                height=height,
+                width=width,
+                chunk_frames=chunk_frames,
+                queued_chunks=max(1, -(-max_queued_frames // chunk_frames)),
+                wav_path=wav_path,
+            )
+        except BaseException:
+            _remove_quietly(wav_path)
+            raise
+
+    def __init__(
+        self,
+        command: list[str],
+        save_file_path: str,
+        *,
+        device: torch.device,
+        height: int,
+        width: int,
+        chunk_frames: int,
+        queued_chunks: int,
+        wav_path: Optional[str],
+    ):
+        self.save_file_path = save_file_path
+        self._command = command
+        self._device = device
+        self._height = height
+        self._width = width
+        self._chunk_frames = chunk_frames
+        self._wav_path = wav_path
+        self._frames_queued = 0
+        self._error: BaseException | None = None
+        self._finished = False
+        self._queue: queue.Queue = queue.Queue(maxsize=queued_chunks)
+        self._stderr = tempfile.TemporaryFile()
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr,
+            )
+        except BaseException:
+            self._stderr.close()
+            raise
+        self._thread = threading.Thread(
+            target=self._pipe_frames, name="sglang-video-encoder", daemon=True
+        )
+        self._thread.start()
+
+    def write(self, frames: torch.Tensor) -> None:
+        """Queue [3, t, H, W] frames; raise once the encoder has failed."""
+        if frames.dim() == 3:
+            frames = frames.unsqueeze(1)
+        if (
+            frames.device != self._device
+            or int(frames.shape[0]) != 3
+            or tuple(frames.shape[2:]) != (self._height, self._width)
+        ):
+            raise ValueError(
+                f"expected [3, t, {self._height}, {self._width}] frames on "
+                f"{self._device}, got {tuple(frames.shape)} on {frames.device}"
+            )
+        stream = torch.cuda.current_stream(frames.device)
+        num_frames = int(frames.shape[1])
+        for start in range(0, num_frames, self._chunk_frames):
+            end = min(start + self._chunk_frames, num_frames)
+            first = self._frames_queued
+            with maybe_record_function(
+                f"VIDEO_CHUNK frames {first}-{first + end - start} convert"
+            ):
+                chunk = (frames[:, start:end] * 255).clamp_(0, 255).to(torch.uint8)
+                chunk = chunk.permute(1, 2, 3, 0).contiguous()
+                ready = torch.cuda.Event()
+                ready.record(stream)
+            self._put((chunk, ready))
+            self._frames_queued += end - start
+
+    def close(self) -> None:
+        """Finish the MP4; on failure clean up as ``abort`` does and raise."""
+        if self._finished:
+            return
+        try:
+            with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
+                self._stop_thread()
+                if self._error is not None:
+                    if self._process.poll():
+                        raise self._ffmpeg_error() from self._error
+                    raise RuntimeError("video encoder failed") from self._error
+                self._process.stdin.close()
+                if self._process.wait():
+                    raise self._ffmpeg_error()
+        except BaseException:
+            self.abort()
+            raise
+        self._finished = True
+        self._release()
+
+    def abort(self) -> None:
+        """Stop ffmpeg and remove the partial file."""
+        if self._finished:
+            return
+        self._finished = True
+        if self._process.poll() is None:
+            self._process.kill()
+        self._stop_thread()
+        try:
+            self._process.stdin.close()
+        except OSError:
+            pass
+        self._process.wait()
+        self._release()
+        _remove_quietly(self.save_file_path)
+
+    def _ffmpeg_error(self) -> subprocess.CalledProcessError:
+        self._stderr.seek(0)
+        return subprocess.CalledProcessError(
+            self._process.returncode, self._command, stderr=self._stderr.read()
+        )
+
+    def _put(self, item) -> None:
+        # never blocks for good: after a failure the writer keeps draining
+        if self._error is not None:
+            raise RuntimeError("video encoder failed") from self._error
+        self._queue.put(item)
+
+    def _stop_thread(self) -> None:
+        self._queue.put(None)
+        self._thread.join()
+
+    def _pipe_frames(self) -> None:
+        frame_bytes = self._height * self._width * 3
+        try:
+            stdin = self._process.stdin
+            if stdin is None:
+                raise RuntimeError("ffmpeg stdin pipe was not created")
+            with (
+                torch.cuda.device(self._device),
+                _acquire_cuda_video_buffer(
+                    (self._chunk_frames, self._height, self._width, 3)
+                ) as buffer,
+                memoryview(buffer.array).cast("B") as staged,
+            ):
+                assert buffer.tensor is not None
+                copy_stream = torch.cuda.Stream()
+                while (item := self._queue.get()) is not None:
+                    chunk, ready = item
+                    del item
+                    count = int(chunk.shape[0])
+                    copy_stream.wait_event(ready)
+                    with torch.cuda.stream(copy_stream):
+                        buffer.tensor[:count].copy_(chunk, non_blocking=True)
+                    copy_stream.synchronize()
+                    # the copy is done, so the allocator may hand this block out again
+                    del chunk, ready
+                    # write() copies into the pipe; sendfile would only lend it these
+                    # pages, and the next chunk overwrites them before ffmpeg reads
+                    _write_all(stdin.fileno(), staged[: count * frame_bytes])
+        except BaseException as exc:
+            self._error = exc
+            while self._queue.get() is not None:
+                pass
+
+    def _release(self) -> None:
+        self._stderr.close()
+        _remove_quietly(self._wav_path)
+        self._wav_path = None
+
+
+def _try_save_cuda_video_direct(
+    *,
+    save_file_path: str,
+    sample: Any,
+    fps: int,
+    audio_sample_rate: Optional[int],
+    output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
+) -> bool:
+    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    video, audio = _split_sample_audio(sample)
+    if not (
+        isinstance(video, torch.Tensor)
+        and video.device.type == "cuda"
+        and video.dim() in (3, 4)
+    ):
+        return False
+    if video.dim() == 3:
+        video = video.unsqueeze(1)
+    if video.shape[0] != 3:
+        return False
+
+    _, num_frames, height, width = video.shape
+    encoder = None
+    try:
+        encoder = CudaVideoEncoder.open(
+            save_file_path,
+            device=video.device,
+            height=height,
+            width=width,
+            fps=fps,
+            num_frames=num_frames,
+            element_size=video.element_size(),
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
+            x264_preset=x264_preset,
+        )
+        if encoder is None:
+            return False
+        encoder.write(video)
+        encoder.close()
+        return True
+    except Exception:
+        if encoder is not None:
+            encoder.abort()
+        logger.warning_once(
+            "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
+            "Enable debug logging for exception details."
+        )
+        logger.debug("Direct CUDA video save failure", exc_info=True)
+        return False
+
+
+def _try_save_cuda_videos_direct(
+    samples: Sequence[Any],
+    save_file_paths: Sequence[str],
+    *,
+    fps: int,
+    audio_sample_rate: Optional[int],
+    output_compression: Optional[int],
+    x264_preset: Optional[str] = None,
+) -> list[bool] | None:
+    """Save independent CUDA videos concurrently when memory permits."""
+    if len(samples) < 2 or len(samples) != len(save_file_paths):
+        return None
+
+    videos = []
+    for sample, save_file_path in zip(samples, save_file_paths):
+        video, _ = _split_sample_audio(sample)
+        if not (
+            isinstance(video, torch.Tensor)
+            and video.device.type == "cuda"
+            and video.dim() in (3, 4)
+            and int(video.shape[0]) == 3
+            and os.path.splitext(save_file_path)[1].lower() == ".mp4"
+        ):
+            return None
+        if video.dim() == 3:
+            video = video.unsqueeze(1)
+        if videos and video.device != videos[0].device:
+            return None
+        videos.append(video)
+
+    # Each direct save creates one multiply result and two uint8 layouts for a
+    # temporal chunk. Keep two such chunks below 25% of currently free device
+    # memory so postprocessing cannot turn a tight inference into an OOM.
+    temporary_bytes = sorted(
+        (
+            _cuda_video_conversion_chunk_frames(video)
+            * 3
+            * int(video.shape[-2])
+            * int(video.shape[-1])
+            * (int(video.element_size()) + 2)
+            for video in videos
+        ),
+        reverse=True,
+    )[:_MAX_PARALLEL_CUDA_VIDEO_SAVES]
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(videos[0].device)
+    except (RuntimeError, TypeError):
+        return None
+    if sum(temporary_bytes) > int(free_bytes) // 4:
+        return None
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available_cpus = os.cpu_count() or 1
+    encoder_threads = sorted(
+        (_x264_auto_thread_count(int(video.shape[-2])) for video in videos),
+        reverse=True,
+    )[:_MAX_PARALLEL_CUDA_VIDEO_SAVES]
+    if sum(encoder_threads) > available_cpus:
+        return None
+
+    def save_one(idx: int) -> bool:
+        return _try_save_cuda_video_direct(
+            save_file_path=save_file_paths[idx],
+            sample=samples[idx],
+            fps=fps,
+            audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
+            x264_preset=x264_preset,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_CUDA_VIDEO_SAVES) as pool:
+            return list(pool.map(save_one, range(len(samples))))
+    except Exception:
+        logger.warning_once(
+            "Parallel CUDA video save failed; falling back to serial output. "
+            "Enable debug logging for exception details."
+        )
+        logger.debug("Parallel CUDA video save failure", exc_info=True)
+        return None
 
 
 def _mux_audio_np_into_mp4(
@@ -286,6 +872,137 @@ def _maybe_mux_audio_into_mp4(
         )
 
 
+def _save_video_ffmpeg(
+    save_file_path: str,
+    frames: list,
+    *,
+    fps: int,
+    quality: float,
+    x264_preset: Optional[str] = None,
+    audio_path: Optional[str] = None,
+) -> None:
+    if not frames:
+        raise ValueError("video output requires at least one frame")
+    if not 1 <= quality <= 10:
+        raise ValueError("video quality must be between 1 and 10")
+    first_frame = np.asarray(frames[0])
+    height, width = first_frame.shape[:2]
+    channels = first_frame.shape[2] if first_frame.ndim == 3 else 1
+    pixel_format = {1: "gray", 3: "rgb24", 4: "rgba"}[channels]
+    command = [
+        _resolve_ffmpeg_exe(),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{width}x{height}",
+        "-pix_fmt",
+        pixel_format,
+        "-r",
+        f"{fps:.02f}",
+        "-i",
+        "pipe:0",
+    ]
+    if audio_path is None:
+        command += ["-an"]
+    else:
+        command += ["-i", audio_path, "-acodec", "aac"]
+    command += [
+        "-vcodec",
+        "libx264",
+        "-preset",
+        x264_preset or X264_PRESET,
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(int((1 - quality / 10.0) * 51)),
+    ]
+    if width % 16 or height % 16:
+        command += [
+            "-vf",
+            f"scale={(width + 15) // 16 * 16}:{(height + 15) // 16 * 16}",
+        ]
+    command += [save_file_path]
+    with tempfile.TemporaryFile() as stderr:
+        with subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+        ) as process:
+            try:
+                for frame in frames:
+                    frame = np.asarray(frame)
+                    if frame.shape != first_frame.shape or frame.dtype != np.uint8:
+                        raise ValueError(
+                            "video frames must have matching shapes and uint8 dtype"
+                        )
+                    process.stdin.write(memoryview(np.ascontiguousarray(frame)))
+            finally:
+                process.stdin.close()
+            if process.wait() != 0:
+                stderr.seek(0)
+                raise RuntimeError(
+                    f"ffmpeg video encoding failed: {stderr.read().decode(errors='replace')}"
+                )
+
+
+def _try_save_video_with_audio(
+    *,
+    save_file_path: str,
+    frames: list,
+    fps: int,
+    audio: Any,
+    audio_sample_rate: Optional[int],
+    quality: float,
+    x264_preset: Optional[str] = None,
+) -> bool:
+    """Encode video and audio in one ffmpeg pass when audio is available."""
+    audio_np = _normalize_audio_to_numpy(audio)
+    if audio_np is None:
+        return False
+
+    selected_sr = _pick_audio_sample_rate(
+        audio_np=audio_np,
+        audio_sample_rate=audio_sample_rate,
+        fps=fps,
+        num_frames=len(frames),
+    )
+    tmp_wav_path = None
+    try:
+        if scipy_wavfile is None:
+            raise RuntimeError(
+                "scipy is required to mux audio into mp4 (pip install scipy)"
+            )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav_path = f.name
+        scipy_wavfile.write(tmp_wav_path, selected_sr, audio_np)
+        _save_video_ffmpeg(
+            save_file_path,
+            frames,
+            fps=fps,
+            quality=quality,
+            audio_path=tmp_wav_path,
+            x264_preset=x264_preset,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "Failed to encode video and audio in one pass; "
+            "falling back to the compatible two-pass path: %s",
+            str(e),
+        )
+        return False
+    finally:
+        if tmp_wav_path:
+            try:
+                os.remove(tmp_wav_path)
+            except OSError:
+                pass
+
+
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
@@ -294,22 +1011,41 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
+    attention_backend_config = server_args.attention_backend_config or {}
+    vsa_sparsity = attention_backend_config.get(
+        "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+    )
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+        VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    if getattr(sampling_params, "max_sequence_length", None) is not None:
+        req.max_sequence_length = sampling_params.max_sequence_length
 
-    req.adjust_size(server_args)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
+        req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
-    if not isinstance(req.prompt, str):
-        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
+    action_prompt = (
+        req.data_type == DataType.ACTION
+        and isinstance(req.prompt, list)
+        and bool(req.prompt)
+        and all(isinstance(item, str) for item in req.prompt)
+    )
+    if not isinstance(req.prompt, str) and not action_prompt:
+        raise TypeError(
+            "`prompt` must be a string, or a non-empty list of strings for "
+            f"batched action requests, but got {type(req.prompt)}"
+        )
 
-    if (req.width is not None and req.width <= 0) or (
-        req.height is not None and req.height <= 0
+    req_width = getattr(req, "width", None)
+    req_height = getattr(req, "height", None)
+    if (req_width is not None and req_width <= 0) or (
+        req_height is not None and req_height <= 0
     ):
         raise ValueError(
-            f"Height and width must be positive, got height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req_height}, width={req_width}"
         )
 
     if server_args.enable_trace:
@@ -330,18 +1066,208 @@ def attach_audio_to_video_sample(
     output_idx: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
+    audio = select_output_audio(audio, output_idx)
     if audio is None:
         return sample
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
-    elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
-
-    if audio is not None and not (
-        isinstance(sample, (tuple, list)) and len(sample) == 2
-    ):
+    if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
         return (sample, audio)
     return sample
+
+
+def select_output_audio(audio: Any, output_idx: int) -> Any:
+    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+        return audio[output_idx] if audio.shape[0] > output_idx else None
+    if isinstance(audio, np.ndarray) and audio.ndim >= 2:
+        return audio[output_idx] if audio.shape[0] > output_idx else None
+    return audio
+
+
+def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
+    if isinstance(sample, (tuple, list)) and len(sample) == 2:
+        return sample[0], sample[1]
+    return sample, None
+
+
+def _sample_to_uint8_frames(sample: Any) -> list[Any]:
+    """return numpy frames in THCW format"""
+    if isinstance(sample, torch.Tensor):
+        # sample is raw tensor
+        if sample.dim() == 3:
+            sample = sample.unsqueeze(1)
+        sample = (sample * 255).clamp(0, 255).to(torch.uint8)
+        videos = sample.permute(1, 2, 3, 0).contiguous()
+        if videos.device.type == "cuda":
+            try:
+                host_videos = torch.empty(
+                    videos.shape,
+                    dtype=videos.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                videos = videos.cpu().numpy()
+            else:
+                host_videos.copy_(videos, non_blocking=True)
+                torch.cuda.current_stream(videos.device).synchronize()
+                videos = host_videos.numpy()
+        else:
+            videos = videos.cpu().numpy()
+        return list(videos)
+
+    if not isinstance(sample, np.ndarray):
+        raise TypeError(f"Unsupported sample type: {type(sample)}")
+
+    # sample is numpy frames
+    arr = sample
+    if arr.ndim == 3:
+        if arr.shape[-1] in (1, 3, 4):
+            arr = arr[None, ...]
+        else:
+            arr = arr[..., None]
+    if arr.ndim != 4:
+        raise ValueError(f"Unexpected numpy sample shape: {tuple(arr.shape)}")
+
+    if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
+        t = torch.from_numpy(arr)
+        if t.dim() == 3:
+            t = t.unsqueeze(1)
+        t = (t * 255).clamp(0, 255).to(torch.uint8)
+        videos = t.permute(1, 2, 3, 0).contiguous().cpu().numpy()
+        return list(videos)
+
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return list(arr)
+
+
+def materialize_output_sample(
+    sample: Any,
+    data_type: DataType,
+    fps: int,
+    *,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
+) -> MaterializedOutput:
+    """materialize samples, apply postprocessing if applicable"""
+    sample_without_audio, audio = _split_sample_audio(sample)
+    frames = _sample_to_uint8_frames(sample_without_audio)
+
+    # frames are uint8 numpy arrays in THWC format at this point
+    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_frames,
+        )
+
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=frame_interpolation_exp,
+            scale=frame_interpolation_scale,
+            model_path=frame_interpolation_model_path,
+        )
+        fps = fps * multiplier
+
+    if enable_upscaling and frames:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+        frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+        )
+
+    return MaterializedOutput(sample=sample, frames=frames, audio=audio, fps=fps)
+
+
+def save_materialized_output(
+    materialized: MaterializedOutput,
+    data_type: DataType,
+    save_file_path: Optional[str],
+    *,
+    save_output: bool = True,
+    audio_sample_rate: Optional[int] = None,
+    output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
+) -> None:
+    if not save_output:
+        return
+    if not save_file_path:
+        logger.info("No output path provided, output not saved")
+        return
+
+    os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+    if data_type == DataType.VIDEO:
+        quality = output_compression / 10 if output_compression is not None else 5
+        saved_with_audio = _try_save_video_with_audio(
+            save_file_path=save_file_path,
+            frames=materialized.frames,
+            fps=materialized.fps,
+            audio=materialized.audio,
+            audio_sample_rate=audio_sample_rate,
+            quality=quality,
+            x264_preset=x264_preset,
+        )
+        if not saved_with_audio:
+            _save_video_ffmpeg(
+                save_file_path,
+                materialized.frames,
+                fps=materialized.fps,
+                quality=quality,
+                x264_preset=x264_preset,
+            )
+
+            _maybe_mux_audio_into_mp4(
+                save_file_path=save_file_path,
+                audio=materialized.audio,
+                frames=materialized.frames,
+                fps=materialized.fps,
+                audio_sample_rate=audio_sample_rate,
+            )
+    else:
+        quality = output_compression if output_compression is not None else 75
+        if len(materialized.frames) > 1:
+            for i, image in enumerate(materialized.frames):
+                parts = save_file_path.rsplit(".", 1)
+                if len(parts) == 2:
+                    indexed_path = f"{parts[0]}_{i}.{parts[1]}"
+                else:
+                    indexed_path = f"{save_file_path}_{i}"
+                _save_image_frame(indexed_path, image, quality, output_compression)
+        else:
+            _save_image_frame(
+                save_file_path, materialized.frames[0], quality, output_compression
+            )
+    logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+
+
+def _save_image_frame(
+    path: str, frame: np.ndarray, quality: int | None, output_compression: int | None
+) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        compress_level = 1
+        if output_compression is not None and output_compression != 75:
+            compress_level = max(0, min(9, round(output_compression / 100 * 9)))
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
+    else:
+        imageio.imwrite(path, frame, quality=quality)
+
+
+def warm_image_writer() -> None:
+    """Run imageio's one-time plugin setup (~30 ms) before the first request saves."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_image_frame(
+                os.path.join(tmp, "warm.jpg"), np.zeros((8, 8, 3), np.uint8), 75, None
+            )
+    except Exception:
+        logger.debug("Image writer warmup failed", exc_info=True)
 
 
 def save_outputs(
@@ -357,6 +1283,7 @@ def save_outputs(
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
     output_compression: Optional[int] = None,
+    x264_preset: Optional[str] = None,
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
@@ -365,13 +1292,79 @@ def save_outputs(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
 ) -> list[str]:
-    """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
-    for idx, output in enumerate(outputs):
-        save_file_path = build_output_path(idx)
-        sample = output
+    samples = (
+        [
+            attach_audio_to_video_sample(sample, audio, idx)
+            for idx, sample in enumerate(outputs)
+        ]
+        if data_type == DataType.VIDEO
+        else outputs
+    )
+    save_file_paths = [build_output_path(idx) for idx in range(len(outputs))]
+    parallel_results = None
+    if (
+        data_type == DataType.VIDEO
+        and len(outputs) > 1
+        and save_output
+        and frames_out is None
+        and not enable_frame_interpolation
+        and not enable_upscaling
+    ):
+        for path in save_file_paths:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        parallel_results = _try_save_cuda_videos_direct(
+            samples,
+            save_file_paths,
+            fps=fps,
+            audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
+            x264_preset=x264_preset,
+        )
+
+    for idx, (sample, save_file_path) in enumerate(zip(samples, save_file_paths)):
+        if data_type == DataType.ACTION:
+            if samples_out is not None:
+                samples_out.append(sample)
+            if audios_out is not None:
+                audios_out.append(None)
+            if frames_out is not None:
+                frames_out.append([])
+            if save_output and save_file_path:
+                os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
+                with open(save_file_path, "w", encoding="utf-8") as f:
+                    json.dump(sample, f, ensure_ascii=False)
+                logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+            output_paths.append(save_file_path)
+            continue
+
         if data_type == DataType.VIDEO:
-            sample = attach_audio_to_video_sample(sample, audio, idx)
+            if (
+                save_output
+                and save_file_path
+                and frames_out is None
+                and not enable_frame_interpolation
+                and not enable_upscaling
+            ):
+                os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
+                direct_saved = parallel_results is not None and parallel_results[idx]
+                if not direct_saved:
+                    direct_saved = _try_save_cuda_video_direct(
+                        save_file_path=save_file_path,
+                        sample=sample,
+                        fps=fps,
+                        audio_sample_rate=audio_sample_rate,
+                        output_compression=output_compression,
+                        x264_preset=x264_preset,
+                    )
+                if direct_saved:
+                    if samples_out is not None:
+                        samples_out.append(sample)
+                    if audios_out is not None:
+                        audios_out.append(select_output_audio(audio, idx))
+                    output_paths.append(save_file_path)
+                    logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+                    continue
 
         frames = post_process_sample(
             sample,
@@ -381,6 +1374,7 @@ def save_outputs(
             save_file_path,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            x264_preset=x264_preset,
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
@@ -394,12 +1388,7 @@ def save_outputs(
             samples_out.append(sample)
         if audios_out is not None:
             if data_type == DataType.VIDEO:
-                audio_item = audio
-                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-                    audio_item = audio[idx] if audio.shape[0] > idx else None
-                elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-                    audio_item = audio[idx] if audio.shape[0] > idx else None
-                audios_out.append(audio_item)
+                audios_out.append(select_output_audio(audio, idx))
             else:
                 audios_out.append(audio)
         if frames_out is not None:
@@ -423,110 +1412,31 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
-):
-    """
-    Process sample output, optionally interpolate video frames, and save.
-    """
-    audio = None
-    if isinstance(sample, (tuple, list)) and len(sample) == 2:
-        sample, audio = sample
+    x264_preset: Optional[str] = None,
+) -> list[Any]:
+    """materialize frames and save outputs (optional)"""
+    if data_type == DataType.ACTION:
+        return []
 
-    # 1. Convert tensor / array to list of uint8 HWC frames
-    frames = None
-    if isinstance(sample, torch.Tensor):
-        if sample.dim() == 3:
-            sample = sample.unsqueeze(1)
-        sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-        videos = sample.permute(1, 2, 3, 0).cpu().numpy()
-        frames = list(videos)
-    else:
-        if not isinstance(sample, np.ndarray):
-            raise TypeError(f"Unsupported sample type: {type(sample)}")
-
-        arr = sample
-        if arr.ndim == 3:
-            if arr.shape[-1] in (1, 3, 4):
-                arr = arr[None, ...]
-            else:
-                arr = arr[..., None]
-        if arr.ndim != 4:
-            raise ValueError(f"Unexpected numpy sample shape: {tuple(arr.shape)}")
-
-        if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
-            t = torch.from_numpy(arr)
-            if t.dim() == 3:
-                t = t.unsqueeze(1)
-            t = (t * 255).clamp(0, 255).to(torch.uint8)
-            videos = t.permute(1, 2, 3, 0).cpu().numpy()
-            frames = list(videos)
-        else:
-            if arr.dtype != np.uint8:
-                arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-            frames = list(arr)
-
-    # 2. Frame interpolation (video only)
-    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
-        from sglang.multimodal_gen.runtime.postprocess import (
-            interpolate_video_frames,
-        )
-
-        frames, multiplier = interpolate_video_frames(
-            frames,
-            exp=frame_interpolation_exp,
-            scale=frame_interpolation_scale,
-            model_path=frame_interpolation_model_path,
-        )
-        fps = fps * multiplier
-
-    # 3. Upscaling (images and videos)
-    if enable_upscaling and frames:
-        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
-
-        frames = upscale_frames(
-            frames,
-            model_path=upscaling_model_path,
-            scale=upscaling_scale,
-        )
-
-    # 4. Save outputs if requested
-    if save_output:
-        if save_file_path:
-            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-            if data_type == DataType.VIDEO:
-                quality = (
-                    output_compression / 10 if output_compression is not None else 5
-                )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
-
-                _maybe_mux_audio_into_mp4(
-                    save_file_path=save_file_path,
-                    audio=audio,
-                    frames=frames,
-                    fps=fps,
-                    audio_sample_rate=audio_sample_rate,
-                )
-
-            else:
-                quality = output_compression if output_compression is not None else 75
-                if len(frames) > 1:
-                    for i, image in enumerate(frames):
-                        parts = save_file_path.rsplit(".", 1)
-                        if len(parts) == 2:
-                            indexed_path = f"{parts[0]}_{i}.{parts[1]}"
-                        else:
-                            indexed_path = f"{save_file_path}_{i}"
-                        imageio.imwrite(indexed_path, image, quality=quality)
-                else:
-                    imageio.imwrite(save_file_path, frames[0], quality=quality)
-            logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
-        else:
-            logger.info(f"No output path provided, output not saved")
-
-    return frames
+    materialized = materialize_output_sample(
+        sample,
+        data_type,
+        fps,
+        enable_frame_interpolation=enable_frame_interpolation,
+        frame_interpolation_exp=frame_interpolation_exp,
+        frame_interpolation_scale=frame_interpolation_scale,
+        frame_interpolation_model_path=frame_interpolation_model_path,
+        enable_upscaling=enable_upscaling,
+        upscaling_model_path=upscaling_model_path,
+        upscaling_scale=upscaling_scale,
+    )
+    save_materialized_output(
+        materialized,
+        data_type,
+        save_file_path,
+        save_output=save_output,
+        audio_sample_rate=audio_sample_rate,
+        output_compression=output_compression,
+        x264_preset=x264_preset,
+    )
+    return materialized.frames

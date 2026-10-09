@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
 from __future__ import annotations
 
@@ -7,8 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.awq import AWQConfig
@@ -22,6 +23,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -201,7 +203,6 @@ class MoeWNA16Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod()
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
-
             if self.linear_quant_method == "gptq":
                 if self.use_marlin:
                     return GPTQMarlinConfig.from_config(
@@ -224,6 +225,23 @@ class MoeWNA16Config(QuantizationConfig):
 
 def is_layer_skipped_quant(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
+
+
+def _local_expert_ids(layer, expert_id: int) -> List[int]:
+    """This rank's slots for checkpoint expert ``expert_id``, as the layer maps it.
+
+    The qzeros are written here rather than through the layer's weight loader,
+    so they need the same expert placement: EPLB's physical replicas, then the
+    expert-parallel slice this rank stores.
+    """
+    metadata = get_global_expert_location_metadata()
+    physical = (
+        [expert_id]
+        if metadata is None
+        else metadata.logical_to_all_physical(layer.layer_id, expert_id)
+    )
+    local = (layer._map_global_expert_id_to_local_expert_id(p) for p in physical)
+    return [i for i in local if 0 <= i < layer.num_local_experts]
 
 
 class MoeWNA16Method(FusedMoEMethodBase):
@@ -384,9 +402,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
@@ -452,8 +470,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
                 return
 
-            device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_group = get_parallel().tp_group
+            device = tp_group.device
+            # The qzeros are split into moe_tp_size shards, one per MoE-TP rank.
+            moe_tp_rank = layer.moe_tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 
@@ -493,15 +513,18 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if "w13_qzeros" in weight_name:
                 tensor = loaded_weight.view(
                     layer.moe_tp_size, -1, loaded_weight.size(1)
-                )[tp_rank]
-                if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
-                else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
+                )[moe_tp_rank]
+                for local_expert_id in _local_expert_ids(layer, expert_id):
+                    if shard_id == "w1":
+                        param.data[local_expert_id, : shard_size // 2] = tensor
+                    else:
+                        param.data[local_expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
+                tensor = loaded_weight.view(
                     loaded_weight.size(0), layer.moe_tp_size, -1
-                )[:, tp_rank]
+                )[:, moe_tp_rank]
+                for local_expert_id in _local_expert_ids(layer, expert_id):
+                    param.data[local_expert_id] = tensor
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 

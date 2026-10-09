@@ -6,14 +6,8 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
-def _is_blocks(n: str, m) -> bool:
-    return "blocks" in n and str.isdigit(n.split(".")[-1])
-
-
 @dataclass
 class MOVAVideoArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [_is_blocks])
-
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
@@ -55,9 +49,9 @@ class MOVAVideoArchConfig(DiTArchConfig):
         self.hidden_size = self.dim
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
-        assert (
-            not self.has_image_input
-        ), "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
+        assert not self.has_image_input, (
+            "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
+        )
 
 
 @dataclass

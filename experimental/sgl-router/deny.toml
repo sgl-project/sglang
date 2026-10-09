@@ -1,0 +1,41 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "warn"
+# Unmaintained advisories are checked for direct dependencies only. The
+# transitive ones we cannot fix from here (`paste` via tokenizers ->
+# dynamo-tokenizers, `number_prefix` via indicatif -> hf-hub, `backoff` and
+# `instant` via kube-runtime, `rustls-pemfile` via kube-client) pose no
+# security risk; revisit when the upstream crates drop them.
+unmaintained = "workspace"
+# `ignore` left empty — we want to be notified of new CVEs.
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    # Added per the initial license review:
+    "CDLA-Permissive-2.0",  # webpki-roots — Linux Foundation permissive license.
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies have no semver requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

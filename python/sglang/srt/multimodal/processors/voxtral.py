@@ -80,7 +80,7 @@ class VoxtralMultimodalProcessor(BaseMultimodalProcessor):
         # load_mm_data handles async loading, format detection, resampling.
         # process_and_combine_mm_data cannot be used: HF VoxtralProcessor.__call__
         # does not support audio (only apply_chat_template does).
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt_with_placeholders,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,

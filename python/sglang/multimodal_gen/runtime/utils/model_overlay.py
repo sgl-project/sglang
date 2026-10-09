@@ -17,6 +17,7 @@ from huggingface_hub.errors import (
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.utils import load_diffusion_overlay_registry_from_env
@@ -28,6 +29,29 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
+    },
+    "jdopensource/JoyAI-Echo": {
+        "overlay_repo_id": "Niehen6174/JoyAI-Echo-overlay",
+        "overlay_revision": "0a19f315c96532b7a5f61bcd765d1fefdd83dc7d",
+        # Last source commit with JoyAI-Echo-release.safetensors, which the
+        # overlay splits; the Echo 1.5 release (a7d585b1) removed it.
+        "source_revision": "4187f9a53c6eff3a76c51e79bd27f70d10f7591b",
+    },
+    "Efficient-Large-Model/SANA-WM_bidirectional": {
+        "overlay_repo_id": "sjmshsh/SANA-WM_bidirectional-overlay",
+        "overlay_revision": "e611beacbcc0cf33c676306ae0eb89f149e044ad",
+    },
+    "Efficient-Large-Model/SANA-WM_streaming": {
+        "overlay_repo_id": "AgainstEntropy/SANA-WM_streaming-overlay",
+        "overlay_revision": "62c6840871ecc3559189047513ba0670e1bf62e7",
+    },
+    "FastVideo/FastVideo-FastH3-8-Step-V2": {
+        "overlay_repo_id": "kevin-mi/FastH3-8step-V2-overlay",
+        "overlay_revision": "308e2dd627218c40ae759a93745429800771a625",
+    },
+    "OpenVDN/vdn-minimax-h3": {
+        "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
+        "overlay_revision": "7de18275dddfe59da36a234e222bcdd274963bc3",
     },
 }
 
@@ -42,6 +66,16 @@ MODEL_OVERLAY_METADATA_PATTERNS = [
     "**/*.py",
     "**/*.txt",
 ]
+
+_MATERIALIZED_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pth", ".pt")
+_MATERIALIZED_CONFIG_ONLY_COMPONENTS = {
+    "feature_extractor",
+    "image_processor",
+    "processor",
+    "scheduler",
+    "tokenizer",
+    "tokenizer_2",
+}
 
 _MODEL_OVERLAY_REGISTRY_CACHE: dict[str, dict[str, Any]] | None = None
 
@@ -84,9 +118,7 @@ def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
 
 
 def get_diffusion_cache_root() -> str:
-    return os.path.expanduser(
-        os.getenv("SGLANG_DIFFUSION_CACHE_ROOT", "~/.cache/sgl_diffusion")
-    )
+    return envs.SGLANG_DIFFUSION_CACHE_ROOT
 
 
 def clear_model_overlay_registry_cache() -> None:
@@ -150,8 +182,16 @@ def resolve_model_overlay_target(
     if os.path.exists(model_name_or_path):
         # Local source dirs do not have a repo id, so match them by basename.
         base_name = os.path.basename(os.path.normpath(model_name_or_path))
+        normalized_path = (
+            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/")
+        )
         for source_model_id, spec in registry.items():
             if base_name == source_model_id.rsplit("/", 1)[-1]:
+                return source_model_id, spec
+            cache_repo_fragment = (
+                f"models--{source_model_id.lower().replace('/', '--')}"
+            )
+            if cache_repo_fragment in normalized_path:
                 return source_model_id, spec
 
     return None
@@ -180,6 +220,52 @@ def load_model_index_from_dir(model_dir: str) -> dict[str, Any]:
     return config
 
 
+def _component_has_weight_file(component_dir: str) -> bool:
+    for root, _, file_names in os.walk(component_dir):
+        if any(
+            file_name.endswith(_MATERIALIZED_WEIGHT_SUFFIXES)
+            and os.path.isfile(os.path.join(root, file_name))
+            for file_name in file_names
+        ):
+            return True
+    return False
+
+
+def _materialized_overlay_has_component_weights(model_dir: str) -> bool:
+    model_index = load_model_index_from_dir(model_dir)
+    for component_name, entry in model_index.items():
+        if (
+            component_name.startswith("_")
+            or component_name == "pipeline_name"
+            or component_name in _MATERIALIZED_CONFIG_ONLY_COMPONENTS
+            or not isinstance(entry, list)
+        ):
+            continue
+        component_dir = os.path.join(model_dir, component_name)
+        if not os.path.isdir(component_dir) or not _component_has_weight_file(
+            component_dir
+        ):
+            logger.warning(
+                "Materialized overlay cache for %s is missing weights for component %s",
+                model_dir,
+                component_name,
+            )
+            return False
+    return True
+
+
+def _materialized_overlay_cache_complete(
+    final_dir: str,
+    marker_path: str,
+    verify_diffusers_model_complete_fn: Callable[[str], bool],
+) -> bool:
+    return (
+        verify_diffusers_model_complete_fn(final_dir)
+        and os.path.exists(marker_path)
+        and _materialized_overlay_has_component_weights(final_dir)
+    )
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -194,11 +280,19 @@ def _find_missing_required_paths(
     return missing
 
 
+# Smaller files are copied, not linked: materializers rewrite configs in place,
+# and a write through a link rewrites the Hugging Face cache blob behind it.
+_OVERLAY_LINK_MIN_BYTES = 64 * 1024 * 1024
+
+
 def _link_or_copy_file(src: str, dst: str) -> None:
     src = os.path.realpath(src)
     _ensure_dir(os.path.dirname(dst))
     if os.path.lexists(dst):
         os.remove(dst)
+    if os.path.getsize(src) < _OVERLAY_LINK_MIN_BYTES:
+        shutil.copy2(src, dst)
+        return
     try:
         os.link(src, dst)
         return
@@ -232,6 +326,7 @@ def ensure_overlay_source_dir_complete(
     allow_patterns: list[str] | None,
     download: bool,
     snapshot_download_fn: Callable[..., str],
+    revision: str | None = None,
 ) -> str:
     required_source_files = cast(
         list[str], list(manifest.get("required_source_files", []))
@@ -271,6 +366,7 @@ def ensure_overlay_source_dir_complete(
             local_dir=local_dir,
             max_workers=8,
             force_download=True,
+            revision=revision,
         )
     missing_after_redownload = _find_missing_required_paths(
         source_dir, required_source_files
@@ -333,6 +429,15 @@ def resolve_direct_overlay_repo(
         "overlay_revision": "main",
     }
     return overlay_spec, overlay_dir, manifest
+
+
+def _overlay_source_revision(
+    overlay_spec: dict[str, Any], manifest: dict[str, Any]
+) -> str | None:
+    # A registry entry pins the source repo the way it pins the overlay repo;
+    # the manifest field covers overlay repos that are loaded directly.
+    revision = overlay_spec.get("source_revision") or manifest.get("source_revision")
+    return str(revision) if revision else None
 
 
 def download_overlay_metadata(
@@ -454,6 +559,7 @@ def materialize_overlay_model(
     overlay_dir: str,
     source_dir: str,
     verify_diffusers_model_complete_fn: Callable[[str], bool],
+    source_revision: str | None = None,
 ) -> str:
     overlay_manifest_path = os.path.join(
         overlay_dir, "_overlay", "overlay_manifest.json"
@@ -470,32 +576,37 @@ def materialize_overlay_model(
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     overlay_revision = str(overlay_spec.get("overlay_revision", "main"))
     overlay_fingerprint = _compute_overlay_fingerprint(overlay_dir)
+    source_revision = source_revision or _overlay_source_revision(
+        overlay_spec, manifest
+    )
+    cache_identity = {
+        "source_model_id": source_model_id,
+        "overlay_repo_id": overlay_repo_id,
+        "overlay_revision": overlay_revision,
+        "materializer_version": materializer_version,
+        "overlay_fingerprint": overlay_fingerprint,
+    }
+    if source_revision is not None:
+        cache_identity["source_revision"] = source_revision
     cache_key = hashlib.sha256(
-        json.dumps(
-            {
-                "source_model_id": source_model_id,
-                "overlay_repo_id": overlay_repo_id,
-                "overlay_revision": overlay_revision,
-                "materializer_version": materializer_version,
-                "overlay_fingerprint": overlay_fingerprint,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
+        json.dumps(cache_identity, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
     cache_root = os.path.join(get_diffusion_cache_root(), "materialized_models")
     _ensure_dir(cache_root)
     safe_name = source_model_id.replace("/", "__")
     final_dir = os.path.join(cache_root, f"{safe_name}-{cache_key}")
     marker_path = os.path.join(final_dir, ".sglang_overlay_materialized.json")
-    if verify_diffusers_model_complete_fn(final_dir) and os.path.exists(marker_path):
+    if _materialized_overlay_cache_complete(
+        final_dir, marker_path, verify_diffusers_model_complete_fn
+    ):
         return final_dir
 
     lock_name = (
         f"overlay-materialize::{source_model_id}::{overlay_repo_id}::{overlay_revision}"
     )
     with get_lock(lock_name).acquire(poll_interval=2):
-        if verify_diffusers_model_complete_fn(final_dir) and os.path.exists(
-            marker_path
+        if _materialized_overlay_cache_complete(
+            final_dir, marker_path, verify_diffusers_model_complete_fn
         ):
             return final_dir
 
@@ -551,6 +662,7 @@ def materialize_overlay_model(
                 {
                     "source_model_id": source_model_id,
                     "source_dir": source_dir,
+                    "source_revision": source_revision,
                     "overlay_repo_id": overlay_repo_id,
                     "overlay_revision": overlay_revision,
                     "materializer_version": materializer_version,
@@ -577,7 +689,6 @@ def maybe_load_overlay_model_index(
         # A local overlay repo already contains the model_index we need.
         if load_overlay_manifest_if_present(model_name_or_path) is not None:
             return load_model_index_from_dir(model_name_or_path)
-        return None
 
     overlay_target = resolve_model_overlay_target(model_name_or_path)
     if overlay_target is not None:
@@ -633,6 +744,7 @@ def maybe_resolve_overlay_model_path(
         source_allow_patterns = cast(
             list[str] | None, manifest.get("source_allow_patterns")
         )
+        source_revision = _overlay_source_revision(overlay_spec, manifest)
         # For local source paths, reuse the directory directly instead of
         # round-tripping through snapshot_download.
         source_dir = (
@@ -644,6 +756,7 @@ def maybe_resolve_overlay_model_path(
                 download=download,
                 allow_patterns=source_allow_patterns or allow_patterns,
                 force_diffusers_model=False,
+                revision=source_revision,
                 skip_overlay_resolution=True,
             )
         )
@@ -655,6 +768,7 @@ def maybe_resolve_overlay_model_path(
             allow_patterns=allow_patterns,
             download=download,
             snapshot_download_fn=snapshot_download_fn,
+            revision=source_revision,
         )
         return materialize_overlay_model(
             source_model_id=source_model_id,
@@ -662,6 +776,7 @@ def maybe_resolve_overlay_model_path(
             overlay_dir=overlay_dir,
             source_dir=source_dir,
             verify_diffusers_model_complete_fn=verify_diffusers_model_complete_fn,
+            source_revision=source_revision,
         )
 
     direct_overlay = resolve_direct_overlay_repo(
@@ -677,12 +792,14 @@ def maybe_resolve_overlay_model_path(
     source_allow_patterns = cast(
         list[str] | None, manifest.get("source_allow_patterns")
     )
+    source_revision = _overlay_source_revision(overlay_spec, manifest)
     source_dir = base_model_download_fn(
         source_model_id,
         local_dir=local_dir,
         download=download,
         allow_patterns=source_allow_patterns or allow_patterns,
         force_diffusers_model=False,
+        revision=source_revision,
         skip_overlay_resolution=True,
     )
     source_dir = ensure_overlay_source_dir_complete(
@@ -693,6 +810,7 @@ def maybe_resolve_overlay_model_path(
         allow_patterns=allow_patterns,
         download=download,
         snapshot_download_fn=snapshot_download_fn,
+        revision=source_revision,
     )
     return materialize_overlay_model(
         source_model_id=source_model_id,
@@ -700,4 +818,5 @@ def maybe_resolve_overlay_model_path(
         overlay_dir=overlay_dir,
         source_dir=source_dir,
         verify_diffusers_model_complete_fn=verify_diffusers_model_complete_fn,
+        source_revision=source_revision,
     )

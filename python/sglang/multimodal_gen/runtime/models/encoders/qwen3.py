@@ -7,9 +7,8 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -21,10 +20,14 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+    load_llm_encoder_weights,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_attention_head_partition,
+)
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 
 
 class Qwen3MLP(nn.Module):
@@ -90,14 +93,10 @@ class Qwen3Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
 
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -131,8 +130,9 @@ class Qwen3Attention(nn.Module):
 
         # QK-Norm: Key difference from LLaMA
         rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        # Keep the small-hidden one-pass kernel used by diffusion QK norm.
+        self.q_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # Rotary embeddings
         self.rotary_emb = get_rope(
@@ -158,6 +158,7 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        attention_lengths: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         # QKV projection
         qkv, _ = self.qkv_proj(hidden_states)
@@ -185,12 +186,64 @@ class Qwen3Attention(nn.Module):
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         # Attention
-        attn_output = self.attn(q, k, v)
+        attn_output = self._masked_causal_attention(q, k, v, attention_lengths)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         # Output projection
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _masked_causal_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_lengths: tuple[int, ...] | None,
+    ) -> torch.Tensor:
+        if attention_lengths is None:
+            return self.attn(q, k, v)
+
+        seq_len = q.shape[1]
+        if all(valid_len == seq_len for valid_len in attention_lengths):
+            return self.attn(q, k, v)
+
+        outputs: list[torch.Tensor] = []
+        for batch_index, valid_len in enumerate(attention_lengths):
+            q_item = q[batch_index : batch_index + 1]
+            k_item = k[batch_index : batch_index + 1]
+            v_item = v[batch_index : batch_index + 1]
+
+            if valid_len == 0:
+                outputs.append(torch.zeros_like(q_item))
+                continue
+
+            real_output = self.attn(
+                q_item[:, :valid_len],
+                k_item[:, :valid_len],
+                v_item[:, :valid_len],
+            )
+            if valid_len == seq_len:
+                outputs.append(real_output)
+                continue
+
+            pad_q = q_item[:, valid_len:].transpose(1, 2)
+            real_k = k_item[:, :valid_len].transpose(1, 2)
+            real_v = v_item[:, :valid_len].transpose(1, 2)
+            if self.num_heads != self.num_kv_heads:
+                repeat_factor = self.num_heads // self.num_kv_heads
+                real_k = real_k.repeat_interleave(repeat_factor, dim=1)
+                real_v = real_v.repeat_interleave(repeat_factor, dim=1)
+            pad_output = torch.nn.functional.scaled_dot_product_attention(
+                pad_q,
+                real_k,
+                real_v,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scaling,
+            ).transpose(1, 2)
+            outputs.append(torch.cat([real_output, pad_output], dim=1))
+
+        return torch.cat(outputs, dim=0)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -241,6 +294,7 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        attention_lengths: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -249,7 +303,11 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            attention_lengths=attention_lengths,
+        )
 
         # MLP
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -266,6 +324,8 @@ class Qwen3ForCausalLM(TextEncoder):
     - QK-Norm for better training stability
     - FSDP sharding for CPU offload
     """
+
+    _aliases = ["Qwen3Model"]
 
     def __init__(self, config: Qwen3TextConfig) -> None:
         super().__init__(config)
@@ -331,9 +391,18 @@ class Qwen3ForCausalLM(TextEncoder):
         residual = None
 
         if position_ids is None:
-            position_ids = torch.arange(
-                0, hidden_states.shape[1], device=hidden_states.device
-            ).unsqueeze(0)
+            position_ids = (
+                torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
+                .unsqueeze(0)
+                .expand(hidden_states.shape[0], -1)
+            )
+
+        attention_lengths = None
+        if attention_mask is not None:
+            attention_lengths = tuple(
+                int(valid_len)
+                for valid_len in attention_mask.sum(dim=-1).detach().cpu().tolist()
+            )
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
 
@@ -344,7 +413,9 @@ class Qwen3ForCausalLM(TextEncoder):
                     if residual is None
                     else (hidden_states + residual,)
                 )
-            hidden_states, residual = layer(position_ids, hidden_states, residual)
+            hidden_states, residual = layer(
+                position_ids, hidden_states, residual, attention_lengths
+            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -359,64 +430,12 @@ class Qwen3ForCausalLM(TextEncoder):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with support for tensor parallelism and weight remapping."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Strip 'model.' prefix from HuggingFace Qwen3 weights
-            if name.startswith("model."):
-                name = name[6:]  # len("model.") == 6
-
-            # Skip rotary embedding weights
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            # Handle KV scale remapping
-            if "scale" in name:
-                kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
-                if kv_scale_name is None:
-                    continue
-                else:
-                    name = kv_scale_name
-
-            # Handle stacked params mapping (qkv_proj, gate_up_proj)
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-
-        return loaded_params
+        return load_llm_encoder_weights(
+            weights,
+            dict(self.named_parameters()),
+            self.config.arch_config.stacked_params_mapping,
+            strip_prefix="model.",
+        )
 
 
 EntryClass = Qwen3ForCausalLM

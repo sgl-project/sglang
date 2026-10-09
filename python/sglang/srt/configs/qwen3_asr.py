@@ -148,7 +148,6 @@ class Qwen3ASRConfig(PretrainedConfig):
     }
 
     def __init__(self, thinker_config=None, **kwargs):
-        super().__init__(**kwargs)
         if thinker_config is None:
             thinker_config = {}
             logger.info(
@@ -159,10 +158,11 @@ class Qwen3ASRConfig(PretrainedConfig):
             self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
         else:
             self.thinker_config = thinker_config
+        super().__init__(**kwargs)
 
     def get_text_config(self, decoder=False) -> PretrainedConfig:
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
+AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)

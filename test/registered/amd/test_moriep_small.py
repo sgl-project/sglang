@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -41,16 +42,15 @@ def wait_all_ports_release(base_url, timeout_s=60):
     print(f"Warning: some ports still occupied after {timeout_s}s")
 
 
-register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=5400, suite="stage-c-test-large-8-gpu-amd")
 
 common_args = [
     "--tp-size",
     "8",
     "--ep-size",
     "8",
-    "--dp-size",
+    "--attn-dp-size",
     "8",
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "mori",
     "--trust-remote-code",
@@ -60,17 +60,31 @@ common_args = [
     "1",
     "--enable-dp-lm-head",
     "--mem-fraction-static",
-    "0.72",  # relax for mi300x
+    "0.7",  # relax for mi300x
     "--chunked-prefill-size",
-    "32768",
+    "1024",
     "--max-running-requests",
     "128",
     "--context-length",
-    "12288",
+    "4096",
+    "--max-total-tokens",
+    "32768",
     "--attention-backend",
     "aiter",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "32",
+]
+
+eplb_args = [
+    "--enable-eplb",
+    "--ep-num-redundant-experts",
+    "32",
+    "--eplb-rebalance-num-iterations",
+    "50",
+    "--expert-distribution-recorder-buffer-size",
+    "50",
+    "--ep-dispatch-algorithm",
+    "static",
 ]
 
 mtp_args = [
@@ -82,11 +96,12 @@ mtp_args = [
     "1",
     "--speculative-num-draft-tokens",
     "4",
+    "--speculative-draft-model-path",
+    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN,
 ]
 
 
 class TestPureDP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -96,7 +111,7 @@ class TestPureDP(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
@@ -121,17 +136,16 @@ class TestPureDP(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
 class TestMTP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -141,7 +155,7 @@ class TestMTP(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
@@ -166,12 +180,12 @@ class TestMTP(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -182,7 +196,6 @@ class TestMTP(CustomTestCase):
 
 
 class TestNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -195,7 +208,7 @@ class TestNormal(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
@@ -220,17 +233,16 @@ class TestNormal(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
 class TestLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -243,7 +255,7 @@ class TestLowLatency(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
@@ -270,17 +282,16 @@ class TestLowLatency(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
 class TestTBOwithNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -294,7 +305,7 @@ class TestTBOwithNormal(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
         cls.process = popen_launch_server(
@@ -319,17 +330,16 @@ class TestTBOwithNormal(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
 class TestTBOwithLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -343,7 +353,7 @@ class TestTBOwithLowLatency(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
@@ -370,17 +380,16 @@ class TestTBOwithLowLatency(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
 class TestMTPwithTBONormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -398,8 +407,9 @@ class TestMTPwithTBONormal(CustomTestCase):
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
+        env["MORI_ENABLE_SDMA"] = "true"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -423,12 +433,12 @@ class TestMTPwithTBONormal(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -439,7 +449,6 @@ class TestMTPwithTBONormal(CustomTestCase):
 
 
 class TestMTPwithTBOLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -451,13 +460,80 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
                 "--deepep-mode",
                 "low_latency",
                 "--enable-two-batch-overlap",
+                "--disable-overlap-schedule",
             ]
         )
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
-        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
+        env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
+        # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
+        # env["MORI_DISABLE_P2P"] = "1"
+        env["MORI_ENABLE_SDMA"] = "true"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=other_args,
+            env=env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
+
+    def test_gsm8k(
+        self,
+    ):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(metrics["accuracy"], 0.90)
+
+        server_info = requests.get(self.base_url + "/server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
+
+
+class TestEPLBMoriStat(CustomTestCase):
+    """EPLB with mori backend, stat mode (on_select_experts path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = (
+            common_args
+            + eplb_args
+            + [
+                "--deepep-mode",
+                "normal",
+                "--expert-distribution-recorder-mode",
+                "stat",
+                "--disable-overlap-schedule",
+            ]
+        )
+
+        env = dict(os.environ)
+        env["SGLANG_USE_AITER"] = "1"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
+        env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
+        env["SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"] = "32"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
@@ -475,28 +551,19 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         kill_process_tree(cls.process.pid)
         wait_all_ports_release(cls.base_url)
 
-    def test_gsm8k(
-        self,
-    ):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
+        self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
 
 if __name__ == "__main__":

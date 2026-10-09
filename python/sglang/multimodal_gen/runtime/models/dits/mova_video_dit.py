@@ -14,6 +14,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
@@ -33,9 +34,14 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -80,33 +86,8 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
-def rope_apply_head_dim(x, freqs, head_dim):
-    x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    # print(f"{x_out.shape = }, {freqs.shape = }")
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
-class SelfAttention(nn.Module):
-    """
-    Self-Attention module for MOVA DiT with Sequence Parallelism support.
-
-    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
-    USPAttention internally handles the all-to-all communication for distributed attention.
-    Input x should already be the local shard [B, S_local, D] when SP is enabled.
-    """
+class _MOVAAttention(nn.Module):
+    """shared projections, normalization and TP head partitioning for MOVA"""
 
     def __init__(
         self,
@@ -143,6 +124,33 @@ class SelfAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
+
+class SelfAttention(_MOVAAttention):
+    """
+    Self-Attention module for MOVA DiT with Sequence Parallelism support.
+
+    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
+    USPAttention internally handles the all-to-all communication for distributed attention.
+    Input x should already be the local shard [B, S_local, D] when SP is enabled.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
+        super().__init__(dim, num_heads, eps, quant_config)
+
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+            complex_dtype=torch.float64,
+        )
+
         self.attn = USPAttention(
             # Local heads per TP rank.
             num_heads=self.num_heads_per_rank,
@@ -151,13 +159,14 @@ class SelfAttention(nn.Module):
             softmax_scale=None,
         )
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, attn_mask_meta=None):
         """
         Forward pass for self-attention.
 
         Args:
             x: Input tensor [B, S_local, D] - already sharded by SP when SP > 1
             freqs: RoPE frequencies [S_local, 1, head_dim] - should match x's sequence length
+            attn_mask_meta: sp_shard tail-pad meta; excludes SP padding from attention
 
         Returns:
             Output tensor [B, S_local, D]
@@ -178,24 +187,29 @@ class SelfAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
 
+        b, s, _ = q.shape
+        q = q.view(b, s, self.num_heads_per_rank, self.head_dim)
+        k = k.view(b, s, self.num_heads_per_rank, self.head_dim)
+        v = v.view(b, s, self.num_heads_per_rank, self.head_dim)
+
         # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
+        q, k = self.rotary_emb(
+            query=q,
+            key=k,
+            complex_freqs=freqs,
+        )
 
         # USPAttention expects [B, S_local, H, D] format
-        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-
-        # USPAttention handles SP communication internally
-        out = self.attn(q, k, v)
-        out = rearrange(out, "b s n d -> b s (n d)")
+        # USPAttention handles SP communication internally; the tail meta keeps
+        # SP padding out of the softmax.
+        out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
+        out = out.reshape(b, s, -1)
 
         out, _ = self.o(out)
         return out
 
 
-class CrossAttention(nn.Module):
+class CrossAttention(_MOVAAttention):
     """
     Cross-Attention module for MOVA DiT.
 
@@ -213,32 +227,7 @@ class CrossAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
     ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.tp_size = get_tp_world_size()
-        if self.num_heads % self.tp_size != 0:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})."
-            )
-        self.num_heads_per_rank = self.num_heads // self.tp_size
-
-        self.q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.o = RowParallelLinear(
-            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
-        )
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        super().__init__(dim, num_heads, eps, quant_config)
 
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
@@ -246,6 +235,7 @@ class CrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
+            is_cross_attention=True,
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
@@ -282,9 +272,6 @@ class CrossAttention(nn.Module):
 
 
 class MulAdd(nn.Module):
-    def __init__(self):
-        super().__init__()
-
     def forward(self, x, gate, residual):
         return residual + gate * x
 
@@ -324,7 +311,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, attn_mask_meta=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -345,7 +332,9 @@ class DiTBlock(nn.Module):
         # - layernorm(x) * (1 + scale_msa) + shift_msa
         input_x = self.norm1(x, shift_msa, scale_msa)
         # 2. torch.compile may fuse mlp_residual and self_attn_norm
-        x = self.mlp_residual(self.self_attn(input_x, freqs), gate_msa, x)
+        x = self.mlp_residual(
+            self.self_attn(input_x, freqs, attn_mask_meta=attn_mask_meta), gate_msa, x
+        )
         norm_x = self.self_attn_norm(x)
         # 3. Cross-attention, fuse:
         # - x = x + 1 * cross_output
@@ -401,9 +390,6 @@ class Conv3dLocalIsland(nn.Conv3d):
       but placements can be customized).
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     def forward(self, input):
         if isinstance(input, DTensor):
             # NOTE: DTensor typing stubs are incomplete; at runtime DTensor has
@@ -419,10 +405,44 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
-class WanModel(CachableDiT, OffloadableDiTMixin):
-    _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAVideoConfig()._compile_conditions
-    _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
+def initialize_mova_transformer_layers(model, config, quant_config):
+    """Create shared audio/video layers in checkpoint registration order."""
+    model.text_embedding = MLP(
+        config.text_dim,
+        config.dim,
+        output_dim=config.dim,
+        act_type="gelu_pytorch_tanh",
+        quant_config=quant_config,
+    )
+    model.time_embedding = MLP(
+        config.freq_dim,
+        config.dim,
+        output_dim=config.dim,
+        act_type="silu",
+        quant_config=quant_config,
+    )
+    # Preserve state_dict keys (time_projection.1.weight/bias).
+    model.time_projection = nn.Sequential(
+        nn.SiLU(),
+        ReplicatedLinear(config.dim, config.dim * 6, quant_config=quant_config),
+    )
+    model.blocks = nn.ModuleList(
+        [
+            DiTBlock(
+                config.dim,
+                config.num_heads,
+                config.ffn_dim,
+                config.eps,
+                quant_config=quant_config,
+            )
+            for _ in range(config.num_layers)
+        ]
+    )
+
+
+class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAVideoConfig().param_names_mapping
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping
@@ -438,15 +458,11 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         # Extract parameters from config
         dim = config.dim
         in_dim = config.in_dim
-        ffn_dim = config.ffn_dim
         out_dim = config.out_dim
-        text_dim = config.text_dim
         freq_dim = config.freq_dim
         eps = config.eps
         patch_size = config.patch_size
         num_heads = config.num_heads
-        num_layers = config.num_layers
-        has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
@@ -464,53 +480,18 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.patch_embedding = Conv3dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = MLP(
-            text_dim,
-            dim,
-            output_dim=dim,
-            act_type="gelu_pytorch_tanh",
-            quant_config=quant_config,
-        )
-        self.time_embedding = MLP(
-            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
-        )
-        # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(
-            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
-        )
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
-                for _ in range(num_layers)
-            ]
-        )
+        initialize_mova_transformer_layers(self, config, quant_config)
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
 
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
         self.hidden_size = dim
         self.num_attention_heads = num_heads
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients = []
-        self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = None
-        self.previous_resiual = None
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = False
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
     def _init_freqs(self):

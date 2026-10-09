@@ -4,7 +4,7 @@ This tool runs two SGLang diffusion variants with the same prompt and seed,
 captures intermediate denoising latents via `return_trajectory_latents`, and
 reports cosine / error metrics for each timestep plus final frame metrics.
 
-The intended use is quant validation on reduced deterministic smoke settings:
+The intended use is quant validation with reduced deterministic settings:
 - same prompt / seed / resolution / step count for both variants
 - BF16 reference on the base model
 - FP8 candidate via `--candidate-transformer-path` and/or component overrides

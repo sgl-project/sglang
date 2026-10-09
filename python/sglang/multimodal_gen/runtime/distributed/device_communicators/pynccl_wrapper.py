@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/pynccl_wrapper.py
 
 # This file is a pure Python wrapper for the NCCL library.
@@ -34,8 +35,8 @@ from typing import Any
 import torch
 from torch.distributed import ReduceOp
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import find_nccl_library
 
 logger = init_logger(__name__)
 
@@ -45,6 +46,34 @@ logger = init_logger(__name__)
 
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
+
+
+def _find_nccl_library() -> str:
+    """
+    We either use the library file specified by the `SGLANG_DIFFUSION_NCCL_SO_PATH`
+    environment variable, or we find the library file brought by PyTorch.
+    After importing `torch`, `libnccl.so.2`, `librccl.so.1` or `libmccl.so.2`
+    can be found by `ctypes` automatically.
+    """
+    so_file = envs.SGLANG_DIFFUSION_NCCL_SO_PATH
+
+    # manually load the nccl library
+    if so_file:
+        logger.info(
+            "Found nccl from environment variable SGLANG_DIFFUSION_NCCL_SO_PATH=%s",
+            so_file,
+        )
+    else:
+        if torch.version.cuda is not None:
+            so_file = "libnccl.so.2"
+        elif torch.version.hip is not None:
+            so_file = "librccl.so.1"
+        elif vars(torch.version).get("musa") is not None:
+            so_file = "libmccl.so.2"
+        else:
+            raise ValueError("NCCL only supports CUDA, ROCm and MUSA backends.")
+        logger.info("Found nccl from library %s", so_file)
+    return str(so_file)
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -255,6 +284,12 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # Batches the enclosed send/recv into one collective, which is what
+        # makes an all-to-all out of the pairwise primitives.
+        # ncclResult_t ncclGroupStart();
+        Function("ncclGroupStart", ncclResult_t, []),
+        # ncclResult_t ncclGroupEnd();
+        Function("ncclGroupEnd", ncclResult_t, []),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -267,7 +302,7 @@ class NCCLLibrary:
 
     def __init__(self, so_file: str | None = None):
 
-        so_file = so_file or find_nccl_library()
+        so_file = so_file or _find_nccl_library()
 
         try:
             if so_file not in NCCLLibrary.path_to_dict_mapping:
@@ -434,6 +469,12 @@ class NCCLLibrary:
                 sendbuff, recvbuff, count, datatype, root, comm, stream
             )
         )
+
+    def ncclGroupStart(self) -> None:
+        self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
+
+    def ncclGroupEnd(self) -> None:
+        self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))

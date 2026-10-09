@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -24,13 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import (
-    PixtralRotaryEmbedding,
+    PixtralVisionRotaryEmbedding,
 )
 from transformers.models.pixtral.modeling_pixtral import (
     generate_block_attention_mask as _get_pixtral_attention_mask,
-)
-from transformers.models.pixtral.modeling_pixtral import (
-    position_ids_in_meshgrid,
 )
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -45,6 +43,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
 USE_XFORMERS_OPS = False
@@ -72,6 +71,16 @@ class VisionEncoderArgs:
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        text_config = hf_config.text_config
+        if getattr(text_config, "model_type", "") != "deepseek_v3":
+            # The GQA text config builds the dense Mistral backbone.
+            return None
+        return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -94,10 +103,21 @@ class PixtralForConditionalGeneration(nn.Module):
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
-        self.language_model = MistralLarge3ForCausalLM(
-            config=self.config.text_config,
-            quant_config=kwargs.get("quant_config"),
-        )
+        # Choose language model based on text architecture:
+        # MLA text configs use DeepSeek V3 backbone (model_type="deepseek_v3"),
+        # GQA text configs use the standard Llama-style Mistral backbone.
+        text_config = self.config.text_config
+        is_mla = getattr(text_config, "model_type", "") == "deepseek_v3"
+        if is_mla:
+            self.language_model = MistralLarge3ForCausalLM(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
+        else:
+            self.language_model = MistralForCausalLMMistralFormat(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
 
         self.vision_encoder = VisionTransformer(self.vision_args)
 
@@ -115,7 +135,7 @@ class PixtralForConditionalGeneration(nn.Module):
             self.vision_args, dim=self.config.text_config.hidden_size
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -836,7 +856,7 @@ class PixtralHFVisionModel(nn.Module):
 
     DEFAULT_IMAGE_TOKEN_ID = 10
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
 
     def __init__(
@@ -881,7 +901,7 @@ class PixtralHFVisionModel(nn.Module):
             )
 
         # Initialize patch position embedding
-        self.patch_positional_embedding = PixtralRotaryEmbedding(config)
+        self.patch_positional_embedding = PixtralVisionRotaryEmbedding(config)
         self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
@@ -927,14 +947,10 @@ class PixtralHFVisionModel(nn.Module):
         embeds_1d = torch.cat([p.flatten(1).T for p in embeds_2d], dim=0)
         embeds_featurized = self.ln_pre(embeds_1d).unsqueeze(0)
 
-        # positional embeddings
-        position_ids = position_ids_in_meshgrid(
-            embeds_2d,
-            max_width=self.image_size // self.patch_size,
-        ).to(self.device)
+        # Axial rope indexes the (h, w) grid coordinates directly, so the ids are
+        # per-patch pairs rather than the flattened `h * max_width + w` offsets.
+        position_ids = position_meshgrid(embeds_2d).to(self.device)
 
-        # The original PixtralRotaryEmbedding expects 2D input but returns a tuple of tensors (cos, sin)
-        # These tensors are used by apply_rotary_pos_emb in the transformer blocks
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )

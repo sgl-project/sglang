@@ -7,7 +7,6 @@
 import argparse
 import contextlib
 import dataclasses
-import datetime
 import inspect
 import logging
 import os
@@ -15,15 +14,10 @@ import sys
 import time
 from contextlib import contextmanager
 from enum import Enum
-from functools import lru_cache, partial
+from functools import lru_cache
 from logging import Logger
 from types import MethodType
 from typing import Any, cast
-
-import sglang.multimodal_gen.envs as envs
-
-SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
-SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
 # color
 CYAN = "\033[1;36m"
@@ -31,45 +25,6 @@ RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RESET = "\033[0;0m"
-
-_FORMAT = (
-    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s: %(lineno)d] %(message)s"
-)
-
-# _FORMAT = "[%(asctime)s] %(message)s"
-_DATE_FORMAT = "%m-%d %H:%M:%S"
-
-DEFAULT_LOGGING_CONFIG = {
-    "formatters": {
-        "sgl_diffusion": {
-            "class": "sglang.multimodal_gen.runtime.utils.logging_utils.ColoredFormatter",
-            "datefmt": _DATE_FORMAT,
-            "format": _FORMAT,
-        },
-    },
-    "handlers": {
-        "sgl_diffusion": {
-            "class": "logging.StreamHandler",
-            "formatter": "sgl_diffusion",
-            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
-            "stream": "ext://sys.stdout",
-        },
-    },
-    "loggers": {
-        "sgl_diffusion": {
-            "handlers": ["sgl_diffusion"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-    "root": {
-        "handlers": ["sgl_diffusion"],
-        "level": "DEBUG",
-    },
-    "version": 1,
-    "disable_existing_loggers": False,
-}
 
 
 class ColoredFormatter(logging.Formatter):
@@ -100,16 +55,53 @@ class SortedHelpFormatter(argparse.HelpFormatter):
         super().add_arguments(actions)
 
 
-@lru_cache
-def _print_info_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.info(msg, stacklevel=2)
+# `logger.warning_once(msg, *args)` is bound as MethodType(_print_warning_once,
+# logger), so there is exactly ONE frame between the caller and logger.warning --
+# and stacklevel=2 is part of the observable contract, asserted literally by
+# test_diffusion_bcg_padding. Any helper in between pushes the record's filename
+# to this file and breaks that assertion, so the dedup cannot be an lru_cache on
+# a second function.
+#
+# It also cannot be an lru_cache on THIS function: keyed on the arguments it would
+# hold a strong reference to each one for the life of the process, and callers
+# here pass tensors. Hence a set of formatted text, which stores only strings.
+#
+# The args themselves are new: these helpers used to take the message alone, so a
+# caller that formatted lazily -- the way the standard contract implies -- raised
+# TypeError instead of logging, always on a branch too rare to have been seen.
+_logged_once: set[tuple[str, int, str]] = set()
 
 
-@lru_cache
-def _print_warning_once(logger: Logger, msg: str) -> None:
-    # Set the stacklevel to 2 to print the original caller's line info
-    logger.warning(msg, stacklevel=2)
+def _log_once_guard(logger: Logger, level: int, msg: str, *args: Any) -> str | None:
+    """The text to log, or None when this message has already been logged."""
+    text = msg % args if args else msg
+    key = (logger.name, level, text)
+    if key in _logged_once:
+        return None
+    _logged_once.add(key)
+    return text
+
+
+def _print_info_once(logger: Logger, msg: str, *args: Any) -> None:
+    text = _log_once_guard(logger, logging.INFO, msg, *args)
+    # stacklevel=2 is asserted literally by test_diffusion_bcg_padding, so it is
+    # contract rather than a tuning knob. It does NOT reach the caller: init_logger
+    # also patches `warning` into a forwarder to `logger.log`, adding a frame, so
+    # the record names this module. That was true before these helpers too.
+    if text is not None:
+        logger.info(text, stacklevel=2)
+
+
+def _print_warning_once(logger: Logger, msg: str, *args: Any) -> None:
+    text = _log_once_guard(logger, logging.WARNING, msg, *args)
+    if text is not None:
+        logger.warning(text, stacklevel=2)
+
+
+# These were lru_cache objects, so `.cache_clear()` was part of their surface and
+# a test resets the dedup through it.
+_print_info_once.cache_clear = _logged_once.clear
+_print_warning_once.cache_clear = _logged_once.clear
 
 
 def get_is_main_process():
@@ -167,19 +159,19 @@ class _SGLDiffusionLogger(Logger):
         `intel_extension_for_pytorch.utils._logger`.
     """
 
-    def info_once(self, msg: str) -> None:
+    def info_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`info`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_info_once(self, msg)
+        _print_info_once(self, msg, *args)
 
-    def warning_once(self, msg: str) -> None:
+    def warning_once(self, msg: str, *args: Any) -> None:
         """
         As :meth:`warning`, but subsequent calls with the same message
-        are silently dropped.
+        and args are silently dropped.
         """
-        _print_warning_once(self, msg)
+        _print_warning_once(self, msg, *args)
 
     def info(  # type: ignore[override]
         self,
@@ -385,82 +377,16 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
-def _trace_calls(log_path, root_dir, frame, event, arg=None):
-    if event in ["call", "return"]:
-        # Extract the filename, line number, function name, and the code object
-        filename = frame.f_code.co_filename
-        lineno = frame.f_lineno
-        func_name = frame.f_code.co_name
-        if not filename.startswith(root_dir):
-            # only log the functions in the sgl_diffusion root_dir
-            return
-        # Log every function call or return
-        try:
-            last_frame = frame.f_back
-            if last_frame is not None:
-                last_filename = last_frame.f_code.co_filename
-                last_lineno = last_frame.f_lineno
-                last_func_name = last_frame.f_code.co_name
-            else:
-                # initial frame
-                last_filename = ""
-                last_lineno = 0
-                last_func_name = ""
-            with open(log_path, "a") as f:
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                if event == "call":
-                    f.write(
-                        f"{ts} Call to"
-                        f" {func_name} in {filename}:{lineno}"
-                        f" from {last_func_name} in {last_filename}:"
-                        f"{last_lineno}\n"
-                    )
-                else:
-                    f.write(
-                        f"{ts} Return from"
-                        f" {func_name} in {filename}:{lineno}"
-                        f" to {last_func_name} in {last_filename}:"
-                        f"{last_lineno}\n"
-                    )
-        except NameError:
-            # modules are deleted during shutdown
-            pass
-    return partial(_trace_calls, log_path, root_dir)
-
-
-def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
-    """
-    Enable tracing of every function call in code under `root_dir`.
-    This is useful for debugging hangs or crashes.
-    `log_file_path` is the path to the log file.
-    `root_dir` is the root directory of the code to trace. If None, it is the
-    sgl_diffusion root directory.
-
-    Note that this call is thread-level, any threads calling this function
-    will have the trace enabled. Other threads will not be affected.
-    """
-    logger.warning(
-        "SGLANG_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
-        " function executed by Python. This will slow down the code. It "
-        "is suggested to be used for debugging hang or crashes only."
-    )
-    logger.info("Trace frame log is saved to %s", log_file_path)
-    if root_dir is None:
-        # by default, this is the sgl_diffusion root directory
-        root_dir = os.path.dirname(os.path.dirname(__file__))
-    sys.settrace(partial(_trace_calls, log_file_path, root_dir))
-
-
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     # Install access log path filter into LOGGING_CONFIG so it survives
@@ -517,6 +443,17 @@ class _UvicornAccessLogFilter(logging.Filter):
         return True
 
 
+class _PytreeEnumRegistrationFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            "is an Enum subclass and is now natively supported by torch.compile"
+            in message
+            and "Calling register_constant() on Enum subclasses is deprecated"
+            in message
+        )
+
+
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
@@ -539,17 +476,6 @@ def get_log_level() -> int:
     return root.level
 
 
-def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
-    original_levels = {}
-
-    for logger_name in loggers_to_suppress:
-        logger = logging.getLogger(logger_name)
-        original_levels[logger_name] = logger.level
-        logger.setLevel(level)
-
-    return original_levels
-
-
 def globally_suppress_loggers():
     # globally suppress some obsessive loggers
     target_names = [
@@ -562,11 +488,20 @@ def globally_suppress_loggers():
         "urllib3",
         "httpx",
         "httpcore",
+        "diffusers.quantizers.torchao.torchao_quantizer",
+        "transformers.processing_utils",
         "flash_attn.cute.cache_utils",
     ]
 
     for name in target_names:
         logging.getLogger(name).setLevel(logging.ERROR)
+
+    pytree_logger = logging.getLogger("torch.utils._pytree")
+    if not any(
+        isinstance(filter_, _PytreeEnumRegistrationFilter)
+        for filter_ in pytree_logger.filters
+    ):
+        pytree_logger.addFilter(_PytreeEnumRegistrationFilter())
 
 
 # source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60

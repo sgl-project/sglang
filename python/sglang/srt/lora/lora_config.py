@@ -42,6 +42,7 @@ class LoRAConfig:
         self.target_modules = self.hf_config["target_modules"]
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
+        self.use_dora = self.hf_config.get("use_dora", False)
 
         # Filter fake added tokens: tokens with ID < base_vocab_size are already
         # part of the base vocabulary and should not be treated as added tokens.
@@ -57,13 +58,6 @@ class LoRAConfig:
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
-
-        if self.lora_added_tokens_size > 0:
-            raise ValueError(
-                f"LoRA adapter has {self.lora_added_tokens_size} added tokens, "
-                f"but added tokens are not supported yet. "
-                f"Added tokens: {self.added_tokens_config}"
-            )
 
     @classmethod
     def from_dict(

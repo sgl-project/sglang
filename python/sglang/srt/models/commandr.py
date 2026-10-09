@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/commandr.py
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,10 +49,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -65,6 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
 
 
@@ -83,6 +84,7 @@ class LayerNorm(nn.Module):
     def __init__(self, param_shape=None, eps=1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(param_shape))
+        self.tp_rank = get_parallel().tp_rank if self.weight.dim() != 1 else 0
         self.variance_epsilon = eps
         set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
@@ -93,12 +95,11 @@ class LayerNorm(nn.Module):
         return hidden_states, residuals
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
         shard_dim = 0 if param.dim() != 1 else None
         param_data = param.data
         if shard_dim is not None:
             shard_size = param_data.shape[shard_dim]
-            start_idx = tp_rank * shard_size
+            start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -148,7 +149,7 @@ class CohereAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size

@@ -18,6 +18,7 @@
 """Inference-only GLM-4.1V model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
@@ -27,15 +28,15 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -57,7 +58,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -75,6 +76,18 @@ class Glm4vRMSNorm(RMSNorm):
         return x
 
 
+def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
+    return is_dp_attention_enabled() and not use_data_parallel
+
+
+def _glm4v_vision_parallel_group(use_data_parallel: bool) -> str:
+    if use_data_parallel:
+        return "replicated"
+    if glm4v_vision_reduces_over_attn_tp(use_data_parallel):
+        return "attn_tp"
+    return "tp"
+
+
 class Glm4vVisionMLP(nn.Module):
     def __init__(
         self,
@@ -86,18 +99,14 @@ class Glm4vVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -105,8 +114,10 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.act_fn = SiluAndMul()
 
@@ -146,6 +157,9 @@ class Glm4vVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm4vVisionMLP(
             dim,
@@ -161,6 +175,7 @@ class Glm4vVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -174,6 +189,7 @@ class Glm4vVisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -237,8 +253,7 @@ class Glm4vPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -253,8 +268,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -262,8 +276,10 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.extra_activation_func = nn.GELU()
 
@@ -521,6 +537,10 @@ class Glm4vVisionModel(nn.Module):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
 
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=self.device
+        )
+
         # x.shape: (s, b, d) where b=1 for vision processing
         # transformers
         x = x.unsqueeze(1)
@@ -530,6 +550,7 @@ class Glm4vVisionModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
             )
 
         # adapter
@@ -551,9 +572,9 @@ class Glm4vForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,
@@ -590,7 +611,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -663,7 +684,7 @@ class Glm4vForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 
         if not (

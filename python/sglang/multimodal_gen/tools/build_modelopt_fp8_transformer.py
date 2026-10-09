@@ -26,10 +26,9 @@ import gc
 import json
 import os
 import re
-import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -38,11 +37,14 @@ from safetensors.torch import load_file, save_file
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
+from sglang.multimodal_gen.tools.modelopt_checkpoint import (
+    load_config,
+    load_selected_tensors,
+    load_weight_map,
+    prepare_output_dir,
+    resolve_transformer_dir,
+)
 
-INDEX_FILENAMES = [
-    "model.safetensors.index.json",
-    "diffusion_pytorch_model.safetensors.index.json",
-]
 FP8_E4M3_MAXBOUND = 448.0
 DEFAULT_FLUX2_KEEP_BF16_PATTERNS = [
     r"^time_guidance_embed\.(timestep_embedder|guidance_embedder)\.linear_[12]$",
@@ -76,16 +78,137 @@ DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(ff|audio_ff)\.proj_(in|out)$",
 ]
-
-
-def _resolve_transformer_dir(path: str) -> str:
-    candidate = Path(path).expanduser().resolve()
-    if (candidate / "config.json").is_file():
-        return str(candidate)
-    transformer_dir = candidate / "transformer"
-    if (transformer_dir / "config.json").is_file():
-        return str(transformer_dir)
-    raise FileNotFoundError(f"Could not resolve a transformer directory from: {path}")
+DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS = [
+    r"^context_embedder\.",
+    r"^x_embedder\.proj$",
+    r"^time_text_embed\.(timestep_embedder|guidance_embedder|text_embedder)\.linear_[12]$",
+    r"^norm_out\.linear$",
+    r"^proj_out$",
+    r"^transformer_blocks\.\d+\.norm1\.linear$",
+    r"^transformer_blocks\.\d+\.norm1_context\.linear$",
+    r"^single_transformer_blocks\.\d+\.norm\.linear$",
+]
+HUNYUANVIDEO_RUNTIME_NAME_REPLACEMENTS = [
+    (
+        r"^context_embedder\.time_text_embed\.timestep_embedder\.linear_1$",
+        r"txt_in.t_embedder.mlp.fc_in",
+    ),
+    (
+        r"^context_embedder\.time_text_embed\.timestep_embedder\.linear_2$",
+        r"txt_in.t_embedder.mlp.fc_out",
+    ),
+    (r"^context_embedder\.proj_in$", r"txt_in.input_embedder"),
+    (
+        r"^context_embedder\.time_text_embed\.text_embedder\.linear_1$",
+        r"txt_in.c_embedder.fc_in",
+    ),
+    (
+        r"^context_embedder\.time_text_embed\.text_embedder\.linear_2$",
+        r"txt_in.c_embedder.fc_out",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.norm1$",
+        r"txt_in.refiner_blocks.\1.norm1",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.norm2$",
+        r"txt_in.refiner_blocks.\1.norm2",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.attn\.to_[qkv]$",
+        r"txt_in.refiner_blocks.\1.self_attn_qkv",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.attn\.to_out\.0$",
+        r"txt_in.refiner_blocks.\1.self_attn_proj",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.ff\.net\.0(?:\.proj)?$",
+        r"txt_in.refiner_blocks.\1.mlp.fc_in",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.ff\.net\.2(?:\.proj)?$",
+        r"txt_in.refiner_blocks.\1.mlp.fc_out",
+    ),
+    (
+        r"^context_embedder\.token_refiner\.refiner_blocks\.(\d+)\.norm_out\.linear$",
+        r"txt_in.refiner_blocks.\1.adaLN_modulation.linear",
+    ),
+    (r"^x_embedder\.proj$", r"img_in.proj"),
+    (r"^time_text_embed\.timestep_embedder\.linear_1$", r"time_in.mlp.fc_in"),
+    (r"^time_text_embed\.timestep_embedder\.linear_2$", r"time_in.mlp.fc_out"),
+    (r"^time_text_embed\.guidance_embedder\.linear_1$", r"guidance_in.mlp.fc_in"),
+    (r"^time_text_embed\.guidance_embedder\.linear_2$", r"guidance_in.mlp.fc_out"),
+    (r"^time_text_embed\.text_embedder\.linear_1$", r"vector_in.fc_in"),
+    (r"^time_text_embed\.text_embedder\.linear_2$", r"vector_in.fc_out"),
+    (r"^transformer_blocks\.(\d+)\.norm1\.linear$", r"double_blocks.\1.img_mod.linear"),
+    (
+        r"^transformer_blocks\.(\d+)\.norm1_context\.linear$",
+        r"double_blocks.\1.txt_mod.linear",
+    ),
+    (r"^transformer_blocks\.(\d+)\.attn\.norm_q$", r"double_blocks.\1.img_attn_q_norm"),
+    (r"^transformer_blocks\.(\d+)\.attn\.norm_k$", r"double_blocks.\1.img_attn_k_norm"),
+    (r"^transformer_blocks\.(\d+)\.attn\.to_[qkv]$", r"double_blocks.\1.img_attn_qkv"),
+    (
+        r"^transformer_blocks\.(\d+)\.attn\.add_[qkv]_proj$",
+        r"double_blocks.\1.txt_attn_qkv",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.attn\.to_out\.0$",
+        r"double_blocks.\1.img_attn_proj",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.attn\.to_add_out$",
+        r"double_blocks.\1.txt_attn_proj",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.attn\.norm_added_q$",
+        r"double_blocks.\1.txt_attn_q_norm",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.attn\.norm_added_k$",
+        r"double_blocks.\1.txt_attn_k_norm",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.ff\.net\.0(?:\.proj)?$",
+        r"double_blocks.\1.img_mlp.fc_in",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.ff\.net\.2(?:\.proj)?$",
+        r"double_blocks.\1.img_mlp.fc_out",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.ff_context\.net\.0(?:\.proj)?$",
+        r"double_blocks.\1.txt_mlp.fc_in",
+    ),
+    (
+        r"^transformer_blocks\.(\d+)\.ff_context\.net\.2(?:\.proj)?$",
+        r"double_blocks.\1.txt_mlp.fc_out",
+    ),
+    (r"^single_transformer_blocks\.(\d+)\.attn\.norm_q$", r"single_blocks.\1.q_norm"),
+    (r"^single_transformer_blocks\.(\d+)\.attn\.norm_k$", r"single_blocks.\1.k_norm"),
+    (
+        r"^single_transformer_blocks\.(\d+)\.attn\.to_[qkv]$",
+        r"single_blocks.\1.linear1",
+    ),
+    (r"^single_transformer_blocks\.(\d+)\.proj_mlp$", r"single_blocks.\1.linear1"),
+    (r"^single_transformer_blocks\.(\d+)\.proj_out$", r"single_blocks.\1.linear2"),
+    (
+        r"^single_transformer_blocks\.(\d+)\.norm\.linear$",
+        r"single_blocks.\1.modulation.linear",
+    ),
+    (r"^norm_out\.linear$", r"final_layer.adaLN_modulation.linear"),
+    (r"^proj_out$", r"final_layer.linear"),
+]
+DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS = [
+    r"^img_in$",
+    r"^txt_in$",
+    r"^time_text_embed\.timestep_embedder\.linear_[12]$",
+    r"^norm_out\.linear$",
+    r"^proj_out$",
+    r"^transformer_blocks\.\d+\.img_mlp\.net\.2$",
+    r"^transformer_blocks\.\d+\.(img_mod|txt_mod)$",
+]
 
 
 def _resolve_backbone_ckpt(path: str) -> str:
@@ -96,53 +219,6 @@ def _resolve_backbone_ckpt(path: str) -> str:
     if backbone_path.is_file():
         return str(backbone_path)
     raise FileNotFoundError(f"Could not resolve backbone.pt from: {path}")
-
-
-def _find_index_file(model_dir: str) -> str | None:
-    for filename in INDEX_FILENAMES:
-        candidate = os.path.join(model_dir, filename)
-        if os.path.isfile(candidate):
-            return filename
-
-    matches = sorted(
-        filename
-        for filename in os.listdir(model_dir)
-        if filename.endswith(".safetensors.index.json")
-    )
-    return matches[0] if matches else None
-
-
-def _load_weight_map(model_dir: str) -> tuple[dict[str, str], str | None]:
-    index_filename = _find_index_file(model_dir)
-    if index_filename is not None:
-        with open(os.path.join(model_dir, index_filename), encoding="utf-8") as f:
-            index_data = json.load(f)
-        return dict(index_data["weight_map"]), index_filename
-
-    safetensors_files = sorted(
-        filename
-        for filename in os.listdir(model_dir)
-        if filename.endswith(".safetensors")
-    )
-    if len(safetensors_files) != 1:
-        raise ValueError(
-            f"Expected an index file or a single safetensors shard in {model_dir}, "
-            f"found {len(safetensors_files)} shard(s)."
-        )
-
-    shard_name = safetensors_files[0]
-    with safe_open(
-        os.path.join(model_dir, shard_name), framework="pt", device="cpu"
-    ) as f:
-        weight_map = {key: shard_name for key in f.keys()}
-    index_filename = f"{Path(shard_name).stem}.safetensors.index.json"
-    return weight_map, index_filename
-
-
-def _load_config(model_dir: str) -> dict:
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _load_first_shard_metadata(
@@ -157,7 +233,27 @@ def _load_first_shard_metadata(
         return dict(f.metadata() or {})
 
 
-def _module_name_variants(weight_name: str) -> list[str]:
+def _map_hunyuanvideo_runtime_module_name(module_name: str) -> list[str]:
+    mapped_names: list[str] = []
+    for pattern, replacement in HUNYUANVIDEO_RUNTIME_NAME_REPLACEMENTS:
+        mapped = re.sub(pattern, replacement, module_name)
+        if mapped != module_name:
+            mapped_names.append(mapped)
+    return mapped_names
+
+
+def _get_runtime_module_name_mapper(
+    *, model_type: str, class_name: str | None
+) -> Callable[[str], list[str]] | None:
+    if model_type == "hunyuan-video" or class_name == "HunyuanVideoTransformer3DModel":
+        return _map_hunyuanvideo_runtime_module_name
+    return None
+
+
+def _module_name_variants(
+    weight_name: str,
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
+) -> list[str]:
     module_name = weight_name[:-7] if weight_name.endswith(".weight") else weight_name
     variants = [module_name]
 
@@ -173,7 +269,13 @@ def _module_name_variants(weight_name: str) -> list[str]:
         canonicalized.append(
             re.sub(r"(\.audio_ff|\.ff)\.net\.2$", r"\1.proj_out", variant)
         )
+        canonicalized.append(re.sub(r"(\.(img_mod|txt_mod))\.1$", r"\1", variant))
     variants.extend(canonicalized)
+    if runtime_name_mapper is not None:
+        runtime_variants: list[str] = []
+        for variant in variants:
+            runtime_variants.extend(runtime_name_mapper(variant))
+        variants.extend(runtime_variants)
 
     deduped: list[str] = []
     for variant in variants:
@@ -182,8 +284,11 @@ def _module_name_variants(weight_name: str) -> list[str]:
     return deduped
 
 
-def _preferred_module_name(weight_name: str) -> str:
-    return _module_name_variants(weight_name)[-1]
+def _preferred_module_name(
+    weight_name: str,
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
+) -> str:
+    return _module_name_variants(weight_name, runtime_name_mapper)[-1]
 
 
 def _scale_key_candidates(weight_name: str) -> list[str]:
@@ -259,18 +364,27 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
+    if model_type == "hunyuan-video":
+        return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
+    if model_type == "qwen-image":
+        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     if model_type == "none":
         return []
     if class_name == "FluxTransformer2DModel":
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if class_name == "Flux2Transformer2DModel":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
+    if class_name == "HunyuanVideoTransformer3DModel":
+        return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
+    if class_name == "QwenImageTransformer2DModel":
+        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     return []
 
 
 def should_keep_bf16(
     weight_name: str,
     keep_bf16_patterns: Sequence[str],
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
 ) -> bool:
     if not keep_bf16_patterns:
         return False
@@ -278,13 +392,14 @@ def should_keep_bf16(
     return any(
         re.search(pattern, module_name)
         for pattern in keep_bf16_patterns
-        for module_name in _module_name_variants(weight_name)
+        for module_name in _module_name_variants(weight_name, runtime_name_mapper)
     )
 
 
 def is_ignored_by_modelopt(
     weight_name: str,
     ignore_patterns: Sequence[str],
+    runtime_name_mapper: Callable[[str], list[str]] | None = None,
 ) -> bool:
     if not ignore_patterns:
         return False
@@ -293,7 +408,7 @@ def is_ignored_by_modelopt(
         regex_str = pattern.replace(".", r"\.").replace("*", r".*")
         if any(
             re.fullmatch(regex_str, module_name)
-            for module_name in _module_name_variants(weight_name)
+            for module_name in _module_name_variants(weight_name, runtime_name_mapper)
         ):
             return True
     return False
@@ -342,37 +457,6 @@ def quantize_fp8_weight(
     return quantized.cpu().contiguous()
 
 
-def _copy_non_shard_files(source_dir: str, output_dir: str) -> None:
-    ignored = set(INDEX_FILENAMES)
-    for entry in os.listdir(source_dir):
-        if entry.endswith(".safetensors") or entry in ignored:
-            continue
-        source_path = os.path.join(source_dir, entry)
-        output_path = os.path.join(output_dir, entry)
-        if os.path.isdir(source_path):
-            shutil.copytree(source_path, output_path, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source_path, output_path)
-
-
-def _load_selected_tensors(
-    model_dir: str,
-    weight_map: Mapping[str, str],
-    tensor_names: Iterable[str],
-) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    names_by_file: dict[str, list[str]] = defaultdict(list)
-    for name in tensor_names:
-        names_by_file[weight_map[name]].append(name)
-
-    for filename, names in names_by_file.items():
-        shard_path = os.path.join(model_dir, filename)
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for name in names:
-                tensors[name] = f.get_tensor(name).contiguous()
-    return tensors
-
-
 def build_modelopt_fp8_transformer(
     *,
     modelopt_hf_dir: str,
@@ -384,13 +468,13 @@ def build_modelopt_fp8_transformer(
     maxbound: float = FP8_E4M3_MAXBOUND,
     overwrite: bool = False,
 ) -> dict[str, int]:
-    source_dir = _resolve_transformer_dir(modelopt_hf_dir)
+    source_dir = resolve_transformer_dir(modelopt_hf_dir)
     backbone_ckpt_path = _resolve_backbone_ckpt(modelopt_backbone_ckpt)
     base_dir = (
-        _resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
+        resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
     )
 
-    config = _load_config(source_dir)
+    config = load_config(source_dir)
     quant_config = config.get("quantization_config")
     if not isinstance(quant_config, dict):
         raise ValueError(
@@ -402,7 +486,7 @@ def build_modelopt_fp8_transformer(
             "(quant_method=modelopt)."
         )
 
-    source_weight_map_all, index_filename = _load_weight_map(source_dir)
+    source_weight_map_all, index_filename = load_weight_map(source_dir)
     source_metadata = _load_first_shard_metadata(source_dir, source_weight_map_all)
     is_ltx2_export = _is_ltx2_x0_export(
         config=config,
@@ -410,6 +494,9 @@ def build_modelopt_fp8_transformer(
         source_weight_map=source_weight_map_all,
     )
     class_name = config.get("_class_name")
+    runtime_name_mapper = _get_runtime_module_name_mapper(
+        model_type=model_type, class_name=class_name
+    )
     ignore_patterns = list(quant_config.get("ignore", []) or [])
     patterns = list(
         get_default_keep_bf16_patterns(model_type=model_type, class_name=class_name)
@@ -423,17 +510,7 @@ def build_modelopt_fp8_transformer(
             "BF16 fallback patterns are enabled, but --base-transformer-dir was not provided."
         )
 
-    output_path = Path(output_dir).expanduser().resolve()
-    if output_path.exists():
-        if not overwrite:
-            raise FileExistsError(
-                f"Output directory already exists: {output_path}. "
-                "Use --overwrite to replace it."
-            )
-        shutil.rmtree(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    _copy_non_shard_files(source_dir, str(output_path))
+    output_path = prepare_output_dir(source_dir, output_dir, overwrite=overwrite)
 
     if is_ltx2_export:
         source_weight_map = {
@@ -445,11 +522,12 @@ def build_modelopt_fp8_transformer(
         source_weight_map = source_weight_map_all
     base_weight_map: dict[str, str] = {}
     if base_dir is not None:
-        base_weight_map, _ = _load_weight_map(base_dir)
+        base_weight_map, _ = load_weight_map(base_dir)
     fallback_weight_names = sorted(
         weight_name
         for weight_name in source_weight_map
-        if weight_name.endswith(".weight") and should_keep_bf16(weight_name, patterns)
+        if weight_name.endswith(".weight")
+        and should_keep_bf16(weight_name, patterns, runtime_name_mapper)
     )
     fallback_weight_names_set = set(fallback_weight_names)
 
@@ -478,14 +556,17 @@ def build_modelopt_fp8_transformer(
 
     auto_ignore_modules = sorted(
         {
-            _preferred_module_name(weight_name)
+            _preferred_module_name(weight_name, runtime_name_mapper)
             for weight_name in source_weight_map
             if weight_name.endswith(".weight")
             and _resolve_scale_key(weight_name, fp8_scale_map) is None
         }
     )
     fallback_ignore_modules = sorted(
-        {_preferred_module_name(weight_name) for weight_name in fallback_weight_names}
+        {
+            _preferred_module_name(weight_name, runtime_name_mapper)
+            for weight_name in fallback_weight_names
+        }
     )
     ignore_patterns = sorted(
         {
@@ -504,7 +585,7 @@ def build_modelopt_fp8_transformer(
     )
 
     fallback_tensors = (
-        _load_selected_tensors(base_dir, base_weight_map, fallback_weight_names)
+        load_selected_tensors(base_dir, base_weight_map, fallback_weight_names)
         if fallback_weight_names and base_dir is not None
         else {}
     )
@@ -552,13 +633,14 @@ def build_modelopt_fp8_transformer(
             if name in fallback_scale_names:
                 del shard_tensors[name]
                 continue
+            if name in fallback_tensors:
+                shard_tensors[name] = fallback_tensors[name]
+                continue
             if name.endswith(".weight") and is_ignored_by_modelopt(
-                name, ignore_patterns
+                name, ignore_patterns, runtime_name_mapper
             ):
                 preserved_ignored_weight_count += 1
                 continue
-            if name in fallback_tensors:
-                shard_tensors[name] = fallback_tensors[name]
             scale_key = _resolve_scale_key(name, fp8_scale_map)
             if (
                 name.endswith(".weight")
@@ -605,7 +687,7 @@ def build_modelopt_fp8_transformer(
             for name in source_weight_map
             if name.endswith(".weight")
             and _resolve_scale_key(name, fp8_scale_map) is not None
-            and not is_ignored_by_modelopt(name, ignore_patterns)
+            and not is_ignored_by_modelopt(name, ignore_patterns, runtime_name_mapper)
         ),
         "bf16_fallback_weights": len(fallback_weight_names),
         "preserved_ignored_weights": preserved_ignored_weight_count,
@@ -645,12 +727,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "flux1", "flux2", "ltx2", "none"],
+        choices=[
+            "auto",
+            "flux1",
+            "flux2",
+            "ltx2",
+            "hunyuan-video",
+            "qwen-image",
+            "none",
+        ],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
-            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 "
-            "fallback set when the export config matches those transformer classes."
+            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 / "
+            "HunyuanVideo / Qwen Image fallback sets when the export config matches "
+            "those transformer classes."
         ),
     )
     parser.add_argument(

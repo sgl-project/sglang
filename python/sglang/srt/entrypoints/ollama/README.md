@@ -9,7 +9,7 @@ Ollama API compatibility for SGLang, plus a Smart Router for intelligent routing
 
 ## Ollama API
 
-For basic Ollama API usage with SGLang (CLI and Python examples), see the [Ollama API documentation](https://sgl-project.github.io/basic_usage/ollama_api.html).
+For basic Ollama API usage with SGLang (CLI and Python examples), see the [Ollama API documentation](https://docs.sglang.io/docs/basic_usage/ollama_api).
 
 ## Smart Router
 

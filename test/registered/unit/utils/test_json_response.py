@@ -2,15 +2,29 @@ import unittest
 
 import numpy as np
 import orjson
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionTokenLogprob,
+    ChatMessage,
+    ChoiceLogprobs,
+    JsonSchemaResponseFormat,
+    TopLogprob,
+    UsageInfo,
+)
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
+    model_json_response,
     orjson_response,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 
 class TestJSONResponseUtils(unittest.TestCase):
@@ -49,6 +63,82 @@ class TestJSONResponseUtils(unittest.TestCase):
         parsed = orjson.loads(response.body)
 
         self.assertIsNone(parsed["value"])
+
+
+def _chat_response_with_top_logprobs(logprob: float) -> ChatCompletionResponse:
+    top = [
+        TopLogprob(token="é", bytes=[195, 169], logprob=logprob),
+        TopLogprob(token=" 中", bytes=[32, 228, 184, 173], logprob=-1e-5),
+    ]
+    return ChatCompletionResponse(
+        id="req-0",
+        created=0,
+        model="m",
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content="é 中"),
+                logprobs=ChoiceLogprobs(
+                    content=[
+                        ChatCompletionTokenLogprob(
+                            token="é",
+                            bytes=[195, 169],
+                            logprob=-0.25,
+                            top_logprobs=top,
+                        )
+                    ]
+                ),
+                finish_reason="length",
+                meta_info={
+                    "output_token_logprobs": [(-0.25, 7, "é")],
+                    "output_top_logprobs": [[(logprob, 7, "é"), (-1e16, 8, None)]],
+                },
+            )
+        ],
+        usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+    )
+
+
+class TestModelJSONResponse(unittest.TestCase):
+    def test_matches_fastapi_encoding(self):
+        response = _chat_response_with_top_logprobs(-3.5)
+        expected = JSONResponse(jsonable_encoder(response)).body
+
+        rendered = model_json_response(response)
+
+        self.assertEqual(rendered.status_code, 200)
+        self.assertEqual(rendered.media_type, "application/json")
+        self.assertEqual(orjson.loads(rendered.body), orjson.loads(expected))
+
+    def test_keeps_the_response_model_serializer(self):
+        """The response's wrap serializer must still drop an unset `sglext`."""
+        rendered = model_json_response(_chat_response_with_top_logprobs(-3.5))
+
+        self.assertNotIn("sglext", orjson.loads(rendered.body))
+
+    def test_applies_field_aliases_like_fastapi(self):
+        schema = JsonSchemaResponseFormat(name="s", schema={"type": "object"})
+
+        parsed = orjson.loads(model_json_response(schema).body)
+
+        self.assertEqual(parsed, jsonable_encoder(schema))
+        self.assertEqual(parsed["schema"], {"type": "object"})
+
+    def test_maps_non_finite_logprobs_to_null(self):
+        response = _chat_response_with_top_logprobs(float("-inf"))
+
+        parsed = orjson.loads(model_json_response(response).body)
+
+        choice = parsed["choices"][0]
+        self.assertIsNone(
+            choice["logprobs"]["content"][0]["top_logprobs"][0]["logprob"]
+        )
+        self.assertIsNone(choice["meta_info"]["output_top_logprobs"][0][0][0])
+
+    def test_passes_non_models_through(self):
+        error = orjson_response({"error": "bad"}, status_code=400)
+
+        self.assertIs(model_json_response(error), error)
 
 
 if __name__ == "__main__":

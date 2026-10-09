@@ -4,8 +4,7 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -28,11 +27,11 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
 class PhiMoEConfig(PretrainedConfig):
-
     model_type = "phimoe"
 
     def __init__(
@@ -190,7 +189,6 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -202,6 +200,7 @@ class PhiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=False,
             custom_routing_function=phimoe_routing_function,
         )
@@ -230,7 +229,6 @@ class PhiMoE(nn.Module):
 
 
 class PhiMoEAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -248,8 +246,7 @@ class PhiMoEAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -281,17 +278,21 @@ class PhiMoEAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
+        )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__, shard_tp_size=attn_tp_size, reduces_over_attn_tp=False
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
@@ -326,7 +327,6 @@ class PhiMoEAttention(nn.Module):
 
 
 class PhiMoEDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,
@@ -397,7 +397,6 @@ class PhiMoEDecoderLayer(nn.Module):
 
 
 class PhiMoEModel(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,
@@ -450,7 +449,6 @@ class PhiMoEModel(nn.Module):
 
 
 class PhiMoEForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PhiMoEConfig,

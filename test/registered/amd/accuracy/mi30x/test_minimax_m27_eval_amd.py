@@ -167,7 +167,7 @@ class TestMiniMaxM27EvalAMD(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MINIMAX_M27_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_minimax_m27_accuracy(self):
         """Test MiniMax-M2.7 with GSM8K completion benchmark."""
@@ -179,9 +179,9 @@ class TestMiniMaxM27EvalAMD(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

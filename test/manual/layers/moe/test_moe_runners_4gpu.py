@@ -55,7 +55,6 @@ class TestMoERunner4GPU(CustomTestCase):
         },
         "moe_runner_cutlass_w4a8_deepep_ll": {
             "model": "tencent/DeepSeek-V3.1-Terminus-W4AFP8",  # FP8 W8A8 MoE model
-            "env_overrides": {"SGLANG_DEEPEP_BF16_DISPATCH": "1"},
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
@@ -64,6 +63,8 @@ class TestMoERunner4GPU(CustomTestCase):
                 "deepep",
                 "--deepep-mode",
                 "low_latency",
+                "--deepep-dispatcher-output-dtype",
+                "bf16",
                 "--attention-backend",
                 "triton",
                 "--sampling-backend",

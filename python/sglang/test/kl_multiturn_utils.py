@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import time
 from typing import Callable
+
+import requests
 
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,
@@ -43,20 +47,32 @@ __all__ = [
 def default_prefill_cache_assert(result: dict, prefix_len: int, label: str):
     """Standard radix cache: cached_tokens == prefix_len."""
     actual = result["meta_info"]["cached_tokens"]
-    assert (
-        actual == prefix_len
-    ), f"{label}: expected cached_tokens={prefix_len}, got {actual}"
+    assert actual == prefix_len, (
+        f"{label}: expected cached_tokens={prefix_len}, got {actual}"
+    )
 
 
 def default_decode_cache_assert(
-    result: dict, history_len: int, output_len: int, label: str
+    result: dict, history_len: int, output_len: int, label: str, page_size: int = 1
 ):
-    """Standard radix cache: cached_tokens == history_len + output_len."""
+    """Standard radix cache: cached_tokens == history_len + output_len.
+
+    A previous turn that finished by length never computed its last output
+    token's KV, so the cache may hold one token less, cut to a page boundary.
+    """
     expected = history_len + output_len
+    allowed = {expected, expected - 1, (expected - 1) // page_size * page_size}
     actual = result["meta_info"]["cached_tokens"]
-    assert (
-        actual == expected
-    ), f"{label}: expected cached_tokens={expected}, got {actual}"
+    assert actual in allowed, (
+        f"{label}: expected cached_tokens in {sorted(allowed)}, got {actual}"
+    )
+
+
+def _default_decode_cache_assert_for(base_url: str) -> Callable:
+    server_info = requests.get(base_url + "/server_info", timeout=30).json()
+    return functools.partial(
+        default_decode_cache_assert, page_size=server_info["page_size"]
+    )
 
 
 def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
@@ -66,9 +82,9 @@ def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
         actual = result["meta_info"]["cached_tokens"]
         upper = (prefix_len // chunk_size) * chunk_size
         lower = max(0, upper - chunk_size)
-        assert (
-            lower <= actual <= upper
-        ), f"{label}: expected cached_tokens in [{lower}, {upper}], got {actual}"
+        assert lower <= actual <= upper, (
+            f"{label}: expected cached_tokens in [{lower}, {upper}], got {actual}"
+        )
 
     return _check
 
@@ -84,9 +100,9 @@ def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
             expected = (
                 (history_len + output_len - 1) // track_interval
             ) * track_interval
-        assert (
-            actual == expected
-        ), f"{label}: expected cached_tokens={expected}, got {actual}"
+        assert actual >= expected, (
+            f"{label}: expected cached_tokens={expected}, got {actual}"
+        )
 
     return _check
 
@@ -104,6 +120,7 @@ def _replay_and_compare_kl(
     output_logprobs: list[list[float]],
     label: str,
     batch_size: int = 1,
+    sampling_temperature: float = 1,
 ):
     """Flush cache, run replay prefill in batches, compare KL divergence."""
     all_input_logprobs = []
@@ -114,6 +131,7 @@ def _replay_and_compare_kl(
                 base_url,
                 replay_input_ids[start:end],
                 output_logprobs[start:end],
+                temperature=sampling_temperature,
             )
         )
     acc = {model_name: {"kl_div": kl_threshold}}
@@ -142,17 +160,46 @@ def _interleave_order(n: int, branches_per_group: int) -> list[int] | None:
     return order
 
 
-def _generate_maybe_interleaved(base_url, inputs, max_new_tokens, order=None):
+def _generate_maybe_interleaved(
+    base_url,
+    inputs,
+    max_new_tokens,
+    order=None,
+    sampling_temperature: float = 1,
+    request_batch_size: int | None = None,
+    inter_batch_delay_s: float = 0,
+):
     """Generate with optional interleaved submission order.
 
     Submits inputs reordered by ``order``, then maps results back to the
     original order so the caller always sees results[i] corresponds to
     inputs[i].
     """
+    ordered = inputs if order is None else [inputs[i] for i in order]
+    if not ordered:
+        return []
+
+    batch_size = (
+        request_batch_size
+        if request_batch_size is not None and request_batch_size > 0
+        else len(ordered)
+    )
+    results = []
+    for start in range(0, len(ordered), batch_size):
+        results.extend(
+            _generate(
+                base_url,
+                ordered[start : start + batch_size],
+                max_new_tokens,
+                return_logprob=True,
+                temperature=sampling_temperature,
+            )
+        )
+        if batch_size < len(ordered) and inter_batch_delay_s > 0:
+            time.sleep(inter_batch_delay_s)
+
     if order is None:
-        return _generate(base_url, inputs, max_new_tokens, return_logprob=True)
-    ordered = [inputs[i] for i in order]
-    results = _generate(base_url, ordered, max_new_tokens, return_logprob=True)
+        return results
     unordered = [None] * len(results)
     for idx, orig in enumerate(order):
         unordered[orig] = results[idx]
@@ -178,6 +225,7 @@ def test_input_output_logprobs_match_helper(
     # --- Cache assertion (for turns > 0) ---
     assert_decode_cached_tokens: Callable | None = None,
     replay_batch_size: int = 1,
+    sampling_temperature: float = 1,
 ):
     """Verify decode logprobs match prefill replay.
 
@@ -213,7 +261,11 @@ def test_input_output_logprobs_match_helper(
             ]
 
         results = _generate(
-            base_url, current_input, max_new_tokens, return_logprob=True
+            base_url,
+            current_input,
+            max_new_tokens,
+            return_logprob=True,
+            temperature=sampling_temperature,
         )
         assert len(results) == n
 
@@ -242,6 +294,7 @@ def test_input_output_logprobs_match_helper(
         output_lps,
         label=label,
         batch_size=replay_batch_size,
+        sampling_temperature=sampling_temperature,
     )
 
 
@@ -269,6 +322,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     # --- Interleaving for branch stress ---
     branches_per_group: int = 0,
     replay_batch_size: int = 1,
+    sampling_temperature: float = 1,
 ):
     """Verify logprobs when prefill cache is hit.
 
@@ -305,10 +359,21 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 
     # Seed cache with prefixes
     _flush_cache(base_url)
-    _generate(base_url, prefix_input_ids, max_new_tokens=0)
+    _generate(
+        base_url,
+        prefix_input_ids,
+        max_new_tokens=0,
+        temperature=sampling_temperature,
+    )
 
     # Turn 0: prefill cache hit (NOT interleaved, matching original behavior)
-    results = _generate(base_url, full_input_ids, max_new_tokens, return_logprob=True)
+    results = _generate(
+        base_url,
+        full_input_ids,
+        max_new_tokens,
+        return_logprob=True,
+        temperature=sampling_temperature,
+    )
     assert len(results) == n
 
     for i, result in enumerate(results):
@@ -324,14 +389,18 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     # Additional turns: decode cache hits (interleaved if order is set)
     if turn_suffixes:
         if assert_decode_cached_tokens is None:
-            assert_decode_cached_tokens = default_decode_cache_assert
+            assert_decode_cached_tokens = _default_decode_cache_assert_for(base_url)
 
         for t, suffixes in enumerate(turn_suffixes):
             current_input = [
                 current_input[i] + last_outputs[i] + suffixes[i] for i in range(n)
             ]
             results = _generate_maybe_interleaved(
-                base_url, current_input, max_new_tokens, order
+                base_url,
+                current_input,
+                max_new_tokens,
+                order,
+                sampling_temperature=sampling_temperature,
             )
             assert len(results) == n
 
@@ -359,6 +428,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         output_lps,
         label=label,
         batch_size=replay_batch_size,
+        sampling_temperature=sampling_temperature,
     )
 
 
@@ -383,6 +453,9 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     # --- Interleaving ---
     branches_per_group: int = 0,
     replay_batch_size: int = 1,
+    sampling_temperature: float = 1,
+    request_batch_size: int | None = None,
+    inter_batch_delay_s: float = 0,
 ):
     """Verify logprobs when decode cache is hit.
 
@@ -400,11 +473,11 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     different suffixes per branch. Use branches_per_group for interleaved
     submission to stress the radix tree.
     """
-    assert (
-        len(turn_suffixes) >= 1
-    ), "turn_suffixes must have at least 1 entry (for turn 2)"
+    assert len(turn_suffixes) >= 1, (
+        "turn_suffixes must have at least 1 entry (for turn 2)"
+    )
     if assert_decode_cached_tokens is None:
-        assert_decode_cached_tokens = default_decode_cache_assert
+        assert_decode_cached_tokens = _default_decode_cache_assert_for(base_url)
 
     n = len(first_turn_input_ids)
     num_turns = 1 + len(turn_suffixes)
@@ -413,8 +486,13 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
 
     # Turn 1: populate cache, no assertion, no interleaving
     _flush_cache(base_url)
-    results = _generate(
-        base_url, first_turn_input_ids, max_new_tokens, return_logprob=True
+    results = _generate_maybe_interleaved(
+        base_url,
+        first_turn_input_ids,
+        max_new_tokens,
+        sampling_temperature=sampling_temperature,
+        request_batch_size=request_batch_size,
+        inter_batch_delay_s=inter_batch_delay_s,
     )
     assert len(results) == n
 
@@ -429,7 +507,13 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
             current_input[i] + last_outputs[i] + suffixes[i] for i in range(n)
         ]
         results = _generate_maybe_interleaved(
-            base_url, current_input, max_new_tokens, order
+            base_url,
+            current_input,
+            max_new_tokens,
+            order,
+            sampling_temperature=sampling_temperature,
+            request_batch_size=request_batch_size,
+            inter_batch_delay_s=inter_batch_delay_s,
         )
         assert len(results) == n
 
@@ -457,4 +541,5 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         output_lps,
         label=label,
         batch_size=replay_batch_size,
+        sampling_temperature=sampling_temperature,
     )

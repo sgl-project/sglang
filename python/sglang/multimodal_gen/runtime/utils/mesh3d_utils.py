@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # Import C++ mesh processor extension
-from sglang.multimodal_gen.csrc.render.mesh_processor import meshVerticeInpaint
+from sglang.kernels.ops.diffusion import meshVerticeInpaint
 
 
 def transform_pos(
@@ -305,12 +305,10 @@ class MeshRender:
         self.set_default_texture_resolution(texture_size)
 
         self.camera_distance = camera_distance
-        self.camera_type = camera_type
         self.bake_angle_thres = 75
         self.bake_unreliable_kernel_size = int(
             (2 / 512) * max(self.default_resolution[0], self.default_resolution[1])
         )
-        self.bake_mode = bake_mode
 
         # Set up camera projection matrix
         if camera_type == "orth":
@@ -363,7 +361,7 @@ class MeshRender:
         resolution: Tuple[int, int],
     ) -> torch.Tensor:
         """Rasterize using CUDA rasterizer."""
-        from sglang.multimodal_gen.csrc.render.hunyuan3d_rasterizer import rasterize
+        from sglang.kernels.ops.diffusion import rasterize
 
         if pos_clip.dim() == 2:
             pos_clip = pos_clip.unsqueeze(0)
@@ -380,7 +378,7 @@ class MeshRender:
         tri: torch.Tensor,
     ) -> torch.Tensor:
         """Interpolate vertex attributes."""
-        from sglang.multimodal_gen.csrc.render.hunyuan3d_rasterizer import interpolate
+        from sglang.kernels.ops.diffusion import interpolate
 
         barycentric = rast_out[0, ..., :-1]
         findices = rast_out[0, ..., -1].int()

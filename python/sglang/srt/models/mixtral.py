@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,11 +25,12 @@ import torch
 from torch import nn
 from transformers import MixtralConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -47,7 +50,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +74,10 @@ class MixtralMoE(nn.Module):
         layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.hidden_size = hidden_size
 
         # Gate always runs at half / full precision for now.
@@ -89,6 +92,7 @@ class MixtralMoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
 
@@ -111,8 +115,6 @@ class MixtralMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
 
 
@@ -130,7 +132,7 @@ class MixtralAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -164,6 +166,7 @@ class MixtralAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
@@ -232,20 +235,22 @@ class MixtralDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(sparse=True, next_layer_sparse=True),
+                self.post_attention_layernorm,
+            ),
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -253,9 +258,10 @@ class MixtralDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.block_sparse_moe(hidden_states)
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class MixtralModel(nn.Module):
@@ -268,7 +274,7 @@ class MixtralModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -279,13 +285,11 @@ class MixtralModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: MixtralDecoderLayer(
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix="layers",
             return_tuple=True,
         )
@@ -308,33 +312,22 @@ class MixtralModel(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
-
-        return hidden_states
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(hidden_states, forward_batch, self.norm)
 
 
 class MixtralForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: MixtralConfig,
@@ -342,7 +335,7 @@ class MixtralForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = MixtralModel(

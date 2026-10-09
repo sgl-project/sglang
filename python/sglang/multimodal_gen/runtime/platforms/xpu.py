@@ -63,11 +63,6 @@ class XpuPlatform(Platform):
         return True
 
     @classmethod
-    def log_warnings(cls) -> None:
-        """Log any XPU-specific warnings."""
-        pass
-
-    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
@@ -103,12 +98,9 @@ class XpuPlatform(Platform):
         if empty_cache:
             torch.xpu.empty_cache()
 
-        used_memory = float(torch.xpu.memory_allocated(device_id))
-        total_gpu_memory = float(
-            torch.xpu.get_device_properties(device_id).total_memory
-        )
-
-        free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(device_id)
+        total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
         if distributed:
             import torch.distributed as dist
@@ -190,7 +182,8 @@ class XpuPlatform(Platform):
         )
 
     @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        """Get device communicator class for Intel XPU distributed communication."""
-        # Use base communicator for now; can be updated to use oneCCL-based communicator
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
