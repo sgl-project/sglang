@@ -42,9 +42,12 @@ BEAM_RESPONSE_TEMPLATE: dict[str, Any] = {
             "repeats": True,
             "content": "xml-inline",
             "content_args": {
+                # The closer is one token that starts with a newline. Once the
+                # model writes that newline as text, the closer no longer fits,
+                # and it may open the next parameter instead.
                 "tag_pattern": (
                     r'<rfl:parameter name="(?P<key>[^"]+)">'
-                    r"\n(?P<value>.*?)\n</rfl:parameter>"
+                    r'\n(?P<value>.*?)\n(?:</rfl:parameter>|(?=<rfl:parameter name="))'
                 ),
                 "value_parser": {
                     "name": "text",
@@ -99,4 +102,6 @@ class BeamReasoningDetector(ResponseTemplateReasoningDetector):
             message_start=self._message_start if message_start else None,
             grammar_requires_reasoning=True,
             undeclared_names=undeclared_names,
+            # Beam also writes arguments sorted by name.
+            sorted_arguments=True,
         )

@@ -37,6 +37,8 @@ _REGEX_META = re.compile(r"[.^$*+?{}\[\]\\|()]")
 _LITERAL_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
 # Stands for `^` while expanding a delimiter pattern.
 _START = "\0"
+# Precedes the text of a final lookahead while expanding a delimiter pattern.
+_AHEAD = "\1"
 # Arbitrary bound on the strings expanded from one delimiter pattern.
 _MAX_LITERALS = 16
 # Templates write at most a newline between parameters.
@@ -145,10 +147,15 @@ def _split_group(pattern: str, name: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _literals(pattern: str, *, message_start: bool = False) -> list[str] | None:
-    """Expand literal alternatives, allowing `^` only at the message start."""
+def _literals(
+    pattern: str, *, message_start: bool = False, lookahead: bool = False
+) -> list[str] | None:
+    """Expand literal alternatives, allowing `^` only at the message start and
+    a final lookahead only with `lookahead`."""
     literals, index = _alternatives(pattern, 0)
     if literals is None or index != len(pattern):
+        return None
+    if any(literal.count(_AHEAD) > lookahead for literal in literals):
         return None
     if not message_start:
         return None if any(_START in literal for literal in literals) else literals
@@ -176,11 +183,14 @@ def _alternatives(pattern: str, index: int) -> tuple[list[str] | None, int]:
 def _concatenation(pattern: str, index: int) -> tuple[list[str] | None, int]:
     literals = [""]
     while index < len(pattern) and pattern[index] not in "|)":
-        if pattern.startswith("(?:", index):
+        if pattern.startswith(("(?:", "(?="), index):
+            ahead = pattern[index + 2] == "="
             atom, index = _alternatives(pattern, index + 3)
             if atom is None or not pattern.startswith(")", index):
                 return None, index
             index += 1
+            if ahead:
+                atom = [_AHEAD + literal for literal in atom]
         elif pattern[index] == "\\" and index + 1 < len(pattern):
             escaped = pattern[index + 1]
             if escaped.isalnum() and escaped not in _LITERAL_ESCAPES:
@@ -198,6 +208,9 @@ def _concatenation(pattern: str, index: int) -> tuple[list[str] | None, int]:
         if pattern.startswith("?", index):
             atom = ["", *atom]
             index += 1
+        # A lookahead reads as a literal only at the end of the pattern.
+        if any(_AHEAD in prefix for prefix in literals):
+            return None, index
         literals = [prefix + suffix for prefix in literals for suffix in atom]
         if len(literals) > _MAX_LITERALS:
             return None, index
@@ -583,6 +596,7 @@ def _xml_arguments_format(
     *,
     strict: bool,
     closers: list[str],
+    sorted_arguments: bool,
 ) -> dict[str, Any] | None:
     if set(content_args) - {"tag_pattern", "value_parser", "merge_duplicates"}:
         return None
@@ -596,11 +610,19 @@ def _xml_arguments_format(
     if not key_split or not value_split:
         return None
     key_pattern = key_split[1]
-    begins, middles, ends = map(
-        _literals, (key_split[0], value_split[0], value_split[2])
-    )
+    begins, middles = _literals(key_split[0]), _literals(value_split[0])
+    ends = _literals(value_split[2], lookahead=True)
     if not begins or not middles or not ends:
         return None
+    aheads = [end.split(_AHEAD) for end in ends if _AHEAD in end]
+    ends = [end for end in ends if _AHEAD not in end]
+    # A value may also end where the next parameter opens, if the template
+    # looks ahead for its only opener.
+    if not ends or (
+        aheads and (len(begins) > 1 or {a for _, a in aheads} != {*begins})
+    ):
+        return None
+    follows = [before + ahead for before, ahead in aheads]
     properties = parameters.get("properties")
     json_values = value_parser.get("name") == "json"
     typed = properties is None or (
@@ -630,14 +652,41 @@ def _xml_arguments_format(
     if _spells_closer(tuple(closers), pieces, repeats=True):
         return None
 
-    # Raw text has no escaping for a call closer.
-    text = {"type": "any_text", "excludes": closers} if closers else _ANY_TEXT
+    # Raw text has no escaping for a call closer, nor, where a value may end
+    # before the next opener, for any value end.
+    excludes = closers + follows + ends if follows else closers
+    text = {"type": "any_text", "excludes": excludes} if excludes else _ANY_TEXT
+    # Each value but the last then ends by opening the next parameter, whose
+    # tag starts after the opener.
+    starts = [""] if follows else begins
 
-    def any_parameters() -> dict[str, Any]:
+    def tag(
+        begin: str, value: dict[str, Any], fits: list[str], last: bool
+    ) -> dict[str, Any]:
+        if follows and not last:
+            fits = [e + sep + begins[0] for e in fits for sep in ("", "\n")] + follows
+        return _tag(begin, value, fits)
+
+    def separated(tags: list[dict[str, Any]]) -> dict[str, Any]:
+        return _one_of(tags) if follows else _sequence(_SEPARATOR, _one_of(tags))
+
+    def arguments(body: dict[str, Any], optional: bool) -> dict[str, Any]:
+        """`body` after the opener of its first parameter."""
+        if not follows:
+            return body
+        body = _sequence(_SEPARATOR, _const_strings(begins), body)
+        return _optional(body) if optional else body
+
+    def any_parameter(last: bool) -> dict[str, Any]:
         name = {"type": "regex", "pattern": key_pattern}
         content = _sequence(name, _const_strings(middles), text)
-        tags = [_tag(begin, content, ends) for begin in begins]
-        return {"type": "star", "content": _sequence(_SEPARATOR, _one_of(tags))}
+        return separated([tag(start, content, ends, last) for start in starts])
+
+    def any_parameters() -> dict[str, Any]:
+        more = {"type": "star", "content": any_parameter(False)}
+        return (
+            arguments(_sequence(more, any_parameter(True)), True) if follows else more
+        )
 
     if not strict:
         return any_parameters()
@@ -661,7 +710,7 @@ def _xml_arguments_format(
             return None
 
     def parameter(
-        key: str, value: dict[str, Any], choices: list[str] | None = None
+        key: str, value: dict[str, Any], choices: list[str] | None, last: bool
     ) -> dict[str, Any] | None:
         if not re.fullmatch(key_pattern, key) or any(
             list(read_back(b + key + m + "0" + e) or ()) != [key]
@@ -671,11 +720,12 @@ def _xml_arguments_format(
         ):
             raise ValueError(f"parameter name {key!r} cannot be encoded in tool calls")
         if choices is None:
-            tags = [_tag(b + key + m, value, ends) for b in begins for m in middles]
-            return _sequence(_SEPARATOR, _one_of(tags))
+            return separated(
+                [tag(s + key + m, value, ends, last) for s in starts for m in middles]
+            )
         # Optional framing whitespace must not change a text choice.
         tags, framed = [], set()
-        for b in begins:
+        for b, s in zip(begins, starts):
             for m in middles:
                 by_ends: dict[tuple[str, ...], list[str]] = {}
                 for choice in choices:
@@ -688,31 +738,57 @@ def _xml_arguments_format(
                 for fits, group in by_ends.items():
                     if fits:
                         tags.append(
-                            _tag(b + key + m, _const_strings(group), list(fits))
+                            tag(s + key + m, _const_strings(group), list(fits), last)
                         )
                         framed.update(group)
         if framed != set(choices):
             return None
-        return _sequence(_SEPARATOR, _one_of(tags))
+        return separated(tags)
 
-    elements = []
+    values = {}
     for key, schema in properties.items():
-        value = _value_format(schema, parameters, json_values, closers + ends)
+        value = _value_format(schema, parameters, json_values, closers + follows + ends)
         if value is None:
             return None
         choices = None
         if value["type"] in ("const_string", "or"):
             choices = _string_choices(schema)
-        element = parameter(key, text if value == _ANY_TEXT else value, choices)
-        if element is None:
+        values[key] = (text if value == _ANY_TEXT else value, choices)
+    values.update((key, (text, None)) for key in required if key not in properties)
+    if not values:
+        return {"type": "const_string", "value": ""}
+    more, final = {}, {}
+    for key, (value, choices) in values.items():
+        more[key] = parameter(key, value, choices, last=False)
+        final[key] = parameter(key, value, choices, last=True)
+        if more[key] is None or final[key] is None:
             return None
-        elements.append(element if key in required else _optional(element))
-    elements.extend(parameter(key, text) for key in required if key not in properties)
-    return _sequence(*elements) if elements else {"type": "const_string", "value": ""}
+
+    def ordered(keys: tuple[str, ...]) -> dict[str, Any]:
+        before = [more[k] if k in required else _optional(more[k]) for k in keys]
+        if not follows:
+            return _sequence(*before)
+        # A branch per last parameter, after every required one.
+        return _one_of(
+            [
+                _sequence(*before[:index], final[key])
+                for index, key in enumerate(keys)
+                if not set(keys[index + 1 :]) & set(required)
+            ]
+        )
+
+    orders = [tuple(values)]
+    if sorted_arguments and sorted(values) != list(values):
+        orders.append(tuple(sorted(values)))
+    return arguments(_one_of([ordered(keys) for keys in orders]), not required)
 
 
 def _arguments_format(
-    field: ResponseTemplateField, parameters: dict[str, Any], *, strict: bool
+    field: ResponseTemplateField,
+    parameters: dict[str, Any],
+    *,
+    strict: bool,
+    sorted_arguments: bool,
 ) -> dict[str, Any] | None:
     closers = _closers(field) or []
     if field.content == "json" and not field.content_args:
@@ -722,7 +798,11 @@ def _arguments_format(
         return _json_format(schema, closers)
     if field.content == "xml-inline":
         return _xml_arguments_format(
-            field.content_args, parameters, strict=strict, closers=closers
+            field.content_args,
+            parameters,
+            strict=strict,
+            closers=closers,
+            sorted_arguments=sorted_arguments,
         )
     return None
 
@@ -796,13 +876,16 @@ def tool_call_structural_tag(
     message_start: list[str] | None = None,
     grammar_requires_reasoning: bool = False,
     undeclared_names: bool = False,
+    sorted_arguments: bool = False,
 ) -> dict[str, Any] | None:
     """Derive native calls, respecting strict arguments, count and reasoning.
 
     An `answer` field lets the model answer instead, in `answer_format` if
     given; without tools, only the answer is derived. With `undeclared_names`
     and no strict tool, calls may name any tool the template can spell.
-    Raises `ValueError` for names the template cannot encode."""
+    Strict `xml-inline` arguments come in declared order, or also
+    alphabetical with `sorted_arguments`. Raises `ValueError` for names the
+    template cannot encode."""
     if not tools and answer is not None:
 
         def reply(start: list[str] | None) -> list[dict[str, Any]] | None:
@@ -826,7 +909,11 @@ def tool_call_structural_tag(
             function.get("parameters") or {"type": "object", "properties": {}}
         )
         strict = bool(function.get("strict"))
-        arguments.append(_arguments_format(field, parameters, strict=strict))
+        arguments.append(
+            _arguments_format(
+                field, parameters, strict=strict, sorted_arguments=sorted_arguments
+            )
+        )
         if arguments[-1] is None:
             return None
     names = []

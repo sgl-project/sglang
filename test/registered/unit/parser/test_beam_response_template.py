@@ -168,6 +168,41 @@ class TestBeamResponseTemplate(CustomTestCase):
                     {"city": "Paris"},
                 )
 
+    def test_value_ends_before_an_opener_on_the_next_line(self):
+        tools = [
+            _tool("write", {"path": {"type": "string"}, "content": {"type": "string"}})
+        ]
+        generation = _continuation_call(
+            "write",
+            '<rfl:parameter name="content">\nprint(1)\n\n' + _parameter("path", "a.py"),
+        )
+        expected = {"content": "print(1)\n", "path": "a.py"}
+        for level in ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER:
+            with (
+                self.subTest(level=level.name),
+                envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value),
+            ):
+                parser, streaming = (
+                    FunctionCallParser(
+                        tools=tools, tool_call_parser="beam", prefix=PREFIX
+                    )
+                    for _ in range(2)
+                )
+                _, tag = parser.get_structure_constraint("required")
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+                _, calls = parser.parse_non_stream(generation)
+                streamed = []
+                for char in generation:
+                    streamed += streaming.parse_stream_chunk(char)[1]
+                streamed += streaming.parse_stream_end()[1]
+
+                self.assertTrue(_is_grammar_accept_string(grammar, generation))
+                self.assertEqual(json.loads(calls[0].parameters), expected)
+                self.assertEqual(
+                    json.loads("".join(call.parameters for call in streamed)), expected
+                )
+
     def test_tool_call_requires_constraint_marker(self):
         parser = FunctionCallParser(
             tools=[_tool()],
