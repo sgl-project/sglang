@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -43,11 +44,39 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if cfg.disaggregation_decode_allocation_policy == "prefill_complete":
+        _validate_prefill_complete(server_args)
+        if (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.optimistic_prefill_attempts == 0
+        ):
+            declare_resolution(
+                server_args, "handle_pd_disaggregation", optimistic_prefill_attempts=1
+            )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "
             "use the same DCP layout, but it usually adds communication "
             "overhead without improving prefill performance."
+        )
+
+    if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
+        raise ValueError(
+            "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
+        )
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        if cfg.enable_hisparse or cfg.enable_pd_role_switch:
+            raise ValueError(
+                "Decode host receive does not yet support HiSparse or role switching"
+            )
+
+        if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
+            raise ValueError("Decode host KV buffering requires host_pool retraction")
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_retraction_backup="host_pool",
         )
 
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
@@ -56,11 +85,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
@@ -83,7 +113,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
 
-            if resolved_view(server_args).enable_dp_attention:
+            if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."
@@ -100,7 +130,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "handle_pd_disaggregation",
                 disable_radix_cache=True,
             )
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            logger.warning("Radix cache is disabled for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the
@@ -109,7 +139,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
             if cfg.max_running_requests is not None:
-                per_worker = cfg.max_running_requests // max(1, cfg.dp_size)
+                per_worker = cfg.max_running_requests // num_dp_ranks_of(cfg)
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
             declare_resolution(
@@ -141,8 +171,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
             unsupported = []
-            if view.enable_dp_attention:
-                unsupported.append("DP attention (--enable-dp-attention)")
+            if attn_dp_enabled_of(view):
+                unsupported.append(f"attention DP (--attn-dp-size {view.attn_dp_size})")
             if view.ep_size > 1:
                 unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
             if view.moe_a2a_backend != "none":
@@ -169,6 +199,52 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+
+def _validate_prefill_complete(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    unsupported = []
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        unsupported.append("aggregated serving")
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        unsupported.append("transfer backends other than Mooncake")
+    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+        unsupported.append("pipeline or attention context parallelism")
+    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
+    if cfg.tp_size != attn_dp_size:
+        unsupported.append("attention tensor parallelism greater than one")
+    if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
+        unsupported.append("PD multiplexing or decoupled speculation")
+    if cfg.enable_pd_role_switch:
+        unsupported.append("runtime PD role switching")
+    if cfg.encoder_only or cfg.language_only:
+        unsupported.append("encoder disaggregation")
+    if cfg.enable_hisparse:
+        unsupported.append("HiSparse")
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        unsupported.append("decode host KV buffering")
+    if cfg.disaggregation_mode == "decode" and (
+        cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
+    ):
+        unsupported.append("decode radix cache or decode HiCache")
+    if (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_hierarchical_cache
+        and (
+            cfg.hicache_storage_backend is not None
+            or cfg.hicache_write_policy != "write_back"
+        )
+    ):
+        unsupported.append("prefill HiCache other than L2 write_back")
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        unsupported.append("staging buffers")
+    if envs.SGLANG_RUST_SERVER.get():
+        unsupported.append("the Rust bootstrap registry")
+    if unsupported:
+        raise ValueError(
+            "--disaggregation-decode-allocation-policy prefill_complete does not "
+            "yet support " + ", ".join(unsupported)
+        )
 
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:

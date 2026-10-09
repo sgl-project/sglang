@@ -10,8 +10,13 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
+from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.utils import common
@@ -278,6 +283,131 @@ class TestSparseKVCacheManager(CustomTestCase):
                     self.assertEqual(manager.device_kv_buffer[0].shape[0], 3)
                     self.assertEqual(manager._decode_query_seq_lengths[:16].numel(), 16)
                     self.assertEqual(manager._zero_sparse_index[:16].shape[0], 16)
+
+    def test_pd_registration_preserves_native_and_staging_buffer_layouts(self):
+        for mode in (
+            config.SparseKVOffloadMode.PD_PREFILL_NATIVE,
+            config.SparseKVOffloadMode.PD_DECODE_OFFLOAD,
+        ):
+            with self.subTest(mode=mode):
+                manager, _ = self.make_manager(topk=3)
+                pool = object.__new__(NPUMLATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 2
+                pool.page_size = 128
+                pool.dcp_size = 1
+                pool.is_draft_worker = False
+                pool.dsa_kv_cache_store_fp8 = False
+                pool.index_head_dim = 2
+                pool.indexer_layer_ids = (1,)
+                pool.index_k_buffer = [torch.zeros(4, 128, 1, 2)]
+                pool.index_k_scale_buffer = None
+                pool.k_buffer = pool.v_buffer = None
+                if mode is config.SparseKVOffloadMode.PD_PREFILL_NATIVE:
+                    pool.k_buffer = [torch.zeros(4, 128, 1, 2) for _ in range(2)]
+                    pool.v_buffer = [torch.zeros(4, 128, 1, 2) for _ in range(2)]
+                manager.paged_kv_cache = pool
+                self.module.register_sparse_kv_manager(manager)
+
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager": self.module
+                        },
+                    ),
+                    patch(
+                        "sglang.srt.hardware_backend.npu.memory_pool_npu.resolve_sparse_kv_offload_mode",
+                        return_value=mode,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.ascend.sparse_pd.resolve_sparse_kv_offload_mode",
+                        return_value=mode,
+                    ),
+                    # Skip transport startup; exercise Ascend registration itself.
+                    patch.object(MooncakeKVManager, "__init__", return_value=None),
+                ):
+                    ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+                    args = SimpleNamespace(
+                        kv_data_ptrs=ptrs,
+                        kv_data_lens=lens,
+                        kv_item_lens=item_lens,
+                        page_size=pool.page_size,
+                        kv_buf_groups=3,
+                    )
+                    layout = (
+                        None
+                        if mode.uses_pd_decode_staging
+                        else pool.get_dcp_remote_decode_layout()
+                    )
+                    conn = AscendKVManager(
+                        args,
+                        DisaggregationMode.DECODE
+                        if mode.uses_pd_decode_staging
+                        else DisaggregationMode.PREFILL,
+                        SimpleNamespace(),
+                        is_mla_backend=True,
+                        dcp_remote_decode_layout=layout,
+                    )
+
+                if mode.uses_pd_decode_staging:
+                    buffers = manager.pd_decode_k_staging + manager.pd_decode_v_staging
+                    expected_item_lens = [128 * 2 * 4] * 4
+                    self.assertEqual(conn.sparse_pd_decode_staging.available_slots(), 1)
+                    self.assertEqual(args.kv_layer_ids, [0, 1, 0, 1, 1])
+                    self.assertEqual(args.kv_buf_groups, 2)
+                else:
+                    buffers = pool.k_buffer + pool.v_buffer
+                    expected_item_lens = [buffer[0].nbytes for buffer in buffers]
+                    self.assertIsNone(conn.sparse_pd_decode_staging)
+                    self.assertEqual(
+                        conn._dcp_remote_decode_layout, [False] * 4 + [True]
+                    )
+                buffers += pool.index_k_buffer
+                expected_item_lens.append(pool.index_k_buffer[0][0].nbytes)
+                self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+                self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
+                self.assertEqual(item_lens, expected_item_lens)
+
+    def test_pd_pp_transfer_uses_staging_pages_and_native_index_pages(self):
+        conn = object.__new__(AscendKVManager)
+        conn.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
+            kv_item_lens=[32, 32, 16, 16, 8],
+            prefill_start_layer=1,
+            prefill_end_layer=3,
+            num_draft_entries=0,
+        )
+        conn.is_mla_backend = True
+        conn.is_hybrid_mla_backend = False
+        conn.pp_size = 2
+        conn.enable_custom_mem_pool = False
+        conn.max_transfer_batch_indices = 0
+        conn._transfer_data = Mock(return_value=0)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            result = conn.send_kvcache(
+                "decode",
+                np.array([3], dtype=np.int32),
+                list(range(10_000, 18_000, 1_000)),
+                np.array([0], dtype=np.int32),
+                executor=None,
+                dst_layer_ids=[0, 1, 2, 0, 1, 2, 0, 2],
+                dst_device_kv_indices=np.array([5], dtype=np.int32),
+            )
+        self.assertEqual(result, 0)
+        conn._transfer_data.assert_called_once_with(
+            "decode",
+            [
+                (1_096, 11_000, 32),
+                (2_096, 12_000, 32),
+                (3_048, 14_000, 16),
+                (4_048, 15_000, 16),
+                (5_024, 17_040, 8),
+            ],
+        )
 
     def test_pd_request_release_resets_lru_and_removes_room(self):
         self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()

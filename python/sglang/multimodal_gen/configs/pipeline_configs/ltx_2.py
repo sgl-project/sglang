@@ -394,6 +394,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
+        batch.sp_video_has_padding = pad_frames > 0
         if pad_frames:
             pad_tokens = int(pad_frames) * int(tokens_per_frame)
             pad = torch.zeros(
@@ -443,6 +444,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_orig_num_frames = int(seq_len)
 
         pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        batch.sp_audio_has_padding = pad_frames > 0
         if pad_frames:
             pad = torch.zeros(
                 (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
@@ -726,3 +728,37 @@ class LTX23PipelineConfig(LTX2PipelineConfig):
 
     # original-mode lora swaps invalidate post-warmup timing calibration
     supports_auto_residency: bool = False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ltx_2 import (
+        LTX2SamplingParams,
+        LTX23HQSamplingParams,
+        LTX23SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX23PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
+        ],
+        pipeline_config_registry_entries={
+            "LTX2TwoStageHQPipeline": (LTX2PipelineConfig, LTX23HQSamplingParams),
+        },
+    )
