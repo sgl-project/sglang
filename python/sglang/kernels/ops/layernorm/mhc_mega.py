@@ -6,6 +6,11 @@ https://github.com/deepseek-ai/DeepGEMM
 
 import torch
 
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    import deep_gemm
+
 
 def mhc_mega_boundary(
     x,
@@ -29,8 +34,6 @@ def mhc_mega_boundary(
     Used by the opt-in SM10x prefill path. Before CUDA graph capture, warm up
     on the capture stream to initialize DeepGEMM's per-stream barriers.
     """
-    import deep_gemm
-
     rows, hidden = x.shape
     hc = residual.shape[1]
     updated = torch.empty_like(residual)
