@@ -85,7 +85,8 @@ def test_publish_captures_draft_extend_seed():
 
     assert state.should_publish
     state.update(torch.arange(12, dtype=torch.int64).view(4, 3))
-    state.publish()
+    with patch.object(forward_mha, "resolve_attn_backend", return_value=None):
+        state.publish()
 
     assert torch.equal(seed_buf, torch.arange(6, dtype=torch.int64).view(2, 3))
     assert batch.spec_info.dsa_topk_indices is None
@@ -162,7 +163,9 @@ def test_mtp_iteration_clears_missing_draft_extend_seed():
     assert batch.spec_info.dsa_topk_indices is None
 
 
-def _capture(indices, *, fused=True, ragged=True, flattened=True, select=None):
+def _capture(
+    indices, *, fused=True, ragged=True, flattened=True, select=None, path="mha"
+):
     # Two requests share their first two physical slots. Logical index 5 is
     # outside the four-slot physical pool, but maps to the valid physical slot 2.
     table = torch.tensor([[3, 1, 0], [3, 1, 2]], dtype=torch.int32)
@@ -181,51 +184,62 @@ def _capture(indices, *, fused=True, ragged=True, flattened=True, select=None):
     rows = len(indices) if select is None else len(select)
     capture = torch.full((rows + 1, indices.shape[1]), -99, dtype=torch.int32)
     batch = SimpleNamespace(
-        forward_mode=object(),
+        forward_mode=ForwardMode.EXTEND,
+        reuse_dsa_topk_indices=False,
         spec_info=SimpleNamespace(
             dsa_seed_topk_capture=capture,
             dsa_seed_topk_select=select,
         ),
     )
-    indexer = Mock(return_value=indices)
     with patch.object(forward_mha, "resolve_attn_backend", return_value=backend):
-        forward_mha.forward_dsa_indexer_for_mha(
-            indexer,
-            hidden_states=None,
-            q_lora=None,
-            positions=None,
-            forward_batch=batch,
-            layer_id=0,
-        )
-    assert indexer.call_args.kwargs["return_indices"]
+        if path == "mha":
+            indexer = Mock(return_value=indices)
+            forward_mha.forward_dsa_indexer_for_mha(
+                indexer,
+                hidden_states=None,
+                q_lora=None,
+                positions=None,
+                forward_batch=batch,
+                layer_id=0,
+            )
+            assert indexer.call_args.kwargs["return_indices"]
+        else:
+            # Long prefills take sparse MLA and export through publish().
+            state = IndexTopKShareState.from_mtp_carry(batch)
+            state.update(indices)
+            state.publish()
     assert torch.all(capture[-1] == -99)
     return capture[:-1]
 
 
+@pytest.mark.parametrize("path", ["mha", "publish"])
 @pytest.mark.parametrize("flattened", [True, False])
 @pytest.mark.parametrize("select", [None, torch.tensor([2, 0])])
-def test_ragged_seed_maps_shared_prefix_and_preserves_padding(flattened, select):
+def test_ragged_seed_maps_shared_prefix_and_preserves_padding(flattened, select, path):
     """Export physical slots, even when shared prefixes make ragged offsets larger."""
     indices = torch.tensor([[0, 2, -1], [3, 4, -1], [5, 1, -1]], dtype=torch.int32)
     original = indices.clone()
     expected = torch.tensor([[3, 0, -1], [3, 1, -1], [2, 1, -1]], dtype=torch.int32)
     if select is not None:
         expected = expected[select]
-    actual = _capture(indices, flattened=flattened, select=select)
+    actual = _capture(indices, flattened=flattened, select=select, path=path)
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(indices, original)
 
 
+@pytest.mark.parametrize("path", ["mha", "publish"])
 @pytest.mark.parametrize("fused,ragged", [(True, False), (False, True), (False, False)])
-def test_paged_and_unfused_seed_contracts_are_preserved(fused, ragged):
+def test_paged_and_unfused_seed_contracts_are_preserved(fused, ragged, path):
     indices = torch.tensor([[2, 0, -1], [1, 2, -1]], dtype=torch.int32)
-    torch.testing.assert_close(_capture(indices, fused=fused, ragged=ragged), indices)
+    actual = _capture(indices, fused=fused, ragged=ragged, path=path)
+    torch.testing.assert_close(actual, indices)
 
 
+@pytest.mark.parametrize("path", ["mha", "publish"])
 @pytest.mark.parametrize("invalid", [-2, 6])
-def test_invalid_ragged_indices_are_not_clamped(invalid):
+def test_invalid_ragged_indices_are_not_clamped(invalid, path):
     with pytest.raises((IndexError, RuntimeError)):
-        _capture(torch.tensor([[invalid, -1]], dtype=torch.int32))
+        _capture(torch.tensor([[invalid, -1]], dtype=torch.int32), path=path)
 
 
 if __name__ == "__main__":
