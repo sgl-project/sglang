@@ -57,6 +57,57 @@ The controller then calls `finish_mamba_state_eviction` or
 `finish_swa_state_eviction` to resume eviction. This keeps I/O outside the Rust
 tree's mutex; both tree cores implement the same contract.
 
+Rust code compiled into this extension registers named native factories with
+`register_tree_component(name, factory, replace)`. A factory implements
+`TreeComponentFactory<K>::create` for both plain and bigram keys, which can share
+one generic `impl<K: ChildKeyType>`. Closures returning a component that supports
+both key types also work. `TreeComponentFactoryFamily` groups these two factory
+implementations automatically. The registry maps factory keys to factories;
+component types select keys separately for each binding. Each binding resolves
+its factory references together before construction, then invokes them without
+holding the registry lock. Replacing a registration affects future bindings.
+
+Both concrete binding constructors accept an optional
+`component_factory_overrides` dictionary from component type IDs to factory keys.
+Rust callers can pass a `HashMap<ComponentType, String>` to either binding's
+`with_component_factories` constructor.
+Unspecified kinds use `full_default`, `swa_default`, and `mamba_default`.
+Unknown keys and inactive kinds raise errors during resolution. Each constructed
+component must match the component type requested by the binding.
+
+For example, register `custom_full` once during Rust extension initialization.
+This factory returns the built-in `FullComponent`:
+
+```rust
+use crate::components::registry::{TreeComponentArgument, register_tree_component};
+use crate::components::FullComponent;
+
+fn full_component_factory(_args: &TreeComponentArgument<'_>) -> FullComponent {
+    FullComponent
+}
+
+register_tree_component("custom_full", full_component_factory, false)
+    .expect("custom Full factory registration failed");
+```
+
+Then select `custom_full` for this binding's Full slot in place of `full_default`:
+
+```python
+from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+full = int(ComponentType.FULL)
+binding = mem_cache.RustUnifiedTreeCoreBinding(
+    mem_cache.TreeCoreInitParamsBinding(),
+    [full],
+    component_factory_overrides={full: "custom_full"},
+)
+```
+
+Selection is exposed at the native binding boundary; `CacheInitParams` and
+Python's class-based component overrides are unchanged. Registration and factory
+invocation remain in Rust, with no Python callbacks in tree operations.
+
 ```bash
 # Build (libtorch from the installed torch package):
 cd rust/sglang-radix-tree

@@ -8,9 +8,10 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{
-    self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
+use crate::components::registry::{
+    ResolvedTreeComponentFactories, TreeComponentKey, resolve_tree_component_factories,
 };
+use crate::components::{self, ComponentSet, TreeComponent};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -803,7 +804,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         });
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self
+    where
+        K: TreeComponentKey,
+    {
+        let factories = resolve_tree_component_factories(&component_types, &HashMap::new())
+            .unwrap_or_else(|error| panic!("{error}"));
+        Self::with_component_factories(params, component_types, factories)
+    }
+
+    /// Construct this tree's drivers from a previously resolved factory selection.
+    pub fn with_component_factories(
+        params: CacheInitParams,
+        component_types: Vec<ComponentType>,
+        factories: ResolvedTreeComponentFactories,
+    ) -> Self
+    where
+        K: TreeComponentKey,
+    {
         assert!(
             !component_types.is_empty(),
             "at least one component type is required"
@@ -813,6 +831,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "the base (Full) component is required"
         );
         assert!(params.page_size >= 1, "page_size must be at least 1");
+        let mut configured = ComponentSet::EMPTY;
+        for &component_type in &component_types {
+            assert!(
+                !configured.contains(component_type),
+                "duplicate component type {component_type:?}"
+            );
+            configured.insert(component_type);
+        }
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
             arena,
@@ -852,11 +878,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ongoing_insert_walk_state: None,
         };
         for ct in &component_types {
-            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match ct {
-                ComponentType::Full => Arc::new(FullComponent),
-                ComponentType::Swa => Arc::new(SwaComponent::new(&params)),
-                ComponentType::Mamba => Arc::new(MambaComponent::new(&params)),
-            };
+            let component = factories.create::<K>(*ct, &params);
             tree_core.register_component_(component);
         }
         tree_core

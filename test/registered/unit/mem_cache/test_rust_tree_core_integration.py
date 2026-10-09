@@ -135,6 +135,145 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_prefix_len == 0
 
 
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize("partial_override", [False, True])
+def test_named_component_factory_builds_working_bindings(is_bigram, partial_override):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    init_params = bindings.TreeCoreInitParamsBinding(
+        swa_sliding_window_size=8, mamba_cache_chunk_size=4
+    )
+    component_types = [0, 1, 2]
+    overrides = {1: "inspection_swa"}
+    if not partial_override:
+        overrides.update({0: "full_default", 2: "mamba_default"})
+    binding = binding_class(
+        init_params, component_types, component_factory_overrides=overrides
+    )
+    default_binding = binding_class(init_params, component_types)
+    tokens = array("q", range(4 + is_bigram))
+    inserted = binding.insert(
+        bindings.InsertParamsBinding(
+            key=tokens,
+            value=torch.arange(10, 14),
+            mamba_value=torch.tensor([17]),
+        )
+    )
+    assert inserted.prefix_len == 0
+    # Cache orchestration publishes the SWA slots after insertion.
+    for tag, node_id, source_value in inserted.cache_actions:
+        assert tag == "swa_rebuild"
+        binding.set_component_device_value(
+            node_id, int(ComponentType.SWA), source_value
+        )
+    match_params = bindings.MatchParamsBinding(tokens)
+    assert binding.match_prefix(match_params).device_indices.tolist() == [
+        10,
+        11,
+        12,
+        13,
+    ]
+    assert default_binding.match_prefix(match_params).device_indices.numel() == 0
+    binding.reset()
+    assert binding.match_prefix(match_params).device_indices.numel() == 0
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+@pytest.mark.parametrize(
+    "overrides,error_type,message",
+    [
+        ({0: "unregistered_factory"}, ValueError, "unknown component factory"),
+        ({0: ""}, ValueError, "must be non-empty"),
+        ({1: "swa_default"}, ValueError, "component Swa is not enabled"),
+        ({255: "full_default"}, ValueError, "unknown component type"),
+        (
+            {0: "swa_default"},
+            RuntimeError,
+            "component factory returned the wrong kind for Full",
+        ),
+    ],
+)
+def test_named_component_factory_rejects_invalid_overrides(
+    is_bigram, overrides, error_type, message
+):
+    binding_class = (
+        mem_cache.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else mem_cache.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(error_type, match=message):
+        binding_class(
+            mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0],
+            overrides,
+        )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_named_component_factory_validates_before_invocation(is_bigram):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(ValueError, match="page_size must be at least 1"):
+        binding_class(
+            bindings.TreeCoreInitParamsBinding(page_size=0),
+            [0],
+            {0: "inspection_factory_panic"},
+        )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_named_component_factory_resolves_all_keys_before_invocation(is_bigram):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    with pytest.raises(ValueError, match="unknown component factory"):
+        binding_class(
+            bindings.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0, 1],
+            {0: "inspection_factory_panic", 1: "unregistered_factory"},
+        )
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_named_component_factory_panic_does_not_change_defaults(is_bigram):
+    bindings = load_tree_core_extension(inspection=True)
+    binding_class = (
+        bindings.RustBigramUnifiedTreeCoreBinding
+        if is_bigram
+        else bindings.RustUnifiedTreeCoreBinding
+    )
+    init_params = bindings.TreeCoreInitParamsBinding()
+    with pytest.raises(RuntimeError, match="named component factory test panic"):
+        binding_class(init_params, [0], {0: "inspection_factory_panic"})
+    assert (
+        binding_class(init_params, [0]).empty_match_result().device_indices.numel() == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "binding_class",
+    [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
+)
+def test_inspection_factories_are_not_available_in_production(binding_class):
+    with pytest.raises(ValueError, match="unknown component factory"):
+        binding_class(
+            mem_cache.TreeCoreInitParamsBinding(swa_sliding_window_size=8),
+            [0, 1],
+            {1: "inspection_swa"},
+        )
+
+
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
 def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_backend):
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
