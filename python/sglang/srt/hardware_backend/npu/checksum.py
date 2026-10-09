@@ -25,6 +25,7 @@ def _adler32_partial_kernel(
     items_per_program,
     remaining_mod,
     stride_mod,
+    MOD: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -36,10 +37,10 @@ def _adler32_partial_kernel(
     lane = tl.arange(0, BLOCK)
 
     # For a stream of N bytes x[j]:
-    # a = 1 + sum(x[j]); b = N + sum((N - j) * x[j]), modulo 65521.
+    # a = 1 + sum(x[j]); b = N + sum((N - j) * x[j]), modulo MOD.
     # Every term is reduced before it accumulates, so the lanes stay in int32:
-    # BLOCK * (65521 - 1) < 2**31, even for multi-GiB streams.
-    pos_mod = ((first.to(tl.int64) * stride) % 65521).to(tl.int32)
+    # BLOCK * (MOD - 1) < 2**31, even for multi-GiB streams.
+    pos_mod = ((first.to(tl.int64) * stride) % MOD).to(tl.int32)
     a = tl.zeros([BLOCK], dtype=tl.int32)
     b = tl.zeros([BLOCK], dtype=tl.int32)
     for item in range(first, last):
@@ -49,13 +50,13 @@ def _adler32_partial_kernel(
             offsets = start + lane
             valid = offsets < stride
             values = tl.load(row_ptr + offsets, mask=valid, other=0).to(tl.int32)
-            # 2 * 65521 keeps the weight positive before the truncating modulo.
-            weights = (remaining_mod - pos_mod - offsets % 65521 + 131042) % 65521
-            a = (a + values) % 65521
-            b = (b + (weights * values) % 65521) % 65521
-        pos_mod = (pos_mod + stride_mod) % 65521
-    tl.store(partials + pid * 2, tl.sum(a, 0) % 65521)
-    tl.store(partials + pid * 2 + 1, tl.sum(b, 0) % 65521)
+            # 2 * MOD keeps the weight positive before the truncating modulo.
+            weights = (remaining_mod - pos_mod - offsets % MOD + 2 * MOD) % MOD
+            a = (a + values) % MOD
+            b = (b + (weights * values) % MOD) % MOD
+        pos_mod = (pos_mod + stride_mod) % MOD
+    tl.store(partials + pid * 2, tl.sum(a, 0) % MOD)
+    tl.store(partials + pid * 2 + 1, tl.sum(b, 0) % MOD)
 
 
 def adler32_strided_checksum(
@@ -117,6 +118,7 @@ def adler32_strided_checksum(
                 per_program,
                 (total_bytes - byte_offset) % _MOD_ADLER,
                 stride % _MOD_ADLER,
+                MOD=_MOD_ADLER,
                 BLOCK=_BLOCK_SIZE,
             )
         program_offset += count
