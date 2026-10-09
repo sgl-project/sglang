@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import msgspec
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
@@ -223,46 +222,6 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         self.assertIs(other.func, comm_ops._reduce_update_read_dp_gather)
         self.assertTrue(other.keywords["reduces_attention_tp"])
         self.assertNotIn("update", other.keywords)
-
-    def test_capabilities_prebind_both_orders_without_capturing_an_update(self):
-        edge = msgspec.structs.replace(
-            self.edge(None), arriving_plain_add=(True, False)
-        )
-        boundary = bind_entry(edge)
-        paths = boundary.prepare.keywords["paths"]
-        self.assertEqual(set(paths), {True, False})
-        self.assertIs(paths[True].keywords["step"].func, comm_ops._dp_gather_sum_read)
-        self.assertIs(
-            paths[False].keywords["step"].func, comm_ops._reduce_update_read_dp_gather
-        )
-        for path in paths.values():
-            self.assertNotIn("update", path.keywords["step"].keywords)
-
-    def test_actual_update_selects_a_prebound_path(self):
-        full = rows(sizes(tp=1))
-        edge = EdgeContract(
-            OutputContract(full, update=None),
-            InputContract(full),
-            full,
-            full,
-            arriving_plain_add=(True, False),
-        )
-        boundary = bind_entry(edge)
-
-        def norm(value, residual=None):
-            return value if residual is None else (value + residual, value + residual)
-
-        for update, expected in ((comm.PLAIN_ADD, 4.0), (_WrittenIn(), 5.0)):
-            with self.subTest(plain=update.is_plain_add):
-                hidden, residual = boundary.prepare(
-                    torch.ones(2, 4),
-                    torch.full((2, 4), 3.0),
-                    None,
-                    norm,
-                    update=update,
-                )
-                torch.testing.assert_close(hidden, torch.full((2, 4), expected))
-                torch.testing.assert_close(residual, hidden)
 
     def test_fused_kernels_take_only_a_plain_add(self):
         full = rows(sizes(tp=2))

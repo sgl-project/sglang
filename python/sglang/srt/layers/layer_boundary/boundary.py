@@ -55,7 +55,6 @@ from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
-    _dispatch_by_update,
     _dp_gather_sum_read,
     _move_before_read,
     _reduce_update_read,
@@ -203,8 +202,6 @@ def bind_entry(
 
     Returns:
         An EntryPath whose prepare accepts the actual update from the stream.
-        Multiple update capabilities select among preconstructed paths; a single
-        capability needs no runtime dispatcher.
     """
     if edge.produced.transform is not None:
         # An attention's transform, run once its sum is complete.
@@ -216,41 +213,25 @@ def bind_entry(
             ),
             residual_joins_sum=False,
         )
-    capabilities = edge.arriving_plain_add
-    if not capabilities:
+    is_plain_add = edge.arriving_plain_add
+    if is_plain_add is None:
         if edge.produced.update is None:
-            raise ValueError("an arrival must declare its update capabilities")
-        capabilities = (edge.produced.update.is_plain_add,)
+            raise ValueError("an arrival must declare its update capability")
+        is_plain_add = edge.produced.update.is_plain_add
     gather_input = (
         attn_tp_gather_input
         if attn_tp_gather is None
         else partial(attn_tp_gather_input, gather=attn_tp_gather)
     )
-    paths = {
-        capability: _bind_entry_path(
-            edge,
-            is_plain_add=capability,
-            fusions=fusions,
-            carried_fusions=carried_fusions,
-            cp_moves=cp_moves,
-            enters_stack=enters_stack,
-            attn_input_adapter=attn_input_adapter,
-            gather_input=gather_input,
-        )
-        for capability in capabilities
-    }
-    first = next(iter(paths.values()))
-    if len(paths) == 1:
-        return first
-    if any(path.input_move != first.input_move for path in paths.values()):
-        raise NotImplementedError("update capabilities require different input moves")
-    return msgspec.structs.replace(
-        first,
-        preserves_residual=None,
-        prepare=partial(
-            _dispatch_by_update,
-            paths={capability: path.prepare for capability, path in paths.items()},
-        ),
+    return _bind_entry_path(
+        edge,
+        is_plain_add=is_plain_add,
+        fusions=fusions,
+        carried_fusions=carried_fusions,
+        cp_moves=cp_moves,
+        enters_stack=enters_stack,
+        attn_input_adapter=attn_input_adapter,
+        gather_input=gather_input,
     )
 
 

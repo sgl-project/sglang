@@ -526,7 +526,7 @@ def _connect(producer, consumer, *, residual_from=None):
                 update=None,
             )
             residual = rows
-            capabilities = (True,)
+            arriving_plain_add = True
         else:
             decl, during, returned = _resolve_stage(before, variant, following=after)
             if during is None:
@@ -550,7 +550,7 @@ def _connect(producer, consumer, *, residual_from=None):
                 before.kind is StageKind.ATTENTION
                 and before.reduction is ProducerReduction.ALWAYS_PARTIAL
             ):
-                arrived, residual, capabilities = decl.output, during, ()
+                arrived, residual, arriving_plain_add = decl.output, during, None
             else:
                 owes = (
                     variant is BatchVariant.INPUT_SCATTERED
@@ -574,7 +574,8 @@ def _connect(producer, consumer, *, residual_from=None):
                     else False,
                     update=None,
                 )
-                residual, capabilities = returned, (before.update.is_plain_add,)
+                residual = returned
+                arriving_plain_add = before.update.is_plain_add
                 written = before.update.applied_at_exit
         if after is None:
             continue
@@ -606,7 +607,7 @@ def _connect(producer, consumer, *, residual_from=None):
             residual,
             during,
             residual_joins_sum=joins,
-            arriving_plain_add=capabilities,
+            arriving_plain_add=arriving_plain_add,
             arrives_written=written,
         )
         entries[variant] = edge
@@ -638,7 +639,7 @@ def _fork_input(prepared, consumer):
             declaration.input,
             source.residual_to,
             during,
-            arriving_plain_add=(True,),
+            arriving_plain_add=True,
         )
     return StageConnection(prepared.consumer, consumer, {}, entries)
 

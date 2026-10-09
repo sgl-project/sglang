@@ -140,9 +140,9 @@ class EdgeContract(msgspec.Struct, frozen=True):
         residual_to: Residual layout after the boundary.
         residual_joins_sum: Whether one rank may add the residual into a partial
             before reduction; valid only for an eligible plain-add update.
-        arriving_plain_add: Allowed values of ResidualUpdate.is_plain_add for
-            arriving contributions. Empty means use produced.update's capability.
-            The actual update object travels with the residual stream.
+        arriving_plain_add: ResidualUpdate.is_plain_add of the arriving
+            contribution, whose update object travels with the residual stream;
+            None means use produced.update's.
         arrives_written: Whether the producer applies its update at its exit,
             so the stream arrives written with no residual add pending.
     """
@@ -154,8 +154,8 @@ class EdgeContract(msgspec.Struct, frozen=True):
     # Whether the residual is added into one rank's share of the produced sum
     # before that sum completes, instead of after it.
     residual_joins_sum: bool = False
-    # Capabilities allowed to arrive from another layer, not its update object.
-    arriving_plain_add: Tuple[bool, ...] = ()
+    # The capability arriving from another layer, not its update object.
+    arriving_plain_add: Optional[bool] = None
     arrives_written: bool = False
 
 
