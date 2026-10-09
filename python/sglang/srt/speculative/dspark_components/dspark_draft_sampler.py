@@ -200,22 +200,30 @@ def maybe_build_draft_sampler(
     if draft_model.markov_head is None:
         return _eager("no markov head")
     # A greedy draft serves sampling requests too, so it keeps no step logits.
-    folded_sampling = not greedy_draft and _resolve_folded_sampling(
-        model=draft_model,
-        gamma=gamma,
-        max_bs=max_bs,
-        device=device,
-        tp_rank=tp_rank,
-        available_memory_gb=available_memory_gb,
-    )
+    if greedy_draft:
+        folded_sampling = False
+        mode = "greedy draft"
+        if (
+            envs.SGLANG_DSPARK_FOLDED_SAMPLING.get() == DsparkFoldedSampling.FORCE
+            and tp_rank == 0
+        ):
+            logger.warning(
+                "SGLANG_DSPARK_FOLDED_SAMPLING=FORCE is ignored: "
+                "SGLANG_DSPARK_USE_GREEDY_DRAFT keeps no sampling buffers."
+            )
+    else:
+        folded_sampling = _resolve_folded_sampling(
+            model=draft_model,
+            gamma=gamma,
+            max_bs=max_bs,
+            device=device,
+            tp_rank=tp_rank,
+            available_memory_gb=available_memory_gb,
+        )
+        mode = "greedy + sampling" if folded_sampling else "greedy only"
     if tp_rank == 0:
         logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
-            "greedy draft"
-            if greedy_draft
-            else "greedy + sampling"
-            if folded_sampling
-            else "greedy only",
+            "DSpark draft proposal (%s) folded into the draft cuda graph.", mode
         )
     return DsparkDraftSampler(
         model=draft_model,
