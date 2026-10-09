@@ -334,7 +334,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         req.kv.kv_committed_len = len(prefix)
         req.kv.kv_allocated_len = len(prefix)
         req.extra_key = None
-        req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+        req.lock = cache.lock(req.last_node)
 
     def test_full_offload_load_round_trip_and_dedup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -417,8 +417,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
         self.assertEqual(consumer.finish_external_linker_loads([req]), [])
-        consumer.insert_req(req, up_to=req.extend_end)
-        consumer.dec_lock_ref(req.last_node, req.lock_receipt)
+        consumer.checkpoint(req, up_to=req.extend_end)
+        consumer.unlock(req.lock)
+        req.lock = None
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
@@ -626,8 +627,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens[:4], loaded)
         if load_landed:
             self.assertEqual(consumer.finish_external_linker_loads([req]), [])
-            consumer.insert_req(req, up_to=req.extend_end)
-            consumer.dec_lock_ref(req.last_node, req.lock_receipt)
+            consumer.checkpoint(req, up_to=req.extend_end)
+            consumer.unlock(req.lock)
+            req.lock = None
             final = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
@@ -651,6 +653,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             release_kv_cache(req, consumer, checkpoint=False)
             self.assertFalse(req.kv.holds_kv)
             self.assertTrue(req.kv.is_kv_released)
+            self.assertIsNone(req.lock)
+            for component in (ComponentType.FULL, ComponentType.SWA):
+                self.assertEqual(_device_lock_ref(consumer, loaded_node, component), 0)
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
             unpublished = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
