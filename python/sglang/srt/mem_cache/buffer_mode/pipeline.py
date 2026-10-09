@@ -1541,11 +1541,11 @@ class BufferModePipeline:
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
         # FULL suffix and may remain nonempty for an aux-only load.
-        load_transfers = list(f.aux_xfers)
+        load_xfers = list(f.aux_xfers)
         staged_swa = next(
             (
                 len(t.host_indices)
-                for t in load_transfers
+                for t in load_xfers
                 if t.name == PoolName.SWA and t.host_indices is not None
             ),
             0,
@@ -1561,7 +1561,7 @@ class BufferModePipeline:
                 )
             component_load_contexts.append(load_context)
             # Not staging, so these stay out of the aux_xfers the ack frees.
-            load_transfers.extend(load_context.load_transfers)
+            load_xfers.extend(load_context.load_xfers)
         swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
         binds_swa_to_full = (
             swa_entry is not None
@@ -1592,11 +1592,11 @@ class BufferModePipeline:
                 host_parts.append(
                     slice(tail_start - window_start, span_end - window_start)
                 )
-            for i, transfer in enumerate(load_transfers):
+            for i, transfer in enumerate(load_xfers):
                 if transfer.name != PoolName.SWA:
                     continue
                 # Keep the original complete host bounce for ack/drop release.
-                load_transfers[i] = replace(
+                load_xfers[i] = replace(
                     transfer,
                     host_indices=(
                         torch.cat([transfer.host_indices[part] for part in host_parts])
@@ -1606,12 +1606,12 @@ class BufferModePipeline:
                     anchor_index_parts=anchor_parts,
                 )
             if not anchor_parts:
-                load_transfers = [t for t in load_transfers if t.name != PoolName.SWA]
+                load_xfers = [t for t in load_xfers if t.name != PoolName.SWA]
 
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
-            extra_pools=load_transfers or None,
+            extra_pools=load_xfers or None,
         )
         for load_context in component_load_contexts:
             load_context.finalize_allocation(success=device_indices is not None)
@@ -1629,7 +1629,7 @@ class BufferModePipeline:
         swa_dev = next(
             (
                 t.device_indices
-                for t in load_transfers
+                for t in load_xfers
                 if t.name == PoolName.SWA
                 and t.device_indices is not None
                 and t.device_indices.numel() > 0

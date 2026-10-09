@@ -1022,7 +1022,7 @@ class _MambaBufferLoadBackContext(BufferLoadBackContext):
         self.req = req
         self.node_copy = node_copy
         self.prep = prep
-        self.load_transfers = (
+        self.load_xfers = (
             PoolTransfer(
                 name=PoolName.MAMBA,
                 host_indices=node_copy.host_indices,

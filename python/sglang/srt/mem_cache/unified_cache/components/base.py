@@ -102,13 +102,13 @@ class PrepareLoadBackResult:
 class BufferLoadBackContext:
     """A component's part in one buffer-mode load-back; the default has none.
 
-    ``load_transfers`` are H2D destinations beyond the staged transfers. After
+    ``load_xfers`` are H2D destinations beyond the staged transfers. After
     ``cc.load``, ``finalize_allocation`` commits or rolls back preparation;
     on success, ``get_insert_fields()`` supplies the node data for insert.
     ``get_redundant_device_slots()`` returns slots to free after the H2D ack.
     """
 
-    load_transfers: tuple[PoolTransfer, ...] = ()
+    load_xfers: tuple[PoolTransfer, ...] = ()
 
     def finalize_allocation(self, success: bool) -> None:
         """Commit or roll back after allocation; H2D may still be pending."""
