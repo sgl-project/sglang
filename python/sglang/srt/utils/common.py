@@ -647,11 +647,12 @@ def device_stream_context(stream):
 
 def is_device_stream_capturing(device: torch.device) -> bool:
     """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
-    # Every platform answering support_cuda_graph() already calls
-    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
-    if device.type != current_platform.device_type:
+    # Every platform declaring capabilities.graph_capture calls
+    # device_module.is_current_stream_capturing() during capture, except CPU,
+    # whose graph runner compiles instead of capturing a stream.
+    if device.type != current_platform.device_type or device.type == "cpu":
         return False
-    if not current_platform.support_cuda_graph():
+    if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
 
@@ -1436,7 +1437,10 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return current_platform.capabilities.supports_triton and backend not in [
+        "torch_native",
+        "intel_amx",
+    ]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -4252,12 +4256,12 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # A branch or tag name (default "main") maps to a commit through refs/;
+    # snapshots/ is keyed by commit only.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:
