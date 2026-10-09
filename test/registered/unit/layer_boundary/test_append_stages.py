@@ -462,6 +462,26 @@ class TestPipelineHandoff(CustomTestCase):
             attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
 
 
+class TestInputScatteredHandoff(CustomTestCase):
+    """On an input-scattered batch the attention keeps the residual on this
+    rank's attention-TP slice; the FFN that hands off to the next pipeline
+    rank runs and exits with the residual on one set of rows."""
+
+    def test_an_ffn_s_entry_leaves_the_rows_its_exit_starts_from(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True
+        )
+        with fixture.planning(parallel):
+            with layer_stack(next_layers=[layer]):
+                stages = [s for _ in range(2) for s in layer(sparse=True)]
+        for stage in stages:
+            for variant, edges in stage.plan.edges.items():
+                with self.subTest(kind=stage.kind.name, variant=variant.name):
+                    self.assertEqual(
+                        edges.incoming.residual_to, edges.outgoing.residual
+                    )
+
+
 class TestUnpaddedBatches(CustomTestCase):
     """Without attention DP, --disable-attn-tp-gather lets a batch reach the
     stages with rows that do not divide over attention TP. Such a batch keeps

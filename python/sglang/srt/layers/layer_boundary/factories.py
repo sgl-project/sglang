@@ -585,12 +585,6 @@ def _connect(producer, consumer, *, residual_from=None):
                 and after.reduction is ProducerReduction.ALWAYS_PARTIAL
                 else residual
             )
-        elif resolve_exit_rows(after.exit_rows) is ExitRows.ATTENTION:
-            during = (
-                decl.input.layout
-                if residual.sharded <= decl.input.layout.sharded
-                else residual
-            )
         joins = (
             variant is BatchVariant.INPUT_SCATTERED
             and arrived.update is not None
