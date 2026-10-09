@@ -2358,6 +2358,15 @@ class KVCacheConfigurator:
                 else mha_pool_class
             )
         pool_kwargs = {}
+        if self.model_config.hf_config.architectures == [
+            "FlashLoopOuroForCausalLM"
+        ] and self.model_config.hf_config.flashloop_components.get(
+            "kv_residual_quantization", False
+        ):
+            from sglang.srt.mem_cache.flashloop_pool import FlashLoopKVPool
+
+            pool_cls = FlashLoopKVPool
+            pool_kwargs["max_requests"] = get_schedule().max_running_requests
         if quant_method is not None:
             pool_kwargs["quant_method"] = quant_method
         else:

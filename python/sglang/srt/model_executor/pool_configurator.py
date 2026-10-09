@@ -614,6 +614,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
+class FlashLoopPoolConfigurator(DefaultPoolConfigurator):
+    """Account for packed recurrent streams and per-request BF16 tails."""
+
+    def __init__(self, kvc):
+        super().__init__(kvc)
+        from sglang.srt.mem_cache.flashloop_pool import bytes_per_token, fixed_bytes
+
+        heads = kvc.model_config.get_num_kv_heads(1)
+        dims = kvc.model_config.head_dim
+        layers = kvc.layer_info.num_effective_layers
+        self._cell_size = bytes_per_token(heads, dims, layers)
+        self._fixed_bytes = fixed_bytes(
+            heads, dims, layers, get_schedule().max_running_requests
+        )
+
+    def calculate_pool_sizes(self, available_bytes, page_size):
+        return super().calculate_pool_sizes(
+            max(0, available_bytes - self._fixed_bytes), page_size
+        )
+
+
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """Splits memory between the full and SWA pools of MHA/MLA sliding-window models."""
 
@@ -1617,5 +1638,11 @@ def create_memory_pool_configurator(
         if SWARequestCapPoolConfigurator.is_applicable(kvc):
             return SWARequestCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if kvc.model_config.hf_config.architectures == [
+        "FlashLoopOuroForCausalLM"
+    ] and kvc.model_config.hf_config.flashloop_components.get(
+        "kv_residual_quantization", False
+    ):
+        return FlashLoopPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.model_overrides import embedding_gemma2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import ernie45_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import falcon_h1  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import flashloop  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma2_gemma3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gigachat35  # noqa: F401
