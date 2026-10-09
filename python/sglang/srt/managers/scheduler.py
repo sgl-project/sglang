@@ -4399,7 +4399,7 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
-
+                    batch.update_repetition_penalties_from_resolved_inputs()
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
 

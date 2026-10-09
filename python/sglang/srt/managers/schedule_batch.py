@@ -138,6 +138,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import BatchedRepetitionPenalizer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -3509,8 +3510,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
         # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
+        # entry. Non-spec overlap updates repetition penalties from resolved
+        # GPU tokens at forward entry instead.
         last_tokens = [
             req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
             for req in self.reqs
@@ -3523,9 +3524,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
         ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+
+        later_repetition = self.enable_overlap and self.spec_algorithm.is_none()
+        orchestrator = self.sampling_info.penalizer_orchestrator
+
+        for penalizer in orchestrator.penalizers.values():
+            if later_repetition and isinstance(penalizer, BatchedRepetitionPenalizer):
+                continue
+            penalizer.cumulate_output_tokens(latest_output_ids)
+
+    def update_repetition_penalties_from_resolved_inputs(self):
+        if not self.enable_overlap or not self.spec_algorithm.is_none():
+            return
+        orchestrator = self.sampling_info.penalizer_orchestrator
+        penalizer = orchestrator.penalizers.get(BatchedRepetitionPenalizer)
+        if penalizer is None or not penalizer.is_prepared():
+            return
+
+        batch_size = self.batch_size()
+        if self.forward_mode.is_decode():
+            row_start = 0
+            output_ids = self.input_ids[:batch_size]
+        elif self.decoding_reqs:
+            num_decode = len(self.decoding_reqs)
+            row_start = batch_size - num_decode
+            output_ids = self.input_ids[-num_decode:]
+        else:
+            return
+
+        row_indices = torch.arange(
+            row_start, batch_size, dtype=torch.int64, device=output_ids.device
         )
+        penalizer.update_penalties(output_ids, row_indices)
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
