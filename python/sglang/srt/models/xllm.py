@@ -28,6 +28,7 @@
 
 import math
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -1433,15 +1434,7 @@ class XllmDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Determine if this layer is sparse (MoE) or dense
-        mlp_only_layers = getattr(config, "mlp_only_layers", [])
-        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-        if (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
-        ):
-            self.is_layer_sparse = True
-        else:
-            self.is_layer_sparse = False
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         is_mova_config = getattr(config, "num_values", 0) > 0
         is_mova_attention = is_mova_config and layer_id >= config.num_dense_layers
@@ -1475,16 +1468,6 @@ class XllmDecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        # Check neighbors for scatter modes
-        def _is_sparse(lid):
-            if lid < 0 or lid >= config.num_hidden_layers:
-                return False
-            return (lid not in mlp_only_layers) and (
-                config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
-            )
-
-        is_next_layer_sparse = _is_sparse(layer_id + 1)
-
         if self.is_layer_sparse:
             self.mlp = XllmSparseMoeBlock(
                 layer_id=layer_id,
@@ -1506,15 +1489,47 @@ class XllmDecoderLayer(nn.Module):
 
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        # Determine if this layer is sparse (MoE) or dense
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        if (layer_id not in mlp_only_layers) and (
+            config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
+        ):
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        # Check neighbors for scatter modes
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        lid = layer_id + 1
+        if lid < 0 or lid >= config.num_hidden_layers:
+            return False
+        return (lid not in mlp_only_layers) and (
+            config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
         )
 
     def forward(
@@ -1576,6 +1591,7 @@ class XllmModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(XllmDecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = _make_norm(config)
