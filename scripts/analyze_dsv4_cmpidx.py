@@ -35,6 +35,17 @@ def _int(d, k, default=-1):
         return default
 
 
+def _float(d, k, default=None):
+    """Float value of field ``k`` (or ``default`` when missing/unparseable)."""
+    try:
+        v = d.get(k)
+        if v is None or v == "":
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def parse(path):
     """Parse probe lines into field-dicts per tag.
 
@@ -246,6 +257,38 @@ def report_blkx(rows, label, field="blkx", keep=None):
         print(f"     block={b} layer={ly}  hashes={s}")
     if len(div) > MAX_DIFF_SHOWN:
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
+def report_cmpidx_div(rows, cmp_reqs, miss_i):
+    """One best-effort ``[CMPIDX-DIV]`` line after the [CMPIDX] report.
+
+    Uses the existing per-block hashing (``_parse_blkx``) to list the blocks whose
+    hash is not unique across requests (=> divergent), plus the MISS/HIT prefill
+    ``ntok`` from the [CMPIDX] request split.  Skipped when there is no split.
+    """
+    if not rows or not cmp_reqs or miss_i >= len(cmp_reqs):
+        return
+    miss_ntok = cmp_reqs[miss_i]["ntok0"]
+    hit_ntoks = [rq["ntok0"] for i, rq in enumerate(cmp_reqs)
+                 if i != miss_i and rq["ntok0"] is not None]
+    hit_ntok = hit_ntoks[0] if hit_ntoks else None
+    groups = defaultdict(set)
+    for r in rows:
+        if not _is_prefill(r):
+            continue
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r, "blkx").items():
+            groups[(ly, b)].add(h)
+    div = sorted({b for (ly, b), s in groups.items() if len(s) > 1})
+    if not div:
+        blocks_txt = "none"
+    elif len(div) <= 20:
+        blocks_txt = ",".join(str(b) for b in div)
+    else:
+        blocks_txt = str(len(div))
+    first_txt = str(div[0]) if div else "none"
+    print(f"[CMPIDX-DIV] miss={miss_ntok} hit={hit_ntok} "
+          f"divergent_blocks={blocks_txt} first={first_txt}")
 
 
 def report_uniq(rows, label, fields, key="mode"):
@@ -511,6 +554,8 @@ C4STP_RUNBOOK = (
 )
 C4STP_CARRY_POS = tuple(range(16380, 16384))
 C4STP_BLOCK136_STEPS = (17532, 17533, 17534, 17535)
+C4STP_NUM_MAX_POS = 12
+C4STP_NUM_WINDOWS = ((16380, 16384), (17516, 17536))
 
 
 def _c4stp_norm(rec):
@@ -538,6 +583,9 @@ def _c4stp_norm(rec):
         "sloc": sloc,
         "md5": md5,
         "tag": tag,
+        "v0": _float(rec, "v0"),
+        "sum": _float(rec, "sum"),
+        "absmax": _float(rec, "absmax"),
     }
 
 
@@ -616,6 +664,89 @@ def _c4stp_cmp(miss_map, hit_map, pos):
     return "SAME" if a == b else "DIFF"
 
 
+def _c4stp_num_report(miss_recs, hit_recs):
+    """Compact numeric MISS-vs-HIT comparison of the c4-indexer state.
+
+    Additive to ``verdict_c4stp``: for the positions present in BOTH streams it
+    diffs the ``v0``/``sum``/``absmax`` float fields and prints ONE block --
+    header + at most 12 per-position lines (boundary windows first) + the MAG
+    summary + a single landing VERDICT.  Prints ``[C4STP-MAG] no numeric data``
+    when neither side carries numeric fields.
+    """
+
+    def _by_pos(records):
+        out = {}
+        for r in records:
+            slot = out.setdefault(
+                r["pos"], {"v0": None, "sum": None, "absmax": None})
+            for k in ("v0", "sum", "absmax"):
+                if slot[k] is None and r.get(k) is not None:
+                    slot[k] = r[k]
+        return {p: s for p, s in out.items()
+                if any(v is not None for v in s.values())}
+
+    def _sub(a, b):
+        return None if a is None or b is None else a - b
+
+    def _efmt(v):
+        return f"{v:.3e}" if v is not None else "None"
+
+    def _afmt(v):
+        return f"{abs(v):.3e}" if v is not None else "None"
+
+    def _prio(p):
+        for lo, hi in C4STP_NUM_WINDOWS:
+            if lo <= p < hi:
+                return (0, p)
+        return (1, p)
+
+    miss, hit = _by_pos(miss_recs), _by_pos(hit_recs)
+    shared = sorted(set(miss) & set(hit))
+    if not shared:
+        print("[C4STP-MAG] no numeric data")
+        return
+
+    diffs, nzero = [], 0
+    max_dsum = max_dabs = max_dv0 = 0.0
+    for pos in shared:
+        m, h = miss[pos], hit[pos]
+        dsum = _sub(m["sum"], h["sum"])
+        dabs = _sub(m["absmax"], h["absmax"])
+        dv0 = _sub(m["v0"], h["v0"])
+        if dsum is not None:
+            max_dsum = max(max_dsum, abs(dsum))
+        if dabs is not None:
+            max_dabs = max(max_dabs, abs(dabs))
+        if dv0 is not None:
+            max_dv0 = max(max_dv0, abs(dv0))
+        present = [d for d in (dsum, dabs, dv0) if d is not None]
+        if present and any(d != 0.0 for d in present):
+            diffs.append((pos, m, h, dsum, dabs, dv0))
+        else:
+            nzero += 1
+
+    print("===== [C4STP-NUM] miss-vs-hit numeric (paste this) =====")
+    if diffs:
+        diffs.sort(key=lambda t: _prio(t[0]))
+        for pos, m, h, dsum, dabs, dv0 in diffs[:C4STP_NUM_MAX_POS]:
+            print(f"pos={pos} miss_sum={_efmt(m['sum'])} "
+                  f"hit_sum={_efmt(h['sum'])} |dsum|={_afmt(dsum)} "
+                  f"|dabsmax|={_afmt(dabs)} |dv0|={_afmt(dv0)}")
+    else:
+        print(f"pos={min(shared, key=_prio)} identical")
+    print(f"[C4STP-MAG] npos={len(shared)} nzero={nzero} "
+          f"max|dsum|={max_dsum:.3e} max|dabsmax|={max_dabs:.3e} "
+          f"max|dv0|={max_dv0:.3e}")
+    if max_dsum == 0.0 and max_dabs == 0.0 and max_dv0 == 0.0:
+        verdict = "IDENTICAL"
+    elif 0.0 < max_dabs < 1e-3:
+        verdict = "NUMERIC"
+    else:
+        verdict = "LOGIC"
+    print(f"[C4STP-MAG] VERDICT={verdict}")
+    print("===== end =====")
+
+
 def verdict_c4stp(recs):
     """Per-position [C4STP] MISS-vs-HIT verdict + one binary-rule line.
 
@@ -633,6 +764,7 @@ def verdict_c4stp(recs):
     rows = [n for n in (_c4stp_norm(r) for r in recs) if n is not None]
     if not rows:
         print("[C4STP-BINRULE] no C4STP data")
+        print("[C4STP-MAG] no numeric data")
         print(C4STP_RUNBOOK)
         return
     # Focus on the indexer state (idx=1) when the probe emitted it, like [C4ST].
@@ -640,11 +772,14 @@ def verdict_c4stp(recs):
         rows = [r for r in rows if r["idx"] == "1"]
 
     miss_by_tag, hit_by_tag = {}, {}
+    miss_recs_by_tag, hit_recs_by_tag = {}, {}
     for tag in ("pre", "post"):
         pool = [r for r in rows if r["tag"] == tag]
         miss, hit = _c4stp_sides(pool) if pool else ([], [])
         miss_by_tag[tag] = _c4stp_by_pos(miss)
         hit_by_tag[tag] = _c4stp_by_pos(hit)
+        miss_recs_by_tag[tag] = miss
+        hit_recs_by_tag[tag] = hit
 
     # The tag that actually pairs positions (prefer post = committed state).
     def _pairs(tag):
@@ -699,6 +834,7 @@ def verdict_c4stp(recs):
     first_txt = "NONE" if first_diff_step is None else str(first_diff_step)
     print(f"[C4STP-BINRULE] carry={carry} "
           f"first_commit_diff_step={first_txt} verdict={verdict}")
+    _c4stp_num_report(miss_recs_by_tag[tag], hit_recs_by_tag[tag])
     print(C4STP_RUNBOOK)
 
 
@@ -777,6 +913,7 @@ def main(path):
         if tag == "CMPIDX":
             print("\n== [CMPIDX] c4-indexer top-k (per-c128-block, prefill) ==")
             report_blkx(rows, "CMPIDX", keep=_is_prefill)
+            report_cmpidx_div(rows, cmp_reqs, miss_i)
             # fall through to the whole-tensor segment compare below as well
         if tag == "IDXK":
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
