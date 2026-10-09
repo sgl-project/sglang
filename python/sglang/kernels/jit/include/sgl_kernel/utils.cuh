@@ -86,6 +86,7 @@ inline constexpr auto cudaSuccess = musaSuccess;
 #define cudaGetLastError musaGetLastError
 #define cudaLaunchKernel musaLaunchKernel
 #define cudaLaunchKernelEx musaLaunchKernelEx
+#define cudaSetDevice musaSetDevice
 #define cudaMemcpy musaMemcpy
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
@@ -103,6 +104,10 @@ inline constexpr auto cudaSuccess = musaSuccess;
 #define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
 #define cudaFuncSetAttribute musaFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout musaFuncAttributePreferredSharedMemoryCarveout
+#define cudaSharedmemCarveoutDefault musaSharedmemCarveoutDefault
+#define cudaSharedmemCarveoutMaxL1 musaSharedmemCarveoutMaxL1
+#define cudaSharedmemCarveoutMaxShared musaSharedmemCarveoutMaxShared
 #endif
 
 namespace sglang {
@@ -435,12 +440,18 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
     return static_cast<uint32_t>(blocks);
   };
-#if defined(USE_ROCM) || defined(USE_MUSA)
+#if defined(USE_ROCM)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
   // The attribute and the occupancy query both act on the current device.
+#if !defined(USE_MUSA)
   tvm::ffi::CUDADeviceGuard guard(device_id);
+#else
+  int previous_device = -1;
+  RuntimeDeviceCheck(::cudaGetDevice(&previous_device));
+  if (device_id >= 0 && previous_device != device_id) RuntimeDeviceCheck(::cudaSetDevice(device_id));
+#endif
   const auto set_carveout = [&](int pct) {
     RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, pct));
   };
@@ -449,7 +460,12 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
   RuntimeCheck(occupancy > 0, "kernel does not fit on an SM");
   for (int pct = cudaSharedmemCarveoutMaxL1;; ++pct) {
     set_carveout(pct);
-    if (const uint32_t now = blocks_per_sm(); now >= occupancy) return {pct, now};
+    if (const uint32_t now = blocks_per_sm(); now >= occupancy) {
+#if defined(USE_MUSA)
+      if (device_id >= 0 && previous_device != device_id) RuntimeDeviceCheck(::cudaSetDevice(previous_device));
+#endif
+      return {pct, now};
+    }
     RuntimeCheck(pct < cudaSharedmemCarveoutMaxShared, "no carveout restores occupancy ", occupancy);
   }
 #endif
@@ -618,15 +634,10 @@ struct LaunchKernel {
   // Memo hit after load-time configure(); stream-constructed launches use the current device.
   template <typename T>
   void apply_prefer_l1(T&& kernel) const {
-#if !defined(USE_MUSA)
     int device_id = m_device_id;
     if (device_id < 0) RuntimeDeviceCheck(::cudaGetDevice(&device_id));
     const dim3 block = m_config.blockDim;
     ensure_prefer_l1(+kernel, device_id, block.x * block.y * block.z, m_config.dynamicSmemBytes);
-#else
-    (void)kernel;
-    return;
-#endif
   }
 
   cudaLaunchConfig_t m_config;
