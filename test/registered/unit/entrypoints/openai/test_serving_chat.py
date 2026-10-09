@@ -1804,6 +1804,27 @@ class ServingChatTestCase(CustomTestCase):
             self.assertNotIn("CUSTOM_STOP", result2.stop)
             self.assertEqual(conv_ins.stop_str, initial_stop_str)
 
+    def test_request_stop_merges_with_str_and_tuple_template_stop_str(self):
+        """A request stop is added to a template stop_str that is a str
+        (phi-4-mm) or a tuple (minicpmv) instead of raising AttributeError."""
+        cases = [
+            ("phi-4-mm", ["<|end|>"]),
+            ("minicpmv", ["<|im_end|>", "<|endoftext|>"]),
+        ]
+        for template_name, template_stop in cases:
+            self.template_manager.chat_template_name = template_name
+            for stop, extra in [("STOP", ["STOP"]), (["A", "B"], ["A", "B"])]:
+                with self.subTest(template=template_name, stop=stop):
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        stop=stop,
+                    )
+                    result = self.chat._apply_conversation_template(
+                        req, is_multimodal=True
+                    )
+                    self.assertEqual(result.stop, template_stop + extra)
+
     def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 

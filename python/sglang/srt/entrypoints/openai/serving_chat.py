@@ -1903,6 +1903,8 @@ class OpenAIServingChat(OpenAIServingBase):
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
         if request.stop:
+            # stop_str may be a str or a tuple, which cannot be extended in place.
+            stop = [stop] if isinstance(stop, str) else list(stop)
             if isinstance(request.stop, str):
                 stop.append(request.stop)
             else:
