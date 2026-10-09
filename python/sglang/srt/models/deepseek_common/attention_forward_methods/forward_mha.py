@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
@@ -114,13 +115,7 @@ def forward_dsa_indexer_for_mha(
     if topk_indices is None:
         raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
 
-    select = spec_info.dsa_seed_topk_select
-    src = topk_indices if select is None else topk_indices[select]
-    backend = resolve_attn_backend(forward_batch)
-    prepare_seed = getattr(backend, "prepare_mtp_seed_indices", None)
-    if prepare_seed is not None:
-        src = prepare_seed(src, forward_batch.forward_mode)
-    seed_buf[: src.shape[0]].copy_(src)
+    write_mtp_seed(forward_batch, seed_buf, topk_indices)
 
 
 # Configs for DeepSeek-V3:
