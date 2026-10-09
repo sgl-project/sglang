@@ -347,16 +347,13 @@ class TestMlxExtendRouting(CustomTestCase):
     def test_async_prefix_hit_reads_slots_from_runner_pool(self):
         """A radix prefix hit takes its slots from the stub runner's pool:
         the worker's own req_to_token_pool is None on MLX."""
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
-
         req_to_token = torch.zeros(2, 8, dtype=torch.int32)
         req_to_token[1, :5] = torch.tensor([11, 12, 13, 14, 15])
-        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker = self._worker(known_rids=set())
         worker.req_to_token_pool = None
         worker._model_runner = SimpleNamespace(
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
         )
-        worker._mlx_runner = _FakeRunner(set())
         req = _FakeReq("r1", req_pool_idx=1)
         req.prefix_len = 3
         batch = _FakeBatch(ForwardMode.EXTEND, [req], [2])
