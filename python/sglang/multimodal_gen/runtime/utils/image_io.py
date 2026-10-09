@@ -44,9 +44,9 @@ def save_base64_image_to_path(
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
-        image_data = base64.b64decode(data)
+        image_data = base64.b64decode(data, validate=True)
     except Exception as exc:
-        raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
+        raise ValueError(f"Failed to decode base64 image: {exc!s}") from exc
 
     with open(target_path, "wb") as f:
         f.write(image_data)
