@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    log_int8_markov_walk_off,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -188,6 +189,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        self._target_tp_size = get_parallel().tp_size
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -516,6 +518,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        if (
+            self._draft_sampler is None
+            and envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.get()
+        ):
+            log_int8_markov_walk_off(
+                tp_rank=self._target_tp_rank,
+                reason="the draft proposal is not folded into the draft cuda graph",
+            )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
@@ -524,8 +534,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            tp_size=self._target_tp_size,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
+            seed=self.target_worker.random_seed,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence

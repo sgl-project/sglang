@@ -553,6 +553,9 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
+    # Walk a vanilla rank-256 markov head with the fused int8 kernels in the folded
+    # draft graph (sm_90, TP1); near-tie draft tokens can differ from the bf16 walk.
+    SGLANG_DSPARK_OPT_INT8_MARKOV_WALK = EnvBool(False)
     # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast
