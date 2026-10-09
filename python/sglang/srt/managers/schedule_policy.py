@@ -7,6 +7,7 @@ from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -66,7 +68,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.common import match_kv_cache
+from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -127,6 +129,11 @@ if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
         PREFILL_TILE_BUDGET_MODE,
     )
     PREFILL_TILE_BUDGET_MODE = "compact"
+
+# Arbitrary; bounds per-round prefix work on the waiting queue.
+WAITING_QUEUE_PREFIX_MATCH_MAX = 128
+# Arbitrary; bounds the walk cost of touching waiting prefixes.
+WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -195,6 +202,7 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
+        self._last_waiting_prefix_refresh = float("-inf")
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -222,9 +230,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return
-
-        if isinstance(policy, CacheAwarePolicy):
+        elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -268,6 +274,28 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
+        self._touch_waiting_prefixes(policy, waiting_queue)
+
+    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+        # Head last, so LRU evicts in reverse admission order; cache-aware policies
+        # already touch while matching, and other eviction strategies ignore recency.
+        if (
+            isinstance(policy, CacheAwarePolicy)
+            or not waiting_queue
+            or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
+            or get_disagg().disaggregation_mode == "decode"
+            or get_memory().radix_eviction_policy.lower() != "lru"
+            or self.tree_cache.supports_fast_match_prefix()
+            or not self.tree_cache.supports_prefix_sharing()
+        ):
+            return
+        now = time.monotonic()
+        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
+            return
+        self._last_waiting_prefix_refresh = now
+        for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
+            touch_waiting_prefix(r, self.tree_cache)
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
             self.policy
@@ -275,7 +303,7 @@ class SchedulePolicy:
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
             )
-            and len(waiting_queue) > 128
+            and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
@@ -768,10 +796,9 @@ class PrefillAdder:
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state, plus the node slot a host hit loads into. Charged only on the
-        SHARED Mamba pool (`_mamba_slot_cost > 0`) and only when the req has no
-        state yet (`mamba_pool_idx is None`, mirroring `HybridReqToTokenPool.alloc`);
-        0 keeps baseline / SWA / non-Mamba unchanged.
+        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
+        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
+        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
 
         Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
         radix COW headroom or locked-but-evictable bytes — that residual is
@@ -779,7 +806,7 @@ class PrefillAdder:
         over-admission crashes under pressure, make this more conservative (e.g.
         also account for missing tracking buffers)."""
         if self._mamba_slot_cost and not req.kv.holds_mamba:
-            return (1 + req.mamba_host_hit_length) * self._mamba_slot_cost
+            return self._mamba_slot_cost
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -843,10 +870,10 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
         )
-        # Each new mamba slot also consumes one mamba-recoverable slot (gated
+        # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= mamba_gap_reserve // self._mamba_slot_cost
+            self.rem_mamba_slots -= 1
         self.rem_input_tokens -= compute_charge
 
         if self.dllm_config is not None:
@@ -1292,16 +1319,6 @@ class PrefillAdder:
         # this returns 0, so the debit sites below reuse the value.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
         total_tokens += mamba_gap_reserve
-        # budget_state only checks one slot is left; a host hit needs two.
-        if (
-            mamba_gap_reserve
-            and self.rem_mamba_slots is not None
-            and mamba_gap_reserve // self._mamba_slot_cost > self.rem_mamba_slots
-        ):
-            pipeline = getattr(self.tree_cache, "buffer_pipeline", None)
-            if pipeline is not None:
-                pipeline.defer_staged_admission(req, pool="mamba")
-            return AddReqResult.NO_TOKEN
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.

@@ -86,9 +86,10 @@ class _UnifiedBackupIntent(msgspec.Struct):
 
     Snapshots node identity at enqueue time: a split rewrites the node's
     key/hash in place while these copies stay intact, so a key-length change
-    detects a split and a missing FULL device value detects eviction
-    (``_validate_backup_intent``). ``keys`` is the admission view (it sizes
-    drop metrics); the D2H launch re-reads rows and keys off the node.
+    detects a split (repaired during queue refresh) and a missing FULL device
+    value detects eviction (``_validate_backup_intent``). ``keys`` is the
+    admission view (it sizes drop metrics); the D2H launch re-reads rows and
+    keys off the node.
     """
 
     snapshot: BufferBackupSnapshot
@@ -703,53 +704,110 @@ class BufferModePipeline:
             need = len(t.keys) * entry.host_pool.page_size
             if entry.host_pool is anchor_pool:
                 anchor_need += need
-            elif need > entry.host_pool.size - self._aux_loads_margin(
-                t.name, entry.host_pool
-            ):
+            elif need > entry.host_pool.size - self._aux_loads_margin(entry.host_pool):
                 return True
         return anchor_need > cc.mem_pool_host.size
 
-    def _aux_loads_margin(self, pool: PoolName, host_pool) -> int:
-        """Aux-pool tokens reserved for loads: at least one prefetch
-        allocation (an SWA trailing window, else one page; a failed alloc
+    def _aux_loads_margin(self, host_pool) -> int:
+        """Aux-pool tokens reserved for loads: at least one trailing window
+        (prepare_prefetch allocates its window here and a failed alloc
         forfeits the whole prefetch), plus a 10% burst absorber mirroring
         live_cap."""
-        one_prefetch = self._swa_window_pages if pool == PoolName.SWA else 1
-        return max(one_prefetch * host_pool.page_size, host_pool.size // 10)
+        return max(
+            self._swa_window_pages * host_pool.page_size,
+            host_pool.size // 10,
+        )
 
     def _validate_backup_intent(
         self, intent: _UnifiedBackupIntent
     ) -> Optional[BufferBackupState]:
         # Arena-lookup failure = deleted, key-length mismatch vs the snapshot
-        # = split, a None FULL device value = evicted. Stale
-        # intents are counted as dropped; the node re-triggers on a later hit.
+        # = split, a None FULL device value = evicted.
         snapshot = intent.snapshot
         return self._cache.tree_core.validate_buffer_backup(
             snapshot.node_id, len(snapshot.key)
         )
 
-    def _sweep_stale_backup_intents(self) -> dict[NodeId, BufferBackupState]:
-        """Cancel stale intents anywhere in the queue, not just at the head:
-        a dead intent would otherwise inflate the backlog accounting and
-        hold FIFO position ahead of live segments."""
+    def _split_pieces(
+        self, snapshot: BufferBackupSnapshot
+    ) -> Optional[list[BufferBackupSnapshot]]:
+        """Resolve a split span, parents first, or return None if it is gone.
+
+        The original node retains the tail; its ancestors must cover exactly
+        the admitted span and end at the original parent.
+        """
+        tree_core = self._cache.tree_core
+        pass_prefix_keys = self._cache.hicache_storage_pass_prefix_keys
+        pieces: list[BufferBackupSnapshot] = []
+        node_id, remaining = snapshot.node_id, len(snapshot.key)
+        while remaining > 0:
+            piece = tree_core.snapshot_buffer_backup(node_id, pass_prefix_keys)
+            if piece is None or len(piece.key) > remaining:
+                return None
+            pieces.append(piece)
+            remaining -= len(piece.key)
+            node_id = piece.parent_node_id
+        if node_id != snapshot.parent_node_id:
+            return None
+        pieces.reverse()
+        return pieces
+
+    def _refresh_pending_backup_intents(self) -> dict[NodeId, BufferBackupState]:
+        """Drop dead spans and replace split intents in FIFO order.
+
+        The earliest intent for each (node, pool) wins, including split pieces.
+        """
         if not self.pending_write_queue:
             return {}
         page_size = self._cache.page_size
-        survivors: deque[_UnifiedBackupIntent] = deque()
+        queued = {(i.snapshot.node_id, i.pool) for i in self.pending_write_queue}
+        survivors: dict[tuple[NodeId, PoolName], _UnifiedBackupIntent] = {}
         states: dict[NodeId, BufferBackupState] = {}
         swept_tokens = 0
         for intent in self.pending_write_queue:
             snapshot = intent.snapshot
-            state = self._validate_backup_intent(intent)
-            if state is None:
-                self._finish_inflight(snapshot.node_id, intent.pool)
-                intent_tokens = len(intent.keys) * page_size
+            key = (snapshot.node_id, intent.pool)
+            if key in survivors:
+                # The replacement retains this intent's inflight ownership.
                 self._release_queued_span(intent)
-                swept_tokens += intent_tokens
                 continue
-            survivors.append(intent)
-            states[snapshot.node_id] = state
-        self.pending_write_queue = survivors
+            state = self._validate_backup_intent(intent)
+            if state is not None:
+                survivors[key] = intent
+                states[snapshot.node_id] = state
+                continue
+            self._finish_inflight(snapshot.node_id, intent.pool)
+            self._release_queued_span(intent)
+            pieces = self._split_pieces(snapshot)
+            if pieces is None:
+                swept_tokens += len(intent.keys) * page_size
+                continue
+            for piece in pieces:
+                key = (piece.node_id, intent.pool)
+                if key in survivors:
+                    continue
+                if (
+                    intent.pool in self.inflight_backup_pools.get(piece.node_id, ())
+                    and key not in queued
+                ):
+                    continue  # staged or awaiting its storage ack
+                keys = dict(self._write_intents(piece)).get(intent.pool)
+                if not keys:
+                    continue  # covered since admission
+                repaired = _UnifiedBackupIntent(
+                    snapshot=piece, pool=intent.pool, keys=list(keys)
+                )
+                survivors[key] = repaired
+                states[piece.node_id] = BufferBackupState(
+                    parent_node_id=piece.parent_node_id,
+                    parent_is_root=piece.parent_is_root,
+                    parent_last_hash=piece.parent_last_hash,
+                )
+                self.inflight_backup_pools.setdefault(piece.node_id, set()).add(
+                    intent.pool
+                )
+                self._retain_queued_span(repaired)
+        self.pending_write_queue = deque(survivors.values())
         self._log_backup_dropped(swept_tokens)
         return states
 
@@ -764,7 +822,7 @@ class BufferModePipeline:
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
-        states = self._sweep_stale_backup_intents()
+        states = self._refresh_pending_backup_intents()
         # Loads have priority (writes are deferrable): the write window is
         # the pool minus prefetch occupancy minus a 10% margin, floored at
         # the configured fraction.
@@ -998,7 +1056,7 @@ class BufferModePipeline:
                 continue
             need = len(t.keys) * entry.host_pool.page_size
             headroom = entry.host_pool.available_size() - self._aux_loads_margin(
-                t.name, entry.host_pool
+                entry.host_pool
             )
             if need > headroom:
                 return True
@@ -1284,44 +1342,11 @@ class BufferModePipeline:
         return True
 
     def _drop_staged_hit(self, req: Req, reason: str) -> None:
-        req.staged_prefetch_plan = None
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason=reason)
-
-    def defer_staged_admission(self, req: Req, *, pool: str) -> None:
-        """Retry a staged hit the device cannot take yet, a bounded number of
-        times, then drop it so the request recomputes."""
-        request = req.cache_request_handle
-        f = self.staged_prefetches.get(request)
-        if f is None:
-            return
-        defers = self._staged_admission_defers.get(request, 0) + 1
-        self._staged_admission_defers[request] = defers
-        self._cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
-        if defers < self.max_staged_admission_defers:
-            logger.warning(
-                "HiCache staged prefetch deferred at admission req=%s "
-                "reason=device_capacity pool=%s tokens=%d defers=%d",
-                req.rid,
-                pool,
-                f.num_tokens,
-                defers,
-            )
-            return
-        # Still unmaterializable: drop the hold so the admission loop stops
-        # breaking on this request, which recomputes on its next pass.
-        logger.warning(
-            "HiCache staged prefetch dropped after %d device_capacity "
-            "deferrals req=%s pool=%s tokens=%d",
-            defers,
-            req.rid,
-            pool,
-            f.num_tokens,
-        )
-        self._drop_staged_hit(req, reason="device_capacity")
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1456,6 +1481,33 @@ class BufferModePipeline:
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
+        def _defer_for_capacity(pool: str) -> None:
+            defers = self._staged_admission_defers.get(request, 0) + 1
+            self._staged_admission_defers[request] = defers
+            cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
+            if defers < self.max_staged_admission_defers:
+                logger.warning(
+                    "HiCache staged prefetch deferred at admission req=%s "
+                    "reason=device_capacity pool=%s tokens=%d defers=%d",
+                    req.rid,
+                    pool,
+                    f.num_tokens,
+                    defers,
+                )
+                return
+            # Still unmaterializable: drop the hold so the admission loop stops
+            # breaking on this request, which recomputes on its next pass.
+            logger.warning(
+                "HiCache staged prefetch dropped after %d device_capacity "
+                "deferrals req=%s pool=%s tokens=%d",
+                defers,
+                req.rid,
+                pool,
+                f.num_tokens,
+            )
+            self.release_staged_hold(request, reason="device_capacity")
+            req.staged_prefetch_plan = None
+
         splice_base = plan.device_prefix_len
         assert req.prefix_len == splice_base
         prefix_indices = self._cache.prefix_device_indices(req)
@@ -1483,7 +1535,7 @@ class BufferModePipeline:
             else:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < load_tokens:
-                return self.defer_staged_admission(req, pool="full")
+                return _defer_for_capacity("full")
 
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
@@ -1503,9 +1555,7 @@ class BufferModePipeline:
             if share is None:
                 for prepared in shares:
                     prepared.finish(success=False)
-                return self.defer_staged_admission(
-                    req, pool=component.component_type.name.lower()
-                )
+                return _defer_for_capacity(component.component_type.name.lower())
             shares.append(share)
             # Not staging, so these stay out of the aux_xfers the ack frees.
             load_xfers.extend(share.load_xfers)
@@ -1565,7 +1615,7 @@ class BufferModePipeline:
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
-            return self.defer_staged_admission(req, pool="full_or_aux")
+            return _defer_for_capacity("full_or_aux")
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None

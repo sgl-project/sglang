@@ -733,21 +733,6 @@ class MambaComponent(TreeComponent):
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
 
-    def validate_buffer_mode(self) -> None:
-        host = self._mamba_pool_host
-        if host is None or host.size < 2:
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only on Mamba models needs a "
-                "Mamba host staging pool of at least two state slots (got "
-                f"{0 if host is None else host.size}): one staging a write "
-                "while one stays in the loads reserve."
-            )
-        if self.int8_ckpt_pool is not None:
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only does not support int8 "
-                "Mamba checkpoints: the load-back restores into a raw state slot."
-            )
-
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
     ) -> Optional[BufferLoadBack]:
