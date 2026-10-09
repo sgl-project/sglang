@@ -25,6 +25,12 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    cp_shard_position_ids,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
@@ -1434,6 +1440,17 @@ def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
+def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
+    """A CP extend under CP-TP group sharing: every layer runs on this rank's
+    zigzag token rows, and the GDN and the PLE gather the sequence in global
+    token order where they need it. The batch metadata stays global."""
+    return (
+        get_parallel().enable_cp_tp_group_sharing
+        and forward_batch.attn_cp_metadata is not None
+        and is_cp_active(forward_batch)
+    )
+
+
 def _ffn_exit_rows(layer_id, config):
     """A PLE layer's read adds an embedding computed for every row, so the FFN
     before it hands its output on as full attention rows."""
@@ -1559,6 +1576,12 @@ class Qwen4ExpLayerExtensionMixin:
                 raise RuntimeError("non-idle Qwen4 PLE forward is missing its batch")
             self.ple.forward_idle(forward_batch)
             return residual
+        if _shards_rows_over_cp(forward_batch):
+            # The n-gram window and the short conv read the sequence in global
+            # token order: run on the gathered rows, keep this rank's rows.
+            full_rows = cp_gather_after_forward(residual, forward_batch)
+            embedding = self.ple(full_rows, forward_batch, ple_batch)
+            return residual + cp_shard_hidden_states(embedding, forward_batch)
         return residual + self.ple(residual, forward_batch, ple_batch)
 
     def _prepare_attn_stage(
@@ -1628,7 +1651,17 @@ class Qwen4ExpLinearDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
+            shards_rows = _shards_rows_over_cp(forward_batch)
+            if shards_rows:
+                # The gated delta rule scans the sequence in global token order.
+                hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
             hidden_states = self.linear_attn(hidden_states, forward_batch)
+            if get_parallel().enable_cp_tp_group_sharing:
+                # The heads are partitioned over the TP group while attention
+                # TP is 1, so the boundary owes no sum: add the partials here.
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            if shards_rows:
+                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
@@ -1676,6 +1709,7 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             return _breakable_qsa_indexer(
@@ -1685,6 +1719,7 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            cp_global_positions=cp_global_positions,
         )
 
     def _compute_qsa_topk_indices_eager(
@@ -1694,6 +1729,7 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         *,
         use_host_prefill_lengths: bool = False,
+        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1719,11 +1755,17 @@ class Qwen4ExpAttentionDecoderLayer(
                     forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
                 ),
             )
+        indexer_kwargs = {}
+        if cp_global_positions is not None:
+            # Prefill CP: this rank's rows select against the index keys of the
+            # whole sequence, gathered in global token order.
+            indexer_kwargs["cp_global_rope_positions"] = cp_global_positions
         topk_indices = self.indexer(
             hidden_states,
             positions,
             forward_batch,
             indexer_metadata,
+            **indexer_kwargs,
         )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
@@ -1739,6 +1781,7 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         overlap_indexer = (
             self.is_qsa
@@ -1773,7 +1816,7 @@ class Qwen4ExpAttentionDecoderLayer(
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
-                hidden_states, positions, forward_batch
+                hidden_states, positions, forward_batch, cp_global_positions
             )
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
@@ -1804,6 +1847,7 @@ class Qwen4ExpAttentionDecoderLayer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                cp_global_positions=kwargs.get("cp_global_positions"),
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1891,6 +1935,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 pp_proxy_tensors, forward_batch
             )
 
+        cp_global_positions = None
+        if _shards_rows_over_cp(forward_batch):
+            cp_global_positions = positions
+            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+            positions = cp_shard_position_ids(positions, forward_batch)
+
         breakable_ple = (
             self.has_ple
             and is_in_breakable_cuda_graph()
@@ -1928,6 +1978,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    cp_global_positions=cp_global_positions,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1952,6 +2003,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self._mix_streams
         )
+        if cp_global_positions is not None:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            # Only hidden-state capture reads the streams; gather them for it.
+            capture = forward_batch.capture_hidden_mode
+            hc_hidden_states = (
+                cp_gather_after_forward(hc_hidden_states, forward_batch)
+                if capture is not None and capture.need_capture()
+                else None
+            )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 

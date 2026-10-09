@@ -87,9 +87,12 @@ def _reduce_results_names(tree) -> set:
 def _unguarded_sums(source: str):
     """Sum calls not under ``if ... self.reduce_results ...``: such a branch is
     a shared class built without stage boundaries by another model. Sums inside
-    a vocabulary-parallel embedding complete its lookup, not a stage output."""
+    a vocabulary-parallel embedding complete its lookup, not a stage output.
+    Nor under ``if ... enable_cp_tp_group_sharing ...``: there linear attention
+    partitions its heads over the TP group while attention TP is 1, so the
+    boundary owes no sum and the layer completes the partition's own."""
     found = []
-    guards = _reduce_results_names(ast.parse(source))
+    guards = _reduce_results_names(ast.parse(source)) | {"enable_cp_tp_group_sharing"}
 
     def visit(node, guarded):
         if _is_vocab_parallel(node):
