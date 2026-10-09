@@ -2050,8 +2050,8 @@ class CommonKVSender(BaseKVSender):
         ):
             self._transfer_start_time = time.perf_counter()
 
-        # The early-send event belongs to exactly one chunk. Mori consumes it
-        # in its worker before RDMA; other backends do not use this extension.
+        # The early-send event belongs to exactly one chunk; the Mooncake and
+        # Mori workers synchronize on it before reading source KV.
         wait_event = self._early_send_wait_event
         self._early_send_wait_event = None
         self.kv_mgr.add_transfer_request(

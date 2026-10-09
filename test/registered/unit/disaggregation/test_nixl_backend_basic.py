@@ -1481,7 +1481,7 @@ class ReloadFakeAgent:
             raise RuntimeError("NIXL_ERR_NOT_FOUND")
         return name, self.sections.get(name)
 
-    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif):
+    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif=b""):
         name, generation = dst
         if generation != self.sections.get(name):
             raise RuntimeError("NIXL_ERR_NOT_FOUND")
@@ -1579,8 +1579,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr._staging_outstanding = defaultdict(int)
         mgr._deferred_ack_targets = {}
         mgr._deferred_ack_poisoned_rooms = set()
-        mgr.transfer_source_rank = 0
-        mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
         mgr.send_kv_status_message = MagicMock()
@@ -1611,7 +1609,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 prefill_kv_indices=np.array([1], dtype=np.int32),
                 index_slice=slice(0, 1),
                 is_last_chunk=True,
-                chunk_id=0,
                 prefill_aux_index=0,
                 state_indices=None,
             )
@@ -1651,7 +1648,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             mgr.decode_kv_args_table["dropped"].dst_kv_ptrs,
             np.array([2], dtype=np.int32),
             0,
-            "notif",
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
