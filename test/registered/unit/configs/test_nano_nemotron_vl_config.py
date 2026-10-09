@@ -8,7 +8,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestNemotronHOmniConfig(CustomTestCase):
@@ -45,6 +45,15 @@ class TestNemotronHOmniConfig(CustomTestCase):
             llm_config["layers_block_type"],
             ["linear_attention", "moe", "full_attention"],
         )
+
+    def test_text_config_resolves_to_the_language_model_config(self):
+        """get_text_config() returns llm_config, which LoRAManager sizes from."""
+        config = NemotronH_Omni_Reasoning_V3_Config(
+            vision_config={"args": {"model": "radio"}},
+            llm_config={},
+        )
+
+        self.assertIs(config.get_text_config(), config.llm_config)
 
 
 if __name__ == "__main__":
