@@ -158,32 +158,78 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
-def get_deep_gemm_prefill_data(
-    inputs: PrefillInputs, req_to_token: torch.Tensor
-) -> Optional[DeepGEMMPrefillData]:
-    """None when the chunk has no row or no visible compressed position."""
+# Per compress ratio, the step-level part of the prefill data. The step's page table
+# (held, so its identity cannot be reused) changes every step; positions arrive as
+# fresh views of one buffer, so they key by address and length.
+_step_rows_cache: dict = {}
+
+
+def _step_rows(inputs: PrefillInputs, req_to_token: torch.Tensor):
+    """The prefill data's row and column plumbing; it depends on the step and the
+    ratio only, so every index layer of a step can share it."""
+    from sglang.srt.environ import envs
+
     ratio = inputs.compress_ratio
     pos = inputs.positions
-    assert (
-        inputs.seq_lens_cpu is not None
-        and inputs.rows_per_request is not None
-        and inputs.rows_per_request_device is not None
-    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
+    cached = _step_rows_cache.get(ratio)
+    if (
+        cached is not None
+        and cached[0] is inputs.kv_page_table
+        and cached[1] == (pos.data_ptr(), pos.shape[0])
+        and cached[2] is inputs.req_pool_indices
+    ):
+        return cached[3]
     device = pos.device
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
     lens_per_request = [s // ratio for s in inputs.seq_lens_cpu]
     columns = sum(lens_per_request)
     num_tokens = pos.shape[0]
     if columns == 0 or num_tokens == 0:
+        rows = None
+    else:
+        starts = list(itertools.accumulate(lens_per_request, initial=0))[:-1]
+        lens = async_h2d(lens_per_request, dtype=torch.int64, device=device)
+        starts_dev = async_h2d(starts, dtype=torch.int64, device=device)
+        request = torch.repeat_interleave(
+            torch.arange(len(lens_per_request), device=device),
+            lens,
+            output_size=columns,
+        )
+        position = torch.arange(columns, device=device) - starts_dev[request]
+        pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
+        rows = dict(
+            k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
+            request_starts=torch.repeat_interleave(
+                starts_dev.to(torch.int32),
+                inputs.rows_per_request_device.to(torch.int64),
+                output_size=num_tokens,
+            ),
+            lens_per_request=lens_per_request,
+            compress_lens=((pos + 1) // ratio).to(torch.int32),
+        )
+    if envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get():
+        _step_rows_cache[ratio] = (
+            inputs.kv_page_table,
+            (pos.data_ptr(), pos.shape[0]),
+            inputs.req_pool_indices,
+            rows,
+        )
+    return rows
+
+
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs, req_to_token: torch.Tensor
+) -> Optional[DeepGEMMPrefillData]:
+    """None when the chunk has no row or no visible compressed position."""
+    pos = inputs.positions
+    assert (
+        inputs.seq_lens_cpu is not None
+        and inputs.rows_per_request is not None
+        and inputs.rows_per_request_device is not None
+    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
+    rows = _step_rows(inputs, req_to_token)
+    if rows is None:
         return None
-    starts = list(itertools.accumulate(lens_per_request, initial=0))[:-1]
-    lens = async_h2d(lens_per_request, dtype=torch.int64, device=device)
-    starts_dev = async_h2d(starts, dtype=torch.int64, device=device)
-    request = torch.repeat_interleave(
-        torch.arange(len(lens_per_request), device=device), lens, output_size=columns
-    )
-    position = torch.arange(columns, device=device) - starts_dev[request]
-    pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
     q_fp4, q_sf, weights = _index_q_and_weights(
         indexer=inputs.indexer,
         x=inputs.x,
@@ -192,15 +238,8 @@ def get_deep_gemm_prefill_data(
         positions=pos,
     )
     return DeepGEMMPrefillData(
-        k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
-        request_starts=torch.repeat_interleave(
-            starts_dev.to(torch.int32),
-            inputs.rows_per_request_device.to(torch.int64),
-            output_size=num_tokens,
-        ),
-        lens_per_request=lens_per_request,
+        **rows,
         rows_per_request=inputs.rows_per_request,
-        compress_lens=((pos + 1) // ratio).to(torch.int32),
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
