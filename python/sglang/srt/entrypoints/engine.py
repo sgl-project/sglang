@@ -1043,6 +1043,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(worker_ipc_names, server_args, port_args),
+            kwargs={"enable_metrics": get_observability().enable_metrics},
         )
         router_proc.start()
         processes.append(router_proc)

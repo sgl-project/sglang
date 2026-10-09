@@ -1,14 +1,18 @@
 import unittest
+from contextlib import suppress
+from unittest import mock
 
 import numpy as np
+from prometheus_client import CollectorRegistry, Counter
 
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
@@ -100,7 +104,52 @@ def _make_batch_str_output() -> BatchStrOutput:
     )
 
 
-class TestMultiTokenizerMixin(unittest.TestCase):
+class TestMultiTokenizerMixin(CustomTestCase):
+    def test_router_cpu_metric_is_exported_only_when_enabled(self):
+        """Router CPU usage must be observable without opting disabled servers in."""
+        for enabled in (False, True):
+            with self.subTest(enable_metrics=enabled):
+                registry = CollectorRegistry()
+                with (
+                    mock.patch.multiple(
+                        multi_tokenizer_mixin,
+                        kill_itself_when_parent_died=mock.DEFAULT,
+                        configure_logger=mock.DEFAULT,
+                        MultiDetokenizerRouter=mock.DEFAULT,
+                    ),
+                    mock.patch("setproctitle.setproctitle"),
+                    mock.patch("psutil.Process") as process,
+                    mock.patch("threading.Thread") as thread,
+                    mock.patch("time.sleep", side_effect=[None, SystemExit]),
+                    mock.patch(
+                        "prometheus_client.Counter",
+                        side_effect=lambda **kwargs: Counter(
+                            registry=registry, **kwargs
+                        ),
+                    ),
+                ):
+                    process.return_value.cpu_times.side_effect = [
+                        mock.Mock(user=1.0, system=0.5),
+                        mock.Mock(user=2.5, system=1.0),
+                    ]
+
+                    def sample_once():
+                        with suppress(SystemExit):
+                            thread.call_args.kwargs["target"]()
+
+                    thread.return_value.start.side_effect = sample_once
+                    multi_tokenizer_mixin.run_multi_detokenizer_router_process(
+                        [], None, None, enable_metrics=enabled
+                    )
+
+                self.assertEqual(
+                    registry.get_sample_value(
+                        "sglang:process_cpu_seconds_total",
+                        {"component": "detokenizer_router"},
+                    ),
+                    2.0 if enabled else None,
+                )
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
