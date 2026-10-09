@@ -169,12 +169,14 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Write the request's MLX state to the pool at the scheduler's radix
+        insert point, while the request still owns its req_to_token row."""
         if self._mlx_runner.has_request(req.rid):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
+            self._mlx_runner.release_request_row(req.rid, req.owned_kv_len())
 
     def _drop_state_if_retracted(self, req: Req) -> None:
         """Drop the MLX state of a request retracted since its state was made.
@@ -186,7 +188,7 @@ class MlxTpModelWorker(TpModelWorker):
         made_at = self._req_retraction_count.get(req.rid)
         if made_at is not None and made_at != req.retraction_count:
             del self._req_retraction_count[req.rid]
-            self._mlx_runner.remove_request(req.rid, sync_kv=False)
+            self._mlx_runner.remove_request(req.rid)
             self._mlx_active_rids.discard(req.rid)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
@@ -458,10 +460,6 @@ class MlxTpModelWorker(TpModelWorker):
             )
 
         if forward_mode.is_extend():
-            # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before pool-backed attention
-            # reads it for prefix-cached prefills. Mirror the sync path.
-            self._mlx_runner.flush_all_decode_kv()
             return self._async_extend_batch(batch)
 
         raise ValueError(

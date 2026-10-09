@@ -65,7 +65,6 @@ class _FakeRunner:
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
         self.prefix_slot_ids: dict[str, list[int]] = {}
-        self.removed_sync_kv: dict[str, bool] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -73,12 +72,8 @@ class _FakeRunner:
     def has_request(self, rid):
         return rid in self._known
 
-    def flush_all_decode_kv(self):
-        pass
-
-    def remove_request(self, rid, sync_kv=True):
+    def remove_request(self, rid):
         self.calls.append(("remove_request", rid))
-        self.removed_sync_kv[rid] = sync_kv
         self._known.discard(rid)
 
     def ops_for(self, rid):
@@ -267,8 +262,8 @@ class TestMlxExtendRouting(CustomTestCase):
     # ---------- retraction ----------
 
     def test_retracted_request_reprefills_from_scratch(self):
-        """A request retracted after its MLX state was made drops that state
-        without a pool sync, so its re-prefill routes as a fresh prefill."""
+        """A request retracted after its MLX state was made drops that state,
+        so its re-prefill routes as a fresh prefill."""
         worker = self._worker(known_rids=set())
         req = _FakeReq("r1")
         worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
@@ -276,7 +271,6 @@ class TestMlxExtendRouting(CustomTestCase):
 
         req.retraction_count += 1
         worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
-        self.assertEqual(worker._mlx_runner.removed_sync_kv, {"r1": False})
         self.assertEqual(
             worker._mlx_runner.ops_for("r1"),
             ["prefill_start", "remove_request", "prefill_start"],
