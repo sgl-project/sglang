@@ -484,13 +484,13 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         del hidden_states
-        latent = self.get_prev_embeddings(token_ids)
+        latent = self.get_prev_embeddings(prev_tokens)
         shard = self._tp_shard
         if shard is None:
             return self.project_bias(latent), state
@@ -498,7 +498,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             shard.org_vocab_start : shard.org_vocab_end
         ]
         if self._opt_markov_w2_bf16:
-            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
+            # Keep the bias in BF16; the step add upcasts it to FP32.
             return F.linear(latent.to(weight_local.dtype), weight_local), state
         return F.linear(latent.float(), weight_local), state
 
