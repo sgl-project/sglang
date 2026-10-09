@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, NamedTuple, Optional, Union
 
 import torch
 import triton
@@ -162,6 +162,13 @@ def _quantize_fp8_qkv(q, k, v, layer):
 global_cute_dsl_workspace_buffer = None
 
 
+class HostSeqLens(NamedTuple):
+    """Per-request lengths on the host, for flashinfer's empty-row check."""
+
+    lens: torch.Tensor  # CPU int32, one entry per request
+    total: int  # lens.sum(), precomputed
+
+
 @dataclass
 class TRTLLMMLAPrefillMetadata:
     """Metadata for TRTLLM MLA prefill operations."""
@@ -170,8 +177,7 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
-    # (CPU copy of seq_lens, its sum), for flashinfer's host-side row check.
-    host_seq_lens: Optional[Tuple[torch.Tensor, int]] = None
+    host_seq_lens: Optional[HostSeqLens] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -809,9 +815,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
-                (
-                    torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32),
-                    sum(forward_batch.extend_seq_lens_cpu),
+                HostSeqLens(
+                    lens=torch.tensor(
+                        forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                    ),
+                    total=sum(forward_batch.extend_seq_lens_cpu),
                 ),
             )
         elif (
@@ -1836,22 +1844,21 @@ def _prefix_chunk_host_seq_lens(forward_batch, chunk_idx):
         or forward_batch.prefix_chunk_num_tokens is None
     ):
         return None
-    return (
-        forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
-        forward_batch.prefix_chunk_num_tokens[chunk_idx],
+    return HostSeqLens(
+        lens=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
+        total=forward_batch.prefix_chunk_num_tokens[chunk_idx],
     )
 
 
 def _host_seq_lens(q, k, q_lens, kv_lens):
-    """Host q/kv lengths, as (CPU lengths, total) pairs, let flashinfer skip its
-    empty-row .item() sync. Pass them only when they cover q/k exactly and no
-    graph is being captured."""
+    """Host q/kv lengths let flashinfer skip its empty-row .item() sync. Pass
+    them only when they cover q/k exactly and no graph is being captured."""
     if (
         q_lens is None
         or kv_lens is None
-        or q_lens[1] != q.shape[0]
-        or kv_lens[1] != k.shape[0]
+        or q_lens.total != q.shape[0]
+        or kv_lens.total != k.shape[0]
         or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
     ):
         return {}
-    return {"q_seq_lens_cpu": q_lens[0], "kv_seq_lens_cpu": kv_lens[0]}
+    return {"q_seq_lens_cpu": q_lens.lens, "kv_seq_lens_cpu": kv_lens.lens}

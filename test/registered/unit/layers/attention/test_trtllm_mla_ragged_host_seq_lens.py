@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.attention import trtllm_mla_backend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
+    HostSeqLens,
     TRTLLMMLABackend,
     _host_seq_lens,
     _prefix_chunk_host_seq_lens,
@@ -23,15 +24,15 @@ def _lens(*values):
 
 
 def _host(*values):
-    return _lens(*values), sum(values)
+    return HostSeqLens(lens=_lens(*values), total=sum(values))
 
 
 class TestHostSeqLens(CustomTestCase):
     def test_passes_lens_that_cover_q_and_k(self):
         q_lens, kv_lens = _host(3, 5), _host(0, 7)
         kwargs = _host_seq_lens(torch.empty(8, 2), torch.empty(7, 2), q_lens, kv_lens)
-        self.assertIs(kwargs["q_seq_lens_cpu"], q_lens[0])
-        self.assertIs(kwargs["kv_seq_lens_cpu"], kv_lens[0])
+        self.assertIs(kwargs["q_seq_lens_cpu"], q_lens.lens)
+        self.assertIs(kwargs["kv_seq_lens_cpu"], kv_lens.lens)
 
     def test_stock_call_on_padding_or_missing_lens(self):
         q, k = torch.empty(8, 2), torch.empty(7, 2)
@@ -48,9 +49,9 @@ class TestHostSeqLens(CustomTestCase):
         fb = SimpleNamespace(
             prefix_chunk_seq_lens_cpu=lens, prefix_chunk_num_tokens=[7, 2]
         )
-        chunk_lens, total = _prefix_chunk_host_seq_lens(fb, 1)
-        self.assertTrue(torch.equal(chunk_lens, lens[1]))
-        self.assertEqual(total, 2)
+        chunk = _prefix_chunk_host_seq_lens(fb, 1)
+        self.assertTrue(torch.equal(chunk.lens, lens[1]))
+        self.assertEqual(chunk.total, 2)
         unset = SimpleNamespace(
             prefix_chunk_seq_lens_cpu=None, prefix_chunk_num_tokens=None
         )
