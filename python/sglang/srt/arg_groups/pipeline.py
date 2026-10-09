@@ -162,7 +162,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
-        apply_glm5_prefill_cuda_graph_policy,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
@@ -239,7 +238,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_mamba_backend, server_args)
     run_hook(handle_int8_mamba_checkpoint, server_args)
     run_hook(handle_linear_attn_backend, server_args)
-    run_hook(apply_glm5_prefill_cuda_graph_policy, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
@@ -269,9 +267,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
-        validate_cutedsl_a2a_token_budget,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
+        validate_flashinfer_a2a_token_budget,
     )
 
     run_hook(handle_moe_kernel_config, server_args)
@@ -297,8 +295,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_layernorm_sp, server_args)
 
-    # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
-    run_hook(validate_cutedsl_a2a_token_budget, server_args)
+    # Validate the FlashInfer A2A token budget now that draft-token counts are final.
+    run_hook(validate_flashinfer_a2a_token_budget, server_args)
 
     from sglang.srt.arg_groups.mega_moe_hook import (
         validate_mega_moe_token_budget_for_model,

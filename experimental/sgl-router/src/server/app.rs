@@ -206,6 +206,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/v1/completions",
+            post(crate::server::routes::chat::completions)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
@@ -215,6 +221,19 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/classify",
+            post(crate::server::routes::chat::classify)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/rerank",
+            post(crate::server::routes::chat::rerank)
+                .put(crate::server::routes::chat::rerank)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )

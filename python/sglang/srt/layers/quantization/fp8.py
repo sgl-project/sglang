@@ -113,6 +113,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -555,6 +556,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     @staticmethod
     def validate_block_quant_shapes(
+        layer: LinearBase,
         quant_config,
         input_size: int,
         input_size_per_partition: int,
@@ -573,7 +575,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
-            tp_size = get_parallel().tp_size
+            tp_group = layer.tp_group
+            tp_size = tp_group.world_size if tp_group is not None else 1
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -623,6 +626,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if block_quant:
             block_n, block_k = quant_config.weight_block_size
             Fp8LinearMethod.validate_block_quant_shapes(
+                layer,
                 quant_config,
                 input_size,
                 input_size_per_partition,
@@ -822,6 +826,46 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if hasattr(layer, "_block_fp8_bf16_weight"):
+            layer._block_fp8_bf16_weight = None
+            layer._derived_weight_cache_error = None
+        if (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
+            and weight.is_cuda
+            and weight.dtype == torch.float8_e4m3fn
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+            and getattr(layer, "orig_dtype", None) == torch.bfloat16
+            and not self.use_marlin
+            and not getattr(layer, "keep_plain_weight_layout", False)
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            # Keep even the smallest/largest finite E4M3 value representable
+            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-117)
+                & (weight_scale <= 2.0**119)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
+                # Hopper group32 FP8 accumulates each 32-wide block separately.
+                # Reuse a BF16 weight expansion for larger GEMMs, keeping the
+                # original FP8 weights for decode and weight reloads.
+                layer.register_buffer(
+                    "_block_fp8_bf16_weight",
+                    block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
+                    persistent=False,
+                )
+                layer._derived_weight_cache_error = (
+                    "Online weight updates are not supported while Hopper FP8 "
+                    "BF16 weight caches are active: captured CUDA graphs retain "
+                    "these derived weights. Restart with "
+                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
 
@@ -1088,6 +1132,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         # Otherwise, by default, aiter only uses per-tensor quantization
                         self.use_per_token_if_dynamic = True
+                        # This path quantizes activations dynamically per token, which
+                        # is incompatible with a static per-tensor input_scale. Drop it
+                        # so apply_fp8_linear (and the fused RMSNorm+quant path) compute
+                        # the activation scale per token instead of reusing a stale one.
+                        layer.input_scale = None
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                                 weight=weight,
@@ -1122,13 +1171,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # input_scale is None when the per-token path above dropped it.
                 if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
-                ):
+                    (
+                        hasattr(self.quant_config, "activation_scheme")
+                        and self.quant_config.activation_scheme == "static"
+                    )
+                    or (
+                        hasattr(self.quant_config, "linear_activation_scheme")
+                        and self.quant_config.linear_activation_scheme == "static"
+                    )
+                ) and layer.input_scale is not None:
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
@@ -1241,6 +1294,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
+            extra_kwargs = (
+                {"weight_bf16": cached_weight} if cached_weight is not None else {}
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
@@ -1249,6 +1306,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
 
             return self.w8a8_block_fp8_linear(
@@ -1258,6 +1316,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
 
         if use_intel_amx_backend(layer):
@@ -1387,7 +1446,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
 
-        tp_size = get_parallel().tp_size
+        tp_size = layer.moe_tp_size
         w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
@@ -2655,7 +2714,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=True,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 w13_weight_scale_inv=layer.hpc_ops_w13_weight_scale,
                 w2_weight_scale_inv=layer.hpc_ops_w2_weight_scale,
                 block_shape=self.quant_config.weight_block_size,
@@ -2666,7 +2724,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 block_quant=False,
                 global_num_experts=int(layer.num_experts),
-                moe_ep_rank=int(layer.moe_ep_rank),
                 gate_up_alphas=layer.hpc_ops_gate_up_alphas,
                 down_alphas=layer.hpc_ops_down_alphas,
                 w13_input_scale=layer.w13_input_scale,
