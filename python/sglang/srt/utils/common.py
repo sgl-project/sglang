@@ -540,7 +540,8 @@ def get_available_gpu_memory(
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
-        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+        else:
+            free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
