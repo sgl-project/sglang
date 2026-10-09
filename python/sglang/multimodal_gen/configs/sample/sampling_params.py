@@ -763,10 +763,6 @@ class SamplingParams:
 
         RLRolloutArgs.validate_sampling_params(self)
 
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
-
     def _validate_with_pipeline_config(self, pipeline_config):
         """
         check if the sampling params is compatible and valid with server_args

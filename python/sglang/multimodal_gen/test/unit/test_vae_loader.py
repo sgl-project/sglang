@@ -10,6 +10,7 @@ from safetensors.torch import save_file as safetensors_save_file
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
     MiniMaxH3AudioVAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -655,6 +656,9 @@ class TestVAELoader(unittest.TestCase):
             (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
             (LTX2PipelineConfig, 1, "video_vae", True),
             (LTX2PipelineConfig, 2, "video_vae", False),
+            (Cosmos3Config, 1, "vae", True),
+            (Cosmos3Config, 1, "video_vae", True),
+            (Cosmos3Config, 2, "video_vae", False),
         ]
         with (
             patch.dict("os.environ", {}, clear=True),

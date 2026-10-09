@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from functools import lru_cache
 from typing import Callable, Optional, Tuple, Union
@@ -23,6 +24,14 @@ except Exception as _e:  # pragma: no cover
     _flash_attn_import_error = _e
 else:
     _flash_attn_import_error = None
+
+
+def _takes_out(kernel) -> bool:
+    return kernel is not None and "out" in inspect.signature(kernel).parameters
+
+
+# Released flash-attn-4 builds may lack the vendored kernel's out=.
+_kernel_takes_out = _takes_out(_flash_attn_varlen_func)
 
 
 def is_flash_attention_v4_available() -> bool:
@@ -223,6 +232,7 @@ def flash_attn_varlen_func(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -280,6 +290,13 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    # The kernel writes into out, except where it pads MLA heads: its output
+    # then has more heads than out, and the result is a new tensor.
+    out_kwargs = (
+        {"out": out}
+        if out is not None and mla_head_padding is None and _kernel_takes_out
+        else {}
+    )
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -305,6 +322,7 @@ def flash_attn_varlen_func(
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
+        **out_kwargs,
     )
     result = _unpad_mla_result(result, mla_head_padding)
 
@@ -355,6 +373,7 @@ def flash_attn_with_kvcache(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -397,6 +416,7 @@ def flash_attn_with_kvcache(
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
+        out=out,
     )
 
     if return_softmax_lse:

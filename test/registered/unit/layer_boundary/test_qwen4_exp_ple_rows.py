@@ -9,14 +9,14 @@ from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
-from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages
+from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages, _has_ple
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _residual_ops():
+def _residual_ops(*, attn_reads_every_row):
     def unused(*args, **kwargs):
         raise AssertionError("construction only")
 
@@ -26,6 +26,7 @@ def _residual_ops():
         ffn_mix=unused,
         attn_combine=unused,
         ffn_combine=unused,
+        attn_reads_every_row=attn_reads_every_row,
     ).residual_ops()
 
 
@@ -45,7 +46,8 @@ class TestQwen4ExpPleRows(CustomTestCase):
         ):
             layers = [
                 _build_qwen4_exp_stages(
-                    _residual_ops(), sparse=True, layer_id=layer_id, config=config
+                    _residual_ops(attn_reads_every_row=_has_ple(layer_id, config)),
+                    sparse=True,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
