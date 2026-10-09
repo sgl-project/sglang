@@ -671,8 +671,8 @@ async fn fill_gap(
 /// only `from..to`. The publisher replies in sequence order, so stop once the
 /// gap's end is reached without waiting for newer batches or their END_SEQ.
 /// Wire contract: `ZmqEventPublisher._service_replay` in SGLang's
-/// `disaggregation/kv_events.py`; replies are `[b"", seq, payload]` up to an
-/// `END_SEQ` frame.
+/// `disaggregation/kv_events.py`; replies carry `[b"", topic, seq, payload]`
+/// up to `END_SEQ`. Legacy publishers omit the topic.
 async fn fetch_replay(
     endpoint: &str,
     from: i64,
@@ -686,9 +686,13 @@ async fn fetch_replay(
     dealer.send(request).await?;
     loop {
         let reply = dealer.recv().await?;
-        let (3, Some(delim), Some(seq), Some(payload)) =
-            (reply.len(), reply.get(0), reply.get(1), reply.get(2))
-        else {
+        let topic_offset = usize::from(reply.len() == 4);
+        let (3 | 4, Some(delim), Some(seq), Some(payload)) = (
+            reply.len(),
+            reply.get(0),
+            reply.get(1 + topic_offset),
+            reply.get(2 + topic_offset),
+        ) else {
             return Err(anyhow!("replay reply has {} frames", reply.len()));
         };
         if !delim.is_empty() {
@@ -1805,6 +1809,49 @@ mod tests {
         assert_eq!(tally.replays(ReplayOutcome::Repaired), 1);
         server.await.unwrap();
         registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replay_accepts_legacy_and_topic_frames() {
+        use zeromq::RouterSocket;
+
+        for include_topic in [false, true] {
+            let mut router = RouterSocket::new();
+            let endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let request = router.recv().await.unwrap();
+                let peer = request.get(0).unwrap().clone();
+                for seq in [1_i64, END_SEQ_SENTINEL] {
+                    let mut reply = ZmqMessage::from(peer.clone());
+                    reply.push_back(Bytes::new());
+                    if include_topic {
+                        reply.push_back(if seq == END_SEQ_SENTINEL {
+                            Bytes::new()
+                        } else {
+                            Bytes::from_static(b"kv@prefill@model")
+                        });
+                    }
+                    reply.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
+                    reply.push_back(if seq == END_SEQ_SENTINEL {
+                        Bytes::new()
+                    } else {
+                        Bytes::from(helpers::encode_all_blocks_cleared_batch(0.0, None))
+                    });
+                    router.send(reply).await.unwrap();
+                }
+            });
+            let mut batches = Vec::new();
+            timeout(
+                Duration::from_secs(2),
+                fetch_replay(&endpoint, 1, 3, &mut batches),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(batches.len(), 1, "include_topic={include_topic}");
+            assert_eq!(batches[0].0, 1);
+            server.await.unwrap();
+        }
     }
 
     /// Replay can time out or fail after useful batches have already arrived.
