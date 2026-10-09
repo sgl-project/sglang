@@ -14,7 +14,9 @@ import torch
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -52,8 +54,9 @@ class _RequestKV:
         return self.req_pool_idx is not None
 
 
-class TestSparseKVCacheManager(unittest.TestCase):
+class TestSparseKVCacheManager(CustomTestCase):
     def setUp(self):
+        super().setUp()
         # Load a private module instance so the fake kernels do not leak into
         # other tests or require an installed sgl-kernel-npu on CPU workers.
         self.kernels = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
@@ -80,6 +83,16 @@ class TestSparseKVCacheManager(unittest.TestCase):
         patcher = patch.object(torch, "npu", self.npu, create=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = patch.object(torch.Tensor, "record_stream")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (
+            ("get_cuda_graph_batch_size_alignment", 1),
+            ("require_mlp_sync", False),
+        ):
+            patcher = patch.object(common, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def make_manager(self, topk=1536, enable_lru=False, factor=2, pool_device="cpu"):
         pool = ReqToTokenPool(2, 4096, pool_device, False)
@@ -117,7 +130,7 @@ class TestSparseKVCacheManager(unittest.TestCase):
         selected = torch.zeros((len(reqs), manager.sparse_context_len, 1, 4))
         stream = Mock()
         ready = Mock()
-        plan = manager.materialize_selected_kv(
+        plan, valid_mask, valid_counts = manager.materialize_selected_kv(
             SimpleNamespace(layer_id=0),
             batch,
             topk,
@@ -126,10 +139,13 @@ class TestSparseKVCacheManager(unittest.TestCase):
             host_kv_ready_event=ready,
         )
         manager.refill_selected_kv(
-            SimpleNamespace(layer_id=0), selected, *plan[:4], stream
+            layer=SimpleNamespace(layer_id=0),
+            selected_kv_buffer=selected,
+            plan=plan,
+            stream=stream,
         )
         manager._materialize_h2d_miss_stream.wait_event.assert_called_with(ready)
-        return selected, plan
+        return selected, plan, valid_mask, valid_counts
 
     def test_dynamic_window_reorders_hits_and_refills_misses(self):
         for topk in (3, 1536, 3072):
@@ -139,7 +155,7 @@ class TestSparseKVCacheManager(unittest.TestCase):
                 self.assertFalse(hasattr(manager, "device_lru_slots"))
                 self.assertEqual(manager.device_cache_capacity, topk)
                 self.materialize(manager, [10, 11, 12])
-                selected, plan = self.materialize(manager, [12, 10, 13])
+                selected, _, _, valid_counts = self.materialize(manager, [12, 10, 13])
                 torch.testing.assert_close(
                     selected[0, :3], manager.host_kv_buffer[0][2, [12, 10, 13]]
                 )
@@ -148,7 +164,7 @@ class TestSparseKVCacheManager(unittest.TestCase):
                 )
                 self.assertEqual(manager.device_slot_map[0][2, 11].item(), -1)
                 self.assertEqual(manager.device_slot_map[0][2, 12].item(), 0)
-                self.assertEqual(plan[-1].tolist(), [3, 0])
+                self.assertEqual(valid_counts.tolist(), [3, 0])
                 self.assertEqual(selected[1].count_nonzero().item(), 0)
 
     def test_lru_keeps_hit_slots_and_only_refills_misses(self):
@@ -163,13 +179,13 @@ class TestSparseKVCacheManager(unittest.TestCase):
             victims,
             torch.tensor([1, 0], dtype=torch.int32),
         )
-        selected, plan = self.materialize(manager, [10, 11])
+        selected, plan, _, _ = self.materialize(manager, [10, 11])
         torch.testing.assert_close(
             selected[0, :2], manager.host_kv_buffer[0][2, [10, 11]]
         )
         torch.testing.assert_close(manager.device_kv_buffer[0][2, 777], selected[0, 1])
         torch.testing.assert_close(manager.device_kv_buffer[0][2, 3500], selected[0, 0])
-        self.assertEqual(plan[3].sum().item(), 1)
+        self.assertEqual(plan.valid_mask.sum().item(), 1)
         manager._lru_metadata_update.assert_called_once()
         manager._lru_metadata_write.assert_called_once()
 
@@ -177,6 +193,91 @@ class TestSparseKVCacheManager(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "index_topk=2048"):
             self.make_manager(1536, enable_lru=True)
         self.npu.Stream.assert_not_called()
+
+    def test_refill_waits_for_victims_and_finishes_metadata_after_copy(self):
+        manager, _ = self.make_manager(topk=3)
+        selected = torch.arange(12, dtype=torch.float32).reshape(1, 3, 1, 4)
+        victims = torch.full((1, 3), -1, dtype=torch.int32)
+        plan = self.module.KVRefillPlan(
+            victim_slots=victims,
+            src_indices=torch.arange(3),
+            request_offsets=torch.tensor([[3]]),
+            valid_mask=torch.tensor([True, False, False]),
+        )
+
+        # Publish asynchronous results only when their event is waited on.
+        def wait_event(event):
+            if event is manager._materialize_victim_slot_select_done:
+                victims[0, 0] = 2
+            elif event is manager._materialize_metadata_update_done:
+                torch.testing.assert_close(
+                    manager.device_kv_buffer[0][1, 2], selected[0, 0]
+                )
+                manager.device_slot_map[0][1, 10] = 2
+
+        stream = Mock(wait_event=Mock(side_effect=wait_event))
+        manager.refill_selected_kv(
+            layer=SimpleNamespace(layer_id=0),
+            selected_kv_buffer=selected,
+            plan=plan,
+            stream=stream,
+        )
+        self.assertEqual(manager.device_slot_map[0][1, 10].item(), 2)
+        torch.testing.assert_close(manager.device_kv_buffer[0][1, 2], selected[0, 0])
+
+    def test_padded_batch_can_exceed_request_pool_rows(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for enable_lru in (False, True):
+            for runner in ("graph", "eager"):
+                with (
+                    self.subTest(enable_lru=enable_lru, runner=runner),
+                    patch.object(
+                        common,
+                        "get_cuda_graph_batch_size_alignment",
+                        return_value=16 if runner == "graph" else 1,
+                    ),
+                    patch.object(
+                        common, "require_mlp_sync", return_value=runner == "eager"
+                    ),
+                    patch.object(
+                        common,
+                        "get_parallel",
+                        return_value=SimpleNamespace(attn_tp_size=16),
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                        return_value=1,
+                    ),
+                ):
+                    manager, pool = self.make_manager(2048, enable_lru=enable_lru)
+                    if enable_lru:
+                        victims = torch.full((16, 2048), -1, dtype=torch.int32)
+                        victims[0, :2] = torch.tensor([777, 888])
+                        manager._lru_metadata_update.return_value = (
+                            victims,
+                            torch.tensor([2] + [0] * 15, dtype=torch.int32),
+                        )
+                    selected, _, valid_mask, valid_counts = self.materialize(
+                        manager,
+                        [10, 11],
+                        reqs=(2,) + (0,) * 15,
+                        lengths=(32,) + (0,) * 15,
+                    )
+                    torch.testing.assert_close(
+                        selected[0, :2], manager.host_kv_buffer[0][2, [10, 11]]
+                    )
+                    self.assertEqual(selected[1:].count_nonzero().item(), 0)
+                    self.assertEqual(valid_counts.tolist(), [2] + [0] * 15)
+                    self.assertFalse(valid_mask[1:].any().item())
+                    slots = [777, 888] if enable_lru else [0, 1]
+                    torch.testing.assert_close(
+                        manager.device_kv_buffer[0][2, slots], selected[0, :2]
+                    )
+                    self.assertEqual(pool.req_to_token.shape[0], 3)
+                    self.assertEqual(manager.device_kv_buffer[0].shape[0], 3)
+                    self.assertEqual(manager._decode_query_seq_lengths[:16].numel(), 16)
+                    self.assertEqual(manager._zero_sparse_index[:16].shape[0], 16)
 
     def test_pd_request_release_resets_lru_and_removes_room(self):
         self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()

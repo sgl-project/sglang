@@ -8,7 +8,6 @@ import torch
 import torch_npu
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
-    _wait_stream_event,
     normalize_batch_topk_indices,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -175,20 +174,15 @@ def forward_sparsity_driven_kv_offload(
             dtype=k.dtype,
             device=backend.device,
         )
-        (
-            victim_slots,
-            refill_src_index,
-            request_cache_offsets,
-            refill_valid_mask,
-            topk_valid,
-            valid_topk_counts,
-        ) = sparse_kv_manager.materialize_selected_kv(
-            layer,
-            forward_batch,
-            topk_2d,
-            selected_kv_buffer,
-            stream,
-            host_kv_ready_event=decode_offload_done,
+        refill_plan, topk_valid, valid_topk_counts = (
+            sparse_kv_manager.materialize_selected_kv(
+                layer,
+                forward_batch,
+                topk_2d,
+                selected_kv_buffer,
+                stream,
+                host_kv_ready_event=decode_offload_done,
+            )
         )
 
         # Both copies are complete here. Metadata update overlaps preparation
@@ -255,24 +249,13 @@ def forward_sparsity_driven_kv_offload(
             rope_head_dim,
         )
 
-        # Refill can start as soon as victim selection completes. The following
-        # slot-map/reverse-map writes touch different buffers and overlap refill.
-        _wait_stream_event(
-            stream, sparse_kv_manager._materialize_victim_slot_select_done
-        )
+        # The manager orders refill and metadata before attention on this stream.
         sparse_kv_manager.refill_selected_kv(
-            layer,
-            selected_kv_buffer,
-            victim_slots,
-            refill_src_index,
-            request_cache_offsets,
-            refill_valid_mask,
-            stream,
+            layer=layer,
+            selected_kv_buffer=selected_kv_buffer,
+            plan=refill_plan,
+            stream=stream,
         )
-
-        # Keep the full metadata update ordered before attention/next-layer
-        # work while allowing it to overlap the refill above.
-        _wait_stream_event(stream, sparse_kv_manager._materialize_metadata_update_done)
         ret = torch_npu.npu_sparse_flash_attention(
             q_nope_sfa,
             k_nope_sfa,

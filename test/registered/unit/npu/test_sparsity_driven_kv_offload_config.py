@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     resolve_sparse_kv_offload_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -32,7 +33,7 @@ def _make_glm51_model_config():
     )
 
 
-class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
+class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
     def test_device_cache_capacity_defaults_to_two_windows(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR", None)
