@@ -26,7 +26,7 @@ the kernel captured in the graph dereferences its row at replay time.
 
 import logging
 from contextlib import contextmanager
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -52,8 +52,10 @@ from sglang.srt.utils.cuda_vmm_utils import (
 )
 
 from .configs.custom_all_reduce_v2 import (
+    Row,
     get_all_reduce_config,
     get_supported_world_sizes,
+    pick,
 )
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
@@ -96,12 +98,6 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
     return tensor, symm_mem
-
-
-class AllReduceConfig(NamedTuple):
-    algo: AllReduceAlgo
-    use_graph: bool = False
-    use_multicast: bool = False
 
 
 class CustomAllReduceV2:
@@ -150,24 +146,16 @@ class CustomAllReduceV2:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
             max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
-
-        def force_thresholds(heuristic):
-            # forced sizes bypass the tuned NCCL-crossover heuristics: lift
-            # each direction's ceiling to the forced workspace capacity (the
-            # clip() below only ever lowers thresholds)
-            if _FORCE_PULL_SIZE_KB is not None:
-                heuristic = heuristic._replace(two_shot_pull_threshold=max_pull_size)
-            if _FORCE_PUSH_SIZE_KB is not None:
-                heuristic = heuristic._replace(one_shot_push_threshold=max_push_size)
-            return heuristic
-
-        base_config = base_config._replace(
-            graph=force_thresholds(base_config.graph),
-            eager=force_thresholds(base_config.eager),
-        )
+        # forced sizes bypass the tuned NCCL crossover: lift each direction's
+        # ceiling to the forced workspace capacity (the clip() below only
+        # ever lowers it)
+        if _FORCE_PULL_SIZE_KB is not None:
+            base_config = base_config.with_pull_fallback(max_pull_size)
+        if _FORCE_PUSH_SIZE_KB is not None:
+            base_config = base_config.with_push_max(max_push_size)
         # Zero on either pull knob opts out of the pull half entirely: no
         # pull plane at all, and every pull algo disabled below by clipping
-        # its threshold to 0. Push-only callers (the fused qk-norm instances)
+        # its rows to 0. Push-only callers (the fused qk-norm instances)
         # take this path rather than allocating a placeholder buffer just to
         # satisfy a constructor.
         self.pull_enabled = max_pull_blocks != 0 and max_pull_size > 0
@@ -282,7 +270,7 @@ class CustomAllReduceV2:
                 mc_semaphore=mc_at(sem_offset),
             )
         if not self.has_multicast or not self.pull_enabled:
-            self.config = self.config._replace(num_mc_blocks=None)
+            self.config = self.config.without_multicast()._replace(num_mc_blocks=None)
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)
         if self.config.num_mc_blocks is not None:
@@ -305,21 +293,12 @@ class CustomAllReduceV2:
     def uncap_pull_thresholds(self) -> None:
         """Raise the 2-shot ceiling to the workspace capacity.
 
-        The tuned config caps ``2shot_pull`` at the size where NCCL takes
-        over; benchmarks and tests that must keep every sweep size on the
-        custom-AR path can lift that cap up to ``max_pull_size``.
+        The tuned tables end at the size where NCCL takes over; benchmarks
+        and tests that must keep every sweep size on the custom-AR path can
+        extend them with ``2shot_pull`` up to ``max_pull_size``.
         """
-
-        if not self.pull_enabled:
-            return
-
-        def uncap(heuristic):
-            return heuristic._replace(two_shot_pull_threshold=self.max_pull_size)
-
-        self.config = self.config._replace(
-            graph=uncap(self.config.graph),
-            eager=uncap(self.config.eager),
-        )
+        if self.pull_enabled:
+            self.config = self.config.with_pull_fallback(self.max_pull_size)
 
     def _can_use_graph(self) -> bool:
         # `_graph_mode_allowed` is only set inside `capture()`, so the eager
@@ -332,19 +311,8 @@ class CustomAllReduceV2:
             and torch.cuda.is_current_stream_capturing()
         )
 
-    def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
-        # TODO: refactor this along with the config file
-        heuristic = self.config.graph if can_use_graph else self.config.eager
-        can_use_multicast = self.config.num_mc_blocks is not None
-        if nbytes <= heuristic.one_shot_push_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
-        if nbytes <= heuristic.one_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
-        if can_use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
-        if nbytes <= heuristic.two_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
-        return None
+    def _pick_config(self, nbytes: int, can_use_graph: bool) -> Optional[Row]:
+        return pick(self.config.graph if can_use_graph else self.config.eager, nbytes)
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
@@ -366,15 +334,15 @@ class CustomAllReduceV2:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
+        can_use_graph = self._can_use_graph()
         if self.override_algo is not None:
             # TODO: enhance this override pattern
-            algo = self.override_algo
-            use_graph = self._can_use_graph() and not algo.is_push()
-            use_multicast = False
+            algo, use_multicast = self.override_algo, False
         else:
-            config = self._pick_config(nbytes, self._can_use_graph())
-            assert config is not None, f"No config for {nbytes = }"
-            algo, use_graph, use_multicast = config
+            row = self._pick_config(nbytes, can_use_graph)
+            assert row is not None, f"No config for {nbytes = }"
+            algo, use_multicast = row.algo, row.multicast
+        use_graph = can_use_graph and not algo.is_push() and not use_multicast
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(
             self.obj,
