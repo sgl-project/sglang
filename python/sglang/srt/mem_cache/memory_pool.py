@@ -1818,18 +1818,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.mamba_allocator.free(
                 req.kv.mamba_ping_pong_slots(mamba_ping_pong_track_buffer_to_keep)
             )
-            # Match the req.kv.mamba_pool_idx=None clear above so the next
-            # alloc() doesn't see a stale ping-pong reference on the req
-            # and skip allocation (which would silently reuse a freed
-            # tensor on the req side while the new pool slot leaks).
-            req.kv.mamba_ping_pong_track_buffer = None
-            req.kv.mamba_ping_pong_track_buffer_mask = None
-            req.kv.mamba_next_track_idx = None
-            req.kv.mamba_last_track_idx = None
-            req.kv.mamba_last_track_seqlen = None
-            req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
+            # Drop freed buffer references so reallocation obtains fresh slots.
+            req.kv.reset_mamba_tracking()
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

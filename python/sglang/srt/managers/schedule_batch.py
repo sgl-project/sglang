@@ -962,6 +962,17 @@ class ReqKvInfo:
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
 
+    def reset_mamba_tracking(self) -> None:
+        """Clear tracking metadata after its slots have been released or transferred."""
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_ping_pong_track_buffer_mask = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_prev_track_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+
     def mamba_ping_pong_slots(self, exclude_idx: Optional[int] = None) -> torch.Tensor:
         buf = self.mamba_ping_pong_track_buffer
         assert buf is not None
@@ -1967,15 +1978,8 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
         self.kv.mamba_pool_idx = None
-        self.kv.mamba_ping_pong_track_buffer = None
-        self.kv.mamba_ping_pong_track_buffer_mask = None
-        self.kv.mamba_next_track_idx = None
-        self.kv.mamba_last_track_idx = None
-        self.kv.mamba_last_track_seqlen = None
-        self.kv.mamba_prev_track_seqlen = None
+        self.kv.reset_mamba_tracking()
         self.mamba_branching_seqlen = None
-        self.kv.mamba_cow_src_index = None
-        self.kv.mamba_needs_clear = False
         self.already_computed = 0
         assert not self.kv.holds_kv, "expect it is already released"
         self.kv.kv_committed_len = 0
