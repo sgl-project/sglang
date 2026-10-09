@@ -81,8 +81,8 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
         )
     tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-    # With radix caching disabled, chunked prefill uses ChunkCache and keeps
-    # the rotation base on each request; it never constructs a tree core.
+    # A disabled radix cache never matches or inserts, so its tree core never
+    # sees a rotation base; chunked continuations keep the base on the request.
     if not cfg.disable_radix_cache and tree_core_backend != "python":
         raise ValueError(
             "--enable-kv-cache-sharding requires the Python UnifiedTreeCore: "
