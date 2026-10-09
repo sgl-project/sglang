@@ -37,7 +37,6 @@ class TreeCacheBuildContext:
     is_hybrid_ssm: bool
     enable_hierarchical_cache: bool
     disable_radix_cache: bool
-    effective_chunked_prefill_size: Optional[int]
     tp_worker: Any
     model_config: ModelConfig
     tp_size: int
@@ -82,19 +81,18 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
 
     is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
-    # The decode host-pool backup needs UnifiedRadixCache; otherwise its
-    # disabled mode serves every layout but pure-SWA.
-    if ctx.disable_radix_cache and (
-        get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-        or not is_pure_swa
-    ):
-        return create_unified_radix_cache(ctx)
-
     # A disabled cache publishes nothing, so no storage backend applies.
-    if ctx.disable_radix_cache and is_pure_swa:
-        from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+    # Host-pool retraction goes to UnifiedRadixCache, which validates it (and
+    # rejects pure-SWA).
+    if ctx.disable_radix_cache:
+        if (
+            is_pure_swa
+            and get_disagg().disaggregation_decode_retraction_backup != "host_pool"
+        ):
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
-        return PureSWARadixCache(params=params)
+            return PureSWARadixCache(params=params)
+        return create_unified_radix_cache(ctx)
 
     if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
@@ -103,7 +101,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
         tree_components = []
-        if not (ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0):
+        if not is_pure_swa:
             tree_components.append(ComponentType.FULL)
         if ctx.is_hybrid_swa:
             tree_components.append(ComponentType.SWA)
@@ -122,7 +120,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if get_memory().enable_unified_cache_external_linker:
         return create_unified_radix_cache(ctx)
 
-    if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+    if is_pure_swa:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)

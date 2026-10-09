@@ -943,7 +943,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
-        """True when SWAChunkCache can be sized from explicit max requests."""
+        """True when a radix-disabled hybrid SWA cache can be sized from
+        explicit max requests."""
         if get_schedule().max_running_requests is None:
             return False
         if not get_memory().disable_radix_cache:
