@@ -564,7 +564,11 @@ class CompressorAscendBackendMixin:
                 _width = int(state_block_table.shape[1])
                 _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
                 _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
-                _flat = state_cache.reshape(-1, state_cache.shape[-1])
+                _flat = (
+                    state_cache.reshape(-1, state_cache.shape[-1])
+                    .detach()
+                    .to("cpu")
+                )
                 _rows_n = _flat.shape[0]
                 _by_blk = {}
                 for _b in range(_tbl_cpu.shape[0]):
