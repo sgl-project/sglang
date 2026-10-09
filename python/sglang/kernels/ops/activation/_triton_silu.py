@@ -7,9 +7,10 @@ import triton.language as tl
 
 @triton.jit
 def _silu_fast_math(gate):
-    # Match silu_and_mul's __fdividef(x, 1 + __expf(-x)). Accurate exp/div
-    # can move the result across a BF16 rounding boundary. Keep SiLU in FP32;
-    # callers apply the multiply before the final BF16 store.
+    # Preserve the fused MoE epilogue's __fdividef(x, 1 + __expf(-x)): accurate
+    # exp/div can move the result across a BF16 rounding boundary. silu_and_mul
+    # matches it only before SM100, where it is built with --use_fast_math.
+    # Keep SiLU in FP32; callers apply the multiply before the final BF16 store.
     exp_neg_gate = tl.inline_asm_elementwise(
         "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
         "=f,f",
