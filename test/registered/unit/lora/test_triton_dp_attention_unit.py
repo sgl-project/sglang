@@ -2,14 +2,23 @@
 
 import sys
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.layer_boundary import (
+    NORM_QUANT_READOUT,
+    PLAIN_ADD,
+    Layout,
+    StageKind,
+    TokenAxis,
+)
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, EntryPath
+from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.triton_backend import (
     TritonLoRABackend,
@@ -26,7 +35,9 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
 )
+from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import COMMUNICATOR_MODULES
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -95,8 +106,8 @@ class _LocalOnlyLoRABackend(BaseLoRABackend):
 class TestDPAttentionBackendContract(CustomTestCase):
     def test_manager_requires_global_routing_only_for_dp_attention(self):
         """DPA must not proceed with local-only routing; non-DPA remains supported."""
-        for enable_dp_attention in (False, True):
-            with self.subTest(enable_dp_attention=enable_dp_attention):
+        for attn_dp_enabled in (False, True):
+            with self.subTest(attn_dp_enabled=attn_dp_enabled):
                 backend = _LocalOnlyLoRABackend(
                     max_loras_per_batch=3, device=torch.device("cpu")
                 )
@@ -104,7 +115,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                 pool.max_loras_per_batch = 3
                 pool.uid_to_buffer_id = {None: 0, "adapter": 1}
                 manager = LoRAManager.__new__(LoRAManager)
-                manager.enable_dp_attention = enable_dp_attention
+                manager.attn_dp_enabled = attn_dp_enabled
                 manager.max_loras_per_batch = 3
                 manager.num_pinned_loras = 1
                 manager.lora_backend = backend
@@ -135,7 +146,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                         NotImplementedError,
                         "_LocalOnlyLoRABackend.*prepare_global_lora_batch",
                     )
-                    if enable_dp_attention
+                    if attn_dp_enabled
                     else nullcontext()
                 )
                 with (
@@ -179,12 +190,12 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
 ):
     with (
         get_context().override_server_args(
-            enable_dp_attention=True, enable_lora_overlap_loading=False
+            tp_size=4, attn_dp_size=2, enable_lora_overlap_loading=False
         ) as args,
         get_parallel().override(
             tp_size=4, attn_dp_size=2, moe_tp_size=4, **attention_widths
         ),
-        pytest.raises(ValueError, match="requires --dp-size equal to --tp-size"),
+        pytest.raises(ValueError, match="requires --attn-dp-size equal to --tp-size"),
     ):
         LoRAManager(
             base_model=torch.nn.Linear(2, 2),
@@ -197,58 +208,84 @@ def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
         )
 
 
-@pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])
+@pytest.mark.parametrize("gathered_over_dp", [True, False])
 @pytest.mark.parametrize("num_tokens", [0, 2])
 @pytest.mark.parametrize("publish_lora_layout", [False, True])
 def test_communicator_publishes_layout_at_each_transition(
-    monkeypatch, mlp_mode, num_tokens, publish_lora_layout
+    monkeypatch, gathered_over_dp, num_tokens, publish_lora_layout
 ):
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_parallel",
-        lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
-    )
+    for module in COMMUNICATOR_MODULES:
+        if hasattr(module, "get_parallel"):
+            monkeypatch.setattr(
+                module,
+                "get_parallel",
+                lambda: SimpleNamespace(attn_dp_enabled=publish_lora_layout),
+            )
     # Start from TP_GLOBAL so an unpublished transition is distinguishable.
     initial = LoRABatchLayout.TP_GLOBAL
     expected_mlp = (
-        LoRABatchLayout.TP_GLOBAL
-        if mlp_mode is ScatterMode.FULL
-        else LoRABatchLayout.DP_LOCAL
+        LoRABatchLayout.TP_GLOBAL if gathered_over_dp else LoRABatchLayout.DP_LOCAL
     )
     expected_attn = LoRABatchLayout.DP_LOCAL
     if not publish_lora_layout:
         # Without LoRA under DP attention, the communicator leaves the flag alone.
         expected_mlp = expected_attn = initial
-    communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator = stub_plan()
     communicator._publish_lora_layout = publish_lora_layout
-    communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
-    communicator._context = SimpleNamespace()
-    communicator._sp_region = False
-    communicator.post_attention_layernorm = None
-    communicator.input_layernorm = lambda x: x
+    communicator.enters_stack = False
+    communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = None
+    communicator.norm = lambda x: x
     communicator.qkv_latent_func = None
-    communicator._communicate_simple_fn = lambda **kwargs: kwargs["hidden_states"]
-    communicator._mlp_input = lambda hidden_states, residual, *args: (
-        hidden_states,
-        residual,
+    gathered, local = Layout(frozenset()), Layout(frozenset({TokenAxis.ATTN_DP}))
+    # The rows of the steps the batch runs decide, not the ordinary steps'.
+    communicator.paths[BatchVariant.ORDINARY] = SimpleNamespace(
+        entry=SimpleNamespace(input_rows=local if gathered_over_dp else gathered)
     )
-    communicator._attn_input_fusions = ()
-    monkeypatch.setattr(
-        "sglang.srt.layers.communicator.get_attn_tp_context",
-        lambda: SimpleNamespace(input_scattered=False),
+    attention_entry = EntryPath(
+        input_rows=local,
+        prepare=partial(
+            _run_entry,
+            step=partial(
+                _update_read,
+                pre_move=None,
+                enters_stack=False,
+                read=NORM_QUANT_READOUT,
+                update=PLAIN_ADD,
+            ),
+            carried_fusions=(),
+            is_plain_add=True,
+        ),
+        input_move=lambda hidden_states, **kwargs: hidden_states,
+        attn_input_adapter=lambda hidden_states, *args: hidden_states,
     )
+    ffn_entry = EntryPath(
+        prepare=lambda hidden_states, residual, *args, **kwargs: (
+            hidden_states,
+            residual,
+        ),
+        input_rows=gathered if gathered_over_dp else local,
+        input_move=None,
+        attn_input_adapter=None,
+    )
+    selected = SimpleNamespace(entry=ffn_entry)
+    communicator.path_for = lambda forward_batch: selected
     hidden = torch.zeros(num_tokens, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
-            communicator.prepare_mlp(hidden, hidden, None)
+            selected.entry = ffn_entry
+            prepare_input(stub_stage(communicator, StageKind.FFN), hidden, hidden, None)
             assert get_forward().lora_batch_layout is expected_mlp
-            communicator.prepare_attn(hidden, None, None)
+            selected.entry = attention_entry
+            prepare_input(
+                stub_stage(communicator, StageKind.ATTENTION), hidden, None, None
+            )
             assert get_forward().lora_batch_layout is expected_attn
 
 
 @pytest.mark.parametrize("can_run_decode_cuda_graph", [False, True])
 def test_manager_uses_current_dp_cuda_graph_eligibility(can_run_decode_cuda_graph):
     manager = LoRAManager.__new__(LoRAManager)
-    manager.enable_dp_attention = True
+    manager.attn_dp_enabled = True
     manager.max_bs_in_cuda_graph = 4
     tokens = torch.zeros(2, dtype=torch.int64)
     forward_batch = ForwardBatch(

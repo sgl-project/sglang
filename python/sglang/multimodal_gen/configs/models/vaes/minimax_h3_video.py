@@ -33,6 +33,8 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
     load_decoder: bool = True
     use_tiling: bool = True
     use_parallel_tiling: bool = True
+    # Decode each rank's spatial tiles in one batched call instead of one by one.
+    stack_tiling: bool = False
     # The released checkpoint's quality contract uses overlapping latent
     # tiles. Parallel tiling distributes whole tiles without changing that
     # recipe. Spatial-shard decode is rejected because validation found output
@@ -69,6 +71,12 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
 
     def post_init(self) -> None:
         self.resolved_parallel_decode_mode()
+        if (
+            self.arch_config.latents_mean is None
+            and self.arch_config.latents_std is None
+        ):
+            # ComfyUI DiT-forward never loads this VAE; stats stay unset.
+            return
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,
             component_name="video_vae",

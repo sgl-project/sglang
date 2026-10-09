@@ -3,7 +3,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
@@ -36,6 +36,9 @@ def _optional_positive_finite_float(value: Any, field_name: str) -> float | None
 
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
+    # The video/audio sigma schedules include both interval endpoints.
+    min_num_inference_steps: ClassVar[int] = 2
+
     height: int = 512
     width: int = 896
     num_inference_steps: int = 50
@@ -240,15 +243,37 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
             )
-        if self.rollout:
-            raise ValueError(
-                "MiniMax H3 does not support rollout: its coupled video/audio "
-                "scheduler has no SchedulerRLMixin contract"
+        if self.enable_spectrum:
+            if self.quality == "high":
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    'quality="high" (Cache-DiT). Use one skip-step accelerator.'
+                )
+            if self.enable_cache_dit:
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    "enable_cache_dit. Use one skip-step accelerator."
+                )
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+            from sglang.multimodal_gen.runtime.cache.spectrum import (
+                apply_h3_spectrum_param_defaults,
             )
+
+            if isinstance(self.spectrum_params, dict):
+                self.spectrum_params = SpectrumParams(**self.spectrum_params)
+            elif self.spectrum_params is None:
+                self.spectrum_params = SpectrumParams()
+            apply_h3_spectrum_param_defaults(self.spectrum_params)
+        if self.rollout:
+            task = str(self.task or "t2va").lower()
+            if task not in ("t2va",):
+                raise ValueError(
+                    f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
+                )
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
-                "MiniMax H3 does not support trajectory output for its coupled "
-                "video/audio denoise state"
+                "MiniMax H3 does not support return_trajectory_latents/decoded; "
+                "use rollout=True with rollout_return_dit_trajectory instead"
             )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
@@ -332,15 +357,16 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
 @dataclass
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
-    """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
+    """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
-    num_inference_steps: int = 5
+    num_inference_steps: int = 9
+    quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 5:
+        if self.num_inference_steps != 9:
             raise ValueError(
-                "FastH3 is distilled for exactly five sigma grid points (four DiT "
+                "FastH3 is distilled for exactly nine sigma grid points (eight DiT "
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )

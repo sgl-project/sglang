@@ -116,11 +116,24 @@ class _Harness(deepseek_v4.MQALayer):
         return q_out, k_nope_out
 
 
+_NO_HIP_GLUE = SimpleNamespace(
+    skip_head_pad=lambda attn: False,
+    attention_inv_rope=lambda *args, **kwargs: None,
+    wo_a_emits_fp8_grid=lambda attn: False,
+    wo_b_emits_mxfp8=lambda attn, num_tokens: False,
+    wo_a_fp8_grid_matmul=lambda o, wo_a, fp8_grid, emit_fp8=False: None,
+)
+
+
 def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     layer = _Harness()
     layer.dsa_enable_prefill_cp = cp
     backend = _RecordingBackend()
     forward_batch = SimpleNamespace(forward_mode=mode)
+
+    def materialize(payload, *_):
+        # Stand in for another CP rank: append one globally ordered row.
+        return torch.cat((payload, payload[:1]), dim=0)
 
     with (
         envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
@@ -137,11 +150,20 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             deepseek_v4, "get_parallel", return_value=SimpleNamespace(tp_size=8)
         ),
         patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
-        patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=cp),
+        patch.object(deepseek_v4, "is_cp_active", return_value=cp),
+        patch.object(
+            deepseek_v4,
+            "cp_materialize_global_token_order",
+            side_effect=materialize,
+        ) as materialize_mock,
+        patch.object(torch.cuda, "current_stream", return_value=object()),
         patch.object(deepseek_v4, "fused_rope_inplace", return_value=None),
         patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
         patch.object(deepseek_v4, "_is_gfx942_supported", False),
+        patch.object(deepseek_v4, "_is_gfx95_supported", False),
         patch.object(deepseek_v4, "_is_hip", True),
+        # the ROCm model glue is only imported on ROCm; the unified path needs none of it
+        patch.object(deepseek_v4, "_hip", _NO_HIP_GLUE),
         patch.object(deepseek_v4, "_is_npu", False),
     ):
         layer.forward(
@@ -150,6 +172,7 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
             forward_batch,
         )
 
+    layer.materialize_mock = materialize_mock
     return layer, backend.calls[0]
 
 
@@ -247,24 +270,31 @@ class TestUnifiedFp8QPair(unittest.TestCase):
         self.assertNotIn("k_rope", call)
         self.assertIsNone(layer.prepare_kwargs["k_nope_out"])
 
-    def test_fp8_prefill_cp_is_refused_with_a_reason(self):
-        """the gather hands kv back in global token order after norm+RoPE, so
-        packing would have to move ahead of it -- refuse rather than guess"""
-        with self.assertRaisesRegex(NotImplementedError, "cp_size"):
-            _run(fp8=True, mode=ForwardMode.EXTEND, cp=True)
+    def test_fp8_prefill_cp_gathers_one_byte_packed_pair(self):
+        layer, call = _run(fp8=True, mode=ForwardMode.EXTEND, cp=True)
+
+        layer.materialize_mock.assert_called_once()
+        # The fake peer adds one globally ordered row; attention gets the gathered
+        # pair. Byte layout and contiguity are pinned in test_deepseek_v4_cp_kv_store.
+        self.assertEqual(tuple(call["k"].shape), (TOKENS + 1, NOPE_ROW_BYTES))
+        self.assertEqual(tuple(call["k_rope"].shape), (TOKENS + 1, ROPE_DIM))
+        self.assertTrue(call["save_kv_cache"])
 
     def test_bf16_prefill_cp_is_left_alone(self):
-        """the refusal is fp8-only, CP prefill without it keeps working"""
+        """the byte-packed gather is fp8-only; bf16 CP keeps its existing path"""
         _, call = _run(fp8=False, mode=ForwardMode.EXTEND, cp=True)
 
         self.assertNotIn("q_rope", call)
         self.assertNotIn("k_rope", call)
 
-    def test_fp8_decode_under_cp_is_not_refused(self):
-        """only prefill packs this chunk; decode reads rows the ring already has"""
-        _, call = _run(fp8=True, mode=ForwardMode.DECODE, cp=True)
+    def test_fp8_decode_and_verify_under_cp_do_not_gather(self):
+        """only prefill gathers; decode and verify read rows the ring already has"""
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                layer, call = _run(fp8=True, mode=mode, cp=True)
 
-        self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
+                self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
+                layer.materialize_mock.assert_not_called()
 
     def test_sink_is_sliced_to_this_rank(self):
         _, call = _run(fp8=True)
