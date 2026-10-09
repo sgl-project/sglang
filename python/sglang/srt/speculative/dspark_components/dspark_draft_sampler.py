@@ -181,6 +181,7 @@ def maybe_build_draft_sampler(
     device,
     tp_rank: int,
     noise: DraftNoise,
+    greedy_draft: bool,
     tp_sync: SpecTpSync,
     available_memory_gb: float,
     confidence_fn=None,
@@ -198,7 +199,8 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
-    folded_sampling = _resolve_folded_sampling(
+    # A greedy draft serves sampling requests too, so it keeps no step logits.
+    folded_sampling = not greedy_draft and _resolve_folded_sampling(
         model=draft_model,
         gamma=gamma,
         max_bs=max_bs,
@@ -209,7 +211,11 @@ def maybe_build_draft_sampler(
     if tp_rank == 0:
         logger.info(
             "DSpark draft proposal (%s) folded into the draft cuda graph.",
-            "greedy + sampling" if folded_sampling else "greedy only",
+            "greedy draft"
+            if greedy_draft
+            else "greedy + sampling"
+            if folded_sampling
+            else "greedy only",
         )
     return DsparkDraftSampler(
         model=draft_model,

@@ -52,6 +52,9 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    # Every row was drafted by argmax, so sampling accept treats the draft
+    # distribution as one-hot instead of reading corrected_logits.
+    greedy_draft: bool = False
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -183,6 +186,7 @@ def sample_draft_block(
     noise: DraftNoise,
     device: torch.device,
     tp_sync: SpecTpSync,
+    greedy_draft: bool,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -194,17 +198,25 @@ def sample_draft_block(
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
         draft_hidden=draft_hidden,
-        step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
+        step_temperatures=(
+            torch.zeros_like(temperatures)
+            if greedy_draft
+            else temperatures.masked_fill(greedy_mask, 0.0)
+        ),
         noise=noise,
         tp_sync=tp_sync,
+        keep_logits=not greedy_draft,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
-        corrected_logits=expect(
-            _DRAFT_STEP_LOGITS, markov_head.gather_vocab(local_logits)
+        corrected_logits=(
+            None
+            if greedy_draft
+            else expect(_DRAFT_STEP_LOGITS, markov_head.gather_vocab(local_logits))
         ),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        greedy_draft=greedy_draft,
     )
 
 
@@ -219,6 +231,7 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         random_seed: int,
+        greedy_draft: bool,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -229,6 +242,7 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
+        self._greedy_draft = greedy_draft
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -293,13 +307,14 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or draft_sampler.folded_sampling)
+            and (all_greedy or self._greedy_draft or draft_sampler.folded_sampling)
         ):
             folded = True
-            # Greedy accept compares tokens only; sampling accept needs the
+            # Greedy accept compares tokens only, and a greedy draft is
+            # accepted as one-hot; otherwise sampling accept needs the
             # markov-corrected logits the graph tail kept.
             corrected_logits = None
-            if not all_greedy:
+            if not (all_greedy or self._greedy_draft):
                 corrected_logits = self.draft_model.markov_head.gather_vocab(
                     draft_sampler.step_logits[:bs]
                 )
@@ -312,6 +327,7 @@ class DraftBlockProposer:
                 temperatures=resolve_draft_temperatures(
                     bs=bs, sampling_info=sampling_info, device=device
                 ),
+                greedy_draft=self._greedy_draft,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
@@ -330,6 +346,7 @@ class DraftBlockProposer:
                 noise=self._noise,
                 device=device,
                 tp_sync=self._tp_sync,
+                greedy_draft=self._greedy_draft,
             )
         proposal_block_ids = (
             draft_block_ids
