@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
     is_rust_server_built,
     popen_launch_server,
     run_logprob_check,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=265, stage="base-b", runner_config="1-gpu-small")
@@ -746,24 +747,53 @@ class TestTokenizeDetokenize(CustomTestCase):
         cls.tokenize_url = f"{cls.base_url}/tokenize"
         cls.openai_tokenize_url = f"{cls.base_url}/v1/tokenize"
         cls.detokenize_url = f"{cls.base_url}/detokenize"
+        cls.context_length = 1024
         cls.session = requests.Session()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=SERVER_ENV,
+            other_args=["--context-length", str(cls.context_length)],
         )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        cls.session.close()
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+        if hasattr(cls, "session"):
+            cls.session.close()
 
     def _post_json(self, url, payload):
         r = self.session.post(url, json=payload)
         r.raise_for_status()
         return r.json()
+
+    def test_tokenize_reports_server_context_length(self):
+        """Tokenization must report the serving limit even when the tokenizer differs."""
+        models = self.session.get(f"{self.base_url}/v1/models")
+        models.raise_for_status()
+        context_length = models.json()["data"][0]["max_model_len"]
+        self.assertEqual(context_length, self.context_length)
+        tokenizer_limit = self.tokenizer.model_max_length
+        self.assertIsInstance(tokenizer_limit, int)
+        self.assertGreater(tokenizer_limit, 0)
+        self.assertLess(tokenizer_limit, 2**64)
+        self.assertNotEqual(
+            tokenizer_limit,
+            context_length,
+            "The tokenizer limit must differ from the server limit for this regression.",
+        )
+        for url in (self.tokenize_url, self.openai_tokenize_url):
+            for payload in (
+                {"prompt": "Hello"},
+                {"prompt": ["Hello", "Goodbye"]},
+                {"messages": [{"role": "user", "content": "Hello"}]},
+            ):
+                with self.subTest(url=url, payload=payload):
+                    response = self._post_json(url, {"model": self.model, **payload})
+                    self.assertEqual(response["max_model_len"], context_length)
 
     def test_tokenize_various_inputs(self):
         single = "Hello SGLang world! 123 😊, ಪರ್ವತದ ಮೇಲೆ ಹಿಮ."
