@@ -69,6 +69,9 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
+    /// Whether the rendered generation prompt already opened a reasoning block.
+    pub reasoning_started_in_prefill: bool,
+
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
