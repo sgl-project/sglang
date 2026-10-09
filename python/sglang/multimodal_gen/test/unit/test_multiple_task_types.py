@@ -426,7 +426,15 @@ class EditExtrasSamplingParams(SamplingParams):
         ({"style_strength": "0.25", "extra_body": '{"style_strength": 0.5}'}, 0.25),
     ],
 )
-def test_image_edits_pass_model_declared_fields(http_client, form, expected):
+def test_image_edits_pass_model_declared_fields(
+    http_client, monkeypatch, form, expected
+):
+    # the fixture's loader returns the base class; serve the model's class instead
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: EditExtrasSamplingParams()),
+    )
     client, admitted, _ = http_client
     response = client.post(
         "/v1/images/edits",
