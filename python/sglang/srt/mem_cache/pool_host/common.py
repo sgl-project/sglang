@@ -358,8 +358,7 @@ def _default_alloc_memory_func():
             f"got {host_alloc!r}"
         )
     use_pin_memory = host_alloc == "pin" or (
-        host_alloc == "auto"
-        and "microsoft" in platform.uname().release.lower()
+        host_alloc == "auto" and "microsoft" in platform.uname().release.lower()
     )
     if use_pin_memory:
         logger.warning(
