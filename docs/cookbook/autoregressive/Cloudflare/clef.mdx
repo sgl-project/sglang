@@ -51,12 +51,6 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
 
 <Deployment config={config} />
 
-<Note>
-  We tested both models on one B300 and one H200 inside `lmsysorg/sglang:dev-clef`, built from [SGLang bd2d73daa5af](https://github.com/sgl-project/sglang/commit/bd2d73daa5afda6bcad8d479a834f2e70bbe9569), with PyTorch 2.14.1+cu130 and Transformers 5.19.0. Each configuration passed the wizard’s cURL request, the Python example below, and four requests covering short and long text, each with and without an image. Both long requests used all 16,384 prompt tokens and preserved every question.
-
-  B200 passed the same four text/image cases with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. These checks covered serving behavior; throughput and accuracy were not measured.
-</Note>
-
 ## 1. Model introduction
 
 Cloudflare post-trained Clef from Qwen3.8-27B and Clef Flash from Qwen3.5-9B, then released both under the Apache-2.0 license. Each model keeps its backbone and vision encoder and adds a joint schema head. The head reads the backbone’s final hidden states, routes state evidence to each option, and lets questions attend to one another. It returns one logit per allowed option in a single prefill, with no text generation.
