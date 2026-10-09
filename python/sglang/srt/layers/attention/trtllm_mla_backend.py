@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import triton
@@ -170,6 +170,8 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    # (CPU copy of seq_lens, its sum), for flashinfer's host-side row check.
+    host_seq_lens: Optional[Tuple[torch.Tensor, int]] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -807,6 +809,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
+                (
+                    torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int32),
+                    sum(forward_batch.extend_seq_lens_cpu),
+                ),
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1066,6 +1072,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
@@ -1093,6 +1101,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            q_seq_lens_cpu=q_seq_lens_cpu,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
         )
 
     def _set_kv_and_concat_q_fused(
@@ -1713,6 +1723,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out_buffer=out,
                 o_sf_scale=-1.0,
+                **_host_seq_lens(
+                    q,
+                    k,
+                    self.forward_prefill_metadata.host_seq_lens,
+                    _prefix_chunk_host_seq_lens(forward_batch, chunk_idx),
+                ),
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -1756,6 +1772,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                **_host_seq_lens(
+                    q,
+                    k,
+                    self.forward_prefill_metadata.host_seq_lens,
+                    self.forward_prefill_metadata.host_seq_lens,
+                ),
             )
 
 
@@ -1806,3 +1828,30 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
+
+
+def _prefix_chunk_host_seq_lens(forward_batch, chunk_idx):
+    if (
+        forward_batch.prefix_chunk_seq_lens_cpu is None
+        or forward_batch.prefix_chunk_num_tokens is None
+    ):
+        return None
+    return (
+        forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
+        forward_batch.prefix_chunk_num_tokens[chunk_idx],
+    )
+
+
+def _host_seq_lens(q, k, q_lens, kv_lens):
+    """Host q/kv lengths, as (CPU lengths, total) pairs, let flashinfer skip its
+    empty-row .item() sync. Pass them only when they cover q/k exactly and no
+    graph is being captured."""
+    if (
+        q_lens is None
+        or kv_lens is None
+        or q_lens[1] != q.shape[0]
+        or kv_lens[1] != k.shape[0]
+        or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    ):
+        return {}
+    return {"q_seq_lens_cpu": q_lens[0], "kv_seq_lens_cpu": kv_lens[0]}
