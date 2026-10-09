@@ -41,7 +41,7 @@ class TestAscendMlaHicache(CustomTestCase):
             4,
             "--enable-hierarchical-cache",
             "--hicache-size",
-            10,
+            1 if _is_pr_pipeline else 10,
         ]
 
     def test_a_gsm8k(self):
