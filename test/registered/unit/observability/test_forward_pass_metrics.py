@@ -215,6 +215,25 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
         self.assertAlmostEqual(self.scheduler._fpm_gpu_time_acc, 0.0)
 
+    def test_decode_sequence_length_sources(self):
+        reqs = [_FakeReq(10, output_len=5), _FakeReq(20, output_len=3)]
+        for requests, cpu_lengths, expected in (
+            (reqs, None, (2, 38, 16.0)),
+            (reqs, [9, 13], (2, 22, 4.0)),
+            ([], None, (0, 0, 0.0)),
+        ):
+            with self.subTest(cpu_lengths=cpu_lengths, expected=expected):
+                batch = self._make_batch(reqs=requests, seq_lens_cpu=cpu_lengths)
+                metrics = self.reporter._build_scheduled_request_metrics(batch)
+                self.assertEqual(
+                    (
+                        metrics.num_decode_requests,
+                        metrics.sum_decode_kv_tokens,
+                        metrics.var_decode_kv_tokens,
+                    ),
+                    expected,
+                )
+
     def test_emit_skips_when_device_timer_zero(self):
         self.scheduler._fpm_uses_device_timer = True
         self.scheduler._fpm_gpu_time_acc = 0.0
