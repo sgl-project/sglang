@@ -14,6 +14,7 @@
 
 
 import logging
+import os
 import re
 from array import array
 from functools import lru_cache
@@ -198,7 +199,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        self.language_model_only = getattr(config, "language_model_only", False) or os.environ.get("SGLANG_DISABLE_VISION", "0") == "1"
+        if self.pp_group.is_first_rank and not self.language_model_only:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
