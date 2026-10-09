@@ -200,6 +200,9 @@ class FakeServerArgs:
     def resolve_component_attention_backend(self, *names):
         return None, None
 
+    def resolve_component_backend_by_role(self, *names):
+        return {}
+
 
 def _write_component(directory, config, tensors):
     directory.mkdir(parents=True, exist_ok=True)
