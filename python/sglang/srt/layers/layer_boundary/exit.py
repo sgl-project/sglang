@@ -555,6 +555,8 @@ class FfnExit:
     ):
         self._stream = stream
         self.boundary = boundary
+        # The same path the entry took: the flags that select it hold for the
+        # whole call, and a stage keeps no state between its entry and exit.
         steps = boundary.plan.path_for(forward_batch)
         completion = boundary._decide(forward_batch, steps)
         self.defer_moe_finalize = completion.defer_moe_finalize

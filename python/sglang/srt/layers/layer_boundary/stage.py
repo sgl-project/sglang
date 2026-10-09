@@ -317,6 +317,13 @@ class StageBoundary:
         return hidden_states
 
     def _prepare_input(self, hidden_states, stream, forward_batch, **call):
+        hidden_states, steps = self._select(hidden_states, forward_batch)
+        return self._prepare(hidden_states, stream, forward_batch, steps, **call)
+
+    def _select(self, hidden_states, forward_batch):
+        """This call's path, looked up once the flags that select it are set:
+        the stack's first stage starts a sequence-parallel batch. Publishes
+        the rows LoRA reads for the stage's input."""
         plan = self.plan
         if self.kind is StageKind.ATTENTION:
             publish_attn_lora_rows(plan._publish_lora_layout)
@@ -329,11 +336,10 @@ class StageBoundary:
                 )
                 if get_forward().sp_active:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        else:
-            publish_ffn_lora_rows(
-                plan._publish_lora_layout, self.entry(forward_batch).input_rows
-            )
-        return self._prepare(hidden_states, stream, forward_batch, **call)
+        steps = plan.path_for(forward_batch)
+        if self.kind is StageKind.FFN:
+            publish_ffn_lora_rows(plan._publish_lora_layout, steps.entry.input_rows)
+        return hidden_states, steps
 
     def _prepare_attention(
         self,
@@ -362,14 +368,16 @@ class StageBoundary:
                     capture(value)
                 else:
                     capture(value + previous, owned=True)
-        hidden_states, stream = self._prepare_input(
+        hidden_states, steps = self._select(hidden_states, forward_batch)
+        hidden_states, stream = self._prepare(
             hidden_states,
             stream,
             forward_batch,
+            steps,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
-        entry = self.entry(forward_batch)
+        entry = steps.entry
         if capture is not None and not capture_before_read:
             value = stream.residual
             move = entry.capture_move
