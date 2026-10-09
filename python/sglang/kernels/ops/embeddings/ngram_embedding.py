@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
     import torch
@@ -12,6 +13,10 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_ngram_embedding_module() -> Module:
+    if is_xpu():
+        import torch
+
+        return torch.ops.sgl_kernel  # SYCL port in sgl-kernel-xpu, same signatures
     return load_jit(
         "ngram_embedding",
         cuda_files=["speculative/ngram_embedding.cuh"],
