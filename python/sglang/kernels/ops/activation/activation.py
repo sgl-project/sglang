@@ -6,8 +6,8 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    get_activation_cuda_cflags,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
-    fast_math_flags = [] if is_hip_runtime() else ["--use_fast_math"]
+    fast_math_flags = get_activation_cuda_cflags()
     if not fast_math and not fast_math_flags:
         return activation_module(dtype)
     args = make_cpp_args(dtype, is_arch_support_pdl())
