@@ -52,6 +52,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -484,17 +485,20 @@ class UniflowKVManager(CommonKVManager):
                         self.record_failure(room, reason)
                         self.update_status(room, KVPoll.Failed)
                     self.condition.notify_all()
-            if self.enable_deferred_decode_kv_release and len(msg) >= 6:
+            if self.enable_deferred_decode_kv_release and len(msg) >= 7:
                 # Decode holds the aborted pages until this ack. It is
                 # queued only after the room can no longer transfer,
                 # and the single FIFO worker runs it after every chunk
-                # queued before it has finished its put.
+                # queued before it has finished its put. A decode that
+                # did not arm a generation does not wait for an ack.
+                target = AckTarget(
+                    msg[4].decode("ascii"),
+                    int(msg[5].decode("ascii")),
+                    int(msg[6].decode("ascii")),
+                )
                 self._transfer_queue.put(
                     functools.partial(
-                        self._send_abort_ack_unless_shutdown_failed,
-                        msg[4].decode("ascii"),
-                        int(msg[5].decode("ascii")),
-                        room,
+                        self._send_abort_ack_unless_shutdown_failed, room, target
                     )
                 )
             return
@@ -525,12 +529,9 @@ class UniflowKVManager(CommonKVManager):
         threading.Thread(target=message_thread, daemon=True).start()
 
     def _handle_decode_message(self, msg: list[bytes]) -> None:
-        if msg and msg[0] == b"ABORT_ACK" and len(msg) >= 3:
-            # Common deferred-release ack, not GUARD-framed. Counted only while
-            # decode holds the room's pages.
-            self.note_abort_ack(
-                int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
-            )
+        # Common deferred-release ack, not GUARD-framed. Counted only for the
+        # generation that currently holds the room's pages.
+        if self.handle_abort_ack_message(msg):
             return
         if not msg or msg[0] != GUARD:
             logger.warning(
@@ -722,7 +723,7 @@ class UniflowKVManager(CommonKVManager):
         return True
 
     def _send_abort_ack_unless_shutdown_failed(
-        self, decode_ip: str, decode_port: int, room: int
+        self, room: int, target: AckTarget
     ) -> None:
         # Runs on the transfer worker, after every put queued before the abort.
         if room in self._failed_shutdown_rooms:
@@ -732,7 +733,7 @@ class UniflowKVManager(CommonKVManager):
                 room,
             )
             return
-        self._send_abort_ack(decode_ip, decode_port, room)
+        self._send_abort_ack(room, target)
 
     def _is_room_stopped(self, room: int) -> bool:
         """Whether decode or the sender aborted the room, or the sender cleared it."""
@@ -978,16 +979,12 @@ class UniflowKVSender(CommonKVSender):
         mgr: UniflowKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: list[int],
-        pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
         super().__init__(
             mgr,
             bootstrap_addr,
             bootstrap_room,
-            dest_tp_ranks,
-            pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
         self._transfer_start_time: float | None = None
@@ -1122,7 +1119,9 @@ class UniflowKVReceiver(CommonKVReceiver):
         if self.kv_mgr.enable_deferred_decode_kv_release and (
             force_arm or self.init_time is not None
         ):
-            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
+            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
+                self.bootstrap_room
+            )
         with self.kv_mgr.failure_lock:
             reason = self.kv_mgr.failure_records.get(
                 self.bootstrap_room, DEFAULT_ABORT_REASON
@@ -1140,6 +1139,11 @@ class UniflowKVReceiver(CommonKVReceiver):
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
                         ]
+                        + (
+                            []
+                            if self._abort_generation is None
+                            else [str(self._abort_generation).encode("ascii")]
+                        )
                     )
             except Exception:
                 # Best-effort per peer, like the base notification.

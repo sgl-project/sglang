@@ -240,7 +240,7 @@ class _Endpoint:
         )
 
     def start_sender(self, room: int, num_pages: int, aux_idx: int) -> None:
-        sender = UniflowKVSender(self.mgr, self.bootstrap_addr, room, [0], 0)
+        sender = UniflowKVSender(self.mgr, self.bootstrap_addr, room)
         sender.init(num_pages, aux_index=aux_idx)
         self.senders[room] = sender
 

@@ -183,6 +183,10 @@ def _bare_manager(**attrs: Any) -> UniflowKVManager:
         enable_deferred_decode_kv_release=False,
         _transfer_queue=queue.Queue(),
         _deferred_abort_ack_tracker={},
+        _deferred_abort_generation=0,
+        _deferred_ack_targets={},
+        _deferred_ack_poisoned_rooms=set(),
+        _staging_outstanding=defaultdict(int),
         bootstrap_timeout=0.05,
         waiting_timeout=0.05,
         is_dummy_cp_rank=False,
@@ -309,6 +313,7 @@ def _bare_receiver(
         conclude_state=None,
         init_time=None,
         abort_notified=False,
+        _abort_generation=None,
         _connection_pool_entries={},
         started_transfer=False,
         required_dst_info_num=1,
@@ -638,7 +643,7 @@ def test_abort_before_sender_exists_is_consumed_by_sender() -> None:
     assert mgr.pending_aborts == {room: "early abort"}
     assert room not in mgr.request_status
     with get_parallel().override(num_dp_ranks=1):
-        sender = UniflowKVSender(mgr, f"{LOCALHOST}:8998", room, [0], 0)
+        sender = UniflowKVSender(mgr, f"{LOCALHOST}:8998", room)
     assert not mgr.pending_aborts
     assert sender.poll() == KVPoll.Failed
     with pytest.raises(KVTransferError, match="early abort"):
@@ -653,10 +658,12 @@ def test_late_abort_for_concluded_room_is_ignored_but_acked(status: int) -> None
     mgr = _bare_manager(enable_deferred_decode_kv_release=True)
     mgr.request_status[room] = status
     acks: list[tuple[str, int, int]] = []
-    mgr._send_abort_ack = lambda ip, port, ack_room: acks.append((ip, port, ack_room))
+    mgr._send_abort_ack = lambda ack_room, target: acks.append(
+        (target.ip, target.port, ack_room)
+    )
 
     mgr._handle_prefill_message(
-        [GUARD, ABORT_MSG, _ascii(room), b"late", _ascii(LOCALHOST), b"17001"]
+        [GUARD, ABORT_MSG, _ascii(room), b"late", _ascii(LOCALHOST), b"17001", b"1"]
     )
 
     assert mgr.request_status[room] == status
@@ -694,7 +701,7 @@ def test_abort_ack_runs_after_chunks_queued_before_it() -> None:
         wait_event=None,
     )
     mgr._handle_prefill_message(
-        [GUARD, ABORT_MSG, _ascii(room), b"abort", _ascii(LOCALHOST), b"17001"]
+        [GUARD, ABORT_MSG, _ascii(room), b"abort", _ascii(LOCALHOST), b"17001", b"1"]
     )
     _run_queued_tasks(mgr)
 
@@ -703,8 +710,12 @@ def test_abort_ack_runs_after_chunks_queued_before_it() -> None:
 
 @pytest.mark.parametrize(
     "enabled, extra",
-    [(False, [_ascii(LOCALHOST), b"17001"]), (True, [])],
-    ids=["flag-off", "no-decode-address"],
+    [
+        (False, [_ascii(LOCALHOST), b"17001", b"1"]),
+        (True, []),
+        (True, [_ascii(LOCALHOST), b"17001"]),
+    ],
+    ids=["flag-off", "no-decode-address", "no-generation"],
 )
 def test_abort_ack_requires_flag_and_decode_address(
     enabled: bool, extra: list[bytes]
@@ -775,11 +786,14 @@ def test_register_and_metadata_make_room_ready() -> None:
 
 def test_decode_handler_counts_acks_and_applies_status() -> None:
     room = 0xC0FFEE_215
-    mgr = _bare_manager()
-    mgr.register_deferred_abort_room(room)
+    # The common handler records ACKs only while deferred release is enabled.
+    mgr = _bare_manager(enable_deferred_decode_kv_release=True)
+    generation = mgr.register_deferred_abort_room(room)
 
-    mgr._handle_decode_message([b"ABORT_ACK", _ascii(room), b"0"])
-    mgr._handle_decode_message([b"ABORT_ACK", _ascii(room + 1), b"0"])
+    mgr._handle_decode_message([b"ABORT_ACK", _ascii(room), b"0", _ascii(generation)])
+    mgr._handle_decode_message(
+        [b"ABORT_ACK", _ascii(room + 1), b"0", _ascii(generation)]
+    )
 
     assert mgr.is_abort_release_safe(room, 1)
     assert not mgr.is_abort_release_safe(room + 1, 1)
@@ -1655,7 +1669,15 @@ def test_put_timeout_drains_connection_before_reporting_failed() -> None:
 
 
 def _decode_abort_frame(room: int) -> list[bytes]:
-    return [GUARD, ABORT_MSG, _ascii(room), b"client gone", _ascii(LOCALHOST), b"17001"]
+    return [
+        GUARD,
+        ABORT_MSG,
+        _ascii(room),
+        b"client gone",
+        _ascii(LOCALHOST),
+        b"17001",
+        b"1",
+    ]
 
 
 def test_decode_abort_during_put_is_acked_only_after_drain() -> None:
@@ -2217,7 +2239,7 @@ def test_cpu_chunked_transfer_writes_only_requested_pages(
 
     receiver = UniflowKVReceiver(cpu_pd.decode, cpu_pd.addr, room)
     receiver.init(0)
-    sender = UniflowKVSender(cpu_pd.prefill, cpu_pd.addr, room, [0], 0)
+    sender = UniflowKVSender(cpu_pd.prefill, cpu_pd.addr, room)
     sender.init(len(src_pages), aux_index=2)
     receiver.send_metadata(
         np.array(dst_pages, dtype=np.int32), aux_index=1, state_indices=[[3]]
@@ -2250,7 +2272,7 @@ def test_cpu_decode_abort_before_sender_fails_sender(cpu_pd: SimpleNamespace) ->
     receiver.abort()
 
     assert _wait_until(lambda: room in cpu_pd.prefill.pending_aborts, 10.0)
-    sender = UniflowKVSender(cpu_pd.prefill, cpu_pd.addr, room, [0], 0)
+    sender = UniflowKVSender(cpu_pd.prefill, cpu_pd.addr, room)
     assert sender.poll() == KVPoll.Failed
     with pytest.raises(KVTransferError, match="Aborted by AbortReq"):
         sender.failure_exception()
@@ -2277,7 +2299,7 @@ def test_cpu_bootstrap_timeout_during_worker_wait_leaks_nothing(
             done.set()
 
     prefill.wait_for_transfer_info = observed_wait
-    sender = UniflowKVSender(prefill, cpu_pd.addr, room, [0], 0)
+    sender = UniflowKVSender(prefill, cpu_pd.addr, room)
     sender.init(1, aux_index=0)
     sender.send(np.array([0], dtype=np.int32))
     assert entered.wait(5.0)
