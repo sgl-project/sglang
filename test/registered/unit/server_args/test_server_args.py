@@ -3922,7 +3922,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "requires the Python"):
                 handle_kv_cache_sharding(self._args())
 
-    def test_unused_rust_tree_core_is_allowed_with_radix_disabled(self):
+    def test_rust_tree_core_is_allowed_with_radix_disabled(self):
         args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
         args.disable_radix_cache = True
         with (
