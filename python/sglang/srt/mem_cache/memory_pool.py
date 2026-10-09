@@ -114,9 +114,8 @@ def _safe_zeros(shape, dtype, device):
     try:
         return torch.zeros(shape, dtype=dtype, device=device)
     except (NotImplementedError, RuntimeError):
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        buf.view(torch.uint8).zero_()
-        return buf
+        buf = torch.empty(shape, dtype=torch.uint8, device=device).zero_()
+        return buf.view(dtype)
 
 _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
@@ -2119,7 +2118,7 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim
             if v_head_dim is not None
-            else head_dim
+            else self.head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -3102,6 +3101,23 @@ class MHATokenToKVPool(KVCache):
                 "KV rows must match loc_2d size: "
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
+
+        if self.is_quantized_kv_cache:
+            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                loc_2d.reshape(-1).index_select(0, valid_idx),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale,
+                v_scale,
+                layer_id_override=layer_id,
+            )
+            return
 
         if cache_k.dtype != self.dtype:
             if k_scale is not None:

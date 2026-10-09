@@ -439,45 +439,134 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
-            n = model_config.get_num_kv_heads(tp_size, dcp_size)
-            cell_size = (
-                n
-                * (model_config.head_dim + model_config.v_head_dim)
-                * effective_num_layers
-                * kv_size
+            swa_layer_ids = getattr(kvc.layer_info, "swa_attention_layer_ids", [])
+            full_layer_ids = getattr(kvc.layer_info, "full_attention_layer_ids", [])
+            swa_count = sum(
+                1
+                for i in swa_layer_ids
+                if kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
             )
-
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
-                from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-                    get_kv_cache_quant_method,
-                    resolve_kv_cache_quant,
-                )
-
-                quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
-                if quant_name is None:
-                    raise ValueError(
-                        "FP4 storage dtype requires an explicit KV recipe name."
+            full_count = sum(
+                1
+                for i in full_layer_ids
+                if kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
+            )
+            has_heterogeneous = (
+                swa_count > 0
+                and (
+                    getattr(model_config, "swa_head_dim", model_config.head_dim)
+                    != model_config.head_dim
+                    or getattr(model_config, "swa_v_head_dim", model_config.v_head_dim)
+                    != model_config.v_head_dim
+                    or (
+                        hasattr(model_config, "get_swa_num_kv_heads")
+                        and model_config.get_swa_num_kv_heads(tp_size, dcp_size)
+                        != model_config.get_num_kv_heads(tp_size, dcp_size)
                     )
-                quant_method = get_kv_cache_quant_method(
-                    quant_name,
-                    num_layers=effective_num_layers,
-                    device=kvc.device,
-                    page_size=kvc.page_size,
                 )
-                quant_method.configure_attention_backends_from_server_args(
-                    kvc.server_args
+            )
+            if has_heterogeneous and (swa_count + full_count == effective_num_layers):
+                n_swa = (
+                    model_config.get_swa_num_kv_heads(tp_size, dcp_size)
+                    if hasattr(model_config, "get_swa_num_kv_heads")
+                    else model_config.get_num_kv_heads(tp_size, dcp_size)
                 )
-                cell_size = quant_method.compute_cell_size(
-                    n,
-                    model_config.head_dim,
-                    effective_num_layers,
-                    kv_size,
+                swa_head_dim = model_config.swa_head_dim
+                swa_v_head_dim = model_config.swa_v_head_dim
+
+                n_full = model_config.get_num_kv_heads(tp_size, dcp_size)
+                full_head_dim = model_config.head_dim
+                full_v_head_dim = model_config.v_head_dim
+
+                if is_float4_e2m1fn_x2(kv_cache_dtype):
+                    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                        get_kv_cache_quant_method,
+                        resolve_kv_cache_quant,
+                    )
+
+                    quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
+                    if quant_name is None:
+                        raise ValueError(
+                            "FP4 storage dtype requires an explicit KV recipe name."
+                        )
+                    quant_method = get_kv_cache_quant_method(
+                        quant_name,
+                        num_layers=effective_num_layers,
+                        device=kvc.device,
+                        page_size=kvc.page_size,
+                    )
+                    quant_method.configure_attention_backends_from_server_args(
+                        kvc.server_args
+                    )
+                    cell_size = (
+                        quant_method.compute_cell_size(
+                            n_full,
+                            full_head_dim,
+                            full_count,
+                            kv_size,
+                        )
+                        + quant_method.compute_cell_size(
+                            n_swa,
+                            swa_head_dim,
+                            swa_count,
+                            kv_size,
+                        )
+                    )
+                elif self.kv_cache_dtype_str == "mxfp8":
+                    scale_block_size = 32
+                    cell_size = (
+                        full_count * n_full * (full_head_dim + full_v_head_dim) * kv_size
+                        + swa_count * n_swa * (swa_head_dim + swa_v_head_dim) * kv_size
+                    )
+                    cell_size += (
+                        full_count * n_full * (full_head_dim + full_v_head_dim)
+                        + swa_count * n_swa * (swa_head_dim + swa_v_head_dim)
+                    ) // scale_block_size
+                else:
+                    cell_size = (
+                        full_count * n_full * (full_head_dim + full_v_head_dim) * kv_size
+                        + swa_count * n_swa * (swa_head_dim + swa_v_head_dim) * kv_size
+                    )
+            else:
+                n = model_config.get_num_kv_heads(tp_size, dcp_size)
+                cell_size = (
+                    n
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * effective_num_layers
+                    * kv_size
                 )
-            elif self.kv_cache_dtype_str == "mxfp8":
-                scale_block_size = 32
-                cell_size += (
-                    n * (model_config.head_dim + model_config.v_head_dim) * num_layers
-                ) // scale_block_size
+
+                if is_float4_e2m1fn_x2(kv_cache_dtype):
+                    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                        get_kv_cache_quant_method,
+                        resolve_kv_cache_quant,
+                    )
+
+                    quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
+                    if quant_name is None:
+                        raise ValueError(
+                            "FP4 storage dtype requires an explicit KV recipe name."
+                        )
+                    quant_method = get_kv_cache_quant_method(
+                        quant_name,
+                        num_layers=effective_num_layers,
+                        device=kvc.device,
+                        page_size=kvc.page_size,
+                    )
+                    quant_method.configure_attention_backends_from_server_args(
+                        kvc.server_args
+                    )
+                    cell_size = quant_method.compute_cell_size(
+                        n,
+                        model_config.head_dim,
+                        effective_num_layers,
+                        kv_size,
+                    )
+                elif self.kv_cache_dtype_str == "mxfp8":
+                    scale_block_size = 32
+                    cell_size += (
+                        n * (model_config.head_dim + model_config.v_head_dim) * num_layers
+                    ) // scale_block_size
 
         cell_size += self._compute_qsa_cell_size(
             hf_config=model_config.hf_config, num_layers=num_layers
@@ -667,7 +756,36 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
 
-        if self.kv_cache_dtype_str == "mxfp8":
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+                get_kv_cache_quant_method,
+                resolve_kv_cache_quant,
+            )
+
+            quant_name = resolve_kv_cache_quant(kvc.kv_cache_dtype_str)
+            if quant_name is not None:
+                quant_method = get_kv_cache_quant_method(
+                    quant_name,
+                    num_layers=1,
+                    device=kvc.device,
+                    page_size=kvc.page_size,
+                )
+                quant_method.configure_attention_backends_from_server_args(
+                    kvc.server_args
+                )
+                self._full_per_token = quant_method.compute_cell_size(
+                    model_config.get_num_kv_heads(tp_size),
+                    model_config.head_dim,
+                    1,
+                    kv_size,
+                )
+                self._swa_per_token = quant_method.compute_cell_size(
+                    model_config.get_swa_num_kv_heads(tp_size),
+                    model_config.swa_head_dim,
+                    1,
+                    kv_size,
+                )
+        elif self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)

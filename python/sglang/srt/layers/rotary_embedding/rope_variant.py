@@ -927,25 +927,55 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
             dtype,
         )
 
-    def _compute_inv_freq(self, base: float) -> torch.Tensor:
+    def _compute_inv_freq(
+        self, base: float, device: Optional[Union[str, torch.device]] = None
+    ) -> torch.Tensor:
         """Compute frequencies only for the rotated dimensions.
 
         Non-rotated dims are padded with 0.0 to produce identity rotation.
         """
+        if device is None:
+            if hasattr(self, "cos_sin_cache") and self.cos_sin_cache is not None:
+                device = self.cos_sin_cache.device
+            elif hasattr(self, "device") and self.device is not None:
+                device = self.device
+            else:
+                try:
+                    device = torch.empty(0).device
+                except Exception:
+                    device = torch.device("cpu")
+        else:
+            device = torch.device(device)
+
         freq_exponents = (
-            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float) / self.head_size
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float, device=device)
+            / self.head_size
         )
-        inv_freq = 1.0 / (base**freq_exponents)
+        inv_freq = (1.0 / (base**freq_exponents)).to(
+            device=device, dtype=torch.float32
+        )
 
         # Zero-pad for non-rotated dims (identity rotation: cos=1, sin=0)
         if self.nope_angles > 0:
-            inv_freq = torch.cat(
-                [
-                    inv_freq,
-                    torch.zeros(self.nope_angles, dtype=torch.float),
-                ]
-            )
+            zeros = torch.zeros(
+                self.nope_angles, dtype=torch.float, device=device
+            ).to(device=device, dtype=torch.float32)
+            inv_freq = torch.cat([inv_freq, zeros])
         return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float,
+            device=inv_freq.device,
+        )
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
