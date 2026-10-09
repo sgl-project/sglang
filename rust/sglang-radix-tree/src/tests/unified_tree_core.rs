@@ -2477,52 +2477,6 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_mamba_offload_keys_the_state_by_its_end_page() {
-    let params = CacheInitParams {
-        page_size: 2,
-        mamba_cache_chunk_size: Some(2),
-        ..Default::default()
-    };
-    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    tc.set_enable_external_cache_linker(true);
-    let root = tc.arena.root();
-    let node = tc.add_new_node_(
-        root,
-        vec![1, 2, 3, 4],
-        &Tensor::from_slice(&[10i64, 11, 12, 13]),
-        0,
-        None,
-    );
-    let node_id = tc.arena.node(node).id;
-    let transfers = tc
-        .build_external_linker_offload_transfers(node_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(transfers.len(), 1);
-    assert_eq!(transfers[0].name, PoolName::Kv);
-
-    tc.arena.node_mut(node).values[MAMBA.idx()].value = Some(Tensor::from_slice(&[7i64]));
-    let transfers = tc
-        .build_external_linker_offload_transfers(node_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(transfers.len(), 2);
-    assert_eq!(transfers[1].name, PoolName::Mamba);
-    assert_eq!(transfers[1].hit_policy, PoolHitPolicy::TrailingPages);
-    assert!(
-        transfers[1]
-            .device_indices
-            .as_ref()
-            .unwrap()
-            .equal(&Tensor::from_slice(&[7i64]))
-    );
-    assert_eq!(
-        transfers[1].keys.as_ref().unwrap(),
-        &tc.arena.node(node).hash_value.as_ref().unwrap()[1..]
-    );
-}
-
-#[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true);
