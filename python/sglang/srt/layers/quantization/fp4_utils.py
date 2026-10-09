@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from enum import Enum
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -13,6 +15,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    is_gfx95_supported,
+    is_hip,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
@@ -99,6 +103,8 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     MARLIN = "marlin"
+    AITER = "aiter"
+    TRITON = "triton"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -117,6 +123,12 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_marlin(self) -> bool:
         return self == Fp4GemmRunnerBackend.MARLIN
+
+    def is_aiter(self) -> bool:
+        return self == Fp4GemmRunnerBackend.AITER
+
+    def is_triton(self) -> bool:
+        return self == Fp4GemmRunnerBackend.TRITON
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
@@ -146,12 +158,70 @@ class Fp4GemmRunnerBackend(Enum):
 FP4_GEMM_RUNNER_BACKEND: Fp4GemmRunnerBackend | None = None
 
 
+_ROCM_ONLY_FP4_GEMM_BACKENDS = ("aiter", "triton")
+_LEGACY_AITER_FP4_ASM_GEMM_ENV = "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM"
+
+
+def _warn_legacy_aiter_fp4_asm_gemm_env(message: str) -> None:
+    # DeprecationWarning is hidden by Python's default filters, so also log it.
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+    logger.warning(message)
+
+
+def resolve_rocm_fp4_gemm_backend(
+    *,
+    backend: str,
+    is_gfx95: bool,
+    legacy_use_aiter_asm: Optional[bool],
+) -> str:
+    """Resolve --fp4-gemm-backend for ROCm.
+
+    ``legacy_use_aiter_asm`` is the value of the deprecated
+    SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM, or None when it is unset.
+    """
+    if legacy_use_aiter_asm is not None:
+        message = (
+            f"Environment variable {_LEGACY_AITER_FP4_ASM_GEMM_ENV} is deprecated "
+            "and will be removed in a future release. Please use "
+            "'--fp4-gemm-backend aiter' (or 'triton') instead."
+        )
+        if backend != "auto":
+            _warn_legacy_aiter_fp4_asm_gemm_env(
+                f"{message} It is ignored because --fp4-gemm-backend={backend} "
+                "is set explicitly."
+            )
+        else:
+            _warn_legacy_aiter_fp4_asm_gemm_env(message)
+            # The env var was a silent no-op off gfx95; keep it that way.
+            return "aiter" if legacy_use_aiter_asm and is_gfx95 else "triton"
+
+    if backend == "auto":
+        # AITER stays opt-in: its preshuffled weights cannot serve the Quark
+        # tuple-input fusion paths (e.g. DeepSeek MLA projections) yet.
+        return "triton"
+    if backend == "aiter" and not is_gfx95:
+        raise ValueError(
+            "--fp4-gemm-backend=aiter requires an AMD gfx95 GPU (MI350/MI355). "
+            "Use --fp4-gemm-backend triton instead."
+        )
+    return backend
+
+
 def initialize_fp4_gemm_config() -> None:
     """Initialize the FP4 GEMM backend from the published configuration."""
     global FP4_GEMM_RUNNER_BACKEND
 
     backend = get_exec().kernel.fp4_gemm_runner_backend
-    if backend == "auto":
+    if is_hip():
+        legacy_env = envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM
+        backend = resolve_rocm_fp4_gemm_backend(
+            backend=backend,
+            is_gfx95=is_gfx95_supported(),
+            legacy_use_aiter_asm=legacy_env.get() if legacy_env.is_set() else None,
+        )
+    elif backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
+        raise ValueError(f"--fp4-gemm-backend={backend} is only supported on ROCm.")
+    elif backend == "auto":
         if get_platform().is_sm100:
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
