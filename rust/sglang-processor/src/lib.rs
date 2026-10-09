@@ -13,6 +13,8 @@ pub mod openai;
 mod parser;
 #[cfg(feature = "render")]
 mod render;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod think;
 #[cfg(feature = "tokenizer")]
 mod tokenizer;
 
@@ -30,6 +32,8 @@ pub use render::{
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
+#[cfg(any(feature = "parser", feature = "openai"))]
+pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 

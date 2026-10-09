@@ -3,7 +3,7 @@
 //! back as the OpenAI response SGLang returns. Fixtures come from
 //! `tests/scripts/generate_openai_parity.py`.
 
-#![cfg(all(feature = "openai", feature = "tokenizer"))]
+#![cfg(all(feature = "openai", feature = "render", feature = "tokenizer"))]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,9 +11,12 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_completion,
+    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_chat,
+    lower_completion,
 };
-use sglang_processor::{load_tokenizer, resolve_model_file};
+use sglang_processor::{
+    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
+};
 
 struct FixtureTokenizer {
     tokenizer: Tokenizer,
@@ -27,23 +30,61 @@ impl OpenAiTokenizer for FixtureTokenizer {
         }
     }
 
-    fn byte_level_piece(&self, id: u32) -> Option<String> {
-        self.pieces.byte_level_piece(id).map(str::to_owned)
+    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        self.pieces.byte_level_bytes(id)
     }
 }
 
-impl FixtureTokenizer {
-    fn load(path: &str) -> Self {
-        let json = std::fs::read_to_string(path).unwrap();
+/// The cached checkpoint's renderer and tokenizer, as a host has them.
+struct Checkpoint {
+    formatter: ChatFormatter,
+    tokenizer: Tokenizer,
+    openai: Arc<dyn OpenAiTokenizer>,
+}
+
+impl Checkpoint {
+    fn load(tokenizer_file: &str) -> Self {
+        let dir = Path::new(tokenizer_file).parent().unwrap();
+        let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
+            tokenizer_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let json = std::fs::read_to_string(tokenizer_file).unwrap();
         Self {
-            tokenizer: load_tokenizer(Some(path), None, false).unwrap(),
-            pieces: TokenPieces::from_tokenizer_json(&serde_json::from_str(&json).unwrap()),
+            formatter: formatter.unwrap_or_else(|| panic!("{error:?}")),
+            tokenizer: load_tokenizer(Some(tokenizer_file), None, true).unwrap(),
+            openai: Arc::new(FixtureTokenizer {
+                tokenizer: load_tokenizer(Some(tokenizer_file), None, false).unwrap(),
+                pieces: TokenPieces::from_tokenizer_json(&serde_json::from_str(&json).unwrap()),
+            }),
         }
     }
+
+    /// The prompt ids SGLang encodes: the rendered prompt, then the
+    /// `continue_final_message` prefix without its BOS.
+    fn render(&self, request: &Value, settings: &OpenAiSettings) -> Option<Vec<u32>> {
+        let defaults = settings
+            .default_chat_template_kwargs
+            .clone()
+            .unwrap_or_default();
+        let (prompt, prefix) = self
+            .formatter
+            .render_request(request.clone(), &defaults.into_iter().collect())
+            .ok()?;
+        let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
+        let bos = ids("").first().copied();
+        let mut out = ids(&prompt);
+        let mut suffix = ids(&prefix);
+        if bos.is_some() && suffix.first().copied() == bos {
+            suffix.remove(0);
+        }
+        out.extend(suffix);
+        Some(out)
+    }
 }
 
-/// Without the cached tokenizer, cases that need it are skipped, so the rest
-/// still run in CI.
+/// Without the cached checkpoint, chat renders to Python's recorded prompt ids
+/// and cases that need the tokenizer are skipped, so the rest still run in CI.
 #[test]
 fn fixtures_match_sglang() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openai_parity");
@@ -51,12 +92,13 @@ fn fixtures_match_sglang() {
         let fixture: Value =
             serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
         let model = fixture["model"].as_str().unwrap();
-        let tokenizer = resolve_model_file(model, fixture["revision"].as_str(), "tokenizer.json")
-            .map(|path| Arc::new(FixtureTokenizer::load(&path)) as Arc<dyn OpenAiTokenizer>);
+        let checkpoint = resolve_model_file(model, fixture["revision"].as_str(), "tokenizer.json")
+            .map(|path| Checkpoint::load(&path));
         let settings: OpenAiSettings = serde_json::from_value(fixture["settings"].clone()).unwrap();
+        let chat_model: ChatModel = serde_json::from_value(fixture["chat_model"].clone()).unwrap();
         let mut skipped = 0;
         for case in fixture["cases"].as_array().unwrap() {
-            match check_case(case, &fixture, &settings, tokenizer.clone()) {
+            match check_case(case, &fixture, &settings, &chat_model, checkpoint.as_ref()) {
                 Ok(true) => {}
                 Ok(false) => skipped += 1,
                 Err(error) => panic!("{model} {}: {error}", case["name"]),
@@ -72,19 +114,32 @@ fn check_case(
     case: &Value,
     fixture: &Value,
     settings: &OpenAiSettings,
-    tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+    chat_model: &ChatModel,
+    checkpoint: Option<&Checkpoint>,
 ) -> Result<bool, String> {
     let header = |name: &str| case["headers"][name].as_str();
     let headers = OpenAiHeaders {
         routing_key: header("x-smg-routing-key"),
         custom_labels: None,
+        sglext_ids: false,
     };
     let body = serde_json::to_vec(&case["request"]).unwrap();
-    let missing_tokenizer = tokenizer.is_none();
-    let lowered = lower_completion(&body, &headers, settings, tokenizer)
-        .map(|(body, responder)| (body, Responder::Completion(responder)));
+    let tokenizer = checkpoint.map(|c| c.openai.clone());
+    let lowered = match case["endpoint"].as_str() {
+        Some("chat") => {
+            let recorded = || serde_json::from_value(case["generate"]["input_ids"].clone()).ok();
+            let render = |request: &Value| match checkpoint {
+                Some(checkpoint) => checkpoint.render(request, settings),
+                None => recorded(),
+            };
+            lower_chat(&body, &headers, settings, chat_model, render, tokenizer)
+                .map(|(body, responder)| (body, Responder::Chat(responder)))
+        }
+        _ => lower_completion(&body, &headers, settings, tokenizer)
+            .map(|(body, responder)| (body, Responder::Completion(responder))),
+    };
     let (generate, mut responder) = match (lowered, case["unsupported"].as_bool()) {
-        (Err(reason), None) if missing_tokenizer && reason.0 == "no_tokenizer" => {
+        (Err(reason), None) if checkpoint.is_none() && reason.0 == "no_tokenizer" => {
             return Ok(false);
         }
         (Err(_), Some(true)) => return Ok(true),
@@ -92,7 +147,7 @@ fn check_case(
         (Err(reason), _) => return Err(format!("unsupported: {reason:?}")),
         (Ok(lowered), _) => lowered,
     };
-    let generate = without_defaults(generate, fixture);
+    let generate = without_defaults(generate, fixture, &case["endpoint"]);
     if generate != case["generate"] {
         return Err(format!("/generate body differs:\n{generate:#}"));
     }
@@ -154,13 +209,14 @@ fn check_case(
 }
 
 /// The fields Python set away from `GenerateReqInput`'s and a bare request's sampling defaults.
-fn without_defaults(body: Value, fixture: &Value) -> Value {
+fn without_defaults(body: Value, fixture: &Value, endpoint: &Value) -> Value {
     let Value::Object(mut fields) = body else {
         unreachable!()
     };
     fields.retain(|name, value| fixture["generate_defaults"].get(name) != Some(value));
+    let sampling_defaults = &fixture["sampling_defaults"][endpoint.as_str().unwrap()];
     if let Some(Value::Object(params)) = fields.get_mut("sampling_params") {
-        params.retain(|name, value| fixture["sampling_defaults"].get(name) != Some(value));
+        params.retain(|name, value| sampling_defaults.get(name) != Some(value));
     }
     Value::Object(fields)
 }
