@@ -3,7 +3,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -92,6 +91,48 @@ class TestMarkovSampleStep(CustomTestCase):
             # Lowest NaN, then lowest index of a tie; column 15 is padding.
             self.assertEqual(tokens.tolist(), [3, 0, 5, 0])
 
+    def test_greedy_tie_across_blocks_takes_the_lower_index(self):
+        base = torch.zeros(2, 9000, device=DEVICE)
+        base[:, 1000] = base[:, 5000] = 5.0
+        bias = torch.zeros(2, 9000, device=DEVICE)
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            tokens = _call(
+                impl,
+                base=base,
+                bias=bias,
+                temps=torch.zeros(2, device=DEVICE),
+                step_dtype=torch.float32,
+            )
+            self.assertEqual(tokens.tolist(), [1000, 1000])
+
+    def test_strided_rows_match_contiguous(self):
+        # The draft passes one step of a [bs, gamma, vocab] block, rows strided.
+        g = torch.Generator(device=DEVICE).manual_seed(2)
+        block = torch.randn(8, 5, 6000, generator=g, device=DEVICE)
+        bias = torch.randn(8, 5990, generator=g, device=DEVICE)
+        temps = torch.rand(8, generator=g, device=DEVICE)
+        temps[:3] = 0.0
+        logits_block = torch.empty(8, 5, 6000, device=DEVICE)
+        strided = _call(
+            MarkovSampleStep.triton,
+            base=block[:, 2],
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=logits_block[:, 2],
+        )
+        logits = torch.empty(8, 6000, device=DEVICE)
+        contiguous = _call(
+            MarkovSampleStep.triton,
+            base=block[:, 2].contiguous(),
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=logits,
+        )
+        self.assertTrue(torch.equal(strided, contiguous))
+        self.assertTrue(torch.equal(logits_block[:, 2], logits))
+
     def test_sampling_follows_tempered_softmax(self):
         vocab, rows = 32, 1 << 16
         logits = torch.linspace(-3, 3, vocab, device=DEVICE)
@@ -135,48 +176,45 @@ class TestMarkovSampleStep(CustomTestCase):
             self.assertLess((other == first).float().mean().item(), 0.01)
 
     def test_sharded_vocab_matches_full_vocab(self):
-        # Two shards of the vocab must pick the same tokens as one full vocab:
-        # the noise is keyed by global token id, so every rank draws the same.
+        # Every rank must pick the full vocab's token: the noise is keyed by
+        # global token id, so the shards draw what the full vocab draws.
         g = torch.Generator(device=DEVICE).manual_seed(1)
         rows, shard = 32, 5000
-        base = torch.randn(rows, 2 * shard, generator=g, device=DEVICE)
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE)
         bias = torch.randn(rows, 2 * shard - 7, generator=g, device=DEVICE)
         temps = torch.rand(rows, generator=g, device=DEVICE)
         temps[:8] = 0.0
         full = _call(
             MarkovSampleStep.triton,
-            base=base,
+            base=base[:, : bias.shape[1]].contiguous(),
             bias=bias,
             temps=temps,
             step_dtype=torch.float32,
         )
-        pieces = [None, None]
+        # The last shard is empty: all its columns are padding.
+        shards = [
+            (rank * shard, base[:, rank * shard : (rank + 1) * shard].contiguous())
+            for rank in range(3)
+        ]
+        partials = {}
 
-        def gather_from(rank):
-            def gather(partial):
-                pieces[rank] = partial.clone()
-                other = pieces[1 - rank]
-                if other is None:
-                    other = torch.zeros_like(partial)
-                ordered = [partial, other] if rank == 0 else [other, partial]
-                return torch.cat(ordered).contiguous()
-
-            return gather
-
-        group = SimpleNamespace(world_size=2)
-        for rank in (0, 1):
-            start = rank * shard
-            sharded = _call(
+        def run(rank, gather):
+            start, shard_base = shards[rank]
+            return _call(
                 MarkovSampleStep.triton,
-                base=base[:, start : start + shard].contiguous(),
+                base=shard_base,
                 bias=bias[:, start : start + shard].contiguous(),
                 temps=temps,
                 step_dtype=torch.float32,
                 vocab_start=start,
-                group=group,
-                gather=gather_from(rank),
+                gather=gather,
             )
-        self.assertTrue(torch.equal(sharded, full))
+
+        for rank in range(3):
+            run(rank, lambda partial, rank=rank: partials.setdefault(rank, partial))
+        stacked = torch.cat([partials[rank] for rank in range(3)])
+        for rank in range(3):
+            self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
 
 if __name__ == "__main__":

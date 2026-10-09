@@ -6,7 +6,6 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.dspark.markov_sample import draft_noise_key
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -110,6 +109,16 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
+# XORed into the server seed so the draft noise key differs from the seed other
+# samplers use.
+_DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
+
+
+def draft_noise_key(random_seed: int) -> int:
+    """The Philox key of the draft noise for a server's random seed."""
+    return (int(random_seed) ^ _DRAFT_NOISE_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+
+
 class DraftNoise(msgspec.Struct, frozen=True):
     """Philox key of the draft sampling noise, and its counter: one GPU int64
     that every draft block advances by one."""
@@ -130,11 +139,12 @@ def draft_markov_block(
     site: SpecTpSyncSite,
     logits_out: Optional[torch.Tensor] = None,
     keep_logits: bool = True,
+    has_sampled_rows: Optional[bool] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Draft ``gamma`` tokens per row, each step biased by the token before it;
     a row at temperature 0 takes the argmax. With ``keep_logits`` the step
     logits land in ``logits_out`` ([bs, gamma, local vocab]), allocated here
-    when not given. The graph tail and the eager path both run this."""
+    when not given."""
     bs, gamma = base_logits.shape[:2]
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
@@ -159,6 +169,7 @@ def draft_markov_block(
             noise_offset=noise.offset,
             step=step,
             logits_out=logits_out[:, step] if keep_logits else None,
+            has_sampled_rows=has_sampled_rows,
         )
         prev_tokens = tp_sync.sync(site, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -204,6 +215,7 @@ def sample_draft_block(
             if any_sampling
             else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
         ),
+        has_sampled_rows=any_sampling,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
