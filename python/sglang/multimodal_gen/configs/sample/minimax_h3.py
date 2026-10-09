@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -8,6 +7,7 @@ from typing import Any, ClassVar
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -20,17 +20,6 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
     out = float(value)
     if out < 0.0 or out > 1.0:
         raise ValueError(f"{field_name} must be in [0, 1]")
-    return out
-
-
-def _optional_positive_finite_float(value: Any, field_name: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field_name} must be a number")
-    out = float(value)
-    if not math.isfinite(out) or out <= 0.0:
-        raise ValueError(f"{field_name} must be a positive finite number")
     return out
 
 
@@ -225,8 +214,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 if field_name in self.target
             }
         super()._validate()
-        _optional_positive_finite_float(self.flow_shift, "flow_shift")
-        _optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
+        optional_positive_finite_float(self.flow_shift, "flow_shift")
+        optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
         if self.enable_frame_interpolation:
             raise ValueError(
                 "MiniMax H3 does not support enable_frame_interpolation: the "

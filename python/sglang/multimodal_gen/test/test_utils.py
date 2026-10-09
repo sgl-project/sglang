@@ -13,7 +13,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import urljoin
 
 import cv2
@@ -29,9 +29,6 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
-
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
@@ -248,16 +245,6 @@ def is_image_url(image_path: str | Path | None) -> bool:
     )
 
 
-def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        try:
-            s.connect((host, port))
-            return True
-        except OSError:
-            return False
-
-
 def is_in_ci() -> bool:
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
@@ -311,16 +298,6 @@ def wait_for_server_health(
     )
 
 
-def post_json(
-    base_url: str,
-    path: str,
-    payload: dict,
-    timeout: float = 300.0,
-) -> httpx.Response:
-    """POST JSON to ``<base_url><path>`` and return the response."""
-    return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
-
-
 def run_command(command: list[str]) -> bool:
     """Run a CLI command and return whether it succeeded."""
     print(f"Running command: {' '.join(command)}", flush=True)
@@ -369,35 +346,6 @@ def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | 
             "cannot enforce GPU memory assertions."
         )
         return None
-
-
-def require_gpu_mem_query(gpu_index: int = 0) -> int:
-    """Same as :func:`query_gpu_mem_used_mib` but asserts availability.
-
-    Raises ``AssertionError`` when ``nvidia-smi`` is unavailable instead of
-    returning ``None``, so callers can rely on a valid ``int`` result.
-    """
-    mem = query_gpu_mem_used_mib(gpu_index, required=True)
-    assert mem is not None
-    return mem
-
-
-def assert_gpu_mem_changed(
-    label: str,
-    before_mib: int,
-    after_mib: int,
-    min_delta_mib: int,
-) -> None:
-    """Assert that GPU memory changed by at least *min_delta_mib* MiB."""
-    delta = abs(after_mib - before_mib)
-    logger.debug(
-        f"[MEM] {label}: before={before_mib} MiB  after={after_mib} MiB  |delta|={delta} MiB"
-    )
-    assert delta >= min_delta_mib, (
-        f"GPU memory change too small for '{label}': "
-        f"|after-before|={delta} MiB < {min_delta_mib} MiB "
-        f"(before={before_mib} MiB, after={after_mib} MiB)"
-    )
 
 
 def is_mp4(data: bytes) -> bool:
@@ -452,16 +400,6 @@ def get_expected_image_format(
     if (background or "auto").lower() == "transparent":
         return "png"
     return "jpg"  # Default
-
-
-def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
-    end = time.time() + deadline
-    last_err = None
-    while time.time() < end:
-        if probe_port(host, port, timeout=interval):
-            return True
-        time.sleep(interval)
-    raise TimeoutError(f"Port {host}:{port} not ready. Last error: {last_err}")
 
 
 def check_image_size(ut, image, width, height):
@@ -547,13 +485,6 @@ def validate_image(b64_json: str) -> None:
     """Decode and validate that image is PNG or JPEG."""
     image_bytes = base64.b64decode(b64_json)
     assert is_png(image_bytes) or is_jpeg(image_bytes), "Image must be PNG or JPEG"
-
-
-def validate_video(b64_json: str) -> None:
-    """Decode and validate that video is a valid format."""
-    video_bytes = base64.b64decode(b64_json)
-    is_webm = video_bytes[:4] == b"\x1a\x45\xdf\xa3"
-    assert is_mp4(video_bytes) or is_webm, "Video must be MP4 or WebM"
 
 
 def validate_openai_video(video_bytes: bytes) -> None:
@@ -1157,18 +1088,6 @@ def compare_audio_with_gt(
         duration_diff=duration_diff,
         thresholds=thresholds,
     )
-
-
-def get_clip_threshold(
-    case: "DiffusionTestCase",
-    metadata: dict[str, Any] | None = None,
-) -> float:
-    """Get CLIP similarity threshold for a consistency test case."""
-    return get_consistency_thresholds(
-        case_id=case.id,
-        is_video=case.server_args.modality == "video",
-        metadata=metadata,
-    ).clip_threshold
 
 
 @dataclass
@@ -1979,21 +1898,6 @@ def load_audio_consistency_gt(case_id: str, num_gpus: int) -> np.ndarray:
     loaded_gt = decode_audio_gt_wav(content)
     _consistency_gt_cache[cache_key] = loaded_gt
     return loaded_gt
-
-
-def load_gt_embeddings(
-    case_id: str,
-    num_gpus: int,
-    is_video: bool = False,
-    output_format: str | None = None,
-) -> list[np.ndarray]:
-    """Load GT images and convert them into CLIP embeddings."""
-    return load_consistency_gt(
-        case_id=case_id,
-        num_gpus=num_gpus,
-        is_video=is_video,
-        output_format=output_format,
-    ).embeddings
 
 
 def gt_exists(
