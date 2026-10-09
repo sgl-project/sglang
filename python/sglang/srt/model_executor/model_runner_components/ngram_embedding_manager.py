@@ -130,6 +130,8 @@ class NgramEmbeddingManager:
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
+        # Per-forward mask; a stale one no longer matches the next decode batch.
+        batch.ne_skip_token_table_update = None
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
             column_starts = []
