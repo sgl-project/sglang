@@ -389,6 +389,7 @@ class Envs:
     # inputs; default false so local and scheduled runs never skip the cargo tests.
     SGLANG_SKIP_RUST_TESTS = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

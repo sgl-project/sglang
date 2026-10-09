@@ -36,6 +36,7 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.srt.environ import envs
 
 
 @dataclass
@@ -724,9 +725,10 @@ MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
     extras={"num_inference_steps": 50, "seed": 0},
 )
 
-# Keep the release asset locally so image-edit CI does not depend on GitHub I/O.
+# CI prefetches the input; standalone runs retain the release URL fallback.
 TI2I_QWEN_IMAGE_EDIT_INPUT = (
-    Path(__file__).parent / "assets" / "TI2I_Qwen_Image_Edit_Input.jpg"
+    envs.SGLANG_TEST_TI2I_INPUT_IMAGE.get()
+    or "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg"
 )
 
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
