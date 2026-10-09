@@ -222,6 +222,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_context=None,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -248,6 +249,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            mla_dedup_context=mla_dedup_context,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -946,7 +948,12 @@ class HybridCacheController(BaseHiCacheController):
         excluded from the per-pool token counts.
         """
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
+        num_bytes = (
+            0
+            if getattr(anchor_pool, "_is_dummy", False)
+            else kv_tokens * anchor_pool.size_per_token
+        )
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -954,7 +961,7 @@ class HybridCacheController(BaseHiCacheController):
                 source_len[t.name] = len(t.host_indices)
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
-            if entry is None:
+            if entry is None or getattr(entry.host_pool, "_is_dummy", False):
                 continue
             if t.indices_from_pool is not None:
                 num_slots = source_len.get(t.indices_from_pool, 0)

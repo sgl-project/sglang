@@ -175,6 +175,7 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
+            # Keep cudaError_t for cudaGetErrorString; int is only for comparison/logging.
             rc = cudart.cudaHostRegister(ptr, size, 0)
             if int(rc) != 0:
                 raise RuntimeError(
@@ -204,6 +205,7 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
+        # cudaGetErrorString requires cudaError_t, not its integer value.
         rc = cudart.cudaHostUnregister(ptr)
         if int(rc) != 0:
             failed_ranges.append((ptr, size))

@@ -81,6 +81,14 @@ class BaseTpWorker(ABC):
     def forward_batch_generation(self, forward_batch: ForwardBatch):
         pass
 
+    def _forward_with_hicache_completion(self, forward_batch, **kwargs):
+        output = self.model_runner.forward(forward_batch, **kwargs)
+        counter = getattr(self, "hicache_layer_transfer_counter", None)
+        finish = getattr(counter, "finish_consumer", None)
+        if finish is not None:
+            finish()
+        return output
+
     @property
     @abstractmethod
     def model_runner(self) -> ModelRunner:
@@ -267,12 +275,14 @@ class BaseTpWorker(ABC):
         return result
 
     def forward_batch_embedding(self, batch: ScheduleBatch):
+        if hasattr(self, "set_hicache_consumer"):
+            self.set_hicache_consumer(batch.hicache_consumer_index)
         forward_batch = ForwardBatch.init_new(
             batch,
             self.model_runner,
             return_hidden_states_before_norm=False,
         )
-        output = self.model_runner.forward(forward_batch)
+        output = self._forward_with_hicache_completion(forward_batch)
         return output.logits_output, output.can_run_graph
 
 
@@ -653,7 +663,7 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
+            out = self._forward_with_hicache_completion(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
@@ -745,7 +755,7 @@ class TpModelWorker(BaseTpWorker):
             self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
-            out = self.model_runner.forward(
+            out = self._forward_with_hicache_completion(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
@@ -757,6 +767,7 @@ class TpModelWorker(BaseTpWorker):
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        self.set_hicache_consumer(batch.hicache_consumer_index)
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(
                 batch,
@@ -765,7 +776,7 @@ class TpModelWorker(BaseTpWorker):
             )
             batch.split_forward_batch = forward_batch
 
-        out = self.model_runner.forward(
+        out = self._forward_with_hicache_completion(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph

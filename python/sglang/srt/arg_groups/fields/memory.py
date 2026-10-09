@@ -106,6 +106,16 @@ class Memory(msgspec.Struct):
             choices=["cache", "buffer_only"],
         ),
     ] = "cache"
+    enable_mla_hicache_host_dedup: A[
+        bool,
+        "Deduplicate MLA/DSA HiCache host KV across attention-TP ranks. "
+        "Disabled by default.",
+    ] = False
+    enable_mla_hicache_layerwise_overlap: A[
+        bool,
+        "Overlap per-layer MLA/DSA host restore with model forward. "
+        "Requires --enable-mla-hicache-host-dedup; disabled by default.",
+    ] = False
     hicache_ratio: A[
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",

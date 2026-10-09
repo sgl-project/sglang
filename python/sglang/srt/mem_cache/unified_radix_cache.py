@@ -3342,6 +3342,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
+            ready_check = getattr(ack, "ready_check", None)
+            if ready_check is not None and not ready_check():
+                break
             if not ack.finish_event.query():
                 break
             ready_count += 1
@@ -3491,6 +3494,9 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            consumer_index = getattr(ack, "consumer_index", -1)
+            if consumer_index >= 0:
+                cc.mla_dedup.release_layerwise_load(consumer_index)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
@@ -3662,6 +3668,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Return True after this rank's load-back event is complete."""
         if consumer_index < 0 or self.cache_controller is None:
             return True
+
+        context = self.cache_controller.mla_dedup
+        if context is not None and context.layerwise_overlap:
+            return context.is_layerwise_load_done(consumer_index)
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index

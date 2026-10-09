@@ -492,7 +492,12 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         seen = {}
 
         def fake_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             self.assertIsInstance(decl, HostPoolDecl)
             self.assertIs(decl.device_pool, draft_kv_pool)
@@ -684,7 +689,12 @@ class TestDeclaredStackStructure(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             return real_indexer_host(
                 decl,
@@ -783,6 +793,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 hybrid_pool_assembler,
                 "get_memory",
                 return_value=SimpleNamespace(
+                    enable_mla_hicache_host_dedup=False,
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
@@ -1048,7 +1059,12 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             return real_indexer_host(
                 decl=decl,
@@ -1078,6 +1094,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                     hicache_size=0,
                     hicache_ratio=2,
                     hicache_mem_layout="page_first",
+                    enable_mla_hicache_host_dedup=False,
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
