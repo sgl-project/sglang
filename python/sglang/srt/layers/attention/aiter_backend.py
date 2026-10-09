@@ -353,6 +353,7 @@ class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    skip_mla_head_count_assert: bool = False
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
@@ -599,6 +600,7 @@ class AiterAttnBackend(AttentionBackend):
                 or _valid_heads
                 or _pad_heads_to_16
                 or not may_run_mla_decode
+                or self.skip_mla_head_count_assert
             ), (
                 f"Aiter MLA supports num_head of 4, 8, 12, or multiples of 16 "
                 f"in [16, 128].\n"
