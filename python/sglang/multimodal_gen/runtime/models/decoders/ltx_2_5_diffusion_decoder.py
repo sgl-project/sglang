@@ -19,7 +19,6 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_ltx25_decoder_rope,
     fused_ltx25_decoder_rope,
     tensors_equal,
 )
@@ -32,7 +31,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -326,7 +328,9 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
         verified = _LTX25_DECODER_ROPE.verified
         if (
             not _LTX25_DECODER_ROPE.disabled
-            and can_use_ltx25_decoder_rope(query, key, tables, self.rope_dim_split)
+            and _is_cuda
+            and query.is_cuda
+            and query.dtype is torch.bfloat16
             and (verified or _LTX25_DECODER_ROPE.can_attempt_once())
         ):
             dim_t, dim_h, _ = self.rope_dim_split
@@ -676,6 +680,8 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         self.trailing_pad_latent_frames = (stage_kernels[0][0] // 2) * 2
 
         self.conv_in = nn.Linear(arch.latent_channels, stage_channels[0], bias=True)
+        # checkpoint keyframe-stream tag; ordinary video decoding does not use it
+        self.type_emb = nn.Parameter(torch.zeros(arch.latent_channels))
 
         self.det_stages = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -725,6 +731,31 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         )
         self.norm_out = nn.RMSNorm(stage5_channels, eps=1e-6)
         self.conv_out = nn.Linear(stage5_channels, noised_pixel_channels, bias=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # older checkpoints predate the keyframe tag and use a zero embedding
+        state_dict.setdefault(
+            prefix + "type_emb",
+            torch.zeros(self.type_emb.shape, dtype=self.type_emb.dtype, device="cpu"),
+        )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward_stages_1_to_3(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Latent `(B, C, T, H, W)` to a channels-last feature volume."""

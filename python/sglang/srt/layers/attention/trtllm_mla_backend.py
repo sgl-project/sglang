@@ -57,6 +57,8 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -77,6 +79,7 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -297,10 +300,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
-        # [:n] view of a capture-stable buffer on the cuda-graph path; None on
-        # the eager path, which passes forward_batch.out_cache_loc through.
-        self._decode_kernel_loc: Optional[torch.Tensor] = None
-        self.cuda_graph_out_cache_loc_kernel: Optional[torch.Tensor] = None
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
         # async asserts: the fused path writes the pool directly and would
@@ -400,7 +399,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
-            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
@@ -410,6 +408,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _create_block_kv_indices(
         self,
+        plan: KVLocPlan,
         batch_size: int,
         max_blocks: int,
         req_pool_indices: torch.Tensor,
@@ -429,11 +428,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         Returns:
             Block KV indices tensor
         """
+        dcp_enabled = get_parallel().dcp_enabled
+        translated = self.kv_index_translator.is_translating and not dcp_enabled
+        # A translated table holds the plan's page ids and reads the sink past
+        # them: a draft extend pads every row's key length to its widest row,
+        # and the padded queries (whose outputs are dropped) read that far.
         block_kv_indices = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+            (batch_size, max_blocks),
+            0 if translated else -1,
+            dtype=torch.int32,
+            device=device,
         )
 
-        if get_parallel().dcp_enabled:
+        if dcp_enabled:
             self._fill_dcp_block_kv_indices(
                 block_kv_indices,
                 req_pool_indices,
@@ -441,12 +448,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             return block_kv_indices
 
-        if self.kv_index_translator.is_translating:
-            self.kv_index_translator.fill_read_table(
-                out=block_kv_indices,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-            )
+        if translated:
+            self.kv_index_translator.copy_page_table(plan, out=block_kv_indices)
         else:
             create_flashmla_kv_indices_triton[
                 (
@@ -479,13 +482,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        # Unified pool: capture-stable buffer for the kernel-facing KV write loc, filled
-        # out-of-graph in init_forward_metadata_out_graph so the in-graph
-        # set_mla_kv_buffer captures no translate.
-        if self.kv_index_translator.is_translating:
-            self.cuda_graph_out_cache_loc_kernel = torch.zeros(
-                max_num_tokens, dtype=torch.int64, device=self.device
-            )
         num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
@@ -602,6 +598,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _apply_cuda_graph_metadata(
         self,
+        plan: KVLocPlan,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -641,10 +638,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Update block indices for new sequences.
         if self.kv_index_translator.is_translating:
-            self.kv_index_translator.fill_read_table(
-                out=metadata.block_kv_indices,
-                req_pool_indices=req_pool_indices[:bs],
-                seq_lens=seq_lens,
+            # The plan's table reaches a verify's draft tail.
+            self.kv_index_translator.copy_page_table(
+                plan, out=metadata.block_kv_indices[:bs]
             )
         else:
             create_flashmla_kv_indices_triton[
@@ -754,6 +750,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -761,54 +758,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             self._apply_cuda_graph_metadata(
+                plan=forward_batch.kv_loc_plan,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
                 forward_mode=forward_mode,
             )
-
-        # Out-of-graph on capture AND every replay-prep, so the in-graph
-        # set_mla_kv_buffer captures no translate.
-        if self.kv_index_translator.is_translating and (
-            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
-        ):
-            # The captured kernel consumes the whole buffer, so the tail a
-            # shorter replay leaves must go to slot 0 rather than live pages.
-            self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
-                out=self.cuda_graph_out_cache_loc_kernel,
-                forward_batch=forward_batch,
-                width=self.cuda_graph_out_cache_loc_kernel.numel(),
-            )
-        else:
-            self._decode_kernel_loc = None
-
-    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The loc an unfused KV scatter must write at: the capture-stable
-        buffer under a captured unified-pool decode, since the translate
-        rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
-        the batch's own loc everywhere else.
-        """
-        if self._decode_kernel_loc is not None:
-            return self._decode_kernel_loc
-        return forward_batch.out_cache_loc
-
-    def _resolve_fused_write_loc(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
-        """Write loc for the fused fp8 KV scatter, or None when this batch is
-        not covered by it.
-
-        Captured decode refills `_decode_kernel_loc` out of the graph, and the
-        captured kernel must read that buffer. Eager decode on a unified pool
-        has no such buffer, and the caller falls back to the unfused path.
-        """
-        if self._decode_kernel_loc is not None:
-            return self._decode_kernel_loc
-        return (
-            None
-            if self.kv_index_translator.is_translating
-            else forward_batch.out_cache_loc
-        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -819,7 +774,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch,
             )
 
-        self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
             forward_batch.forward_mode.is_extend()
@@ -910,6 +864,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
+                forward_batch.kv_loc_plan,
                 bs,
                 max_seqlen_pad,
                 forward_batch.req_pool_indices,
@@ -1149,7 +1104,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q: torch.Tensor,
         q_rope: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Decode: scatter the KV row at ``loc`` (already kernel-facing) and
+        """Decode: scatter the KV row at ``loc`` (already physical) and
         build the [q_nope | q_rope] fmha query in one kernel launch (saves one
         launch per MLA layer and keeps the PDL chain intact).
 
@@ -1285,7 +1240,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
-                    loc = self._resolve_fused_write_loc(forward_batch)
+                    loc = forward_batch.out_cache_loc
                     if loc is not None:
                         # Fused: bf16->fp8 quantize + KV scatter + q concat
                         # in one launch; None when not covered.
@@ -1321,42 +1276,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            if self._decode_kernel_loc is not None:
-                if merge_query and self._fused_set_kv_concat_q:
-                    # Fused: KV scatter + [q_nope | q_rope] concat in one
-                    # launch; None when the inputs are not covered.
-                    query = self._set_kv_and_concat_q_fused(
-                        layer=layer,
-                        loc=self._decode_kernel_loc,
-                        k=k,
-                        k_rope=k_rope,
-                        q=q,
-                        q_rope=q_rope,
-                    )
-                if query is None:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, self._decode_kernel_loc, k, k_rope
-                    )
-            else:
-                # eager (or static pool): out_cache_loc is kernel-facing.
-                if (
-                    merge_query
-                    and self._fused_set_kv_concat_q
-                    and not self.kv_index_translator.is_translating
-                ):
-                    # Static pool only, conservatively.
-                    query = self._set_kv_and_concat_q_fused(
-                        layer=layer,
-                        loc=forward_batch.out_cache_loc,
-                        k=k,
-                        k_rope=k_rope,
-                        q=q,
-                        q_rope=q_rope,
-                    )
-                if query is None:
-                    self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, k_rope
-                    )
+            # `out_cache_loc` is physical on every pool, eager or captured
+            # (the runner's slot).
+            if merge_query and self._fused_set_kv_concat_q:
+                # Fused: KV scatter + [q_nope | q_rope] concat in one launch;
+                # None when the inputs are not covered.
+                query = self._set_kv_and_concat_q_fused(
+                    layer=layer,
+                    loc=forward_batch.out_cache_loc,
+                    k=k,
+                    k_rope=k_rope,
+                    q=q,
+                    q_rope=q_rope,
+                )
+            if query is None:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
+                )
 
         # Prepare query tensor inline (already built when the fused save-KV
         # path ran)
@@ -1383,7 +1319,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Prepare KV cache inline
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
         metadata = (
@@ -1513,7 +1449,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
-                    loc = self._resolve_fused_write_loc(forward_batch)
+                    loc = forward_batch.out_cache_loc
                     if loc is not None:
                         # Fused: bf16->fp8 quantize + KV scatter + q concat
                         # in one launch; None when not covered.
@@ -1548,14 +1484,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            if self._decode_kernel_loc is not None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_kernel_loc, k, k_rope
-                )
-            else:
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
+            )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline (already built when the fused fp8 path
@@ -1599,7 +1530,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             bs = forward_batch.batch_size
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
             q = q.to(self.data_type)
 
