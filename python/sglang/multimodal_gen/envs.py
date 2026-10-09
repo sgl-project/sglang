@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
+    SGLANG_DIFFUSION_SHARE_PINNED_STORES: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
@@ -374,6 +375,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # courier; their pages arrive at fault-time readahead beats instead.
     "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED"
+    ),
+    # Serve the layerwise pinned weight stores from a named segment so every
+    # co-resident instance reads one copy instead of holding its own. The store
+    # is verified against the weights this process loaded before it is used, so
+    # a wrong match costs a refill rather than wrong weights.
+    "SGLANG_DIFFUSION_SHARE_PINNED_STORES": _lazy_bool(
+        "SGLANG_DIFFUSION_SHARE_PINNED_STORES"
     ),
     # Kill-switch: on a shared host/device pool the courier reads mapped layers
     # from their checkpoint files with O_DIRECT instead of through the page
