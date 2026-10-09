@@ -27,7 +27,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_packed_pool_buffers,
+    bind_host_pool_buffers,
+    can_use_dsa_buffer_infos,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
@@ -42,7 +43,6 @@ from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
-from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     import torch
@@ -162,10 +162,11 @@ def build_kv_host_pool(
         kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
     )
     if (
-        type(kv_pool) is DSATokenToKVPool
-        and use_mla
+        use_mla
         and override_kv_cache_dim == kv_pool.kv_cache_dim
-        and _uses_native_dsa_kv_buffers(kv_pool, mtp_draft_device_pools)
+        and can_use_dsa_buffer_infos(
+            kv_pool, mtp_draft_device_pools, dcp_enabled=get_parallel().dcp_enabled
+        )
     ):
         if page_size != kv_pool.page_size:
             raise ValueError("DSA transfer page coverage must match its buffer input")
@@ -200,17 +201,6 @@ def build_kv_host_pool(
     )
 
 
-def _uses_native_dsa_kv_buffers(pool, drafts) -> bool:
-    return (
-        is_cuda()
-        and not get_parallel().dcp_enabled
-        and all(
-            type(item) is DSATokenToKVPool and not item.layer_shard_enabled
-            for item in (pool, *drafts)
-        )
-    )
-
-
 def build_dsa_kv_host_from_infos(
     pool: DSATokenToKVPool,
     *,
@@ -229,12 +219,13 @@ def build_dsa_kv_host_from_infos(
         )
         for draft in drafts
     )
-    buffers, _ = bind_packed_pool_buffers(
+    buffers, layer_mapping = bind_host_pool_buffers(
         target=target,
         drafts=draft_infos,
-        model_to_transfer_layer={layer: i for i, layer in enumerate(target.layer_ids)},
-        target_layer_num=pool.layer_num,
+        target_model_layer_ids=target.layer_ids,
     )
+    if layer_mapping != {layer: layer for layer in range(len(buffers.buffers))}:
+        raise ValueError("MLA host buffers require an identity device-layer mapping")
     if not isinstance(buffers, MLABufferInfo):
         raise TypeError("DSA main KV assembly requires MLA buffers")
     host = MLATokenToKVPoolHost.from_buffer_info(

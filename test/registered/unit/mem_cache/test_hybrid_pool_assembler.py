@@ -708,7 +708,7 @@ class TestKvHostPoolRow(CustomTestCase):
         with (
             patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
             patch.object(
-                hybrid_pool_assembler, "_uses_native_dsa_kv_buffers", return_value=False
+                hybrid_pool_assembler, "can_use_dsa_buffer_infos", return_value=False
             ),
             patch.object(
                 hybrid_pool_assembler,

@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_packed_pool_buffers,
+    bind_host_pool_buffers,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -46,14 +46,13 @@ class TestDSABufferInfoTransfer(CustomTestCase):
         self.assertEqual(kv.layer_ids, (21, 25, 29))
         self.assertEqual(index.layer_ids, (21, 29))
         self.assertEqual(pool.host_pool_decls()[1].owned_device_layers, (0, 2))
-        packed, mapping = bind_packed_pool_buffers(
+        packed, mapping = bind_host_pool_buffers(
             target=index,
             drafts=(),
-            model_to_transfer_layer={layer: i for i, layer in enumerate(kv.layer_ids)},
-            target_layer_num=3,
+            target_model_layer_ids=kv.layer_ids,
         )
         self.assertEqual(mapping, {0: 0, 2: 1})
-        self.assertEqual(len(packed.buffers.buffers), 2)
+        self.assertEqual(len(packed.buffers), 2)
 
     def test_hybrid_preserves_hisparse_pool_constructor(self):
         # Alternate DSA pools retain their existing constructor contract.
@@ -159,6 +158,9 @@ class TestDSABufferInfoTransfer(CustomTestCase):
         self.assertEqual(index.page_num, kv.page_num)
         self.assertEqual(index.size, kv.size)
         self.assertEqual(index.layer_num, 4)
+        self.assertEqual(index.target_layer_num, 2)
+        self.assertEqual(index._live_target_layers, [0, 2])
+        self.assertEqual(index.end_layer, 2)
         self.assertEqual(index.indexer_page_stride_size, 64 * 132)
         self.assertIsNone(kv.device_pool)
         self.assertIsNone(index.device_pool)
@@ -274,23 +276,23 @@ class TestDSABufferInfoTransfer(CustomTestCase):
                     drafts = [self._pool(ratio=ratio, layers=1) for _ in range(2)]
                     target_info = target.get_device_pool_infos()[1]
                     self.assertEqual(target_info.pool_name, PoolName.INDEXER)
-                    info, mapping = bind_packed_pool_buffers(
+                    info, mapping = bind_host_pool_buffers(
                         target=target_info,
                         drafts=tuple(
                             pool.get_device_pool_infos()[1] for pool in drafts
                         ),
-                        model_to_transfer_layer={20: 0, 21: 1, 22: 2},
-                        target_layer_num=3,
+                        target_model_layer_ids=(20, 21, 22),
                     )
                     host = DSAIndexerPoolHost.from_buffer_info(
                         info,
                         layer_mapping=mapping,
+                        target_device_layer_num=3,
                         num_host_pages=9,
                         layout=layout,
                     )
                     self.addCleanup(host.destroy)
                     expected = []
-                    for layer, buffer in enumerate(info.buffers.buffers):
+                    for layer, buffer in enumerate(info.buffers):
                         values = torch.arange(
                             buffer.numel(), device="cuda", dtype=torch.int64
                         ).reshape_as(buffer)
@@ -313,7 +315,7 @@ class TestDSABufferInfoTransfer(CustomTestCase):
                         "kernel",
                     )
                     torch.cuda.synchronize()
-                    for buffer in info.buffers.buffers:
+                    for buffer in info.buffers:
                         buffer.fill_(17)
                     for callback in (0, 1, 2, 3, 4):
                         host.load_to_device_per_layer(
@@ -325,7 +327,7 @@ class TestDSABufferInfoTransfer(CustomTestCase):
                             is_draft=callback >= 3,
                         )
                     torch.cuda.synchronize()
-                    for layer, buffer in enumerate(info.buffers.buffers):
+                    for layer, buffer in enumerate(info.buffers):
                         self.assertTrue(
                             torch.equal(buffer[[1, 3]], expected[layer][[1, 3]])
                         )

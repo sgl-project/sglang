@@ -432,7 +432,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-        def dsa_pool(layers):
+        def dsa_pool(layers, width=3, dtype=torch.uint8):
             pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
             pool.page_size = 64
             pool.index_kpool = 1
@@ -440,14 +440,14 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             pool.layer_num = layers
             pool.model_layer_ids = tuple(range(layers))
             pool.skip_topk_layers = [False] * layers
-            pool.kv_buffer = [torch.zeros((256, 1, 3), dtype=torch.uint8)] * layers
+            pool.kv_buffer = [torch.zeros((256, 1, width), dtype=dtype)] * layers
             pool.index_key_cache = SimpleNamespace(
                 buffer=[torch.zeros((4, 8448), dtype=torch.uint8)] * layers
             )
             return pool
 
         kvcache = dsa_pool(2)
-        draft_pools = (dsa_pool(1), dsa_pool(1))
+        draft_pools = (dsa_pool(1, width=5, dtype=torch.bfloat16), dsa_pool(1))
 
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -469,7 +469,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
             [0], 0
         )
-        self.assertEqual(sizes, [[192, 192]])
+        self.assertEqual(sizes, [[192, 640]])
         self.assertEqual(offsets, [[0, 384]])
         _, sizes, offsets = group.entry_map[
             PoolName.INDEXER

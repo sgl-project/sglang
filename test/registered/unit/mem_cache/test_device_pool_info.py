@@ -6,9 +6,8 @@ import torch
 
 from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
-    EncodedPageBuffers,
     IndexKeyBufferInfo,
-    IndexPageEncoding,
+    IndexKeyFormat,
     MLABufferInfo,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -17,7 +16,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_packed_pool_buffers,
+    bind_host_pool_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,13 +42,11 @@ def _pool_infos(*, layers=(20, 22), page_size=256, ratio=4):
             buffer_info=IndexKeyBufferInfo(
                 page_size=page_size,
                 compress_ratio=ratio,
-                buffers=EncodedPageBuffers(
-                    buffers=tuple(
-                        torch.empty((4, page_size // ratio * 132), dtype=torch.uint8)
-                        for _ in layers
-                    ),
-                    encoding=IndexPageEncoding.DSA_FP8,
+                buffers=tuple(
+                    torch.empty((4, page_size // ratio * 132), dtype=torch.uint8)
+                    for _ in layers
                 ),
+                format=IndexKeyFormat.DSA_FP8,
             ),
         ),
     )
@@ -74,11 +71,10 @@ class TestDevicePoolInfo(CustomTestCase):
                     self.subTest(pool=info.pool_name, layers=layers),
                     self.assertRaisesRegex(ValueError, "model layers must match"),
                 ):
-                    bind_packed_pool_buffers(
+                    bind_host_pool_buffers(
                         target=replace(info, layer_ids=layers),
                         drafts=(),
-                        model_to_transfer_layer={20: 0, 21: 1, 22: 2, 23: 3},
-                        target_layer_num=4,
+                        target_model_layer_ids=(20, 21, 22, 23),
                     )
 
     def test_packed_draft_layers_match_physical_layers_for_each_buffer_format(self):
@@ -90,11 +86,10 @@ class TestDevicePoolInfo(CustomTestCase):
                 self.subTest(pool=target.pool_name),
                 self.assertRaisesRegex(ValueError, "model layers must match"),
             ):
-                bind_packed_pool_buffers(
+                bind_host_pool_buffers(
                     target=target,
                     drafts=(draft,),
-                    model_to_transfer_layer={20: 0, 21: 1, 22: 2},
-                    target_layer_num=3,
+                    target_model_layer_ids=(20, 21, 22),
                 )
 
     def test_packed_mla_rejects_strided_rows_before_linker_construction(self):
@@ -105,12 +100,11 @@ class TestDevicePoolInfo(CustomTestCase):
         target = replace(
             target, buffer_info=replace(target.buffer_info, buffers=strided)
         )
-        with self.assertRaisesRegex(ValueError, "matching packed rows"):
-            bind_packed_pool_buffers(
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            bind_host_pool_buffers(
                 target=target,
                 drafts=(),
-                model_to_transfer_layer={20: 0, 21: 1, 22: 2},
-                target_layer_num=3,
+                target_model_layer_ids=(20, 21, 22),
             )
 
     def test_dcp_index_host_keeps_legacy_page_geometry(self):
@@ -144,15 +138,14 @@ class TestDevicePoolInfo(CustomTestCase):
     def test_packed_layer_coordinates_preserve_source_context(self):
         target = _pool_infos()[1]
         draft = _pool_infos(layers=(0,))[1]
-        packed, mapping = bind_packed_pool_buffers(
+        packed, mapping = bind_host_pool_buffers(
             target=target,
             drafts=(draft, draft),
-            model_to_transfer_layer={20: 0, 21: 1, 22: 2},
-            target_layer_num=3,
+            target_model_layer_ids=(20, 21, 22),
         )
         self.assertEqual(mapping, {0: 0, 2: 1, 3: 2, 4: 3})
-        self.assertIs(packed.buffers.buffers[1], target.buffer_info.buffers.buffers[1])
-        self.assertIs(packed.buffers.buffers[2], draft.buffer_info.buffers.buffers[0])
+        self.assertIs(packed.buffers[1], target.buffer_info.buffers[1])
+        self.assertIs(packed.buffers[2], draft.buffer_info.buffers[0])
         self.assertEqual(target.layer_ids, (20, 22))
         self.assertEqual(draft.layer_ids, (0,))
 
@@ -160,31 +153,95 @@ class TestDevicePoolInfo(CustomTestCase):
         target = _pool_infos()[1]
         draft = _pool_infos(layers=(0,), page_size=128, ratio=2)[1]
         self.assertEqual(
-            target.buffer_info.buffers.buffers[0].shape,
-            draft.buffer_info.buffers.buffers[0].shape,
+            target.buffer_info.buffers[0].shape,
+            draft.buffer_info.buffers[0].shape,
         )
-        with self.assertRaisesRegex(ValueError, "page format differs"):
-            bind_packed_pool_buffers(
+        with self.assertRaisesRegex(ValueError, "page coverage differs"):
+            bind_host_pool_buffers(
                 target=target,
                 drafts=(draft,),
-                model_to_transfer_layer={20: 0, 21: 1, 22: 2},
-                target_layer_num=3,
+                target_model_layer_ids=(20, 21, 22),
             )
 
     def test_index_page_coverage_rejects_wrong_compression(self):
         info = _pool_infos()[1].buffer_info
         wrong = IndexKeyBufferInfo(
-            page_size=info.page_size, buffers=info.buffers, compress_ratio=1
+            page_size=info.page_size,
+            buffers=info.buffers,
+            compress_ratio=1,
+            format=info.format,
         )
         with self.assertRaisesRegex(ValueError, "index pages of 33792 bytes"):
             wrong.validate()
 
-    def test_linker_compiles_model_layers_without_pool_buffer_reads(self):
+    def test_linker_preserves_heterogeneous_draft_page_metadata(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_legacy_dsa_device_pool_group,
+        )
+
+        def pool(layers, width, dtype, extra_rows=0):
+            pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            pool.page_size = 64
+            pool.index_kpool = 1
+            pool.start_layer = 20
+            pool.layer_num = layers
+            pool.layer_shard_enabled = False
+            pool.model_layer_ids = tuple(range(20, 20 + layers))
+            pool.skip_topk_layers = [False] * layers
+            pool.kv_buffer = [
+                torch.empty((128 + extra_rows, 1, width), dtype=dtype)
+                for _ in range(layers)
+            ]
+            pool.index_key_cache = SimpleNamespace(
+                buffer=[
+                    torch.empty((2, 8448), dtype=torch.uint8) for _ in range(layers)
+                ]
+            )
+            return pool
+
+        target = pool(2, 576, torch.bfloat16, extra_rows=17)
+        drafts = (pool(1, 656, torch.uint8), pool(1, 576, torch.float32))
+        legacy = _build_legacy_dsa_device_pool_group(target, 64, drafts)
+        with patch("sglang.srt.utils.is_cuda", return_value=True):
+            native = _build_dsa_device_pool_group(target, 64, drafts)
+        for name, entry in native.entry_map.items():
+            self.assertIsNone(entry.device_pool)
+            previous = legacy.entry_map[name]
+            for page in (0, 1):
+                indices = torch.arange(page * 64, (page + 1) * 64)
+                self.assertEqual(
+                    entry.get_page_buffer_meta(indices),
+                    previous.get_page_buffer_meta(indices),
+                )
+                for layer in (0, 1):
+                    self.assertEqual(
+                        entry.get_prepared_layer_range_meta(
+                            entry.prepare_locations(indices), layer
+                        ),
+                        previous.get_prepared_layer_range_meta(
+                            previous.prepare_locations(indices), layer
+                        ),
+                    )
+        with self.assertRaisesRegex(ValueError, "matching rows"):
+            bind_host_pool_buffers(
+                target=target.get_device_pool_infos()[0],
+                drafts=tuple(draft.get_device_pool_infos()[0] for draft in drafts),
+                target_model_layer_ids=target.model_layer_ids,
+            )
+
+    def test_linker_compiles_noncontiguous_model_layers_without_pool_buffer_reads(self):
         pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        pool.layer_shard_enabled = False
         pool.page_size = 256
         pool.layer_num = 3
         pool.start_layer = 20
-        infos = _pool_infos()
+        from msgspec.structs import replace
+
+        kv, index = _pool_infos()
+        infos = (
+            replace(kv, layer_ids=(21, 25, 29)),
+            replace(index, layer_ids=(21, 29)),
+        )
         with (
             patch.object(pool, "get_device_pool_infos", return_value=infos),
             patch("sglang.srt.utils.is_cuda", return_value=True),
@@ -193,19 +250,19 @@ class TestDevicePoolInfo(CustomTestCase):
         index = group.entry_map[PoolName.INDEXER]
         self.assertIsNone(index.get_prepared_layer_range_meta([1], 1))
         ptrs, sizes, offsets = index.get_prepared_layer_range_meta([1], 2)
-        self.assertEqual(
-            ptrs, [[infos[1].buffer_info.buffers.buffers[1][1].data_ptr()]]
-        )
+        self.assertEqual(ptrs, [[infos[1].buffer_info.buffers[1][1].data_ptr()]])
         self.assertEqual(sizes, [[8448]])
         self.assertEqual(offsets, [[8448]])
 
     def test_linker_packed_drafts_keep_compact_target_layer_offsets(self):
         target = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        target.layer_shard_enabled = False
         target.page_size, target.layer_num, target.start_layer = 256, 3, 20
         target.get_device_pool_infos = Mock(return_value=_pool_infos())
         drafts = []
         for _ in range(2):
             draft = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            draft.layer_shard_enabled = False
             draft.page_size, draft.layer_num, draft.start_layer = 256, 1, 0
             kv, index = _pool_infos(layers=(0,))
             draft.get_device_pool_infos = Mock(
@@ -237,6 +294,7 @@ class TestDevicePoolInfo(CustomTestCase):
 
     def test_linker_omits_all_shared_index_without_empty_pages(self):
         pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        pool.layer_shard_enabled = False
         pool.page_size = 256
         pool.layer_num = 3
         pool.start_layer = 20
@@ -254,6 +312,7 @@ class TestDevicePoolInfo(CustomTestCase):
         pool.start_layer = 20
         pool.model_layer_ids = (20, 21, 22)
         pool.layer_num = 3
+        pool.layer_shard_enabled = False
         pool.page_size = 256
         pool.index_kpool = 4
         pool.kv_buffer = [torch.empty((1024, 1, 160)) for _ in range(3)]
@@ -268,9 +327,7 @@ class TestDevicePoolInfo(CustomTestCase):
         kv, index = pool.get_device_pool_infos()
         self.assertEqual(kv.layer_ids, (20, 21, 22))
         self.assertEqual(index.layer_ids, (20, 22))
-        self.assertIs(
-            index.buffer_info.buffers.buffers[1], pool.index_key_cache.buffer[2]
-        )
+        self.assertIs(index.buffer_info.buffers[1], pool.index_key_cache.buffer[2])
         with patch.object(pool, "skip_topk_layers", [True] * 3):
             self.assertEqual(len(pool.get_device_pool_infos()), 1)
 

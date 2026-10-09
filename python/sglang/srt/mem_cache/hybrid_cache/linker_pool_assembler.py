@@ -405,20 +405,13 @@ def _build_dsa_device_pool_group(
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
-    from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.mem_cache.pool_buffer_binding import (
-        bind_packed_pool_buffers,
+        bind_pool_layers,
+        can_use_dsa_buffer_infos,
     )
-    from sglang.srt.utils import is_cuda
 
-    if (
-        not is_cuda()
-        or get_parallel().dcp_enabled
-        or any(
-            type(pool) is not DSATokenToKVPool or pool.layer_shard_enabled
-            for pool in (kvcache, *mtp_draft_device_pools)
-        )
+    if not can_use_dsa_buffer_infos(
+        kvcache, mtp_draft_device_pools, dcp_enabled=get_parallel().dcp_enabled
     ):
         return _build_legacy_dsa_device_pool_group(
             kvcache, page_size, mtp_draft_device_pools
@@ -432,15 +425,16 @@ def _build_dsa_device_pool_group(
     target_names = {info.pool_name for info in target_infos}
     if any(set(infos) != target_names for infos in draft_infos):
         raise ValueError("DSA packed drafts must provide the same pools as the target")
+    target_model_layer_ids = next(
+        info.layer_ids for info in target_infos if info.pool_name is PoolName.KV
+    )
     entries = []
     for info in target_infos:
-        buffers, layer_mapping = bind_packed_pool_buffers(
+        drafts = tuple(infos[info.pool_name] for infos in draft_infos)
+        layer_mapping = bind_pool_layers(
             target=info,
-            drafts=tuple(infos[info.pool_name] for infos in draft_infos),
-            model_to_transfer_layer={
-                layer: layer - kvcache.start_layer for layer in info.layer_ids
-            },
-            target_layer_num=kvcache.layer_num,
+            drafts=drafts,
+            target_model_layer_ids=target_model_layer_ids,
         )
         if len(draft_infos) > kvcache.layer_num:
             raise ValueError(
@@ -452,16 +446,20 @@ def _build_dsa_device_pool_group(
                 layer_mapping[depth] = (layer_mapping[depth], draft_position)
             else:
                 layer_mapping[depth] = draft_position
-        encoded = isinstance(buffers, IndexKeyBufferInfo)
+        page_buffers = tuple(
+            buffer
+            for source in (info, *drafts)
+            for buffer in source.buffer_info.page_buffers()
+        )
         entries.append(
             DevicePoolEntry(
                 name=info.pool_name,
                 indices_from_pool=info.indices_from_pool,
-                device_pool=kvcache,
-                components=[buffers.buffers.buffers if encoded else buffers.buffers],
+                device_pool=None,
+                components=[page_buffers],
                 layer_mapping=layer_mapping,
                 page_size=page_size,
-                rows_are_pages=encoded,
+                rows_are_pages=True,
             )
         )
     return DevicePoolGroup(entries, kvcache.layer_num, page_size, rank_replicated=True)

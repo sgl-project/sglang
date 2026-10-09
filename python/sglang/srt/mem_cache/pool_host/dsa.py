@@ -83,19 +83,16 @@ class DSAIndexerHostPoolBuilder:
         packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
     ) -> DSAIndexerPoolHost:
         target = decl.device_pool
-        if (
-            _is_cuda
-            and not anchor_host._is_dummy
-            and anchor_host.dcp_size == 1
-            and all(
-                type(pool) is DSATokenToKVPool and not pool.layer_shard_enabled
-                for pool in (target, *packed_draft_device_pools)
-            )
-        ):
-            from sglang.srt.mem_cache.pool_buffer_binding import (
-                bind_packed_pool_buffers,
-            )
+        from sglang.srt.mem_cache.pool_buffer_binding import (
+            bind_host_pool_buffers,
+            can_use_dsa_buffer_infos,
+        )
 
+        if not anchor_host._is_dummy and can_use_dsa_buffer_infos(
+            target,
+            packed_draft_device_pools,
+            dcp_enabled=anchor_host.dcp_size != 1,
+        ):
             infos = {info.pool_name: info for info in target.get_device_pool_infos()}
             target_info = infos[PoolName.INDEXER]
             draft_infos = tuple(
@@ -106,23 +103,23 @@ class DSAIndexerHostPoolBuilder:
                 )
                 for pool in packed_draft_device_pools
             )
-            buffer_info, layer_mapping = bind_packed_pool_buffers(
+            buffer_info, layer_mapping = bind_host_pool_buffers(
                 target=target_info,
                 drafts=draft_infos,
-                model_to_transfer_layer={
-                    layer: i for i, layer in enumerate(infos[PoolName.KV].layer_ids)
-                },
-                target_layer_num=target.layer_num,
+                target_model_layer_ids=infos[PoolName.KV].layer_ids,
             )
             if buffer_info.page_size != anchor_host.page_size:
                 raise ValueError("DSA index page coverage must match the host KV page")
-            return DSAIndexerPoolHost.from_buffer_info(
+            host = DSAIndexerPoolHost.from_buffer_info(
                 buffer_info,
                 layer_mapping=layer_mapping,
+                target_device_layer_num=target.layer_num,
                 num_host_pages=anchor_host.page_num,
                 layout=anchor_host.layout,
                 allocator_type=allocator_type,
             )
+            host.start_layer, host.end_layer = target.start_layer, target.end_layer
+            return host
         return DSAIndexerPoolHost(
             decl=decl,
             anchor_host=anchor_host,
@@ -197,63 +194,127 @@ class DSAIndexerPoolHost(HostKVCache):
         allocator_type: str = "default",
         is_dummy: bool = False,
     ):
+        self._initialize(
+            decl,
+            anchor_host,
+            packed_draft_device_pools=packed_draft_device_pools,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+            is_dummy=is_dummy,
+        )
+
+    def _initialize(
+        self,
+        decl: HostPoolDecl | None,
+        anchor_host: MLATokenToKVPoolHost | None,
+        *,
+        packed_draft_device_pools: tuple[DSATokenToKVPool, ...] = (),
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        is_dummy: bool = False,
+        buffer_info: IndexKeyBufferInfo | None = None,
+        layer_mapping: dict[int, int] | None = None,
+        target_device_layer_num: int | None = None,
+        num_host_pages: int | None = None,
+        layout: str | None = None,
+    ):
         self._is_dummy = is_dummy
         self._destroyed = False
         self.decl = decl
-        storage_info = decl.storage_info
-        device_pool = decl.device_pool
-        self.device_pool = device_pool
-        self._buffer_device = torch.device("cpu" if is_dummy else device_pool.device)
-        self._layer_sharded = device_pool.layer_shard_enabled
-        self.page_size = anchor_host.page_size
-        self.layout = anchor_host.layout
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.dtype = device_pool.store_dtype
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-        # Host layers are compact: only owned device layers that hold index
-        # buffers, then one tail layer per packed draft pool.
-        owned_start, owned_end = self._device_owned_layer_range()
-        declared = decl.owned_device_layers
-        self._live_target_layers = [
-            layer
-            for layer in range(owned_start, owned_end)
-            if declared is None or layer in declared
-        ]
-        self._device_to_host_layer = {
-            layer: i for i, layer in enumerate(self._live_target_layers)
-        }
-        self.target_layer_num = len(self._live_target_layers)
         self.mtp_draft_device_pools = tuple(packed_draft_device_pools)
-        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
-        self._device_to_host_layer.update(
-            {
-                device_pool.layer_num + depth: self.target_layer_num + depth
-                for depth in range(len(self.mtp_draft_device_pools))
+        if buffer_info is not None:
+            buffer_info.validate()
+            buffers = buffer_info.buffers
+            if (
+                layer_mapping is None
+                or len(layer_mapping) != len(buffers)
+                or set(layer_mapping.values()) != set(range(len(buffers)))
+            ):
+                raise ValueError("every index buffer needs a transfer-layer binding")
+            if target_device_layer_num is None or target_device_layer_num < 1:
+                raise ValueError("index host requires the target device layer count")
+            if (
+                any(layer < 0 for layer in layer_mapping)
+                or num_host_pages is None
+                or num_host_pages < 1
+            ):
+                raise ValueError("invalid index transfer layers or host page count")
+            self.device_pool = None
+            self._layer_sharded = False
+            self._buffer_device = buffers[0].device
+            self.page_size = buffer_info.page_size
+            self.layout = layout
+            self.dtype = self.indexer_dtype = torch.uint8
+            self.layer_num = len(buffers)
+            self.start_layer = 0
+            self.end_layer = target_device_layer_num - 1
+            self._device_to_host_layer = dict(layer_mapping)
+            self._live_target_layers = [
+                layer for layer in layer_mapping if layer < target_device_layer_num
+            ]
+            self.target_layer_num = len(self._live_target_layers)
+            self.packed_device_index_buffers = list(buffers)
+            self.page_num = num_host_pages
+            self.size = num_host_pages * self.page_size
+            self.indexer_page_stride_size = buffer_info.page_bytes
+        else:
+            storage_info = decl.storage_info
+            device_pool = decl.device_pool
+            self.device_pool = device_pool
+            self._buffer_device = torch.device(
+                "cpu" if is_dummy else device_pool.device
+            )
+            self._layer_sharded = device_pool.layer_shard_enabled
+            self.page_size = anchor_host.page_size
+            self.layout = anchor_host.layout
+            self.dtype = device_pool.store_dtype
+            self.start_layer = device_pool.start_layer
+            self.end_layer = device_pool.end_layer
+            # Host layers are compact: only owned device layers that hold index
+            # buffers, then one tail layer per packed draft pool.
+            owned_start, owned_end = self._device_owned_layer_range()
+            declared = decl.owned_device_layers
+            self._live_target_layers = [
+                layer
+                for layer in range(owned_start, owned_end)
+                if declared is None or layer in declared
+            ]
+            self._device_to_host_layer = {
+                layer: i for i, layer in enumerate(self._live_target_layers)
             }
-        )
-        self.packed_device_index_buffers = (
-            []
-            if is_dummy
-            else [
-                device_pool.index_k_with_scale_buffer[layer]
-                for layer in self._live_target_layers
-            ]
-            + [
-                buffer
-                for pool in self.mtp_draft_device_pools
-                for buffer in pool.index_k_with_scale_buffer
-            ]
-        )
+            self.target_layer_num = len(self._live_target_layers)
+            self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+            self._device_to_host_layer.update(
+                {
+                    device_pool.layer_num + depth: self.target_layer_num + depth
+                    for depth in range(len(self.mtp_draft_device_pools))
+                }
+            )
+            self.packed_device_index_buffers = (
+                []
+                if is_dummy
+                else [
+                    device_pool.index_k_with_scale_buffer[layer]
+                    for layer in self._live_target_layers
+                ]
+                + [
+                    buffer
+                    for pool in self.mtp_draft_device_pools
+                    for buffer in pool.index_k_with_scale_buffer
+                ]
+            )
 
-        self.indexer_dtype = storage_info.dtype
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
+            self.indexer_dtype = storage_info.dtype
+            self.size = anchor_host.size
+            self.page_num = anchor_host.page_num
 
-        # uint8 storage, so element counts below are byte counts
-        self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
+            # uint8 storage, so element counts below are byte counts
+            self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
         self._initialize_host_buffers()
 
     def _initialize_host_buffers(self):
@@ -313,40 +374,24 @@ class DSAIndexerPoolHost(HostKVCache):
         buffer_info: IndexKeyBufferInfo,
         *,
         layer_mapping: dict[int, int],
+        target_device_layer_num: int,
         num_host_pages: int,
         layout: str,
         allocator_type: str = "default",
         pin_memory: bool = True,
     ) -> DSAIndexerPoolHost:
-        buffer_info.validate()
-        buffers = buffer_info.buffers.buffers
-        if set(layer_mapping.values()) != set(range(len(buffers))):
-            raise ValueError("every index buffer needs a transfer-layer binding")
-        if any(layer < 0 for layer in layer_mapping) or num_host_pages < 1:
-            raise ValueError("invalid index transfer layers or host page count")
         self = cls.__new__(cls)
-        self._destroyed = False
-        self.device_pool = None
-        self._is_dummy = False
-        self._layer_sharded = False
-        self._buffer_device = buffers[0].device
-        self.page_size = buffer_info.page_size
-        self.layout = layout
-        self.pin_memory = pin_memory
-        self.device = "cpu"
-        self.allocator = get_allocator_from_storage(allocator_type)
-        self.dtype = self.indexer_dtype = torch.uint8
-        self.layer_num = self.target_layer_num = len(buffers)
-        self.start_layer = 0
-        self.end_layer = self.layer_num
-        self._device_to_host_layer = dict(layer_mapping)
-        self._live_target_layers = list(layer_mapping)
-        self.mtp_draft_device_pools = ()
-        self.packed_device_index_buffers = list(buffers)
-        self.page_num = num_host_pages
-        self.size = num_host_pages * self.page_size
-        self.indexer_page_stride_size = buffers[0].shape[1]
-        self._initialize_host_buffers()
+        self._initialize(
+            None,
+            None,
+            buffer_info=buffer_info,
+            layer_mapping=layer_mapping,
+            target_device_layer_num=target_device_layer_num,
+            num_host_pages=num_host_pages,
+            layout=layout,
+            allocator_type=allocator_type,
+            pin_memory=pin_memory,
+        )
         return self
 
     def destroy(self):

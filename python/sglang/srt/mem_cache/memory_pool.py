@@ -5204,9 +5204,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
-            EncodedPageBuffers,
             IndexKeyBufferInfo,
-            IndexPageEncoding,
+            IndexKeyFormat,
             MLABufferInfo,
         )
         from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -5232,10 +5231,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             buffer_info=IndexKeyBufferInfo(
                 page_size=self.page_size,
                 compress_ratio=self.index_kpool,
-                buffers=EncodedPageBuffers(
-                    buffers=tuple(self.index_key_cache.buffer[i] for i in owned_layers),
-                    encoding=IndexPageEncoding.DSA_FP8,
-                ),
+                buffers=tuple(self.index_key_cache.buffer[i] for i in owned_layers),
+                format=IndexKeyFormat.DSA_FP8,
             ),
         )
         return kv_info, index_info

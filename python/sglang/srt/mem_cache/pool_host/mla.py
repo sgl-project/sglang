@@ -88,11 +88,78 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         pool_label: str = "kv",
         is_dummy: bool = False,
     ):
+        self._initialize(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+            override_kv_cache_dim,
+            mtp_draft_device_pools,
+            dcp_size,
+            dcp_rank,
+            pool_label=pool_label,
+            is_dummy=is_dummy,
+        )
+
+    def _initialize(
+        self,
+        device_pool: MLATokenToKVPool | None,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        override_kv_cache_dim: Optional[int] = None,
+        mtp_draft_device_pools: Sequence[MLATokenToKVPool] = (),
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
+        is_dummy: bool = False,
+        buffer_info: MLABufferInfo | None = None,
+        target_layer_num: int | None = None,
+        device_capacity: int | None = None,
+    ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self._is_dummy = is_dummy
+        self._buffer_info = buffer_info
+        self._native_device_layer_count = None
 
-        if is_dummy:
+        if buffer_info is not None:
+            buffer_info.validate()
+            if target_layer_num is None or not 0 < target_layer_num <= len(
+                buffer_info.buffers
+            ):
+                raise ValueError("target layer count is outside the packed MLA buffers")
+            if device_capacity is None or device_capacity <= 0:
+                raise ValueError("native MLA host requires device token capacity")
+            if layout not in ("layer_first", "page_first", "page_first_direct"):
+                raise ValueError(f"unsupported native MLA host layout {layout}")
+            self.device_pool = None
+            self._native_device_layer_count = target_layer_num
+            self.target_layer_num = target_layer_num
+            self.start_layer = 0
+            self.end_layer = target_layer_num - 1
+            self._initialize_host_cache(
+                device_capacity=device_capacity,
+                dtype=buffer_info.buffers[0].dtype,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=host_size,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=pin_memory,
+                device=device,
+                allocator_type=allocator_type,
+                pool_label=pool_label,
+            )
+        elif is_dummy:
             self._init_dummy(
                 device_pool,
                 host_to_device_ratio,
@@ -108,19 +175,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             return
 
-        super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
-            pool_label=pool_label,
-        )
+        else:
+            super().__init__(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+                pool_label=pool_label,
+            )
         self._initialize_transfer_views()
 
     @property
@@ -143,32 +211,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         pool_label: str = "kv",
     ) -> MLATokenToKVPoolHost:
-        buffer_info.validate()
-        if not 0 < target_layer_num <= len(buffer_info.buffers):
-            raise ValueError("target layer count is outside the packed MLA buffers")
-        if layout not in ("layer_first", "page_first", "page_first_direct"):
-            raise ValueError(f"unsupported native MLA host layout {layout}")
         self = cls.__new__(cls)
-        self.device_pool = None
-        self._buffer_info = buffer_info
-        self._native_device_layer_count = target_layer_num
-        self.target_layer_num = target_layer_num
-        self._is_dummy = False
-        self.start_layer = 0
-        self.end_layer = target_layer_num - 1
-        self._initialize_host_cache(
-            device_capacity=device_capacity,
-            dtype=buffer_info.buffers[0].dtype,
-            host_to_device_ratio=host_to_device_ratio,
-            host_size=host_size,
-            page_size=buffer_info.page_size,
-            layout=layout,
+        self._initialize(
+            None,
+            host_to_device_ratio,
+            host_size,
+            buffer_info.page_size,
+            layout,
             pin_memory=pin_memory,
-            device="cpu",
             allocator_type=allocator_type,
             pool_label=pool_label,
+            buffer_info=buffer_info,
+            target_layer_num=target_layer_num,
+            device_capacity=device_capacity,
         )
-        self._initialize_transfer_views()
         return self
 
     def _initialize_transfer_views(self) -> None:

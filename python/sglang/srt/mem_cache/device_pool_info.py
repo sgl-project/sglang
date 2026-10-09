@@ -8,55 +8,81 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
-class IndexPageEncoding(Enum):
+class IndexKeyFormat(Enum):
     # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
     DSA_FP8 = "dsa_fp8"
 
-
-class EncodedPageBuffers(msgspec.Struct, frozen=True, kw_only=True):
-    buffers: tuple[torch.Tensor, ...]
-    encoding: IndexPageEncoding
+    def page_bytes(self, key_count: int) -> int:
+        return key_count * (128 + 4)
 
 
 class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     # Coverage in original tokens, independent of any compressed row count.
     page_size: int
     buffers: tuple[torch.Tensor, ...]
-    compress_ratio: int = 1
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         if layer_ids is not None and len(layer_ids) != len(self.buffers):
             raise ValueError(
                 f"{len(layer_ids)} model layers must match {len(self.buffers)} buffers"
             )
-        if self.page_size <= 0 or self.compress_ratio != 1 or not self.buffers:
-            raise ValueError("MLA host transfer requires uncompressed token rows")
+        if self.page_size <= 0 or not self.buffers:
+            raise ValueError(
+                "MLA buffers require a positive page size and at least one tensor"
+            )
         first = self.buffers[0]
-        if first.ndim != 3 or first.shape[1] != 1 or first.shape[2] < 1:
-            raise ValueError("MLA buffers require [token, 1, width] rows")
         for buffer in self.buffers:
             if (
                 buffer.ndim != 3
                 or buffer.shape[0] <= 0
+                or buffer.shape[1] != 1
+                or buffer.shape[2] < 1
+                or not buffer.is_contiguous()
                 or buffer.shape[1:] != first.shape[1:]
                 or buffer.dtype != first.dtype
                 or buffer.device != first.device
-                or not buffer.is_contiguous()
             ):
-                raise ValueError("MLA layers must have matching packed rows")
+                raise ValueError(
+                    "MLA buffers require contiguous [token, 1, width] with matching rows, dtype and device"
+                )
+
+    def page_buffers(self) -> tuple[torch.Tensor, ...]:
+        """Zero-copy byte views of complete pages, after validate()."""
+        pages = []
+        for buffer in self.buffers:
+            page_count = buffer.shape[0] // self.page_size
+            if page_count == 0:
+                raise ValueError("MLA buffer must contain at least one complete page")
+            pages.append(
+                buffer[: page_count * self.page_size]
+                .view(torch.uint8)
+                .reshape(page_count, -1)
+            )
+        return tuple(pages)
+
+    def packed_with(self, drafts: tuple[MLABufferInfo, ...]) -> MLABufferInfo:
+        if any(draft.page_size != self.page_size for draft in drafts):
+            raise ValueError("packed MLA page coverage differs")
+        buffers = self.buffers + tuple(
+            buffer for draft in drafts for buffer in draft.buffers
+        )
+        packed = MLABufferInfo(page_size=self.page_size, buffers=buffers)
+        packed.validate()
+        return packed
 
 
 class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     page_size: int
-    buffers: EncodedPageBuffers
+    buffers: tuple[torch.Tensor, ...]
     compress_ratio: int
+    format: IndexKeyFormat
 
     @property
     def page_bytes(self) -> int:
-        return self.page_size // self.compress_ratio * (128 + 4)
+        return self.format.page_bytes(self.page_size // self.compress_ratio)
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
-        buffers = self.buffers.buffers
+        buffers = self.buffers
         if layer_ids is not None and len(layer_ids) != len(buffers):
             raise ValueError(
                 f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
@@ -70,8 +96,8 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 f"page coverage {self.page_size} must be divisible by "
                 f"compression ratio {self.compress_ratio}"
             )
-        if self.buffers.encoding is not IndexPageEncoding.DSA_FP8:
-            raise ValueError(f"unsupported index page encoding {self.buffers.encoding}")
+        if self.format is not IndexKeyFormat.DSA_FP8:
+            raise ValueError(f"unsupported index key format {self.format}")
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
         page_bytes = self.page_bytes
@@ -89,6 +115,29 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                     f"on {buffers[0].device}, got {tuple(buffer.shape)} "
                     f"{buffer.dtype} on {buffer.device}"
                 )
+
+    def page_buffers(self) -> tuple[torch.Tensor, ...]:
+        return self.buffers
+
+    def packed_with(self, drafts: tuple[IndexKeyBufferInfo, ...]) -> IndexKeyBufferInfo:
+        if any(
+            draft.page_size != self.page_size
+            or draft.compress_ratio != self.compress_ratio
+            or draft.format is not self.format
+            for draft in drafts
+        ):
+            raise ValueError("packed index page format differs")
+        buffers = self.buffers + tuple(
+            buffer for draft in drafts for buffer in draft.buffers
+        )
+        packed = IndexKeyBufferInfo(
+            page_size=self.page_size,
+            buffers=buffers,
+            compress_ratio=self.compress_ratio,
+            format=self.format,
+        )
+        packed.validate()
+        return packed
 
 
 DeviceBufferInfo = MLABufferInfo | IndexKeyBufferInfo
