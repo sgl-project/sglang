@@ -1,11 +1,13 @@
-"""CUDA graphs of DeepSeek-V4's trimmed late layers on eager prefill steps.
+"""Breakable CUDA graphs of DeepSeek-V4 layer ranges on eager prefill steps.
 
-Under decoder SWA bounded replay the layers after the last kv_source layer run on
-each request's last SWA_WINDOW extend rows. On an eager prefill step those rows
-replay a breakable graph captured for their row bucket (a multiple of 128): the
-KV store, the attention and the low-ratio sources are eager breaks that read the
-step's live tail metadata; everything else reads static row buffers. Graphs are
-captured on first use of a bucket, on every TP rank in the same step.
+Two ranges use them: the full-width layers before the last kv_source layer, keyed
+by the step's token count, and (under decoder SWA bounded replay) the trimmed late
+layers, keyed by the tail's row count. In both, the KV store, the attention and
+the low-ratio sources are eager breaks that read the step's live metadata;
+everything else reads static row buffers. Every bucket is captured at startup
+(``capture_at_startup``), after a full-chunk eager forward has grown every
+row-sized workspace; a bucket missing at serving time runs eagerly. Each replay
+asserts that the buffers its kernels read by address have not moved.
 """
 
 from __future__ import annotations
@@ -13,14 +15,17 @@ from __future__ import annotations
 import copy
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -35,7 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.cont
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -43,13 +48,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Tail rows come in per-request blocks of at most SWA_WINDOW = 128.
-ROW_STEP = 128
+TAIL_ROW_STEP = 128
+# Arbitrary; at most 3% padding on a full 8K chunk.
+TOKEN_STEP = 256
 
 _in_replay_graph = False
 
 
 def in_decoder_replay_graph() -> bool:
-    """True while the late layers capture or replay a decoder replay graph."""
+    """True while a layer range captures or replays an eager replay graph."""
     return _in_replay_graph
 
 
@@ -64,7 +71,7 @@ def _replay_graph_scope():
 
 
 def _late_kv_store(attention, x, positions, qkv_a) -> None:
-    # The SWA store writes the step's live tail slots, so a replay graph breaks here.
+    # The SWA store writes the step's live slots, so a replay graph breaks here.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     num_rows = forward_batch.global_num_token_non_padded_cpu
     attention._compute_kv_to_cache(
@@ -79,25 +86,64 @@ def _late_kv_store(attention, x, positions, qkv_a) -> None:
 bcg_late_kv_store = eager_on_graph(True)(_late_kv_store)
 
 
-def _replay_checked(graph: BreakableCUDAGraph, rows: int) -> None:
-    for i, seg in enumerate(graph._segments):
-        for what, step in (("segment", seg.replay), ("break", None)):
-            if what == "break":
-                if i >= len(graph._break_fns):
-                    continue
-                step = graph._break_fns[i]
-            try:
-                step()
-                torch.cuda.synchronize()
-            except Exception:
-                logger.error(
-                    "Decoder replay graph %d rows: %s %d of %d segments faulted",
-                    rows,
-                    what,
-                    i,
-                    len(graph._segments),
-                )
-                raise
+# ---------------------------------------------------------------------------
+# Pointer guard: buffers a graph reads by address must not move after capture
+# ---------------------------------------------------------------------------
+
+_pointer_probes: dict[str, Callable[[], dict[str, int]]] = {}
+
+
+def register_pointer_probe(name: str, probe: Callable[[], dict[str, int]]) -> None:
+    """``probe`` returns {buffer name: data_ptr} for process-wide buffers that
+    captured kernels may read; a recorded pointer that changes fails the replay."""
+    _pointer_probes[name] = probe
+
+
+def _request_window_probe() -> dict[str, int]:
+    window = getattr(get_token_to_kv_pool(), "request_window", None)
+    if window is None or window.workspace is None:
+        return {}
+    return {"workspace": window.workspace.kv_buffer[0].data_ptr()}
+
+
+def _flashinfer_cache_probe() -> dict[str, int]:
+    try:
+        from flashinfer import utils as flashinfer_utils
+    except ImportError:
+        return {}
+    cache = getattr(flashinfer_utils, "_cache_buf", None) or {}
+    return {str(k): v.data_ptr() for k, v in cache.items() if torch.is_tensor(v)}
+
+
+register_pointer_probe("request_window", _request_window_probe)
+register_pointer_probe("flashinfer_cache", _flashinfer_cache_probe)
+
+
+def _pointer_snapshot(owned: dict[str, Optional[torch.Tensor]]) -> dict[str, int]:
+    pointers = {f"owned.{k}": t.data_ptr() for k, t in owned.items() if t is not None}
+    for name, probe in _pointer_probes.items():
+        pointers.update({f"{name}.{k}": p for k, p in probe().items()})
+    return pointers
+
+
+def check_pointers(
+    recorded: dict[str, int], owned: dict[str, Optional[torch.Tensor]], label: str
+) -> None:
+    current = _pointer_snapshot(owned)
+    moved = [
+        f"{k}: {p:#x} -> {current.get(k, 0):#x}"
+        for k, p in recorded.items()
+        if current.get(k) != p
+    ]
+    if moved:
+        raise AssertionError(
+            f"{label}: buffers read by address moved after capture: " + "; ".join(moved)
+        )
+
+
+# ---------------------------------------------------------------------------
+# State flattening and debug replay
+# ---------------------------------------------------------------------------
 
 
 def _flatten_state(state: HcState):
@@ -116,103 +162,160 @@ def _flatten_state(state: HcState):
     return leaves, (pending, has_pre), rebuild
 
 
+def _replay_checked(graph: BreakableCUDAGraph, label: str) -> None:
+    for i, seg in enumerate(graph._segments):
+        steps = [("segment", seg.replay)]
+        if i < len(graph._break_fns):
+            steps.append(("break", graph._break_fns[i]))
+        for what, step in steps:
+            try:
+                step()
+                torch.cuda.synchronize()
+            except Exception:
+                logger.error(
+                    "%s: %s %d of %d segments faulted",
+                    label,
+                    what,
+                    i,
+                    len(graph._segments),
+                )
+                raise
+
+
+# ---------------------------------------------------------------------------
+# The graphs
+# ---------------------------------------------------------------------------
+
+
 class _ReplayGraph:
-    __slots__ = ("graph", "inputs", "num_token_non_padded", "residual", "pre", "batch")
+    __slots__ = ("graph", "rows", "out_rebuild", "pointers", "owned", "keepalive")
 
-    def __init__(self, graph, inputs, num_token_non_padded, residual, pre, batch):
+    def __init__(self, graph, rows, out_rebuild, pointers, owned, keepalive):
         self.graph = graph
-        self.inputs = inputs
-        # MoE top-k masks rows at or past this count; captured by address.
-        self.num_token_non_padded = num_token_non_padded
-        self.residual = residual
-        self.pre = pre
-        # The capture step's batch and tail attention metadata. Kernels write
-        # buffers cached on them (the TP-padded query heads), so the graph owns them.
-        self.batch = batch
+        self.rows = rows
+        self.out_rebuild = out_rebuild
+        self.pointers = pointers
+        # Buffers the graph owns and its kernels read by address.
+        self.owned = owned
+        # The capture step's batch and attention metadata: kernels write buffers
+        # cached on them (the TP-padded query heads), so the graph keeps them.
+        self.keepalive = keepalive
 
 
-class DecoderReplayGraphs:
-    """Breakable CUDA graphs of the late layers, keyed by padded tail rows."""
+class EagerReplayGraphs:
+    """Breakable CUDA graphs of one layer range, keyed by padded rows.
+
+    ``run_layers(state, forward_batch=..., **inputs) -> HcState`` is the range's
+    body; ``inputs`` are row tensors (or None) handed to it from static buffers.
+    """
 
     def __init__(
         self,
         *,
+        name: str,
         model: torch.nn.Module,
-        run_layers: Callable[..., tuple[torch.Tensor, Optional[torch.Tensor]]],
-        max_rows: int,
+        run_layers: Callable[..., HcState],
+        buckets: list[int],
+        tail_rows: bool,
     ) -> None:
+        self.name = name
+        # Keyed by the late-layer tail's rows rather than the step's tokens.
+        self.tail_rows = tail_rows
         self._model = model
         self._run_layers = run_layers
-        self.max_rows = max_rows
+        self.buckets = sorted(buckets)
         self._graphs: dict[tuple, _ReplayGraph] = {}
+        # Max-size static buffers shared by every bucket of one input structure.
+        self._static: dict[tuple, list[torch.Tensor]] = {}
+        self._static_out: dict[tuple, list[torch.Tensor]] = {}
         self._layers = None
         self._pool = None
         self._stream = None
+        self._capture_open = False
         self.capture_seconds = 0.0
         self.capture_bytes = 0
-        self._warm = False
 
-    def ready(self, num_tokens: int) -> bool:
-        """Whether graphs may run from this step on. Some kernels size their cached
-        workspaces lazily by row count and reallocate them when a bigger step
-        comes, which would leave an earlier capture reading freed memory; a step
-        of a full prefill chunk has grown them all, so capture waits for one."""
-        if not self._warm:
-            chunk = get_schedule().chunked_prefill_size
-            self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
-        return self._warm
+    @property
+    def num_graphs(self) -> int:
+        return len(self._graphs)
 
     def bucket_rows(self, num_rows: int) -> Optional[int]:
-        if num_rows == 0 or num_rows > self.max_rows:
+        if num_rows == 0:
             return None
-        return -(-num_rows // ROW_STEP) * ROW_STEP
-
-    def run(
-        self,
-        *,
-        state: HcState,
-        positions: torch.Tensor,
-        input_ids: torch.Tensor,
-        input_ids_global: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Run the late layers on the tail rows; returns the materialized residual
-        and pre of those rows, which stay valid until the next replay."""
-        num_rows = positions.shape[0]
-        rows = self.bucket_rows(num_rows)
-        assert rows is not None, num_rows
-        leaves, structure, rebuild = _flatten_state(state)
-        live = [*leaves, positions, input_ids, input_ids_global]
-        key = (rows, structure, tuple((t.dtype, t.shape[1:]) for t in live))
-        # The eager breaks read the step's real row count off this view.
-        tail_batch = copy.copy(forward_batch)
-        tail_batch.global_num_token_non_padded_cpu = num_rows
-        with self._break_context(tail_batch), _replay_graph_scope():
-            graph = self._graphs.get(key)
-            if graph is None:
-                graph = self._graphs[key] = self._capture(
-                    key, live, rebuild, forward_batch
-                )
-            else:
-                for buf, t in zip(graph.inputs, live):
-                    buf[:num_rows].copy_(t)
-                if graph.num_token_non_padded is not None:
-                    graph.num_token_non_padded.fill_(num_rows)
-            if envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get():
-                _replay_checked(graph.graph, rows)
-            else:
-                graph.graph.replay()
-        pre = None if graph.pre is None else graph.pre[:num_rows]
-        return graph.residual[:num_rows], pre
+        return next((b for b in self.buckets if b >= num_rows), None)
 
     @contextmanager
-    def _break_context(self, tail_batch: ForwardBatch):
+    def capture_scope(self):
+        self._capture_open = True
+        try:
+            yield
+        finally:
+            self._capture_open = False
+
+    def run(
+        self, *, state: HcState, forward_batch: ForwardBatch, **inputs
+    ) -> Optional[HcState]:
+        """Run the range on ``state``'s rows from its graph; None (run eagerly) when
+        no graph exists for the bucket and capture is closed."""
+        leaves, structure, rebuild = _flatten_state(state)
+        num_rows = leaves[0].shape[0]
+        rows = self.bucket_rows(num_rows)
+        if rows is None:
+            return None
+        names = tuple(k for k, v in inputs.items() if v is not None)
+        live = leaves + [inputs[k] for k in names]
+        shape_key = (structure, names, tuple((t.dtype, t.shape[1:]) for t in live))
+        key = (rows, shape_key)
+        graph = self._graphs.get(key)
+        if graph is None and not self._capture_open:
+            return None
+        # The eager breaks read the step's real row count off this view.
+        break_batch = copy.copy(forward_batch)
+        break_batch.global_num_token_non_padded_cpu = num_rows
+        label = f"{self.name} graph {rows} rows"
+        with self._break_context(break_batch), _replay_graph_scope():
+            static = self._static_inputs(shape_key, live)
+            for buf, t in zip(static, live):
+                buf[:num_rows].copy_(t)
+            if graph is None:
+                graph = self._graphs[key] = self._capture(
+                    rows=rows,
+                    num_rows=num_rows,
+                    shape_key=shape_key,
+                    static=static,
+                    num_leaves=len(leaves),
+                    rebuild=rebuild,
+                    names=names,
+                    forward_batch=forward_batch,
+                )
+            else:
+                check_pointers(graph.pointers, graph.owned, label)
+            ntnp = graph.owned["num_token_non_padded"]
+            if ntnp is not None:
+                ntnp.fill_(num_rows)
+            if envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get():
+                _replay_checked(graph.graph, label)
+            else:
+                graph.graph.replay()
+        return graph.out_rebuild(num_rows)
+
+    def _static_inputs(self, shape_key, live) -> list[torch.Tensor]:
+        static = self._static.get(shape_key)
+        if static is None:
+            top = self.buckets[-1]
+            static = self._static[shape_key] = [
+                t.new_zeros((top, *t.shape[1:])) for t in live
+            ]
+        return static
+
+    @contextmanager
+    def _break_context(self, break_batch: ForwardBatch):
         if self._layers is None:
             self._layers = compute_attention_and_moe_layers(self._model)
         layers = self._layers
         with (
             set_tc_piecewise_forward_context(
-                tail_batch,
+                break_batch,
                 layers.attention_layers,
                 None,
                 layers.moe_layers,
@@ -224,15 +327,21 @@ class DecoderReplayGraphs:
         ):
             yield
 
-    def _capture(self, key, live, rebuild, forward_batch) -> _ReplayGraph:
-        rows = key[0]
-        num_rows = live[0].shape[0]
+    def _capture(
+        self,
+        *,
+        rows,
+        num_rows,
+        shape_key,
+        static,
+        num_leaves,
+        rebuild,
+        names,
+        forward_batch,
+    ) -> _ReplayGraph:
         start = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
-        inputs = [t.new_zeros((rows, *t.shape[1:])) for t in live]
-        for buf, t in zip(inputs, live):
-            buf[:num_rows].copy_(t)
-        num_state = len(live) - 3
+        inputs = [buf[:rows] for buf in static]
         # The layers read the step's batch; the copy's count tensor is the graph's.
         capture_batch = copy.copy(forward_batch)
         capture_batch.global_num_token_non_padded_cpu = rows
@@ -242,15 +351,27 @@ class DecoderReplayGraphs:
                 forward_batch.num_token_non_padded, num_rows
             )
             capture_batch.num_token_non_padded = num_token_non_padded
+        out_static: list = []
 
         def body():
-            return self._run_layers(
-                rebuild(inputs[:num_state]),
-                positions=inputs[num_state],
-                input_ids=inputs[num_state + 1],
-                input_ids_global=inputs[num_state + 2],
+            out = self._run_layers(
+                rebuild(inputs[:num_leaves]),
                 forward_batch=capture_batch,
+                **dict(zip(names, inputs[num_leaves:])),
             )
+            out_leaves, out_structure, out_rebuild = _flatten_state(out)
+            if not out_static:
+                # Shared max-size output buffers per output structure.
+                okey = (shape_key, out_structure)
+                buffers = self._static_out.get(okey)
+                if buffers is None:
+                    top = self.buckets[-1]
+                    buffers = self._static_out[okey] = [
+                        t.new_empty((top, *t.shape[1:])) for t in out_leaves
+                    ]
+                out_static.extend([buffers, out_rebuild])
+            for buf, t in zip(out_static[0], out_leaves):
+                buf[: t.shape[0]].copy_(t)
 
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
@@ -269,16 +390,26 @@ class DecoderReplayGraphs:
                 stream=context.stream,
                 barrier_fn=tp_group.barrier,
             ):
-                residual, pre = body()
+                body()
         torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
+        metadata = get_attn_backend().forward_metadata
+        owned = {
+            "num_token_non_padded": num_token_non_padded,
+            "q_pad_buffer": getattr(metadata, "q_pad_buffer", None),
+        }
+        buffers, out_rebuild = out_static
+
+        def rebuild_rows(n: int) -> HcState:
+            return out_rebuild([b[:n] for b in buffers])
+
         replay_graph = _ReplayGraph(
             graph,
-            inputs,
-            num_token_non_padded,
-            residual,
-            pre,
-            (capture_batch, get_attn_backend().forward_metadata),
+            rows,
+            rebuild_rows,
+            _pointer_snapshot(owned),
+            owned,
+            (capture_batch, metadata),
         )
         seconds = time.perf_counter() - start
         used = free_before - torch.cuda.mem_get_info()[0]
@@ -286,8 +417,9 @@ class DecoderReplayGraphs:
         self.capture_bytes += used
         if get_parallel().tp_rank == 0:
             logger.info(
-                "Decoder replay graph: captured %d rows (%d segments) in %.2f s, "
-                "%.3f GiB; bank %d graphs, %.2f s, %.3f GiB",
+                "%s graph: captured %d rows (%d segments) in %.2f s, %.3f GiB; "
+                "%d graphs, %.2f s, %.3f GiB",
+                self.name,
                 rows,
                 len(graph._segments),
                 seconds,
@@ -297,3 +429,73 @@ class DecoderReplayGraphs:
                 self.capture_bytes / 2**30,
             )
         return replay_graph
+
+
+# ---------------------------------------------------------------------------
+# Startup capture
+# ---------------------------------------------------------------------------
+
+
+def _dummy_extend(eager_runner, buffers, *, batch_size: int, tokens_per_req: int):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    n = batch_size * tokens_per_req
+    # Real positions: rotary tables and the request-window layout read them.
+    buffers.positions[:n].copy_(
+        torch.arange(tokens_per_req, device=buffers.positions.device).repeat(batch_size)
+    )
+    eager_runner._dummy_run(
+        batch_size,
+        forward_mode_override=ForwardMode.EXTEND,
+        buffers=buffers,
+        extend_num_tokens_per_req=tokens_per_req,
+    )
+
+
+def capture_at_startup(
+    *, eager_runner, request_window, graphs: list[EagerReplayGraphs]
+) -> None:
+    """Capture every bucket of ``graphs`` from dummy eager forwards, after one
+    full-chunk forward with graphs closed has grown every row-sized workspace."""
+    graphs = [g for g in graphs if g is not None]
+    if not graphs:
+        return
+    chunk = max(g.buckets[-1] for g in graphs)
+    # A tail bucket of B rows is B / 128 requests of 128 tokens.
+    max_bs = max([g.buckets[-1] // TAIL_ROW_STEP for g in graphs if g.tail_rows] + [1])
+    buffers = eager_runner._alloc_dummy_decode_buffers(
+        max_bs, num_tokens_per_req=-(-chunk // max_bs)
+    )
+    start = time.perf_counter()
+    _dummy_extend(eager_runner, buffers, batch_size=1, tokens_per_req=chunk)
+    plan = []
+    for g in graphs:
+        if g.tail_rows:
+            # One 128-token request per tail block.
+            plan += [(b // TAIL_ROW_STEP, TAIL_ROW_STEP) for b in g.buckets]
+        else:
+            plan += [(1, b) for b in g.buckets]
+    # Largest shapes first, so later captures reuse the pool's free blocks.
+    plan = sorted(set(plan), key=lambda p: -p[0] * p[1])
+    with ExitStack() as stack:
+        for g in graphs:
+            stack.enter_context(g.capture_scope())
+        for batch_size, tokens_per_req in plan:
+            _dummy_extend(
+                eager_runner,
+                buffers,
+                batch_size=batch_size,
+                tokens_per_req=tokens_per_req,
+            )
+    if request_window is not None:
+        # Dummy requests used slots [0, max_bs); real requests start clean.
+        request_window.reset(torch.arange(max_bs, device=buffers.positions.device))
+    if get_parallel().tp_rank == 0:
+        logger.info(
+            "Eager replay graphs captured at startup in %.1f s: %s",
+            time.perf_counter() - start,
+            ", ".join(
+                f"{g.name} {g.num_graphs} graphs {g.capture_bytes / 2**30:.2f} GiB"
+                for g in graphs
+            ),
+        )

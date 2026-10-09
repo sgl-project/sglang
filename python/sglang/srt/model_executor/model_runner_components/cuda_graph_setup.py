@@ -419,10 +419,27 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    _capture_eager_replay_graphs(model_runner, eager_runner)
+
     if finalize:
         finalize_cuda_graph_capture(model_runner)
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+def _capture_eager_replay_graphs(model_runner: ModelRunner, eager_runner) -> None:
+    """Capture the model's eager-step replay graphs (DeepSeek-V4) at startup."""
+    inner = getattr(model_runner.model, "model", None)
+    graphs = getattr(inner, "eager_replay_graphs", None)
+    if not graphs or model_runner.spec_algorithm.is_speculative():
+        return
+    from sglang.srt.models.deepseek_v4_replay_graphs import capture_at_startup
+
+    capture_at_startup(
+        eager_runner=eager_runner,
+        request_window=getattr(model_runner.token_to_kv_pool, "request_window", None),
+        graphs=graphs,
+    )
 
 
 def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
