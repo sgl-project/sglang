@@ -86,6 +86,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         )
         # The loader follows the base method's weight layout, as it would without paging.
         layer.weight_load_method = self.base_method
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported with --enable-paged-experts: "
+            "experts already on the GPU would keep the old weights."
+        )
         self.format.check_params(layer=layer, num_slots=self.num_resident)
         # A store that only stages the checkpoint layout for a repack need not be pinned.
         self.store = HostExpertStore(

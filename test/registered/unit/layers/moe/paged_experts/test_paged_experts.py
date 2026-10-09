@@ -245,6 +245,17 @@ class TestLoading(CustomTestCase):
         )
         self.assertFalse(method.store.host["w2_weight"][8].any())
 
+    def test_rejects_online_weight_updates(self):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _unsupported_derived_weight_cache_error,
+        )
+
+        _, layer = self._created_layer()
+        model = torch.nn.Sequential(layer)
+        self.assertIn(
+            "--enable-paged-experts", _unsupported_derived_weight_cache_error(model)
+        )
+
     def test_rejects_undeclared_expert_params(self):
         """A per-expert tensor the format does not declare would never reach the slots."""
         with self.assertRaisesRegex(RuntimeError, "w13_weight_scale"):
