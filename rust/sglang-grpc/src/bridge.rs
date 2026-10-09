@@ -103,6 +103,7 @@ pub struct PyBridge {
     runtime_handle: Py<PyAny>,
     state: BridgeStateRef,
     rust_tokenizer: Option<RustTokenizer>,
+    dllm_mask_id: Option<u32>,
     context_len: i32,
     response_channel_capacity: usize,
     tokio_handle: Handle,
@@ -112,6 +113,7 @@ impl PyBridge {
     pub fn new(
         runtime_handle: Py<PyAny>,
         rust_tokenizer: Option<RustTokenizer>,
+        dllm_mask_id: Option<u32>,
         context_len: i32,
         response_channel_capacity: usize,
         tokio_handle: Handle,
@@ -124,6 +126,7 @@ impl PyBridge {
             runtime_handle,
             state: Arc::new(Mutex::new(BridgeState::default())),
             rust_tokenizer,
+            dllm_mask_id,
             context_len,
             response_channel_capacity,
             tokio_handle,
@@ -133,6 +136,11 @@ impl PyBridge {
     /// Access the Rust tokenizer (if available).
     pub fn rust_tokenizer(&self) -> Option<&RustTokenizer> {
         self.rust_tokenizer.as_ref()
+    }
+
+    /// Return the mask ID reserved for dLLM decoding, if enabled.
+    pub fn dllm_mask_id(&self) -> Option<u32> {
+        self.dllm_mask_id
     }
 
     /// Return the model's context length.
@@ -321,7 +329,7 @@ impl PyBridge {
         })
     }
 
-    /// Tokenize via Python (fallback when Rust tokenizer unavailable).
+    /// Tokenize via Python, including shared dLLM prompt normalization.
     pub fn tokenize_py(&self, text: &str, add_special_tokens: bool) -> PyResult<String> {
         Python::attach(|py| {
             let result =

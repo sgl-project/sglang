@@ -5,6 +5,26 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
+def get_dllm_model_params(model_config: ModelConfig) -> dict[str, Any]:
+    architectures = getattr(model_config.hf_config, "architectures", None) or []
+    if not architectures:
+        raise RuntimeError("The model config does not declare an architecture")
+    arch = architectures[0]
+    dllm_params = {
+        "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+        "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
+        "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+        "DiffusionGemmaForBlockDiffusion": {
+            "block_size": getattr(model_config.hf_config, "canvas_length", 256),
+            "mask_id": -1,
+            "algorithm": "Gemma4Renoise",
+        },
+    }
+    if arch not in dllm_params:
+        raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+    return dllm_params[arch]
+
+
 class DllmConfig:
     def __init__(
         self,
@@ -49,27 +69,10 @@ class DllmConfig:
             model_path=cfg.model_path,
             model_revision=cfg.revision,
         )
-        DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
-            "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "DiffusionGemmaForBlockDiffusion": {
-                "block_size": getattr(model_config.hf_config, "canvas_length", 256),
-                "mask_id": -1,
-                "algorithm": "Gemma4Renoise",
-            },
-        }
-
-        architectures = getattr(model_config.hf_config, "architectures", None) or []
-        if not architectures:
-            raise RuntimeError("The model config does not declare an architecture")
-        arch = architectures[0]
-        if arch in DLLM_PARAMS:
-            params = DLLM_PARAMS[arch]
-            block_size = params["block_size"]
-            mask_id = params["mask_id"]
-        else:
-            raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+        params = get_dllm_model_params(model_config)
+        block_size = params["block_size"]
+        mask_id = params["mask_id"]
+        arch = model_config.hf_config.architectures[0]
 
         from sglang.srt.dllm.algorithm import get_algorithm_cls
 
