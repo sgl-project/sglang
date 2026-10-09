@@ -1265,8 +1265,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.spec_info is None
             ):
-                # Trailing 1-token requests (mixed-batch decode tails) run on
-                # the decode kernel.
                 lengths = forward_batch.extend_seq_lens_cpu
                 prefix = len(lengths)
                 while prefix and lengths[prefix - 1] == 1:
@@ -1846,9 +1844,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 out = native_out if uses_native_fp4 else forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
-                metadata = self.forward_metadata
-                prefix_reqs = metadata.mixed_prefill_reqs
-                prefix_tokens = metadata.mixed_prefill_tokens
+                prefix_reqs = self.forward_metadata.mixed_prefill_reqs
+                prefix_tokens = self.forward_metadata.mixed_prefill_tokens
                 if (
                     prefix_reqs
                     and q.dtype == self.data_type == torch.bfloat16
@@ -1857,10 +1854,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out = torch.empty_like(q) if out is None else out
                     _trtllm_context_attn(
                         q[:prefix_tokens],
-                        metadata.cu_seqlens_q[: prefix_reqs + 1],
-                        metadata.cache_seqlens_int32[:prefix_reqs],
-                        metadata.max_seq_len_q,
-                        cu_seqlens_kv=metadata.cu_seqlens_k[: prefix_reqs + 1],
+                        self.forward_metadata.cu_seqlens_q[: prefix_reqs + 1],
+                        self.forward_metadata.cache_seqlens_int32[:prefix_reqs],
+                        self.forward_metadata.max_seq_len_q,
+                        cu_seqlens_kv=self.forward_metadata.cu_seqlens_k[
+                            : prefix_reqs + 1
+                        ],
                         out=out[:prefix_tokens],
                         page_table_override=page_table[:prefix_reqs],
                     )
@@ -1868,7 +1867,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         q[prefix_tokens:],
                         kv_cache,
                         page_table[prefix_reqs:],
-                        metadata.cache_seqlens_int32[prefix_reqs:],
+                        self.forward_metadata.cache_seqlens_int32[prefix_reqs:],
                         bmm1_scale=bmm1_scale,
                         bmm2_scale=bmm2_scale,
                         window_left=layer.sliding_window_size,
