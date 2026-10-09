@@ -388,6 +388,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        if getattr(param, "_shared_draft_weight", False) is True:
+            return
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
 
