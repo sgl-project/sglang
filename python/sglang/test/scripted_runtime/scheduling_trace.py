@@ -4,6 +4,9 @@ With SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR set, every executed script writes
 one JSONL file there: a ``header`` record with the server config the trace
 ran under, then a ``schedule`` record each time the scheduler picks the next
 batch and a ``result`` record each time a batch result is processed.
+A schedule record also carries what the scheduler's readers (the idle checks
+behind health check, pause and flush, and the load report) saw at the top of
+that scheduler iteration, where they run.
 Records hold only what two runs of one commit reproduce: rids are relabeled
 r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
 
@@ -62,6 +65,7 @@ class SchedulingTraceWriter:
         self._step = 0
         self._rid_labels: Dict[str, str] = {}
         self._retraction_counts: Dict[str, int] = {}
+        self._readers: Dict[str, Any] = {}
         self._write({"kind": "header", **header})
 
     @classmethod
@@ -85,6 +89,23 @@ class SchedulingTraceWriter:
 
     def close(self) -> None:
         self._file.close()
+
+    def observe_readers(self, scheduler: Scheduler) -> None:
+        """Snapshot the readers' values for the next schedule record.
+
+        Called at the top of each scheduler iteration. Not asked from
+        record_schedule: during planning, scheduler.running_batch is not yet
+        the plan's running batch, a state no reader sees.
+        """
+        load = scheduler.load_inquirer.get_loads()
+        self._readers = {
+            "idle": scheduler.is_fully_idle(),
+            "idle_ignore_waiting": scheduler.is_fully_idle(ignore_waiting=True),
+            "load": {
+                "running": load.num_running_reqs,
+                "waiting": load.num_waiting_reqs,
+            },
+        }
 
     def record_schedule(self, scheduler: Scheduler, plan: NextBatchPlan) -> None:
         self._step += 1
@@ -117,6 +138,8 @@ class SchedulingTraceWriter:
             ),
             kv_available=scheduler.token_to_kv_pool_allocator.available_size(),
             kv_evictable=scheduler.tree_cache.evictable_size(),
+            new_token_ratio=scheduler.new_token_ratio_tracker.current,
+            **self._readers,
         )
         self._write(record)
 

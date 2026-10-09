@@ -38,6 +38,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
             waiting_queue=[],
             token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 8),
             tree_cache=SimpleNamespace(evictable_size=lambda: 0),
+            new_token_ratio_tracker=SimpleNamespace(current=0.5),
         )
         batch = SimpleNamespace(
             reqs=[req],

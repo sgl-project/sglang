@@ -229,6 +229,8 @@ class ScriptedSchedulerHook:
 
         done, exc_tb = _advance_generator(self._script_fn_generator)
         if not done:
+            if self._trace is not None:
+                self._trace.observe_readers(self.scheduler)
             return
 
         if exc_tb is not None:
