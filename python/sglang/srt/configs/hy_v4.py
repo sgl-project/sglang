@@ -1,7 +1,7 @@
-from transformers.configuration_utils import PreTrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 
-class HYV4Config(PreTrainedConfig):
+class HYV4Config(PretrainedConfig):
     model_type = "hy_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {"num_local_experts": "n_routed_experts"}
