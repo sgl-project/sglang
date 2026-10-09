@@ -876,7 +876,11 @@ def static_quant_fp8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_PDL": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_PDL": False}
+    )
     _static_quant_fp8[(M,)](
         x,
         x_q.view(torch.uint8),

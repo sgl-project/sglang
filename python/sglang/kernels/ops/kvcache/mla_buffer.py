@@ -161,7 +161,9 @@ def _set_mla_kv_buffer_impl(
         BLOCK = triton.next_power_of_2(nope_dim)
         grid = (n_loc, 1)
         pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+            {"USE_GDC": True, "launch_pdl": True}
+            if is_arch_support_pdl()
+            else {"USE_GDC": False}
         )
         set_mla_kv_buffer_kernel_norope[grid](
             kv_buffer,
@@ -207,7 +209,11 @@ def _set_mla_kv_buffer_impl(
     total_dim = nope_dim + rope_dim
     BLOCK = triton.next_power_of_2(total_dim)
     grid = (n_loc, 1)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -356,7 +362,11 @@ def set_mla_kv_buffer_triton_fp8_quant(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
 
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,

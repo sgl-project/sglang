@@ -495,7 +495,11 @@ def router_gate_matvec(
     # Single k-iteration whenever K fits one block: no serial dependent-load
     # chain on a cold weight.
     block_k = min(4096, triton.next_power_of_2(K))
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     router_gate_matvec_kernel[(M, triton.cdiv(E, block_e))](
         hidden_states,
         weight,

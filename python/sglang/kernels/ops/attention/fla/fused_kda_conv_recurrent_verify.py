@@ -515,7 +515,11 @@ def fused_kda_conv_gating_verify(
     grid = (NV, B * HV)
     # PDL (sm90+): chain behind the producer qkv-projection GEMM and signal the
     # downstream o_norm / o_proj. Scheduling only — bit-exactness unaffected.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     fused_kda_conv_gating_verify_kernel[grid](
         x=mixed_qkv,
         w=conv_weight,

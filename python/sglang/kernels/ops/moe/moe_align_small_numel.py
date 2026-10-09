@@ -131,7 +131,11 @@ def moe_align_small_numel(
     than the two-kernel path.
     """
     numel = topk_ids.numel()
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     _moe_align_small_numel_kernel[(1,)](
         topk_ids,
         sorted_token_ids,

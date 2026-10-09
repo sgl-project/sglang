@@ -495,7 +495,11 @@ def selective_state_update(
         else None
     )
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
 
     with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](

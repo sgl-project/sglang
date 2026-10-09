@@ -225,7 +225,9 @@ def layer_norm_gated_fwd(
     if D <= 512:
         BT = 32
         pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+            {"USE_GDC": True, "launch_pdl": True}
+            if is_arch_support_pdl()
+            else {"USE_GDC": False}
         )
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,

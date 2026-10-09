@@ -370,7 +370,11 @@ def silu_and_mul_triton(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         EVEN_N=N % BLOCK_SIZE_N == 0,
         INT64_INDEX=gateup_output.nbytes >= 2**31,
-        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
+        **(
+            {"USE_PDL": True, "launch_pdl": True}
+            if is_arch_support_pdl()
+            else {"USE_PDL": False}
+        ),
     )
 
     return down_input

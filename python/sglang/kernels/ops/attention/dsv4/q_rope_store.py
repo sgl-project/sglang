@@ -112,7 +112,11 @@ def q_rope_store(
             num_warps=4,
         )
         return
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     _q_rope_store[(q.shape[0], q.shape[1])](
         q,
         output,

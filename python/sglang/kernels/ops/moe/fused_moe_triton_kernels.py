@@ -1001,7 +1001,7 @@ def invoke_fused_moe_kernel(
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
             if is_arch_support_pdl()
-            else {}
+            else {"USE_GDC": False, "GDC_EARLY": False}
         )
         fused_moe_kernel[grid](
             A,
@@ -1261,7 +1261,11 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = (
+        {"USE_GDC": True, "launch_pdl": True}
+        if is_arch_support_pdl()
+        else {"USE_GDC": False}
+    )
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
