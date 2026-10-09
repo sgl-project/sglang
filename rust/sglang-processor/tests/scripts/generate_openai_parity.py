@@ -58,6 +58,8 @@ UNREAD_META = {
     "num_retractions",
     "dp_rank",
 }
+# What each `/generate` stream frame repeats in full; fixtures keep only what a frame adds.
+GROWING = {"text", "output_ids", "output_token_logprobs", "output_top_logprobs"}
 # The bare request of each endpoint; cases keep only the sampling params they change.
 BARE_REQUESTS = {
     "completions": {"prompt": "x"},
@@ -107,6 +109,45 @@ def trim_meta(output):
     return output
 
 
+def frame_delta(prev, frame):
+    """`frame` as stored: `index`, what it appends to `GROWING` and the keys that changed."""
+    delta = {}
+    for key, value in frame.items():
+        if key in GROWING:
+            delta[key] = value[len(prev[key]) :]
+        elif key == "meta_info":
+            delta[key] = frame_delta(prev[key], value)
+        elif key == "index" or prev.get(key) != value:
+            delta[key] = value
+    assert frame_merge(prev, delta) == frame
+    return delta
+
+
+def frame_merge(prev, delta):
+    frame = dict(prev)
+    for key, value in delta.items():
+        if key in GROWING:
+            frame[key] = prev[key] + value
+        elif key == "meta_info":
+            frame[key] = frame_merge(prev[key], value)
+        else:
+            frame[key] = value
+    return frame
+
+
+def stream_frames(frames, store):
+    """Each choice's stream frames as stored (`store`) or as the engine sent them."""
+    last, out = {}, []
+    for frame in frames:
+        prev = last.get(frame.get("index"))
+        if prev is not None and "meta_info" in frame:
+            out.append(frame_delta(prev, frame) if store else frame_merge(prev, frame))
+        else:
+            out.append(frame)
+        last[frame.get("index")] = frame if store else out[-1]
+    return out
+
+
 def record_frames(engine_url, body):
     response = requests.post(
         f"{engine_url}/generate", json=body, stream=body.get("stream")
@@ -117,7 +158,7 @@ def record_frames(engine_url, body):
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("data: ") and line != "data: [DONE]":
             frames.append(json.loads(line[len("data: ") :]))
-    return {"status": 200, "frames": frames}
+    return {"status": 200, "frames": stream_frames(frames, store=True)}
 
 
 def replay(output):
@@ -137,7 +178,7 @@ def replay(output):
                 raise ValueError(body["error"]["message"])
             yield internal(json.loads(json.dumps(body)))
             return
-        for frame in json.loads(json.dumps(output["frames"])):
+        for frame in json.loads(json.dumps(stream_frames(output["frames"], False))):
             if "error" in frame:
                 raise ValueError(frame["error"]["message"])
             yield internal(frame)
@@ -145,11 +186,16 @@ def replay(output):
     return generate_request
 
 
+def event_json(event):
+    data = event.removeprefix("data: ").strip()
+    return data if data == "[DONE]" else json.loads(data)
+
+
 async def openai_response(handler, request, raw_request):
     response = await handler.handle_request(request, raw_request)
     if isinstance(response, StreamingResponse):
         events = [chunk async for chunk in response.body_iterator]
-        return {"events": events}
+        return {"events": [event_json(event) for event in events]}
     if isinstance(response, Response):
         return {"status": response.status_code, "body": json.loads(response.body)}
     return {"status": 200, "body": jsonable_encoder(response)}
