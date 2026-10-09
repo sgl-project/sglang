@@ -30,6 +30,7 @@ def _draft(head, sampling_info, offset):
         noise=DraftNoise(key=3, offset=offset),
         device="cpu",
         tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+        greedy_draft=False,
     )
     return block, base, hidden, anchor
 
