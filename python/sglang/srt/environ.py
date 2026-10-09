@@ -1581,6 +1581,10 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Decoder SWA bounded replay: eager prefill steps run the trimmed late layers
+    # from CUDA graphs captured per tail-row bucket (multiples of 128) up to this
+    # many rows; 0 keeps them eager.
+    SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(0)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
