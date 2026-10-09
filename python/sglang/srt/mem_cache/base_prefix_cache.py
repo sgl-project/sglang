@@ -241,6 +241,16 @@ class DecLockRefParams:
 
 
 @dataclasses.dataclass
+class TreeLock:
+    """``receipt`` replays the acquire on release; ``swa_released`` marks the
+    SWA part released early, so neither release takes it twice."""
+
+    node: Any
+    receipt: DecLockRefParams
+    swa_released: bool = False
+
+
+@dataclasses.dataclass
 class DecLockRefResult:
     """Result of an dec_lock_ref operation."""
 
@@ -261,7 +271,11 @@ class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
     Attributes:
-        device_indices  :   Indices of the KV cache on the device matched by common prefix.
+        device_prefix_len:  Length of the device-resident matched prefix. Its KV
+                            indices lie on the path to ``last_device_node``, except
+                            slots LMCache loaded but has not published (which
+                            ``prefix_device_indices`` appends) and a streaming
+                            session's match, which lives in the lent row.
         last_device_node:   The last TreeNode on the device that was matched.
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
@@ -289,7 +303,7 @@ class MatchResult(NamedTuple):
                             host, independent of other components.
     """
 
-    device_indices: torch.Tensor
+    device_prefix_len: int
     last_device_node: Any
     last_host_node: Any
     best_match_node: Any
@@ -308,13 +322,11 @@ def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
     if not tree_cache.supports_prefix_sharing():
-        # match_prefix already returns a miss; no root_node to walk back to.
+        # A non-sharing cache's match is already a miss; pass it through.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
-        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
-        # without allocating a fresh empty tensor.
-        device_indices=match_result.device_indices[:0],
+        device_prefix_len=0,
         last_device_node=root,
         last_host_node=root,
         best_match_node=root,
@@ -428,6 +440,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def touch_prefix(self, key: RadixKey) -> None:
+        """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
+        never allocates, loads, or queries external tiers."""
+
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
         return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)
@@ -451,7 +467,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
         ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
-        for the unified tree, None for caches without tree nodes). None means
+        for the unified tree). None means
         "no base available here", which sends the alloc path to the base the
         request recorded at its previous alloc. Tree caches that keep the
         per-chain base override this. See UnifiedTreeNode.rotation_base.
@@ -510,11 +526,25 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> DecLockRefResult:
         pass
 
-    def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``; a cache
-        whose acquire returned a receipt releases with it here."""
-        if req.last_node is not None:
-            self.dec_lock_ref(req.last_node)
+    def lock(self, node: Any) -> Optional[TreeLock]:
+        """Take a tree lock on ``node`` for one holder; ``unlock`` releases it."""
+        return TreeLock(node, self.inc_lock_ref(node).to_dec_params())
+
+    def unlock(self, lock: Optional[TreeLock]) -> None:
+        if lock is not None:
+            self.dec_lock_ref(lock.node, lock.receipt)
+
+    def path_device_indices(self, node: Any) -> torch.Tensor:
+        """Device KV indices on the path from the root to ``node``; valid until
+        the next allocation or eviction unless the path is locked."""
+        raise NotImplementedError
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        """KV indices of req's matched prefix, read off the path to its locked
+        match node; valid from match until allocation writes them into the row."""
+        path = self.path_device_indices(req.last_node)
+        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        return path[: req.prefix_len]
 
     def maybe_hand_to_session(self, req: Req) -> None:
         """A cache that keeps records across requests (a streaming session) takes
@@ -560,11 +590,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[Tuple[torch.Tensor, Any]]:
-        """
-        Prepare host-to-device loading. None means retry admission; an empty
-        tensor can be a successful auxiliary-only load or a recompute fallback.
-        """
+    ) -> Optional[Tuple[int, Any]]:
+        """Prepare host-to-device loading; returns (loaded FULL tokens, new last
+        node). None means retry admission; zero can be a successful
+        auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
