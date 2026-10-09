@@ -1104,9 +1104,14 @@ class AnthropicServing:
                 return
 
             if chunk.usage is not None:
+                # The Messages API reports cumulative usage on ``message_delta``
+                # as well, repeating the input-side counters already sent on
+                # ``message_start`` rather than replacing them. Clients that read
+                # final usage from the last event therefore expect the input
+                # counters to be present here too.
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
-                    include_input=False,
+                    include_input=True,
                     include_output=True,
                 )
 
