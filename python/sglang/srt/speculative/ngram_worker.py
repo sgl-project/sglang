@@ -12,7 +12,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.req_time_stats import (
+    set_spec_verify_end_time_batch,
+    set_time_batch,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -437,6 +440,7 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
@@ -494,6 +498,7 @@ class NGRAMWorker(BaseSpecWorker):
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
+            set_spec_verify_end_time_batch(batch.reqs, accept_lens)
             move_accept_tokens_to_target_kvcache(
                 batch,
                 accept_index,
