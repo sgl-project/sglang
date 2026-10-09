@@ -375,9 +375,10 @@ class TestDenseInterleaveBackend(CustomTestCase):
             (True, 3, True),
             (True, 4, True),
         ):
-            with self.subTest(
-                mla=mla, version=version, separate_rope=separate_rope
-            ), self.backend_case(mla=mla, version=version) as c:
+            with (
+                self.subTest(mla=mla, version=version, separate_rope=separate_rope),
+                self.backend_case(mla=mla, version=version) as c,
+            ):
                 actual = c.backend.forward_extend(
                     c.q[:, :, :3] if separate_rope else c.q,
                     c.k,
@@ -433,9 +434,10 @@ class TestDenseInterleaveBackend(CustomTestCase):
             ("logit_cap", 1.0),
             ("num_splits", 2),
         ):
-            with self.subTest(option=option), self.backend_case(
-                mla=True, version=4
-            ) as c:
+            with (
+                self.subTest(option=option),
+                self.backend_case(mla=True, version=4) as c,
+            ):
                 setattr(c.backend if option == "num_splits" else c.layer, option, value)
                 before = c.stored_k.clone()
                 with self.assertRaisesRegex(NotImplementedError, "FA4.*MLA"):
@@ -449,9 +451,10 @@ class TestDenseInterleaveBackend(CustomTestCase):
 
     def test_zigzag_callback_geometry_and_single_mla_write(self):
         for mla in (False, True):
-            with self.subTest(mla=mla), self.backend_case(
-                mla=mla, zigzag_layout=True
-            ) as c:
+            with (
+                self.subTest(mla=mla),
+                self.backend_case(mla=mla, zigzag_layout=True) as c,
+            ):
                 c.backend.forward_extend(
                     c.q, c.k, c.v, c.layer, c.batch, k_rope=c.rope if mla else None
                 )
@@ -491,20 +494,24 @@ class TestQwen2ContextParallelLayout(CustomTestCase):
         initialize_dp_attention_flags(server)
         # CP2 holds full attention heads; CP-off retains ordinary TP2 shards.
         for cp_size in (2, 1):
-            with self.subTest(cp_size=cp_size), parallel_scope(
-                tp_rank=1,
-                tp_size=2,
-                attn_tp_rank=0 if cp_size == 2 else 1,
-                attn_tp_size=2 // cp_size,
-                attn_cp_size=cp_size,
-                attn_cp_rank=1 if cp_size == 2 else 0,
-                pp_group=SimpleNamespace(
-                    is_first_rank=False,
-                    is_last_rank=False,
-                    rank_in_group=0,
-                    world_size=1,
+            with (
+                self.subTest(cp_size=cp_size),
+                parallel_scope(
+                    tp_rank=1,
+                    tp_size=2,
+                    attn_tp_rank=0 if cp_size == 2 else 1,
+                    attn_tp_size=2 // cp_size,
+                    attn_cp_size=cp_size,
+                    attn_cp_rank=1 if cp_size == 2 else 0,
+                    pp_group=SimpleNamespace(
+                        is_first_rank=False,
+                        is_last_rank=False,
+                        rank_in_group=0,
+                        world_size=1,
+                    ),
                 ),
-            ), patch.object(qwen2, "get_rope", return_value=torch.nn.Identity()):
+                patch.object(qwen2, "get_rope", return_value=torch.nn.Identity()),
+            ):
                 attention = qwen2.Qwen2Attention(32, 4, 4, head_dim=8)
                 heads = 4 // (2 // cp_size)
                 self.assertEqual(
