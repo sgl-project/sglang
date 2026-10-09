@@ -6,13 +6,11 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_activation_cuda_cflags,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -20,19 +18,11 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def activation_module(
-    dtype: torch.dtype,
-    *,
-    fast_math: bool = True,
-    vec_size: Optional[int] = None,
-) -> Module:
-    fast_math_flags = get_activation_cuda_cflags()
+def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
+    fast_math_flags = [] if is_hip_runtime() else ["--use_fast_math"]
     if not fast_math and not fast_math_flags:
-        return activation_module(dtype, vec_size=vec_size)
-    template_args = [dtype, is_arch_support_pdl()]
-    if vec_size is not None:
-        template_args.append(vec_size)
-    args = make_cpp_args(*template_args)
+        return activation_module(dtype)
+    args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "activation" if fast_math else "rounded_activation",
         *args,
@@ -60,32 +50,6 @@ def activation_module(
     )
 
 
-@cache_once
-def _resident_threads() -> int:
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return props.multi_processor_count * props.max_threads_per_multi_processor
-
-
-def _activation_vec_size(
-    num_elems: int, hidden_size: int, element_size: int
-) -> Optional[int]:
-    if element_size != 2 or not is_cuda() or get_jit_cuda_arch().major != 10:
-        return None
-    # Thresholds from a B300 sweep over hidden 360-29568 x tokens 1-2048.
-    wave = _resident_threads()
-    if num_elems < wave // 2:
-        vec_size = 2
-    elif num_elems < 4 * wave:
-        vec_size = 4
-    elif num_elems < 16 * wave:
-        vec_size = 8
-    else:
-        vec_size = 16
-    while hidden_size % vec_size:
-        vec_size //= 2
-    return None if vec_size == 16 else vec_size
-
-
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
 SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
 
@@ -95,10 +59,7 @@ def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    vec_size = _activation_vec_size(
-        input.numel() // 2, hidden_size, input.element_size()
-    )
-    module = activation_module(input.dtype, vec_size=vec_size)
+    module = activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation(input_2d, out_2d, op_name)

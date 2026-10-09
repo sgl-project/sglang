@@ -63,11 +63,11 @@ template <
     bool kFilterExpert,
     bool kRoundActivation = false,
     bool kReuseInput = false,
-    bool kClamp = false,
-    uint32_t kVecSize = device::kMaxVecBytes / sizeof(T)>
+    bool kClamp = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
-  using vec_t = AlignedVector<T, kVecSize>;
+  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
+  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto token_id = tid / num_vecs;
@@ -114,10 +114,11 @@ struct UnaryActivationParams {
   uint32_t num_vecs;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL, uint32_t kVecSize = device::kMaxVecBytes / sizeof(T)>
+template <typename T, ActivationKind kAct, bool kUsePDL>
 __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params) {
   using namespace device;
-  using vec_t = AlignedVector<T, kVecSize>;
+  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
+  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
   const auto vec_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (vec_id >= params.num_vecs) return;
   PDLWaitPrimary<kUsePDL>();
@@ -131,8 +132,9 @@ __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params)
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, bool kUsePDL, uint32_t kVecSize = device::kMaxVecBytes / sizeof(T)>
+template <typename T, bool kUsePDL>
 struct ActivationKernel {
+  static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
@@ -140,7 +142,7 @@ struct ActivationKernel {
 
   template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
   static constexpr kernel_fn_t activation_kernel =
-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput, false, kVecSize>;
+      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
@@ -197,7 +199,8 @@ struct ActivationKernel {
     // only get once to avoid overhead
     const auto num_total_items = num_tokens * (hidden_size / kVecSize);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
-    const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
+    const auto block_size = num_tokens <= 32 ? 128u : 256u;
+    const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), block_size);
     const auto params = ActivationParams{
         .input = input.data_ptr(),
         .out = kReuseInput ? nullptr : out.data_ptr(),
@@ -210,15 +213,15 @@ struct ActivationKernel {
     if constexpr (kClamp) {
       RuntimeCheck(type == "silu" && expert_ids == nullptr, "clamping requires unfiltered SiLU");
       const auto kernel =
-          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kRoundActivation, kReuseInput, true, kVecSize>;
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kRoundActivation, kReuseInput, true>;
+      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
     } else if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
       const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
     } else {
       const auto kernel = select_kernel<false, kRoundActivation, kReuseInput>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      LaunchKernel(num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
     }
   }
 
@@ -253,7 +256,7 @@ struct ActivationKernel {
   }
 
   template <ActivationKind kAct>
-  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL, kVecSize>;
+  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
 
   // Use the explicit non-const function-pointer type (mirrors select_kernel's
   // kernel_fn_t) rather than a trailing `decltype(unary_kernel<...>)` return,
