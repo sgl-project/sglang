@@ -61,6 +61,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
+    def _trim_incomplete_tool_suffix(self, text: str) -> str:
+        """Drop an unfinished trailing tool-call fragment from visible text.
+
+        Align with the streaming parser, which buffers any of the structural
+        tags (and their truncated prefixes) instead of emitting them as text.
+        """
+        structural_tags = (
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+            self.tool_call_prefix,
+            self.function_end_token,
+            self.parameter_prefix,
+            self.parameter_end_token,
+        )
+
+        cut_idx = -1
+        for tag in structural_tags:
+            idx = text.find(tag)
+            if idx != -1 and (cut_idx == -1 or idx < cut_idx):
+                cut_idx = idx
+        if cut_idx != -1:
+            return text[:cut_idx]
+
+        # Truncated marker at end, e.g. "...after<tool_call" or "...after<fun".
+        best_len = 0
+        for tag in structural_tags:
+            for i in range(len(tag) - 1, 0, -1):
+                if text.endswith(tag[:i]):
+                    best_len = max(best_len, i)
+                    break
+        if best_len:
+            return text[:-best_len]
+        return text
+
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
     ) -> dict:
@@ -231,11 +265,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     )
                     tool_idx += 1
 
-            # Determine normal text (text before the first tool call)
-            start_idx = text.find(self.tool_call_start_token)
-            if start_idx == -1:
-                start_idx = text.find(self.tool_call_prefix)
-            normal_text = text[:start_idx] if start_idx > 0 else ""
+            # Visible text: everything outside complete <tool_call>...</tool_call>
+            # blocks (prefix, inter-call text, and suffix). Matches streaming,
+            # which keeps emitting after </tool_call>. Trim any unfinished
+            # trailing tool-call fragment so a complete call followed by an
+            # incomplete one does not leak into normal_text.
+            if self.tool_call_regex.search(text):
+                normal_text = self.tool_call_regex.sub("", text)
+            else:
+                # Incomplete / stripped tags: keep text before the first marker.
+                start_idx = text.find(self.tool_call_start_token)
+                if start_idx == -1:
+                    start_idx = text.find(self.tool_call_prefix)
+                normal_text = text[:start_idx] if start_idx > 0 else ""
+
+            normal_text = self._trim_incomplete_tool_suffix(normal_text)
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
