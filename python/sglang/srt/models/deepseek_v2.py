@@ -2038,7 +2038,7 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -2124,7 +2124,7 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank)
 
         if not skip_rope and qk_rope_head_dim > 0:
             is_neox_style = not getattr(config, "rope_interleave", True)
