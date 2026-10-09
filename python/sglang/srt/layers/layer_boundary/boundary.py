@@ -57,6 +57,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_slice_update_read,
     _dispatch_by_update,
     _dp_gather_sum_read,
+    _move_before_read,
     _reduce_update_read,
     _reduce_update_read_dp_gather,
     _run_entry,
@@ -404,6 +405,36 @@ def _select_entry_step(
         raise NotImplementedError(f"{produced=}")
     gathered = produced.layout.sharded - need.layout.sharded - need.gathered_by_compute
     sliced = need.layout.sharded - produced.layout.sharded
+    if residual_to.sharded - produced.layout.sharded == {TokenAxis.ATTN_CP}:
+        # A head-parallel mixer consumes full context, but its residual and
+        # readout coefficients remain on the CP shard. Complete the producer's
+        # sum onto that shard before the (possibly nonlinear) update/read.
+        if (
+            residual != residual_to
+            or cp_moves is None
+            or owes not in (None, SumGroup.ATTN_CP)
+            or (owes is not None and cp_moves.reduce_scatter is None)
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        local = msgspec.structs.replace(
+            produced, layout=residual_to, group=None, always_partial=False
+        )
+        read_local, input_move = _select_entry_step(
+            local,
+            residual=residual,
+            residual_to=residual_to,
+            need=need,
+            is_plain_add=is_plain_add,
+            fusions=(),
+            residual_joins_sum=False,
+            cp_moves=cp_moves,
+            enters_stack=enters_stack,
+        )
+        return partial(
+            _move_before_read,
+            move=cp_moves.reduce_scatter if owes is not None else cp_moves.take_back,
+            read=read_local,
+        ), input_move
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
         # completes the attention-TP sum and slices in one collective; a
@@ -536,7 +567,7 @@ def _select_entry_step(
             return (partial(_tp_sum_with_residual_read, read=read), None)
         # A sum over TP completes only on rows every TP rank holds: the TP group
         # spans attention DP and CP.
-        if owes is not SumGroup.ATTN_TP and (
+        if owes not in (SumGroup.ATTN_TP, SumGroup.ATTN_CP) and (
             owes is not SumGroup.TP or produced.layout.sharded
         ):
             raise NotImplementedError(f"{produced=} {need=}")
@@ -551,7 +582,7 @@ def _select_entry_step(
             ),
             None,
         )
-    if owes not in (None, SumGroup.ATTN_TP):
+    if owes not in (None, SumGroup.ATTN_TP, SumGroup.ATTN_CP):
         raise NotImplementedError(f"{produced=} {need=}")
     owes_attention_tp = owes is SumGroup.ATTN_TP
     # The partial order adds the residual on attention-TP rank 0 before the DP
@@ -579,7 +610,8 @@ def _select_entry_step(
         partial(
             _reduce_update_read_dp_gather,
             gathers_residual=gathers_residual,
-            reduces_attention_tp=owes_attention_tp,
+            reduces_attention_tp=owes is not None,
+            group=owes,
             places_cp_shards=places_cp_shards,
             read=read,
         ),
