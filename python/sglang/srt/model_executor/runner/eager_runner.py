@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 
 
 class EagerRunner(BaseRunner):
-    def __init__(self, model_runner: ModelRunner) -> None:
+    def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
@@ -150,10 +150,10 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        if run_warmup:
+            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
@@ -296,8 +296,12 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                get_parallel().attn_dcp_size > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                and forward_batch.extend_prefix_lens is not None
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
@@ -366,7 +370,8 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            elif cp_active:
+            # Under CP-TP group sharing the model owns the CP row layout.
+            elif cp_active and not get_parallel().enable_cp_tp_group_sharing:
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(

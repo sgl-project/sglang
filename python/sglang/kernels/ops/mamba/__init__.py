@@ -114,3 +114,50 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_short_conv_state",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_verify_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_prefill",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_lfm_short_conv_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="mamba.fill_track_conv_indices",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.sconv_tracking:fill_track_conv_indices",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True, description="short-convolution checkpoint-window indices"
+        ),
+    )
+)

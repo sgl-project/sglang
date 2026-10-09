@@ -5,7 +5,7 @@
 
 use crate::config::{AffinityConfig, SessionAffinityMode};
 use crate::discovery::WorkerId;
-use crate::policies::admission::compare_prefill_pressure;
+use crate::policies::admission::compare_prefill_engines;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::state::load_monitor::router_inflight_load::JanitorHandle;
@@ -201,7 +201,7 @@ fn sampled_backup_excluding(
     };
     let left = &workers[first];
     let right = &workers[second];
-    if compare_prefill_pressure(left, right, ctx.load_snapshot()).is_gt() {
+    if compare_prefill_engines(left, right, ctx.load_snapshot()).is_gt() {
         Some(Arc::clone(right))
     } else {
         Some(Arc::clone(left))
@@ -263,7 +263,7 @@ mod lifecycle_tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 

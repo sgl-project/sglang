@@ -918,9 +918,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.1.2"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae2eaa139651c535aeaad8856c5546709608931ccd4d24d3a529f6c5233c4b6"
+checksum = "d4609cdbd65f8bd15c74f4531c1560d04496e8737dfb6b65b45487644b878963"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3283,6 +3283,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "criterion",
@@ -3290,6 +3291,7 @@ dependencies = [
  "dirs 5.0.1",
  "dynamo-renderer",
  "dynamo-tokenizers",
+ "flate2",
  "futures",
  "hf-hub",
  "http-body",
@@ -3308,6 +3310,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sgl-kv-indexer",
+ "sglang-processor",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -3322,6 +3325,22 @@ dependencies = [
  "url",
  "uuid",
  "zeromq",
+]
+
+[[package]]
+name = "sglang-processor"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "dynamo-protocols",
+ "dynamo-renderer",
+ "futures",
+ "hf-hub",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

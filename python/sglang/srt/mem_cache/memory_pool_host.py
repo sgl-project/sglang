@@ -13,6 +13,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -20,7 +21,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_xpu:
+    from sgl_kernel import transfer_cache_dsv4_mla
+else:
+    from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
@@ -59,6 +64,10 @@ class LogicalHostPool:
     The pool manages page-aligned token slots but holds no KV tensor. V4
     compressed side pools use these logical FULL indices as stable page anchors.
     """
+
+    shared_allocation_domain = None
+    stores_page_envelope = False
+    storage_format_tag = None
 
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
@@ -147,6 +156,26 @@ class LogicalHostPool:
     ):
         pass
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        pass
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -169,6 +198,9 @@ class LogicalHostPool:
         pass
 
     def get_page_buffer_meta(self, indices):
+        return None
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
         return None
 
     def get_ksize_per_token(self):
@@ -300,7 +332,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -836,7 +871,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(

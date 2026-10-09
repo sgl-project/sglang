@@ -14,8 +14,7 @@ use serde_json::Value;
 use crate::preprocessing::{GenerateRequestIdentity, TextRequestGroup};
 use crate::{
     ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
-    RendererConfig, RendererError, SamplingDefaults, SamplingParams, SamplingParamsOverrides,
-    TokenIds, TokenIdsRequest,
+    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -38,6 +37,75 @@ fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), Stri
         if names.len() == 1 { "" } else { "s" },
         names.join(", ")
     ))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub(crate) struct SamplingParamsOverrides {
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub min_tokens: Option<i64>,
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub ebnf: Option<String>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub stop_token_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub stop_regex: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub no_stop_trim: Option<bool>,
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
+    #[serde(default)]
+    pub custom_params: Option<serde_json::Value>,
+}
+
+impl SamplingParamsOverrides {
+    pub fn apply(self, params: &mut SamplingParams) {
+        if let Some(value) = self.top_k {
+            params.top_k = value;
+        }
+        if let Some(value) = self.min_p {
+            params.min_p = value;
+        }
+        if let Some(value) = self.min_tokens {
+            params.min_new_tokens = value;
+        }
+        if let Some(value) = self.regex {
+            params.regex = Some(value);
+        }
+        if let Some(value) = self.ebnf {
+            params.ebnf = Some(value);
+        }
+        if let Some(value) = self.repetition_penalty {
+            params.repetition_penalty = value;
+        }
+        if let Some(value) = self.stop_token_ids {
+            params.stop_token_ids = Some(value);
+        }
+        if let Some(value) = self.stop_regex {
+            params.stop_regex = Some(value);
+        }
+        if let Some(value) = self.no_stop_trim {
+            params.no_stop_trim = value;
+        }
+        if let Some(value) = self.ignore_eos {
+            params.ignore_eos = value;
+        }
+        if let Some(value) = self.skip_special_tokens {
+            params.skip_special_tokens = value;
+        }
+        if let Some(value) = self.custom_params {
+            params.custom_params = Some(value);
+        }
+    }
 }
 
 /// SGLang's OpenAI-compatible chat-completions request.
@@ -396,56 +464,20 @@ pub(crate) fn normalize_reasoning_inputs(
     reasoning: Option<Value>,
     chat_template_kwargs: &mut Option<HashMap<String, Value>>,
 ) -> Result<(), RendererError> {
-    let mut thinking = None;
-    if let Some(Value::Object(reasoning)) = reasoning {
-        let nested_effort = reasoning
-            .get("effort")
-            .filter(|value| !value.is_null())
-            .or_else(|| {
-                reasoning
-                    .get("reasoning_effort")
-                    .filter(|value| !value.is_null())
-            });
-        if let Some(nested_effort) = nested_effort {
-            *reasoning_effort = Some(
-                serde_json::from_value(nested_effort.clone())
-                    .map_err(|error| format!("invalid reasoning effort: {error}"))?,
-            );
-        }
-
-        let enabled = reasoning
-            .get("enabled")
-            .filter(|value| !value.is_null())
-            .or_else(|| reasoning.get("enable"));
-        if enabled.is_some_and(json_truthy) {
-            thinking = Some(true);
-        }
+    let request = serde_json::json!({"reasoning": reasoning, "reasoning_effort": reasoning_effort});
+    if let Some(effort) = sglang_processor::requested_effort(&request) {
+        *reasoning_effort = Some(
+            serde_json::from_value(effort.clone())
+                .map_err(|error| format!("invalid reasoning effort: {error}"))?,
+        );
     }
-
-    if let Some(effort) = reasoning_effort.as_ref() {
-        thinking = Some(!effort.disables_thinking());
-    }
-    if let Some(thinking) = thinking {
+    if let Some(thinking) = sglang_processor::requested_thinking(&request) {
         let args = chat_template_kwargs.get_or_insert_with(HashMap::new);
         args.entry("thinking".into()).or_insert(thinking.into());
         args.entry("enable_thinking".into())
             .or_insert(thinking.into());
     }
     Ok(())
-}
-
-fn json_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
-        Value::String(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
 }
 
 fn validate_chat_request(
@@ -781,4 +813,62 @@ pub fn completion_sampling_params(
         sampling_seed: request.seed,
         ..defaults
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_extensions_override_internal_sampling_params() {
+        let overrides: SamplingParamsOverrides = serde_json::from_value(serde_json::json!({
+            "top_k": 17,
+            "min_p": 0.2,
+            "min_tokens": 3,
+            "repetition_penalty": 1.1,
+            "stop_token_ids": [41, 42],
+            "stop_regex": ["END", "STOP"],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "custom_params": {"tenant": "a"}
+        }))
+        .unwrap();
+        let mut params = SamplingParams::default();
+
+        overrides.apply(&mut params);
+
+        assert_eq!(params.top_k, 17);
+        assert_eq!(params.min_p, 0.2);
+        assert_eq!(params.min_new_tokens, 3);
+        assert_eq!(params.repetition_penalty, 1.1);
+        assert_eq!(params.stop_token_ids, Some(vec![41, 42]));
+        assert_eq!(
+            params.stop_regex,
+            Some(OneOrMany::Many(vec!["END".into(), "STOP".into()]))
+        );
+        assert!(params.no_stop_trim);
+        assert!(params.ignore_eos);
+        assert!(!params.skip_special_tokens);
+        assert_eq!(
+            params.custom_params,
+            Some(serde_json::json!({"tenant": "a"}))
+        );
+    }
+
+    #[test]
+    fn absent_openai_extensions_do_not_override_sampling_defaults() {
+        let mut params = SamplingParams {
+            no_stop_trim: true,
+            ignore_eos: true,
+            skip_special_tokens: true,
+            ..Default::default()
+        };
+
+        SamplingParamsOverrides::default().apply(&mut params);
+
+        assert!(params.no_stop_trim);
+        assert!(params.ignore_eos);
+        assert!(params.skip_special_tokens);
+    }
 }

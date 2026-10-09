@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
+    hybrid_kda_config,
     hybrid_lightning_config,
     kimi_linear_config,
     mamba2_config,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
@@ -252,6 +254,10 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
+    if "DiffusionGemmaForBlockDiffusion" in runner.model_config.hf_config.architectures:
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        return TritonAttnBackend(runner, dllm_fa4=True)
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
@@ -383,7 +389,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            KDAAttnBackend,
+            flashinfer_kda_prefill_default,
+        )
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
         )
@@ -425,6 +434,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
+        elif hybrid_kda_config(runner.model_config) is not None and not is_npu():
+            prefill_default = flashinfer_kda_prefill_default(runner)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )
@@ -438,7 +449,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     # GDN models. In particular, quantized KV recipes use it
                     # to expose an FP8 dequant workspace while a different
                     # backend (for example TRT-LLM GenMHA) owns decode.
-                    allowed = {"triton", "trtllm_mha", "fa4", "flashinfer"}
+                    allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
@@ -522,8 +533,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         else:
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
-                spec, _ = spec_result
-                cfg = runner.model_config
+                spec, cfg = spec_result
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
                 if spec.hybrid_backend_class_name is not None:

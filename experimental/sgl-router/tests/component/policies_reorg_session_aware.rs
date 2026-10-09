@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sgl_router::config::AffinityMode;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::AdmissionLimits;
+use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::load_monitor::engine_reported_load::{
-    EngineReportedLoadTable, EngineReportedWorkerLoad, LoadStat,
+    EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
 };
 use sgl_router::state::load_monitor::router_inflight_load::MockClock;
 use sgl_router::state::AffinityStore;
@@ -22,7 +24,7 @@ fn engine(id: &str, active: usize) -> Arc<Worker> {
         url: format!("http://{id}"),
         mode: Stage::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
     engine.active_requests.store(active, Ordering::Relaxed);
     engine
@@ -52,16 +54,11 @@ struct Admission {
 }
 
 impl EngineAdmission for Admission {
-    fn check(
-        &self,
-        engine: &Worker,
-        _: &PickRequest<'_>,
-        load: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, metrics: &EngineMetrics) -> Result<Decision, PickError> {
         self.calls
             .lock()
             .unwrap()
-            .push((engine.id.0.clone(), load.map(|load| load.num_waiting_reqs)));
+            .push((engine.id.0.clone(), metrics.waiting_requests));
         if self.invalid.load(Ordering::Relaxed) {
             return Err(PickError::InvalidSignal("invalid admission input".into()));
         }
@@ -118,7 +115,7 @@ async fn missing_and_empty_keys_use_admitted_power_of_two_without_binding() {
 }
 
 #[tokio::test]
-async fn rejected_new_and_existing_sessions_never_rebind_or_try_another_engine() {
+async fn failed_fallback_preserves_existing_binding() {
     let (mut policy, store) = policy();
     let admission = Arc::new(Admission::default());
     policy.admission = admission.clone();
@@ -145,7 +142,112 @@ async fn rejected_new_and_existing_sessions_never_rebind_or_try_another_engine()
         "a"
     );
     assert_eq!(store.len(), 1);
-    assert_eq!(admission.calls.lock().unwrap().len(), 4);
+    assert_eq!(admission.calls.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn rejection_and_load_switches_rebind_the_session() {
+    for mode in [AffinityMode::Prefer, AffinityMode::Balanced] {
+        let table = EngineReportedLoadTable::new();
+        let store = AffinityStore::new(Duration::from_secs(60));
+        let mut policy = SessionAwarePolicy::new(store, table.clone());
+        policy.config.mode = mode;
+        policy.config.load_gap = Some(10);
+        policy.admission = Arc::new(AdmissionLimits {
+            max_inflight_requests: Some(10),
+            ..Default::default()
+        });
+        let engines = [engine("a", 0), engine("b", 1)];
+        let model = ModelId("m".into());
+        let request = request(&model);
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "a"
+        );
+        if mode == AffinityMode::Prefer {
+            engines[0].active_requests.store(10, Ordering::Relaxed);
+        } else {
+            for (engine, pending) in [(&engines[0], 100), (&engines[1], 0)] {
+                table.set(
+                    &engine.url,
+                    0,
+                    LoadStat {
+                        native_cache: Some(NativeCacheRankLoad {
+                            num_waiting_uncached_tokens: pending,
+                            num_total_tokens: 10,
+                            max_running_requests: 100,
+                            total_prefill_uncached_tokens: 0,
+                            total_prefill_busy_us: 0,
+                        }),
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 1,
+                        num_tokens: 10,
+                        max_total_num_tokens: 100,
+                    },
+                    Instant::now(),
+                );
+            }
+        }
+        let pick = policy.pick(&engines, &request).await.unwrap();
+        assert_eq!(
+            (pick.engine.id.0.as_str(), pick.reason),
+            ("b", "session_rebound")
+        );
+        engines[0].active_requests.store(0, Ordering::Relaxed);
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "b"
+        );
+    }
+}
+
+#[tokio::test]
+async fn balanced_sessions_count_every_prompt_in_a_batch() {
+    // Ten 1,000-token prompts against queues of 10,000 and 0: the batch makes
+    // it 20,000 vs 10,000, inside factor 2; the longest prompt alone would switch.
+    for (total, expected) in [(10_000, "a"), (1_000, "b")] {
+        let table = EngineReportedLoadTable::new();
+        let store = AffinityStore::new(Duration::from_secs(60));
+        let mut policy = SessionAwarePolicy::new(store, table.clone());
+        policy.config.mode = AffinityMode::Balanced;
+        let engines = [engine("a", 0), engine("b", 1)];
+        let model = ModelId("m".into());
+        let request = PickRequest {
+            total_input_tokens: total,
+            ..PickRequest {
+                input_tokens: 1_000,
+                ..request(&model)
+            }
+        };
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            "a"
+        );
+        for (engine, pending) in [(&engines[0], 10_000), (&engines[1], 0)] {
+            table.set(
+                &engine.url,
+                0,
+                LoadStat {
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: pending,
+                        num_total_tokens: 10,
+                        max_running_requests: 100,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                    num_running_reqs: 1,
+                    num_waiting_reqs: 1,
+                    num_tokens: 10,
+                    max_total_num_tokens: 100,
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(
+            policy.pick(&engines, &request).await.unwrap().engine.id.0,
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -339,6 +441,7 @@ async fn shared_store_refreshes_active_sessions_and_expires_idle_ones() {
 
 #[derive(Debug)]
 struct RacingAdmission {
+    model: ModelId,
     competitor: SessionAwarePolicy,
     winner: Arc<Worker>,
     reject_winner: bool,
@@ -346,19 +449,14 @@ struct RacingAdmission {
 }
 
 impl EngineAdmission for RacingAdmission {
-    fn check(
-        &self,
-        engine: &Worker,
-        request: &PickRequest<'_>,
-        _: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
         self.calls.lock().unwrap().push(engine.id.0.clone());
         if engine.id.0 == "a" {
             // Complete a competing first request after this request selected a,
             // but before it can commit. The effective binding is now b.
             futures::executor::block_on(
                 self.competitor
-                    .pick(std::slice::from_ref(&self.winner), request),
+                    .pick(std::slice::from_ref(&self.winner), &request(&self.model)),
             )?;
         }
         Ok(if self.reject_winner && engine.id == self.winner.id {
@@ -375,6 +473,7 @@ async fn concurrent_assignment_winner_is_checked_and_preserved_on_rejection() {
         let (mut policy, store) = policy();
         let engines = [engine("a", 0), engine("b", 9)];
         let admission = Arc::new(RacingAdmission {
+            model: ModelId("m".into()),
             competitor: SessionAwarePolicy::new(store.clone(), EngineReportedLoadTable::new()),
             winner: engines[1].clone(),
             reject_winner,
