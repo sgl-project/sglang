@@ -18,7 +18,9 @@ use dynamo_renderer::{
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
-use sglang_processor::{OneOrMany as ProcessorOneOrMany, dynamo_tool_parser_name};
+use sglang_processor::{
+    OneOrMany as ProcessorOneOrMany, chat_tool_definitions, dynamo_tool_parser_name,
+};
 
 use crate::{
     ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
@@ -199,6 +201,7 @@ struct RenderPreparation {
     require_reasoning: bool,
     reasoning_state: Option<bool>,
     tools_enabled: bool,
+    tools: Vec<ToolDefinition>,
 }
 
 /// Applies structured chat semantics before the shared text generation path.
@@ -231,7 +234,7 @@ impl ChatPreprocessor {
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools = chat_tool_definitions(&request);
+        let tools = preparation.tools;
         let parser =
             resolve_chat_parser(self.tool_call_parser.as_deref(), preparation.tools_enabled)?;
         if parser.is_some() {
@@ -311,11 +314,8 @@ impl ChatPreprocessor {
         validate_chat(request)?;
         self.normalize_template_args(request);
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools_enabled = request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
-            && tool_choice != DynamoToolChoice::None;
+        let tools = chat_tool_definitions(request.tools.as_deref(), &request.messages)?;
+        let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
         let named_tool_choice = matches!(tool_choice, DynamoToolChoice::Named(_));
         let thinking = self.formatter.as_ref().and_then(|formatter| {
             formatter.resolve_thinking(
@@ -328,6 +328,7 @@ impl ChatPreprocessor {
             require_reasoning: self.reasoning_parser.is_some() && thinking == Some(true),
             reasoning_state: thinking,
             tools_enabled,
+            tools,
         })
     }
 
@@ -360,7 +361,12 @@ impl ChatPreprocessor {
             )
         })?;
         let mut request = request.clone();
-        let final_message = prepare_continuation(&mut request);
+        // DeepSeek-V4 continues the final turn as SGLang's encoder path does,
+        // null and parts content included.
+        let final_message = match formatter {
+            ChatFormatter::DeepSeekV4(_) => None,
+            _ => prepare_continuation(&mut request),
+        };
         let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);
         template_args.insert(
             "add_generation_prompt".into(),
@@ -496,19 +502,6 @@ fn resolve_chat_parser(
         return Err("tool calls require --tool-call-parser".into());
     }
     Ok(tools_enabled.then(|| configured_parser.expect("checked").to_owned()))
-}
-
-fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
-    request
-        .tools
-        .iter()
-        .flatten()
-        .map(|tool| ToolDefinition {
-            name: tool.function.name.clone(),
-            parameters: tool.function.parameters.clone(),
-            strict: tool.function.strict,
-        })
-        .collect()
 }
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
@@ -868,5 +861,56 @@ mod tests {
                 .options
                 .require_reasoning
         );
+    }
+
+    #[test]
+    fn deepseek_v4_continues_the_final_turn_as_sglang_does() {
+        let formatter = ChatFormatter::DeepSeekV4(sglang_processor::DeepSeekV4Profile::Official);
+        let preprocessor = chat_preprocessor_with(None, None, formatter);
+        // SGLang flattens parts, blanks null, drops the continuation's leading BOS
+        // and tokenizes the continuation on its own.
+        let user = serde_json::json!({"role": "user", "content": "Hi"});
+        let after_user = "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>";
+        let parts =
+            serde_json::json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+        for (first, content, prompt, continuation) in [
+            (&user, parts, after_user, "a b"),
+            (&user, JsonValue::Null, after_user, ""),
+            (
+                &user,
+                serde_json::json!("<｜begin▁of▁sentence｜>abc"),
+                after_user,
+                "abc",
+            ),
+            (
+                &serde_json::json!({"role": "system", "content": "a"}),
+                serde_json::json!("b"),
+                "<｜begin▁of▁sentence｜>a",
+                "b",
+            ),
+        ] {
+            let mut request = chat_request(None);
+            request.tools = None;
+            request.continue_final_message = true;
+            // Pinned so SGLANG_DEFAULT_THINKING and SGLANG_DSV4_REASONING_EFFORT don't apply.
+            request.chat_template_args = serde_json::from_value(
+                serde_json::json!({"thinking": false, "reasoning_effort": "low"}),
+            )
+            .unwrap();
+            request.messages = serde_json::from_value(serde_json::json!([
+                first,
+                {"role": "assistant", "content": content}
+            ]))
+            .unwrap();
+            let rendered = preprocessor.lower_to_text(request).unwrap().prompt;
+            assert_eq!(rendered.as_str(), format!("{prompt}{continuation}"));
+            let segments = rendered
+                .segments()
+                .map(|segments| segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>());
+            assert_eq!(
+                segments,
+                (!continuation.is_empty()).then(|| vec![prompt, continuation])
+            );
+        }
     }
 }

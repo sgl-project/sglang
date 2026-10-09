@@ -1287,6 +1287,7 @@ class Scheduler(
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
         self.enable_continuous_input_polling = False
+        self.enable_skip_finishing_decode = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1826,6 +1827,14 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            result_dict["kv_event_sources"] = (
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
+            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -1929,6 +1938,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        self.enable_skip_finishing_decode = True
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -3145,7 +3155,7 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
-            matched_len = len(req.prefix_indices) + req.host_hit_length
+            matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
 
             if (
@@ -3219,7 +3229,7 @@ class Scheduler(
             and buffer_pipeline.has_staged(req.cache_request_handle)
         ):
             return False
-        current_match_len = len(req.prefix_indices) + req.host_hit_length
+        current_match_len = req.prefix_len + req.host_hit_length
         if current_match_len >= previous_match_len:
             return False
         if (
@@ -3578,7 +3588,7 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3656,24 +3666,21 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
-        chunked_req_to_exclude = set()
+        reqs_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+            reqs_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
+            reqs_to_exclude.add(self.chunked_req)
 
-            # Stash (cache) the previous chunk only when it produced new KV
-            # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves extend_range.end ==
-            # len(prefix_indices), so there is nothing new to cache and
-            # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
+            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -3697,14 +3704,14 @@ class Scheduler(
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                reqs_to_exclude.add(last_batch.chunked_req)
 
             if self.dllm_config is not None and last_batch.reqs:
-                chunked_req_to_exclude.update(last_batch.reqs)
+                reqs_to_exclude.update(last_batch.reqs)
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
@@ -3755,8 +3762,12 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                decode_batch = self.update_running_batch(running_batch)
+                ret = (
+                    decode_batch
+                    if decode_batch is not None and not decode_batch.is_empty()
+                    else None
+                )
             else:
                 ret = None
 
@@ -3897,7 +3908,7 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
-            history_len = len(self.chunked_req.prefix_indices)
+            history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -4115,7 +4126,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_range.end
+                req.kv.swa_evict_floor = req.extend_end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4124,9 +4135,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
+                    self.chunked_req.extend_len if self.chunked_req is not None else 0
                 ),
             ),
         )
@@ -4142,7 +4151,10 @@ class Scheduler(
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            running_batch.filter_batch()
+            finishing_reqs = self._reqs_finishing_inflight(running_batch)
+            running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
+            if finishing_reqs:
+                running_batch.batch_is_full = False
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
@@ -4194,17 +4206,40 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
+        """Requests whose queued result commits their last output by length."""
+        if not self.enable_skip_finishing_decode or not self.result_queue:
+            return []
+        # At scheduling time the overlap loop has processed every result but the last.
+        assert len(self.result_queue) == 1
+        queued_reqs = set(self.result_queue[0][0].reqs)
+        return [
+            req
+            for req in batch.reqs
+            if req in queued_reqs
+            and req.beam_group is None
+            and req.next_output_finishes_by_length()
+        ]
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        finishing_reqs = self._reqs_finishing_inflight(batch)
+        batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
 
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and finishing_reqs:
+            # The queued result frees the finishing requests' KV at the end of
+            # this step; decode the rest next step instead of retracting them.
+            batch.batch_is_full = False
+            return None
+
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             if self.decode_offload_manager is not None:
@@ -4608,10 +4643,9 @@ class Scheduler(
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
             if batch.return_logprob or batch.return_hidden_states:
-                batch_result.extend_input_len_per_req = [
-                    req.extend_range.length if req.extend_range is not None else 0
-                    for req in batch.reqs
-                ]
+                batch_result.extend_input_len_per_req = (
+                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+                )
             else:
                 batch_result.extend_input_len_per_req = None
 
@@ -4919,6 +4953,7 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5335,7 +5370,7 @@ class Scheduler(
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
 
@@ -5344,7 +5379,7 @@ class Scheduler(
                 DisaggregationMode.PREFILL,
                 DisaggregationMode.DECODE,
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
@@ -5356,7 +5391,7 @@ class Scheduler(
                     _make_abort_req(req), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -5464,7 +5499,7 @@ class Scheduler(
                 and (req := self.chunked_req) is not None
             ):
                 # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_range.end, len(req.origin_input_ids))
+                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -5804,6 +5839,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
+    scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
