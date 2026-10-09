@@ -118,8 +118,15 @@ skill.
 ChatResponseProcessor::new(tool_parser, reasoning_parser, tools, tool_choice, uses_tool_call_structural_tag, parallel_tool_calls, choices)
     .with_reasoning_state(thinking)
     .process_stream(Stream<DecodedChatEvent>) -> Stream<ChatEvent>
+split_reasoning(reasoning_parser, text, token_ids) -> (reasoning, normal)
+ReasoningStreamSplitter::new(reasoning_parser, thinking).split(text, token_ids)
+tool_constraint(tool_parser, &dynamo_tool_choice(&tool_choice), &tools, parallel_tool_calls)
+    -> Result<Option<ToolConstraint>, ProcessorError>
 dynamo_tool_parser_name(sglang_name) -> &str
 ```
+
+`mod.rs` holds the events and the stream processor, `reasoning.rs` the
+reasoning split, and `tools.rs` tool schemas, constraints and call deltas.
 
 Pass-through for parsing:
 - Reasoning goes through `ReasoningParserType::get_reasoning_parser_from_name`
@@ -128,12 +135,14 @@ Pass-through for parsing:
   OpenAI stream chunks only to feed the jail, then unwrapped into `ChatEvent`.
 
 SGLang additions:
-- **`aliases.rs`** maps SGLang parser names onto Dynamo's before
-  construction, mirroring `parser/reasoning_parser.py` and
+- **Parser names** from SGLang are mapped onto Dynamo's before construction,
+  mirroring `parser/reasoning_parser.py` and
   `function_call/function_call_parser.py`.
 - **Special tokens after a tool call** (qwen25 and glm47 terminators) are
   dropped.
 - **`parallel_tool_calls=false`** keeps only the first call.
+- **`tool_constraint`** turns `tool_choice` into the parser's structural tag,
+  or a `json_schema` array of calls for `required` and named choices.
 
 ## Host example
 
