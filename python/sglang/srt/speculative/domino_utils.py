@@ -5,10 +5,47 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def _gru_cell_manual(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    w_ih: torch.Tensor,
+    w_hh: torch.Tensor,
+    b_ih: torch.Tensor | None = None,
+    b_hh: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """BF16-safe single-layer GRU cell using plain matmul/sigmoid/tanh.
+
+    Ascend's DynamicGRU(V2) TBE kernel rejects BF16 ``weight_hidden``, so on NPU
+    we fall back to an explicit GRU cell instead of ``aten::gru_cell``. Linear
+    projections run in the input dtype (BF16 hardware matmul) while the gate and
+    state updates run in fp32 for parity with the CUDA GRU numerics; the updated
+    hidden is cast back to the input dtype.
+    """
+    out_dtype = x.dtype
+    gi = F.linear(x, w_ih, b_ih).float()
+    gh = F.linear(h, w_hh, b_hh).float()
+    hf = h.float()
+    i_r, i_z, i_n = gi.chunk(3, dim=-1)
+    h_r, h_z, h_n = gh.chunk(3, dim=-1)
+    r = torch.sigmoid(i_r + h_r)
+    z = torch.sigmoid(i_z + h_z)
+    n = torch.tanh(i_n + r * h_n)
+    return ((1.0 - z) * n + z * hf).to(out_dtype)
+
+
 def _domino_gru_cell(
     prefix_gru: nn.GRU, input: torch.Tensor, hidden: torch.Tensor
 ) -> torch.Tensor:
     """Run one feedback token without cuDNN's per-call weight packing."""
+    if input.device.type != "cuda":
+        return _gru_cell_manual(
+            input,
+            hidden,
+            prefix_gru.weight_ih_l0,
+            prefix_gru.weight_hh_l0,
+            prefix_gru.bias_ih_l0 if prefix_gru.bias else None,
+            prefix_gru.bias_hh_l0 if prefix_gru.bias else None,
+        )
     return torch.ops.aten.gru_cell.default(
         input,
         hidden,
@@ -135,8 +172,8 @@ def validate_domino_runtime(
     embed_proj: nn.Sequential,
 ) -> None:
     """Validate the deliberately narrow correctness-first Domino runtime."""
-    if device.type != "cuda":
-        raise ValueError(f"DFLASH Domino currently requires CUDA, got {device}.")
+    if device.type not in ("cuda", "npu"):
+        raise ValueError(f"DFLASH Domino requires CUDA or NPU, got {device}.")
     tp_size = int(tp_size)
     if tp_size < 1:
         raise ValueError(f"DFLASH Domino requires TP>=1, got TP={tp_size}.")
@@ -451,7 +488,20 @@ def domino_greedy_rollout(
         candidate_weight = F.embedding(candidate_ids, embed_proj[2].weight)
 
     prefix_ids = torch.stack((bonus_tokens, first_ids), dim=1)
-    _, gru_hidden = prefix_gru(target_embedding(prefix_ids))
+    prefix_emb = target_embedding(prefix_ids)
+    if prefix_emb.device.type == "cuda":
+        _, gru_hidden = prefix_gru(prefix_emb)
+    else:
+        # Ascend's nn.GRU (DynamicGRUV2) rejects BF16 weights, so run the two
+        # prefix steps with the manual cell above.
+        w_ih = prefix_gru.weight_ih_l0
+        w_hh = prefix_gru.weight_hh_l0
+        b_ih = prefix_gru.bias_ih_l0 if prefix_gru.bias else None
+        b_hh = prefix_gru.bias_hh_l0 if prefix_gru.bias else None
+        h = prefix_emb.new_zeros(prefix_emb.shape[0], w_hh.shape[-1])
+        for t in range(prefix_emb.shape[1]):
+            h = _gru_cell_manual(prefix_emb[:, t], h, w_ih, w_hh, b_ih, b_hh)
+        gru_hidden = h[None]
 
     for index in range(1, num_proposals):
         step_hidden = z[:, index, :]
