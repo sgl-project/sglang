@@ -220,6 +220,11 @@ class EntryPath(msgspec.Struct, frozen=True):
             applies the producer update and performs the consumer read.
         input_rows: Layout handed to compute after preparation and input_move.
         input_move: Optional movement after prepare, before compute takes the input.
+        input_gather_declared: Whether input_move gathers over attention TP
+            with the stage's own gather.
+        input_retainable: Whether a capture may keep input_move's output
+            without copying: it is storage of its own on every path the move
+            takes.
         attn_input_adapter: Optional callable(input, forward_batch, qkv_latent_func) that
             adapts already-placed input for attention.
         capture_move: Optional movement of the updated residual back onto the
@@ -243,6 +248,8 @@ class EntryPath(msgspec.Struct, frozen=True):
     # Moves the input onto the stage's rows after prepare, when prepare does
     # not: (hidden_states, forward_batch) -> hidden_states.
     input_move: Optional[Callable] = None
+    input_gather_declared: bool = False
+    input_retainable: bool = False
     # Hands the stage its input once it is on its rows:
     # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
     attn_input_adapter: Optional[Callable] = None
@@ -264,6 +271,8 @@ class StagePath(msgspec.Struct, frozen=True):
         output_move: Fixed output transport, or None when absent or chosen per
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
+        output_gathers_attn_tp: Whether that move gathers the rows back over
+            attention TP.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
         writes_at_handoff: Whether the exit completes the output and writes it
             into the residual, for an FFN that hands off to another pipeline rank.
@@ -274,6 +283,7 @@ class StagePath(msgspec.Struct, frozen=True):
     # None means no fixed move. returns_over_dp selects batch-dependent DP transport.
     output_move: Optional[Callable]
     output_move_completes_sum: bool = False
+    output_gathers_attn_tp: bool = False
 
     returns_over_dp: bool = False
     writes_at_handoff: bool = False

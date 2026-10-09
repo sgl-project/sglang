@@ -44,10 +44,6 @@ from sglang.srt.layers.layer_boundary.layout import (
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.layer_boundary.ops import (
-    attn_tp_gather_input,
-    update_attn_tp_gather_output,
-)
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -898,13 +894,13 @@ def _check_declared_gathers(appends, bound, *, remote_producer):
     ]
     for (origin, consumer), producer in zip(line, [None, *(b for _, b in line)]):
         if consumer.declaration.attn_tp_gather is None or any(
-            _gathers_input(path) for path in consumer.plan.paths.values()
+            path.entry.input_gather_declared for path in consumer.plan.paths.values()
         ):
             continue
         if producer is None and remote_producer:
             continue
         if producer is not None and any(
-            _gathers_output(path) for path in producer.plan.paths.values()
+            path.output_gathers_attn_tp for path in producer.plan.paths.values()
         ):
             continue
         error = ValueError(
@@ -913,14 +909,6 @@ def _check_declared_gathers(appends, bound, *, remote_producer):
         )
         _note_origin(error, origin)
         raise error
-
-
-def _gathers_input(path):
-    return getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
-
-
-def _gathers_output(path):
-    return getattr(path.output_move, "func", None) is update_attn_tp_gather_output
 
 
 def _ended(declaration, final_read):
