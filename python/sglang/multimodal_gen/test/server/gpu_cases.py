@@ -179,6 +179,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
         ),
     ),
+    # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
         "zimage_image_t2i_multi_lora",
         DiffusionServerArgs(
