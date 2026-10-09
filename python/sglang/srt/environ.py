@@ -1972,7 +1972,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": _DeprecatedEnv(
-        note="The prefill-sized FlashInfer autotune pass always runs; "
+        note="The prefill-sized FlashInfer autotune pass now runs by default; "
         "pass --disable-flashinfer-autotune to skip autotuning."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
