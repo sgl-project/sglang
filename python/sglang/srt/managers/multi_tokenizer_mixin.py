@@ -31,6 +31,7 @@ import zlib
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
+import msgspec
 import psutil
 import setproctitle
 import zmq
@@ -436,189 +437,62 @@ def _extract_field_by_indices(
     return wrap_as_pickle(selected) if should_wrap_result else selected
 
 
+# Per-request fields that may be shorter than rids; the rest must match rids or
+# be empty.
+_UNCHECKED_LENGTH_FIELDS = frozenset(
+    {
+        "input_token_logprobs_val",
+        "input_token_logprobs_idx",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+        "input_top_logprobs_val",
+        "input_top_logprobs_idx",
+        "input_top_logprobs_val_flat",
+        "input_top_logprobs_idx_flat",
+        "input_top_logprobs_flat_null_prefix",
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
+        "input_token_ids_logprobs_val",
+        "input_token_ids_logprobs_idx",
+        "output_token_ids_logprobs_val",
+        "output_token_ids_logprobs_idx",
+        "output_token_entropy_val",
+        "output_token_sampling_mask",
+        "output_hidden_states",
+        "routed_experts",
+        "indexer_topk",
+        "token_steps",
+        "customized_info",
+        "dp_ranks",
+    }
+)
+_NOT_SPLIT_FIELDS = frozenset(
+    {"rids", "http_worker_ipcs", "placeholder_tokens_idx", "placeholder_tokens_val"}
+)
+
+
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
     if len(indices) == 1:
         return _handle_output_by_index(output, indices[0])
+    if not isinstance(output, (BatchTokenIDOutput, BatchStrOutput)):
+        raise _CannotSplitBatch(f"Cannot split {type(output)}")
 
-    def extract(field_name: str, check_length: bool = True):
-        return _extract_field_by_indices(output, field_name, indices, check_length)
-
-    if isinstance(output, BatchTokenIDOutput):
-        return BatchTokenIDOutput(
-            rids=[output.rids[index] for index in indices],
-            spec_verify_ct=extract("spec_verify_ct"),
-            spec_num_correct_drafts=extract("spec_num_correct_drafts"),
-            spec_correct_drafts_histogram=extract("spec_correct_drafts_histogram"),
-            spec_num_block_accept_tokens=extract("spec_num_block_accept_tokens"),
-            spec_num_cap_tokens=extract("spec_num_cap_tokens"),
-            spec_cap_lens_histogram=extract("spec_cap_lens_histogram"),
-            time_stats=extract("time_stats"),
-            finished_reasons=extract("finished_reasons"),
-            decoded_texts=extract("decoded_texts"),
-            decode_ids=extract("decode_ids"),
-            read_offsets=extract("read_offsets"),
-            output_ids=extract("output_ids"),
-            skip_special_tokens=extract("skip_special_tokens"),
-            spaces_between_special_tokens=extract("spaces_between_special_tokens"),
-            no_stop_trim=extract("no_stop_trim"),
-            prompt_tokens=extract("prompt_tokens"),
-            completion_tokens=extract("completion_tokens"),
-            reasoning_tokens=extract("reasoning_tokens"),
-            cached_tokens=extract("cached_tokens"),
-            cached_tokens_details=extract("cached_tokens_details"),
-            image_tokens=extract("image_tokens"),
-            audio_tokens=extract("audio_tokens"),
-            video_tokens=extract("video_tokens"),
-            input_token_logprobs_val=extract(
-                "input_token_logprobs_val", check_length=False
-            ),
-            input_token_logprobs_idx=extract(
-                "input_token_logprobs_idx", check_length=False
-            ),
-            output_token_logprobs_val=extract(
-                "output_token_logprobs_val", check_length=False
-            ),
-            output_token_logprobs_idx=extract(
-                "output_token_logprobs_idx", check_length=False
-            ),
-            input_top_logprobs_val=extract(
-                "input_top_logprobs_val", check_length=False
-            ),
-            input_top_logprobs_idx=extract(
-                "input_top_logprobs_idx", check_length=False
-            ),
-            input_top_logprobs_val_flat=extract(
-                "input_top_logprobs_val_flat", check_length=False
-            ),
-            input_top_logprobs_idx_flat=extract(
-                "input_top_logprobs_idx_flat", check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=extract(
-                "input_top_logprobs_flat_null_prefix", check_length=False
-            ),
-            output_top_logprobs_val=extract(
-                "output_top_logprobs_val", check_length=False
-            ),
-            output_top_logprobs_idx=extract(
-                "output_top_logprobs_idx", check_length=False
-            ),
-            input_token_ids_logprobs_val=extract(
-                "input_token_ids_logprobs_val", check_length=False
-            ),
-            input_token_ids_logprobs_idx=extract(
-                "input_token_ids_logprobs_idx", check_length=False
-            ),
-            output_token_ids_logprobs_val=extract(
-                "output_token_ids_logprobs_val", check_length=False
-            ),
-            output_token_ids_logprobs_idx=extract(
-                "output_token_ids_logprobs_idx", check_length=False
-            ),
-            output_token_entropy_val=extract(
-                "output_token_entropy_val", check_length=False
-            ),
-            output_token_sampling_mask=extract(
-                "output_token_sampling_mask", check_length=False
-            ),
-            output_hidden_states=extract("output_hidden_states", check_length=False),
-            routed_experts=extract("routed_experts", check_length=False),
-            indexer_topk=extract("indexer_topk", check_length=False),
-            retraction_counts=extract("retraction_counts"),
-            weight_versions=extract("weight_versions"),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            beam_search_output=extract("beam_search_output"),
-            token_steps=extract("token_steps", check_length=False),
-            customized_info=extract("customized_info", check_length=False),
-            dp_ranks=extract("dp_ranks", check_length=False),
+    split_fields = {
+        field.name: _extract_field_by_indices(
+            output,
+            field.name,
+            indices,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
         )
-
-    if isinstance(output, BatchStrOutput):
-        return BatchStrOutput(
-            rids=[output.rids[index] for index in indices],
-            spec_verify_ct=extract("spec_verify_ct"),
-            spec_num_correct_drafts=extract("spec_num_correct_drafts"),
-            spec_correct_drafts_histogram=extract("spec_correct_drafts_histogram"),
-            spec_num_block_accept_tokens=extract("spec_num_block_accept_tokens"),
-            spec_num_cap_tokens=extract("spec_num_cap_tokens"),
-            spec_cap_lens_histogram=extract("spec_cap_lens_histogram"),
-            time_stats=extract("time_stats"),
-            finished_reasons=extract("finished_reasons"),
-            output_strs=extract("output_strs"),
-            output_ids=extract("output_ids"),
-            prompt_tokens=extract("prompt_tokens"),
-            completion_tokens=extract("completion_tokens"),
-            reasoning_tokens=extract("reasoning_tokens"),
-            cached_tokens=extract("cached_tokens"),
-            cached_tokens_details=extract("cached_tokens_details"),
-            image_tokens=extract("image_tokens"),
-            audio_tokens=extract("audio_tokens"),
-            video_tokens=extract("video_tokens"),
-            input_token_logprobs_val=extract(
-                "input_token_logprobs_val", check_length=False
-            ),
-            input_token_logprobs_idx=extract(
-                "input_token_logprobs_idx", check_length=False
-            ),
-            output_token_logprobs_val=extract(
-                "output_token_logprobs_val", check_length=False
-            ),
-            output_token_logprobs_idx=extract(
-                "output_token_logprobs_idx", check_length=False
-            ),
-            input_top_logprobs_val=extract(
-                "input_top_logprobs_val", check_length=False
-            ),
-            input_top_logprobs_idx=extract(
-                "input_top_logprobs_idx", check_length=False
-            ),
-            input_top_logprobs_val_flat=extract(
-                "input_top_logprobs_val_flat", check_length=False
-            ),
-            input_top_logprobs_idx_flat=extract(
-                "input_top_logprobs_idx_flat", check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=extract(
-                "input_top_logprobs_flat_null_prefix", check_length=False
-            ),
-            output_top_logprobs_val=extract(
-                "output_top_logprobs_val", check_length=False
-            ),
-            output_top_logprobs_idx=extract(
-                "output_top_logprobs_idx", check_length=False
-            ),
-            input_token_ids_logprobs_val=extract(
-                "input_token_ids_logprobs_val", check_length=False
-            ),
-            input_token_ids_logprobs_idx=extract(
-                "input_token_ids_logprobs_idx", check_length=False
-            ),
-            output_token_ids_logprobs_val=extract(
-                "output_token_ids_logprobs_val", check_length=False
-            ),
-            output_token_ids_logprobs_idx=extract(
-                "output_token_ids_logprobs_idx", check_length=False
-            ),
-            output_token_entropy_val=extract(
-                "output_token_entropy_val", check_length=False
-            ),
-            output_token_sampling_mask=extract(
-                "output_token_sampling_mask", check_length=False
-            ),
-            output_hidden_states=extract("output_hidden_states", check_length=False),
-            routed_experts=extract("routed_experts", check_length=False),
-            indexer_topk=extract("indexer_topk", check_length=False),
-            customized_info=extract("customized_info", check_length=False),
-            dp_ranks=extract("dp_ranks", check_length=False),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            retraction_counts=extract("retraction_counts"),
-            beam_search_output=extract("beam_search_output"),
-            weight_versions=extract("weight_versions"),
-            token_steps=extract("token_steps", check_length=False),
-        )
-
-    raise _CannotSplitBatch(f"Cannot split {type(output)}")
+        for field in msgspec.structs.fields(output)
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    return type(output)(
+        rids=[output.rids[index] for index in indices],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **split_fields,
+    )
 
 
 class MultiHttpWorkerDetokenizerMixin:
