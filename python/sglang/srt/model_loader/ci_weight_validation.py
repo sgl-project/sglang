@@ -425,8 +425,11 @@ def _validate_sharded_model(
                     corrupted_files.append(f)
 
         if group_info["suffix"] == "safetensors":
+            # Qwen3.5 names shards `model.safetensors-00001-of-00014.safetensors`,
+            # so the prefix may already end with the suffix.
+            index_stem = group_info["prefix"].removesuffix(".safetensors")
             index_file = os.path.join(
-                snapshot_dir, f"{group_info['prefix']}.safetensors.index.json"
+                snapshot_dir, f"{index_stem}.safetensors.index.json"
             )
             if not os.path.exists(index_file):
                 return (
