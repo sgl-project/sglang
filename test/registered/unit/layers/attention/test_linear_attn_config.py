@@ -157,5 +157,56 @@ class TestLinearAttnBackends(CustomTestCase):
         )
 
 
+class TestFlashInferKDAPrefillPolicy(CustomTestCase):
+    def test_fixed_restrictions_are_rejected_before_forward(self):
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            _validate_flashinfer_kda_prefill,
+        )
+
+        for chunk, tbo, graph, error in [
+            (0, False, "disabled", "checkpoint interval"),
+            (33, False, "disabled", "checkpoint interval"),
+            (64, True, "disabled", "two-batch overlap"),
+            (64, False, "full", "eager linear attention"),
+            (64, False, "breakable", None),
+        ]:
+            with self.subTest(chunk=chunk, tbo=tbo, graph=graph):
+                kwargs = dict(
+                    chunk_size=chunk,
+                    enable_two_batch_overlap=tbo,
+                    prefill_cuda_graph_backend=graph,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _validate_flashinfer_kda_prefill(**kwargs)
+                else:
+                    _validate_flashinfer_kda_prefill(**kwargs)
+
+    def test_invalid_checkpoint_metadata_fails_instead_of_falling_back(self):
+        import torch
+
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+            build_flashinfer_kda_checkpoint_plan,
+        )
+
+        for extend_len, track_len, rows in (
+            (128, 1, [0]),
+            (128, 193, [0]),
+            (130, 130, []),
+        ):
+            with self.subTest(extend_len=extend_len, track_len=track_len, rows=rows):
+                batch = SimpleNamespace(
+                    extend_seq_lens_cpu=[extend_len],
+                    extend_prefix_lens_cpu=[0],
+                    mamba_track_seqlens_cpu=[track_len],
+                    mamba_prefill_track_mask_cpu=[True],
+                )
+                metadata = SimpleNamespace(
+                    track_ssm_h_batch_src=torch.tensor(rows, dtype=torch.int32)
+                )
+                with self.assertRaisesRegex(AssertionError, "KDA checkpoint"):
+                    build_flashinfer_kda_checkpoint_plan(batch, metadata, "cpu", 64)
+
+
 if __name__ == "__main__":
     unittest.main()

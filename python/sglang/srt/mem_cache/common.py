@@ -172,6 +172,34 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
+def _req_radix_key(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: array[int],
+    max_prefix_len: Optional[int] = None,
+) -> RadixKey:
+    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
+    # prefix carries stale SWA; cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+    return RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        limit=key_limit,
+        cache_salt=req.cache_salt,
+    )
+
+
+def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    tree_cache.touch_prefix(
+        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
+    )
+
+
 def match_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -184,23 +212,9 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-    if max_prefix_len is not None:
-        key_limit = (
-            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
-        )
-
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
+            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
             req=req,
         )

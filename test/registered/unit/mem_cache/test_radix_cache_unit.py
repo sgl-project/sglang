@@ -319,6 +319,7 @@ class TestRadixCache(CustomTestCase):
 
                 self.assertEqual(cache.page_size, page_size)
                 self.assertEqual(cache.disable, disable)
+                self.assertEqual(cache.supports_prefix_sharing(), not disable)
                 self.assertEqual(cache.kv_events.enabled, enable_events)
                 self.assertEqual(cache.device, torch.device("cpu"))
                 self.assertIsNotNone(cache.root_node)
