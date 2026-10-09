@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -69,6 +70,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    prepare_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -396,7 +398,13 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        head_shard_size = get_parallel().attn_tp_size
+        from sglang.srt.runtime_context import (
+            linear_attn_parallel_group,
+            linear_attn_tp_size,
+        )
+
+        head_shard_size = linear_attn_tp_size()
+        head_parallel_group = linear_attn_parallel_group()
 
         self.hidden_size = hidden_size
         self.config = config
@@ -435,7 +443,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                parallel_group="attn_tp",
+                parallel_group=head_parallel_group,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -447,7 +455,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
-                parallel_group="attn_tp",
+                parallel_group=head_parallel_group,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -457,7 +465,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=head_parallel_group,
                 prefix=f"{prefix}.qkv_proj",
             )
 
@@ -468,7 +476,7 @@ class Glm5NextLinearAttention(nn.Module):
                     [self.head_dim, self.head_dim],
                     quant_config=None,
                     prefix=f"{prefix}.fused_bfg_a_proj",
-                    parallel_group="attn_tp",
+                    parallel_group=head_parallel_group,
                 )
                 self.bfg_split_sizes = [self.local_num_heads, 2 * self.head_dim]
                 self.fused_fg_b_proj = ColumnParallelBatchedLinear(
@@ -476,7 +484,7 @@ class Glm5NextLinearAttention(nn.Module):
                     self.head_dim,
                     projection_size,
                     dtype=self.fused_bfg_a_proj.params_dtype,
-                    parallel_group="attn_tp",
+                    parallel_group=head_parallel_group,
                 )
             else:
                 self.f_a_proj = ReplicatedLinear(
@@ -493,7 +501,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.f_b_proj",
-                    parallel_group="attn_tp",
+                    parallel_group=head_parallel_group,
                 )
 
                 self.b_proj = ColumnParallelLinear(
@@ -502,7 +510,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.b_proj",
-                    parallel_group="attn_tp",
+                    parallel_group=head_parallel_group,
                 )
 
                 self.g_a_proj = ReplicatedLinear(
@@ -518,7 +526,7 @@ class Glm5NextLinearAttention(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.g_b_proj",
-                    parallel_group="attn_tp",
+                    parallel_group=head_parallel_group,
                 )
 
         self.dt_bias = nn.Parameter(
@@ -527,7 +535,11 @@ class Glm5NextLinearAttention(nn.Module):
 
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {
+                "weight_loader": sharded_weight_loader(
+                    0, parallel_group=head_parallel_group
+                )
+            },
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -536,7 +548,7 @@ class Glm5NextLinearAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            parallel_group="attn_tp",
+            parallel_group=head_parallel_group,
         )
         # ColumnParallelLinear's loader cannot reshape conv1d weights, so add the
         # singleton dimension after construction.
@@ -547,7 +559,11 @@ class Glm5NextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(2, parallel_group="attn_tp")},
+            {
+                "weight_loader": sharded_weight_loader(
+                    2, parallel_group=head_parallel_group
+                )
+            },
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -560,7 +576,7 @@ class Glm5NextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            parallel_group="attn_tp",
+            parallel_group=head_parallel_group,
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -630,6 +646,14 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
+        from sglang.srt.layers.cp.interleave import (
+            cp_interleave_to_sequence_order,
+            cp_sequence_to_interleave_order,
+        )
+
+        gathered_rows = hidden_states.shape[0]
+        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, forward_batch
@@ -654,7 +678,9 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        return self.o_proj(core_attn_out)[0]
+        return cp_sequence_to_interleave_order(
+            self.o_proj(core_attn_out)[0], forward_batch, gathered_rows
+        )
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -790,7 +816,13 @@ class Glm5NextDecoderLayer(nn.Module):
             ).residual_ops()
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(read=residual.attn_readout, update=residual.attn_update),
+                declare_attn(
+                    read=residual.attn_readout,
+                    update=residual.attn_update,
+                    tp_group=SumGroup.TP
+                    if self.is_linear_attn and get_parallel().enable_cp_tp_group_sharing
+                    else SumGroup.ATTN_TP,
+                ),
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.self_attn.prepare_qkv_latent
@@ -984,6 +1016,7 @@ class Glm5NextDecoderLayer(nn.Module):
             isinstance(self.mlp, Glm5NextMoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            and hidden_states_orig.shape[0] == hidden_states.shape[0]
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
@@ -1609,6 +1642,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
         video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
         return video_embeds
 
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        """Finish multimodal embedding injection before the runner shards tokens."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        positions = (
+            forward_batch.mrope_positions
+            if self.is_mrope_enabled
+            else forward_batch.positions
+        )
+        if input_embeds is None or forward_batch.contains_mm_inputs():
+            input_embeds = prepare_mm_inputs(
+                forward_batch.input_ids,
+                forward_batch,
+                self.model,
+                kwargs,
+                multimodal_model=self,
+            )
+        return input_embeds, positions, kwargs
+
     @torch.no_grad()
     def forward(
         self,
@@ -1622,14 +1673,25 @@ class Glm5NextForConditionalGeneration(nn.Module):
             positions = forward_batch.mrope_positions
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = general_mm_embed_routine(
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                language_model=self.model,
-                multimodal_model=self,
-                positions=positions,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            if input_embeds is not None and not forward_batch.contains_mm_inputs():
+                # Preserve input_embeds / replace_embeds supplied by the runner.
+                # The MM routine otherwise performs a fresh token lookup.
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

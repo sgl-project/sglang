@@ -283,6 +283,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
             and not declaration.update.is_plain_add
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
+            and not _cp_gathers_over_attn_cp()
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         attn_input_adapter = None

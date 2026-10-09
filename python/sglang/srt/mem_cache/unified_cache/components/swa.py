@@ -69,12 +69,19 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
+        # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
+        # only frees through free_swa_segment / free / free_group_*, which the
+        # HiSparse allocator defines.
         assert isinstance(
-            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            params.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         ), (
-            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+            f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         if params.sliding_window_size is None or params.sliding_window_size <= 0:
             raise ValueError("SWAComponent requires a positive sliding_window_size")
@@ -356,7 +363,7 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         ct = self.component_type
-        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+        swa_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable SWA window. The branching
         # point is the last page-aligned position within the Full-KV hit that lies
