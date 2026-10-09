@@ -1,6 +1,7 @@
 """Pure-language V4.1 CP input, padding and DSpark state regressions."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -12,7 +13,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
 )
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM, MQALayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_cp_test_utils import cp_context, simulated_collective
 from sglang.test.test_utils import CustomTestCase
@@ -24,6 +25,55 @@ RUNNER = "sglang.srt.model_executor.runner.eager_runner"
 
 
 class TestDSV41TextCP(CustomTestCase):
+    def test_cp_multistream_joins_swa_after_indexer_before_attention(self):
+        # SWA KV is not an input of logits/top-k, but must be complete before
+        # attention starts. A moved/removed join silently changes that boundary.
+        order = []
+        worker_streams = [object(), object(), object()]
+        parent = NS(
+            wait_stream=lambda stream: order.append(worker_streams.index(stream))
+        )
+        workers = [NS(wait_stream=lambda stream: None) for _ in range(3)]
+        worker_streams[:] = workers
+        x = torch.zeros(4, 2)
+        positions = torch.arange(4)
+        indexer = NS(
+            queries=lambda q, freqs: x,
+            head_weights=lambda hidden: x,
+        )
+        layer = NS(
+            alt_streams=workers,
+            fuse_wqa_wkv=False,
+            compressor=object(),
+            indexer=indexer,
+            freqs_cis=torch.zeros(4),
+            _compute_q_a=lambda *args, **kwargs: (x, x),
+            _materialize_cp_swa_k=lambda *args, **kwargs: x,
+            _store_cp_swa_k=lambda *args: None,
+            _compute_q_b=lambda *args: x,
+        )
+        backend = NS(
+            low_ratio_prefill_graph=True,
+            forward_low_ratio_sources=lambda **kwargs: None,
+            _low_ratio_gather_k_prefill_graph=lambda layer: None,
+            _low_ratio_quantize_q_prefill_graph=lambda q: None,
+            _low_ratio_index_topk_captured=lambda *args, **kwargs: order.append("topk"),
+        )
+        module = "sglang.srt.models.deepseek_v4"
+        with (
+            patch(module + ".torch.cuda.current_stream", return_value=parent),
+            patch(
+                module + ".torch.cuda.stream", side_effect=lambda stream: nullcontext()
+            ),
+            patch(module + ".cp_materialize_global_token_order", return_value=x),
+            patch(module + ".is_in_breakable_cuda_graph", return_value=True),
+        ):
+            result = MQALayer._forward_prepare_low_ratio_cp_multi_stream(
+                layer, x, positions, NS(encoder_swa_replay=False), backend
+            )
+        self.assertIs(result, x)
+        self.assertEqual(order, [1, 2, "topk", 0])
+
     def test_interleave_roundtrip_mixed_lengths_prefix_and_padding(self):
         for size in (2, 4):
             for length in (4, 5, 9, 127, 128, 129):
