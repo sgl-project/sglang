@@ -8,7 +8,6 @@ when the runner hands back a MoeDeferredFinalize.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from functools import partial
 from typing import Callable, Optional, Sequence
@@ -76,8 +75,7 @@ def _resolve_max_m(*, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-@dataclasses.dataclass(frozen=True)
-class MoeDeferredFinalize(DeferredFinalize):
+class MoeDeferredFinalize(DeferredFinalize, frozen=True):
     """Unfinalized routed output plus the separately gated shared contribution.
     The next layer's fused finalize + AR + add + norm takes it; ``finish`` is
     the MoE's own unfused tail, for any other reader."""

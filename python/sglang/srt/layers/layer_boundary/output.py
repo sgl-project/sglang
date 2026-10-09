@@ -13,7 +13,6 @@
 # ==============================================================================
 """Outputs that carry work their consumer still owes."""
 
-import dataclasses
 from typing import Callable, Optional, Union
 
 import msgspec
@@ -38,12 +37,7 @@ class OutputTransform(msgspec.Struct, frozen=True):
     before_reduce_scatter: bool = False
 
 
-# UnreducedOutput and DeferredFinalize are created inside the traced forward
-# region, so they are plain dataclasses: torch.compile cannot construct msgspec
-# structs (dynamo's example value goes through object.__new__, which msgspec's
-# C-level tp_new rejects).
-@dataclasses.dataclass(frozen=True)
-class UnreducedOutput:
+class UnreducedOutput(msgspec.Struct, frozen=True):
     """Internal adapter value describing an unfinished reduction.
 
     Fields:
@@ -71,8 +65,7 @@ class UnreducedOutput:
         return self.group.all_reduce(self.partial)
 
 
-@dataclasses.dataclass(frozen=True)
-class DeferredFinalize:
+class DeferredFinalize(msgspec.Struct, frozen=True):
     """A layer output that still owes work only its producer knows how to do (a
     MoE's finalize and sum), left for the next layer's input or for a terminal
     norm that accepts it (residual_batch.final_norm(finalize_norm=...)). A fused kernel
