@@ -169,15 +169,15 @@ acceleration features and their runtime requirements.
 
 | Target | Recommended server flags | Notes |
 | --- | --- | --- |
-| 1 GPU, 96 GB or more | *(no extra flags)* | DiT resident: about 71 GiB peak per GPU at the default workload. Add `--text-encoder-cpu-offload` to keep the fp32 text encoder off the GPU. |
-| 1 GPU, 80 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer: about 39 GiB peak at the same end-to-end time as the resident DiT; output identical. |
+| 1 GPU, 96 GB or more | *(no extra flags)* | DiT resident: about 70 GiB peak per GPU at the default workload. Add `--text-encoder-cpu-offload` to keep the fp32 text encoder off the GPU. |
+| 1 GPU, 80 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer: about 40 GiB peak at the same end-to-end time as the resident DiT; output identical. |
 | 2+ GPUs, long sequences | `--num-gpus N --ulysses-degree N` | Sequence parallel across ranks (ring degree stays 1). |
 | 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. With `--tp-size` smaller than `--num-gpus` (or than half of it with `--enable-cfg-parallel`), the leftover GPUs are auto-assigned to Ulysses sequence parallelism (last row). |
 | 2 GPUs, split CFG | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided/unguided branches. |
-| 2 GPUs, 80 GB cards | `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | Same speed as resident CFG-parallel at about 42 GiB per GPU, output bit-identical to a single GPU (the CI configuration). |
-| 4 GPUs | `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2` | CFG-parallel across two pairs of Ulysses ranks: the fastest 4-GPU layout. Add `--encoder-parallel replicate --vae-config.use-parallel-decode false` for output bit-identical to a single GPU; pass the flags explicitly to pin the layout instead of relying on the automatic assignment. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (about 43 GiB per GPU, same speed). |
+| 2 GPUs, 80 GB cards | `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | Same speed as resident CFG-parallel at about 43 GiB per GPU, output bit-identical to a single GPU (the CI configuration). |
+| 4 GPUs | `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2` | CFG-parallel across two pairs of Ulysses ranks: the fastest 4-GPU layout; pass the flags explicitly to pin the layout instead of relying on the automatic assignment. Ulysses shards the attention sequence, so 4-GPU outputs match the single-GPU video to about 30 dB mean PSNR rather than bit for bit. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (about 35 GiB per GPU, same speed). |
 | FSDP sharding | `--use-fsdp-inference` is **not supported** | Rejected at startup, before any weights load; use `--tp-size` to shard the DiT or `--dit-layerwise-offload` to cut peak memory. |
-| 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 35 GiB peak per GPU (27 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 17 percent slower than CFG-parallel x tensor parallel and 33 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
+| 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 33 GiB peak per GPU (25 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
 
 ## 4. Model Invocation
 
@@ -313,29 +313,28 @@ synchronizes the device so the per-stage timings are accurate.
 
     | Config | GPUs | Extra flags | E2E (s) | Peak per GPU (GiB) |
     | --- | ---: | --- | ---: | ---: |
-    | 1 GPU, DiT resident | 1 | none | 1040 | 71.2 |
-    | 1 GPU, layerwise DiT offload | 1 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 1041 | 39.4 |
-    | 2 GPUs, CFG-parallel | 2 | `--enable-cfg-parallel` | 536 | 71.7 |
-    | 2 GPUs, CFG-parallel, replicated encoders, serial VAE decode | 2 | `--enable-cfg-parallel --encoder-parallel replicate --vae-config.use-parallel-decode false` | 537 | 73.2 |
-    | 2 GPUs, CFG-parallel, layerwise DiT offload, bit-identical to 1 GPU | 2 | `--enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 537 | 42.2 |
-    | 2 GPUs, Ulysses | 2 | `--ulysses-degree 2` | 564 | 64.1 |
-    | 2 GPUs, tensor parallel | 2 | `--tp-size 2` | 637 | 40.3 |
-    | 4 GPUs, framework default (CFG2 x SP2, KV-gather exchange) | 4 | none | 294 | 61.5 |
-    | 4 GPUs, CFG-parallel x Ulysses | 4 | `--enable-cfg-parallel --ulysses-degree 2` | 294 | 61.7 |
-    | 4 GPUs, CFG-parallel x Ulysses, layerwise DiT offload | 4 | `--enable-cfg-parallel --ulysses-degree 2 --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` | 303 | 42.9 |
-    | 4 GPUs, Ulysses | 4 | `--ulysses-degree 4` | 342 | 53.5 |
-    | 4 GPUs, CFG-parallel x tensor parallel | 4 | `--enable-cfg-parallel --tp-size 2` | 331 | 38.9 |
-    | 4 GPUs, tensor parallel x Ulysses | 4 | `--tp-size 2 --ulysses-degree 2` | 374 | 34.5 |
-    | 4 GPUs, tensor parallel | 4 | `--tp-size 4` | 392 | 28.4 |
+    | 1 GPU, DiT resident | 1 | none | 993 | 69.5 |
+    | 1 GPU, layerwise DiT offload | 1 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 996 | 40.2 |
+    | 2 GPUs, CFG-parallel | 2 | `--enable-cfg-parallel` | 513 | 67.3 |
+    | 2 GPUs, CFG-parallel, replicated encoders, serial VAE decode | 2 | `--enable-cfg-parallel --encoder-parallel replicate --vae-config.use-parallel-decode false` | 515 | 71.0 |
+    | 2 GPUs, CFG-parallel, layerwise DiT offload, bit-identical to 1 GPU | 2 | `--enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 512 | 43.0 |
+    | 2 GPUs, Ulysses | 2 | `--ulysses-degree 2` | 547 | 58.1 |
+    | 2 GPUs, tensor parallel | 2 | `--tp-size 2` | 613 | 36.6 |
+    | 4 GPUs, framework default (CFG2 x SP2, KV-gather exchange) | 4 | none | 283 | 58.4 |
+    | 4 GPUs, CFG-parallel x Ulysses | 4 | `--enable-cfg-parallel --ulysses-degree 2` | 283 | 58.4 |
+    | 4 GPUs, CFG-parallel x Ulysses, layerwise DiT offload | 4 | `--enable-cfg-parallel --ulysses-degree 2 --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` | 291 | 35.2 |
+    | 4 GPUs, Ulysses | 4 | `--ulysses-degree 4` | 317 | 49.0 |
+    | 4 GPUs, CFG-parallel x tensor parallel | 4 | `--enable-cfg-parallel --tp-size 2` | 318 | 37.5 |
+    | 4 GPUs, tensor parallel x Ulysses | 4 | `--tp-size 2 --ulysses-degree 2` | 361 | 33.5 |
+    | 4 GPUs, tensor parallel | 4 | `--tp-size 4` | 379 | 27.3 |
 
-    Layerwise DiT offload cuts the 1-GPU peak by 32 GiB at the same end-to-end time.
+    Layerwise DiT offload cuts the 1-GPU peak by 29 GiB at the same end-to-end time.
     The fastest 4-GPU layout is 3.5x faster than one GPU. The framework default and the explicit CFG-parallel x Ulysses
     layout run at the same speed and produce the same output; the explicit flags pin the layout.
-    Tensor parallel x Ulysses is the memory-leaning 4-GPU layout: the lowest 4-GPU peak after `--tp-size 4`, about 17 percent slower than CFG-parallel x tensor parallel and 33 percent slower than the default.
-    That row was measured separately; its CFG-parallel x tensor parallel and framework-default controls ran 318 s and 280 s against the 331 s and 294 s in the table, so it reads about 4 to 5 percent faster than the other rows.
-    Adding `--encoder-parallel replicate --vae-config.use-parallel-decode false` to the CFG-parallel x Ulysses row (the flags that make the output bit-identical to a single GPU) costs about 4 percent (305 s, 75.6 GiB).
+    Tensor parallel x Ulysses is the memory-leaning 4-GPU layout: the lowest 4-GPU peak after `--tp-size 4`, about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default.
+    Adding `--encoder-parallel replicate --vae-config.use-parallel-decode false` to the CFG-parallel x Ulysses row costs about 1 percent (287 s, 62.5 GiB) and does not make the output bit-identical to a single GPU: every Ulysses layout matches the single-GPU video to about 30 dB mean PSNR.
     The layerwise rows are the configurations for 80 GB GPUs. With the replicated encoders, serial VAE decode and the
-    channels-last VAE layout (`SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1`) the CFG-parallel output is bit-identical to a single GPU.
+    channels-last VAE layout (`SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1`) the 2-GPU CFG-parallel output is bit-identical to a single GPU.
   </Tab>
 </Tabs>
 
