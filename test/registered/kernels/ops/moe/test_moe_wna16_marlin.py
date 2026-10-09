@@ -684,6 +684,93 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+def test_compressed_tensors_nvfp4_moe_marlin_matches_dequant_reference():
+    """compressed-tensors NVFP4 MoE checkpoints store w13 as [gate; up] rows and the
+    inverse of the per-expert global scale; the Marlin path must dequantize to the
+    checkpoint weights (a swapped gate/up or an uninverted global scale fails this)."""
+    from unittest import mock
+
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        compressed_tensors_w4a4_nvfp4_moe as ct_nvfp4_moe,
+    )
+
+    torch.manual_seed(0)
+    m, e, topk, intermediate_size, hidden_size = 9, 4, 2, 256, 512
+    dtype = torch.bfloat16
+    with mock.patch.object(
+        ct_nvfp4_moe, "get_moe_runner_backend", return_value=MoeRunnerBackend.MARLIN
+    ):
+        scheme = ct_nvfp4_moe.CompressedTensorsW4A4Nvfp4MoE()
+    assert not scheme.load_up_proj_weight_first
+
+    layer = torch.nn.Module()
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.intermediate_size_per_partition = intermediate_size
+    with torch.device("cuda"):
+        scheme.create_weights(
+            layer,
+            num_experts=e,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            params_dtype=dtype,
+        )
+    w13_ref, w2_ref = [], []
+    for expert in range(e):
+        for name, n, k, refs in (
+            ("w13", 2 * intermediate_size, hidden_size, w13_ref),
+            ("w2", hidden_size, intermediate_size, w2_ref),
+        ):
+            packed, scales, global_scale, ref = make_nvfp4_weight_and_ref(n, k, dtype)
+            getattr(layer, f"{name}_weight_packed").data[expert] = packed
+            getattr(layer, f"{name}_weight_scale").data[expert] = scales
+            getattr(layer, f"{name}_weight_global_scale").data[expert] = (
+                1 / global_scale.float()
+            )
+            refs.append(ref.double())
+    layer.w13_input_global_scale.data.fill_(1.0)
+    layer.w2_input_global_scale.data.fill_(1.0)
+    scheme.process_weights_after_loading(layer)
+
+    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 10
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(router_logits, dim=-1, dtype=torch.float32), topk
+    )
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        w1_global_scale=layer.w13_weight_scale_2,
+        w2_global_scale=layer.w2_weight_scale_2,
+        workspace=layer.workspace,
+        num_bits=4,
+        is_k_full=True,
+    )
+
+    reference = torch.zeros((m, hidden_size), device="cuda", dtype=torch.float64)
+    for token in range(m):
+        for route in range(topk):
+            expert = topk_ids[token, route]
+            gate, up = (hidden_states[token].double() @ w13_ref[expert].T).chunk(2)
+            activated = torch.nn.functional.silu(gate) * up
+            reference[token] += (activated @ w2_ref[expert].T) * topk_weights[
+                token, route
+            ].double()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output.double(),
+        reference,
+        rtol=0.05,
+        atol=reference.square().mean().sqrt().item() * 0.05,
+    )
+
+
 def _dequant_mxfp4_reference(packed, scales):
     fp4 = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],

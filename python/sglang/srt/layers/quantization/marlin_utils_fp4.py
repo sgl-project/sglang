@@ -466,14 +466,15 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
 
 def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if layer.quant_config.group_size != 16:
-        raise ValueError(
-            f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
-        )
-
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
     w13_scale = layer.w13_weight_scale.data
+    # Read from the scales, not the quant config: compressed-tensors configs carry no
+    # group_size of their own.
+    group_size = w13.shape[2] * 2 // w13_scale.shape[2]
+    if group_size != 16:
+        raise ValueError(f"NVFP4 Marlin MoE requires group_size=16, got {group_size}.")
+
     w2_scale = layer.w2_weight_scale.data
     w13_global_scale = layer.w13_weight_scale_2.data
     w2_global_scale = layer.w2_weight_scale_2.data
