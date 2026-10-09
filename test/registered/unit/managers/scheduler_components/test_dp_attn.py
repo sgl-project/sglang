@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import torch
@@ -33,6 +34,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             batch_size=lambda: 4,
             spec_info=None,
             reqs=[],
+            seq_lens_cpu=torch.ones(4, dtype=torch.int64),
         )
         tbo_preparer = Mock()
         tbo_preparer.prepare_all_gather.return_value = (
@@ -94,17 +96,25 @@ class TestDPBalanceStats(CustomTestCase):
         local_tokens: int,
         peer_tokens: int,
         *,
-        reqs=(),
+        reqs: Optional[list] = None,
+        peer_attention_pairs: Optional[int] = None,
         peer_health_check: bool = False,
         get_idle_batch=None,
         sync_wait_carry=None,
         wait_seconds=None,
     ):
+        if reqs is None:
+            # One-token rows, the shortest a decode row can be.
+            reqs = [
+                SimpleNamespace(rid=f"req-{i}", seqlen=1) for i in range(local_tokens)
+            ]
         batch = SimpleNamespace(
             forward_mode=forward_mode,
             batch_size=lambda: local_tokens,
             spec_info=None,
             reqs=list(reqs),
+            # Spec batches carry no CPU seq_lens at schedule time.
+            seq_lens_cpu=None,
             dp_balance_stats=None,
         )
         gathered_mode = forward_mode or ForwardMode.IDLE
@@ -116,6 +126,10 @@ class TestDPBalanceStats(CustomTestCase):
             peer = local.clone()
             peer[0] = peer[1] = peer_tokens  # num_tokens, num_tokens_for_logprob
             peer[9] = int(peer_health_check)
+            # attention_pairs; one-token rows unless the test says otherwise.
+            peer[10] = (
+                peer_tokens if peer_attention_pairs is None else peer_attention_pairs
+            )
             output.copy_(torch.stack([local, peer]).flatten())
 
         # all_gather reads the clock once before and once after the collective.
@@ -183,6 +197,99 @@ class TestDPBalanceStats(CustomTestCase):
         self.assertAlmostEqual(stats.max_over_mean, 8 * 2 / 12)
         self.assertGreater(stats.sync_wait_seconds, 0)
 
+    def test_attention_pairs_follow_context_not_rows(self):
+        """Fewer rows with longer contexts is the busier rank in pairs.
+
+        Rows and pairs are gathered side by side, so the two series can
+        disagree on which rank is the busiest; this is the case the pair
+        series exists for.
+        """
+        reqs = [SimpleNamespace(rid=f"req-{n}", seqlen=n) for n in (1000, 3000)]
+        result = self._prepare_dp2_batch(
+            ForwardMode.DECODE,
+            local_tokens=2,
+            peer_tokens=8,
+            reqs=reqs,
+            peer_attention_pairs=800,
+        )
+
+        stats = result.dp_balance_stats
+        self.assertEqual((stats.local_tokens, stats.imbalance_tokens), (2, 6))
+        self.assertEqual(
+            (stats.local_attention_pairs, stats.max_attention_pairs), (4000, 4000)
+        )
+        self.assertEqual(stats.imbalance_attention_pairs, 0)
+        self.assertAlmostEqual(stats.max_over_mean, 8 * 2 / 10)
+
+    def test_attention_pairs_gathered_without_the_metrics_flag(self):
+        """The pair column must not depend on a per-process flag: a rank with
+        the flag off would gather zeros and trip the pair-count guard on its
+        flag-on peers."""
+        with patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", False):
+            info = dp_attn.MLPSyncBatchInfo(
+                num_dp_ranks=2,
+                tp_size=1,
+                cp_size=1,
+                num_tokens=2,
+                num_tokens_for_logprob=2,
+                can_run_decode_cuda_graph=True,
+                can_run_draft_cuda_graph=True,
+                can_run_prefill_cuda_graph=False,
+                is_extend_in_batch=False,
+                local_can_run_tbo=False,
+                local_forward_mode=ForwardMode.DECODE.value,
+                attention_pairs=dp_attn._local_attention_pairs(
+                    SimpleNamespace(
+                        forward_mode=ForwardMode.DECODE,
+                        seq_lens_cpu=None,
+                        reqs=[SimpleNamespace(seqlen=5), SimpleNamespace(seqlen=7)],
+                    )
+                ),
+            )
+        self.assertEqual(info._get_local_tensor(device="cpu")[10].item(), 12)
+
+    def test_prefill_chunk_pairs_are_causal(self):
+        """A chunk after prefix p reads p keys per query plus the causal
+        triangle inside the chunk; a one-token chunk after prefix p therefore
+        costs the same as a decode row of length p + 1."""
+        extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, prefix_lens=[10, 6], extend_lens=[4, 1]
+        )
+        decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=None,
+            reqs=[SimpleNamespace(seqlen=7)],
+        )
+        self.assertEqual(dp_attn._local_attention_pairs(extend), (10 * 4 + 10) + 7)
+        self.assertEqual(dp_attn._local_attention_pairs(decode), 7)
+        self.assertEqual(dp_attn._local_attention_pairs(None), 0)
+        self.assertEqual(
+            dp_attn._local_attention_pairs(
+                SimpleNamespace(forward_mode=ForwardMode.IDLE)
+            ),
+            0,
+        )
+
+    def test_decode_pairs_from_seq_lens_cpu_match_request_lengths(self):
+        """The prepared seq_lens_cpu fast path and the committed-length
+        fallback count the same pairs, so the series has no discontinuity when
+        a batch switches between them."""
+        lens = [3, 5, 9]
+        fast = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=torch.tensor(lens),
+            reqs=[],
+        )
+        slow = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=None,
+            reqs=[SimpleNamespace(seqlen=n) for n in lens],
+        )
+        self.assertEqual(
+            dp_attn._local_attention_pairs(fast), dp_attn._local_attention_pairs(slow)
+        )
+        self.assertEqual(dp_attn._local_attention_pairs(fast), 17)
+
     def _adapter(self):
         return dp_attn.SchedulerDPAttnAdapter(
             model_runner=object(),
@@ -247,7 +354,7 @@ class TestDPBalanceStats(CustomTestCase):
         self.assertEqual(carry.seconds, 0.0)
 
     def test_health_check_probe_steps_not_recorded(self):
-        probe = SimpleNamespace(rid=f"{HEALTH_CHECK_RID_PREFIX}-0")
+        probe = SimpleNamespace(rid=f"{HEALTH_CHECK_RID_PREFIX}-0", seqlen=1)
         result = self._prepare_dp2_batch(
             ForwardMode.DECODE, local_tokens=1, peer_tokens=0, reqs=[probe]
         )
@@ -267,9 +374,24 @@ class TestDPBalanceStats(CustomTestCase):
         self.assertIs(result, idle_batch)
         self.assertIsNone(result.dp_balance_stats)
 
-    def test_create_rejects_steps_without_tokens(self):
+    def test_create_rejects_steps_without_tokens_or_pairs(self):
         with self.assertRaises(ValueError):
-            DPBalanceStats.create(0, [0, 0], 0.0)
+            DPBalanceStats.create(
+                local_tokens=0,
+                global_num_tokens=[0, 0],
+                local_attention_pairs=0,
+                global_attention_pairs=[0, 0],
+                sync_wait_seconds=0.0,
+            )
+        # Rows without pairs cannot come from a correct gather.
+        with self.assertRaises(ValueError):
+            DPBalanceStats.create(
+                local_tokens=0,
+                global_num_tokens=[0, 8],
+                local_attention_pairs=0,
+                global_attention_pairs=[0, 0],
+                sync_wait_seconds=0.0,
+            )
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):

@@ -310,6 +310,103 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class _PagedFullComponent(FullComponent):
+    """FULL component whose device values are not backed one-to-one by pool
+    rows: a value lists two entries per row, and the component can hand rows
+    of a node back to the allocator while the value stays on device."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rows_handed_back: dict[int, int] = {}
+
+    def reclaimable_tokens(self, node):
+        return self.value_len(node) // 2 - self.rows_handed_back.get(node.id, 0)
+
+
+class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
+    def test_ledgers_count_reclaimable_tokens(self):
+        """The evictable and protected ledgers are in the allocator's units:
+        prefill admission adds the evictable ledger to the allocator's free
+        space and the eviction walk counts them toward its request. So every
+        ledger site (insert, lock, release, an in-place change, eviction)
+        reads ``TreeComponent.reclaimable_tokens`` rather than the value
+        length. A site that goes back to ``len(value)`` drifts the ledger from
+        the recount in ``sanity_check`` for a component that overrides it."""
+        cache, allocator, _ = build_fixture(
+            CacheConfig(),
+            component_registry_override={ComponentType.FULL: _PagedFullComponent},
+            tree_core_backend="python",
+        )
+        component = cache.components[ComponentType.FULL]
+
+        def ledgers():
+            cache.sanity_check()
+            return cache.evictable_size(), cache.protected_size()
+
+        tokens = array("q", range(1, 9))
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        self.assertEqual(ledgers(), (4, 0))
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+        lock_params = cache.inc_lock_ref(leaf).to_dec_params()
+        self.assertEqual(ledgers(), (0, 4))
+
+        # The figure changes in place, without a lock transition.
+        component.rows_handed_back[leaf] = 1
+        cache.tree_core.adjust_component_ledger(
+            node=cache.tree_core.node_by_id(leaf),
+            component_type=ComponentType.FULL,
+            delta=-1,
+        )
+        self.assertEqual(ledgers(), (0, 3))
+
+        cache.dec_lock_ref(leaf, lock_params)
+        self.assertEqual(ledgers(), (3, 0))
+
+        # The eviction walk is satisfied by what the node reclaims, not by
+        # its value length.
+        cache.evict(EvictParams(num_tokens=3))
+        self.assertEqual(ledgers(), (0, 0))
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(tokens))
+            ).device_prefix_len,
+            0,
+        )
+
+
+class TestDisabledUnifiedRadixCache(CustomTestCase):
+    def _params(self, disable):
+        return CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=disable,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+            enable_kv_cache_events=True,
+            eviction_policy="lru",
+            eviction_policy_config={"not_an_lru_option": 1},
+        )
+
+    def test_disabled_cache_skips_events_and_eviction_config(self):
+        cache = UnifiedRadixCache(params=self._params(disable=True))
+        cache.reset()
+        self.assertEqual(cache.take_events(), [])
+
+        with self.assertRaises(TypeError):
+            UnifiedRadixCache(params=self._params(disable=False))
+
+
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists (#26177)."""
