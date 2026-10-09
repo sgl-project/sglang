@@ -621,9 +621,29 @@ class PipelineConfig:
         time_dim = latents.shape[2]
 
         # Zero-padding a non-divisible time dim would enter self-attention
-        # unmasked (video models pass no attn_mask) and corrupt real tokens;
-        # keep such shapes unsharded until models consume the sp_shard meta.
+        # unmasked (video models pass no attn_mask) and corrupt real tokens.
+        # Models with a token-level sequence-shard forward (see
+        # ``resolve_sequence_shard``) can still shard such shapes: they pad
+        # the flattened token sequence, slice a contiguous per-rank range, and
+        # compute the local RoPE range themselves. Delegate to that path
+        # instead of leaving every rank replicated -- a replicated input
+        # silently breaks the Ulysses all-to-all (sequence inflated by the SP
+        # degree) and the rank-offset RoPE grid.
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            from sglang.multimodal_gen.configs.sample.sampling_params import (
+                resolve_sequence_shard,
+            )
+
+            if resolve_sequence_shard(self, None):
+                logger.info(
+                    "Latent time dim %d is not divisible by SP degree %d; "
+                    "using the token-level sequence shard instead of the "
+                    "frame shard.",
+                    time_dim,
+                    sp_world_size,
+                )
+                batch.enable_sequence_shard = True
+                return latents, False
             logger.warning_once(
                 f"Latent time dim {time_dim} is not divisible by SP degree "
                 f"{sp_world_size}; skipping sequence shard for correctness."

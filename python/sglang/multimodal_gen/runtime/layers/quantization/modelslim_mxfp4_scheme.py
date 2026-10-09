@@ -161,10 +161,11 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             if uses_w4a8 and uses_w4a4:
                 raise NotImplementedError(
                     f"{self.prefix}: mixed W4A4/W4A8 linear timestep policies are "
-                    "unsupported for single-level MXFP4. The W4A8 load path casts "
-                    "the weight to FRACTAL_NZ, which the W4A4 matmul cannot "
-                    "consume; use a uniform policy until this is verified on "
-                    "hardware."
+                    "unsupported for single-level MXFP4. Both load paths now lay "
+                    "the weight out as FRACTAL_NZ, but the two applies quantize "
+                    "activations differently (FP8 vs FP4) and the per-timestep "
+                    "switch has not been verified on hardware; use a uniform "
+                    "policy."
                 )
             kernel = self.w4a8_kernel if uses_w4a8 else self.single_level_kernel
             kernel.process_weights_after_loading(layer)
