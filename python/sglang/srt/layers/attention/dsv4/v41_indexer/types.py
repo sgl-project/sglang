@@ -67,6 +67,7 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens_cpu: Optional[List[int]]
     rows_per_request: Optional[List[int]]
     rows_per_request_device: Optional[torch.Tensor]
+    req_pool_indices_cpu: Optional[List[int]] = None
 
 
 class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):

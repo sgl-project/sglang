@@ -756,13 +756,17 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             ),
             max_compressed_seq_len=65536,
         )
-        for capture_mode in (True, False):
+        for capture_mode, pdmux in product((True, False), (True, False)):
             with (
-                self.subTest(capture_mode=capture_mode),
+                self.subTest(capture_mode=capture_mode, pdmux=pdmux),
                 patch(f"{_METADATA}.get_is_capture_mode", return_value=capture_mode),
                 patch("torch.cuda.is_current_stream_capturing", return_value=False),
                 patch(f"{_METADATA}.is_in_breakable_cuda_graph", return_value=False),
                 patch(f"{_METADATA}.is_in_tc_piecewise_cuda_graph", return_value=False),
+                patch(
+                    f"{_METADATA}.get_disagg",
+                    return_value=SimpleNamespace(enable_pdmux=pdmux),
+                ),
                 patch(
                     f"{_METADATA}.mqa_logits_budget_bytes", return_value=4096
                 ) as budget,
@@ -773,7 +777,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                     budget.assert_not_called()
                 else:
                     self.assertEqual(result, 4096)
-                    budget.assert_called_once_with(device_index=0, allow_sync=True)
+                    budget.assert_called_once_with(device_index=0, allow_sync=not pdmux)
 
     def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
         deep_gemm = SimpleNamespace(

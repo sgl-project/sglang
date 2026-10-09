@@ -1513,7 +1513,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            trace = envs.SGLANG_PDMUX_TRACE.get()
+            if trace:
+                logger.info(
+                    "PDMux graph begin worker=%s stream_idx=%s key=%s mode=%s",
+                    "draft" if self.model_runner.is_draft_worker else "target",
+                    get_current_stream_idx(),
+                    self._replay_graph_key,
+                    forward_batch.forward_mode.name,
+                )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if trace:
+                logger.info("PDMux graph returned key=%s", self._replay_graph_key)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

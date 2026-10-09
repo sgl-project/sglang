@@ -101,6 +101,10 @@ class GenerationBatchResult:
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
+    # PDMux stages this pinned CPU mirror during submission and publishes it
+    # only after this lane's completion fence.
+    new_seq_lens_cpu: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[SpecInput] = None
 

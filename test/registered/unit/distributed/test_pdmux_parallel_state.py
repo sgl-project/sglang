@@ -5,7 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.distributed import parallel_state
+from sglang.srt.layers.moe.utils import post_experts_all_reduce
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import publish_build_topology
@@ -14,7 +17,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestPDMuxParallelGroups(unittest.TestCase):
-    def _initialize(self, *, dp_size, duplicate=True, rank=0):
+    def _initialize(self, *, dp_size, ep_size=1, duplicate=True, rank=0):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         self.addCleanup(reset_context)
@@ -69,14 +72,16 @@ class TestPDMuxParallelGroups(unittest.TestCase):
                 parallel_state, "init_model_parallel_group", side_effect=initialize
             )
         )
-        publish_build_topology(tp_size=8, pp_size=1, ep_size=1, attn_dp_size=dp_size)
+        publish_build_topology(
+            tp_size=8, pp_size=1, ep_size=ep_size, attn_dp_size=dp_size
+        )
         parallel_state.initialize_model_parallel(
             backend="nccl", duplicate_tp_group=duplicate
         )
         self.addCleanup(parallel_state.destroy_model_parallel)
         return created, arguments
 
-    def test_tp8_dp2_prefill_overrides_only_the_full_tp_group(self):
+    def test_tp8_dp2_prefill_keeps_independent_attention_group(self):
         for rank in (0, 4):
             with self.subTest(rank=rank):
                 created, _ = self._initialize(dp_size=2, rank=rank)
@@ -90,6 +95,7 @@ class TestPDMuxParallelGroups(unittest.TestCase):
                 with parallel_state.pdmux_prefill_tp_group():
                     self.assertIs(get_parallel().tp_group, prefill)
                     self.assertIs(get_parallel().attn_tp_group, attention)
+                    self.assertIs(get_parallel().moe_tp_group, prefill)
                 self.assertIs(get_parallel().tp_group, decode)
                 self.assertIs(get_parallel().attn_tp_group, attention)
                 parallel_state.destroy_model_parallel()
@@ -102,7 +108,48 @@ class TestPDMuxParallelGroups(unittest.TestCase):
         self.assertEqual(decode_attention.ranks, [0])
         with parallel_state.pdmux_prefill_tp_group():
             self.assertIs(get_parallel().attn_tp_group, decode_attention)
-            self.assertIs(get_parallel().moe_tp_group, created["tp"][1])
+            self.assertIs(get_parallel().moe_tp_group, created["pdmux_prefill_tp"][1])
+
+    def test_tp8_dp8_ep8_public_moe_reduction_follows_prefill_alias(self):
+        for rank in range(8):
+            with self.subTest(rank=rank):
+                created, _ = self._initialize(dp_size=8, ep_size=8, rank=rank)
+                decode = created["tp"][1]
+                prefill = created["pdmux_prefill_tp"][1]
+                decode.all_reduce = Mock(side_effect=lambda tensor: tensor)
+                prefill.all_reduce = Mock(side_effect=lambda tensor: tensor)
+                hidden = torch.zeros(8, 4)
+                if rank in (2, 5, 6, 7):
+                    hidden[rank] = 1
+                self.assertIs(get_parallel().moe_ep_group, decode)
+                with patch(
+                    "sglang.srt.layers.moe.utils.should_skip_post_experts_all_reduce",
+                    return_value=False,
+                ):
+                    post_experts_all_reduce(hidden)
+                    with parallel_state.pdmux_prefill_tp_group():
+                        self.assertIs(get_parallel().moe_ep_group, prefill)
+                        post_experts_all_reduce(hidden)
+                        with parallel_state.pdmux_prefill_tp_group():
+                            self.assertIs(get_parallel().moe_ep_group, prefill)
+                        self.assertIs(get_parallel().moe_ep_group, prefill)
+                    post_experts_all_reduce(hidden)
+                self.assertIs(get_parallel().moe_ep_group, decode)
+                self.assertEqual(decode.all_reduce.call_count, 2)
+                prefill.all_reduce.assert_called_once_with(hidden)
+                parallel_state.destroy_model_parallel()
+                prefill.destroy.assert_called_once_with()
+
+    def test_derived_moe_groups_are_shared_without_new_communicators(self):
+        created, _ = self._initialize(dp_size=2, ep_size=2)
+        ep, tp = get_parallel().moe_ep_group, get_parallel().moe_tp_group
+        with parallel_state.pdmux_prefill_tp_group():
+            self.assertIs(get_parallel().moe_ep_group, ep)
+            self.assertIs(get_parallel().moe_tp_group, tp)
+        self.assertEqual(
+            [name for name in created if name.startswith("pdmux_prefill_")],
+            ["pdmux_prefill_tp"],
+        )
 
     def test_full_tp_aliases_restore_after_exception(self):
         created, _ = self._initialize(dp_size=1)
@@ -112,8 +159,8 @@ class TestPDMuxParallelGroups(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "stop lane"):
             with parallel_state.pdmux_prefill_tp_group():
                 self.assertIs(get_parallel().tp_group, prefill)
-                self.assertIs(get_parallel().attn_tp_group, decode)
-                self.assertIs(get_parallel().moe_tp_group, decode)
+                self.assertIs(get_parallel().attn_tp_group, prefill)
+                self.assertIs(get_parallel().moe_tp_group, prefill)
                 raise RuntimeError("stop lane")
         self.assertIs(get_parallel().tp_group, decode)
         self.assertIs(get_parallel().attn_tp_group, decode)

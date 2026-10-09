@@ -313,6 +313,11 @@ def _init_parallel_groups(
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
+    if backend == "nccl" and get_disagg().enable_pdmux and tp_size > 1:
+        from sglang.srt.multiplex.launch_order import configure_pdmux_nccl_launch_order
+
+        configure_pdmux_nccl_launch_order()
+
     init_distributed_environment(
         backend=backend,
         world_size=world_size,

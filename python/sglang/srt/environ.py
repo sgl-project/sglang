@@ -632,6 +632,8 @@ class Envs:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Host-only lane submission diagnostics; never reads device tensor values.
+    SGLANG_PDMUX_TRACE = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds

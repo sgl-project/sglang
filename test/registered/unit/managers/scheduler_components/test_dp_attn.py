@@ -18,6 +18,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        disagg = patch.object(
+            dp_attn, "get_disagg", return_value=SimpleNamespace(enable_pdmux=False)
+        )
+        disagg.start()
+        self.addCleanup(disagg.stop)
+
     def test_scheduler_counts_remain_global_and_owned_without_mlp_gather(self):
         for counts in ([4, 0], [0, 4], [4] * 8, [0] * 8):
             with self.subTest(counts=counts):
@@ -116,6 +124,95 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
+
+    def test_pdmux_dp_cannot_skip_participant_consensus(self):
+        with (
+            patch.object(
+                dp_attn, "get_disagg", return_value=SimpleNamespace(enable_pdmux=True)
+            ),
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True),
+        ):
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(1))
+            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(8))
+
+    def test_pdmux_metadata_uses_cpu_even_with_non_overlap_cuda_policy(self):
+        for world_gather in (False, True):
+            with self.subTest(world_gather=world_gather):
+                cpu_group = object()
+                device_group = object()
+                group = SimpleNamespace(
+                    device="cuda", device_group=device_group, cpu_group=cpu_group
+                )
+                tbo = Mock()
+                tbo.prepare_all_gather.return_value = (False, ForwardMode.IDLE.value)
+                tbo.compute_output.return_value = (None, None)
+                calls = []
+
+                def gather(info, **kwargs):
+                    calls.append(kwargs)
+                    info.global_num_tokens = [0, 4]
+                    info.global_num_tokens_for_logprob = [0, 1]
+                    info.tp0_info_cpu = torch.zeros((2, 9), dtype=torch.int64)
+
+                idle = SimpleNamespace(forward_mode=ForwardMode.IDLE, spec_info=None)
+                with (
+                    patch.object(
+                        dp_attn,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            num_dp_ranks=2,
+                            attn_tp_size=4,
+                            attn_cp_size=1,
+                            tp_group=group,
+                            world_group=group,
+                        ),
+                    ),
+                    patch.object(
+                        dp_attn,
+                        "get_disagg",
+                        return_value=SimpleNamespace(enable_pdmux=True),
+                    ),
+                    patch.object(
+                        dp_attn, "world_dp_gather_enabled", return_value=world_gather
+                    ),
+                    patch.object(
+                        dp_attn, "_resolve_elastic_world_num_dp_ranks", return_value=2
+                    ),
+                    patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo),
+                    patch.object(
+                        dp_attn, "check_cuda_graph_backend", return_value=False
+                    ),
+                    patch.object(dp_attn.MLPSyncBatchInfo, "all_gather", gather),
+                    envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True),
+                    envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.override(
+                        True
+                    ),
+                ):
+                    result = dp_attn.prepare_mlp_sync_batch_raw(
+                        None,
+                        model_runner=SimpleNamespace(
+                            prefill_cuda_graph_runner=None,
+                            spec_algorithm=SpeculativeAlgorithm.NONE,
+                            model_config=object(),
+                        ),
+                        get_idle_batch=lambda: idle,
+                        disable_cuda_graph=False,
+                        require_mlp_tp_gather=True,
+                        disable_overlap_schedule=True,
+                        offload_tags=set(),
+                    )
+                self.assertIs(result, idle)
+                self.assertEqual(result.scheduler_global_num_tokens, [0, 4])
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "device": "cpu",
+                            "group": cpu_group,
+                            "use_all_reduce": world_gather,
+                        }
+                    ],
+                )
 
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(

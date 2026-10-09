@@ -302,14 +302,34 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
-        lens = compress_lens[tok]
-        lc = int(lens.max().item())
-        if lc == 0:
+    rows_per_request = inputs.rows_per_request
+    seq_lens = inputs.seq_lens_cpu
+    assert rows_per_request is not None and seq_lens is not None, (
+        "the torch prefill indexer needs CPU request lengths"
+    )
+    start = 0
+    # Extend rows are contiguous within each request. The scheduler already
+    # knows both boundaries and the newest position; deriving them with
+    # unique/nonzero/item on CUDA would block this lane during submission.
+    for i, (rows, seq_len) in enumerate(zip(rows_per_request, seq_lens)):
+        end = start + rows
+        tok = torch.arange(start, end, device=pos.device)
+        start = end
+        lc = seq_len // ratio
+        if rows == 0 or lc == 0:
             continue
+        lens = compress_lens[tok]
         j = torch.arange(lc, device=pos.device)
-        slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
+        if inputs.req_pool_indices_cpu is not None:
+            r = inputs.req_pool_indices_cpu[i]
+            slots = req_to_token[r, j * ratio]
+        else:
+            # Keep the request index one-dimensional: scalar CUDA indices
+            # can invoke .item() inside Tensor.__getitem__.
+            slots = req_to_token[
+                inputs.req_pool_indices[i : i + 1, None], (j * ratio)[None, :]
+            ].reshape(-1)
+        slots = slots.to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         request = RequestScores(

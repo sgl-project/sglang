@@ -537,6 +537,13 @@ class DeepSeekV4IndexerPool(KVCache):
 
         self._create_buffer()
 
+        if self.use_fp4_indexer:
+            from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+            # Upload once at pool initialization. A blocking H2D upload inside
+            # each request's scorer drains the in-flight prefill stream.
+            self._dequant_fp4_table = DSV4_DEQUANT_FP4_TABLE.to(self.device)
+
     def get_bytes_per_token(self) -> int:
         return get_dsv4_indexer_bytes_per_token(
             self.index_head_dim, self.use_fp4_indexer
@@ -720,8 +727,6 @@ class DeepSeekV4IndexerPool(KVCache):
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
-        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
-
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
@@ -736,9 +741,7 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
-            1
-        )  # [n, 128]
+        vals = self._dequant_fp4_table[codes.long()].flatten(1)  # [n, 128]
         exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)
