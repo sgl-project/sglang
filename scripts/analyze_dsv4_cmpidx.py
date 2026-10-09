@@ -291,7 +291,21 @@ def main(path):
             continue
         if tag == "C4ST":
             print("\n== [C4ST] c4 compress STATE rows (indexer idx=1, per-block) ==")
-            report_blkx(rows, "C4ST.idx1", keep=lambda r: r.get("idx") == "1")
+            report_blkx(
+                rows,
+                "C4ST.idx1.pre",
+                keep=lambda r: r.get("idx") == "1" and r.get("tag") == "pre",
+            )
+            report_blkx(
+                rows,
+                "C4ST.idx1.post",
+                keep=lambda r: r.get("idx") == "1" and r.get("tag") == "post",
+            )
+            report_blkx(
+                rows,
+                "C4ST.idx1.any",
+                keep=lambda r: r.get("idx") == "1" and not r.get("tag"),
+            )
             continue
         if tag == "IDXIN":
             print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")

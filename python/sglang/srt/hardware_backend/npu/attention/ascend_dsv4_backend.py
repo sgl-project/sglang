@@ -554,55 +554,67 @@ class CompressorAscendBackendMixin:
         # DSV4_DUMP_C4ST = layer id or "all". Only meaningful for the INDEXER
         # compressor (idx=1) which produces the c4 index-K.
         _want_st = os.environ.get("DSV4_DUMP_C4ST")
-        if _want_st and (
-            _want_st in ("all", "") or _want_st == str(compressor.layer_id)
-        ):
-            try:
-                import hashlib as _hlst
 
-                _hist = coff * ratio
-                _width = int(state_block_table.shape[1])
-                _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
-                _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
-                _flat = (
-                    state_cache.reshape(-1, state_cache.shape[-1])
-                    .detach()
-                    .to("cpu")
-                )
-                _rows_n = _flat.shape[0]
-                _by_blk = {}
-                for _b in range(_tbl_cpu.shape[0]):
-                    _base = int(_sp[_b]) - _hist
-                    for _c in range(_width):
-                        _p = _base + _c
-                        if _p < 0:
-                            continue
-                        _sl = int(_tbl_cpu[_b, _c])
-                        if _sl < 0 or _sl >= _rows_n:
-                            continue
-                        _by_blk.setdefault(_p // 128, []).append(_sl)
-                _out = []
-                _locx = []
-                for _bk in sorted(_by_blk):
-                    _locs = sorted(set(_by_blk[_bk]))
-                    _idxs = torch.tensor(_locs, dtype=torch.int64)
-                    _r = _flat.index_select(0, _idxs)
-                    _h = _hlst.md5(
-                        _r.detach().to(torch.float32).cpu().numpy().tobytes()
-                    ).hexdigest()[:16]
-                    _out.append(f"{_bk}:{_h}")
-                    # S195: raw state SLOT ids per block -> tells LOC (slots
-                    # identical across suffix blocks) vs CONTENT (distinct slots,
-                    # identical content) apart.
-                    _locx.append(f"{_bk}:n{len(_locs)}:{_locs[:6]}")
-                print(
-                    f"[C4ST] layer={compressor.layer_id} "
-                    f"idx={int(compressor.is_in_indexer)} start={_sp.tolist()} "
-                    f"rows={_rows_n} blkx={_out[-10:]} locx={_locx[-10:]}",
-                    flush=True,
-                )
+        def _c4st_probe(_tag):
+            import hashlib as _hlst
+
+            _hist = coff * ratio
+            _width = int(state_block_table.shape[1])
+            _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+            _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
+            _flat = (
+                state_cache.reshape(-1, state_cache.shape[-1])
+                .detach()
+                .to("cpu")
+            )
+            _rows_n = _flat.shape[0]
+            _by_blk = {}
+            for _b in range(_tbl_cpu.shape[0]):
+                _base = int(_sp[_b]) - _hist
+                for _c in range(_width):
+                    _p = _base + _c
+                    if _p < 0:
+                        continue
+                    _sl = int(_tbl_cpu[_b, _c])
+                    if _sl < 0 or _sl >= _rows_n:
+                        continue
+                    _by_blk.setdefault(_p // 128, []).append(_sl)
+            _out = []
+            _locx = []
+            for _bk in sorted(_by_blk):
+                _locs = sorted(set(_by_blk[_bk]))
+                _idxs = torch.tensor(_locs, dtype=torch.int64)
+                _r = _flat.index_select(0, _idxs)
+                _h = _hlst.md5(
+                    _r.detach().to(torch.float32).cpu().numpy().tobytes()
+                ).hexdigest()[:16]
+                _out.append(f"{_bk}:{_h}")
+                # S195: raw state SLOT ids per block -> tells LOC (slots
+                # identical across suffix blocks) vs CONTENT (distinct slots,
+                # identical content) apart.
+                _locx.append(f"{_bk}:n{len(_locs)}:{_locs[:6]}")
+            print(
+                f"[C4ST] layer={compressor.layer_id} "
+                f"idx={int(compressor.is_in_indexer)} start={_sp.tolist()} "
+                f"rows={_rows_n} blkx={_out[-10:]} locx={_locx[-10:]} tag={_tag}",
+                flush=True,
+            )
+
+        _c4st_on = bool(_want_st) and (
+            _want_st in ("all", "") or _want_st == str(compressor.layer_id)
+        )
+        # S197: read the c4/index-K compress STATE at the op input (pre) AND at
+        # the op output (post, stateGm is written in-place by the op). Pre-on-hit
+        # = the state REUSED from the prefix; post-on-miss = the state the op
+        # itself just computed for the SAME absolute block. If block 127 / the
+        # suffix blocks differ post-op between hit and miss => the reused
+        # (prefix-written) boundary state is stale (candidate A); if identical
+        # => the divergence is inside the closed compressor op (candidate B-op).
+        if _c4st_on:
+            try:
+                _c4st_probe("pre")
             except Exception as _exc:
-                print(f"[C4ST] skipped: {_exc}", flush=True)
+                print(f"[C4ST] pre skipped: {_exc}", flush=True)
 
         import os
 
@@ -713,6 +725,13 @@ class CompressorAscendBackendMixin:
             rotary_mode=2,
             cache_mode=2,
         )
+
+        # S197: POST-op read of the same state (the op writes stateGm in-place).
+        if _c4st_on:
+            try:
+                _c4st_probe("post")
+            except Exception as _exc:
+                print(f"[C4ST] post skipped: {_exc}", flush=True)
 
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
