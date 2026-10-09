@@ -57,3 +57,47 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     ]
     assert "style" not in base.patches  # the upstream model is not mutated
     assert set(second.patches) == {"style", "detail"}
+
+
+def test_switching_and_dropping_loras_sends_exact_active_set() -> None:
+    nodes = _load_nodes()
+    calls = []
+    executor = SimpleNamespace(set_lora=lambda **kwargs: calls.append(kwargs))
+    base = _Model(executor)
+    loader = nodes.SGLDLoraLoader()
+
+    def names(call):
+        return call["lora_nickname"]
+
+    (a,) = loader.load_lora(base, "a.safetensors", 1.0, nickname="a")
+    (ab,) = loader.load_lora(a, "b.safetensors", 0.5, nickname="b")
+    (abc,) = loader.load_lora(ab, "c.safetensors", 0.7, nickname="c")
+    assert names(calls[-1]) == ["a", "b", "c"]
+
+    # Reducing: a branch that stops after "a" must send only "a".
+    (a2,) = loader.load_lora(base, "a.safetensors", 1.0, nickname="a")
+    assert names(calls[-1]) == ["a"]
+
+    # Switching: a different chain from the same base drops the earlier ones.
+    (xy,) = loader.load_lora(
+        loader.load_lora(base, "x.safetensors", 1.0, nickname="x")[0],
+        "y.safetensors",
+        0.3,
+        nickname="y",
+    )
+    assert names(calls[-1]) == ["x", "y"]
+    assert calls[-1]["strength"] == [1.0, 0.3]
+
+    # Going back to an earlier chain restores exactly its set.
+    loader.load_lora(ab, "d.safetensors", 1.0, nickname="d")
+    assert names(calls[-1]) == ["a", "b", "d"]
+
+    # Re-applying the same nickname replaces its strength, not duplicates it.
+    (a3,) = loader.load_lora(abc, "a.safetensors", 0.2, nickname="a")
+    assert names(calls[-1]) == ["a", "b", "c"]
+    assert calls[-1]["strength"] == [0.2, 0.5, 0.7]
+
+    # No branch leaked into the shared base or its siblings.
+    assert base.patches == {}
+    assert set(a.patches) == {"a"} and set(ab.patches) == {"a", "b"}
+    assert set(a2.patches) == {"a"} and set(xy.patches) == {"x", "y"}
