@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import random
@@ -267,6 +268,16 @@ def process_tracing_init(
 
 def get_global_tracing_enabled():
     return opentelemetry_initialized
+
+
+def fastapi_telemetry_disabled_kwargs() -> Dict[str, Any]:
+    # FastAPI >= 0.142 traces every request once a global tracer provider is set,
+    # which tracing init does; sglang's own spans already honor the trace level.
+    from fastapi import FastAPI
+
+    if "telemetry" not in inspect.signature(FastAPI).parameters:
+        return {}
+    return {"telemetry": {"tracing": False, "metrics": False, "logs": False}}
 
 
 def get_otlp_span_exporter(endpoint):
