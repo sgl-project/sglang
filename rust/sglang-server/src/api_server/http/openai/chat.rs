@@ -14,7 +14,7 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
+use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -26,8 +26,8 @@ use dynamo_protocols::types::{
 use futures::StreamExt;
 use serde::Deserialize;
 use sglang_processor::{
-    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, dynamo_tool_parser_name,
-    split_reasoning,
+    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
+    tool_call_stream,
 };
 
 use super::completions::completion_usage;
@@ -744,13 +744,13 @@ pub(super) fn chat_event_stream(
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
-        Box::pin(apply_tool_calling_jail(
-            Some(dynamo_tool_parser_name(&parser).to_owned()),
+        tool_call_stream(
+            &parser,
             tool_choice,
             tools,
             uses_tool_call_structural_tag,
             raw,
-        ))
+        )
     } else {
         Box::pin(raw)
     };
