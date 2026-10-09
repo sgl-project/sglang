@@ -41,11 +41,14 @@ class ExpertLocationDispatchInfo:
     @classmethod
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
-        expert_location_metadata = get_global_expert_location_metadata()
-        assert expert_location_metadata is not None
-
         if ep_dispatch_algorithm is None:
             return None
+
+        expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None, (
+            "no expert location metadata: the model class is missing "
+            "get_model_config_for_expert_location"
+        )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
