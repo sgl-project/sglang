@@ -9,6 +9,7 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -155,7 +156,10 @@ def _should_use_channels_last_3d(
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
     if (
-        isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
+        isinstance(
+            pipeline_config,
+            (WanT2V480PConfig, LTX2PipelineConfig, Cosmos3Config),
+        )
         and server_args.num_gpus == 1
     ):
         return True
