@@ -112,13 +112,14 @@ def compare(tag, a_steps, b_steps):
     return n_lp, same_shape, prefill, n_pre
 
 
-def report_group(rows, key, label):
+def report_group(rows, key, label, extra=()):
     """Order-independent verdict for any md5-carrying tag.
 
     All requests are deterministic, so at a given (ntok, lastpos, layer) the
     ``key`` value (md5 / logical) must be a SINGLE value across all requests.
     A group with >1 distinct value is a REAL divergence at that layer/step.
     Needs no request segmentation (robust to warmup/interleaving).
+    ``extra`` appends more fields to the signature (e.g. nblk/ptab).
     """
     groups = defaultdict(set)
     have_ntok = any("ntok" in r for r in rows)
@@ -126,6 +127,8 @@ def report_group(rows, key, label):
         v = r.get(key)
         if v is None or v == "empty":
             continue
+        if extra:
+            v = "|".join([str(v)] + [f"{e}={r.get(e, '?')}" for e in extra])
         try:
             lp = int(r.get("lastpos", "-1"))
         except (TypeError, ValueError):
@@ -202,7 +205,7 @@ def main(path):
             continue
         if tag == "C128KV":
             print("\n== [C128KV] c128 compressed-KV (order-independent) ==")
-            report_group(rows, "logical", "C128KV")
+            report_group(rows, "logical", "C128KV", extra=("nblk", "ptab"))
             continue
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")

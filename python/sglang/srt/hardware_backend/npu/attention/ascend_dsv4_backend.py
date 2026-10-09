@@ -2702,14 +2702,25 @@ class DeepseekV4AscendAttnBackend(
                     _lo = int(_os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
                     _hi = int(_os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
                     if _lo <= _lp <= _hi:
+                        import hashlib as _hl
+
                         _ntok = int(forward_batch.positions.numel())
                         _pages = int(cmp_kv.shape[0])
-                        _logical = _read_page_table_md5(
-                            cmp_kv, getattr(fm, "c128_page_table", None), _pages
-                        )
+                        _tbl = getattr(fm, "c128_page_table", None)
+                        _logical = _read_page_table_md5(cmp_kv, _tbl, _pages)
+                        _nblk = 0
+                        _ptab = "none"
+                        if torch.is_tensor(_tbl) and _tbl.numel():
+                            _t = _tbl.reshape(_tbl.shape[0], -1)[0].to(torch.int64)
+                            _valid = _t[(_t >= 0) & (_t < _pages)]
+                            _nblk = int(_valid.numel())
+                            _ptab = _hl.md5(
+                                _valid.contiguous().numpy().tobytes()
+                            ).hexdigest()[:16]
                         print(
                             f"[C128KV] layer={layer.layer_id} lastpos={_lp} "
-                            f"ntok={_ntok} pages={_pages} logical={_logical}",
+                            f"ntok={_ntok} pages={_pages} nblk={_nblk} "
+                            f"ptab={_ptab} logical={_logical}",
                             flush=True,
                         )
                 except Exception as _exc:
