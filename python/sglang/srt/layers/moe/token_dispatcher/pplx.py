@@ -187,14 +187,24 @@ class PplxAllToAllManager:
         return cls._all_to_all
 
 
-def _route_padded_slots(topk_ids: torch.Tensor, topk_weights: torch.Tensor):
-    # pplx-kernels has no skip for -1 (padded rows), so send each one to a
-    # distinct expert with zero weight; distinct keeps per-expert capacity.
+def _pplx_routing(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (indices, weights, bound_m) for pplx dispatch/combine.
+
+    pplx-kernels has no skip for topk_ids == -1. Padded rows are all -1 and
+    form a suffix, so bound_m stops the kernel before them. Any other -1 slot
+    is sent to a distinct expert with zero weight (distinct keeps per-expert
+    capacity). Dispatch and combine must derive bound_m from the same ids.
+    """
     invalid = topk_ids < 0
+    bound_m = (~invalid).any(dim=1).sum().to(torch.uint32).reshape(1)
     fill = torch.arange(
         topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
     ).expand_as(topk_ids)
-    return torch.where(invalid, fill, topk_ids), topk_weights.masked_fill(invalid, 0.0)
+    indices = torch.where(invalid, fill, topk_ids).to(torch.uint32)
+    weights = topk_weights.masked_fill(invalid, 0.0).to(torch.float32)
+    return indices, weights, bound_m
 
 
 class _PplxDispatcherImpl:
@@ -293,8 +303,6 @@ class _PplxDispatcherImpl:
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids, topk_weights = _route_padded_slots(topk_ids, topk_weights)
-
         ata = self._get_all_to_all()
 
         num_tokens = hidden_states.shape[0]
@@ -328,8 +336,7 @@ class _PplxDispatcherImpl:
                 device=device,
             )
 
-        bound_m = torch.full((1,), num_tokens, dtype=torch.uint32, device=device)
-        indices = topk_ids.to(torch.uint32)
+        indices, _, bound_m = _pplx_routing(topk_ids, topk_weights)
 
         ata.dispatch(
             out_expert_num_tokens=out_expert_num_tokens,
@@ -397,12 +404,12 @@ class _PplxDispatcherImpl:
             device=device,
         )
 
-        bound_m = torch.full((1,), num_tokens, dtype=torch.uint32, device=device)
+        indices, weights, bound_m = _pplx_routing(topk_ids, topk_weights)
 
         ata.combine(
             out_tokens=out_tokens,
-            indices=topk_ids.to(torch.uint32),
-            weights=topk_weights.to(torch.float32),
+            indices=indices,
+            weights=weights,
             expert_y=hidden_states,
             bound_m=bound_m,
         )
