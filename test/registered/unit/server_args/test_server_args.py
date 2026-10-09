@@ -2216,6 +2216,28 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "unified_memory_with_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_mem_layout": "page_first_direct",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "unified_memory_mooncake_with_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
                 "name": "fa3_kernel_with_explicit_decode_backend",
                 "overrides": {
                     "enable_hierarchical_cache": True,

@@ -65,6 +65,7 @@ class TestHiCacheStridedDeviceRows(unittest.TestCase):
                     device="cpu",
                     allocator_type="default",
                 )
+                self.addCleanup(host.destroy)
                 if not host.can_use_jit:
                     self.skipTest("strided device rows need the JIT HiCache kernels")
 
@@ -89,6 +90,27 @@ class TestHiCacheStridedDeviceRows(unittest.TestCase):
                 # The staged write-back reads whole device pages: packed rows only.
                 self.assertEqual(host.device_row_stride_bytes, _E * 2)
                 self.assertFalse(host.can_use_write_back_jit)
+
+    def test_direct_page_first_direct_rejects_strided_rows(self):
+        # Its page copies assume packed rows and would overrun neighbours.
+        device = _strided_device_pool()
+        host = MHATokenToKVPoolHost(
+            device_pool=device,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=1,
+            layout="page_first_direct",
+            pin_memory=True,
+            device="cpu",
+            allocator_type="default",
+        )
+        self.addCleanup(host.destroy)
+        src = torch.tensor([3, 7], device="cuda")
+        host_slots = host.alloc(len(src)).to("cuda")
+        with self.assertRaisesRegex(NotImplementedError, "direct_lf_pf"):
+            host.backup_from_device_all_layer(device, host_slots, src, "direct")
+        with self.assertRaisesRegex(NotImplementedError, "direct_pf_lf"):
+            host.load_to_device_per_layer(device, host_slots, src, 0, "direct")
 
 
 if __name__ == "__main__":
