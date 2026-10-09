@@ -44,16 +44,6 @@ def _module(n, k):
     )
 
 
-@cache_once
-def _module_m4():
-    return load_jit(
-        "sm120_lossless_bf16_head_m4",
-        cuda_files=["gemm/sm120_lossless_bf16_head_m4.cuh"],
-        cuda_wrappers=[("run", "sglang::LosslessHeadTc4::run")],
-        extra_cuda_cflags=["-O3"],
-    )
-
-
 def _pack_bf16(weight):
     """CPU-only preprocessing; preserve all 65536 possible BF16 bit patterns."""
     if weight.ndim != 2 or weight.dtype != torch.bfloat16 or weight.shape[1] % 256:
@@ -162,8 +152,6 @@ def prepare_lossless_bf16_head(layer):
 
 
 def try_lossless_bf16_head(x, layer):
-    from sglang.srt.environ import envs
-
     source = getattr(layer, "_lossless_bf16_source", None)
     if (
         not lossless_bf16_head_enabled()
@@ -171,10 +159,7 @@ def try_lossless_bf16_head(x, layer):
         or source() is not layer.weight
         or x.ndim != 2
         or x.shape[1] != 4096
-        or not (
-            x.shape[0] == 1
-            or (x.shape[0] == 4 and envs.SGLANG_SM120_LOSSLESS_BF16_HEAD_M4.get())
-        )
+        or x.shape[0] != 1
         or x.dtype != torch.bfloat16
         or x.device != layer.weight.device
         or not x.is_contiguous()
@@ -182,6 +167,6 @@ def try_lossless_bf16_head(x, layer):
     ):
         return None
     out = torch.empty((x.shape[0], 131072), dtype=x.dtype, device=x.device)
-    module = _module(131072, 4096) if x.shape[0] == 1 else _module_m4()
+    module = _module(131072, 4096)
     module.run(x, layer._lossless_bf16_payload, layer._lossless_bf16_metadata, out)
     return out

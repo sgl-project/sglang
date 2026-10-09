@@ -1587,84 +1587,6 @@ class FlashInferAttnBackend(AttentionBackend):
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
 
-def _try_compact_draft_decode_plan(
-    wrapper,
-    indptr,
-    indices,
-    last_page_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    indptr_host,
-    fixed_split_size=None,
-    disable_split_kv=False,
-):
-    """Prepare the same fa2 plan from resolved CPU page-one lengths.
-
-    The graph's metadata producer already writes the live indptr/indices/last
-    page buffers. Recompute the native plan on every call, including rollback;
-    only avoid temporary dtype tensors and page-one length arithmetic.
-    """
-    batch_size = len(last_page_len)
-    if not (
-        wrapper.is_cuda_graph_enabled
-        and wrapper.use_tensor_cores
-        and getattr(wrapper, "_backend", None) == "fa2"
-        and getattr(wrapper, "_q_len_per_req", None) == 1
-        and getattr(wrapper, "_cached_module", None) is not None
-        and batch_size == wrapper._fixed_batch_size
-        and len(indices) <= len(wrapper._paged_kv_indices_buf)
-        and indptr_host is not None
-        and indptr_host.device.type == "cpu"
-        and indptr_host.dtype == torch.int32
-        and indptr_host.ndim == 1
-        and indptr_host.numel() == batch_size + 1
-        and indptr_host.is_contiguous()
-        and indptr.data_ptr() == wrapper._paged_kv_indptr_buf.data_ptr()
-        and indices.data_ptr() == wrapper._paged_kv_indices_buf.data_ptr()
-        and last_page_len.data_ptr() == wrapper._paged_kv_last_page_len_buf.data_ptr()
-    ):
-        return False
-    qo_host = getattr(wrapper, "_sglang_draft_qo_host", None)
-    if qo_host is None:
-        qo_host = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
-        wrapper._sglang_draft_qo_host = qo_host
-    # This updater uses page_size=1 and last_page_len=1 for every sequence.
-    # Hence get_seq_lens(indptr_host, ones, 1) is exactly this difference.
-    kv_lens_host = indptr_host[1:] - indptr_host[:-1]
-    with torch.cuda.device(wrapper.device):
-        wrapper._plan_info = wrapper._cached_module.plan(
-            wrapper._float_workspace_buffer,
-            wrapper._int_workspace_buffer,
-            wrapper._pin_memory_int_workspace_buffer,
-            qo_host,
-            indptr_host,
-            kv_lens_host,
-            batch_size,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            1,
-            True,
-            head_dim,
-            head_dim,
-            False,
-            -1,
-            fixed_split_size if fixed_split_size is not None else -1,
-            disable_split_kv,
-            0,
-            0,
-        )
-    wrapper._q_len_per_req = 1
-    wrapper._pos_encoding_mode = "NONE"
-    wrapper._window_left = -1
-    wrapper._logits_soft_cap = 0.0
-    wrapper._sm_scale = None
-    wrapper._rope_scale = None
-    wrapper._rope_theta = None
-    return True
-
-
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -1914,40 +1836,24 @@ class FlashInferIndicesUpdaterDecode:
         )
 
         if wrapper_uses_fast_decode_plan:
-            compact = (
-                envs.SGLANG_FLASHINFER_DRAFT_COMPACT_PLAN.get()
-                and spec_info is not None
-                and _try_compact_draft_decode_plan(
-                    wrapper,
-                    kv_indptr,
-                    kv_indices,
-                    self.kv_last_page_len[:bs],
-                    self.num_qo_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    global_override_indptr_cpu,
-                    fixed_split_size,
-                    disable_split_kv if disable_split_kv is not None else False,
-                )
+            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+                global_override_indptr_cpu=global_override_indptr_cpu,
             )
-            if not compact:
-                wrapper.begin_forward(
-                    kv_indptr,
-                    kv_indices,
-                    self.kv_last_page_len[:bs],
-                    self.num_qo_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    1,
-                    data_type=self.data_type,
-                    q_data_type=self.q_data_type,
-                    non_blocking=True,
-                    fixed_split_size=fixed_split_size,
-                    disable_split_kv=(
-                        disable_split_kv if disable_split_kv is not None else False
-                    ),
-                    global_override_indptr_cpu=global_override_indptr_cpu,
-                )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
             wrapper.begin_forward(

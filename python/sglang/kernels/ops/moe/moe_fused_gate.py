@@ -414,25 +414,33 @@ def moe_fused_gate(
 
     if (
         envs.SGLANG_SM120_MTP_ROUTER_TOP22.get()
+        and scores.is_cuda
+        and torch.cuda.get_device_capability(scores.device) == (12, 0)
+        and 2 <= scores.shape[0] <= 16
+        and scores.shape[1] == 512
+        and scores.dtype == torch.float32
+        and scores.stride(1) == 1
+        and bias is not None
+        and bias.dtype == torch.float32
+        and bias.is_contiguous()
+        and topk == 22
         and scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
     ):
         from sglang.kernels.ops.moe.sm120_topk_gate_small_m import (
-            covered,
             topk_gate_small_m,
         )
 
-        if covered(scores, bias, topk):
-            return topk_gate_small_m(
-                scores,
-                bias,
-                topk=topk,
-                renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
+        return topk_gate_small_m(
+            scores,
+            bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
 
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this

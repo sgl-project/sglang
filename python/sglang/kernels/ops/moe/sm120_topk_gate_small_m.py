@@ -61,6 +61,7 @@ def topk_gate_small_m(
     routed_scaling_factor=1.0,
     apply_routed_scaling_factor_on_output=False,
 ):
+    assert scores.is_cuda and bias.device == scores.device
     assert scores.ndim == 2 and scores.shape[1] == 512
     assert scores.dtype == torch.float32
     assert 1 <= scores.shape[0] <= 16
@@ -85,21 +86,3 @@ def topk_gate_small_m(
         **({"launch_pdl": True} if pdl else {}),
     )
     return weights, ids
-
-
-def covered(scores, bias, topk):
-    return (
-        scores.is_cuda
-        and scores.ndim == 2
-        and 2 <= scores.shape[0] <= 16
-        and scores.shape[1] == 512
-        and scores.dtype == torch.float32
-        and scores.stride(1) == 1
-        and bias is not None
-        and bias.device == scores.device
-        and bias.dtype == torch.float32
-        and bias.shape == (512,)
-        and bias.is_contiguous()
-        and topk == 22
-        and torch.cuda.get_device_capability(scores.device) == (12, 0)
-    )

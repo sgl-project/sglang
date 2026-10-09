@@ -65,7 +65,6 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     w2_blockscale_plain: Optional[torch.Tensor] = None
     is_gated: bool = True
     activation: Optional[str] = None
-    lossless_bf16_buffers: Optional[tuple[torch.Tensor, ...]] = None
     pair_w2_weight: Optional[torch.Tensor] = None
 
 
@@ -301,75 +300,6 @@ def _run_flashinfer_cutlass(
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
-
-    if (
-        envs.SGLANG_SM120_BF16_MOE_UNION.get()
-        and quant_info.quant_type == "bf16"
-        and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
-        and quant_info.w13_weight.shape == (512, 2688, 1024)
-        and quant_info.w2_weight.shape == (512, 1024, 2688)
-        and quant_info.w13_weight.dtype == quant_info.w2_weight.dtype == torch.bfloat16
-        and quant_info.w13_weight.is_contiguous()
-        and quant_info.w2_weight.is_contiguous()
-        and not runner_config.is_gated
-        and runner_config.activation == "relu2"
-        and x.ndim == 2
-        and 1 <= x.shape[0] <= 4
-        and x.shape[1] == 1024
-        and x_sf is None
-        and x.dtype == output_dtype == torch.bfloat16
-        and x.is_contiguous()
-        and quant_info.moe_ep_size == quant_info.moe_tp_size == 1
-        and not enable_alltoall
-        and topk_ids.shape == topk_weights.shape == (x.shape[0], 22)
-        and topk_ids.dtype == torch.int32
-        and topk_weights.dtype == torch.float32
-        and topk_ids.is_contiguous()
-        and topk_weights.is_contiguous()
-        and is_sm120()
-        and not _flashinfer_autotune_active()
-    ):
-        from sglang.kernels.ops.gemm.sm120_bf16_moe_union import bf16_moe_union
-
-        output = bf16_moe_union(
-            x,
-            quant_info.w13_weight,
-            quant_info.w2_weight,
-            topk_ids,
-            topk_weights,
-            out=output,
-        )
-        return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
-
-    if (
-        envs.SGLANG_SM120_LOSSLESS_BF16_MOE.get()
-        and quant_info.quant_type == "bf16"
-        and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
-        and quant_info.lossless_bf16_buffers is not None
-        and not runner_config.is_gated
-        and runner_config.activation == "relu2"
-        and x.ndim == 2
-        and 1 <= x.shape[0] <= 4
-        and x.shape[1] == 1024
-        and x_sf is None
-        and x.dtype == output_dtype == torch.bfloat16
-        and x.is_contiguous()
-        and quant_info.moe_ep_size == quant_info.moe_tp_size == 1
-        and not enable_alltoall
-        and topk_ids.shape == topk_weights.shape == (x.shape[0], 22)
-        and topk_ids.dtype == torch.int32
-        and topk_weights.dtype == torch.float32
-        and topk_ids.is_contiguous()
-        and topk_weights.is_contiguous()
-        and is_sm120()
-        and not _flashinfer_autotune_active()
-    ):
-        from sglang.kernels.ops.gemm.sm120_lossless_bf16_moe import lossless_bf16_moe
-
-        output = lossless_bf16_moe(
-            x, quant_info.lossless_bf16_buffers, topk_ids, topk_weights, out=output
-        )
-        return _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
 
     # Native small-M NVFP4 MoE uses the actual CUTLASS-swizzled scales.
     if (
