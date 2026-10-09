@@ -14,6 +14,7 @@ from sglang.srt.layers.layer_boundary import (
     BatchVariant,
     ExitRows,
     ProducerReduction,
+    ReadoutFusion,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -25,6 +26,11 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_gather_input,
     keep_output,
     update_attn_tp_gather_output,
+)
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    PLAIN_ADD,
+    REPLACE_AT_EXIT,
+    NormQuantReadout,
 )
 from sglang.srt.layers.rotary_embedding import factory as rope_factory
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -449,6 +455,171 @@ class TestUnpaddedBatches(CustomTestCase):
                 )
                 _, ffn, _, _ = self.build(parallel, sparse=True)
                 self.assertNotIn(BatchVariant.UNPADDED, ffn.plan.paths)
+
+
+class TestSliceExitRows(CustomTestCase):
+    """An FFN on this rank's attention-TP slice that declares ExitRows.SLICE
+    leaves its output there, the stack's last one too, where the final read
+    then takes it; the next layer's attention reads it there and gathers what
+    it read, in the declared gather when that takes the batch."""
+
+    def build(self, exit_rows, *, disable_attn_tp_gather=False, gather=None):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=2, disable_attn_tp_gather=disable_attn_tp_gather
+        )
+        with fixture.planning(parallel, a2a=True, boundary_reduction="ar"):
+            with layer_stack():
+                return [
+                    stage
+                    for idx in range(2)
+                    for stage in append_stages(
+                        (
+                            declare_attn(attn_tp_gather=gather if idx else None),
+                            fixture.Norm(),
+                        ),
+                        (
+                            declare_ffn(
+                                sparse=True,
+                                next_layer_sparse=True,
+                                exit_rows=exit_rows,
+                            ),
+                            fixture.Norm(),
+                        ),
+                    )
+                ]
+
+    def test_the_last_ffn_stays_on_its_slice(self):
+        for exit_rows in (ExitRows.SLICE, None):
+            with self.subTest(exit_rows=exit_rows):
+                last = self.build(exit_rows)[-1].plan.paths[BatchVariant.ORDINARY]
+                if exit_rows is ExitRows.SLICE:
+                    self.assertIs(last.output_move, keep_output)
+                else:
+                    self.assertIs(last.output_move.func, update_attn_tp_gather_output)
+
+    def test_an_unpadded_batch_leaves_the_last_ffn_on_the_attention_rows(self):
+        last = self.build(ExitRows.SLICE, disable_attn_tp_gather=True)[-1]
+        unpadded = last.plan.paths[BatchVariant.UNPADDED]
+        self.assertEqual(unpadded.output.layout.sharded, frozenset())
+        self.assertIs(unpadded.output_move, keep_output)
+
+    def test_the_next_attention_gathers_in_the_declared_gather(self):
+        def gather(hidden_states):
+            return None
+
+        _, _, attention, _ = self.build(ExitRows.SLICE, gather=gather)
+        move = attention.plan.paths[BatchVariant.ORDINARY].entry.input_move
+        self.assertIs(move.func, attn_tp_gather_input)
+        self.assertIs(move.keywords["gather"], gather)
+
+    def test_a_read_that_gathers_needs_a_plain_add_or_a_written_stream(self):
+        def gather_read(hidden_states, residual, norm):
+            return None
+
+        class GatheringRead(NormQuantReadout):
+            gathering_reads = (gather_read,)
+
+        class Scaled:
+            """Neither a plain add nor applied at the producer's exit."""
+
+            is_plain_add = False
+            applied_at_exit = False
+            outlives_layer = True
+
+        # One pipeline rank: an update other than a plain add can't cross one.
+        parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1)
+        for update, binds in (
+            (PLAIN_ADD, True),
+            (REPLACE_AT_EXIT, True),
+            (Scaled(), False),
+        ):
+            with self.subTest(update=type(update).__name__):
+                with (
+                    fixture.planning(parallel, a2a=True, boundary_reduction="ar"),
+                    layer_stack(),
+                ):
+                    stages = [
+                        stage
+                        for _ in range(2)
+                        for stage in append_stages(
+                            (declare_attn(read=GatheringRead()), fixture.Norm()),
+                            (
+                                declare_ffn(
+                                    sparse=True,
+                                    next_layer_sparse=True,
+                                    update=update,
+                                    exit_rows=ExitRows.SLICE,
+                                ),
+                                fixture.Norm(),
+                            ),
+                        )
+                    ]
+                # The stack binds its stages when it closes.
+                entry = stages[2].plan.paths[BatchVariant.ORDINARY].entry
+                self.assertEqual(
+                    entry.prepare.keywords["step"].keywords["read_gathers"],
+                    (gather_read,) if binds else (),
+                )
+
+
+class TestReadKernels(CustomTestCase):
+    """The entry steps around a read's own kernels: one that reads and gathers
+    hands its input to the entry's gather as already gathered, and one that
+    completes the sum and reads returns the read."""
+
+    def test_a_read_that_gathers_passes_through_the_entry_gather(self):
+        gathered = torch.ones(4, 8)
+
+        class Read:
+            def read(self, residual, norm, quant_format=""):
+                return residual * 2, residual
+
+        def takes(hidden_states, residual, norm):
+            return gathered, None
+
+        def declines(hidden_states, residual, norm):
+            return None
+
+        shard = torch.randn(2, 8)
+        common = dict(pre_move=None, enters_stack=False, read=Read())
+        got, residual = boundary_prepare._update_read(
+            shard, None, None, None, read_gathers=(declines, takes), **common
+        )
+        self.assertIs(attn_tp_gather_input(got, None), gathered)
+        self.assertIsNone(residual)
+        got, residual = boundary_prepare._update_read(
+            shard, None, None, None, read_gathers=(declines,), **common
+        )
+        torch.testing.assert_close(got, shard * 2, rtol=0, atol=0)
+
+    def test_a_kernel_that_reads_returns_the_read(self):
+        read_result = (torch.zeros(2, 8), torch.ones(2, 8))
+
+        def reads(takes):
+            def run(hidden_states, residual, forward_batch, norm):
+                return read_result if takes else None
+
+            return ReadoutFusion(SumGroup.ATTN_TP, run, scatters=True, reads=True)
+
+        class Read:
+            def update_and_read(self, update, hidden_states, residual, norm):
+                return "boundary", residual
+
+        class Update:
+            def slice_residual_attn_tp(self, residual):
+                return residual[:2]
+
+        call = dict(scatters_residual=True, read=Read(), update=Update())
+        hidden, residual = torch.randn(4, 8), torch.randn(4, 8)
+        with patch.object(boundary_prepare, "attn_tp_reduce_scatter", lambda h: h[:2]):
+            got = boundary_prepare._attn_tp_reduce_scatter_update_read(
+                hidden, residual, None, None, read_fusions=(reads(True),), **call
+            )
+            self.assertIs(got, read_result)
+            got, _ = boundary_prepare._attn_tp_reduce_scatter_update_read(
+                hidden, residual, None, None, read_fusions=(reads(False),), **call
+            )
+            self.assertEqual(got, "boundary")
 
 
 class TestDenseFfnOverAttentionTp(CustomTestCase):

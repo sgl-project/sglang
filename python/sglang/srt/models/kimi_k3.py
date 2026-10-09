@@ -51,6 +51,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layer_boundary import (
     ExitRows,
+    ReadoutFusion,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -142,7 +144,9 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_spec,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -426,6 +430,48 @@ def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
     optional quant-method capability; only the unquantized method has it."""
     return getattr(o_proj.quant_method, "apply_into", None) is not None
+
+
+def _k3_all_reduce_add(hidden_states, residual, forward_batch):
+    """o_proj's attention-TP sum with the pending residual add in K3's fused
+    all-reduce, for an output o_proj wrote into its multicast buffer."""
+    if k3_ar_fusion.find_mc_ptr(hidden_states) is None:
+        return None
+    return k3_ar_fusion.all_reduce(hidden_states, residual)
+
+
+def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
+    """o_proj's attention-TP sum onto this rank's slice with the pending
+    residual add, in K3's tuned reduce-scatter when it takes the batch."""
+    return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
+
+
+def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
+    """o_proj under SP-MoE."""
+    # o_proj emits TP-partial sums, which the stage boundary completes.
+    o_proj.reduce_results = False
+    if k3_sp_collective.enabled():
+        # The table selects NVLS pull RS for larger token buckets.
+        # Only those o_proj outputs come from the persistent symmetric
+        # buffer; small push RS keeps the regular graph allocator.
+        _sp_inner_o_proj_forward = o_proj.forward
+
+        def _sp_o_proj_forward(x, *args, **kwargs):
+            output_rows = x.shape[0]
+            if k3_sp_collective.requires_symmetric_rs(
+                output_rows, x.device, x.element_size()
+            ):
+                output = k3_sp_collective.get_o_proj_output_buffer(
+                    output_rows, x.dtype, o_proj.output_size
+                )
+                result = _sp_inner_o_proj_forward(
+                    x, *args, output_tensor=output[: x.shape[0]], **kwargs
+                )
+                k3_sp_collective.register_o_proj_output(result[0], output)
+                return result
+            return _sp_inner_o_proj_forward(x, *args, **kwargs)
+
+        o_proj.forward = _sp_o_proj_forward
 
 
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
@@ -1546,6 +1592,7 @@ class KimiK3DeltaAttention(nn.Module):
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         reduce_results: bool = True,
+        sp_moe: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1818,7 +1865,7 @@ class KimiK3DeltaAttention(nn.Module):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = True
+            self.o_proj.reduce_results = reduce_results
             self.o_proj.use_dp_attention_reduce = True
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -1841,6 +1888,8 @@ class KimiK3DeltaAttention(nn.Module):
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
+        if sp_moe:
+            _route_sp_o_proj_output(self.o_proj)
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -2200,6 +2249,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
         reduce_results: bool = True,
+        sp_moe: bool = False,
     ) -> None:
         # ModelSlim can quantize K3 latent projections while still storing
         # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
@@ -2276,7 +2326,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.reduce_results = True
+            self.o_proj.reduce_results = reduce_results
             self.o_proj.use_dp_attention_reduce = True
         if self.all_reduce_fusion:
             # Hand the GEMM a slice of the persistent symmetric buffer
@@ -2350,6 +2400,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+        if sp_moe:
+            _route_sp_o_proj_output(self.o_proj)
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -2445,17 +2497,34 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
-    """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. The layer's own communication still runs for: an
-    attention-residual bank whose o_proj all-reduce is fused with the pending
-    add, or whose MoE on its attention-TP token shard (SP-MoE) uses K3's tuned
-    SP collectives, which the sharded carry also needs."""
-    if _fuses_attn_all_reduce(config):
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
+    """Whether consecutive SP-MoE layers keep the stream and the
+    attention-residual bank on each rank's attention-TP shard of the rows
+    (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
+    gathers what it read. A rank then holds only its own rows of the bank, so
+    neither a later pipeline rank nor a draft model's capture of the target's
+    hidden states can take them; it is decided at construction. Nor can a
+    dense layer after an SP-MoE one, whose FFN reads every row of the bank:
+    every layer from the first MoE layer on must be one."""
+    if not (
+        _shards_moe_rows()
+        and config.attn_res_block_size is not None
+        and k3_sp_collective.enabled()
+        and envs.SGLANG_K3_SP_ATTN_RES.get()
+        and get_parallel().pp_size == 1
+    ):
         return False
-    if not _shards_moe_rows():
-        return True
-    return config.attn_res_block_size is None or not k3_sp_collective.enabled()
+    moe = [_is_moe_layer(config, idx) for idx in range(config.num_hidden_layers)]
+    if True not in moe or not all(moe[moe.index(True) :]):
+        return False
+    spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    return not (spec.is_eagle3() or spec.is_dflash_family())
+
+
+def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
+    """Whether the layers build stage boundaries, which every configuration
+    does."""
+    return True
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2500,6 +2569,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 reduce_results=not self._stage_boundaries,
+                sp_moe=self._sp_moe,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
                 bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
@@ -2512,6 +2582,7 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
                 reduce_results=not self._stage_boundaries,
+                sp_moe=self._sp_moe,
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
@@ -2571,35 +2642,6 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        if self._sp_moe:
-            # o_proj emits TP-partial sums; _finish_attn_reduce completes the
-            # reduction (RS on the clean attn-res path, AR on fallbacks).
-            o_proj = getattr(self.self_attn, "o_proj", None)
-            assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
-            o_proj.reduce_results = False
-            if k3_sp_collective.enabled():
-                # The table selects NVLS pull RS for larger token buckets.
-                # Only those o_proj outputs come from the persistent symmetric
-                # buffer; small push RS keeps the regular graph allocator.
-                _sp_inner_o_proj_forward = o_proj.forward
-
-                def _sp_o_proj_forward(x, *args, **kwargs):
-                    output_rows = x.shape[0]
-                    if k3_sp_collective.requires_symmetric_rs(
-                        output_rows, x.device, x.element_size()
-                    ):
-                        output = k3_sp_collective.get_o_proj_output_buffer(
-                            output_rows, x.dtype, o_proj.output_size
-                        )
-                        result = _sp_inner_o_proj_forward(
-                            x, *args, output_tensor=output[: x.shape[0]], **kwargs
-                        )
-                        k3_sp_collective.register_o_proj_output(result[0], output)
-                        return result
-                    return _sp_inner_o_proj_forward(x, *args, **kwargs)
-
-                o_proj.forward = _sp_o_proj_forward
-
         # A latent MoE on this rank's rows adds the residual in its tail add and
         # writes the next stream itself; one gathered over attention DP returns
         # its output to this rank's tokens first.
@@ -2611,56 +2653,98 @@ class KimiK3DecoderLayer(nn.Module):
             and not (self._dp_attention and not self.mlp._ep_a2a)
         )
         if self._stage_boundaries:
-            # Under attention DP the FFN input is read on this rank's rows
-            # once the attention's sum is complete, then gathered.
-            attn_ops = {}
-            ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
-            if self.use_attn_residuals:
-                bank_ops = AttnBankState(
-                    attn_bank,
-                    self.self_attention_res_proj,
-                    self.self_attention_res_norm,
-                    self.mlp_res_proj,
-                    self.mlp_res_norm,
-                    writes_block=self.is_block_write_layer,
-                ).residual_ops()
-                attn_ops = dict(read=bank_ops.attn_readout, update=bank_ops.attn_update)
-                ffn_ops = dict(
-                    read=bank_ops.ffn_readout,
-                    update=(
-                        REPLACE_AT_EXIT
-                        if self._ffn_writes_stream
-                        else bank_ops.ffn_update
-                    ),
-                )
-            self.attn_boundary, self.ffn_boundary = append_stages(
-                (declare_attn(**attn_ops), self.input_layernorm),
-                (
-                    declare_ffn(
-                        **ffn_ops,
-                        sparse=self._is_moe_layer,
-                        next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-                        # The TP width the dense MLP is built with.
-                        dense_tp_size=(
-                            None
-                            if self._is_moe_layer
-                            else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
-                        ),
-                        # SP-MoE runs on this rank's attention-TP shard of the
-                        # rows; on the bank path, whose reads write the bank on
-                        # every row, its output returns to all of them.
-                        exit_rows=(
-                            ExitRows.ATTENTION
-                            if self._sp_moe and self.use_attn_residuals
-                            else None
-                        ),
-                        # A latent MoE completes its output sum together with
-                        # the latent reduction its norm needs.
-                        output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
-                    ),
-                    self.post_attention_layernorm,
+            self._declare_stages(config, layer_idx, attn_bank)
+
+    def _declare_stages(self, config, layer_idx, attn_bank):
+        """Declare this layer's attention and FFN stages: the reads and updates
+        around them, the rows the FFN takes and leaves, and the kernels K3
+        supplies for the bank path."""
+        # Under attention DP the FFN input is read on this rank's rows
+        # once the attention's sum is complete, then gathered.
+        attn_ops = {}
+        ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
+        carries = _carries_bank_slices(config)
+        bank_sp_moe = self._sp_moe and self.use_attn_residuals
+        tuned_gather = (
+            k3_sp_collective.all_gather if k3_sp_collective.enabled() else None
+        )
+        if self.use_attn_residuals:
+            bank_ops = AttnBankState(
+                attn_bank,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                writes_block=self.is_block_write_layer,
+                ffn_input_fusions=self._ffn_input_fusions(),
+                fuses_slice_collectives=self._sp_moe
+                and k3_sp_collective.enabled()
+                and envs.SGLANG_K3_SP_ATTN_RES.get(),
+            ).residual_ops()
+            attn_ops = dict(
+                read=bank_ops.attn_readout,
+                update=bank_ops.attn_update,
+                # An input read on the shard an SP-MoE layer left is gathered
+                # in K3's tuned all-gather when it takes the batch.
+                attn_tp_gather=(
+                    tuned_gather
+                    if carries and _is_moe_layer(config, layer_idx - 1)
+                    else None
                 ),
             )
+            ffn_ops = dict(
+                read=bank_ops.ffn_readout,
+                update=(
+                    REPLACE_AT_EXIT if self._ffn_writes_stream else bank_ops.ffn_update
+                ),
+            )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(**attn_ops), self.input_layernorm),
+            (
+                declare_ffn(
+                    **ffn_ops,
+                    sparse=self._is_moe_layer,
+                    next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+                    # The TP width the dense MLP is built with.
+                    dense_tp_size=(
+                        None
+                        if self._is_moe_layer
+                        else get_group_rank_size(self.mlp.down_proj.tp_group)[1]
+                    ),
+                    # SP-MoE runs on this rank's attention-TP shard of the
+                    # rows; on the bank path, whose reads write the bank on
+                    # every row, its output returns to all of them, unless
+                    # the bank stays on the shard, read there to the end.
+                    exit_rows=(
+                        (ExitRows.SLICE if carries else ExitRows.ATTENTION)
+                        if bank_sp_moe
+                        else None
+                    ),
+                    # A latent MoE completes its output sum together with
+                    # the latent reduction its norm needs.
+                    output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
+                    # The bank path's gather back to every row, in K3's
+                    # tuned all-gather when it takes the batch.
+                    attn_tp_gather=(
+                        tuned_gather if bank_sp_moe and not carries else None
+                    ),
+                ),
+                self.post_attention_layernorm,
+            ),
+        )
+
+    def _ffn_input_fusions(self):
+        """K3's kernels that complete the attention output's sum with the
+        pending residual add ahead of the bank's FFN read: the fused
+        all-reduce on every row, or the tuned reduce-scatter onto this rank's
+        attention-TP shard (SP-MoE)."""
+        if self.all_reduce_fusion:
+            return (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
+        if self._sp_moe and k3_sp_collective.enabled():
+            return (
+                ReadoutFusion(SumGroup.ATTN_TP, _k3_reduce_scatter_add, scatters=True),
+            )
+        return ()
 
     def _finish_attn_reduce(
         self,
@@ -2949,6 +3033,7 @@ class KimiK3LinearModel(nn.Module):
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
         self._stage_boundaries = _uses_stage_boundaries(config)
+        self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3016,6 +3101,11 @@ class KimiK3LinearModel(nn.Module):
                     self.output_attn_res_proj,
                     self.output_attn_res_norm,
                     self.norm,
+                    attn_tp_gather=(
+                        k3_sp_collective.all_gather
+                        if self.carries_bank_slices
+                        else None
+                    ),
                 )
             )
         else:
@@ -3358,6 +3448,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        if self.model.carries_bank_slices:
+            raise RuntimeError(
+                "the model keeps each rank's shard of the rows across SP-MoE "
+                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
+                "to capture whole"
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)

@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 import msgspec
 
@@ -260,6 +260,11 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        attn_tp_gather: Optional implementation of the gather over attention
+            TP this stage's boundaries run: given this rank's contiguous slice
+            of the rows, it returns them all, in rank order, or None to leave
+            the gather to the boundary. Called on every batch, so it must be
+            CUDA-graph safe.
         previous: Declaration whose output this stage consumes, as the stack
             records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
@@ -281,6 +286,7 @@ class StageDeclaration:
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
     output_complete: bool = False
+    attn_tp_gather: Optional[Callable] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -325,6 +331,7 @@ def declare_attn(
     gathers_attn_tp_input=True,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
+    attn_tp_gather=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -339,6 +346,8 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
+        attn_tp_gather: Implementation of this stage's gathers over attention
+            TP, tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -356,6 +365,7 @@ def declare_attn(
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
+        attn_tp_gather=attn_tp_gather,
     )
 
 
@@ -369,6 +379,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    attn_tp_gather=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -385,6 +396,8 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        attn_tp_gather: Implementation of this stage's gathers over attention
+            TP, tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -398,6 +411,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        attn_tp_gather=attn_tp_gather,
     )
 
 
@@ -423,8 +437,13 @@ def _resolve_stage(stage, variant, following=None):
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
         )
-        if resolve_exit_rows(stage.exit_rows) is ExitRows.ATTENTION:
+        exit_rows = resolve_exit_rows(stage.exit_rows)
+        if exit_rows is ExitRows.ATTENTION:
             returned = attention
+        elif exit_rows is ExitRows.SLICE:
+            # The residual's rows during the FFN: this rank's slice for an FFN
+            # on its own rows, else the attention's.
+            returned = residual
         return declaration, residual, returned
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
@@ -489,6 +508,7 @@ def _connect(producer, consumer, *, residual_from=None):
     exits, entries = {}, {}
     for variant in _active_variants():
         _, attention, local, _ = _row_layouts(variant)
+        written = False
         if before is None:
             rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
             owes = variant is BatchVariant.INPUT_SCATTERED
@@ -548,6 +568,7 @@ def _connect(producer, consumer, *, residual_from=None):
                     update=None,
                 )
                 residual, capabilities = returned, (before.update.is_plain_add,)
+                written = before.update.applied_at_exit
         if after is None:
             continue
         decl, during, _ = _resolve_stage(after, variant)
@@ -579,6 +600,7 @@ def _connect(producer, consumer, *, residual_from=None):
             during,
             residual_joins_sum=joins,
             arriving_plain_add=capabilities,
+            arrives_written=written,
         )
         entries[variant] = edge
         if (

@@ -14,11 +14,14 @@
 """A residual read that aggregates a bank of snapshots of itself."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attn_residual import AttnResidual
+from sglang.srt.layers.layer_boundary import ops
+from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
+from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
@@ -87,6 +90,12 @@ class AttnBankState:
     ffn_score_proj: torch.nn.Module
     ffn_score_norm: torch.nn.Module
     writes_block: bool = False
+    # Kernels that complete the attention output's sum with the pending add
+    # ahead of the FFN read.
+    ffn_input_fusions: Tuple[ReadoutFusion, ...] = ()
+    # A read on this rank's attention-TP slice first tries the bank's kernels
+    # that also run the collective around it.
+    fuses_slice_collectives: bool = False
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -131,6 +140,42 @@ class AttnBankState:
             write=False,
         )
 
+    def reduce_scatter_and_read_ffn_input(
+        self, hidden_states, residual, forward_batch, norm
+    ):
+        parallel = get_parallel()
+        rows, rest = divmod(hidden_states.shape[0], parallel.attn_tp_size)
+        if rows == 0 or rest:
+            return None
+        start = parallel.attn_tp_rank * rows
+        return self.bank.require().forward_sp_reduce_scatter(
+            hidden_states,
+            residual,
+            self.ffn_score_proj,
+            self.ffn_score_norm,
+            norm,
+            rows=slice(start, start + rows),
+        )
+
+    def read_and_gather_attn_input(self, contribution, residual, norm):
+        bank = self.bank.require()
+        rows = _bank_rows(bank, contribution)
+        if rows is None:
+            return None
+        read = bank.forward_sp_all_gather(
+            contribution,
+            residual,
+            self.attn_score_proj,
+            self.attn_score_norm,
+            norm,
+            rows=rows,
+            write=self.writes_block,
+        )
+        if read is None:
+            return None
+        normed, residual = read
+        return normed, None if self.writes_block else residual
+
     def residual_ops(self) -> LayerResidualOps:
         return LayerResidualOps(
             attn_readout=_AttnReadout(self),
@@ -171,6 +216,13 @@ class _AttnReadout(_BankReadout):
     """The attention input: the bank aggregation and this layer's input norm.
     A write layer snapshots the residual this read forms."""
 
+    @property
+    def gathering_reads(self):
+        state = self.state
+        return (
+            (state.read_and_gather_attn_input,) if state.fuses_slice_collectives else ()
+        )
+
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         self._reject(None, quant_format)
         if post_residual_addition is not None:
@@ -188,6 +240,19 @@ class _FfnReadout(_BankReadout):
     """The FFN input: the attention output's add folded into the bank
     aggregation, and this layer's post-attention norm."""
 
+    @property
+    def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
+        state = self.state
+        if not state.fuses_slice_collectives:
+            return state.ffn_input_fusions
+        reads = ReadoutFusion(
+            SumGroup.ATTN_TP,
+            state.reduce_scatter_and_read_ffn_input,
+            scatters=True,
+            reads=True,
+        )
+        return (reads, *state.ffn_input_fusions)
+
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
         # attention output alone is the head.
@@ -202,22 +267,40 @@ class _FfnReadout(_BankReadout):
 class AttnBankOutputRead:
     """The layer stack's terminal read: the bank aggregation with the output
     side's scoring parameters, then the final norm. A callable final norm for
-    `residual_batch.final_norm`."""
+    `residual_batch.final_norm`.
 
-    def __init__(self, bank: AttnBank, score_proj, score_norm, norm):
+    A stack that ends on this rank's attention-TP slice of the rows is read
+    there, against the bank rows this rank wrote, and what it read is
+    gathered: by the bank's kernel that does both when it takes the batch,
+    else by ``attn_tp_gather`` when that does, else over the attention-TP
+    group."""
+
+    def __init__(
+        self, bank: AttnBank, score_proj, score_norm, norm, attn_tp_gather=None
+    ):
         self.bank = bank
         self.score_proj = score_proj
         self.score_norm = score_norm
         self.norm = norm
+        self.attn_tp_gather = attn_tp_gather
 
     def __call__(self, hidden_states, residual=None):
         bank = self.bank.require()
-        normed, head = bank.forward(
-            hidden_states,
-            residual,
-            self.score_proj,
-            self.score_norm,
-            self.norm,
-            rows=_bank_rows(bank, hidden_states),
+        rows = _bank_rows(bank, hidden_states)
+        read_args = (hidden_states, residual, self.score_proj, self.score_norm)
+        read = (
+            None
+            if rows is None
+            else bank.forward_sp_all_gather(*read_args, self.norm, rows=rows)
         )
+        if read is None:
+            read = bank.forward(*read_args, self.norm, rows=rows)
+            if rows is not None:
+                read = (self._gather(read[0]), read[1])
+        normed, head = read
         return normed if residual is None else (normed, head)
+
+    def _gather(self, normed):
+        gathered = None if self.attn_tp_gather is None else self.attn_tp_gather(normed)
+        # The output outlives the layer stack.
+        return ops.attn_tp_gather(normed, owned=True) if gathered is None else gathered

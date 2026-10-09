@@ -47,6 +47,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_tp_gather_input,
+    update_attn_tp_gather_output,
+)
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
@@ -186,6 +190,7 @@ class StagePlan:
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
+        attn_tp_gather=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
@@ -229,11 +234,16 @@ class StagePlan:
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                     attn_input_adapter=edges.attn_input_adapter,
+                    attn_tp_gather=attn_tp_gather,
                 )
             out = (
                 ExitMove()
                 if finishes_directly
-                else bind_exit(edges.outgoing, cp_moves=edges.cp_moves)
+                else bind_exit(
+                    edges.outgoing,
+                    cp_moves=edges.cp_moves,
+                    attn_tp_gather=attn_tp_gather,
+                )
             )
             self.paths[variant] = StagePath(
                 entry=entry,
@@ -242,6 +252,15 @@ class StagePlan:
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
                 writes_at_handoff=writes_at_handoff,
+            )
+        if attn_tp_gather is not None and not any(
+            getattr(path.output_move, "func", None) is update_attn_tp_gather_output
+            or getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
+            for path in self.paths.values()
+        ):
+            raise ValueError(
+                "an attention-TP gather is declared, but no batch variant "
+                "gathers over attention TP at this stage's boundaries"
             )
 
     @property
@@ -334,6 +353,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
         writes_at_handoff=declaration.writes_at_handoff,
+        attn_tp_gather=declaration.attn_tp_gather,
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
         **options,
