@@ -125,6 +125,8 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ((comm, "get_moe_cp_size"), lambda: CP_SIZE),
                 ((comm, "get_moe_cp_rank"), lambda: cp),
                 ((comm, "should_use_dp_reduce_scatterv"), lambda: False),
+                ((comm, "post_experts_sum_is_one_all_reduce"), lambda: False),
+                ((comm, "get_lora"), lambda: SimpleNamespace(enable_lora=False)),
                 (
                     (comm, "get_moe_a2a_backend"),
                     lambda: SimpleNamespace(is_none=lambda: True),

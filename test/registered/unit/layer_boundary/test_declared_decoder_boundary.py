@@ -27,7 +27,6 @@ from sglang.srt.layers.layer_boundary import (
     append_stages,
 )
 from sglang.srt.layers.layer_boundary import boundary as comm_boundary
-from sglang.srt.layers.layer_boundary import construction as comm_layer
 from sglang.srt.layers.layer_boundary import (
     declare_attn,
     declare_ffn,
@@ -150,9 +149,43 @@ def planning(
         patch_communicator(
             "get_exec",
             lambda: SimpleNamespace(
-                comm=SimpleNamespace(boundary_reduction=boundary_reduction),
+                comm=SimpleNamespace(
+                    boundary_reduction=boundary_reduction,
+                    enable_quant_communications=False,
+                ),
                 overlap=SimpleNamespace(enable_two_batch_overlap=False),
             ),
+        ),
+        # What the MoE predicates an exit's decisions read, in their module.
+        patch.object(moe_utils, "get_parallel", get_parallel),
+        patch.object(
+            moe_utils,
+            "get_moe_a2a_backend",
+            lambda: SimpleNamespace(
+                is_none=lambda: not a2a,
+                is_flashinfer=lambda: False,
+                is_pplx=lambda: False,
+                is_flashinfer_megamoe=lambda: False,
+            ),
+        ),
+        patch.object(moe_utils, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
+        patch.object(
+            moe_utils,
+            "get_exec",
+            lambda: SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+        patch.object(
+            moe_utils, "post_experts_reduction_group", lambda: get_parallel().tp_group
+        ),
+        patch.object(
+            moe_utils, "should_use_flashinfer_cutlass_moe_fp4_allgather", lambda: False
+        ),
+        patch.object(
+            moe_utils,
+            "is_dp_attention_enabled",
+            lambda: get_parallel().attn_dp_size > 1,
         ),
     ):
         yield
@@ -401,11 +434,15 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         ):
             with self.subTest(name):
                 hc_post = MagicMock(side_effect=lambda h, r, h_res, h_post: h + r)
-                communicator = build_mhc(
-                    layer_case(1, 3),
-                    parallel,
-                    hc_post=hc_post,
-                )
+                # Whether the DP return is the reduce-scatterv is the configuration's.
+                with patch_communicator(
+                    "should_use_dp_reduce_scatterv", lambda: reduce_scatterv
+                ):
+                    communicator = build_mhc(
+                        layer_case(1, 3),
+                        parallel,
+                        hc_post=hc_post,
+                    )
                 communicator.mhc.h_res = communicator.mhc.h_post = torch.zeros(2)
                 forward_batch = SimpleNamespace(
                     dp_padding_mode=SimpleNamespace(is_max_len=lambda: is_max_len),
@@ -415,9 +452,6 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 to_local_tokens = MagicMock(side_effect=lambda step, fb, h: h[:2])
                 with (
                     planning(parallel),
-                    patch_communicator(
-                        "should_use_dp_reduce_scatterv", lambda: reduce_scatterv
-                    ),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
                     patch_communicator("_select_dp_reduce_scatter", choose),
                     patch_communicator("to_dp_local", to_local_tokens),
@@ -877,14 +911,10 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 ),
                 patch_communicator("is_dp_attention_enabled", lambda: False),
             ):
-                self.assertIs(
-                    communicator.ffn.plan.output._sum_deferral_allowed(
-                        communicator.ffn.plan.output.plan.path_for(
-                            SimpleNamespace(forward_mode=ForwardMode.DECODE)
-                        )
-                    ),
-                    not active,
+                steps = communicator.ffn.plan.path_for(
+                    SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 )
+                self.assertIs(steps.exit.may_defer_sum, not active)
 
 
 class TestInputScatteredAttention(CustomTestCase):

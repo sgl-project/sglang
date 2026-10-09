@@ -16,6 +16,7 @@ from sglang.srt.layers.layer_boundary import (
     UnreducedOutput,
 )
 from sglang.srt.layers.layer_boundary import exit as exit_module
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
@@ -190,18 +191,21 @@ class TestMixerExit(CustomTestCase):
                     may_defer_to_next=may,
                     update=PLAIN_ADD,
                 )
-                communicator = SimpleNamespace(
-                    plan=SimpleNamespace(
-                        path_for=lambda batch: SimpleNamespace(output=produced),
-                    ),
-                    _sum_deferral_allowed=MagicMock(return_value=movable),
-                )
+                path = SimpleNamespace(output=produced)
+                plan = SimpleNamespace(finishes_directly=False, path_for=lambda b: path)
+                communicator = SimpleNamespace(plan=plan)
                 hidden = torch.ones(2, 4)
                 summed = MagicMock(side_effect=lambda h, *args, **kwargs: h * 2)
                 with (
                     get_parallel().override(tp_group=tp_group, tp_size=2),
                     patch.object(exit_module, "sum_output", summed),
                 ):
+                    with patch.object(
+                        exit_module, "_sum_deferral_allowed", return_value=movable
+                    ):
+                        path.exit = exit_module.exit_facts(
+                            StageKind.ATTENTION, plan, BatchVariant.ORDINARY, path
+                        )
                     with MixerExit(
                         communicator, None, stream=ResidualStream()
                     ) as mixer_exit:
