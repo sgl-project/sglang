@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
@@ -587,7 +588,7 @@ class SchedulerPPMixin:
         # attn-TP group; the send-slice + recv-all-gather transport assumes replicated tensors
         # and would scramble them, so those ranks must transfer per-rank tensors as-is.
         self.require_attn_tp_allgather = (
-            not get_parallel().enable_dsa_prefill_context_parallel
+            not is_dsa_enable_prefill_cp()
             and not self.tp_worker.model_runner.is_pp_proxy_input_scattered()
             and not self.tp_worker.model_runner.is_pp_proxy_output_scattered()
         )
