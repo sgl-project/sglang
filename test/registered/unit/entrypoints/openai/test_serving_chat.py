@@ -4719,7 +4719,10 @@ class ServingChatTestCase(CustomTestCase):
 
     # ------------- include_reasoning -------------
     def _build_reasoning_response(
-        self, include_reasoning, reasoning_parser="mock-reasoning-parser", reasoning="想了一下"
+        self,
+        include_reasoning,
+        reasoning_parser="mock-reasoning-parser",
+        reasoning="想了一下",
     ):
         """Build a non-stream response whose reasoning parser splits think text."""
         self.template_manager.force_reasoning = False
