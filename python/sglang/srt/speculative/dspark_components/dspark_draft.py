@@ -118,6 +118,62 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
+def draft_markov_block(
+    *,
+    markov_head,
+    base_logits: torch.Tensor,
+    anchor_tokens: torch.Tensor,
+    draft_hidden: Optional[torch.Tensor],
+    step_temperatures: torch.Tensor,
+    noise: DraftNoise,
+    tp_sync: SpecTpSync,
+    site: SpecTpSyncSite,
+    logits_out: Optional[torch.Tensor] = None,
+    keep_logits: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Draft ``gamma`` tokens per row, each step biased by the token before it;
+    a row at temperature 0 takes the argmax. With ``keep_logits`` the step
+    logits land in ``logits_out`` ([bs, gamma, local vocab]), allocated here
+    when not given. The graph tail and the eager path both run this."""
+    bs, gamma = base_logits.shape[:2]
+    state = markov_head.init_state(draft_hidden)
+    prev_tokens = anchor_tokens.long()
+    draft_tokens = []
+    for step in range(gamma):
+        step_hidden = None if draft_hidden is None else draft_hidden[:, step]
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=step_hidden, state=state
+        )
+        step_base = base_logits[:, step]
+        if keep_logits and logits_out is None:
+            logits_out = torch.empty(
+                (bs, gamma, step_base.shape[-1]),
+                dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
+                device=step_base.device,
+            )
+        prev_tokens = markov_head.sample_step(
+            step_base,
+            bias,
+            temperatures=step_temperatures,
+            noise_key=noise.key,
+            noise_offset=noise.offset,
+            step=step,
+            logits_out=logits_out[:, step] if keep_logits else None,
+        )
+        prev_tokens = tp_sync.sync(site, prev_tokens)
+        draft_tokens.append(prev_tokens)
+    noise.offset.add_(1)
+    return torch.stack(draft_tokens, dim=1), logits_out
+
+
+def resolve_draft_temperatures(
+    *, bs: int, sampling_info, device: torch.device
+) -> torch.Tensor:
+    if sampling_info is None:
+        return torch.ones(bs, dtype=torch.float32, device=device)
+    return sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+
+
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
@@ -129,56 +185,31 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
-    bs, gamma = base_logits.shape[:2]
+    bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
-    if sampling_info is None:
-        temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-    else:
-        temperatures = (
-            sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
-        )
-    # A step at temperature 0 takes the argmax.
-    step_temperatures = temperatures.masked_fill(greedy_mask, 0.0)
-    site = (
-        SpecTpSyncSite.DSPARK_DRAFT_SAMPLE
-        if any_sampling
-        else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
+    temperatures = resolve_draft_temperatures(
+        bs=bs, sampling_info=sampling_info, device=device
     )
-
-    local_logits = None
-    state = markov_head.init_state(draft_hidden)
-    prev_tokens = anchor_tokens.long()
-    draft_tokens = []
-    for step in range(gamma):
-        step_hidden = None if draft_hidden is None else draft_hidden[:, step]
-        bias, state = markov_head.step_bias(
-            prev_tokens, hidden_states=step_hidden, state=state
-        )
-        step_base = base_logits[:, step]
-        if local_logits is None:
-            local_logits = torch.empty(
-                (bs, gamma, step_base.shape[-1]),
-                dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
-                device=device,
-            )
-        prev_tokens = markov_head.sample_step(
-            step_base,
-            bias,
-            temperatures=step_temperatures,
-            noise_key=noise.key,
-            noise_offset=noise.offset,
-            step=step,
-            logits_out=local_logits[:, step],
-        )
-        prev_tokens = tp_sync.sync(site, prev_tokens)
-        draft_tokens.append(prev_tokens)
-    noise.offset.add_(1)
-
-    corrected_logits = markov_head.gather_vocab(local_logits)
+    draft_tokens, local_logits = draft_markov_block(
+        markov_head=markov_head,
+        base_logits=base_logits,
+        anchor_tokens=anchor_tokens,
+        draft_hidden=draft_hidden,
+        step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
+        noise=noise,
+        tp_sync=tp_sync,
+        site=(
+            SpecTpSyncSite.DSPARK_DRAFT_SAMPLE
+            if any_sampling
+            else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
+        ),
+    )
     return DraftBlockResult(
-        draft_tokens=torch.stack(draft_tokens, dim=1),
-        corrected_logits=expect(_DRAFT_STEP_LOGITS, corrected_logits),
+        draft_tokens=draft_tokens,
+        corrected_logits=expect(
+            _DRAFT_STEP_LOGITS, markov_head.gather_vocab(local_logits)
+        ),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )
@@ -221,6 +252,10 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+
+    @property
+    def noise(self) -> DraftNoise:
+        return self._noise
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -268,38 +303,22 @@ class DraftBlockProposer:
             and (all_greedy or draft_sampler.folded_sampling)
         ):
             folded = True
-            if draft_sampler.folded_sampling:
-                greedy_mask = draft_sampler.greedy_mask[:bs]
-                temperatures = draft_sampler.temperatures[:bs]
-                # The sampling accept path needs the markov-corrected block
-                # logits; greedy accept only compares tokens.
-                corrected_logits = (
-                    None
-                    if all_greedy
-                    else draft_sampler.corrected_out[: bs * self.gamma].view(
-                        bs, self.gamma, -1
-                    )
+            # Greedy accept compares tokens only; sampling accept needs the
+            # markov-corrected logits the graph tail kept.
+            corrected_logits = None
+            if not all_greedy:
+                corrected_logits = self.draft_model.markov_head.gather_vocab(
+                    draft_sampler.step_logits[:bs]
                 )
-            else:
-                # Greedy-only folding: the hook argmaxed every row and kept no
-                # sampling buffers, so derive the params on the fly.
-                greedy_mask = resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                )
-                if sampling_info is None:
-                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-                else:
-                    temperatures = (
-                        sampling_info.temperatures.view(-1)
-                        .to(torch.float32)
-                        .clamp_min(1e-5)
-                    )
-                corrected_logits = None
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=corrected_logits,
-                greedy_mask=greedy_mask,
-                temperatures=temperatures,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+                temperatures=resolve_draft_temperatures(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]

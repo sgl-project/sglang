@@ -551,7 +551,6 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
-    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast
@@ -1989,6 +1988,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
         note="DSpark draft sampling always uses Gumbel-max."
+    ),
+    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
+        note="Greedy DSpark draft rows always use the markov sample step kernel."
     ),
     "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(

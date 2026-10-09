@@ -525,6 +525,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            noise=self._proposer.noise,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(

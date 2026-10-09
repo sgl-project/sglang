@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -128,10 +126,7 @@ class TestDsparkFoldedSamplingDefault(CustomTestCase):
             _resolve_folded_sampling,
         )
 
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
-            markov_head=SimpleNamespace(supports_sharded_greedy=True),
-        )
+        model = SimpleNamespace(lm_head=SimpleNamespace(org_vocab_size=128))
         args = dict(
             model=model,
             gamma=5,
@@ -140,16 +135,13 @@ class TestDsparkFoldedSamplingDefault(CustomTestCase):
             tp_rank=0,
             available_memory_gb=16,
         )
-        # AUTO decides on memory alone, also for sharded-greedy (V4.1 TP) heads.
-        for sharded_greedy in (True, False):
-            model.markov_head.supports_sharded_greedy = sharded_greedy
-            with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-                DsparkFoldedSampling.AUTO.value
-            ):
-                self.assertTrue(_resolve_folded_sampling(**args))
-                self.assertFalse(
-                    _resolve_folded_sampling(**{**args, "available_memory_gb": 0.5})
-                )
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+            DsparkFoldedSampling.AUTO.value
+        ):
+            self.assertTrue(_resolve_folded_sampling(**args))
+            self.assertFalse(
+                _resolve_folded_sampling(**{**args, "available_memory_gb": 0.5})
+            )
         with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
             DsparkFoldedSampling.FORCE.value
         ):
