@@ -18,11 +18,11 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
-    compact_topk,
     decode_scores,
     get_deep_gemm_prefill_data,
     prefill_requests,
     score_tiles,
+    select_compact_prefill,
     select_decode,
     write_decode,
     write_prefill,
@@ -245,15 +245,7 @@ class DenseBlocksBackend:
         ):
             for chunk in chunks:
                 if chunk.candidate_blocks is not None:
-                    idx = compact_topk(
-                        chunk.scores,
-                        chunk.candidate_blocks,
-                        chunk.lens,
-                        request.k,
-                        request.lc,
-                        self.block_size,
-                    )
-                    write_prefill(inputs, request, chunk, idx)
+                    select_compact_prefill(inputs, request, chunk, self.req_to_token)
                     continue
                 idx = topk_among_blocks(
                     chunk.scores,

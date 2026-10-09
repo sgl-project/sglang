@@ -25,6 +25,9 @@ def _finish_paged_indexer_topk_kernel(
     Pages,
     Raw,
     Blocks,
+    OutputRows,
+    HAS_OUTPUT_ROWS: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
     BLOCK_STRIDE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
     BATCH: tl.constexpr,
@@ -55,21 +58,25 @@ def _finish_paged_indexer_topk_kernel(
         idx = tl.where(valid & (block >= 0), block * 8 + idx % 8, 0x7FFFFFFF)
     idx = tl.sort(tl.where(idx >= 0, idx, WIDTH), descending=False)
     length = tl.load(Lengths + row, row < BATCH, 0)
-    req = tl.load(Requests + row, row < BATCH, 0)
+    output_row = tl.load(OutputRows + row) if HAS_OUTPUT_ROWS else row
     valid = (row < BATCH) & (col < K) & (idx < length)
-    slot = tl.load(
-        ReqTable + req.to(tl.int64) * TABLE_STRIDE + idx.to(tl.int64) * RATIO,
-        valid,
-        0,
-    )
-    tl.store(
-        Pages + row * PAGE_STRIDE + col,
-        tl.where(valid, slot.to(tl.int64) // RATIO, -1),
-        col < OUT_WIDTH,
-    )
+    if WRITE_PAGES:
+        req = tl.load(Requests + row, row < BATCH, 0)
+        slot = tl.load(
+            ReqTable + req.to(tl.int64) * TABLE_STRIDE + idx.to(tl.int64) * RATIO,
+            valid,
+            0,
+        )
+        tl.store(
+            Pages + output_row * PAGE_STRIDE + col,
+            tl.where(valid, slot.to(tl.int64) // RATIO, -1),
+            col < OUT_WIDTH,
+        )
     if WRITE_RAW:
         tl.store(
-            Raw + row * RAW_STRIDE + col, tl.where(valid, idx, -1), col < OUT_WIDTH
+            Raw + output_row * RAW_STRIDE + col,
+            tl.where(valid, idx, -1),
+            col < OUT_WIDTH,
         )
 
 
@@ -77,26 +84,38 @@ def finish_paged_indexer_topk(
     indices: torch.Tensor,
     scores: torch.Tensor,
     lengths: torch.Tensor,
-    req: torch.Tensor,
-    req_table: torch.Tensor,
-    page_indices: torch.Tensor,
+    req: torch.Tensor | None,
+    req_table: torch.Tensor | None,
+    page_indices: torch.Tensor | None,
     raw_indices: torch.Tensor | None,
     ratio: int,
     mask_scores: bool,
     *,
     candidate_blocks: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ) -> None:
     """Sort selected positions and map them to compressed KV slots.
 
     Candidate consumers discard selected masked scores, including top-k underfill.
-    The entire output (including padded rows/columns) is written, with -1 padding.
+    With output_rows, write only those rows (unique, in-range destination indices).
+    Otherwise write every output row, including padded decode rows. Unselected
+    columns are -1. Raw-only prefill does not read the request table.
     """
     if candidate_blocks is not None:
         assert candidate_blocks.shape == (lengths.numel(), scores.shape[1] // 8)
         assert candidate_blocks.stride(1) == 1
-    if not page_indices.shape[0]:
+    out = page_indices if page_indices is not None else raw_indices
+    assert out is not None
+    if page_indices is not None:
+        assert req is not None and req_table is not None
+        if raw_indices is not None:
+            assert raw_indices.shape == page_indices.shape
+    if output_rows is not None:
+        assert output_rows.shape == (lengths.numel(),) and output_rows.is_contiguous()
+    rows = out.shape[0] if output_rows is None else output_rows.numel()
+    if not rows or not out.shape[1]:
         return
-    _finish_paged_indexer_topk_kernel[(page_indices.shape[0],)](
+    _finish_paged_indexer_topk_kernel[(rows,)](
         indices,
         scores,
         lengths,
@@ -105,21 +124,24 @@ def finish_paged_indexer_topk(
         page_indices,
         raw_indices,
         candidate_blocks,
+        output_rows,
+        output_rows is not None,
+        page_indices is not None,
         candidate_blocks.stride(0) if candidate_blocks is not None else 0,
         candidate_blocks is not None,
         lengths.numel(),
         indices.shape[1],
         scores.shape[1],
-        page_indices.shape[1],
+        out.shape[1],
         indices.stride(0),
         scores.stride(0),
-        req_table.stride(0),
-        page_indices.stride(0),
+        req_table.stride(0) if req_table is not None else 0,
+        page_indices.stride(0) if page_indices is not None else 0,
         raw_indices.stride(0) if raw_indices is not None else 0,
         ratio,
         mask_scores or candidate_blocks is not None,
         raw_indices is not None,
-        triton.next_power_of_2(max(page_indices.shape[1], indices.shape[1])),
+        triton.next_power_of_2(max(out.shape[1], indices.shape[1])),
         num_warps=4,
     )
 

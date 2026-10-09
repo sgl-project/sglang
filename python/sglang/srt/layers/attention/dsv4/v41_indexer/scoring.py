@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_til
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
+    topk_transform_ragged_v2,
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
@@ -543,34 +544,37 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
     ).to(torch.int32)
 
 
-def compact_topk(
-    scores: torch.Tensor,
-    blocks: torch.Tensor,
-    lengths: torch.Tensor,
-    topk: int,
-    width: int,
-    block_size: int,
-) -> torch.Tensor:
-    """Restore compact columns to request-local positions; width pads invalid picks.
-
-    write_prefill sorts these positions before mapping to physical slots. The -inf check drops padding even when top-k exceeds visibility.
-    """
-    out = torch.full(
-        (scores.shape[0], topk), width, dtype=torch.int64, device=scores.device
+def select_compact_prefill(
+    inputs: PrefillInputs,
+    request: RequestScores,
+    chunk: ChunkScores,
+    req_to_token: torch.Tensor,
+) -> None:
+    rows, width = chunk.scores.shape
+    k = min(request.k, width)
+    if not rows or not k:
+        return  # prefill_requests has reset the output to -1.
+    indices = torch.empty((rows, k), dtype=torch.int32, device=chunk.scores.device)
+    # Scan the entire compact row: padding/causal holes can precede valid blocks.
+    scan_lens = torch.full(
+        (rows,), width, dtype=torch.int32, device=chunk.scores.device
     )
-    k = min(topk, scores.shape[1])
-    if not k or not scores.shape[0]:
-        return out
-    values, columns = scores.topk(k, dim=-1, sorted=False)
-    positions = (
-        blocks.long().gather(1, columns // block_size) * block_size
-        + columns % block_size
+    topk_transform_ragged_v2(
+        chunk.scores,
+        scan_lens,
+        out_offsets=torch.zeros_like(scan_lens),
+        out_indices=indices,
     )
-    valid = (
-        (values > -torch.inf)
-        & (positions >= 0)
-        & (positions < width)
-        & (positions < lengths[:, None])
+    finish_paged_indexer_topk(
+        indices,
+        chunk.scores,
+        chunk.lens,
+        inputs.req_rows[chunk.tok] if inputs.out_page_indices is not None else None,
+        req_to_token,
+        inputs.out_page_indices,
+        inputs.out_raw_indices,
+        inputs.compress_ratio,
+        True,
+        candidate_blocks=chunk.candidate_blocks,
+        output_rows=chunk.tok,
     )
-    out[:, :k] = positions.masked_fill(~valid, width)
-    return out
