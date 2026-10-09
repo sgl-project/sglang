@@ -1736,6 +1736,10 @@ class Envs:
     # Prefill-graph shapes of at least this many tokens run the tail from the tail
     # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
+    # Cached prefix tokens per query row required for direct FP8 prefill reads.
+    # Zero keeps the bf16 workspace. Breakable prefill graphs use a higher threshold.
+    SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW = EnvInt(5)
+    SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH = EnvInt(8)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for

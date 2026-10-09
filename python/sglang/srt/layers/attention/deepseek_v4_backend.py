@@ -255,7 +255,8 @@ def _maybe_precompute_flashmla_sched_meta(
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
-    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
+    # Include statically allocated shared state and its CUDA alignment.
+    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) + 64 > 48 * 1024:
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
@@ -1204,6 +1205,24 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+def _prefill_reads_fp8_direct(
+    forward_batch: ForwardBatch, *, in_prefill_graph: bool
+) -> bool:
+    if not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get():
+        return True
+    per_row = (
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH
+        if in_prefill_graph
+        else envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW
+    ).get()
+    prefix = forward_batch.extend_prefix_lens_cpu
+    if per_row <= 0 or prefix is None:
+        return False
+    # The bf16 workspace pays per cached token, the direct kernel per query row;
+    # one choice per forward from the batch totals.
+    return sum(prefix) >= per_row * sum(forward_batch.extend_seq_lens_cpu)
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -1359,6 +1378,8 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
+        # Set per step from the live batch: sparse prefill reads the fp8 cache directly.
+        self._sparse_prefill_direct = False
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2864,6 +2885,9 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
+        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
+            forward_batch, in_prefill_graph=False
+        )
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2928,7 +2952,7 @@ class DeepseekV4AttnBackend(
             and self.forward_metadata.late_layer_tail is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                or not self._sparse_prefill_direct
             )
         )
 
@@ -3168,6 +3192,9 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = self._prefill_graph_context_width(forward_batch)
+        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
+            forward_batch, in_prefill_graph=True
+        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -3280,6 +3307,9 @@ class DeepseekV4AttnBackend(
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
         max_seq_len = self._prefill_graph_context_width(metadata_batch)
+        self._sparse_prefill_direct = _prefill_reads_fp8_direct(
+            forward_batch, in_prefill_graph=True
+        )
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -4041,6 +4071,9 @@ class DeepseekV4AttnBackend(
             self.mega_attn
             or self.tail_forward_metadata is not None
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
+            # Captured indexers keep this choice, so any step may still read direct.
+            or envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.get() > 0
+            or envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH.get() > 0
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
