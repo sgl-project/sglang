@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
@@ -26,16 +25,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    When tracing the code, the result tensor is not an AsyncCollectiveTensor,
-    so we cannot call ``wait()``.
-    """
-    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
-        return tensor.wait()
-    return tensor
 
 
 _A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
@@ -107,6 +96,20 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
+
+
+def _usp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``x`` from every Ulysses rank along dim 0, rank order."""
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x = x.contiguous()
+    output = torch.empty(
+        (get_ulysses_parallel_world_size() * x.shape[0], *x.shape[1:]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    dist.all_gather_into_tensor(output, x, group=ulysses_pg)
+    return output
 
 
 def _usp_all_to_all_single_varlen(
@@ -399,6 +402,18 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
+    """True when ``x.view(b * s_local, h, d)`` costs no copy.
+
+    The pack kernel reads q/k/v through explicit row/head strides, so only the
+    head_size dim has to be unit-stride; full contiguity is not required. The
+    batch and sequence dims still have to merge into one, which is free when
+    batch is 1 or when the two dims are already adjacent in memory.
+    """
+    batch, seq_local = x.shape[0], x.shape[1]
+    return x.stride(-1) == 1 and (batch == 1 or x.stride(0) == seq_local * x.stride(1))
+
+
 def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
@@ -408,9 +423,9 @@ def _can_use_packed_qkv_a2a_4d(
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
         and q.dtype in (torch.float16, torch.bfloat16)
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
+        and _packed_qkv_row_view_is_free(q)
+        and _packed_qkv_row_view_is_free(k)
+        and _packed_qkv_row_view_is_free(v)
         and q.shape[2] % world_size == 0
         and not torch.compiler.is_compiling()
     )
@@ -427,7 +442,8 @@ def _usp_input_all_to_all_qkv(
     destination-major by one relayout kernel and exchanged in a single
     collective instead of three; only data movement changes, so the result is
     bit-identical to the unpacked path, which stays as the fallback for
-    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
+    would copy).
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()
@@ -823,12 +839,12 @@ def _ring_merge_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Online-softmax combine of one more ring step's partial attention.
 
-    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
-    layout `[H, T]`. Both are already self-normalized over their own KV
+    `step_out` is `[T, H, D]` or `[B, T, H, D]`; `step_lse` is
+    `[H, T]` or `[B, H, T]`. Both are already self-normalized over their own KV
     chunk, so combining chunks is the standard two-term logsumexp merge
     (exact up to float rounding); done in fp32 for stability.
     """
-    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_lse = step_lse.transpose(-2, -1).unsqueeze(-1).to(torch.float32)
     step_out = step_out.to(torch.float32)
     if out_acc is None:
         return step_out, step_lse
@@ -850,7 +866,8 @@ def _ring_attention_varlen(
 ) -> torch.Tensor:
     """Ring-rotated varlen attention over one rank's local packed chunk.
 
-    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    `q, k, v` are `[T, H, D]` or `[B, T, H, D]`, with equal lengths per batch.
+    They contain this rank's full local ring chunk (`ring_chunk_len` rows,
     real rows followed by however many of this chunk's rows are padding).
     KV is P2P-rotated around the ring one hop per step (send this step's
     buffer to the next rank, receive the following step's buffer from the
@@ -864,7 +881,7 @@ def _ring_attention_varlen(
     """
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
-    ring_chunk_len = q.shape[0]
+    ring_chunk_len = q.shape[-3]
     _, ring_rank = get_ring_ctx()
 
     # `isend`/`irecv` (unlike collectives) address peers by global rank even
@@ -913,11 +930,14 @@ def _ring_attention_varlen(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
         if remote_used > 0:
-            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
-                q,
-                kv_bufs[cur][0, :remote_used],
-                kv_bufs[cur][1, :remote_used],
-            )
+            key = kv_bufs[cur][0, ..., :remote_used, :, :]
+            value = kv_bufs[cur][1, ..., :remote_used, :, :]
+            if q.ndim == 3:
+                step_out, step_lse = attn_impl.forward_ring_kv_chunk(q, key, value)
+            else:
+                step_out, step_lse, *_ = attn_impl.forward(
+                    q, key, value, attn_metadata=None, return_softmax_lse=True
+                )
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse
             )

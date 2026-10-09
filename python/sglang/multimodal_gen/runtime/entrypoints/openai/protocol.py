@@ -158,6 +158,7 @@ class VideoGenerationsRequest(BaseModel):
     upscaling_scale: Optional[int] = 4
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
+    x264_preset: Optional[str] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
@@ -170,10 +171,6 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
-
-
-class VideoRemixRequest(BaseModel):
-    prompt: str
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):

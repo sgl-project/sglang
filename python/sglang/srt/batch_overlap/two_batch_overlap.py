@@ -19,7 +19,6 @@ from sglang.srt.layers.layer_boundary import (
     tbo_split_moves,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -698,6 +697,15 @@ class TboForwardBatchPreparer:
             output_dict["out_cache_loc_virtual"] = batch.out_cache_loc_virtual[
                 start_token_index:end_token_index
             ]
+        output_dict["out_cache_loc_is_physical"] = batch.out_cache_loc_is_physical
+        # Unified memory refuses two-batch overlap, so the plan's reads stay in
+        # `req_to_token`, which each child indexes at its own rows; each child
+        # writes its own tokens of the plan's window.
+        output_dict["kv_loc_plan"] = batch.kv_loc_plan
+        if batch.kv_loc_plan is not None:
+            output_dict["kv_loc_cols"] = batch.kv_loc_plan.cols_slice(
+                batch.kv_loc_cols, slice(start_token_index, end_token_index)
+            )
 
         attention_tp_size = get_parallel().attn_tp_size
         _tbo_padded_len = (
@@ -1100,43 +1108,42 @@ def _model_forward_filter_inputs(
 
 def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
     stream_a, stream_b = output_a["residual"], output_b["residual"]
-    has_stream = isinstance(stream_a, ResidualStream)
-    assert has_stream == isinstance(stream_b, ResidualStream)
+    pending_a, pending_b = stream_a.pending, stream_b.pending
+    assert (pending_a is None) == (pending_b is None)
     update = None
-    if has_stream:
-        pending_a, pending_b = stream_a.pending, stream_b.pending
-        assert (pending_a is None) == (pending_b is None)
-        if pending_a is not None:
-            assert pending_a.update is pending_b.update
-            update = pending_a.update
+    if pending_a is not None:
+        assert pending_a.update is pending_b.update
+        update = pending_a.update
     for output in (output_a, output_b):
-        output["hidden_states"], output["residual"] = export_output(
-            output["hidden_states"], output["residual"], output["forward_batch"]
+        output["hidden_states"], output["residual"] = output["residual"].export(
+            output["hidden_states"]
         )
 
-    def _handle_key(name):
-        value_a = output_a[name]
-        value_b = output_b[name]
-        assert (value_a is None) == (value_b is None)
-        if value_a is None:
-            return None
-        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
-        res = torch.zeros(
-            (original_len, *value_a.shape[1:]),
-            dtype=value_a.dtype,
-            device=value_a.device,
-        )
-        res[slice(s0, t0)] = value_a[: t0 - s0]
-        res[slice(s1, t1)] = value_b[: t1 - s1]
-        return res
-
-    hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
-    return (
-        ResidualStream.from_handoff(hidden, residual, update)
-        if has_stream
-        else (hidden, residual)
+    hidden = _model_forward_tbo_merge_key(
+        output_a, output_b, "hidden_states", original_len
     )
+    residual = _model_forward_tbo_merge_key(
+        output_a, output_b, "residual", original_len
+    )
+    return ResidualStream.from_handoff(hidden, residual, update)
+
+
+def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
+    value_a = output_a[name]
+    value_b = output_b[name]
+    assert (value_a is None) == (value_b is None)
+    if value_a is None:
+        return None
+    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    res = torch.zeros(
+        (original_len, *value_a.shape[1:]),
+        dtype=value_a.dtype,
+        device=value_a.device,
+    )
+    res[slice(s0, t0)] = value_a[: t0 - s0]
+    res[slice(s1, t1)] = value_b[: t1 - s1]
+    return res
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------
