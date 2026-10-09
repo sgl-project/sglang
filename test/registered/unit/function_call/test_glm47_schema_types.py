@@ -264,6 +264,26 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             {"value": "123abc"},
         )
 
+    def test_non_json_container_and_boolean_values_stream_as_json(self):
+        """Streaming passed array/object/boolean values through verbatim, so a
+        value that isn't JSON ("1, 2", "True") produced invalid JSON while
+        non-streaming parsed it."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array"},
+                "flag": {"type": "boolean"},
+                "opts": {"type": "object"},
+            },
+        }
+        self.check_arguments(schema, {"ids": [1, 2]}, raw_values={"ids": "1, 2"})
+        self.check_arguments(schema, {"flag": True}, raw_values={"flag": "True"})
+        self.check_arguments(
+            schema,
+            {"ids": [1, 2], "opts": {"a": 1}},
+            raw_values={"ids": "\n[1, 2]\n", "opts": ' {"a": 1}'},
+        )
+
     def test_completed_siblings_disambiguate_root_union(self):
         for keyword in ("oneOf", "anyOf"):
             for discriminator in ("const", "enum"):
@@ -355,26 +375,6 @@ class TestGlm47SchemaTypes(unittest.TestCase):
         self.assertEqual(
             json.loads("".join(call.parameters for call in first.calls + last.calls)),
             {"value": "hello"},
-        )
-
-    def test_non_json_container_and_boolean_values_stream_as_json(self):
-        """Streaming passed array/object/boolean values through verbatim, so a
-        value that isn't JSON ("1, 2", "True") produced invalid JSON while
-        non-streaming parsed it."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "ids": {"type": "array"},
-                "flag": {"type": "boolean"},
-                "opts": {"type": "object"},
-            },
-        }
-        self.check_arguments(schema, {"ids": [1, 2]}, raw_values={"ids": "1, 2"})
-        self.check_arguments(schema, {"flag": True}, raw_values={"flag": "True"})
-        self.check_arguments(
-            schema,
-            {"ids": [1, 2], "opts": {"a": 1}},
-            raw_values={"ids": "\n[1, 2]\n", "opts": ' {"a": 1}'},
         )
 
 
