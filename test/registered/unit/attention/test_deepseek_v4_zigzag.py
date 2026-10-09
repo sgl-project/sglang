@@ -287,10 +287,10 @@ class TestDeepseekV4Zigzag(CustomTestCase):
             torch.testing.assert_close(restored, global_rows)
             # Exercise the active v2 attention/indexer writer, with only the
             # fused CUDA compression/store replaced by a row-sentinel store.
+            from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
             from sglang.srt.layers.attention.dsv4.compressor_v2 import (
                 CompressorBackendMixin,
             )
-            from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
             for ratio, indexer in ((4, True), (4, False), (128, False)):
                 locations = torch.arange(sum(lengths)).flip(0)
