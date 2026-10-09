@@ -600,11 +600,16 @@ class IndexerKPool(MultiPlatformOp):
         return_compressed: bool = False,
         write_cache: bool = True,
     ):
-        if key.shape[0] == 0:
-            return None
-
         if gate_score is None:
             gate_score = F.linear(x, self.index_kpool_compress_gate)
+
+        from sglang.srt.layers.cp.interleave_kpool import materialize_compression_inputs
+
+        key, gate_score, positions = materialize_compression_inputs(
+            key, gate_score, positions, forward_batch
+        )
+        if key.shape[0] == 0:
+            return None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._compress_write_decode(
