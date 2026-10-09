@@ -801,6 +801,27 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_convert_to_internal_request_forwards_cache_ids(self):
+        self.tm.tokenizer = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            cache_id="doc-42",
+            load_cache_id="doc-42",
+        )
+
+        with patch("sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"):
+            adapted, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+        self.assertEqual(adapted.cache_id, "doc-42")
+        self.assertEqual(adapted.load_cache_id, "doc-42")
+        # The tokenizer manager forwards only cache_salt to the scheduler.
+        adapted.normalize_batch_and_arguments()
+        self.assertEqual(adapted.cache_salt, "doc-42")
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
