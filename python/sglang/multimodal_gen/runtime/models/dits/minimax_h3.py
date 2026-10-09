@@ -25,6 +25,7 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
+    can_use_rmsnorm_indexed_scale_shift,
     can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
@@ -32,6 +33,9 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_mxfp8_,
+    mark_minimax_h3_norm_modulate_site,
+    minimax_h3_norm_modulate_active,
+    rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -392,12 +396,22 @@ def _modulate_rmsnorm_scale_shift(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    fused: bool = False,
 ) -> torch.Tensor:
     """RMSNorm + indexed AdaLN.
 
-    Keep ``nn.RMSNorm``; a fused RMSNorm+AdaLN kernel drifted 2-GPU
-    consistency GT for ~0.3% e2e, so it was removed.
+    The reference chain rounds after the norm and after every modulation op.
+    ``fused`` (quality lossless / high) runs one fp32 pass with one rounding,
+    which moves the denoising trajectory at rounding level.
     """
+    if (
+        fused
+        and x.dtype == dtype == _BF16_DTYPE
+        and norm.weight is not None
+        and can_use_rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices)
+    ):
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        return rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices, eps)
     return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
 
 
@@ -1574,6 +1588,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
+        mark_minimax_h3_norm_modulate_site(self)
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -1646,6 +1661,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_msa,
                 combined_indices,
                 dtype=_BF16_DTYPE,
+                fused=minimax_h3_norm_modulate_active(self),
             )
         h = self.attn(
             h,
@@ -1688,6 +1704,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_mlp,
                 combined_indices,
                 dtype=_BF16_DTYPE,
+                fused=minimax_h3_norm_modulate_active(self),
             )
             h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place

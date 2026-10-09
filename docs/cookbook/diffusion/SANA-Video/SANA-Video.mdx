@@ -1,6 +1,6 @@
 ---
 title: SANA-Video
-description: Serve the native SANA-Video 2B 480p text-to-video model with SGLang Diffusion.
+description: Generate videos with native SANA-Video 2B and SANA-Video 2.0 5B pipelines.
 metatags:
     description: "Run Efficient-Large-Model/SANA-Video_2B_480p_diffusers text-to-video generation with SGLang Diffusion."
 ---
@@ -95,3 +95,33 @@ Path("sana_video.mp4").write_bytes(video.content)
 - Use width and height values divisible by 16.
 - The prompt supports an optional `motion score: N.` suffix to express the
   desired amount of motion.
+
+## 6. SANA-Video 2.0
+
+The separate `Efficient-Large-Model/SANA-Video_2.0_5B_720p` checkpoint supports
+text-to-video and first-frame image conditioning. Its default profile is
+1280×736, 193 frames at 24 FPS, 50 steps, and guidance scale 8. This integration
+loads the official checkpoint directly and uses Gemma 2 and the LTX 2.3 VAE.
+
+On a single NVIDIA CUDA GPU, generate a short video with:
+
+```bash Command
+sglang generate \
+  --model-path Efficient-Large-Model/SANA-Video_2.0_5B_720p \
+  --prompt "A red tram moves slowly through a sunlit city square." \
+  --width 832 --height 480 --num-frames 17 --fps 24 \
+  --num-inference-steps 50 --guidance-scale 8 --seed 42 \
+  --output-file-path sana_video2.mp4
+```
+
+Add `--image-path first_frame.png` to condition the video on an image. Frame
+counts align to `8n+1`; width and height must be divisible by 32. The 4-step
+preview is a different checkpoint and is not supported by this pipeline.
+
+For offline weights, keep the model directory name, such as
+`/path/to/SANA-Video_2.0_5B_720p`, and pass it as `--model-path`. That directory
+must contain `config.yaml` and `checkpoints/SANA_Video_2.0_5B_720p.pth`. Set
+`--component-paths.text_encoder /path/to/gemma-2-2b-it` and
+`--component-paths.vae /path/to/ltx-2.3-vae`. The latter directory may contain
+the `vae` subdirectory or the VAE files directly. Without these overrides,
+the component checkpoints are downloaded automatically.
