@@ -478,6 +478,37 @@ class CompressorAscendBackendMixin:
         self._ensure_compressor_hadamard(compressor, device)
         self._ensure_fused_caches(compressor)
 
+        if ratio == 128:
+            import os as _osx
+
+            _envx = _osx.environ.get("DSV4_DUMP_C128X")
+            if _envx is not None and (
+                _envx in ("", "all") or _envx == str(compressor.layer_id)
+            ):
+                try:
+                    _lpx = (
+                        int(forward_batch.positions.reshape(-1)[-1].item())
+                        if forward_batch.positions.numel()
+                        else -1
+                    )
+                    _lox = int(_osx.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+                    _hix = int(_osx.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+                    if _lox <= _lpx <= _hix:
+                        import hashlib as _hlx
+
+                        # Hash the trailing 128 rows so the full-prefill miss and
+                        # the suffix hit compare the SAME absolute positions.
+                        _tail = x[-128:] if x.shape[0] >= 128 else x
+                        _xt = _tail.detach().contiguous().to(torch.float32).cpu()
+                        print(
+                            f"[C128X] layer={compressor.layer_id} lastpos={_lpx} "
+                            f"ntok={int(x.shape[0])} ntail={int(_tail.shape[0])} "
+                            f"md5={_hlx.md5(_xt.numpy().tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
+                except Exception as _exc:
+                    print(f"[C128X] skipped: {_exc}", flush=True)
+
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
