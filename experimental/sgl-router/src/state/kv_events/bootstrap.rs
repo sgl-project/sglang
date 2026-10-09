@@ -3,7 +3,8 @@
 
 //! Peer-snapshot bootstrap for the KV-event tree: the wire shape
 //! ([`PeerSnapshot`]) and its producer constants, the fetch client
-//! ([`fetch_snapshot`], [`fetch_cursors`]), the per-rank
+//! ([`fetch_snapshot`], [`fetch_cursors`]), the [`VettedSnapshot`] pass that
+//! turns wire input into something graftable, the per-rank
 //! [`BootstrapTracker`], and the [`PeerRegistry`] of peers a snapshot may be
 //! pulled from.
 //!
@@ -37,10 +38,12 @@ use super::tree::{KvWorkerId, SnapshotNode};
 mod fetch;
 mod peers;
 mod tracker;
+mod vet;
 
 pub use fetch::{fetch_cursors, fetch_snapshot, FetchAnswer};
 pub use peers::PeerRegistry;
 pub use tracker::BootstrapTracker;
+pub use vet::{VetError, VettedSnapshot};
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
@@ -122,13 +125,25 @@ pub enum SnapshotOutcome {
     /// Peer did not answer, or answered non-200 (including the 404 an older
     /// router image returns for an endpoint it does not serve).
     Unreachable,
-    /// Answered, but holds no state to graft.
+    /// Answered, but holds no state to graft for the ranks being bootstrapped.
+    /// That includes WARM peers whose tree shares no carriers with our live
+    /// workers or tracks none of those ranks, so this is not
+    /// [`PeerSnapshot::is_cold`] and does not count toward a cold-fleet verdict.
     ColdPeer,
-    /// Answered with an untrustworthy body (format, parents, block size).
+    /// Answered with an untrustworthy body: any [`VetError`] whose
+    /// [`VetError::outcome`] is `Rejected`.
     Rejected,
 }
 
 impl SnapshotOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 4] = [
+        Self::Accepted,
+        Self::Unreachable,
+        Self::ColdPeer,
+        Self::Rejected,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -150,15 +165,29 @@ pub enum SweepOutcome {
     FleetCold,
     /// The deadline expired first.
     TimedOut,
+    /// Every rank the sweep was run for left `Pending` without its snapshot:
+    /// resolved from its own stream's origin, settled cold because every
+    /// sibling proved it holds nothing for that rank, or forgotten.
+    RanksResolved,
 }
 
 impl SweepOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 5] = [
+        Self::Found,
+        Self::NoPeers,
+        Self::FleetCold,
+        Self::TimedOut,
+        Self::RanksResolved,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Found => "found",
             Self::NoPeers => "no_peers",
             Self::FleetCold => "fleet_cold",
             Self::TimedOut => "timed_out",
+            Self::RanksResolved => "ranks_resolved",
         }
     }
 }
@@ -174,17 +203,37 @@ pub enum RankOutcome {
     WarmUnwitnessed,
     /// The accepted snapshot carried no cursor for this rank.
     Uncovered,
-    /// No peer supplied a usable snapshot.
+    /// No peer supplied a usable snapshot: the deadline expired, discovery
+    /// confirmed there are no siblings, or every sibling proved it has nothing
+    /// to give — an empty tree, a permanent incompatibility, or this rank named
+    /// in [`PeerSnapshot::empty_ranks`].
     Abandoned,
-    /// The held batches overflowed before a snapshot arrived.
+    /// Held batches hit their cap before a snapshot arrived; bootstrap was
+    /// abandoned and they were replayed as live deltas.
     Overflow,
     /// The publisher restarted mid-bootstrap.
     PublisherReset,
     /// The tree refused the snapshot's structure.
     TreeRejected,
+    /// The rank's first held batch was its publisher's first batch ever, so its
+    /// history is complete without a snapshot and none was grafted.
+    FromOrigin,
 }
 
 impl RankOutcome {
+    /// Every variant, so the metrics surface can emit a zero row per label.
+    pub const ALL: [Self; 9] = [
+        Self::Warm,
+        Self::Gap,
+        Self::WarmUnwitnessed,
+        Self::Uncovered,
+        Self::Abandoned,
+        Self::Overflow,
+        Self::PublisherReset,
+        Self::TreeRejected,
+        Self::FromOrigin,
+    ];
+
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Warm => "warm",
@@ -195,6 +244,7 @@ impl RankOutcome {
             Self::Overflow => "overflow",
             Self::PublisherReset => "publisher_reset",
             Self::TreeRejected => "tree_rejected",
+            Self::FromOrigin => "from_origin",
         }
     }
 }
@@ -229,8 +279,9 @@ pub struct PeerSnapshot {
     pub block_size: u32,
     /// Producer's hashing mode (EAGLE-family workers hash token bigrams).
     pub is_bigram: bool,
-    /// True when the producer's hash config is established and its tree holds
-    /// nodes, so a cold or half-configured replica is never copied.
+    /// True when the producer's own bootstrap has settled, its hash config is
+    /// established, and its tree holds nodes, so a cold, still-bootstrapping
+    /// or half-configured replica is never copied.
     pub producer_ready: bool,
     /// Worker table; node carrier lists index into this.
     pub workers: Vec<WireWorker>,
@@ -239,6 +290,25 @@ pub struct PeerSnapshot {
     pub cursors: Vec<(u32, i64)>,
     /// Tree nodes in dependency order; see [`SnapshotNode`].
     pub nodes: Vec<SnapshotNode>,
+    /// Ranks the producer is subscribed to but held no tree node for at export
+    /// time: ranks it is still bootstrapping itself (their batches are held,
+    /// not applied), and ranks whose applied stream left nothing standing.
+    ///
+    /// Evidence for the consumer's per-rank cold settle: a rank every sibling
+    /// names here is one no sibling can supply, and the export was taken after
+    /// the consumer subscribed (see [`MAX_AGE_PARAM`]), so nothing a sibling
+    /// learns about it later is anything the consumer's own subscription will
+    /// not also deliver. Without it, "has nothing for this rank" and "has not
+    /// discovered this rank yet" look identical — a rank absent from
+    /// `workers` — and only the second is worth waiting for.
+    ///
+    /// Backward compatible in both directions, so no [`SNAPSHOT_FORMAT`] bump:
+    /// an older consumer ignores the unknown field, and an older producer omits
+    /// it, which reads as empty — no evidence, so the consumer keeps waiting
+    /// exactly as it did before the field existed. Omitted from the body when
+    /// empty for the same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empty_ranks: Vec<WireWorker>,
 }
 
 impl PeerSnapshot {
@@ -251,6 +321,16 @@ impl PeerSnapshot {
     /// `producer_ready: false` with nodes.
     pub fn holds_no_state(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Whether this body names `(url, dp_rank)` in [`Self::empty_ranks`]: the
+    /// producer is subscribed to it and holds nothing for it. Addressed by wire
+    /// identity, like [`Self::wire_cursor_for`], because it is evidence, not
+    /// tree state.
+    pub fn holds_nothing_for(&self, url: &str, dp_rank: u32) -> bool {
+        self.empty_ranks
+            .iter()
+            .any(|w| w.url == url && w.dp_rank == dp_rank)
     }
 
     /// Last-applied seq the producer reports for `(url, dp_rank)`. Sequence
@@ -271,6 +351,13 @@ impl PeerSnapshot {
 #[cfg(test)]
 mod test_support {
     use super::*;
+
+    pub(super) fn wire_worker(url: &str, dp_rank: u32) -> WireWorker {
+        WireWorker {
+            url: url.into(),
+            dp_rank,
+        }
+    }
 
     pub(super) fn sample_snapshot() -> PeerSnapshot {
         PeerSnapshot {
@@ -303,16 +390,76 @@ mod test_support {
                     tiers: vec![],
                 },
             ],
+            empty_ranks: vec![],
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::sample_snapshot;
+    use super::test_support::{sample_snapshot, wire_worker};
     use super::*;
 
+    /// A wire cursor is read by worker identity, without vetting. A worker the
+    /// snapshot does not mention yields `None` rather than a misaddressed
+    /// cursor from another rank's table slot.
+    #[test]
+    fn wire_cursor_is_addressed_by_identity_not_table_position() {
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size: 4,
+            is_bigram: false,
+            producer_ready: true,
+            workers: vec![wire_worker("http://w1", 0), wire_worker("http://w2", 1)],
+            // Out of table order, and with no entry for index 0.
+            cursors: vec![(1, 77)],
+            nodes: vec![],
+            empty_ranks: vec![],
+        };
+        assert_eq!(snap.wire_cursor_for("http://w2", 1), Some(77));
+        assert_eq!(
+            snap.wire_cursor_for("http://w1", 0),
+            None,
+            "a worker in the table without a cursor must not borrow another's",
+        );
+        assert_eq!(
+            snap.wire_cursor_for("http://w2", 0),
+            None,
+            "dp_rank matters"
+        );
+        assert_eq!(snap.wire_cursor_for("http://nope", 0), None);
+    }
+
     /// A body with every field populated survives a JSON round trip.
+    /// `empty_ranks` is additive on the wire. An older producer's body has no
+    /// such key and must decode as "no evidence"; an empty list is omitted, so
+    /// an older consumer sees the body it always has.
+    #[test]
+    fn empty_ranks_is_backward_compatible_on_the_wire() {
+        let old_producer = serde_json::json!({
+            "format": SNAPSHOT_FORMAT,
+            "block_size": 64,
+            "is_bigram": false,
+            "producer_ready": true,
+            "workers": [],
+            "cursors": [],
+            "nodes": [],
+        });
+        let decoded: PeerSnapshot = serde_json::from_value(old_producer).unwrap();
+        assert!(decoded.empty_ranks.is_empty());
+        assert!(!decoded.holds_nothing_for("http://a", 0));
+
+        let encoded = serde_json::to_value(sample_snapshot()).unwrap();
+        assert!(encoded.get("empty_ranks").is_none(), "omitted when empty");
+
+        let mut named = sample_snapshot();
+        named.empty_ranks = vec![wire_worker("http://a", 1)];
+        let round: PeerSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&named).unwrap()).unwrap();
+        assert!(round.holds_nothing_for("http://a", 1));
+        assert!(!round.holds_nothing_for("http://a", 0), "dp_rank matters");
+    }
+
     #[test]
     fn snapshot_round_trips_through_json() {
         let snap = sample_snapshot();
@@ -353,6 +500,26 @@ mod tests {
             snap.wire_cursor_for("http://a:30000", 1),
             None,
             "a listed worker with no cursor entry is not a witness",
+        );
+    }
+
+    /// Connect and read cut a dead or stalled peer loose well inside the total
+    /// cap, which is what lets the cap be generous enough for a large healthy
+    /// snapshot.
+    #[test]
+    fn fetch_bounds_separate_hung_from_big() {
+        assert!(
+            SNAPSHOT_FETCH_CONNECT_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "connect must cut a dead peer long before the total bound",
+        );
+        assert!(
+            SNAPSHOT_FETCH_READ_TIMEOUT < DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "an idle bound above the total can never fire, leaving the total as \
+             the hang detector again",
+        );
+        assert!(
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP >= Duration::from_secs(90),
+            "a cap this side of ~90s cannot seed a warm fleet",
         );
     }
 }

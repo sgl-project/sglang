@@ -9,6 +9,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -79,9 +80,7 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
-    # Weight slicing derives the shard rank from the wrapped base layer
-    # (base_layer.tp_rank): under DP attention, attention layers are built
-    # on the attn-TP group, so the outer/global TP rank would overshoot.
+    # LoRA slices follow the base layer's group; attention TP can differ from TP.
     def slice_lora_a_weights(self, A: torch.Tensor):
         pass
 
@@ -520,7 +519,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(self.base_layer.tp_group)[0]
         shard_size = self.base_layer.output_partition_sizes[0]
         start_idx = local_tp_rank * shard_size
         end_idx = (local_tp_rank + 1) * shard_size
@@ -623,7 +622,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(self.base_layer.tp_group)[0]
         partition_sizes = self.base_layer.output_partition_sizes
         output_sizes = self.base_layer.output_sizes
         slices = []
@@ -648,13 +647,13 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor):
         bl = self.base_layer
-        tp_rank = bl.tp_rank
+        tp_rank = get_group_rank_size(bl.tp_group)[0]
         hd, nkv, nh, dr, tp = (
             bl.inkling_head_dim,
             bl.inkling_num_kv_heads,
             bl.inkling_num_heads,
             bl.inkling_d_rel,
-            bl.inkling_tp_size,
+            get_group_rank_size(bl.tp_group)[1],
         )
         q_size, kv_size, r_size = hd * nh, hd * nkv, dr * nh
         q_off, k_off, v_off, r_off = 0, q_size, q_size + kv_size, q_size + 2 * kv_size
@@ -738,17 +737,18 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         q_proj_shard_size = base_layer.q_proj_shard_size
         kv_proj_shard_size = base_layer.kv_proj_shard_size
         num_kv_head_replicas = base_layer.num_kv_head_replicas
-        local_tp_rank = base_layer.tp_rank
+        local_tp_rank = get_group_rank_size(base_layer.tp_group)[0]
 
         q_start_idx = q_proj_shard_size * local_tp_rank
         q_end_idx = q_start_idx + q_proj_shard_size
 
-        kv_shard_id = local_tp_rank // num_kv_head_replicas
+        kv_tp_rank, _ = get_group_rank_size(base_layer.kv_tp_group)
+        kv_shard_id = kv_tp_rank // num_kv_head_replicas
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size = base_layer.output_sizes[0]
-        k_size = base_layer.output_sizes[1] // num_kv_head_replicas
+        q_size = base_layer.total_num_heads * base_layer.head_size
+        k_size = base_layer.total_num_kv_heads * base_layer.head_size
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
@@ -805,13 +805,12 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.lora_backend.start_lora_a_overlap(x, self.A_buffer)
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
+        tp_rank, tp_size = get_group_rank_size(self.base_layer.tp_group)
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.base_layer.tp_size
-            )
-            input_parallel = splitted_input[self.base_layer.tp_rank].contiguous()
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=tp_size)
+            input_parallel = splitted_input[tp_rank].contiguous()
 
         lora_active = self.lora_active
         if lora_active:
@@ -819,7 +818,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
         bias_ = (
             None
-            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            if (tp_rank > 0 or self.base_layer.skip_bias_add)
             else self.base_layer.bias
         )
         output_parallel = self.base_layer.quant_method.apply(
@@ -828,7 +827,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
         should_reduce = (
             self.base_layer.reduce_results
-            and self.base_layer.tp_size > 1
+            and tp_size > 1
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         )
@@ -865,7 +864,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor):
-        local_tp_rank = self.base_layer.tp_rank
+        local_tp_rank, _ = get_group_rank_size(self.base_layer.tp_group)
         shard_size = self.base_layer.input_size_per_partition
         start_idx = local_tp_rank * shard_size
         end_idx = (local_tp_rank + 1) * shard_size
@@ -1149,9 +1148,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 

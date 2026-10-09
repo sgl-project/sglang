@@ -1,7 +1,6 @@
-//! The response direction: the per-request back-channel the API handler
-//! drains ([`ResponseSink`] / [`ResponseItem`]), the response frame encodings
-//! (batch / control result / error), and the columnar batch decode into
-//! per-request [`ChunkEvent`]s.
+//! The runtime response direction: per-request channels into the core
+//! boundary ([`ResponseSink`] / [`ResponseItem`]), response frame encodings,
+//! and columnar batch decoding into per-request [`ChunkEvent`]s.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -12,8 +11,8 @@ use crate::message::ids::Rid;
 use crate::message::types::TokenIds;
 use crate::utils::error::Error;
 
-/// Per-request back-channel the detok shard writes decode frames to and the API
-/// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
+/// Per-request back-channel the detok shard writes runtime outputs to and the
+/// core boundary drains; bounded, and receiver-drop cancels the producer.
 #[derive(Clone, Debug)]
 pub enum ResponseSink {
     Local(mpsc::Sender<ResponseItem>),
@@ -39,26 +38,26 @@ impl ResponseSink {
     }
 }
 
-#[allow(dead_code)] // the receiver half is owned by frontend::FrontendCall.
+#[allow(dead_code)] // the receiver half is owned inside the core boundary.
 pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
-/// What the connection handler receives on the decode stream: a detok-decoded
-/// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
+/// Runtime-facing output delivered to the core boundary: a detok-decoded
+/// [`ChunkEvent`], a serialized internal-operation result, or a stage error.
+/// [`crate::api_server::core::CoreHandle`] translates these variants before a
+/// transport adapter sees them.
 #[derive(Debug)]
 pub enum ResponseItem {
     /// An intermediate streamed generation step (only sent for streaming reqs).
     Frame(ChunkEvent),
     /// The final generation step.
     Done(ChunkEvent),
-    /// A control-request result: one verbatim payload (e.g. `/server_info`),
-    /// delivered as-is with no per-protocol formatting.
+    /// A control-request result encoded by the Python scheduler.
     Control(Bytes),
     /// Reply to an internal service request (`RequestKind::Detokenize`): raw
-    /// bytes for the SUBMITTER to consume (e.g. the decoded prompt text), not
-    /// client-bound JSON like `Control` and not a generation frame. Generation
-    /// and control drains never see it.
+    /// bytes for the core to decode (e.g. detokenized text), not a
+    /// client-facing wire payload and not a generation frame.
     Data(Bytes),
-    /// Terminal failure: handler emits an error frame (stream) or status (unary).
+    /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
 
@@ -536,8 +535,8 @@ pub fn frame_control_result(rid: &str, payload: &[u8]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Frame a per-request failure `[rid, message]` for the response — routes a
-/// terminal error back to the owning request (→ HTTP 400) instead of crashing.
+/// Frame a per-request validation failure `[rid, message]` for the response —
+/// routes a terminal error back to the owning request instead of crashing.
 pub fn frame_error(rid: &str, message: &str) -> Bytes {
     use rmpv::Value;
     let arr = Value::Array(vec![Value::from(rid), Value::from(message)]);
@@ -558,10 +557,9 @@ pub fn frame_error(rid: &str, message: &str) -> Bytes {
 /// frame and moved between stages in-process (never serialized), so no serde.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
-    /// Client-visible rid — the request's IDENTITY. Moved out of the frame header
-    /// (which owns it and drops it), so carrying it costs no allocation. The shard
-    /// is still chosen by `Rid::shard`, but a hash collision there now only
-    /// co-locates two requests instead of merging them.
+    /// Runtime correlation ID. Moved out of the frame header (which owns it and
+    /// drops it), so carrying it costs no allocation. The core strips this
+    /// field before exposing semantic output; the shard routes it via `Rid::shard`.
     pub rid: Rid,
     /// New token ids for this step, widened from the scheduler's int32 wire
     /// width at parse time. Empty allowed (e.g. metadata-only frames).
