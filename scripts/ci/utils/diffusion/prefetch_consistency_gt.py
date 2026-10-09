@@ -34,6 +34,12 @@ CHECKOUT_TIMEOUT_SECONDS = 120
 # mid-extract otherwise leaves a partial tree that the next run treats as a hit.
 MARKER_NAME = ".complete"
 
+# A fetch in flight has no marker (it is written last) and its PID is in another
+# container's namespace, so age is the only usable signal that a concurrent job
+# still owns a temp directory. The timeouts above cap one fetch near 15 minutes.
+TMP_DIR_MARK = ".tmp."
+ABANDONED_FETCH_SECONDS = 3600
+
 
 def _resolve_gt_source() -> tuple[str, str, str]:
     """Return (repo, revision, in-repo GT path) from the constants the tests use."""
@@ -247,8 +253,15 @@ def _prune(cache_root: Path, keep_dir: Path, keep_days: float) -> None:
     # pin runs alongside main-branch jobs on the same pool, and the two would
     # delete each other's tree on every run.
     cutoff = time.time() - keep_days * 86400
+    abandoned_cutoff = time.time() - ABANDONED_FETCH_SECONDS
     for entry in sorted(cache_root.iterdir()):
         if not entry.is_dir() or entry == keep_dir:
+            continue
+        if TMP_DIR_MARK in entry.name:
+            if entry.stat().st_mtime >= abandoned_cutoff:
+                continue
+            print(f"Removing abandoned download: {entry}", flush=True)
+            shutil.rmtree(entry, ignore_errors=True)
             continue
         marker = entry / MARKER_NAME
         # No marker means a crashed fetch or an interrupted prune.
