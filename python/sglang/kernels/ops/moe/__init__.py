@@ -21,6 +21,21 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
+        op="moe.bf16_mega_gate",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+        format_signature=FormatSignature(
+            description="BF16 gate GEMM + normalized sqrtsoftplus top-k; FP32 weights, int64 logical IDs",
+        ),
+        description="DeepGEMM MegaGate routing on datacenter Blackwell.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
