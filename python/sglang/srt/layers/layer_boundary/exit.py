@@ -194,8 +194,10 @@ class ExitPolicy:
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
         )
-        if not steps.output.may_defer_to_next and not (
-            self.plan.terminal and defer_moe_finalize
+        # An FFN that writes its output at a pipeline handoff completes it here.
+        if steps.writes_at_handoff or (
+            not steps.output.may_defer_to_next
+            and not (self.plan.terminal and defer_moe_finalize)
         ):
             return ExitDecision(
                 defer_moe_finalize=False,
@@ -279,7 +281,7 @@ class ExitPolicy:
                 forward_batch=forward_batch,
             )
         update = steps.output.update
-        if residual is not None and update.applied_at_exit:
+        if residual is not None and (update.applied_at_exit or steps.writes_at_handoff):
             hidden_states = update.update(hidden_states, residual)
             residual = None
         return hidden_states, residual

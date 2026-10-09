@@ -1,0 +1,160 @@
+---
+title: Clef
+description: "Deploy Cloudflare's Clef 27B and Clef Flash 9B decision models with SGLang. Select either variant for BF16 text and image decisions on one NVIDIA B200, B300, or H200."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Clef support merged after v0.5.21 in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use the pinned nightly wheel or Docker image below. See the [installation guide](/docs/get-started/install) for other methods.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+This command selects the wheel from [nightly build 37ae292e6f](https://github.com/sgl-project/sglang/actions/runs/37897861964), which includes Clef support. It targets Python 3.10 on Linux x86_64 with glibc 2.39 or newer.
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv venv --python 3.10
+source .venv/bin/activate
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ "sglang==0.5.22.dev20261009+g37ae292e6f"
+```
+
+Run the command from the wizard’s Python tab in this environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:dev-clef
+```
+
+The [Clef image build](https://github.com/sgl-project/sglang/actions/runs/37893990016) produces this image from the #42721 merge commit. Run the command from the wizard’s Docker tab. Both checkpoints are public; no Hugging Face token is required.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Choose your GPU, then Clef or Clef Flash. The wizard updates the model in the launch command and sample request. Both models run on one GPU in BF16 with TP=1 using the default settings; the commands need only the model path, host, and port.
+
+import { Deployment } from "/src/snippets/_deployment.jsx"
+import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
+
+<Deployment config={config} />
+
+<Note>
+  We tested both models on one B300 and one H200 inside `lmsysorg/sglang:dev-clef`, built from [SGLang bd2d73daa5af](https://github.com/sgl-project/sglang/commit/bd2d73daa5afda6bcad8d479a834f2e70bbe9569), with PyTorch 2.14.1+cu130 and Transformers 5.19.0. Each configuration passed the wizard’s cURL request, the Python example below, and four requests covering short and long text, each with and without an image. Both long requests used all 16,384 prompt tokens and preserved every question.
+
+  B200 passed the same four text/image cases with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. These checks covered serving behavior; throughput and accuracy were not measured.
+</Note>
+
+## 1. Model introduction
+
+Cloudflare post-trained Clef from Qwen3.8-27B and Clef Flash from Qwen3.5-9B, then released both under the Apache-2.0 license. Each model keeps its backbone and vision encoder and adds a joint schema head. The head reads the backbone’s final hidden states, routes state evidence to each option, and lets questions attend to one another. It returns one logit per allowed option in a single prefill, with no text generation.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "40%"}} />
+    <col style={{width: "35%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Backbone</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}>Clef (27B)</td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Cloudflare/clef">Cloudflare/clef</a></td>
+      <td style={{padding: "9px 12px"}}>Qwen3.8-27B</td>
+    </tr>
+    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
+      <td style={{padding: "9px 12px"}}>Clef Flash (9B)</td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Cloudflare/clef-flash">Cloudflare/clef-flash</a></td>
+      <td style={{padding: "9px 12px"}}>Qwen3.5-9B</td>
+    </tr>
+  </tbody>
+</table>
+
+Pass a text string, JSON object, or JSON array as the state, with optional images. `/v1/systemone` returns one answer per question: a `choice` over allowed options, a `noul` probability of true, or a `score` over ordered levels.
+
+## 2. Configuration tips
+
+- **Route.** Send requests to `/v1/systemone`, or set your System One client’s base URL to the server. This includes TypeSafe SDK clients. See the [API reference](/docs/supported-models/decision_models#system-one-compatible-api) for request and response fields. Clef refuses `/v1/decisions`, chat, and generation requests.
+- **One GPU, one prefill per request.** Keep TP=1 and PP=1. All questions share one prompt, so the model reads the state once. SGLang detects `joint_head_config.json`, loads `joint_head.safetensors`, and enables embedding mode. It disables radix caching, chunked prefill, and CUDA graphs. No reasoning parser, tool-call parser, or chat-template override is needed.
+- **Answers.** `probabilities` are the softmax of the head’s logits for each question. `confidence` uses the System One adapter formulas. It can differ from the checkpoint’s reference `systemone()`, which reports the top option’s probability as confidence. Answers omit `x_label_mass` because the head scores only the allowed options.
+- **Long states.** Prompts, including images, are capped at 16,384 tokens, the reference `encode_record` function’s default `max_length`. The effective limit can be lower, depending on the server context, KV token pool, and `--max-prefill-tokens`. The server truncates the state to leave room for the questions and images. If those do not fit even without the state, it rejects the request.
+- **Images.** Send each image in `images` as a data URL, such as `data:image/jpeg;base64,...`, or an HTTP(S) URL. Keep the data-URL prefix for JPEGs: bare base64 starts with `/`, which the loader treats as a file path, causing the request to fail. Images precede the state.
+
+## 3. Advanced usage
+
+### 3.1 Text decisions
+
+Set `MODEL` to the checkpoint you selected in the wizard. The request works with either variant.
+
+<Accordion title="Text decision example (Python)">
+
+```python Example
+import requests
+
+MODEL = "Cloudflare/clef-flash"  # Or "Cloudflare/clef".
+
+response = requests.post(
+    "http://localhost:30000/v1/systemone",
+    json={
+        "model": MODEL,
+        "state": "My Stripe integration keeps failing. I am losing sales. Please help ASAP.",
+        "questions": {
+            "routing": {
+                "type": "choice",
+                "instructions": "Which team should handle this request?",
+                "criteria": {
+                    "billing": "Charges and refunds",
+                    "technical_support": "Integration errors",
+                    "sales": "Questions about buying a product",
+                },
+            },
+            "urgency": {"type": "noul", "instructions": "Does this message express urgency?"},
+            "frustration": {
+                "type": "score",
+                "instructions": "How frustrated is the customer?",
+                "criteria": ["Calm", "Frustrated but civil", "Very angry"],
+            },
+        },
+    },
+    timeout=60,
+)
+response.raise_for_status()
+answers = response.json()["answers"]
+print("Routing:", answers["routing"]["choice"])
+print("Urgency:", answers["urgency"]["noul"])
+print("Frustration:", answers["frustration"]["score"])
+print("Usage:", response.json()["usage"])
+```
+
+</Accordion>
+
+<Accordion title="Example output">
+
+Captured with Clef Flash on one H200. Probabilities can vary with the model variant, hardware, and numerical backend.
+
+```text Output
+Routing: technical_support
+Urgency: 0.9492946352021694
+Frustration: 1.7297646970642042
+Usage: {'input_tokens': 334, 'output_tokens': 0}
+```
+
+</Accordion>

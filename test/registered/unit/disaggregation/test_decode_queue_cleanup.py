@@ -251,7 +251,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock()
-        queue.token_to_kv_pool_allocator = MagicMock()
+        # SWA tail pre-allocation runs on a paged pool.
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
         queue.req_to_token_pool = MagicMock()

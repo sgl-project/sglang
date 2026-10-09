@@ -377,7 +377,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.transformer_2 = transformer_2
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         # Per-request Cache-DiT overrides for the batch being executed
         # (stashed by _maybe_enable_cache_dit; read by the config builders).
         self._cache_dit_request_overrides: dict[str, Any] = {}
@@ -431,7 +430,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -850,7 +848,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             disable_cache_on_transformer(transformer)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
@@ -1206,7 +1203,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
 
         self._cache_dit_enabled = True
-        self._cached_num_steps = num_inference_steps
         self._cache_dit_active_key = desired_key
 
     @lru_cache(maxsize=8)
