@@ -4460,6 +4460,33 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(message.content, "\n\nThe answer is 42.\n")
 
     # ------------- reasoning config tests -------------
+    def test_minimax_m3_reasoning_toggle_round_trips(self):
+        """Bug regression: MiniMax-M3's Anthropic thinking override must use
+        the string-valued ``thinking_mode`` template kwarg that its read path
+        consumes, instead of falling through to the parser's always-on mode.
+        """
+        self.chat.reasoning_parser = "minimax-m3"
+        self.chat._reasoning_detector = Mock(reasoning_default="always")
+        self.template_manager.reasoning_config = None
+
+        for enabled, thinking_mode in ((True, "enabled"), (False, "disabled")):
+            with self.subTest(enabled=enabled):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    chat_template_kwargs={"preserved": "value"},
+                )
+
+                self.chat.apply_reasoning_enabled(request, enabled)
+
+                self.assertEqual(
+                    request.chat_template_kwargs,
+                    {"preserved": "value", "thinking_mode": thinking_mode},
+                )
+                self.assertEqual(
+                    self.chat._get_reasoning_from_request(request), enabled
+                )
+
     def test_get_reasoning_from_request_default_true_toggle(self):
         self.tm.server_args.reasoning_parser = "qwen3"
         self.chat.reasoning_parser = "qwen3"
