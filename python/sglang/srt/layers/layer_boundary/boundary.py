@@ -171,6 +171,10 @@ class _TransformedRead:
     def reads_before_dp_gather(self):
         return self.inner.reads_before_dp_gather
 
+    @property
+    def reads_after_attn_tp_gather(self):
+        return self.inner.reads_after_attn_tp_gather
+
     def init_residual(self, hidden_states):
         return self.inner.init_residual(hidden_states)
 

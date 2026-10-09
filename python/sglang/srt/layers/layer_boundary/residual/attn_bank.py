@@ -247,6 +247,8 @@ class _FfnReadout(_BankReadout):
     """The FFN input: the attention output's add folded into the bank
     aggregation, and this layer's post-attention norm."""
 
+    reads_after_attn_tp_gather = False
+
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state

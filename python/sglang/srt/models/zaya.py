@@ -135,6 +135,7 @@ class _ResidualMergeRead:
 
     is_plain_norm = False
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, res_scale: Optional[ResidualScaling]):
         self.res_scale = res_scale

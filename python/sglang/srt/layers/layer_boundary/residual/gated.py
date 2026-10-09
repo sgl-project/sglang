@@ -171,6 +171,7 @@ class _FfnReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state

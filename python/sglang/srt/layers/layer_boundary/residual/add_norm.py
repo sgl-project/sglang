@@ -328,6 +328,7 @@ class NormQuantReadout:
 
     is_plain_norm = True
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
 
     def init_residual(self, hidden_states):
@@ -363,6 +364,7 @@ class NormReadout:
 
     is_plain_norm = True
     reads_before_dp_gather: bool = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states

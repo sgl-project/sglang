@@ -438,8 +438,7 @@ def _resolve_stage(stage, variant, following=None):
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
-            following is not None
-            and getattr(following.read, "reads_after_attn_tp_gather", False)
+            following is not None and following.read.reads_after_attn_tp_gather
         ):
             returned = attention
         elif exit_rows is ExitRows.SLICE:
@@ -705,11 +704,12 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
             stack's first. What they build is discarded.
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
-        final_read: The model's final read of the stack's output, when it is
-            not a plain final norm: the consumer of the last stage when no
-            later layer declares one. Its ``attn_tp_gather`` gathers the rows
-            that stage leaves on this rank's attention-TP slice, and with
-            ``reads_attn_tp_slices`` it reads that slice instead.
+        final_read: The model's final read of the stack's output (a
+            ``FinalRead``), when it is not a plain final norm: the consumer of
+            the last stage when no later layer declares one. Its
+            ``attn_tp_gather`` gathers the rows that stage leaves on this
+            rank's attention-TP slice, and with ``reads_attn_tp_slices`` it
+            reads that slice instead.
     """
     global _stack
     outer = _stack

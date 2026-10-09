@@ -48,6 +48,7 @@ class PlainReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def init_residual(self, hidden_states):
         return hidden_states
