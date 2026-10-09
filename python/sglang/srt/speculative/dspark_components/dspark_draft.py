@@ -127,7 +127,6 @@ def draft_markov_block(
     step_temperatures: torch.Tensor,
     noise: DraftNoise,
     tp_sync: SpecTpSync,
-    site: SpecTpSyncSite,
     logits_out: Optional[torch.Tensor] = None,
     keep_logits: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -160,7 +159,7 @@ def draft_markov_block(
             step=step,
             logits_out=logits_out[:, step] if keep_logits else None,
         )
-        prev_tokens = tp_sync.sync(site, prev_tokens)
+        prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
     noise.offset.add_(1)
     return torch.stack(draft_tokens, dim=1), logits_out
@@ -187,7 +186,6 @@ def sample_draft_block(
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
-    any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     temperatures = resolve_draft_temperatures(
         bs=bs, sampling_info=sampling_info, device=device
     )
@@ -199,11 +197,6 @@ def sample_draft_block(
         step_temperatures=temperatures.masked_fill(greedy_mask, 0.0),
         noise=noise,
         tp_sync=tp_sync,
-        site=(
-            SpecTpSyncSite.DSPARK_DRAFT_SAMPLE
-            if any_sampling
-            else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
-        ),
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,

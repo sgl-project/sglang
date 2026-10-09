@@ -11,7 +11,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     draft_markov_block,
     select_draft_hidden_without_anchor,
 )
-from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +61,6 @@ class DsparkDraftSampler:
         self.folded_sampling = folded_sampling
         self._noise = noise
         self._tp_sync = tp_sync
-        self._site = (
-            SpecTpSyncSite.DSPARK_GRAPH_SAMPLE
-            if folded_sampling
-            else SpecTpSyncSite.DSPARK_GRAPH_GREEDY
-        )
         # Per-row draft temperature, 0 for argmax rows; staged before each replay.
         self.temperatures = torch.zeros(
             (self.max_bs,), dtype=torch.float32, device=device
@@ -117,7 +112,6 @@ class DsparkDraftSampler:
             step_temperatures=self.temperatures[:bs],
             noise=self._noise,
             tp_sync=self._tp_sync,
-            site=self._site,
             logits_out=logits_out,
             keep_logits=self.folded_sampling,
         )
