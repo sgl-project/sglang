@@ -22,6 +22,7 @@ from sglang.srt.layers.layer_boundary import (
     layer_stack,
 )
 from sglang.srt.layers.layer_boundary import prepare as boundary_prepare
+from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
 from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_gather_input,
@@ -169,7 +170,7 @@ class TestAppendStages(CustomTestCase):
         self.assertTrue(all(s.plan is not None for s in branch))
         # The branch reads the MoE's input; the next layer follows the main
         # line's MoE, not the branch's dense FFN.
-        self.assertEqual(branch[0].declaration.prepared_from, moe.declaration)
+        self.assertEqual(branch[0].declaration.prepared_from, facts_of(moe.declaration))
         self.assertTrue(following[0].declaration.previous.sparse)
 
     def test_a_nested_stack_leaves_the_outer_one_untouched(self):
@@ -214,7 +215,7 @@ class TestAppendStages(CustomTestCase):
                 (declare_ffn(), fixture.Norm()), prepared_from=first.declaration
             )
         self.assertIsNot(first.declaration, second.declaration)
-        self.assertIs(branch.declaration.prepared_from, first.declaration)
+        self.assertEqual(branch.declaration.prepared_from, facts_of(first.declaration))
 
     @unittest.skipUnless(hasattr(BaseException, "add_note"), "needs add_note")
     def test_an_error_at_close_names_the_append_it_binds(self):

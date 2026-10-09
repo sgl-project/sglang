@@ -29,6 +29,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageContract,
     StageKind,
 )
+from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.layout import (
     Layout,
     SumGroup,
@@ -304,8 +305,9 @@ class StageDeclaration:
             producer's rank takes it from the neighbouring layer it builds on
             the meta device, so it may use only the communication state of the
             rank it runs on, not the declaring layer's weights or buffers.
-        previous: Declaration whose output this stage consumes, as the stack
-            records it; across pipeline ranks it is built locally.
+        previous: The stage whose output this stage consumes, as the stack
+            records it: only the facts binding reads of it (see facts_of),
+            on this rank or another.
         prepared_from: Declaration whose already-read input a branch reuses.
             Mutually exclusive with previous; avoids a second update/read.
 
@@ -738,6 +740,19 @@ def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
     if arrivals is None:
         arrivals = {v: _stack_arrival(v) for v in variants}
         if before is not None:
+            if (
+                before.output_transform is not None
+                and before.kind is StageKind.ATTENTION
+                and before.reduction is ProducerReduction.ALWAYS_PARTIAL
+            ):
+                # Its transform runs at the next stage's input, which would be
+                # on this rank, without the module that declares it.
+                error = NotImplementedError(
+                    "a pipeline rank that ends on an attention transforming the "
+                    "output whose sum it leaves"
+                )
+                _note_origin(error, origins[0])
+                raise error
             flow = resolve(0, before, arrivals, line[0])
             arrivals = {v: _arrival(before, flow[v], v) for v in variants}
     flows = []
@@ -875,7 +890,9 @@ def _neighbour_stage(build_layers, *, last):
         finally:
             _stack = outer
         if appends:
-            return appends[-1].declarations[-1] if last else appends[0].declarations[0]
+            return facts_of(
+                appends[-1].declarations[-1] if last else appends[0].declarations[0]
+            )
     return None
 
 
@@ -938,15 +955,6 @@ def _return_before_trailing_attention(line):
             return
 
 
-def _detached(declaration):
-    """The declaration as the stage after it records it: without its own
-    history, so a bound stage holds its producer's facts and not the chain of
-    declarations before it."""
-    if declaration is None:
-        return None
-    return replace(declaration, previous=None, prepared_from=None)
-
-
 def _bind_stack(appends, *, previous, following, final_read=None):
     """Bind every appended stage and fill in the boundaries each append
     returned.
@@ -973,13 +981,13 @@ def _bind_stack(appends, *, previous, following, final_read=None):
     bound = {id(append): [None] * len(append.bindings) for append in appends}
     # A returned declaration's stage as bound, for the branches that start from it.
     sources = {}
-    producer = _detached(_handed_off(previous))
+    producer = facts_of(_handed_off(previous))
     chained = []
     for append, index in stages:
         chained.append(
             replace(append.declarations[index], previous=producer, prepared_from=None)
         )
-        producer = _detached(chained[-1])
+        producer = facts_of(chained[-1])
     connections = _connect_line(
         chained,
         [append.origin for append, _ in stages],
@@ -1010,8 +1018,8 @@ def _bind_stack(appends, *, previous, following, final_read=None):
             chained.append(
                 replace(
                     declaration,
-                    previous=chained[-1] if chained else None,
-                    prepared_from=None if chained else source_declaration,
+                    previous=facts_of(chained[-1]) if chained else None,
+                    prepared_from=None if chained else facts_of(source_declaration),
                 )
             )
         try:
