@@ -411,11 +411,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
-        # materialize the padded weight parameter for CUDA Graph compatibility.
-        self._create_padded_weight_param(layer)
+        # materialize the merged weight parameter for CUDA Graph compatibility.
+        self._create_merged_weight_param(layer)
 
-    def _create_padded_weight_param(self, layer: torch.nn.Module):
-        """Create padded weight parameter for GGUF MergedLinear layer."""
+    def _create_merged_weight_param(self, layer: torch.nn.Module):
+        """Create flat merged weight parameter for GGUF MergedLinear layer."""
         qweight = layer.qweight
         shard_id_map = qweight.shard_id_map
         shard_id = qweight.shard_id
@@ -425,32 +425,28 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Data container has mixed dtypes: {dtype}"
             )
             dtype = next(iter(dtype))
-            # concat dim0 and pad dim1
-            padded_side = max(x.size(1) for x in data_container)
-            concat_side = sum(x.size(0) for x in data_container)
-            # Pad the quantized weights to dense tensor, and create a map
-            # with the location of each shard in the padded tensor.
-            padded_data = torch.zeros(
-                (concat_side, padded_side), dtype=dtype, device=qweight.device
-            )
-            # (dim0_start, dim0_end, dim1_size)
-            shard_offset_map = dict[str, tuple[int, int, int]]()
+            # Lay the shards end to end in one flat buffer without padding.
+            # Shards may have different GGUF types (row widths), so a padded
+            # 2D block would need a copy per forward to slice them out; here
+            # each shard is a contiguous (rows, row_bytes) view at an offset.
+            total = sum(x.numel() for x in data_container)
+            flat_data = torch.empty((total,), dtype=dtype, device=qweight.device)
+            # (offset, rows, row_bytes)
+            shard_flat_map = dict[str, tuple[int, int, int]]()
             ordered_shard_ids = _ordered_gguf_shard_ids(shard_id)
             cursor = 0
             for idx in ordered_shard_ids:
-                id_in_container = shard_id_map[idx]
-                start = cursor
-                end = start + data_container[id_in_container].size(0)
-                size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
-                shard_offset_map[idx] = (start, end, size)
-                cursor = end
+                data = data_container[shard_id_map[idx]]
+                rows, width = data.size(0), data.size(1)
+                flat_data[cursor : cursor + rows * width].view(rows, width).copy_(data)
+                shard_flat_map[idx] = (cursor, rows, width)
+                cursor += rows * width
             qweight.data_container.clear()
-            padded_param = Parameter(padded_data, requires_grad=False)
-            set_weight_attrs(padded_param, vars(qweight))
-            padded_param.shard_id = ordered_shard_ids
-            set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
-            layer.register_parameter("qweight", padded_param)
+            flat_param = Parameter(flat_data, requires_grad=False)
+            set_weight_attrs(flat_param, vars(qweight))
+            flat_param.shard_id = ordered_shard_ids
+            set_weight_attrs(flat_param, {"shard_flat_map": shard_flat_map})
+            layer.register_parameter("qweight", flat_param)
 
     def apply(
         self,
@@ -461,19 +457,34 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
+            # Each shard is a contiguous view of the flat buffer (no copy).
+            # Neighbouring shards of the same GGUF type and row width run as
+            # one GEMM: one activation quantization and one launch.
             shard_id = _ordered_gguf_shard_ids(shard_id)
             qweight = layer.qweight
-            result = []
+            shard_weight_type = layer.qweight_type.shard_weight_type
+            groups = []  # [offset, rows, row_bytes, qweight_type]
             for idx in shard_id:
-                start, end, offset = layer.qweight.shard_offset_map[idx]
-                qweight_type = layer.qweight_type.shard_weight_type[idx]
-                result.append(
-                    fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
-                    )
+                offset, rows, width = qweight.shard_flat_map[idx]
+                qweight_type = shard_weight_type[idx]
+                if (
+                    groups
+                    and groups[-1][3] == qweight_type
+                    and groups[-1][2] == width
+                    and groups[-1][0] + groups[-1][1] * width == offset
+                ):
+                    groups[-1][1] += rows
+                else:
+                    groups.append([offset, rows, width, qweight_type])
+            result = [
+                fused_mul_mat_gguf(
+                    x,
+                    qweight[offset : offset + rows * width].view(rows, width),
+                    qweight_type,
                 )
-            out = torch.cat(result, axis=1)
+                for offset, rows, width, qweight_type in groups
+            ]
+            out = result[0] if len(result) == 1 else torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
