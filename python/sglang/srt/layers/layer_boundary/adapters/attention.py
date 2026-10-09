@@ -23,14 +23,11 @@ import torch
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_local_dp_buffer,
-    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary.layout import (
-    _prefill_cp_shards_tokens,
     batches_are_unpadded,
-    is_dense_ffn_fully_dp,
+    input_scattered_configured,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -82,17 +79,13 @@ class AttnTpContext:
         # Only MHC pre-gathers hidden states before DSA attention, so non-MHC DSA
         # cannot use scattered inputs.
         self.is_dsa = is_dsa
+        # Only narrows input_scattered_configured(), for which stages bind
+        # the input-scattered variant.
         self.allow_input_scattered = (
-            get_parallel().enable_attn_tp_input_scattered
+            input_scattered_configured()
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and (is_mhc or not is_dsa)
-            and get_parallel().tp_size > 1
-            and not is_dp_attention_enabled()
-            # The stages bind no input-scattered path under a prefill CP.
-            and not _prefill_cp_shards_tokens()
-            and get_moe_a2a_backend().is_none()
-            and not is_dense_ffn_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_spec().speculative_algorithm != "EAGLE3"
         )

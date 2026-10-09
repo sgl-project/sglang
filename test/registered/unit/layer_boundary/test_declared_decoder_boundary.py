@@ -1709,7 +1709,7 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         # What the MoE declares its skipped reduction leaves, read in its module.
         for name, value in (
             ("get_parallel", lambda: state().parallel),
-            ("get_moe_a2a_backend", comm_layer.get_moe_a2a_backend),
+            ("get_moe_a2a_backend", comm_layout.get_moe_a2a_backend),
             (
                 "post_experts_output_is_complete",
                 replaced["post_experts_output_is_complete"],

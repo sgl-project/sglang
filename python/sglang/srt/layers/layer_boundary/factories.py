@@ -20,7 +20,6 @@ from sglang.srt.layers.layer_boundary.boundary import _cp_moves
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     _bind_stage,
-    _input_scattered_possible,
     _reject_unsupported_cp_moe,
     _unpadded_possible,
     _use_ag_after_qlora,
@@ -40,6 +39,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    input_scattered_configured,
     is_dense_ffn_fully_dp,
     moe_gathers_over_moe_cp,
     token_axis_sizes,
@@ -63,7 +63,7 @@ def _active_variants():
     yield BatchVariant.ORDINARY
     if _prefill_cp_shards_tokens():
         yield BatchVariant.CONTEXT_PARALLEL
-    if _input_scattered_possible():
+    if input_scattered_configured():
         yield BatchVariant.INPUT_SCATTERED
     if layernorm_sp.layernorm_sp_enabled():
         yield BatchVariant.SEQUENCE_PARALLEL
@@ -471,7 +471,7 @@ def _resolve_stage(stage, variant, following=None):
                 "an update applied at the stage's exit with a MoE gathered over "
                 "the MoE-CP group"
             )
-        if get_parallel().attn_cp_size > 1 and _input_scattered_possible():
+        if get_parallel().attn_cp_size > 1 and input_scattered_configured():
             raise NotImplementedError(
                 "an update applied at the stage's exit with input-scattered "
                 "attention under attention CP"
