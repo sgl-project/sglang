@@ -191,6 +191,10 @@ class Sampler(nn.Module):
                     logits.shape[0], device=logits.device, dtype=torch.int32
                 )
                 _aiter_greedy_sample(batch_next_token_ids, logits)
+            elif logits.device.type == "mps":
+                from sglang.kernels.ops.sampling.mps import greedy_argmax
+
+                batch_next_token_ids = greedy_argmax(logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
             _trace_e2e_sampler(

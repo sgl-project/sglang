@@ -8,9 +8,24 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
+)
+
+register_kernel(
+    KernelSpec(
+        op="sampling.mps_greedy_argmax",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.sampling.mps:greedy_argmax",
+        capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32", "float16", "bfloat16"),
+            description="[batch, vocab] logits to int64 greedy token IDs",
+        ),
+        description="Hierarchical Torch MPS argmax preserving first-index ties and NaNs.",
+    )
 )
 
 if TYPE_CHECKING:

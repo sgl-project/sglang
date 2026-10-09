@@ -9,6 +9,10 @@ using [MLX](https://opensource.apple.com/projects/mlx/). SGLang Diffusion uses
 PyTorch MPS instead; see its [installation guide](/docs/sglang-diffusion/installation#platform-specific-apple-mps).
 If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
+You can also keep the standard PyTorch MPS model loader and opt into
+[direct compiled MLX decode](#experimental-direct-compiled-mlx-decode).
+This is separate from native MLX; neither existing path is replaced.
+
 ## Prerequisites
 
 The MLX runtime requires Apple Silicon with macOS 14 or newer, stable PyTorch
@@ -28,7 +32,9 @@ Line Tools are not sufficient. After installing Xcode, select it with:
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 ```
 
-Verify the compiler with `xcrun -sdk macosx metal --version`.
+Verify the compiler with `xcrun -sdk macosx metal --version`. If Xcode reports a
+missing Metal Toolchain component, install it with
+`xcodebuild -downloadComponent MetalToolchain`.
 
 ## Install SGLang
 
@@ -97,6 +103,65 @@ The MLX backend supports two quantization paths on Apple Silicon:
    Quantization complete in 0.13s — active mem: 1.11 GB -> 0.31 GB (71.9% reduction)
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
+
+## Experimental direct compiled MLX decode
+
+Use `--mps-execution-backend mlx-compiled` to run an exported Torch model's decode
+graph through `mx.compile` with AOT Metal radix attention. Torch retains model
+loading, weight/KV ownership and sampling. Prefill stays eager MPS; native MLX
+is unchanged. This path uses `torch.export`, not ExecuTorch.
+
+Install the `srt_mps` extra and build the Metal extension in the same environment.
+The build requires full Xcode and its Metal compiler (see prerequisites above).
+Rebuild after upgrading MLX:
+
+```bash
+python python/sglang/kernels/aot/setup_metal.py install
+
+SGLANG_USE_MLX=0 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-0.6B --device mps --dtype bfloat16 --tp-size 1 \
+  --mps-execution-backend mlx-compiled \
+  --context-length 16384 --max-total-tokens 16384 \
+  --max-running-requests 16 --mem-fraction-static 0.6
+```
+
+The installed `sgl_kernel` package must include `_metal` and
+`sgl_metal_kernels.metallib`; missing artifacts produce an error.
+The model graph compiles lazily for each batch shape, so warm up before measuring
+decode throughput. AOT applies to the radix shaders, not the entire model.
+
+### Supported configurations
+
+- Dense, unquantized models on a single rank, with decode batches of 1-16.
+  Qwen3-0.6B, SmolLM2-135M and GPT-2 have been checked; other models must pass
+  structural and operator-coverage checks.
+- Standard Torch-owned MHA KV pools and local radix caching. Keep page size 1
+  by default. Sizes 16, 32 and 64 are supported, but larger pages reduce prefix
+  sharing granularity and may waste partially filled slots.
+- Prefill, ineligible batches and unsupported model regions use eager MPS with
+  a fallback log. Unexpected execution errors are not silently retried.
+- LoRA, speculative decoding, MoE/recurrent models, distributed execution,
+  memory saver, alternate KV layouts and external/disaggregated caches are
+  unsupported.
+
+The scheduler enables one-token read-only lookahead for eligible greedy requests.
+Torch sampling remains authoritative, and only accepted tokens are committed
+to the KV pool. Grammar, bias and penalty processing disable lookahead, not
+ordinary compiled decode. Standalone one-batch execution is synchronous.
+
+Native MLX remains faster for the measured batch-1 workloads. See
+[`benchmark/mps/README.md`](https://github.com/sgl-project/sglang/blob/main/benchmark/mps/README.md)
+for results and reproduction commands; standalone timings do not represent
+HTTP-serving performance.
+
+### Custom kernels
+
+Register read-only operators under `sglang.kernels.ops.<group>` and expose them
+through a Torch custom op with a fake implementation. The exported model must
+call that op. Supply its MLX callable in `CompiledMlxGraph(custom_lowerings=...)`.
+Lowerings must return lazy MLX arrays without host synchronization or mutation
+of borrowed Torch weights, request tables or KV pools. Attention extensions must
+preserve the private lookahead K/V dependency.
 
 ## Benchmarking with Requests
 

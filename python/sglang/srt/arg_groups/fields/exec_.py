@@ -499,6 +499,19 @@ class ExecGraph(msgspec.Struct):
 
     _NS_PATH = "exec.graph"
 
+    mps_execution_backend: A[
+        Literal["eager", "mlx-compiled"],
+        Arg(
+            help="Experimental Torch MPS execution backend. mlx-compiled uses "
+            "torch.export and mx.compile for capability-checked dense model decode "
+            "including the existing model forward and logits processor, "
+            "with paged radix attention and scheduler-managed greedy lookahead. "
+            "Decode batches up to 16 are compiled; prefill remains eager. "
+            "Unsupported regions use eager MPS with a diagnostic. Native MLX is unchanged.",
+            choices=["eager", "mlx-compiled"],
+        ),
+    ] = "eager"
+
     # -------------------------------------------------------------------------
     # Cuda graphs
     # -------------------------------------------------------------------------

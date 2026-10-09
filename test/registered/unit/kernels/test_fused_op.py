@@ -96,6 +96,8 @@ def test_forced_backend_global_switch():
     assert op(_t(1.0), _t(2.0)).item() == 3.0
     K.set_fused_op_backend(None)
     assert op(_t(1.0), _t(2.0)).item() == 1003.0
+    K.set_fused_op_backend(KernelBackend.MLX)
+    assert op(_t(1.0), _t(2.0)).item() == 1003.0
 
 
 def test_forced_backend_env_var():
@@ -110,9 +112,10 @@ def test_forced_backend_env_var():
     m._forced_backend = m._UNRESOLVED
 
 
-def test_unimplemented_backend_raises():
+@pytest.mark.parametrize("backend", [KernelBackend.AOT, KernelBackend.MLX])
+def test_unimplemented_backend_raises(backend):
     with pytest.raises(NotImplementedError):
-        _ToyAdd().forward(_t(1.0), _t(2.0), backend=KernelBackend.AOT)
+        _ToyAdd().forward(_t(1.0), _t(2.0), backend=backend)
 
 
 def test_trace_records_op_backend_and_shapes():

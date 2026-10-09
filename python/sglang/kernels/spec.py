@@ -49,6 +49,7 @@ class KernelBackend(str, Enum):
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)
     TORCH_NPU = "torch_npu"  # Ascend NPU vendor runtime (device=NPU)
+    MLX = "mlx"  # Direct MLX Metal kernels.
     # TODO(RFC #29630): more provenance as needed (cpu-avx, sgl_kernel_npu, ...)
 
 
@@ -59,6 +60,7 @@ class DeviceType(str, Enum):
     HIP = "hip"
     NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
     CPU = "cpu"
+    MPS = "mps"
     # TODO(RFC #29630): XPU / MUSA / ... as backends land.
 
 
@@ -113,6 +115,8 @@ class PlatformInfo(msgspec.Struct, frozen=True):
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
                 )
+            if torch.backends.mps.is_available():
+                return cls(device_type="mps")
         except Exception:
             pass
         return cls()
