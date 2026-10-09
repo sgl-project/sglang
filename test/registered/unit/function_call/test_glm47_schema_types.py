@@ -357,6 +357,26 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             {"value": "hello"},
         )
 
+    def test_non_json_container_and_boolean_values_stream_as_json(self):
+        """Streaming passed array/object/boolean values through verbatim, so a
+        value that isn't JSON ("1, 2", "True") produced invalid JSON while
+        non-streaming parsed it."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array"},
+                "flag": {"type": "boolean"},
+                "opts": {"type": "object"},
+            },
+        }
+        self.check_arguments(schema, {"ids": [1, 2]}, raw_values={"ids": "1, 2"})
+        self.check_arguments(schema, {"flag": True}, raw_values={"flag": "True"})
+        self.check_arguments(
+            schema,
+            {"ids": [1, 2], "opts": {"a": 1}},
+            raw_values={"ids": "\n[1, 2]\n", "opts": ' {"a": 1}'},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
