@@ -94,6 +94,11 @@ def _resolve_eagle_aux_hidden_state(
             is_draft_model=True,
         )
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+    if num_nextn_predict_layers is None:
+        # Qwen3.5 names its MTP depth mtp_num_hidden_layers; models without MTP have neither
+        num_nextn_predict_layers = getattr(
+            draft_model_config.hf_text_config, "mtp_num_hidden_layers", None
+        )
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
     elif get_spec().speculative_draft_model_path:
