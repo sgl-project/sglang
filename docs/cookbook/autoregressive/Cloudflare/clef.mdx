@@ -10,18 +10,20 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Clef support merged after v0.5.21 in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use a [nightly wheel](/docs/get-started/install#nightly-builds) containing that change or the Docker image below, built from the merge commit. See the [installation guide](/docs/get-started/install) for other methods.
+Clef support merged after v0.5.21 in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use the pinned nightly wheel or Docker image below. See the [installation guide](/docs/get-started/install) for other methods.
 
 <Tabs>
 
 <Tab title="Python (pip / uv)">
 
+This command selects the wheel from [nightly build 37ae292e6f](https://github.com/sgl-project/sglang/actions/runs/37897861964), which includes Clef support. Use Python 3.10 to match the build.
+
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv venv --python 3.12
+uv venv --python 3.10
 source .venv/bin/activate
-uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ "sglang==0.5.22.dev20261009+g37ae292e6f"
 ```
 
 Run the command from the wizard’s Python tab in this environment.
