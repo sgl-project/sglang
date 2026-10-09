@@ -618,6 +618,10 @@ class KimiK3MoE(nn.Module):
             shared_experts_parallel_group = (
                 "shared_experts_tp" if requested_shared_tp is not None else "attn_tp"
             )
+        else:
+            # The full TP group, which _reduce_shared sums over, whatever the
+            # dense MLP's sharding.
+            shared_experts_parallel_group = "tp"
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
