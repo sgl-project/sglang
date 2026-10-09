@@ -220,9 +220,9 @@ def test_direct_rank_keys_owned_spans_roundtrip_and_empty_rank(layers, shards):
 def staged_case():
     wire = ByteStore()
     store = adapter(wire, pools(0, 2, 5), staged=True)
-    transfers, slabs = [], []
+    transfers, buffers = [], []
     for name, width in ((PoolName.KV, 4), (PoolName.INDEXER, 3)):
-        slab = StagingComponent(
+        component_buffer = StagingComponent(
             name=str(name),
             num_pages=2,
             layer_count=5,
@@ -230,9 +230,11 @@ def staged_case():
             row_bytes=width,
             pin_memory=False,
         )
-        slab.buffer.view(-1).copy_(torch.arange(slab.buffer.numel()).to(torch.uint8))
+        component_buffer.buffer.view(-1).copy_(
+            torch.arange(component_buffer.buffer.numel()).to(torch.uint8)
+        )
         alias = f"physical-{name}"
-        store.register_mem_host_pool_v2(slab, alias)
+        store.register_mem_host_pool_v2(component_buffer, alias)
         transfers.append(
             PoolTransfer(
                 name,
@@ -242,13 +244,13 @@ def staged_case():
                 indices_from_pool=PoolName.KV if name == PoolName.INDEXER else None,
             )
         )
-        slabs.append(slab)
-    return store, wire, transfers, slabs
+        buffers.append(component_buffer)
+    return store, wire, transfers, buffers
 
 
-def test_staged_disjoint_slabs_use_independent_objects_and_query_keys():
-    store, wire, transfers, slabs = staged_case()
-    expected = [slab.buffer.clone() for slab in slabs]
+def test_staged_disjoint_buffers_use_independent_objects_and_query_keys():
+    store, wire, transfers, buffers = staged_case()
+    expected = [component.buffer.clone() for component in buffers]
     result = store.batch_set_v2(transfers)
     assert result == {PoolName.KV: [True, True], PoolName.INDEXER: [True, True]}
     assert len(wire.objects) == 4
@@ -260,10 +262,13 @@ def test_staged_disjoint_slabs_use_independent_objects_and_query_keys():
         ).kv_hit_pages
         == 2
     )
-    for slab in slabs:
-        slab.buffer.zero_()
+    for component in buffers:
+        component.buffer.zero_()
     assert store.batch_get_v2(transfers) == result
-    assert all(torch.equal(slab.buffer, value) for slab, value in zip(slabs, expected))
+    assert all(
+        torch.equal(component.buffer, value)
+        for component, value in zip(buffers, expected)
+    )
 
 
 @pytest.mark.parametrize("fault", ["short_get", "short_response"])

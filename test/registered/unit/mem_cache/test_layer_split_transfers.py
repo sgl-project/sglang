@@ -111,10 +111,10 @@ class _Storage:
 
     def batch_set_v2(self, transfers):
         for transfer in transfers:
-            slab = self.pools[transfer.physical_pool_name]
+            component_buffer = self.pools[transfer.physical_pool_name]
             for key, position in zip(transfer.keys, transfer.host_indices):
                 self.objects[(str(transfer.name), key)] = (
-                    slab.buffer[int(position)].numpy().tobytes()
+                    component_buffer.buffer[int(position)].numpy().tobytes()
                 )
         return {t.name: [True] * len(t.keys) for t in transfers}
 
@@ -126,15 +126,15 @@ class _Storage:
             raise ConnectionError("settled GET disconnect")
         result = {}
         for transfer in transfers:
-            slab = self.pools[transfer.physical_pool_name]
+            component_buffer = self.pools[transfer.physical_pool_name]
             mask = []
             for key, position in zip(transfer.keys, transfer.host_indices):
                 value = self.objects.get((str(transfer.name), key))
                 mask.append(value is not None)
                 if value is not None:
                     data = torch.frombuffer(bytearray(value), dtype=torch.uint8)
-                    slab.buffer[int(position)].copy_(
-                        data.reshape_as(slab.buffer[int(position)])
+                    component_buffer.buffer[int(position)].copy_(
+                        data.reshape_as(component_buffer.buffer[int(position)])
                     )
             result[transfer.name] = mask
         return result
@@ -160,7 +160,6 @@ def test_fixed_buffers_have_independent_memory_and_expected_capacity():
         0,
         False,
     )
-    assert prefetch.max_rounds == 2
     for component in EXCHANGE_COMPONENTS:
         assert (
             prefetch.components[component].buffer.data_ptr()
@@ -172,6 +171,7 @@ def test_fixed_buffers_have_independent_memory_and_expected_capacity():
         )
     for buffer in (prefetch, backup):
         assert buffer.components["target"].buffer.shape == (2, 5, 2, 4)
+        assert buffer.scratch["target"].shape == (2, 2, 3 * 2 * 4)
 
 
 @pytest.mark.parametrize("outcome", ["complete", "stop", "short_get"])
@@ -437,12 +437,12 @@ def test_shared_all_to_all_failure_retains_buffers_and_never_sets_l3(failure):
             stage.executor.shutdown(wait=True)
 
 
-def test_component_slab_exposes_exact_page_addresses_to_storage():
+def test_component_buffer_exposes_exact_page_addresses_to_storage():
     from sglang.srt.mem_cache.layer_split.layer_split_staging_pool import (
         StagingComponent,
     )
 
-    slab = StagingComponent(
+    component_buffer = StagingComponent(
         name="test",
         num_pages=4,
         layer_count=3,
@@ -450,13 +450,16 @@ def test_component_slab_exposes_exact_page_addresses_to_storage():
         row_bytes=4,
         pin_memory=False,
     )
-    pointers, sizes = slab.get_page_buffer_meta([0, 2])
+    pointers, sizes = component_buffer.get_page_buffer_meta([0, 2])
     assert sizes == [24, 24]
-    assert pointers == [slab.buffer.data_ptr(), slab.buffer.data_ptr() + 48]
-    assert slab.get_hybrid_pool_buffer()[0] is slab.buffer
+    assert pointers == [
+        component_buffer.buffer.data_ptr(),
+        component_buffer.buffer.data_ptr() + 48,
+    ]
+    assert component_buffer.get_hybrid_pool_buffer()[0] is component_buffer.buffer
     for invalid in (-1, 4):
         with pytest.raises(ValueError, match="out of range"):
-            slab.get_page_buffer_meta([invalid])
+            component_buffer.get_page_buffer_meta([invalid])
 
 
 def test_shared_scheduler_selects_global_readiness_not_local_arrival_order():

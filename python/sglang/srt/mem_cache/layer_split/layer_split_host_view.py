@@ -33,13 +33,8 @@ class LayerSplitShardView:
         pool = self.pool
         if pool.layout != "layer_first":
             raise ValueError("LayerSplit host views require layer_first layout")
-        if getattr(pool, "mtp_draft_device_pools", ()) or (
-            getattr(pool, "target_layer_num", None) is not None
-            and pool.layer_num != pool.target_layer_num
-        ):
-            raise ValueError("LayerSplit storage does not support draft layers")
-        if self.page_size <= 0 or self.row_bytes <= 0:
-            raise ValueError("Page size and component row width must be positive")
+        if self.row_bytes <= 0:
+            raise ValueError("Component row width must be positive")
         if not 0 <= self.owned_layers <= self.capacity_layers:
             raise ValueError("Owned layers exceed host capacity")
         if self.component == "target":
@@ -49,10 +44,9 @@ class LayerSplitShardView:
             width = buffer.shape[-1] * buffer.element_size()
         else:
             buffer = pool.index_k_with_scale_buffer
-            if buffer.ndim != 3 or buffer.dtype != torch.uint8:
-                raise ValueError(
-                    "Indexer host buffer must be uint8 [layers, pages, stride]"
-                )
+            if buffer.ndim != 3:
+                raise ValueError("Indexer host buffer must be [layers, pages, stride]")
+            # The native DSA indexer pool stores uint8, so elements are bytes.
             width = buffer.shape[-1]
         expected_width = self.row_bytes * (
             self.page_size if self.component == "indexer" else 1

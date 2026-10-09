@@ -85,7 +85,6 @@ class StagingBufferConfig:
 
     @property
     def pages_per_window(self):
-        self.require_host_layout()
         return self.window_size // self.page_size
 
     @property

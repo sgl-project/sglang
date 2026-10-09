@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.layer_split.layer_split_config import StagingBufferCon
 
 # Canonical components of a page, in the order the exchange walks them.
 #
-# They are exchanged as separate collectives because they live in separate slabs,
-# and they live in separate slabs because the L3 object needs each component
+# They are exchanged as separate collectives because they live in separate buffers,
+# and they live in separate buffers because the L3 object needs each component
 # contiguous -- interleaving them into one send buffer would make neither of them
 # a single span. So a round costs one collective per component.
 #
@@ -146,17 +146,9 @@ class PageTransferPlan:
             result.append(PageWindow(index=index, page_start=start, page_count=count))
         return result
 
-    def owned_ordinals(
-        self, rank: int, window: Optional[PageWindow] = None
-    ) -> List[int]:
-        """Page ordinals whose L3 I/O ``rank`` is responsible for.
-
-        Restricted to ``window`` when given. The returned order is the order in
-        which the owner should issue its GETs, which is also the order the
-        round-based exchange consumes them in.
-        """
-        ordinals = window.ordinals() if window is not None else range(self.page_count)
-        return [i for i in ordinals if self.page_owners[i] == rank]
+    def owned_ordinals(self, rank: int, window: PageWindow) -> List[int]:
+        """Pages whose L3 I/O this rank owns in the window, in round order."""
+        return [i for i in window.ordinals() if self.page_owners[i] == rank]
 
     def window_fingerprint(self, window: PageWindow) -> int:
         """Stable digest of *what* this window is, identical on every rank.
@@ -227,7 +219,6 @@ def build_transfer_plan(
     Hit-prefix selection belongs to query/L2 admission, not this builder.
     Ownership rotates by the common request ID, never a rank-local operation ID.
     """
-    staging_buffer_config.require_host_layout()
     base = rotation_base(request_id) if window_base is None else window_base
     hashes = tuple(page_hashes)
     shard_size = staging_buffer_config.shard_size

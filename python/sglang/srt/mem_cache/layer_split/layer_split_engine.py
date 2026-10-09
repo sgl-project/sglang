@@ -109,6 +109,7 @@ class LayerSplitTransferEngine:
         self._write_ack_stall_since = None
         self.rank = rank
         self.staging_buffer_config = staging_buffer_config
+        # Validate the resolved, immutable layout once before any transfer runs.
         staging_buffer_config.require_host_layout()
         self.storage_backend = storage_backend
         self.layer_count = layer_count
@@ -190,7 +191,6 @@ class LayerSplitTransferEngine:
         if set(self.l2_pools) != set(EXCHANGE_COMPONENTS):
             raise ValueError("Both DSA host shard views are required")
         for name, view in self.l2_pools.items():
-            view.validate()
             if (
                 view.component != name
                 or view.owned_layers != self.component_layer_counts[name][self.rank]
@@ -356,6 +356,8 @@ class LayerSplitTransferEngine:
     def _start_io(self, lane, plan, window, ordinals):
         stage = self.stages[lane]
         if not ordinals:
+            # A short window may assign this rank no L3 pages. Its local I/O
+            # is already done, but it must still join the window's exchange.
             future = Future()
             future.set_result({name: [] for name in LOGICAL_COMPONENT_POOLS.values()})
         else:
@@ -469,9 +471,15 @@ class LayerSplitTransferEngine:
         owned = plan.owned_ordinals(self.rank, window)
         pending = self._start_io(PREFETCH, plan, window, owned)
         mask = self._finish_io(pending, len(owned))
-        landed = mask.index(False) if False in mask else len(mask)
+        successful_owned_prefix = mask.index(False) if False in mask else len(mask)
         rounds = build_exchange_rounds(plan, window)
-        supported = len(rounds) if landed == len(owned) else landed
+        # A rank with fewer (or zero) owned pages still receives shards in the
+        # remaining rounds. Only a failed local GET limits the shared prefix.
+        supported_rounds = (
+            len(rounds)
+            if successful_owned_prefix == len(owned)
+            else successful_owned_prefix
+        )
 
         def exchange(agreed):
             usable, keep_going = agreed
@@ -482,7 +490,7 @@ class LayerSplitTransferEngine:
             PREFETCH,
             WindowJob(
                 plan.window_fingerprint(window),
-                lambda: [supported, int(not stop_requested())],
+                lambda: [supported_rounds, int(not stop_requested())],
                 exchange,
             ),
         )

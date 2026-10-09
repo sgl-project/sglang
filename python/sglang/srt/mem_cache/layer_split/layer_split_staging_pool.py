@@ -1,4 +1,4 @@
-"""Fixed full-page component slabs exposed to the L3 storage backend.
+"""Fixed full-page component buffers exposed to the L3 storage backend.
 
 KV and indexer are independent objects. Window ownership and safe buffer reuse
 belong to the transfer engine; this module has no leases or free-list state.
@@ -15,10 +15,10 @@ from sglang.srt.mem_cache.layer_split.layer_split_utils import STAGE_NAMES
 
 
 class StagingComponent:
-    """One component's slab, exposing the host-pool contract storage expects.
+    """One component's buffer, exposing the host-pool contract storage expects.
 
     ``get_page_buffer_meta`` mirrors the method every real host pool already
-    implements, so a storage backend can address this slab through the same
+    implements, so a storage backend can address this buffer through the same
     zero-copy path once the transfer descriptor can name a physical buffer
     separately from its logical pool.
     """
@@ -69,7 +69,7 @@ class StagingComponent:
         """``(pointers, sizes)`` for the given slots, one entry per slot.
 
         Mirrors the method every real host pool implements, so a storage backend
-        can address this slab through the same zero-copy path.
+        can address this buffer through the same zero-copy path.
         """
         pointers: List[int] = []
         sizes: List[int] = []
@@ -86,14 +86,14 @@ class StagingComponent:
         """The registrable backing tensors for the storage backend.
 
         ``_iter_host_pool_buffers`` looks for this method first and falls back to
-        a ``kv_buffer`` attribute; a slab is one contiguous tensor, so it returns
+        a ``kv_buffer`` attribute; this buffer is one contiguous tensor, so it returns
         exactly that for registration by the backend.
         """
         return [self.buffer]
 
 
 class FixedStageBuffer:
-    """One direction's component slabs and per-round local-shard scratch.
+    """One direction's component buffers and per-round local-shard scratch.
 
     Full-page position = round.index. No allocator, leases, banks or ordinal-to-
     slot dictionary. A short window simply uses fewer positions. Both directions
@@ -102,14 +102,16 @@ class FixedStageBuffer:
 
     def __init__(self, stage, config, layer_counts, row_bytes, rank, pin):
         self.stage = stage
-        self.max_rounds = config.pages_per_rank_per_window
+        # Each rank owns at most one full page per round, so the same capacity
+        # sizes the full-page buffer and the round-indexed shard scratch.
+        num_pages = config.pages_per_rank_per_window
         self.names = {
             c: f"l3_shared_{STAGE_NAMES[stage]}_{c}" for c in EXCHANGE_COMPONENTS
         }
         self.components = {
             c: StagingComponent(
                 name=self.names[c],
-                num_pages=self.max_rounds,
+                num_pages=num_pages,
                 layer_count=sum(layer_counts[c]),
                 page_size=config.page_size,
                 row_bytes=row_bytes[c],
@@ -123,7 +125,7 @@ class FixedStageBuffer:
         }
         self.scratch = {
             c: torch.empty(
-                self.max_rounds,
+                num_pages,
                 config.shard_size,
                 self.shard_bytes[c][rank],
                 dtype=torch.uint8,

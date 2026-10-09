@@ -237,7 +237,12 @@ class TestOwnership(CustomTestCase):
 
     def test_every_page_has_exactly_one_owner(self):
         plan = make_plan(PAGES_PER_WINDOW + 5)
-        owned = [i for rank in range(SHARD_SIZE) for i in plan.owned_ordinals(rank)]
+        owned = [
+            i
+            for window in plan.windows()
+            for rank in range(SHARD_SIZE)
+            for i in plan.owned_ordinals(rank, window)
+        ]
         self.assertEqual(sorted(owned), list(range(plan.page_count)))
 
     def test_partial_window_imbalance_is_at_most_one_page(self):
@@ -252,14 +257,17 @@ class TestOwnership(CustomTestCase):
         scoped = plan.owned_ordinals(0, second)
         self.assertTrue(all(i in second.ordinals() for i in scoped))
         self.assertEqual(len(scoped), PAGES_PER_WINDOW // SHARD_SIZE)
-        # Scoped results are a subset of the unscoped ones.
-        self.assertTrue(set(scoped).issubset(plan.owned_ordinals(0)))
+        self.assertEqual(
+            scoped,
+            [i for i in second.ordinals() if plan.page_owners[i] == 0],
+        )
 
     def test_owned_ordinals_are_ascending(self):
-        plan = make_plan(PAGES_PER_WINDOW)
-        for rank in range(SHARD_SIZE):
-            ordinals = plan.owned_ordinals(rank)
-            self.assertEqual(ordinals, sorted(ordinals))
+        plan = make_plan(PAGES_PER_WINDOW + 5)
+        for window in plan.windows():
+            for rank in range(SHARD_SIZE):
+                ordinals = plan.owned_ordinals(rank, window)
+                self.assertEqual(ordinals, sorted(ordinals))
 
     def test_rotation_moves_the_uneven_tail_between_ranks(self):
         # The tail of a partial window must not always burden the same ranks.
@@ -344,8 +352,6 @@ class TestExchangeRounds(CustomTestCase):
                 if r.contributions[rank] is not None
             ]
             self.assertEqual(from_rounds, plan.owned_ordinals(rank, window))
-            # GET order is a prefix-compatible superset across all windows.
-            self.assertEqual(plan.owned_ordinals(rank)[: len(from_rounds)], from_rounds)
 
 
 class TestRoundEdges(CustomTestCase):

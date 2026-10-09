@@ -82,6 +82,12 @@ def operation(pages=5):
     return op
 
 
+@pytest.mark.parametrize("layout", [{}, {"page_size": 2}, {"shard_size": 1}])
+def test_engine_requires_resolved_host_layout(layout):
+    with pytest.raises(ValueError, match="native host layout"):
+        LayerSplitTransferEngine(0, staging_buffer_config=StagingBufferConfig(**layout))
+
+
 def test_storage_coordination_follows_runtime_engine_replacement():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.cache_controller = controller()
