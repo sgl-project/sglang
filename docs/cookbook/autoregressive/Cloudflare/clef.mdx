@@ -42,7 +42,7 @@ Use an image built after #42721 merges, then run the **Docker** output of the co
 
 </Accordion>
 
-Select **Clef** or **Clef Flash** under **Variant**, then select your GPU. Both recipes run on one NVIDIA GPU in BF16 with TP=1. Changing the variant updates the checkpoint in the launch command and the sample request.
+Select **Clef** or **Clef Flash** under **Variant**, then select your GPU. Both recipes use the SGLang defaults and run on one NVIDIA GPU in BF16 with TP=1. Only the model path, host, and port are needed. Changing the variant updates the checkpoint in the launch command and the sample request.
 
 import { Deployment } from "/src/snippets/_deployment.jsx"
 import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
@@ -50,7 +50,7 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
 <Deployment config={config} />
 
 <Note>
-  Both variants were tested on one B200 and one H200 using the Python server from [#42721 at 4704c2424a81](https://github.com/sgl-project/sglang/commit/4704c2424a81e1c3e87e50a1de4b949180a47c9d), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed short text, short text with an image, long text, and long text with an image. Both long requests used the full 16,384-token prompt budget. These are serving checks, not throughput or accuracy benchmarks; the Docker wrapper was not separately tested.
+  Both variants were tested on one B200 and one H200 using the Python server from [#42721 at e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed short text, short text with an image, long text, and long text with an image. Both long requests used the full 16,384-token prompt budget. These are serving checks, not throughput or accuracy benchmarks; the Docker wrapper was not separately tested.
 </Note>
 
 ## 1. Model introduction
@@ -91,8 +91,7 @@ Both variants accept a text or JSON state with optional images. Their `/v1/syste
 - **Route.** Send requests to `/v1/systemone`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference. `/v1/decisions`, chat, and generation requests are refused, because the checkpoint answers through its head rather than its language model head.
 - **One GPU, one prefill per request.** Keep TP=1 and PP=1. All questions share one prompt, so the state is read once however many questions you ask. SGLang detects `joint_head_config.json`, loads `joint_head.safetensors`, and enables embedding mode without radix cache, chunked prefill, or CUDA graphs automatically. No reasoning parser, tool-call parser, or chat-template override is needed.
 - **Answers.** `probabilities` are the softmax of the head's logits for each question, and `confidence` uses the same formulas as other models on this route, so it can differ from the `confidence` of the checkpoint's reference `systemone()`, which is the probability of the top option. Answers omit `x_label_mass`, because the head scores only the allowed options.
-- **Long states.** The prompt, images included, holds at most 16,384 tokens, the default `max_length` of the checkpoint's reference `encode_record`, or fewer when the server's context length, KV cache, or `--max-prefill-tokens` is smaller. A longer state is truncated so that every question still fits, as in the reference code. The 32,768-token server context and token pool leave room for scheduler reservations; they do not increase the 16,384-token prompt cap.
-- **Concurrency.** The verified recipes set `--max-running-requests 1` and `--max-total-tokens 32768` as a starting point. Requests are processed one at a time. Higher concurrency needs separate memory and load testing.
+- **Long states.** The prompt, images included, holds at most 16,384 tokens, the default `max_length` of the checkpoint's reference `encode_record`, or fewer when the server's context length, KV cache, or `--max-prefill-tokens` is smaller. A longer state is truncated so that every question still fits, as in the reference code.
 - **Images.** Pass each image in `images` as a data URL, such as `data:image/jpeg;base64,...`, or as an HTTP(S) URL. A bare base64 JPEG starts with `/`, which the shared image loader reads as a file path, so the request fails. Images precede the state, as in the reference code.
 
 ## 3. Advanced usage

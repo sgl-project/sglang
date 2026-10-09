@@ -1,5 +1,5 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// BF16, TP=1 recipes tested on B200 and H200 at PR #42721 / 4704c2424a81.
+// BF16, TP=1 recipes tested on B200 and H200 at PR #42721 / e122069670a7.
 // Each model passed text and image requests, including 16,384-token prompts.
 export const config = {
   modelName: "Clef",
@@ -34,12 +34,6 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--served-model-name {{MODEL_NAME}}",
-        "--tp-size 1",
-        "--dtype bfloat16",
-        "--context-length 32768",
-        "--max-total-tokens 32768",
-        "--max-running-requests 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -50,12 +44,6 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--served-model-name {{MODEL_NAME}}",
-        "--tp-size 1",
-        "--dtype bfloat16",
-        "--context-length 32768",
-        "--max-total-tokens 32768",
-        "--max-running-requests 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -66,12 +54,6 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--served-model-name {{MODEL_NAME}}",
-        "--tp-size 1",
-        "--dtype bfloat16",
-        "--context-length 32768",
-        "--max-total-tokens 32768",
-        "--max-running-requests 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -82,12 +64,6 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--served-model-name {{MODEL_NAME}}",
-        "--tp-size 1",
-        "--dtype bfloat16",
-        "--context-length 32768",
-        "--max-total-tokens 32768",
-        "--max-running-requests 1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
