@@ -93,8 +93,7 @@ class TestTP(CustomTestCase):
 
 class TestPureDP(TestTP):
     extra_args = [
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "4",
     ]
 
@@ -135,8 +134,7 @@ class TestPureDP(TestTP):
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHybridDPTP(TestPureDP):
     extra_args = [
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "2",
     ]
 
