@@ -92,6 +92,48 @@ class TestMarkovSampleStep(CustomTestCase):
             # Lowest NaN, then lowest index of a tie; column 15 is padding.
             self.assertEqual(tokens.tolist(), [3, 0, 5, 0])
 
+    def test_greedy_tie_across_blocks_takes_the_lower_index(self):
+        base = torch.zeros(2, 9000, device=DEVICE)
+        base[:, 1000] = base[:, 5000] = 5.0
+        bias = torch.zeros(2, 9000, device=DEVICE)
+        for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
+            tokens = _call(
+                impl,
+                base=base,
+                bias=bias,
+                temps=torch.zeros(2, device=DEVICE),
+                step_dtype=torch.float32,
+            )
+            self.assertEqual(tokens.tolist(), [1000, 1000])
+
+    def test_strided_rows_match_contiguous(self):
+        # The draft passes one step of a [bs, gamma, vocab] block, rows strided.
+        g = torch.Generator(device=DEVICE).manual_seed(2)
+        block = torch.randn(8, 5, 6000, generator=g, device=DEVICE)
+        bias = torch.randn(8, 5990, generator=g, device=DEVICE)
+        temps = torch.rand(8, generator=g, device=DEVICE)
+        temps[:3] = 0.0
+        logits_block = torch.empty(8, 5, 6000, device=DEVICE)
+        strided = _call(
+            MarkovSampleStep.triton,
+            base=block[:, 2],
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=logits_block[:, 2],
+        )
+        logits = torch.empty(8, 6000, device=DEVICE)
+        contiguous = _call(
+            MarkovSampleStep.triton,
+            base=block[:, 2].contiguous(),
+            bias=bias,
+            temps=temps,
+            step_dtype=torch.float32,
+            logits_out=logits,
+        )
+        self.assertTrue(torch.equal(strided, contiguous))
+        self.assertTrue(torch.equal(logits_block[:, 2], logits))
+
     def test_sampling_follows_tempered_softmax(self):
         vocab, rows = 32, 1 << 16
         logits = torch.linspace(-3, 3, vocab, device=DEVICE)
