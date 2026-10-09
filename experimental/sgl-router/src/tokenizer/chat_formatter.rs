@@ -18,6 +18,7 @@ use dynamo_renderer::{
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
+use sglang_processor::DeepSeekV4Profile;
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -49,7 +50,11 @@ pub struct ChatFormatter {
 impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
-        let files = super::adapter::ModelFiles::open(tokenizer_path);
+        Self::load_from(model_id, &super::adapter::ModelFiles::open(tokenizer_path))
+    }
+
+    /// [`Self::load`] over already opened model files.
+    pub fn load_from(model_id: &str, files: &super::adapter::ModelFiles) -> Result<Option<Self>> {
         let config = files.json("config.json")?.unwrap_or_default();
         let mut model_type = config["model_type"].as_str().map(str::to_owned);
         // SGLang also recognizes V4.1 checkpoints that retain a V4 model_type.
@@ -68,7 +73,7 @@ impl ChatFormatter {
             Some(t) if t.starts_with("deepseek_v4") => {
                 let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
                 if let Some(formatter) = &mut formatter {
-                    formatter.configure_deepseek(&files, &config)?;
+                    formatter.configure_deepseek(files, &config)?;
                 }
                 return Ok(formatter);
             }
@@ -81,7 +86,7 @@ impl ChatFormatter {
         let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
             .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
-            formatter.configure_deepseek(&files, &config)?;
+            formatter.configure_deepseek(files, &config)?;
         }
         Ok(formatter)
     }
@@ -92,7 +97,17 @@ impl ChatFormatter {
         config: &JsonValue,
     ) -> Result<()> {
         if let Some(super::deepseek::Encoder::V4(profile)) = &mut self.deepseek {
-            *profile = super::deepseek::V4Profile::load(files, config)?;
+            let profile_override = config
+                .get("dsv4_reasoning_effort_profile")
+                .filter(|v| !v.is_null())
+                .map(|v| v.as_str().context("invalid dsv4_reasoning_effort_profile"))
+                .transpose()?;
+            let encoder = match profile_override {
+                Some(_) => None,
+                None => files.text("encoding/encoding_dsv4.py")?,
+            };
+            *profile = DeepSeekV4Profile::from_checkpoint(profile_override, encoder.as_deref())
+                .map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -224,11 +239,20 @@ impl ChatFormatter {
             deepseek: if is_deepseek_v41 {
                 Some(super::deepseek::Encoder::V41)
             } else {
-                is_deepseek_v4.then(|| super::deepseek::Encoder::V4(Default::default()))
+                is_deepseek_v4.then_some(super::deepseek::Encoder::V4(DeepSeekV4Profile::Preview))
             },
             is_kimi_k3: false,
             worker_defaults: ChatTemplateKwargs::new(),
         })
+    }
+
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 stays disabled.
+    pub fn forwarding_scope(&self) -> super::ForwardingScope {
+        match self.deepseek {
+            Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
+            Some(super::deepseek::Encoder::V41) => super::ForwardingScope::Never,
+            None => super::ForwardingScope::Guarded,
+        }
     }
 
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
@@ -318,6 +342,12 @@ impl ChatFormatter {
     /// Rendered prompt plus the assistant continuation prefix SGLang tokenizes
     /// separately (`_handle_last_assistant_message`).
     fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
+        if let Some(super::deepseek::Encoder::V4(profile)) = self.deepseek {
+            let (prompt, prefix) = sglang_processor::ChatFormatter::DeepSeekV4(profile)
+                .render_request(request.clone(), &self.worker_defaults)
+                .context("render DeepSeek-V4 chat")?;
+            return Ok((RenderedPrompt::text(prompt), prefix));
+        }
         let mut kwargs = self.template_kwargs(request)?;
         let continuing = request["continue_final_message"] == true;
         let mut messages: Vec<JsonValue> = request["messages"]
@@ -329,8 +359,9 @@ impl ChatFormatter {
         if self.is_kimi_k3 {
             super::kimi::normalize(request, &mut messages, &mut kwargs)?;
         }
-        if let Some(encoder) = self.deepseek {
-            encoder.normalize(&mut messages)?;
+        // Past the V4 return above, `deepseek` is V4.1.
+        if self.deepseek.is_some() {
+            super::deepseek::normalize_messages(&mut messages)?;
         }
         let mut prefix = String::new();
         if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") {
@@ -346,14 +377,13 @@ impl ChatFormatter {
         if self.deepseek.is_some() {
             if let Some(task) = request.get("task").filter(|v| !v.is_null()).cloned() {
                 // V4.1 also treats a mid-conversation system turn as the task target.
-                let v41 = matches!(self.deepseek, Some(super::deepseek::Encoder::V41));
                 let message = messages
                     .iter_mut()
                     .enumerate()
                     .rev()
                     .find(|(i, m)| match m["role"].as_str() {
                         Some("user" | "developer") => true,
-                        Some("system") => v41 && *i > 0,
+                        Some("system") => *i > 0,
                         _ => false,
                     })
                     .map(|(_, m)| m)
@@ -361,10 +391,12 @@ impl ChatFormatter {
                 message["task"] = task;
             }
         }
-        if let Some(profile) = self.deepseek {
+        if self.deepseek.is_some() {
             let effort = self.effective_effort(request);
             return Ok((
-                RenderedPrompt::text(profile.render(request, messages, &kwargs, effort)?),
+                RenderedPrompt::text(super::deepseek::render_v41(
+                    request, messages, &kwargs, effort,
+                )?),
                 prefix,
             ));
         }

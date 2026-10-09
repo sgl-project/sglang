@@ -36,9 +36,11 @@ def make_batch(counts, logprobs):
     return SimpleNamespace(
         global_num_tokens=list(counts),
         global_num_tokens_for_logprob=list(logprobs),
+        draft_global_num_tokens=None,
         dp_spec_prefill_coordination_applied=False,
         is_extend_in_batch=False,
         can_run_decode_cuda_graph=True,
+        can_run_dp_draft_cuda_graph=True,
         can_run_dp_prefill_cuda_graph=True,
     )
 
@@ -136,6 +138,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     tbo_split_seq_index=None,
                     global_forward_mode=ForwardMode.DECODE,
                     can_run_decode_cuda_graph=True,
+                    can_run_draft_cuda_graph=True,
                     can_run_prefill_cuda_graph=False,
                     prefill_cuda_graph_max_prefix_len=0,
                 )
@@ -278,6 +281,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         hidden_states=object(), mm_input_embeds=None
                     ),
                     next_token_ids=object(),
+                    kv_loc_plan=None,
                 )
                 verify_input = object()
 
@@ -303,11 +307,11 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         self.assertEqual(kwargs["grammar_barrier"], "grammar")
                     return result
 
-                def extend(current, *args):
+                def extend(current, *args, **kwargs):
                     record("draft_extend", current)
                     return object()
 
-                def draft_context(group, *, owns_attention):
+                def draft_context(owns_attention):
                     self.assertEqual(owns_attention, bool(rank % 2))
                     return contextlib.nullcontext()
 
@@ -317,9 +321,8 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
                 worker._target_worker = SimpleNamespace(forward_batch_generation=target)
                 worker._draft_worker = SimpleNamespace(
-                    draft_runner=SimpleNamespace(tp_group=None),
+                    draft_runner=SimpleNamespace(),
                     draft_owns_attention=bool(rank % 2),
-                    draft_tp_context=draft_context,
                     draft=draft,
                     _draft_extend_for_prefill=extend,
                     _draft_extend_for_decode=extend,
@@ -335,6 +338,12 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                     stack.enter_context(
                         patch(
                             f"{WORKER_MODULE}.ScheduleBatch.init_new", return_value=idle
+                        )
+                    )
+                    stack.enter_context(
+                        patch(
+                            f"{WORKER_MODULE}.draft_tp_context",
+                            side_effect=draft_context,
                         )
                     )
                     stack.enter_context(
