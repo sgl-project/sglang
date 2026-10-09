@@ -104,6 +104,8 @@ class _AttnReadout:
     written back."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 
@@ -151,6 +153,8 @@ class _FfnReadout:
     norm, fused in post_pre when the layer provides it."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 

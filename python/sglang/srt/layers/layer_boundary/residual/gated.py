@@ -117,6 +117,8 @@ class _AttnReadout:
     the previous layer's output: such a layer takes its input written back."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
 
     def __init__(self, state: GatedResidualState):
@@ -170,6 +172,8 @@ class _FfnReadout:
     """The attention output's injection and the FFN input's mix."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 

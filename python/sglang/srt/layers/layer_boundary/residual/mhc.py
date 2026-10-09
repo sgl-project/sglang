@@ -125,6 +125,8 @@ class _AttnReadout:
     layer's output: an MHC layer takes its input written back."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 
@@ -171,6 +173,8 @@ class _FfnReadout:
     in hc_ffn_post_pre when it takes the batch."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 

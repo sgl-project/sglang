@@ -47,6 +47,8 @@ class PlainReadout:
     """The input is the residual itself; the stage's norm is not applied."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
     reads_after_attn_tp_gather = False
 

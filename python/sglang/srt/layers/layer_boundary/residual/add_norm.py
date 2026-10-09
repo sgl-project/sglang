@@ -327,6 +327,8 @@ class NormQuantReadout:
     the norm."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
     reads_after_attn_tp_gather = False
     fp8_input: Optional[Fp8Input] = None
@@ -363,6 +365,8 @@ class NormReadout:
     runs in the same kernel. An empty batch skips the norm."""
 
     is_plain_norm = True
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather: bool = False
     reads_after_attn_tp_gather = False
 
@@ -408,6 +412,8 @@ class UnfusedNormReadout(NormReadout):
     in models that add their residual themselves. No fused kernel takes it."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
 
     def update_and_read(
         self,

@@ -90,13 +90,16 @@ class ResidualReadout(Protocol):
             read that slice, its result gathered after it. Not derivable from
             the rows the stage computes on: a read on the slice followed by a
             gather and a read after the gather leave the same compute rows.
-        completing_fusions: Optional. ReadoutFusion kernels that complete the
-            sum the input owes with the residual add ahead of this read, tried
-            before the boundary's own all-reduce or reduce-scatter.
-        gathering_reads: Optional. Callables ``(hidden_states, residual,
-            norm)`` that read the input on this rank's attention-TP slice and
-            gather it over attention TP, returning ``(input, residual)``, or
-            None when they do not take the batch.
+        completing_fusions: ReadoutFusion kernels that complete the sum the
+            input owes with the residual add ahead of this read, tried before
+            the boundary's own all-reduce or reduce-scatter. Empty when the
+            read offers none: the boundary's own collective followed by
+            update_and_read is correct for every read.
+        gathering_reads: Callables ``(hidden_states, residual, norm)`` that
+            read the input on this rank's attention-TP slice and gather it over
+            attention TP, returning ``(input, residual)``, or None when they do
+            not take the batch. Empty when the read offers none: it then runs
+            on the slice and the boundary gathers what it read.
 
     init_residual initializes the stack residual. read consumes an
     already-written residual; update_and_read first applies the actual
@@ -113,6 +116,12 @@ class ResidualReadout(Protocol):
     reads_before_dp_gather: bool
     # The read needs every row of the attention's, not this rank's slice.
     reads_after_attn_tp_gather: bool
+    # Kernels that complete the sum the input owes with the residual add
+    # ahead of this read; empty when the read offers none.
+    completing_fusions: Tuple
+    # Reads that run on this rank's attention-TP slice and gather what they
+    # read; empty when the read offers none.
+    gathering_reads: Tuple
 
     def init_residual(self, hidden_states) -> torch.Tensor:
         """The residual the layer stack starts from, given its input."""

@@ -279,7 +279,9 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
     def test_cross_layer_update_requires_a_lifetime_guarantee(self):
         local = Layout(frozenset())
-        stateful_update = SimpleNamespace(is_plain_add=False, applied_at_exit=False)
+        stateful_update = SimpleNamespace(
+            is_plain_add=False, applied_at_exit=False, outlives_layer=False
+        )
         edge = EdgeContract(
             OutputContract(local, update=stateful_update),
             InputContract(local),
@@ -304,6 +306,8 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
 class ProbeRead:
     reads_before_dp_gather = False
+    completing_fusions = ()
+    gathering_reads = ()
     """A read that marks what it reads: the input is the residual plus 100.
     ``is_plain_norm`` says whether it may stand in for a norm."""
 

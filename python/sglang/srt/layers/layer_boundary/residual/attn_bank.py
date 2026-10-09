@@ -195,6 +195,8 @@ class _BankReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = True
+    completing_fusions = ()
+    gathering_reads = ()
 
     def __init__(self, state: AttnBankState):
         self.state = state

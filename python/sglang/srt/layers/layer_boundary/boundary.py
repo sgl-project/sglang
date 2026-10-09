@@ -166,6 +166,10 @@ class _TransformedRead:
     transform: OutputTransform
 
     is_plain_norm = False
+    # The inner read's kernels read the stream directly and would skip the
+    # transform, so none is offered.
+    completing_fusions = ()
+    gathering_reads = ()
 
     @property
     def reads_before_dp_gather(self):
@@ -372,8 +376,8 @@ def bind_exit(
         transport. The receiver binds its read independently.
     """
     update = edge.produced.update
-    if not getattr(update, "applied_at_exit", False):
-        if not getattr(update, "outlives_layer", False):
+    if not update.applied_at_exit:
+        if not update.outlives_layer:
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
@@ -400,7 +404,7 @@ def _read_fusions(read, owes, is_plain_add, *, scatters):
         return ()
     return tuple(
         f
-        for f in getattr(read, "completing_fusions", ())
+        for f in read.completing_fusions
         if f.completes is owes and f.scatters == scatters
     )
 
@@ -562,9 +566,7 @@ def _select_entry_step(
                 enters_stack=enters_stack,
                 read=read,
                 read_gathers=(
-                    getattr(read, "gathering_reads", ())
-                    if is_plain_add or arrives_written
-                    else ()
+                    read.gathering_reads if is_plain_add or arrives_written else ()
                 ),
             ),
             input_move=(

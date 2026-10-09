@@ -329,7 +329,9 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
             in edge.produced.layout.sharded - edge.need.layout.sharded
             and not _cp_gathers_over_attn_cp()
         ):
-            raise NotImplementedError("MHC with a gather over attention CP")
+            raise NotImplementedError(
+                "an update applied at the stage's exit with a gather over attention CP"
+            )
         attn_input_adapter = None
         if declaration.kind is StageKind.ATTENTION:
             # On an input-scattered batch the step gathers the rows itself for
