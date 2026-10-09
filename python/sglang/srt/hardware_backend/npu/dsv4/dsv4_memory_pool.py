@@ -343,19 +343,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        request_scoped = False
         size = config.state_size
-        if ratio == 128:
-            # Make the c128 compress-state ring SWA-page-scoped (persistent across
-            # a prefix-cache hit) exactly like the c4 attention state, instead of
-            # request-scoped. A request-scoped ring is never restored on a hit, so
-            # the fused compressor reads a stale/zeroed boundary state and emits a
-            # different c128 compressed KV -> L3 (first ratio-128 layer) diverges.
-            # Size it by the SWA page count so translate_from_swa_loc_to_state_loc
-            # (state_loc = (swa_loc // swa_page_size) * ring_size + swa_loc % ring_size)
-            # can never index past the pool.
-            n_swa_pages = int(self.swa_kv_pool.size) // int(self.swa_page_size) + 2
-            size = max(size, n_swa_pages * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
@@ -365,7 +353,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
-            request_scoped=request_scoped,
+            request_scoped=ratio == 128,
             swa_page_size=self.swa_page_size,
         )
 
