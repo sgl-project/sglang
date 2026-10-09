@@ -367,7 +367,11 @@ class BaseRunner(ABC):
 
         mr = self.model_runner
         tokens_per_req = mr.decode_num_tokens_per_req()
-        capture_bs, _ = get_batch_sizes_to_capture(mr, tokens_per_req)
+        capture_bs, _ = get_batch_sizes_to_capture(
+            mr,
+            tokens_per_req,
+            gathered_buffer_required=any(mr.decode_graph_gather_requirements()),
+        )
         if not capture_bs:
             return None
         return max(capture_bs) * tokens_per_req
