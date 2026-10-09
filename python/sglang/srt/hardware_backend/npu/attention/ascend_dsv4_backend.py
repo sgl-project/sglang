@@ -650,10 +650,14 @@ class CompressorAscendBackendMixin:
                     _h = _hlsp.md5(
                         _row.numpy().tobytes()
                     ).hexdigest()[:16]
+                    _v0 = float(_row[0]) if _row.numel() > 0 else 0.0
+                    _sum = float(_row.sum())
+                    _absmax = float(_row.abs().max()) if _row.numel() > 0 else 0.0
                     print(
                         f"[C4STP] layer={compressor.layer_id} "
                         f"idx={int(compressor.is_in_indexer)} start={_sp_list} "
-                        f"pos={_p} sloc={_sl} md5={_h} tag={_tag}",
+                        f"pos={_p} sloc={_sl} md5={_h} tag={_tag} "
+                        f"v0={_v0:.6e} sum={_sum:.6e} absmax={_absmax:.6e}",
                         flush=True,
                     )
 
