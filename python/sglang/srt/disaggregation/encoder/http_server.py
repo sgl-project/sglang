@@ -582,6 +582,7 @@ async def health_generate():
 
     # uuid keeps rids unique across workers; a bare time.time() can collide.
     req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+    deadline = time.monotonic() + HEALTH_CHECK_TIMEOUT
     owns_dispatch_lock = False
     try:
         dummy_request = {
@@ -596,7 +597,9 @@ async def health_generate():
         # request. Serialize its broadcast and rank-0 forward with every other
         # collective dispatch, then recheck whether traffic made the probe
         # unnecessary while it waited for the lock.
-        await encoder.encode_dispatch_lock.acquire()
+        await asyncio.wait_for(
+            encoder.encode_dispatch_lock.acquire(), timeout=HEALTH_CHECK_TIMEOUT
+        )
         owns_dispatch_lock = True
         if encoder.has_pending_embeddings():
             return Response(status_code=200)
@@ -620,7 +623,7 @@ async def health_generate():
         owns_dispatch_lock = False
         result = await asyncio.wait_for(
             asyncio.shield(drain_task),
-            timeout=HEALTH_CHECK_TIMEOUT,
+            timeout=max(0.0, deadline - time.monotonic()),
         )
 
         if result is None:
