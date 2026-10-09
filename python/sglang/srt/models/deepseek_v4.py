@@ -4190,6 +4190,7 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
             _model_forward_filter_inputs,
+            _model_forward_tbo_merge_key,
         )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
@@ -4263,15 +4264,9 @@ class DeepseekV4Model(nn.Module):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-        # DSV4 carries no ResidualStream across layers, which the shared
-        # _model_forward_tbo_merge_outputs now requires; merge hidden states here.
-        merged = outputs_arr[0]["hidden_states"].new_zeros(
-            (hidden_states.shape[0], *outputs_arr[0]["hidden_states"].shape[1:])
+        return _model_forward_tbo_merge_key(
+            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
         )
-        for output in outputs_arr:
-            start, end = output["forward_batch"].tbo_parent_token_range
-            merged[start:end] = output["hidden_states"][: end - start]
-        return merged
 
     @torch.no_grad()
     def forward(

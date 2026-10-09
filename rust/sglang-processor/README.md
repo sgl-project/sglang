@@ -23,6 +23,7 @@ src/
     models/        model-specific SGLang code
     legacy/        conversation.py templates
   parser/          engine output -> chat events
+  openai/          OpenAI requests over /generate
 ```
 
 ## model_files
@@ -118,8 +119,15 @@ skill.
 ChatResponseProcessor::new(tool_parser, reasoning_parser, tools, tool_choice, uses_tool_call_structural_tag, parallel_tool_calls, choices)
     .with_reasoning_state(thinking)
     .process_stream(Stream<DecodedChatEvent>) -> Stream<ChatEvent>
+split_reasoning(reasoning_parser, text, token_ids) -> (reasoning, normal)
+ReasoningStreamSplitter::new(reasoning_parser, thinking).split(text, token_ids)
+tool_constraint(tool_parser, &dynamo_tool_choice(&tool_choice), &tools, parallel_tool_calls)
+    -> Result<Option<ToolConstraint>, ProcessorError>
 dynamo_tool_parser_name(sglang_name) -> &str
 ```
+
+`mod.rs` holds the events and the stream processor, `reasoning.rs` the
+reasoning split, and `tools.rs` tool schemas, constraints and call deltas.
 
 Pass-through for parsing:
 - Reasoning goes through `ReasoningParserType::get_reasoning_parser_from_name`
@@ -128,12 +136,30 @@ Pass-through for parsing:
   OpenAI stream chunks only to feed the jail, then unwrapped into `ChatEvent`.
 
 SGLang additions:
-- **`aliases.rs`** maps SGLang parser names onto Dynamo's before
-  construction, mirroring `parser/reasoning_parser.py` and
+- **Parser names** from SGLang are mapped onto Dynamo's before construction,
+  mirroring `parser/reasoning_parser.py` and
   `function_call/function_call_parser.py`.
 - **Special tokens after a tool call** (qwen25 and glm47 terminators) are
   dropped.
 - **`parallel_tool_calls=false`** keeps only the first call.
+- **`tool_constraint`** turns `tool_choice` into the parser's structural tag,
+  or a `json_schema` array of calls for `required` and named choices.
+
+## openai
+
+```rust
+lower_completion(body, &headers, &settings, tokenizer) -> Result<(generate_body, CompletionResponder), Unsupported>
+responder.unary(status, body) / responder.stream_data(frame) -> OpenAI JSON or SSE events
+```
+
+SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
+`/generate`, for hosts that send generation there. Lowering builds the
+`GenerateReqInput` SGLang's handler would, and the responder turns `/generate`
+output into the response SGLang's handler would return. Anything not reproduced
+exactly is `Unsupported`, and the host sends it to the engine's own route.
+`tests/openai_parity.rs` replays fixtures recorded by
+`tests/scripts/generate_openai_parity.py`, which runs SGLang's handler on the
+`/generate` output of a live engine.
 
 ## Host example
 
