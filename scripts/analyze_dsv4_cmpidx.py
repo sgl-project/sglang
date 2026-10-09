@@ -325,6 +325,10 @@ def main(path):
             print("\n== [IDXK] c4 index-K (per-logical-page, prefill) ==")
             report_blkx(rows, "IDXK", keep=_is_prefill)
             # fall through to the whole-logical segment compare below as well
+        if tag == "C4KV":
+            print("\n== [C4KV] c4 attention-KV (per-logical-page, prefill) ==")
+            report_blkx(rows, "C4KV", keep=_is_prefill)
+            # fall through to the whole-logical segment compare below as well
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")
         if cmp_reqs is not None and tag != "CMPIDX" and len(reqs) != len(cmp_reqs):

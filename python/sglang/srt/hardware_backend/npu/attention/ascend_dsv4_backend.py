@@ -1303,7 +1303,8 @@ class C4IndexerAscendBackendMixin:
                         blkx.append(f"{_j}:{_md5(_buf_cpu[_pid])}")
                     blkx = blkx[-8:]
                 print(
-                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} "
+                    f"[IDXK] layer={layer_id} mode={forward_batch.forward_mode} "
+                    f"lastpos={lastpos} pages={pages} "
                     f"logical={logical} blkx={blkx}",
                     flush=True,
                 )
@@ -1314,12 +1315,25 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, False)
                 pages = int(buf.shape[0])
-                logical = _read_page_table_md5(
-                    buf, getattr(self.forward_metadata, "c4_page_table", None), pages
-                )
+                tbl = getattr(self.forward_metadata, "c4_page_table", None)
+                logical = _read_page_table_md5(buf, tbl, pages)
+                # S181: per-LOGICAL-PAGE breakdown (key = c4 page-table column j =
+                # absolute token block j), same as [IDXK]. Covers the c4 ATTENTION
+                # KV, which block 134 (same top-k, different output) actually reads.
+                blkx = []
+                if torch.is_tensor(tbl) and tbl.numel():
+                    _row = tbl.reshape(1, -1).to(torch.int64)[0]
+                    _buf_cpu = buf.detach().to("cpu")
+                    for _j in range(int(_row.numel())):
+                        _pid = int(_row[_j])
+                        if _pid < 0 or _pid >= pages:
+                            continue
+                        blkx.append(f"{_j}:{_md5(_buf_cpu[_pid])}")
+                    blkx = blkx[-8:]
                 print(
-                    f"[C4KV] layer={layer_id} lastpos={lastpos} pages={pages} "
-                    f"logical={logical}",
+                    f"[C4KV] layer={layer_id} mode={forward_batch.forward_mode} "
+                    f"lastpos={lastpos} pages={pages} "
+                    f"logical={logical} blkx={blkx}",
                     flush=True,
                 )
             except Exception as exc:
