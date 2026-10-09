@@ -920,8 +920,11 @@ class Engine(EngineScoreMixin, EngineBase):
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
                     gpu_id = (
                         get_device().base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                        + (
+                            (pp_rank % pp_size_per_node) * tp_size_per_node
+                            + (tp_rank % tp_size_per_node)
+                        )
+                        * get_device().gpu_id_step
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:

@@ -680,8 +680,11 @@ class DataParallelController:
                 gpu_id = (
                     get_device().base_gpu_id
                     + base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                    + (
+                        (pp_rank % pp_size_per_node) * tp_size_per_node
+                        + (tp_rank % tp_size_per_node)
+                    )
+                    * get_device().gpu_id_step
                 )
                 # Derive the child's EP rank for its display label.
                 moe_ep_rank = (

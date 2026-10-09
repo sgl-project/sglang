@@ -542,9 +542,9 @@ class MMEncoder:
         gpu_id: Optional[int] = None,
     ):
         """``gpu_id`` pins this encoder to a device other than
-        ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
-        this instance's value, not a config change, so it travels as an
-        argument."""
+        ``base_gpu_id + rank * gpu_id_step``. The DP launcher passes its
+        per-worker placement explicitly, including any device reindexing.
+        This is an instance value rather than a config change."""
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
@@ -576,7 +576,11 @@ class MMEncoder:
         ).lower()
 
         self.device = get_device().device
-        self.gpu_id = get_device().base_gpu_id + rank if gpu_id is None else gpu_id
+        self.gpu_id = (
+            get_device().base_gpu_id + rank * get_device().gpu_id_step
+            if gpu_id is None
+            else gpu_id
+        )
 
         self.device_config = DeviceConfig(
             device=self.device,
@@ -590,7 +594,7 @@ class MMEncoder:
             world_size=get_parallel().tp_size,
             rank=rank,
             distributed_init_method=dist_init_method,
-            local_rank=rank,
+            local_rank=self.gpu_id,
         )
         # The encoder uses a separate WORLD with tensor and attention-CP parallelism.
         parallel = get_parallel()
