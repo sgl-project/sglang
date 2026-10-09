@@ -412,8 +412,8 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
 
         # MoE
         # MLP
-        sparse = _is_moe_layer(config, layer_id)
-        if sparse:
+        attn, ffn = self.stage_facts(config, layer_id)
+        if ffn.sparse:
             self.mlp = Ernie4_5_VLMoeMoE(
                 config=config,
                 layer_id=layer_id,
@@ -435,15 +435,22 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        sparse = _is_moe_layer(config, layer_id)
         next_sparse = layer_id + 1 < config.num_hidden_layers and _is_moe_layer(
             config, layer_id + 1
         )
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
-                self.post_attention_layernorm,
-            ),
+        return (
+            declare_attn(),
+            declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
 
     def forward(
@@ -502,6 +509,7 @@ class Ernie4_5_VLMoeModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Ernie4_5_VLMoeDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
