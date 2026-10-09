@@ -20,6 +20,8 @@ register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
+_SM80 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=0)
+_SM89 = PlatformInfo(device_type="cuda", cuda_arch_major=8, cuda_arch_minor=9)
 _HIP = PlatformInfo(device_type="hip")
 
 
@@ -348,6 +350,116 @@ def test_deep_select_spec_matches_wrapper_architectures():
     spec = K.registry.get_backend("attention.deep_select_topk", KernelBackend.JIT)
     assert spec.capabilities == frozenset(
         Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select.SUPPORTED_CUDA_ARCHS
+    )
+
+
+_LORA_ENGINE_APIS = (
+    ("common.routing", "build_route", "build_route"),
+    ("common.lora_a", "grouped_lora_a", "grouped_lora_a"),
+    ("common.lora_a", "per_row_lora_a", "per_row_lora_a"),
+    ("common.lora_b", "grouped_lora_b", "grouped_lora_b"),
+    ("common.lora_b", "per_row_lora_b", "per_row_lora_b"),
+    (
+        "dense.embedding_lora_a",
+        "embedding_lora_a_tokens_fwd",
+        "embedding_lora_a_tokens_fwd",
+    ),
+    ("moe.activation_delta", "act_delta_masked", "act_delta_masked"),
+    ("moe.activation_delta", "act_delta_contiguous", "act_delta_contiguous"),
+    ("moe.align_rows", "pair_to_row_map", "pair_to_row_map"),
+    ("moe.align_rows", "moe_align_single_token", "moe_align_single_token"),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_layout_contiguous",
+        "dispatch_layout_contiguous",
+    ),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_fill_rows_contiguous_bf16",
+        "dispatch_fill_rows_contiguous_bf16",
+    ),
+    (
+        "moe.dispatch_contiguous",
+        "dispatch_fill_rows_contiguous_fp8",
+        "dispatch_fill_rows_contiguous_fp8",
+    ),
+    ("moe.dispatch_masked", "dispatch_fill_masked_bf16", "dispatch_fill_masked_bf16"),
+    ("moe.dispatch_masked", "dispatch_fill_masked_fp8", "dispatch_fill_masked_fp8"),
+    ("moe.dispatch_masked_small", "small_masked_prepare", "small_masked_prepare"),
+    (
+        "moe.finalize",
+        "invoke_shared_token_delta_reduce",
+        "invoke_shared_token_delta_reduce",
+    ),
+    (
+        "moe.finalize",
+        "invoke_shared_token_delta_tail",
+        "invoke_shared_token_delta_tail",
+    ),
+    ("moe.finalize", "invoke_shared_one_pass", "invoke_shared_one_pass"),
+    ("moe.finalize", "invoke_small_finalize", "invoke_small_finalize"),
+    ("moe.fused_act", "fused_b_act_masked", "fused_b_act_masked"),
+    ("moe.fused_act", "fused_b_act_contiguous", "fused_b_act_contiguous"),
+    ("moe.lora_b", "grouped_lora_b", "moe_grouped_lora_b"),
+    ("moe.lora_b", "invoke_down_b_into_base", "invoke_down_b_into_base"),
+    (
+        "moe.cutedsl.schedule_builder",
+        "build_dual_stage_schedules_masked",
+        "build_dual_stage_schedules_masked",
+    ),
+    (
+        "moe.cutedsl.schedule_builder",
+        "build_dual_stage_schedules_contiguous",
+        "build_dual_stage_schedules_contiguous",
+    ),
+)
+
+
+@pytest.mark.parametrize("module, function, op", _LORA_ENGINE_APIS)
+def test_lora_engine_launch_apis_are_inventoried(module, function, op):
+    spec = K.select_kernel(f"lora.{op}", backend=KernelBackend.TRITON)
+    assert spec.target == f"sglang.kernels.ops.lora.{module}:{function}"
+    # Validate the lazy target without importing CUDA/Triton/CuTe implementations.
+    root = Path(K.__file__).resolve().parent / "ops/lora"
+    tree = ast.parse(root.joinpath(*module.split(".")).with_suffix(".py").read_text())
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == function
+        for node in tree.body
+    )
+
+
+@pytest.mark.parametrize(
+    "platform, eligible", [(_CPU, False), (_HIP, False), (_SM90, True), (_SM100, True)]
+)
+def test_lora_engine_inventory_is_cuda_only(platform, eligible):
+    for _, _, op in _LORA_ENGINE_APIS:
+        spec = K.select_kernel(f"lora.{op}", backend=KernelBackend.TRITON)
+        assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        "prepare_masked_bf16",
+        "prepare_contiguous_bf16",
+        "prepare_masked_fp8",
+        "prepare_contiguous_fp8",
+    ],
+)
+def test_lora_cute_dsl_grouped_gemms_are_inventoried(function):
+    spec = K.select_kernel(f"lora.{function}", backend=KernelBackend.CUTE_DSL)
+    assert spec.target == f"sglang.kernels.ops.lora.moe.cutedsl.api:{function}"
+    # The grouped GEMMs have SM90 and SM100 kernel classes only.
+    for platform in (_CPU, _HIP, _SM80, _SM89):
+        assert not K.capabilities_satisfied(spec.capabilities, platform)
+    for platform in (_SM90, _SM100):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    tree = ast.parse(
+        (Path(K.__file__).resolve().parent / "ops/lora/moe/cutedsl/api.py").read_text()
+    )
+    assert any(
+        isinstance(node, ast.FunctionDef) and node.name == function
+        for node in tree.body
     )
 
 

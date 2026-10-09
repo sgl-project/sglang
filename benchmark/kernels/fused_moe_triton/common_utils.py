@@ -186,6 +186,11 @@ def get_model_config(
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "InklingForConditionalGeneration":
+        # Routed experts use gated SiLU; shared/sink experts are separate.
+        E = config.n_routed_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
