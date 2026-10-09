@@ -249,6 +249,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
+            fused_intra=kwargs.get("fused_intra"),
             track_state=kwargs.get("track_state"),
             track_chunk_idx=kwargs.get("track_chunk_idx"),
         )

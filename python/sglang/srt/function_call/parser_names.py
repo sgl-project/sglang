@@ -10,6 +10,7 @@ when you register a parser.
 TOOL_CALL_PARSER_NAMES = [
     "apertus2509",
     "cohere_command4",
+    "berrylm",
     "deepseekv3",
     "deepseekv31",
     "deepseekv32",
