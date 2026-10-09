@@ -264,6 +264,93 @@ def report_uniq(rows, label, fields, key="mode"):
             print("     " + "  ".join(f"{f}={v}" for f, v in zip(fields, t)))
 
 
+C4ST_RUNBOOK = (
+    "[C4ST-RUNBOOK] DSV4_DUMP_C4ST=2 bash start_test.sh > /tmp/dsv4_c4st.log 2>&1 & "
+    "bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/dsv4_c4st.log"
+)
+
+
+def _c4st_start(rec):
+    """First absolute position of the C4ST ``start=[...]`` field (or None)."""
+    v = rec.get("start")
+    if not v:
+        return None
+    s = v.strip().replace('"', "'")
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    for item in s.split(","):
+        item = item.strip().strip("'").strip()
+        if not item:
+            continue
+        try:
+            return int(item)
+        except ValueError:
+            continue
+    return None
+
+
+def _c4st_md5(blks, block):
+    """Single md5 for ``block`` over a side's blkx maps (comma-joined if >1)."""
+    vals = sorted({b[block] for b in blks if b.get(block)})
+    if not vals:
+        return None
+    return vals[0] if len(vals) == 1 else ",".join(vals)
+
+
+def _c4st_suffix(blks):
+    """Compact signature of post blocks 128..136 (must match hit vs miss)."""
+    return ",".join(f"{b}:{_c4st_md5(blks, b) or '?'}" for b in range(128, 137))
+
+
+def verdict_c4st(rows):
+    """Deterministic device A/B verdict for the [C4ST] post-op state.
+
+    MISS = largest prefill (its C4ST ``start`` is 0); HIT = suffix prefill
+    (largest ``start``, e.g. 16384).  Block 127 post-op: differs => A (the
+    reused, prefix-written boundary state is stale); equal => B (the divergence
+    is inside the closed compressor op).  Suffix blocks 128..136 must be equal.
+    """
+    post = [r for r in rows if r.get("idx") == "1" and r.get("tag") == "post"]
+    parsed = []
+    for r in post:
+        st = _c4st_start(r)
+        if st is None:
+            continue
+        parsed.append((_int(r, "layer"), st, _parse_blkx(r)))
+    if not parsed:
+        print("[C4ST-VERDICT] no C4ST post data")
+        return
+
+    # the runbook dumps a single layer (DSV4_DUMP_C4ST=2); keep the densest one
+    counts = {}
+    for ly, _, _ in parsed:
+        counts[ly] = counts.get(ly, 0) + 1
+    layer = max(counts, key=lambda k: counts[k])
+    parsed = [p for p in parsed if p[0] == layer]
+
+    starts = sorted({st for _, st, _ in parsed})
+    if len(starts) < 2:
+        print("[C4ST-VERDICT] no C4ST post data")
+        return
+    miss_st, hit_st = starts[0], starts[-1]
+    miss_blks = [b for _, st, b in parsed if st == miss_st]
+    hit_blks = [b for _, st, b in parsed if st == hit_st]
+
+    miss127 = _c4st_md5(miss_blks, 127)
+    hit127 = _c4st_md5(hit_blks, 127)
+    if miss127 is None or hit127 is None:
+        print("[C4ST-VERDICT] no C4ST post data")
+        return
+    verdict = "A" if miss127 != hit127 else "B"
+    print(f"[C4ST-VERDICT] block127 post miss={miss127} hit={hit127} -> {verdict}")
+    print(f"[C4ST-VERDICT] suffix128_136 post "
+          f"miss={_c4st_suffix(miss_blks)} hit={_c4st_suffix(hit_blks)} "
+          f"(must be equal)")
+
+
 def main(path):
     recs = parse(path)
     for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST"):
@@ -372,6 +459,9 @@ def main(path):
                 print(f"     ... {len(same) + len(pre) - MAX_DIFF_SHOWN} more")
             if not same and not pre:
                 print("     IDENTICAL")
+
+    verdict_c4st(recs.get("C4ST", []))
+    print(C4ST_RUNBOOK)
 
 
 if __name__ == "__main__":
