@@ -1,4 +1,4 @@
-"""Test for ComfyUIQwenImageEditPipeline with pass-through scheduler (I2I/edit mode)."""
+"""Test for QwenImageEditPlusPipeline with pass-through scheduler (I2I/edit mode)."""
 
 import os
 import sys
@@ -6,13 +6,17 @@ import sys
 import pytest
 import torch
 
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.test.passthrough import (
+    check_passthrough_output,
+    prepare_passthrough_request,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
-    """Test ComfyUIQwenImageEditPipeline with edit mode (I2I) and custom inputs."""
+    """Test QwenImageEditPlusPipeline with edit mode (I2I) and custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_QWEN_IMAGE_EDIT_MODEL_PATH",
         "Qwen/Qwen-Image-Edit-2511",  # Supports both safetensors file and diffusers format
@@ -20,7 +24,7 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIQwenImageEditPipeline",
+        pipeline_class_name="QwenImageEditPlusPipeline",
         num_gpus=1,
         comfyui_mode=True,
         dit_layerwise_offload=False,
@@ -94,42 +98,9 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
     req.vae_image_sizes = [(condition_width_latent, condition_height_latent)]
     req.raw_latent_shape = torch.tensor(noisy_image_latents.shape, dtype=torch.long)
 
-    if req.guidance_scale > 1.0 and req.negative_prompt_embeds is not None:
-        req.do_classifier_free_guidance = True
-    else:
-        req.do_classifier_free_guidance = False
+    prepare_passthrough_request(req)
 
-    if req.seed is not None:
-        generator_device = req.generator_device
-        device_str = "cpu" if generator_device == "cpu" else "cuda"
-        req.generator = [
-            torch.Generator(device_str).manual_seed(req.seed + i)
-            for i in range(req.num_outputs_per_prompt)
-        ]
-    else:
-        req.generator = [
-            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
-        ]
-
-    output_batch = generator._send_to_scheduler_and_wait_for_response([req])
-    noise_pred = output_batch.noise_pred
-
-    assert noise_pred is not None, "noise_pred should not be None in OutputBatch"
-    assert isinstance(noise_pred, torch.Tensor), "noise_pred should be a torch.Tensor"
-    assert noise_pred.device.type == "cuda", (
-        f"noise_pred should be on cuda, got {noise_pred.device}"
-    )
-    assert noise_pred.dtype == torch.bfloat16, (
-        f"noise_pred should be bfloat16, got {noise_pred.dtype}"
-    )
-
-    print("✓ Successfully retrieved noise_pred from OutputBatch (Edit Mode)!")
-    print(f"  noise_pred shape: {noise_pred.shape}")
-    print(f"  noise_pred dtype: {noise_pred.dtype}")
-    print(f"  noise_pred device: {noise_pred.device}")
-
-    latents = output_batch.output if output_batch.output is not None else req.latents
-    assert latents is not None, "latents should not be None"
+    check_passthrough_output(generator, req, label=" (Edit Mode)")
 
 
 if __name__ == "__main__":

@@ -249,6 +249,14 @@ def pad_masked_prompt_kwargs(call_kwargs: dict, buckets: tuple[int, ...]) -> dic
     return out
 
 
+def unwrap_model(current_model: Any) -> Any:
+    for attr in ("module", "_orig_mod"):
+        wrapped = getattr(current_model, attr, None)
+        if wrapped is not None:
+            current_model = wrapped
+    return current_model
+
+
 def transformer_class_name_matches(current_model: Any, needle: str) -> bool:
     """True when ``current_model`` (or its ``module`` / ``_orig_mod`` wrapper)
     is a transformer whose qualified class name contains ``needle``."""
@@ -302,6 +310,7 @@ def _ensure_model_padders_registered() -> None:
     from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (  # noqa: F401
         ideogram,
         longcat_image,
+        ming_image,
         minimax_h3,
         qwen_image,
         sana_video,

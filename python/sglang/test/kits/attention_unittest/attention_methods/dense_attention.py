@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -23,9 +22,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-# Unit tests run without distributed initialization. Backends that size buffers by
-# attention tensor-parallel degree should see the single-rank default.
-_parallel_override = get_parallel().override(attn_tp_size=1)
+# Use single-rank attention without distributed initialization.
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
 _parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
@@ -274,6 +272,7 @@ class TinyModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
@@ -332,10 +331,6 @@ class MockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self.is_draft_worker = False
         self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
@@ -372,7 +367,6 @@ class MockModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
             is_embedding=False,
@@ -412,7 +406,6 @@ class MockModelRunner(ModelRunner):
             get_kvcache=lambda: self.token_to_kv_pool,
         )
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -768,6 +761,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.kv_index_translator.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         batch.extend_prefix_lens = torch.tensor(

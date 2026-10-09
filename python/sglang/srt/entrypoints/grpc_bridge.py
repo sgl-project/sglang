@@ -16,11 +16,8 @@ from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
-    get_lora,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -83,6 +80,9 @@ class RuntimeHandle:
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
+
+    def set_engine_state_changed_callback(self, callback) -> None:
+        self.tokenizer_manager.set_engine_state_changed_callback(callback)
 
     @property
     def _tm_loop(self):
@@ -235,9 +235,7 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import (
-            OpenAIServingClassify,
-        )
+        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -411,6 +409,9 @@ class RuntimeHandle:
             "load_format": self.tokenizer_manager.config_value("load_format"),
             "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
             "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -424,17 +425,14 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
-        # `resolved_dict` answers with what resolution decided; the launch
-        # command answers with what was asked for, and the two are not
-        # derivable from each other. The HTTP and in-process readbacks both
-        # carry it, so this one does too.
-        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
-        result.update(self.scheduler_info)
-        result["kv_events"] = describe_kv_events_publisher(
-            self.tokenizer_manager.server_args
+        return json.dumps(
+            msgspec_to_builtins(
+                build_server_info(
+                    self.tokenizer_manager.server_args, self.scheduler_info
+                )
+            ),
+            default=str,
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus
@@ -446,8 +444,9 @@ class RuntimeHandle:
             ServerStatus.UnHealthy,
         )
 
-    def get_is_ready(self) -> bool:
-        return self.tokenizer_manager.is_ready()
+    def is_pause(self) -> bool:
+        """Return the tokenizer manager's authoritative generation pause state."""
+        return self.tokenizer_manager.is_pause
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer

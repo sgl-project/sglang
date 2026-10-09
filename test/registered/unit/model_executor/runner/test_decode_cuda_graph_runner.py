@@ -92,48 +92,6 @@ class TestInitProfileBatchMode(CustomTestCase):
             self.assertEqual(fake_self._profile_bs_list, [8, 4, 2, 1])
             self.assertEqual(fake_self._profile_bs_idx, 0)
 
-    def test_profiler_built_with_trace_export_knobs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _, mock_profile, mock_schedule, mock_record_history = self._invoke(
-                capture_bs=[1, 2], profiler_dir=tmp
-            )
-            self.assertEqual(mock_profile.call_count, 1)
-            kwargs = mock_profile.call_args.kwargs
-            self.assertTrue(kwargs["record_shapes"])
-            self.assertTrue(kwargs["with_stack"])
-            self.assertTrue(kwargs["with_flops"])
-            self.assertTrue(kwargs["profile_memory"])
-            self.assertTrue(callable(kwargs["on_trace_ready"]))
-            # Schedule skips the two dummy/warmup runs and records the capture.
-            mock_schedule.assert_called_once_with(wait=2, warmup=0, active=1, repeat=0)
-            self.assertIs(kwargs["schedule"], mock_schedule.return_value)
-            # Memory history recording is armed alongside the profiler.
-            mock_record_history.assert_called_once()
-
-    def test_default_dir_used_when_profiler_dir_env_unset(self):
-        # No SGLANG_TORCH_PROFILER_DIR -> falls back to the envs default base dir.
-        # Patch makedirs so the test never writes to the cwd.
-        fake_self = _make_fake_self([1])
-        with (
-            mock.patch.dict(os.environ, {_BATCH_CAPTURE: "1"}, clear=False),
-            mock.patch.object(
-                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-            ),
-            mock.patch.object(mod, "profile"),
-            mock.patch("torch.profiler.schedule"),
-            mock.patch("torch.cuda.memory._record_memory_history"),
-            mock.patch.object(mod.os, "makedirs") as mock_makedirs,
-        ):
-            os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
-            os.environ.pop(_CAPTURE_TRACE, None)
-            DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
-
-        mock_makedirs.assert_called_once()
-        self.assertEqual(
-            mock_makedirs.call_args.args[0],
-            os.path.join("/tmp", "graph_capture_profile"),
-        )
-
 
 class TestInitProfileOriginalMode(CustomTestCase):
     """No flag, original flag only, or both (precedence) -> unscheduled pass with
@@ -248,14 +206,19 @@ class TestOriginalTraceExport(CustomTestCase):
 
     def test_writes_named_trace_when_flag_set(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                os.environ,
-                {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
-                clear=False,
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    putils, "get_parallel", return_value=SimpleNamespace(tp_rank=2)
+                ),
             ):
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=2
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 expected = os.path.join(
                     tmp,
@@ -275,22 +238,49 @@ class TestOriginalTraceExport(CustomTestCase):
                 os.environ.pop(_CAPTURE_TRACE, None)
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=0
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 prof.export_chrome_trace.assert_not_called()
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
                 )
 
-    def test_dir_helper_uses_profiler_dir(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                os.environ, {"SGLANG_TORCH_PROFILER_DIR": tmp}, clear=False
-            ):
-                self.assertEqual(
-                    putils.graph_capture_profile_dir(),
-                    os.path.join(tmp, "graph_capture_profile"),
+
+class TestRaggedVerifyLayoutPerTier(CustomTestCase):
+    """Every graph variant of a token tier must replay the staged live layout."""
+
+    def test_replay_stages_layout_of_every_variant(self):
+        import torch
+
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = 6
+        runner.capture_num_tokens = [6, 12, 24, 48]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        with mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        ):
+            captured = {
+                variant: runner._capture_ragged_verify_layout(24)
+                for variant in ("candidate_unfiltered", "candidate_filtered")
+            }
+
+        live = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([6, 1, 6, 3, 6], dtype=torch.int32),
+            graph_num_tokens=24,
+        )
+        expected = live.padded_to_bucket(padded_bs=8, cap=6)
+        runner._stage_ragged_verify_layout(live, 24)
+        for variant, layout in captured.items():
+            with self.subTest(variant=variant):
+                torch.testing.assert_close(
+                    layout.qo_indptr_device, expected.qo_indptr_device
                 )
+                torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_model,
@@ -193,7 +194,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return output
 
         matched = finished_reason.get("matched", None)
-        if not matched:
+        if matched is None:
             return output
 
         # TODO(lmzheng): handle the case where multiple stop strs are hit
@@ -495,7 +496,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_token_sampling_mask=recv_obj.output_token_sampling_mask,
-            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
@@ -543,6 +543,7 @@ def run_detokenizer_process(
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
+    load_plugins()
     configure_logger(server_args)
     publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
