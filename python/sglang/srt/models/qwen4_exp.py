@@ -45,6 +45,7 @@ from sglang.srt.layers.hyperconnection import (
 from sglang.srt.layers.layer_boundary import (
     ExitRows,
     GatedResidualState,
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -92,7 +93,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 from sglang.srt.utils.common import is_building_neighbour_layer
 
@@ -1457,7 +1458,20 @@ def _ffn_exit_rows(layer_id, config):
     return ExitRows.ATTENTION if _has_ple(layer_id + 1, config) else None
 
 
-def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
+def _linear_attn_options():
+    """Linear attention scans the sequence in token order, and its output owes
+    the sum over the group its heads are partitioned over."""
+    return dict(
+        sum_group=(
+            SumGroup.TP if linear_attn_parallel_group() == "tp" else SumGroup.ATTN_TP
+        ),
+        in_token_order=True,
+    )
+
+
+def _build_qwen4_exp_stages(
+    residual, *, sparse, layer_id, config, linear_attention=False
+):
     """The attention and FFN stage boundaries of one gated hyper-connection layer.
 
     Each read normalizes the streams itself, so neither stage binds a norm, and
@@ -1466,7 +1480,11 @@ def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
     """
     return append_stages(
         (
-            declare_attn(read=residual.attn_readout, update=residual.attn_update),
+            declare_attn(
+                read=residual.attn_readout,
+                update=residual.attn_update,
+                **(_linear_attn_options() if linear_attention else {}),
+            ),
             None,
         ),
         (
@@ -1489,6 +1507,7 @@ class Qwen4ExpLayerExtensionMixin:
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        linear_attention: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1547,6 +1566,7 @@ class Qwen4ExpLayerExtensionMixin:
             sparse=isinstance(self.mlp, Qwen2MoeSparseMoeBlock),
             layer_id=layer_id,
             config=config,
+            linear_attention=linear_attention,
         )
 
     def _widen_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1637,7 +1657,9 @@ class Qwen4ExpLinearDecoderLayer(
             is_nextn,
             build_stages=False,
         )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, linear_attention=True
+        )
 
     def forward(
         self,
@@ -1651,17 +1673,7 @@ class Qwen4ExpLinearDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
-            shards_rows = _shards_rows_over_cp(forward_batch)
-            if shards_rows:
-                # The gated delta rule scans the sequence in global token order.
-                hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
             hidden_states = self.linear_attn(hidden_states, forward_batch)
-            if get_parallel().enable_cp_tp_group_sharing:
-                # The heads are partitioned over the TP group while attention
-                # TP is 1, so the boundary owes no sum: add the partials here.
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            if shards_rows:
-                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)

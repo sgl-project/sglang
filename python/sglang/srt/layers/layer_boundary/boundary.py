@@ -42,6 +42,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_cp_take_back_output,
     attn_tp_gather_input,
     attn_tp_slice_output,
+    cp_gather_in_token_order,
     dp_cp_take_back_output,
     keep_output,
     moe_cp_take_back_output,
@@ -55,6 +56,7 @@ from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
+    _cp_take_back_update_read,
     _dispatch_by_update,
     _dp_gather_sum_read,
     _reduce_update_read,
@@ -404,6 +406,25 @@ def _select_entry_step(
         raise NotImplementedError(f"{produced=}")
     gathered = produced.layout.sharded - need.layout.sharded - need.gathered_by_compute
     sliced = need.layout.sharded - produced.layout.sharded
+    if produced.in_token_order:
+        # A whole-sequence output in token order: complete its sum, take this
+        # rank's CP shard back and write it into the residual there, then
+        # gather the input onto the stage's rows.
+        if (
+            residual_to.sharded - produced.layout.sharded != {TokenAxis.ATTN_CP}
+            or residual != residual_to
+            or owes not in (None, SumGroup.TP)
+            or need.in_token_order
+        ):
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        on_shard = partial(_cp_take_back_update_read, group=owes, read=read)
+        if need.layout == residual_to:
+            return on_shard, None
+        if residual_to.sharded - need.layout.sharded != {TokenAxis.ATTN_CP}:
+            raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        if cp_moves is None:
+            raise NotImplementedError(f"{produced=} {need=}")
+        return partial(cp_moves.gather, gather=on_shard), None
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
         # completes the attention-TP sum and slices in one collective; a
@@ -473,6 +494,9 @@ def _select_entry_step(
             cp_moves=cp_moves,
             enters_stack=enters_stack,
         )
+        if need.in_token_order:
+            # The stage scans the whole sequence: gather it in token order.
+            return on_chunk, cp_gather_in_token_order
         return (partial(cp_moves.gather, gather=on_chunk), None)
     if gathered == {TokenAxis.ATTN_TP}:
         # A complete input on each rank's slice, gathered over attention TP

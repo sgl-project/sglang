@@ -27,6 +27,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.cp.interleave import (
     attn_cp_interleave_gather,
 )
+from sglang.srt.layers.cp.utils import cp_shard_hidden_states
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_scatter,
@@ -70,6 +71,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     dp_gather,
     dp_gather_sum,
     moe_cp_gather,
+    sum_output,
 )
 
 
@@ -406,6 +408,37 @@ def _tp_sum_with_residual_read(
     update: ResidualUpdate = PLAIN_ADD,
 ):
     return _tp_all_reduce_with_scattered_residual(hidden_states, residual, norm, read)
+
+
+def _cp_take_back_update_read(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    norm: torch.nn.Module,
+    *,
+    cache=None,
+    group: Optional[SumGroup],
+    read: ResidualReadout,
+    update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
+    post_residual_addition: Optional[torch.Tensor] = None,
+):
+    """A whole-sequence output in token order: complete the sum it owes over
+    ``group``, take this rank's CP shard back, then write it into the residual
+    and read the input there."""
+    if group is not None:
+        hidden_states = sum_output(
+            hidden_states, group, forward_batch, may_quantize=update.is_plain_add
+        )
+    hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+    return read.update_and_read(
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format=quant_format,
+        post_residual_addition=post_residual_addition,
+    )
 
 
 def _then_attn_cp_gather(

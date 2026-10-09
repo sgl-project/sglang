@@ -209,6 +209,10 @@ class StageDeclaration:
         reduction: Whether the next stage's input always completes the sum
             (an attention's), or the exit decides (an FFN's or a mixer's).
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
+        sum_group: The group an attention's heads are partitioned over, whose
+            sum its output owes.
+        in_token_order: Whether an attention reads the whole sequence in token
+            order (a scan over it), e.g. linear attention under prefill CP.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
@@ -228,6 +232,8 @@ class StageDeclaration:
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
+    sum_group: SumGroup = SumGroup.ATTN_TP
+    in_token_order: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     # Only declarations participate in construction, never executable stages.
@@ -273,6 +279,8 @@ def declare_attn(
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
     output_transform=None,
+    sum_group=SumGroup.ATTN_TP,
+    in_token_order=False,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -286,15 +294,22 @@ def declare_attn(
             complete, before the residual update (a sandwich norm). The next
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
+        sum_group: The group the heads are partitioned over: attention TP, or
+            the TP group for linear attention under CP-TP group sharing.
+        in_token_order: Compute scans the whole sequence in token order. On a
+            CP extend its input is gathered into that order, and the next
+            stage's input completes the sum and takes this rank's shard back.
+            Requires ALWAYS_PARTIAL.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
     if (
-        output_transform is not None
-        and reduction is not ProducerReduction.ALWAYS_PARTIAL
-    ):
-        raise ValueError("an attention output transform requires ALWAYS_PARTIAL")
+        output_transform is not None or in_token_order
+    ) and reduction is not ProducerReduction.ALWAYS_PARTIAL:
+        raise ValueError(
+            "an attention output transform or token-order input requires ALWAYS_PARTIAL"
+        )
     return StageDeclaration(
         StageKind.ATTENTION,
         read,
@@ -302,6 +317,8 @@ def declare_attn(
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
+        sum_group=sum_group,
+        in_token_order=in_token_order,
     )
 
 
@@ -379,12 +396,29 @@ def _resolve_stage(stage, variant, following=None):
         if stage.gathers_attn_tp_input and (sp or scattered or _use_ag_after_qlora)
         else frozenset()
     )
-    owes = not sp and axes[TokenAxis.ATTN_TP] > 1
+    if stage.sum_group is not SumGroup.ATTN_TP and (sp or scattered):
+        raise NotImplementedError(f"{stage.sum_group=} on a {variant.name} batch")
+    width = (
+        axes[TokenAxis.ATTN_TP]
+        if stage.sum_group is SumGroup.ATTN_TP
+        else get_parallel().tp_size
+    )
+    owes = not sp and width > 1
+    # On a CP extend a token-order stage takes the whole sequence.
+    in_token_order = stage.in_token_order and variant is BatchVariant.CONTEXT_PARALLEL
+    if in_token_order and get_parallel().attn_dp_size > 1:
+        raise NotImplementedError("a token-order attention under attention DP")
+    rows = full if in_token_order else attention
     declaration = StageContract(
-        InputContract(attention, gathered_by_compute=gathers, read=stage.read),
+        InputContract(
+            rows,
+            gathered_by_compute=gathers,
+            read=stage.read,
+            in_token_order=in_token_order,
+        ),
         OutputContract(
-            local if sp else attention,
-            group=SumGroup.ATTN_TP if owes else None,
+            local if sp else rows,
+            group=stage.sum_group if owes else None,
             always_partial=owes
             and (
                 stage.reduction is ProducerReduction.ALWAYS_PARTIAL
@@ -396,6 +430,7 @@ def _resolve_stage(stage, variant, following=None):
             and following.kind is StageKind.ATTENTION,
             update=stage.update,
             transform=stage.output_transform,
+            in_token_order=in_token_order,
         ),
     )
     return declaration, None, attention

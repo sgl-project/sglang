@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
@@ -160,6 +161,14 @@ def moe_cp_gather(
     )
     moe_cp_all_gather_into_tensor(output, hidden_states)
     return output
+
+
+def cp_gather_in_token_order(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """This rank's CP shard to the whole sequence in token order, without the
+    shards' padding."""
+    return cp_gather_full_sequence_states(hidden_states, forward_batch)
 
 
 def attn_tp_all_reduce(

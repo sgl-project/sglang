@@ -62,6 +62,9 @@ class InputContract(msgspec.Struct, frozen=True):
         gathered_by_compute: Token axes compute can gather internally; the boundary
             may hand it input still sharded over those axes.
         read: Operation that derives input from the updated residual.
+        in_token_order: Compute reads the whole sequence in the batch's token
+            order (a scan over it), so a gather over attention CP restores
+            that order instead of placing the shards side by side.
     """
 
     layout: Layout
@@ -70,6 +73,7 @@ class InputContract(msgspec.Struct, frozen=True):
     gathered_by_compute: FrozenSet[TokenAxis] = frozenset()
     # How the consumer reads its input from the residual.
     read: ResidualReadout = NORM_READOUT
+    in_token_order: bool = False
 
 
 class OutputContract(msgspec.Struct, frozen=True):
@@ -90,6 +94,8 @@ class OutputContract(msgspec.Struct, frozen=True):
         update: Producer residual operation; None on an arrival contract that
             declares capabilities and obtains the actual update from the stream.
         transform: Optional operation on the contribution before residual update.
+        in_token_order: The output covers the whole sequence in the batch's
+            token order; the consumer takes this rank's CP shard of it back.
 
     These are permissions, not a record of a particular output. The exit
     decision and ResidualStream record what that output actually owes.
@@ -109,6 +115,7 @@ class OutputContract(msgspec.Struct, frozen=True):
     # description has no producer object; its edge declares capabilities only.
     update: Optional[ResidualUpdate] = PLAIN_ADD
     transform: Optional[OutputTransform] = None
+    in_token_order: bool = False
 
 
 class StageContract(msgspec.Struct, frozen=True):
