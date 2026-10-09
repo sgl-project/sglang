@@ -1516,9 +1516,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
-                and merged[-1].get("phase") == msg.get("phase")
+                and (
+                    merged[-1].get("phase") == msg.get("phase")
+                    or set(merged[-1]) == {"role", "reasoning_content"}
+                )
             ):
                 prev = merged[-1] = dict(merged[-1])
+                if msg.get("phase") is not None:
+                    prev["phase"] = msg["phase"]
                 # Lift mixed str/list content to list parts so non-text parts
                 # (e.g. image_url) survive when the two sides differ in shape.
                 new_content = msg.get("content")

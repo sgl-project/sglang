@@ -351,12 +351,20 @@ class InputMessageConstructionTestCase(CustomTestCase):
             self.assertEqual(item.phase, phase)
             self.assertEqual(item.content[0].text, "answer")
 
-    def test_replay_preserves_different_assistant_phases(self):
+    def test_replay_preserves_reasoning_and_assistant_phases(self):
         serving = make_serving()
         request = ResponsesRequest(
             model="x",
             input=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                },
                 {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "conclusion"}],
+                },
                 {"role": "assistant", "content": "answer", "phase": "final_answer"},
             ],
             store=False,
@@ -364,6 +372,9 @@ class InputMessageConstructionTestCase(CustomTestCase):
         messages = serving._construct_input_messages(request)
         self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
         self.assertEqual([m["content"] for m in messages], ["working", "answer"])
+        self.assertEqual(
+            [m["reasoning_content"] for m in messages], ["plan", "conclusion"]
+        )
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
