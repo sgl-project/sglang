@@ -114,6 +114,19 @@ pub struct ModelArgs {
         requires = "override_sampling_params"
     )]
     pub sampling_param_conflict: Option<ConflictPolicy>,
+
+    /// API profile YAML: the client-facing contract (sampling, output cap,
+    /// limits, aliases, error type). See README "API profiles".
+    #[arg(long, value_name = "PATH", conflicts_with = "api_profile")]
+    pub api_profile_file: Option<std::path::PathBuf>,
+
+    /// Built-in API profile preset, e.g. moonshot-kimi.
+    #[arg(long, value_name = "NAME")]
+    pub api_profile: Option<String>,
+
+    /// Print the resolved API profile as YAML and exit.
+    #[arg(long)]
+    pub print_profile: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -545,18 +558,23 @@ impl Cli {
         let eligibility = self.routing.build_eligibility()?;
         let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
-        let sampling_overrides = self
-            .model
-            .override_sampling_params
-            .as_deref()
-            .map(|raw| {
+        let mut profile = crate::profile::resolve(
+            self.model.api_profile_file.as_deref(),
+            self.model.api_profile.as_deref(),
+        )?;
+        // The flag replaces the profile's sampling section as a whole.
+        let sampling_overrides = match self.model.override_sampling_params.as_deref() {
+            Some(raw) => {
+                profile.sampling = None;
                 parse_sampling_overrides(
                     raw,
                     self.model.sampling_param_conflict.unwrap_or_default(),
-                )
-            })
-            .transpose()?
-            .unwrap_or_default();
+                )?
+            }
+            None => profile
+                .sampling_overrides()
+                .with_context(|| format!("api profile ({})", profile.origin))?,
+        };
         let default_chat_template_kwargs = self
             .model
             .default_chat_template_kwargs
@@ -609,6 +627,7 @@ impl Cli {
                 fused,
                 eligibility,
                 sampling_overrides,
+                profile,
                 default_chat_template_kwargs,
             },
             discovery,

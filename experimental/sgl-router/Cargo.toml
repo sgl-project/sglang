@@ -58,6 +58,7 @@ sgl-kv-indexer = { path = "sgl-kv-indexer" }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so

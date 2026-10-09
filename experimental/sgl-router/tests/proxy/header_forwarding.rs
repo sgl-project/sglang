@@ -46,6 +46,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            profile: Default::default(),
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

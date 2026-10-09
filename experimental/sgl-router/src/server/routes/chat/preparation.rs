@@ -7,6 +7,7 @@
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
+use crate::profile::{ApiProfile, BudgetField};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
@@ -59,13 +60,14 @@ impl PreparedRequest {
     pub(super) fn chat(
         ctx: &AppContext,
         model: ModelId,
-        fields: RoutingFields,
+        mut fields: RoutingFields,
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
         // Validate configured sampling rules and collect missing defaults for forwarding.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let body = apply_profile(&ctx.config.model.profile, &mut fields, body)?;
         let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
             ForwardingScope::Never
         } else {
@@ -320,6 +322,35 @@ impl PreparedRequest {
         }
         Ok(body)
     }
+}
+
+/// The API profile's image limit and output budget. A budget edit is written
+/// into the body here, so routing and forwarding both see it.
+fn apply_profile(
+    profile: &ApiProfile,
+    fields: &mut RoutingFields,
+    body: Bytes,
+) -> Result<Bytes, ApiError> {
+    profile.check_images(&body).map_err(ApiError::BadRequest)?;
+    let Some(edit) = profile
+        .output_budget(fields.max_completion_tokens, fields.max_tokens)
+        .map_err(ApiError::BadRequest)?
+    else {
+        return Ok(body);
+    };
+    match edit.field {
+        BudgetField::MaxCompletionTokens => fields.max_completion_tokens = Some(edit.value),
+        BudgetField::MaxTokens => fields.max_tokens = Some(edit.value),
+    }
+    let key = edit.field.wire_name();
+    if !edit.replaces {
+        return append_fields(&body, &[(key, edit.value.to_string())]).ok_or_else(invalid_request);
+    }
+    let mut value: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+    value[key] = edit.value.into();
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|e| ApiError::Internal(e.into()))
 }
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.

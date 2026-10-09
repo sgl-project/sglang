@@ -1,0 +1,11 @@
+# Moonshot-style immutable sampling, as Kimi models are served by Moonshot's own API.
+name: moonshot-kimi
+sampling:
+  conflict: reject
+  params:
+    temperature: { min: 0, max: 1 }
+    top_p: 0.95
+    top_k: 1000
+    frequency_penalty: 0
+    presence_penalty: 0
+    n: 1

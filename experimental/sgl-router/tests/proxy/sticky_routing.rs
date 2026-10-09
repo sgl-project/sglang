@@ -62,6 +62,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+            profile: Default::default(),
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
