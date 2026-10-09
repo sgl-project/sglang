@@ -277,6 +277,7 @@ class PlainAdd:
     applied_at_exit = False
     outlives_layer = True
     writes_stream = False
+    quantized_sum = True
 
     def update(self, hidden_states, residual):
         hidden_states += residual
@@ -299,6 +300,7 @@ class ReplaceAtExit:
     applied_at_exit = True
     outlives_layer = True
     writes_stream = True
+    quantized_sum = False
 
     def update(self, hidden_states, residual):
         return hidden_states

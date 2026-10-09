@@ -271,7 +271,7 @@ class ExitPolicy:
                 hidden_states,
                 steps.output.group,
                 forward_batch,
-                may_quantize=steps.output.update.is_plain_add,
+                may_quantize=steps.output.update.quantized_sum,
             )
         if steps.output.transform is not None:
             hidden_states = steps.output.transform.apply(hidden_states)
@@ -476,7 +476,7 @@ class MixerExit:
                 hidden_states,
                 self._group,
                 self._forward_batch,
-                may_quantize=self._update.is_plain_add,
+                may_quantize=self._update.quantized_sum,
             )
         return self._stream.record(
             hidden_states, self._update, declared_sum=self._declared_sum

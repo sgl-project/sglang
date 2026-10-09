@@ -27,6 +27,7 @@ class PostNormAdd:
     is_plain_add = False
     outlives_layer = True
     writes_stream = False
+    quantized_sum = False
 
     def __init__(self, norm, *, applied_at_exit: bool = False):
         self.norm = norm

@@ -1959,7 +1959,7 @@ class TestTheFfnInputReduction(CustomTestCase):
     """With quantized communications a prefill reduces the FFN input quantized
     for a plain residual; MHC sums its streams in full precision."""
 
-    def test_only_a_plain_residual_reduces_quantized(self):
+    def test_only_an_update_that_allows_it_reduces_quantized(self):
         exec_ = SimpleNamespace(
             comm=SimpleNamespace(
                 enable_quant_communications=True, boundary_reduction="rs+rsv"
@@ -1968,9 +1968,11 @@ class TestTheFfnInputReduction(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
         )
-        for is_plain_add, reduction in ((True, "quant"), (False, "full")):
-            with self.subTest(is_plain_add=is_plain_add):
-                update = SimpleNamespace(is_plain_add=is_plain_add)
+        for update, reduction in (
+            (SimpleNamespace(quantized_sum=True), "quant"),
+            (SimpleNamespace(quantized_sum=False), "full"),
+        ):
+            with self.subTest(update=update):
                 read = SimpleNamespace(
                     update_and_read=lambda update, h, r, norm, **read_kwargs: (h, r)
                 )

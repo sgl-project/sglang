@@ -34,6 +34,10 @@ class ResidualUpdate(Protocol):
         writes_stream: Whether the producer computes the next stream itself
             and writes it at its exit, dropping the previous residual: what
             reaches its exit is already complete.
+        quantized_sum: Whether the sum the contribution owes may be completed
+            by a quantized all-reduce when quantized communication is enabled.
+            This is a numerical policy, separate from being a plain add; full
+            precision is always correct.
 
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim is_plain_add.
@@ -53,6 +57,8 @@ class ResidualUpdate(Protocol):
     # its exit has no sum left to complete and the previous residual is dropped.
     # Only an update applied at the exit can, and it is not a plain add.
     writes_stream: bool
+    # The sum it owes may run as a quantized all-reduce.
+    quantized_sum: bool
 
     def update(self, hidden_states, residual) -> torch.Tensor:
         """Write hidden_states, the producer contribution, into residual.

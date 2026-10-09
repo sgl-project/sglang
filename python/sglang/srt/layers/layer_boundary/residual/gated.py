@@ -151,6 +151,7 @@ class _AttnUpdate:
     applied_at_exit = False
     outlives_layer = False
     writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -200,6 +201,7 @@ class _FfnUpdate:
     applied_at_exit = True
     outlives_layer = False
     writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
