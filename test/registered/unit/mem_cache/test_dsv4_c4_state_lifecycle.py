@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.mem_cache.allocation import alloc_req_slots
-from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    KVAndScore,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -160,3 +163,39 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestC4StateAddressingCanonical(unittest.TestCase):
+    """The c4 compress-state ring must be addressed by REQUEST-SCOPED absolute
+    position, not via swa_loc (which drifts ~3 pages on a cache hit)."""
+
+    def _pool(self):
+        # duck-typed receiver for the unbound methods (compression ratio 4)
+        return SimpleNamespace(swa_page_size=128, ring_size=8)
+
+    def test_swa_based_addressing_diverges_when_swa_map_shifts(self):
+        # Documents the bug (characterization): the SAME logical position yields
+        # a different ring row when the physical SWA window drifts -3 pages.
+        pool = self._pool()
+        pos = torch.tensor([16376, 16380, 16383])
+        miss_swa = pos % (128 * 128)             # fresh prefill: canonical
+        hit_swa = (pos - 3 * 128) % (128 * 128)  # hit window drifts -3 pages
+        miss_loc = CompressStatePool.translate_from_swa_loc_to_state_loc(pool, miss_swa)
+        hit_loc = CompressStatePool.translate_from_swa_loc_to_state_loc(pool, hit_swa)
+        self.assertFalse(
+            torch.equal(miss_loc, hit_loc),
+            "swa-based addressing must differ under a -3-page SWA drift (the bug)",
+        )
+        self.assertEqual(int(hit_loc[0]) - int(miss_loc[0]), -24)
+
+    def test_req_position_addressing_is_swa_independent(self):
+        # The fix: request-scoped absolute-position addressing is canonical and
+        # has no dependence on full_to_swa_index_mapping.
+        pool = self._pool()
+        positions = torch.arange(16376, 16384)  # one 8-token history window
+        req = torch.tensor([0])
+        loc = CompressStatePool.translate_from_req_position_to_state_loc(
+            pool, req, positions
+        )
+        # 8 consecutive positions -> 8 distinct rows 0..7 (each history slot once)
+        self.assertEqual(sorted(int(x) for x in loc.tolist()), list(range(8)))

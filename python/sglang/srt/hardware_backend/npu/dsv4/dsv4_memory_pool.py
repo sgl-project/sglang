@@ -353,7 +353,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
-            request_scoped=ratio == 128,
+            request_scoped=ratio in (4, 128),
             swa_page_size=self.swa_page_size,
         )
 
