@@ -62,6 +62,9 @@ class _FakeReq:
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 
+    def check_match_stop_str_prefix(self):
+        return False
+
 
 def _make_accumulator() -> _GenerationStreamAccumulator:
     return _GenerationStreamAccumulator(
