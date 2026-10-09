@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import NamedTuple
@@ -546,9 +546,18 @@ def is_shared_experts_fusion_disabled() -> bool:
 
 @contextmanager
 def draft_model_build_scope():
-    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
-    fusion decision on the speculative leaf as well, and the target's ACTIVE
-    value returns on exit.
+    """Brackets a draft model's CONSTRUCTION with the draft's construction-time
+    settings; every value below returns to the target's on exit, including on
+    error.
+
+    - Shared-experts fusion: the gates the draft runs also record their
+      decision on the speculative leaf; the target's ACTIVE
+      ``disable_shared_experts_fusion`` is restored.
+    - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
+      Boundaries built here keep the resolved value after exit.
+    - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
+      when set, else inherited. ``FusedMoE`` layers built here keep the
+      draft's MegaMoE MMA type after exit.
 
     Deliberately does not touch ``runner_backend`` — swapping that is
     ``speculative_moe_backend_context``'s job and has to bracket the draft's
@@ -561,13 +570,25 @@ def draft_model_build_scope():
         moe.in_speculative_scope = True
         # Boundaries capture this resolved preference while the draft builds.
         # Restoring it cannot change an already constructed target plan.
-        with get_exec().comm.override(
-            boundary_reduction=get_spec().speculative_boundary_reduction
+        with (
+            get_exec().comm.override(
+                boundary_reduction=get_spec().speculative_boundary_reduction
+            ),
+            _draft_w4a4_mxfp4_megamoe_override(),
         ):
             yield
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
+
+
+def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
+    # FusedMoE pins its MegaMoE MMA type at construction, so the draft's layers
+    # keep this value after the scope exits.
+    draft_w4a4 = get_spec().speculative_enable_w4a4_mxfp4_megamoe
+    if draft_w4a4 is None:
+        return nullcontext()
+    return get_exec().moe.override(enable_w4a4_mxfp4_megamoe=draft_w4a4)
 
 
 def install_shared_experts_fusion_decision(
@@ -730,12 +751,10 @@ def should_use_dp_reduce_scatterv():
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
-    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
-    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
-    on ``get_forward()``.
+    True when the decoder published ``mlp_reduce_scatter`` (postprocess will
+    reduce-scatter) on ``get_forward()``.
     """
-    f = get_forward()
-    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+    return get_forward().mlp_reduce_scatter
 
 
 def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
@@ -748,8 +767,13 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     """
     if get_parallel().dwdp_size > 1:
         return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
-        # The combine reduce-scatters back to the local tokens.
+    if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The standard dispatcher all-gathers tokens and reduce-scatters the
+        # expert outputs over _TP, which spans the whole EP group
+        # (moe_ep_size == attn_dp_size), so both post-experts sums are already
+        # done. An extra EP all-reduce would reduce DP-local outputs of
+        # different tokens, and mismatched token counts across ranks crash or
+        # hang the collective.
         return True
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
@@ -797,6 +821,18 @@ def should_add_replicated_moe_output() -> bool:
     return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
+def adds_replicated_output_to_partial() -> bool:
+    """For a MoE block whose stage boundary completes its sum: whether this rank
+    adds an output every TP rank holds in full, such as a shared expert
+    replicated with tp_size=1, to its MoE output. While the output still owes a
+    TP sum, only TP rank 0 adds it, so the sum counts it once."""
+    parallel = get_parallel()
+    owes_sum = parallel.tp_size > 1 and not post_experts_output_is_complete(
+        is_tp_path=True
+    )
+    return not owes_sum or parallel.tp_rank == 0
+
+
 def can_merge_post_experts_all_reduce() -> bool:
     """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 
@@ -818,18 +854,36 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     sequential ones, which also restores the invariant the fused residual+LN path
     depends on.
     """
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not should_skip_post_experts_all_reduce(is_tp_path=False),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not should_skip_post_experts_all_reduce(is_tp_path=True),
+    )
+
+
+def sum_post_experts_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Complete the sum a MoE output owes over the EP and MoE-TP groups, for the
+    boundary that owns it; a path the combine already summed is left alone."""
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not post_experts_output_is_complete(is_tp_path=False),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not post_experts_output_is_complete(is_tp_path=True),
+    )
+
+
+def _post_experts_sum(
+    hidden_states: torch.Tensor, *, reduce_ep: bool, reduce_tp: bool
+) -> torch.Tensor:
     from sglang.srt.distributed.communication_op import (
         moe_expert_parallel_all_reduce,
         moe_tensor_model_parallel_all_reduce,
         tensor_model_parallel_all_reduce,
-    )
-
-    parallel = get_parallel()
-    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=False
-    )
-    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
     )
 
     if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():

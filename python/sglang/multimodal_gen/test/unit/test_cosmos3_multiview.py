@@ -1875,7 +1875,7 @@ class TestLidarDecoder(unittest.TestCase):
     def test_video_api_accepts_an_empty_top_level_prompt(self):
         """Per-camera captions live in multiview.views[].prompt, so the multipart video
         endpoint must not reject the empty top-level prompt schema-2 requests send."""
-        self.assertTrue(Cosmos3MultiviewSamplingParams.video_prompt_optional())
+        self.assertTrue(Cosmos3MultiviewSamplingParams.prompt_optional)
 
     def test_bev_places_rays_by_azimuth_and_range(self):
         """Column 0 of the range image is azimuth +180 (rear), the middle column is

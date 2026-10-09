@@ -26,7 +26,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";
 import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-flash-next-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <a id="spark-note" />
 
@@ -68,6 +68,19 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next.jsx";
+
+<AgentX data={agentx} />
 
 ## 1. Model Introduction
 

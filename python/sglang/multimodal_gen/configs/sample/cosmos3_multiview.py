@@ -389,10 +389,9 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
     # Rescale the guided velocity to the conditional branch's norm.
     normalize_cfg: bool | None = None
 
-    @classmethod
-    def video_prompt_optional(cls) -> bool:
-        # Captions are read per camera from multiview.views[].prompt.
-        return True
+    # Captions are read per camera from multiview.views[].prompt, so the video
+    # API must not require the top-level prompt.
+    prompt_optional = True
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:

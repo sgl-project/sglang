@@ -82,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -145,6 +146,7 @@ class Req:
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
     sp_audio_orig_num_frames: int = 0
+    sp_audio_has_padding: bool = False
 
     # Audio Parameters
     generate_audio: bool = True
@@ -155,6 +157,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
+    sp_video_has_padding: bool = False
     noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
@@ -346,7 +349,8 @@ class Req:
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
@@ -390,13 +394,7 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        # Prefer true_cfg_scale when it is explicitly provided.
-        cfg_scale = (
-            self.true_cfg_scale
-            if self.true_cfg_scale is not None
-            else self.guidance_scale
-        )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if self.sampling_params.should_use_classifier_free_guidance():
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
@@ -486,6 +484,12 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # The effective fps the worker actually produced ``output`` at (e.g. a model whose input
+    # stage resamples / resolves the request's nominal fps to a source-derived one, such as
+    # Kandinsky6 SR). ``None`` means the worker did not resolve its own fps; callers that save
+    # ``output`` client-side (return_file_paths_only=False) then fall back to the originating
+    # request's own fps field, as before this field existed.
+    fps: int | None = None
     action_pred: torch.Tensor | None = None
     action_mode: str | None = None
     action_domain_id: int | None = None
