@@ -48,7 +48,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
-from sglang.kernels.ops.common.numerics import (
+from sglang.kernels.numerics import (
     cuda_rsqrtf,
     div_rn_f32,
     round_bf16_to_fp32,

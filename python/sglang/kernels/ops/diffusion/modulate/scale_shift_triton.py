@@ -2,7 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.common.numerics import mul_rn_f32
+from sglang.kernels.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
     fuse_scale_shift_kernel_native,
 )

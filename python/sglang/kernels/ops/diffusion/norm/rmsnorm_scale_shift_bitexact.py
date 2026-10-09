@@ -55,7 +55,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.common.numerics import (
+from sglang.kernels.numerics import (
     mul_rn_f32,
     round_bf16_to_fp32,
     rsqrt_approx_f32,
