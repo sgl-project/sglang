@@ -256,6 +256,7 @@ mod tests {
             prompt_tokens: 3,
             text: text.into(),
             completion_tokens: 1,
+            metadata: None,
             extras: None,
         }
     }
@@ -399,10 +400,12 @@ mod tests {
         assert!(intake.admission.try_accept());
         assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
         assert!(intake.request.text.is_none());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "A", 10, false)))
-            .unwrap();
+        let mut first = chunk(&intake.rid, "A", 10, false);
+        first.metadata = Some(crate::message::response::SchedulerMetadata {
+            cached_tokens: 128,
+            ..Default::default()
+        });
+        intake.sink.try_send(ResponseItem::Frame(first)).unwrap();
         intake
             .sink
             .try_send(ResponseItem::Done(chunk(&intake.rid, "B", 11, true)))
@@ -413,7 +416,9 @@ mod tests {
         assert_eq!(output_ids(&first), [10]);
         assert_eq!(output_ids(&finished), [11]);
         assert_eq!(finished.text, "B");
-        assert_eq!(meta(&finished).completion_tokens, 2);
+        let finished_meta = meta(&finished);
+        assert_eq!(finished_meta.completion_tokens, 2);
+        assert_eq!(finished_meta.cached_tokens, Some(128));
         assert!(stream.next().await.is_none());
     }
 

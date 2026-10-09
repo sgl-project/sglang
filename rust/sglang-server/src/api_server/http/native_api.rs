@@ -464,6 +464,7 @@ fn delta_frame(
     e2e_latency: Option<f64>,
 ) -> api::GenerateResponse {
     delta.completion_tokens = accumulated.completion_tokens;
+    delta.metadata.clone_from(&accumulated.metadata);
     delta.frame(rid_str, index, e2e_latency)
 }
 
@@ -836,7 +837,15 @@ mod tests {
         let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
 
-        tx.send(frame(10, "Hello")).await.unwrap();
+        let mut first = match frame(10, "Hello") {
+            ResponseItem::Frame(event) => event,
+            _ => unreachable!(),
+        };
+        first.metadata = Some(crate::message::response::SchedulerMetadata {
+            cached_tokens: 128,
+            ..Default::default()
+        });
+        tx.send(ResponseItem::Frame(first)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);
@@ -855,6 +864,7 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
+        assert_eq!(v["meta_info"]["cached_tokens"], 128);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 

@@ -137,14 +137,19 @@
           "id": "client-rid",
           "prompt_tokens": 5,
           "completion_tokens": 2,
-          "finish_reason": null
+          "finish_reason": null,
+          "cached_tokens": 0,
+          "cached_tokens_details": null,
+          "reasoning_tokens": 0,
+          "num_retractions": 0,
+          "dp_rank": null
         },
         "output_ids": [
           7,
           8
         ]
       },
-      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"client-rid\",\"prompt_tokens\":5,\"completion_tokens\":2,\"finish_reason\":null},\"output_ids\":[7,8]}"
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"client-rid\",\"prompt_tokens\":5,\"completion_tokens\":2,\"finish_reason\":null,\"cached_tokens\":0,\"cached_tokens_details\":null,\"reasoning_tokens\":0,\"num_retractions\":0,\"dp_rank\":null},\"output_ids\":[7,8]}"
     },
     {
       "type": "GenerateResponse",
@@ -213,14 +218,24 @@
             ],
             []
           ],
-          "e2e_latency": 0.01
+          "e2e_latency": 0.01,
+          "cached_tokens": 1,
+          "cached_tokens_details": {
+            "device": 0,
+            "host": 0,
+            "storage": 1,
+            "storage_backend": "test"
+          },
+          "reasoning_tokens": 0,
+          "num_retractions": 2,
+          "dp_rank": 1
         },
         "output_ids": [
           5
         ],
         "index": 0
       },
-      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01},\"output_ids\":[5],\"index\":0}"
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01,\"cached_tokens\":1,\"cached_tokens_details\":{\"device\":0,\"host\":0,\"storage\":1,\"storage_backend\":\"test\"},\"reasoning_tokens\":0,\"num_retractions\":2,\"dp_rank\":1},\"output_ids\":[5],\"index\":0}"
     },
     {
       "type": "GenerateResponse",
@@ -237,7 +252,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9}}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens_details\":null,\"dp_rank\":null}}"
     },
     {
       "type": "GenerateResponse",
@@ -256,7 +271,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"abort\",\"message\":\"over the limit\",\"status_code\":400,\"err_type\":null}}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"abort\",\"message\":\"over the limit\",\"status_code\":400,\"err_type\":null},\"cached_tokens_details\":null,\"dp_rank\":null}}"
     },
     {
       "type": "GenerateResponse",
@@ -273,7 +288,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"detail\":3,\"type\":\"novel\"}}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"detail\":3,\"type\":\"novel\"},\"cached_tokens_details\":null,\"dp_rank\":null}}"
     },
     {
       "type": "GenerateStreamError",
@@ -367,7 +382,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]}}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]},\"cached_tokens_details\":null,\"dp_rank\":null}}"
     }
   ]
 }

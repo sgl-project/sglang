@@ -453,6 +453,30 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
+    /// Scheduler snapshots, including zero. Absent for legacy runtime frames.
+    #[prost(uint64, optional, tag = "13")]
+    pub cached_tokens: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "14")]
+    pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
+    #[prost(uint64, optional, tag = "15")]
+    pub reasoning_tokens: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "16")]
+    pub num_retractions: ::core::option::Option<u64>,
+    #[prost(uint32, optional, tag = "17")]
+    pub dp_rank: ::core::option::Option<u32>,
+}
+/// The scheduler's cache-source breakdown. Storage fields are omitted when
+/// that tier/backend is not reported; device and host include zero counts.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CachedTokensDetails {
+    #[prost(uint64, tag = "1")]
+    pub device: u64,
+    #[prost(uint64, tag = "2")]
+    pub host: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub storage: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub storage_backend: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

@@ -471,6 +471,20 @@ class RustServer:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
 
+        # One trailing block, matching SchedulerMetadataColumns in Rust. Keep
+        # the twelve optional shape columns in place without packing extras.
+        if not has_extra:
+            header_cols.extend([[] for _ in range(12)])
+        metadata = (
+            payload.cached_tokens,
+            payload.cached_tokens_details,
+            payload.reasoning_tokens,
+            payload.retraction_counts,
+            payload.dp_ranks or [],
+        )
+        if any(col is None or len(col) != len(rids) for col in metadata):
+            raise ValueError("generation metadata must have one entry per request")
+        header_cols.append(metadata)
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.
