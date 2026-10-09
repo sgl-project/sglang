@@ -19,15 +19,18 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
+    eager_on_graph,
     enable_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    get_tc_piecewise_forward_context,
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
@@ -57,6 +60,22 @@ def _replay_graph_scope():
         yield
     finally:
         _in_replay_graph = False
+
+
+def _late_kv_store(attention, x, positions, qkv_a) -> None:
+    # The SWA store writes the step's live tail slots, so a replay graph breaks here.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    num_rows = forward_batch.global_num_token_non_padded_cpu
+    attention._compute_kv_to_cache(
+        x[:num_rows],
+        positions[:num_rows],
+        forward_batch,
+        get_attn_backend(),
+        qkv_a=None if qkv_a is None else qkv_a[:num_rows],
+    )
+
+
+bcg_late_kv_store = eager_on_graph(True)(_late_kv_store)
 
 
 def _flatten_state(state: HcState):
