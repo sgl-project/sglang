@@ -17,7 +17,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 # MoE and linear attention keep their TP partition (the linear attention
 # gathers the sequence where its recurrence needs it). Model ports register
 # here; every other model keeps the ordinary prefill CP path.
-_SUPPORTED_MODELS: set[str] = set()
+_SUPPORTED_MODELS: set[str] = {"Qwen4ExpForConditionalGeneration"}
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
@@ -42,7 +42,17 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
+        # The MoE runs TP experts on rows gathered over the TP group.
+        "ep-size > 1": view.ep_size > 1,
+        "moe-a2a-backend": view.moe_a2a_backend != "none",
+        "pp-size > 1": cfg.pp_size > 1,
+        # Prefill only: a decode node serves plain TP. Only mooncake sends each
+        # CP rank's linear-attention state shard to its decode rank.
+        "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
+        "disaggregation-transfer-backend other than mooncake": (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ),
     }
     for flag, enabled in unsupported.items():
         if enabled:

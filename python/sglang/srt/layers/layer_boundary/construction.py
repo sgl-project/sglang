@@ -282,6 +282,7 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
             declaration.update.applied_at_exit
             and TokenAxis.ATTN_CP
             in edge.produced.layout.sharded - edge.need.layout.sharded
+            and not get_parallel().enable_cp_tp_group_sharing
         ):
             raise NotImplementedError("MHC with a gather over attention CP")
         attn_input_adapter = None

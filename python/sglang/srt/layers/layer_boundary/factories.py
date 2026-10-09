@@ -346,7 +346,12 @@ def declare_ffn(
 def _resolve_stage(stage, variant, following=None):
     axes, attention, local, full = _row_layouts(variant)
     if stage.update.applied_at_exit:
-        if stage.sparse and moe_gathers_over_moe_cp():
+        # CP-TP group sharing is the MoE-CP gather MHC has been run with.
+        if (
+            stage.sparse
+            and moe_gathers_over_moe_cp()
+            and not get_parallel().enable_cp_tp_group_sharing
+        ):
             raise NotImplementedError(
                 "MHC does not support a MoE gathered over the MoE-CP group"
             )

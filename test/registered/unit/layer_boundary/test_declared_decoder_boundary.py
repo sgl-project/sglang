@@ -79,6 +79,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         attn_cp_rank=0,
         moe_dense_tp_size=None,
         enable_prefill_cp=False,
+        enable_cp_tp_group_sharing=False,
         moe_ep_size=1,
         moe_tp_size=attn_dp * attn_cp * attn_tp,
         moe_dp_size=1,
@@ -619,6 +620,18 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
         parallel = parallel_of(
             attn_dp=1, attn_tp=2, attn_cp=2, moe_dp_size=2, moe_tp_size=2
+        )
+        build_mhc(
+            layer_case(1, 3, sparse=True, previous_sparse=True),
+            parallel,
+        )
+        # CP-TP group sharing (Qwen4-Exp) runs MHC on the MoE-CP gather.
+        parallel = parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
         )
         build_mhc(
             layer_case(1, 3, sparse=True, previous_sparse=True),

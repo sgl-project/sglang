@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
+    linear_attn_tp_size,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
@@ -319,6 +320,9 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        # The mamba state's head partition: attention TP, or the TP group under
+        # CP-TP group sharing.
+        self.linear_attn_tp_size = linear_attn_tp_size()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
@@ -338,7 +342,11 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
-        self.enable_all_cp_ranks_for_transfer = (
+        # CP-TP group sharing: CP rank r holds every KV head, the CP-replicated
+        # state and linear-attention head shard r. It transfers as TP rank r of
+        # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
+        cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
@@ -388,6 +396,7 @@ class CommonKVManager(BaseKVManager):
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not cp_tp_group_sharing
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -466,6 +475,7 @@ class CommonKVManager(BaseKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().enable_cp_tp_group_sharing
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -1358,11 +1368,16 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
+        attn_tp = (self.attn_tp_size, self.attn_tp_rank)
+        attn_cp = (self.attn_cp_size, self.attn_cp_rank)
+        if get_parallel().enable_cp_tp_group_sharing:
+            # Decode pairs its TP rank r with this CP rank r (see __init__).
+            attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
-            "attn_tp_size": self.attn_tp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_cp_size": self.attn_cp_size,
-            "attn_cp_rank": self.attn_cp_rank,
+            "attn_tp_size": attn_tp[0],
+            "attn_tp_rank": attn_tp[1],
+            "attn_cp_size": attn_cp[0],
+            "attn_cp_rank": attn_cp[1],
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
