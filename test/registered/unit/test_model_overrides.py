@@ -3593,12 +3593,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 "page_size": 64,
                                 "attn_dp_size": 1,
                                 "dp_size": 1,
-                                "moe_dense_tp_size": 1,
-                                "moe_a2a_backend": "deepep",
-                                "ep_size": 8,
                                 "attn_cp_size": 8,
                             },
                         )
+                        with self.assertRaisesRegex(ValueError, "index_kpool=1"):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="zigzag",
+                                    tp_size=8,
+                                    dp_size=1,
+                                    attn_dp_size=1,
+                                ),
+                                SimpleNamespace(index_kpool=2),
+                            )
                         # Interleave keeps attention DP and the configured dense TP.
                         for attn_dp_size, dense_tp_size, cp_size, expected_cp in (
                             (1, None, 1, 8),

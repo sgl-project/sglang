@@ -93,13 +93,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 overrides["attn_dp_size"] = attn_dp_size
                 overrides["dp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
-                    overrides["moe_dense_tp_size"] = 1
-                    overrides["moe_a2a_backend"] = "deepep"
-                    overrides["ep_size"] = cfg.tp_size
-                    logger.warning(
-                        "zigzag DSA CP requires moe_dense_tp_size=1, "
-                        "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
-                    )
+                    if get_dsa_index_kpool(hf_config) > 1:
+                        raise ValueError(
+                            "Zigzag DSA CP requires index_kpool=1; "
+                            "use interleave for pooled DSA indexers."
+                        )
                 assert cfg.tp_size <= 8, (
                     "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                 )
