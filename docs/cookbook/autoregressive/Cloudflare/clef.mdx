@@ -1,6 +1,6 @@
 ---
 title: Clef
-description: "Deploy Cloudflare's Clef 27B and Clef Flash 9B decision models with SGLang. Select either variant for BF16 text and image decisions on one NVIDIA B200 or H200."
+description: "Deploy Cloudflare's Clef 27B and Clef Flash 9B decision models with SGLang. Select either variant for BF16 text and image decisions on one NVIDIA B200, B300, or H200."
 tag: NEW
 ---
 
@@ -52,7 +52,9 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
 <Deployment config={config} />
 
 <Note>
-  We tested both models on one B200 and one H200 with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed four requests: short and long text, each with and without an image. The long requests used all 16,384 prompt tokens. These checks covered serving behavior. We did not measure throughput or accuracy, or run the Docker command on hardware.
+  We tested both models on one B300 and one H200 inside `lmsysorg/sglang:dev-clef`, built from [SGLang bd2d73daa5af](https://github.com/sgl-project/sglang/commit/bd2d73daa5afda6bcad8d479a834f2e70bbe9569), with PyTorch 2.14.1+cu130 and Transformers 5.19.0. Each configuration passed the wizard’s cURL request, the Python example below, and four requests covering short and long text, each with and without an image. Both long requests used all 16,384 prompt tokens and preserved every question.
+
+  B200 passed the same four text/image cases with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. These checks covered serving behavior; throughput and accuracy were not measured.
 </Note>
 
 ## 1. Model introduction
