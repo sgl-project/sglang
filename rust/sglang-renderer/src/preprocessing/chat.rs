@@ -18,7 +18,9 @@ use dynamo_renderer::{
 use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
-use sglang_processor::{OneOrMany as ProcessorOneOrMany, dynamo_tool_parser_name};
+use sglang_processor::{
+    OneOrMany as ProcessorOneOrMany, chat_tool_definitions, dynamo_tool_parser_name,
+};
 
 use crate::{
     ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
@@ -199,6 +201,7 @@ struct RenderPreparation {
     require_reasoning: bool,
     reasoning_state: Option<bool>,
     tools_enabled: bool,
+    tools: Vec<ToolDefinition>,
 }
 
 /// Applies structured chat semantics before the shared text generation path.
@@ -231,7 +234,7 @@ impl ChatPreprocessor {
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools = chat_tool_definitions(&request);
+        let tools = preparation.tools;
         let parser =
             resolve_chat_parser(self.tool_call_parser.as_deref(), preparation.tools_enabled)?;
         if parser.is_some() {
@@ -311,11 +314,8 @@ impl ChatPreprocessor {
         validate_chat(request)?;
         self.normalize_template_args(request);
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
-        let tools_enabled = request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
-            && tool_choice != DynamoToolChoice::None;
+        let tools = chat_tool_definitions(request.tools.as_deref(), &request.messages)?;
+        let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
         let named_tool_choice = matches!(tool_choice, DynamoToolChoice::Named(_));
         let thinking = self.formatter.as_ref().and_then(|formatter| {
             formatter.resolve_thinking(
@@ -328,6 +328,7 @@ impl ChatPreprocessor {
             require_reasoning: self.reasoning_parser.is_some() && thinking == Some(true),
             reasoning_state: thinking,
             tools_enabled,
+            tools,
         })
     }
 
@@ -501,19 +502,6 @@ fn resolve_chat_parser(
         return Err("tool calls require --tool-call-parser".into());
     }
     Ok(tools_enabled.then(|| configured_parser.expect("checked").to_owned()))
-}
-
-fn chat_tool_definitions(request: &ChatRequest) -> Vec<ToolDefinition> {
-    request
-        .tools
-        .iter()
-        .flatten()
-        .map(|tool| ToolDefinition {
-            name: tool.function.name.clone(),
-            parameters: tool.function.parameters.clone(),
-            strict: tool.function.strict,
-        })
-        .collect()
 }
 
 fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {

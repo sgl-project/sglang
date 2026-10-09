@@ -93,7 +93,7 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            if is_in_breakable_cuda_graph():
+            if is_in_breakable_cuda_graph() and not _linear_extend_in_graph():
                 bcg_unified_linear_attention_with_output(
                     mixed_qkv,
                     a,
@@ -146,6 +146,20 @@ class RadixLinearAttention(nn.Module):
             a=a,
             b=b,
         )
+
+
+def _linear_extend_in_graph() -> bool:
+    """Whether the backend runs this breakable prefill capture's linear extend
+    on static tables inside the graph (no eager break at the layer)."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    backend = get_attn_backend()
+    return (
+        isinstance(backend, HybridLinearAttnBackend)
+        and backend.linear_extend_in_graph()
+    )
 
 
 def _linear_attention_with_output_impl(
