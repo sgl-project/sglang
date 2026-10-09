@@ -304,6 +304,18 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
     return (q_fp4, q_sf), weights_out
 
 
+_FREQS_REAL: dict = {}
+
+
+def _freqs_real(freqs_cis: torch.Tensor) -> torch.Tensor:
+    # freqs_cis is a per-layer buffer that never moves; its real view is reused.
+    key = (freqs_cis.data_ptr(), freqs_cis.shape)
+    view = _FREQS_REAL.get(key)
+    if view is None:
+        view = _FREQS_REAL[key] = torch.view_as_real(freqs_cis).flatten(-2)
+    return view
+
+
 def fused_k_norm_rope_flashmla(
     kv: torch.Tensor,
     kv_weight: torch.Tensor,
@@ -319,7 +331,7 @@ def fused_k_norm_rope_flashmla(
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
     cache at ``out_loc``."""
     layout = KVLayout.parse(layout)
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    freqs_real = _freqs_real(freqs_cis)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
