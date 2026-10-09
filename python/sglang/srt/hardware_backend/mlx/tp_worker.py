@@ -118,6 +118,8 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        # rid -> req.retraction_count when its MLX state was created.
+        self._req_retraction_count: dict[str, int] = {}
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -161,6 +163,7 @@ class MlxTpModelWorker(TpModelWorker):
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
+                self._req_retraction_count.pop(rid, None)
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
@@ -173,14 +176,16 @@ class MlxTpModelWorker(TpModelWorker):
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
 
-    def on_reqs_retracted(self, reqs: list[Req]) -> None:
-        """Drop the MLX state of retracted requests.
+    def _drop_state_if_retracted(self, req: Req) -> None:
+        """Drop the MLX state of a request retracted since its state was made.
 
-        Their KV was freed without a tree insert, so nothing is synced to the
-        pool. Kept state would make the re-prefill route as a continuation
-        and extend the old KV a second time.
+        The scheduler freed that KV without a tree insert, so nothing is synced
+        to the pool. Kept state would make the re-prefill route as a
+        continuation and extend the old KV a second time.
         """
-        for req in reqs:
+        made_at = self._req_retraction_count.get(req.rid)
+        if made_at is not None and made_at != req.retraction_count:
+            del self._req_retraction_count[req.rid]
             self._mlx_runner.remove_request(req.rid, sync_kv=False)
             self._mlx_active_rids.discard(req.rid)
 
@@ -488,7 +493,10 @@ class MlxTpModelWorker(TpModelWorker):
             offset += seq_len
             slot_offset += seq_len
 
+            self._drop_state_if_retracted(req)
             route = self._route_extend_request(req.rid, decoding_rids)
+            if route == "prefill":
+                self._req_retraction_count[req.rid] = req.retraction_count
             if route == "continuation":
                 pending_extends.append(
                     self._mlx_runner.extend_start(

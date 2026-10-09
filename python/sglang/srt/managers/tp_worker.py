@@ -69,7 +69,6 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -91,13 +90,6 @@ class BaseTpWorker(ABC):
     ) -> None:
         """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
         process relayed spec results through a plain worker."""
-
-    def on_reqs_retracted(self, reqs: List[Req]) -> None:
-        """Called after the scheduler retracts *reqs* and frees their KV.
-
-        A worker that keeps per-request state outside the KV pool drops it
-        here, so the request's re-prefill starts clean. No-op by default.
-        """
 
     @property
     def last_shared_read_runner(self):
