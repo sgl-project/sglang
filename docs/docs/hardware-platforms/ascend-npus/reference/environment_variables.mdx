@@ -18,6 +18,11 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
+      <td><code>SGLANG_QWEN4_NPU_DENSE_FALLBACK</code></td>
+      <td>Opt into the experimental Qwen4-Exp dense attention fallback on NPU. Set <code>--context-length</code> no higher than the checkpoint's <code>indexer_budget</code>; larger contexts are rejected at startup. This disables the QSA indexer and its cache allocation. It does not implement long-context sparse attention. Use eager execution (<code>--disable-cuda-graph</code>) for this bring-up path.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>

@@ -7,6 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 
 @lru_cache(None)
@@ -51,7 +54,7 @@ class GroupedGemmaRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and x.device.type == "cuda"
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -155,7 +158,8 @@ class GatedResidual(HyperConnectionBase):
             )
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
-                torch.cuda.is_available()
+                self.input_mix_weight_down.weight.device.type == "cuda"
+                and torch.cuda.is_available()
                 # The CuTe split-K pair is tcgen05 (sm_100 family) only.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
@@ -230,8 +234,12 @@ class GatedResidual(HyperConnectionBase):
             )
             return (R + injection).flatten(-2)
 
-        self._mix_compute = torch.compile(_mix_compute)
-        self._combine_compute = torch.compile(_combine_compute)
+        # NPU CUDA compatibility aliases are incompatible with Inductor's
+        # CUDA capability checks. Keep the same math eager on this backend.
+        self._mix_compute = _mix_compute if _is_npu else torch.compile(_mix_compute)
+        self._combine_compute = (
+            _combine_compute if _is_npu else torch.compile(_combine_compute)
+        )
 
     def mix(
         self,
@@ -257,7 +265,7 @@ class GatedResidual(HyperConnectionBase):
             ).flatten(-2)
         if (
             self._jit_mix_ok
-            and hyper_input_normed.is_cuda
+            and hyper_input_normed.device.type == "cuda"
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
@@ -372,7 +380,7 @@ class GatedResidual(HyperConnectionBase):
 
         if (
             self._jit_combine_ok
-            and block_output.is_cuda
+            and block_output.device.type == "cuda"
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype
             and hyper_input_normed.dtype == block_output.dtype

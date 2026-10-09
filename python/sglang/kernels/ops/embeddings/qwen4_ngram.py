@@ -61,18 +61,18 @@ def can_fuse_qwen4_ngram_hash(
     """Return whether inputs match the fixed Qwen4 PLE hash contract."""
 
     return (
-        contexts.is_cuda
+        contexts.device.type == "cuda"
         and contexts.dtype == torch.long
         and contexts.dim() == 2
         and contexts.shape[1] == _QWEN4_NGRAM_SIZE
         and contexts.is_contiguous()
-        and multipliers.is_cuda
+        and multipliers.device.type == "cuda"
         and multipliers.dtype == torch.long
         and multipliers.numel() == _QWEN4_NGRAM_SIZE
-        and vocab_sizes.is_cuda
+        and vocab_sizes.device.type == "cuda"
         and vocab_sizes.dtype == torch.long
         and vocab_sizes.numel() == _QWEN4_NGRAM_HEADS
-        and offsets.is_cuda
+        and offsets.device.type == "cuda"
         and offsets.dtype == torch.long
         and offsets.numel() == _QWEN4_NGRAM_HEADS
     )

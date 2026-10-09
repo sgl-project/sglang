@@ -21,7 +21,10 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qsa.config import (
+    parse_qsa_profile,
+    qsa_dense_fallback,
+)
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QSAMTPSharedSparseIndices,
     QwenSparseAttnBackend,
@@ -373,7 +376,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
-            qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
+            qsa_profile=(
+                None
+                if qsa_dense_fallback()
+                else parse_qsa_profile(self.draft_runner.model_config.hf_config)
+            ),
         )
 
         # Initialize decode attention backend

@@ -465,15 +465,24 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
-            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+            from sglang.srt.layers.attention.qsa.config import (
+                is_qwen_qsa,
+                qsa_dense_fallback,
+            )
 
             if is_qwen_qsa(runner.model_config.hf_config):
-                from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
-                    QwenSparseAttnBackend,
-                )
+                if qsa_dense_fallback():
+                    logger.info(
+                        "Using the explicitly enabled NPU dense QSA fallback "
+                        "within the model's indexer budget."
+                    )
+                else:
+                    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                        QwenSparseAttnBackend,
+                    )
 
-                logger.info("Using QSA for sparse full-attention layers.")
-                full_attn_backend = QwenSparseAttnBackend(runner)
+                    logger.info("Using QSA for sparse full-attention layers.")
+                    full_attn_backend = QwenSparseAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig

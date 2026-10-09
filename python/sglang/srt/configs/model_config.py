@@ -1216,6 +1216,10 @@ class ModelConfig:
             else:
                 self.context_len = derived_context_len
 
+        from sglang.srt.layers.attention.qsa.config import validate_qsa_dense_fallback
+
+        validate_qsa_dense_fallback(self.hf_config, self.context_len)
+
         # Transfer context_len to HuggingFace config so models can access it
         self.hf_config.context_len = self.context_len
 

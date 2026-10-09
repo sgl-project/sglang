@@ -49,7 +49,6 @@ def rms_norm_ref(
     upcast=True,
 ):
     dtype = x.dtype
-    N = x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:
@@ -381,12 +380,40 @@ def rms_norm_gated(
             assert z.ndim == 3
             assert z.shape[0] * z.shape[1] == x.shape[0]
             assert z.shape[2] == x.shape[1]
-            assert z.stride(-1) == 1
+            if _is_npu:
+                # The external NPU kernel accepts only a contiguous 2D gate.
+                z = z.reshape(x.shape).contiguous()
+            else:
+                assert z.stride(-1) == 1
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        assert activation == "swish", "NPU only supports swish activation"
+        if activation == "sigmoid":
+            # Older sgl-kernel-npu accepts an activation argument but always
+            # computes swish. Keep sigmoid's math explicit, in FP32, until
+            # the external kernel provides this activation on all NPU builds.
+            group_size = x.shape[-1] if group_size is None else group_size
+            assert group_size > 0 and x.shape[-1] % group_size == 0
+            values = x.float()
+            gate = torch.sigmoid(z.float()) if z is not None else None
+            if gate is not None and not norm_before_gate:
+                values = values * gate
+            grouped = values.reshape(x.shape[0], x.shape[-1] // group_size, group_size)
+            if not is_rms_norm:
+                grouped = grouped - grouped.mean(dim=-1, keepdim=True)
+            normalized = grouped * torch.rsqrt(
+                grouped.square().mean(dim=-1, keepdim=True) + eps
+            )
+            y = normalized.reshape_as(x) * weight.float()
+            if bias is not None:
+                y = y + bias.float()
+            if gate is not None and norm_before_gate:
+                y = y * gate
+            return y.to(x.dtype).reshape(x_shape_og)
+        if activation not in ("swish", "silu"):
+            raise ValueError(f"Unsupported NPU gated norm activation: {activation}")
+        activation = "swish"
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
