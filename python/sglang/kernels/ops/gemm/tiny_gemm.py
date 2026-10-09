@@ -51,17 +51,16 @@ def _jit_tiny_gemm_module(
     weight_dtype: torch.dtype = torch.bfloat16,
 ) -> Module:
     use_k_variant = _prefer_k_variant(n, k)
-    args = make_cpp_args(n, k, max_m, n_split, out_dtype, is_arch_support_pdl())
     if weight_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("tiny_gemm requires BF16 or FP32 weights")
     if use_k_variant and weight_dtype != torch.bfloat16:
         raise ValueError(
             "FP32 weights require the tiny-N variant (N >= K is unsupported)"
         )
-    if not use_k_variant:
-        args = make_cpp_args(
-            n, k, max_m, n_split, out_dtype, is_arch_support_pdl(), weight_dtype
-        )
+    weight_args = () if use_k_variant else (weight_dtype,)
+    args = make_cpp_args(
+        n, k, max_m, n_split, out_dtype, is_arch_support_pdl(), *weight_args
+    )
     name = "tiny_k_gemm" if use_k_variant else "tiny_n_gemm"
     kernel = "TinyKGemmKernel" if use_k_variant else "TinyNGemmKernel"
     return load_jit(
