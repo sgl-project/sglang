@@ -301,6 +301,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         k_nope: torch.Tensor,
         k_pe: torch.Tensor,
         v: torch.Tensor,
+        *,
+        layer: Optional[RadixAttention] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
         strided ``v`` into contig FP8 V in a single kernel.
