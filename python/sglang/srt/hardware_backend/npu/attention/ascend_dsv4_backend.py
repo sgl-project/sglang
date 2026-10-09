@@ -1082,11 +1082,12 @@ class C4IndexerAscendBackendMixin:
             sparse_count=self._dsv4_index_topk,
             metadata=li_quant_metadata,
         )
-        # S169: L2 c4-indexer RAW-INPUT direct read. Decisive op-vs-mapping split:
-        # if q / index-K(buffer) / weights / c4_page_table / seq-lens / k-scale are
-        # byte-identical at prefill hit vs miss, the block-135 topk split is the
-        # (closed-source) OP; if ANY input differs, it is framework read/mapping/state.
-        # Env DSV4_DUMP_IDXIN = layer id (or "all"). Per-c128-block hashes appended.
+        # S169: L2 c4-indexer RAW-INPUT direct read. Decisive op-vs-mapping split.
+        # CRITICAL: only LOGICAL per-position fields are comparable hit vs miss
+        # (qblk/wblk/slq/slk); whole-tensor or physical-buffer hashes are NOT
+        # comparable (hit ntok=1139 vs miss 17523; physical pages differ), so they
+        # are dumped as diagnostics only and MUST NOT be read as "input differs".
+        # Env DSV4_DUMP_IDXIN = layer id (or "all").
         _want_idxin = os.environ.get("DSV4_DUMP_IDXIN")
         if _want_idxin and (
             _want_idxin == "all" or str(getattr(c4_indexer, "layer_id", -1)) == _want_idxin
@@ -1110,19 +1111,28 @@ class C4IndexerAscendBackendMixin:
                             parts.append(f"{int(b)}:{_md5_in(tt[blk == b])}")
                     return parts[-8:]
 
-                _slq = fm.actual_seq_lengths_q
-                _slk = fm.actual_seq_lengths_kv
+                def _seq(tt):
+                    if tt is None:
+                        return "None"
+                    try:
+                        return f"({int(tt.min())},{int(tt.max())},{tt.numel()})"
+                    except Exception:
+                        try:
+                            return f"(len={len(tt)})"
+                        except Exception:
+                            return "?"
+
                 _ptab = fm.c4_page_table
                 print(
                     f"[IDXIN] layer={getattr(c4_indexer, 'layer_id', -1)} "
                     f"mode={forward_batch.forward_mode} "
-                    f"q={_md5_in(q)} qq={_md5_in(q_quant)} qblk={_blk_in(q_quant)} "
-                    f"w={_md5_in(kwargs['weights'])} kbuf={_md5_in(k)} "
-                    f"kshape={tuple(k.shape)} kscale={_md5_in(k_scale)} "
-                    f"ptab={_md5_in(_ptab)} "
-                    f"ptab_head={_ptab.reshape(-1)[:8].tolist() if _ptab is not None and _ptab.numel() else []} "
-                    f"slq=({int(_slq.min())},{int(_slq.max())},{_slq.numel()}) "
-                    f"slk=({int(_slk.min())},{int(_slk.max())},{_slk.numel()})",
+                    f"qblk={_blk_in(q_quant)} wblk={_blk_in(kwargs['weights'])} "
+                    f"slq={_seq(fm.actual_seq_lengths_q)} "
+                    f"slk={_seq(fm.actual_seq_lengths_kv)} "
+                    f"qshape={tuple(q_quant.shape)} wshape={tuple(kwargs['weights'].shape)} "
+                    f"#-diag-notcomparable: kshape={tuple(k.shape)} "
+                    f"ptab_shape={tuple(_ptab.shape) if _ptab is not None and hasattr(_ptab, 'shape') else None} "
+                    f"ptab_head={_ptab.reshape(-1)[:8].tolist() if _ptab is not None and getattr(_ptab, 'numel', lambda: 0)() else []}",
                     flush=True,
                 )
             except Exception as exc:
