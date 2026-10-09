@@ -174,9 +174,9 @@ class DeepSeekV31Detector(BaseFormatDetector):
                     # Update the stored arguments
                     try:
                         parsed_args = json.loads(func_args_raw)
-                        self.prev_tool_call_arr[self.current_tool_id][
-                            "arguments"
-                        ] = parsed_args
+                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                            parsed_args
+                        )
                     except json.JSONDecodeError:
                         pass
 
