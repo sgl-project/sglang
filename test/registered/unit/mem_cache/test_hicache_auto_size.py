@@ -111,7 +111,7 @@ class TestHiCacheAutoSize(CustomTestCase):
             get_kv_size_bytes=Mock(return_value=100),
         )
         state = Mock(host_capacity_bytes=None, get_kv_size_bytes=Mock(return_value=300))
-        for hybrid in (False,):
+        for hybrid in (False, True):
             pool = (
                 Mock(spec=HybridLinearKVPool, full_kv_pool=target, size=100)
                 if hybrid

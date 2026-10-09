@@ -486,6 +486,66 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     trace, (["target"] if not dummy else []) + ["broadcast", "draft"]
                 )
 
+    def test_mla_loader_maps_three_state_layers_to_one_mla_layer(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        target = SimpleNamespace()
+        state = SimpleNamespace()
+        restored = torch.full((8,), -1, dtype=torch.int64)
+        broadcast_layers = []
+        mla_map = {3: 0, 7: 1}
+        state_map = {layer: local for local, layer in enumerate((0, 1, 2, 4, 5, 6))}
+
+        def restore_state(pool, host, device, layer, backend, **kwargs):
+            global_layer = next(k for k, v in state_map.items() if v == layer)
+            restored[global_layer] = 10 + layer
+
+        def broadcast(layer, plan):
+            broadcast_layers.append(layer)
+            global_layer = next(k for k, v in mla_map.items() if v == layer)
+            restored[global_layer] = 100 + layer
+
+        controller.mla_dedup = SimpleNamespace(
+            broadcaster=SimpleNamespace(
+                device_pool=target,
+                layer_num=2,
+                prepare_broadcast=lambda indices, stream: (indices, None),
+                broadcast_loaded_layer=broadcast,
+            )
+        )
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        transfers = [
+            L2Transfer(
+                SimpleNamespace(_is_dummy=True),
+                target,
+                _indices(0, 2),
+                _indices(2, 4),
+                layer_mapper=mla_map.get,
+            ),
+            L2Transfer(
+                SimpleNamespace(
+                    _is_dummy=False,
+                    load_to_device_per_layer_physical=restore_state,
+                ),
+                state,
+                _indices(0, 2),
+                _indices(2, 4),
+                layer_mapper=state_map.get,
+            ),
+        ]
+        load = controller._mla_layer_loader(_indices(2, 4))
+        for layer in range(8):
+            load(transfers, layer)
+        self.assertEqual(restored.tolist(), [10, 11, 12, 100, 13, 14, 15, 101])
+        self.assertEqual(broadcast_layers, [0, 1])
+        # A state-only restore has no anchor transfer and must not broadcast.
+        restored.fill_(-1)
+        broadcast_layers.clear()
+        for layer in range(8):
+            load(transfers[1:], layer)
+        self.assertEqual(restored.tolist(), [10, 11, 12, -1, 13, 14, 15, -1])
+        self.assertEqual(broadcast_layers, [])
+
     def test_v4_loader_restores_all_side_pools_using_physical_indices(self):
         from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
 

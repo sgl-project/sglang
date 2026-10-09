@@ -1392,6 +1392,7 @@ def build_hybrid_mamba_stack(
     )
     root = config.pools[0]
     kv_pool = root.decl.device_pool
+    mla_dedup = _create_mla_dedup_context(kv_pool, params, storage_backend)
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -1411,6 +1412,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
     )
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
@@ -1485,6 +1487,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller, config
 

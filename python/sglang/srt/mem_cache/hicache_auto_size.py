@@ -152,7 +152,7 @@ def _estimate_hicache_bytes(
     total = _v4_host_bytes(params, pool) if is_v4 else _pool_bytes(pool)
     target_bytes = total
     if physical and get_memory().enable_mla_hicache_host_dedup:
-        target = pool
+        target = pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
         rank, size = mla_dedup_rank_and_size()
         if size > 1 and rank != 0 and mla_host_dedup_eligible(target, None):
             # Only the target MLA/DSA mirror is deduplicated. Draft and linear
