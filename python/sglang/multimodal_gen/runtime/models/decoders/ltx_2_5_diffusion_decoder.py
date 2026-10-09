@@ -680,6 +680,8 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         self.trailing_pad_latent_frames = (stage_kernels[0][0] // 2) * 2
 
         self.conv_in = nn.Linear(arch.latent_channels, stage_channels[0], bias=True)
+        # checkpoint keyframe-stream tag; ordinary video decoding does not use it
+        self.type_emb = nn.Parameter(torch.zeros(arch.latent_channels))
 
         self.det_stages = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -729,6 +731,31 @@ class LTX2VideoDiffusionDecoder3d(nn.Module):
         )
         self.norm_out = nn.RMSNorm(stage5_channels, eps=1e-6)
         self.conv_out = nn.Linear(stage5_channels, noised_pixel_channels, bias=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # older checkpoints predate the keyframe tag and use a zero embedding
+        state_dict.setdefault(
+            prefix + "type_emb",
+            torch.zeros(self.type_emb.shape, dtype=self.type_emb.dtype, device="cpu"),
+        )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward_stages_1_to_3(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Latent `(B, C, T, H, W)` to a channels-last feature volume."""

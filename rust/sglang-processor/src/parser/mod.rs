@@ -23,9 +23,11 @@ use serde::de::DeserializeOwned;
 use crate::ProcessorError;
 
 mod aliases;
+mod tools;
 
 use self::aliases::build_reasoning_parser;
 pub use self::aliases::dynamo_tool_parser_name;
+pub use self::tools::chat_tool_definitions;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
