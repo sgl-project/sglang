@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -60,6 +61,15 @@ def _draft_bytes(target, draft) -> int:
     return _pool_bytes(draft) * target.size // draft.size
 
 
+def _bundled_draft_bytes(params: CacheInitParams, target, draft) -> int:
+    """As _add_draft_swa_host_pool sizes it."""
+    page_size = params.page_size
+    window_tokens = -(-params.sliding_window_size // page_size) * page_size
+    mamba_slots = params.req_to_token_pool.mamba_pool.size
+    tokens = min(mamba_slots * window_tokens, target.size)
+    return _pool_bytes(draft) * tokens // draft.size
+
+
 def _estimate_hicache_bytes(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
 ) -> int:
@@ -73,6 +83,9 @@ def _estimate_hicache_bytes(
     total = _pool_bytes(pool)
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
         total += _pool_bytes(params.req_to_token_pool.mamba_pool)
+    allocator = params.token_to_kv_pool_allocator
+    if isinstance(allocator, DraftSWATokenToKVPoolAllocator):
+        total += _bundled_draft_bytes(params, pool, allocator.draft_kv_pool.swa_kv_pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
