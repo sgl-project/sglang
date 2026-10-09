@@ -59,6 +59,46 @@ DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
 MAX_FRAMES = 128
 
 
+def _create_visual_items(
+    *,
+    create_data_items,
+    image_feature: torch.Tensor | list[torch.Tensor] | None,
+    image_offsets: list[tuple[int, int]],
+    num_tokens_per_image: list[int] | None,
+    video_feature: torch.Tensor | None,
+    video_offsets: list[tuple[int, int]],
+    frames_per_video: list[int],
+    input_ids_list: list[int],
+) -> list[MultimodalDataItem]:
+    items = []
+    if num_tokens_per_image is not None:
+        for pv, offset, num_tokens in zip(
+            image_feature, image_offsets, num_tokens_per_image, strict=True
+        ):
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=pv,
+                    offsets=[offset],
+                    model_specific_data={"num_tokens": num_tokens, "is_dynamic": True},
+                )
+            )
+        image_feature = None
+    items.extend(
+        create_data_items(
+            image=image_feature,
+            image_offsets=image_offsets,
+            video=video_feature,
+            video_offsets=video_offsets,
+            input_ids_list=input_ids_list,
+        )
+    )
+    for item in items:
+        if item.is_video():
+            item.set("frames_per_video", frames_per_video)
+    return items
+
+
 class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     models = [
         NemotronH_Nano_VL_V2,
@@ -189,8 +229,8 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 frame_indices[0], timestamp=timestamps[0], num_tokens=num_tokens
             )
         parts = " and ".join(
-            f"frame {fi + 1} sampled at {ts:.2f} seconds"
-            for fi, ts in zip(frame_indices, timestamps)
+            f"{'Frame' if j == 0 else 'frame'} {fi + 1} sampled at {ts:.2f} seconds"
+            for j, (fi, ts) in enumerate(zip(frame_indices, timestamps))
         )
         return f"{parts}: {self.PLACEHOLDER}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
 
@@ -472,36 +512,16 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
         prompt_ids_list = prompt_ids.tolist()
 
-        if image_is_dynamic and image_feature is not None:
-            items = []
-            for i, (pv, offset) in enumerate(zip(image_feature, img_offsets)):
-                items.append(
-                    MultimodalDataItem(
-                        modality=Modality.IMAGE,
-                        feature=pv,
-                        offsets=[offset],
-                        model_specific_data={
-                            "num_tokens": num_tokens_per_image[i],
-                            "is_dynamic": True,
-                        },
-                    )
-                )
-            if video_feature is not None:
-                items.append(
-                    MultimodalDataItem(
-                        modality=Modality.VIDEO,
-                        feature=video_feature,
-                        offsets=video_offsets,
-                    )
-                )
-        else:
-            items = create_data_items(
-                image=image_feature,
-                image_offsets=img_offsets,
-                video=video_feature,
-                video_offsets=video_offsets,
-                input_ids_list=prompt_ids_list,
-            )
+        items = _create_visual_items(
+            create_data_items=create_data_items,
+            image_feature=image_feature,
+            image_offsets=img_offsets,
+            num_tokens_per_image=num_tokens_per_image if image_is_dynamic else None,
+            video_feature=video_feature,
+            video_offsets=video_offsets,
+            frames_per_video=[len(frames) for frames, _ in videos],
+            input_ids_list=prompt_ids_list,
+        )
         items.extend(audio_items)
 
         return MultimodalProcessorOutput(
