@@ -121,6 +121,21 @@ class TestQwen4ExpPDPrefillCP(GSM8KMixin, PDDisaggregationServerBase):
             enable_thinking=False,
         )
 
+    def test_short_prompt(self):
+        # Under 2 * CP_SIZE tokens the zigzag split does not apply, so the
+        # prefill node runs the non-CP path, where the GDN still sums its
+        # TP-partitioned heads.
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+            },
+            timeout=600,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("Paris", response.json()["text"])
+
     def test_long_context_needle(self):
         for depth in NEEDLE_DEPTHS:
             with self.subTest(depth=depth):

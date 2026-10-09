@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
@@ -42,9 +43,11 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        # The MoE runs TP experts on rows gathered over the TP group.
+        # The MoE runs TP experts on rows gathered over the TP group. Waterfill
+        # turns on DeepEP and EP after this hook.
         "ep-size > 1": view.ep_size > 1,
         "moe-a2a-backend": view.moe_a2a_backend != "none",
+        "enable-waterfill": cfg.enable_waterfill,
         "pp-size > 1": cfg.pp_size > 1,
         # Prefill only: a decode node serves plain TP. Only mooncake sends each
         # CP rank's linear-attention state shard to its decode rank.
@@ -57,6 +60,12 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")
+    # Decode sees this prefill as TP cp_size, while its sender stages by
+    # attention TP 1, so the two would pick different staging layouts.
+    if cfg.disaggregation_mode == "prefill" and envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        raise ValueError(
+            "SGLANG_DISAGG_STAGING_BUFFER is not supported with CP-TP group sharing."
+        )
 
     linear_config = mambaish_config(model)
     if getattr(linear_config, "linear_num_key_heads", None) is not None:

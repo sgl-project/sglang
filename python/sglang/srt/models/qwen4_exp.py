@@ -28,7 +28,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_hidden_states,
-    cp_shard_position_ids,
+    cp_split_before_forward,
     is_cp_active,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1938,8 +1938,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         cp_global_positions = None
         if _shards_rows_over_cp(forward_batch):
             cp_global_positions = positions
-            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
-            positions = cp_shard_position_ids(positions, forward_batch)
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
 
         breakable_ple = (
             self.has_ple
