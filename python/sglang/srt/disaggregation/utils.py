@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.constants import FAKE_BOOTSTRAP_HOST
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -46,7 +47,6 @@ if is_npu():
 #########################
 # Constants & Enums
 #########################
-FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
 def poll_and_all_reduce_pp(
