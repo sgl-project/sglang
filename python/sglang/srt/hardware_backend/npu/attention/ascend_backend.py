@@ -39,7 +39,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_current_device_stream_fast,
     next_power_of_2,
 )
 
