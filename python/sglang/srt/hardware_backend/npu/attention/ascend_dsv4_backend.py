@@ -2715,7 +2715,7 @@ class DeepseekV4AscendAttnBackend(
                             _valid = _t[(_t >= 0) & (_t < _pages)]
                             _nblk = int(_valid.numel())
                             _ptab = _hl.md5(
-                                _valid.contiguous().numpy().tobytes()
+                                _valid.contiguous().cpu().numpy().tobytes()
                             ).hexdigest()[:16]
                         print(
                             f"[C128KV] layer={layer.layer_id} lastpos={_lp} "
