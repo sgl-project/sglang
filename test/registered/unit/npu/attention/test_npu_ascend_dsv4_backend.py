@@ -22,6 +22,7 @@ for mod in (
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
+    "sgl_kernel_npu.kvcacheio",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -522,6 +523,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)
         backend.req_to_token_pool = MagicMock()
         backend._dsv4_compress_ratios = ()
+        backend._prefill_graph_max_context_size = MagicMock(return_value=None)
         backend._compute_compress_locs = MagicMock(return_value={})
 
         forward_mode = MagicMock()
