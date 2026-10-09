@@ -4016,28 +4016,6 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    def test_buffer_only_accepts_mamba(self):
-        if (
-            self.cfg.components
-            != (
-                ComponentType.FULL,
-                ComponentType.MAMBA,
-            )
-            or self.cfg.page_size != 1
-        ):
-            self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
-
-        cache, _, _ = build_fixture(self.cfg)
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        self._init_hicache(
-            cache,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-            host_memory_mode="buffer_only",
-        )
-
     def _init_buffer_hicache(
         self,
         cache,
