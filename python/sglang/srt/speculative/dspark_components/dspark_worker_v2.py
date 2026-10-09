@@ -398,6 +398,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            block_verification=get_spec().speculative_use_block_verification,
         )
 
         self._forced_budget_frac: Optional[float] = None

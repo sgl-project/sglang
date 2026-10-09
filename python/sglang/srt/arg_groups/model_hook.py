@@ -838,6 +838,24 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.info(
             "Embedding architecture detected: enabling embedding mode automatically."
         )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_radix_cache
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            disable_radix_cache=True,
+        )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_chunked_prefill
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            chunked_prefill_size=-1,
+        )
 
     is_embedding_gemma = (
         embedding_model_spec is not None
