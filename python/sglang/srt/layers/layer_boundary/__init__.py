@@ -24,7 +24,6 @@ from sglang.srt.layers.layer_boundary.boundary import (
 )
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
-    VariantEdges,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     EdgeContract,
@@ -35,11 +34,10 @@ from sglang.srt.layers.layer_boundary.contracts import (
     OutputContract,
     ProducerReduction,
     ReadoutFusion,
-    StageContract,
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.exit import ExitDecision, FfnExit, MixerExit
+from sglang.srt.layers.layer_boundary.exit import MixerExit
 from sglang.srt.layers.layer_boundary.factories import (
     append_stages,
     declare_attn,
@@ -52,8 +50,6 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     batch_gathers_over_moe_cp,
     is_dense_ffn_fully_dp,
-    moe_gathers_over_moe_cp,
-    token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.ops import (
     move_rows,
@@ -64,11 +60,9 @@ from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
     NORM_QUANT_READOUT,
-    NORM_READOUT,
     PLAIN_ADD,
     PLAIN_RESIDUAL_OPS,
 )
@@ -94,21 +88,16 @@ __all__ = [
     "ExitRows",
     "ProducerReduction",
     "FUSE_ALLREDUCE_MAX_BATCH_SIZE",
-    "ExitDecision",
-    "FfnExit",
     "FfnInputFusion",
     "ReadoutFusion",
     "DeferredFinalize",
     "GatedResidualState",
     "IHCState",
-    "LayerResidualOps",
     "Layout",
     "MHCState",
     "MixerExit",
     "NORM_QUANT_READOUT",
-    "NORM_READOUT",
     "PLAIN_RESIDUAL_OPS",
-    "StageContract",
     "EntryPath",
     "InputContract",
     "StageKind",
@@ -123,8 +112,6 @@ __all__ = [
     "batch_gathers_over_moe_cp",
     "move_rows",
     "complete_owed",
-    "moe_gathers_over_moe_cp",
     "tbo_split_moves",
-    "token_axis_sizes",
     "tp_reduce_scatter",
 ]

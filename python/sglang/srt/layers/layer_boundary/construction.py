@@ -235,9 +235,6 @@ class StagePlan:
             return _bound_for(self._next_input_rows, self.variant_for(forward_batch))
         return self.path_for(forward_batch).entry.input_rows
 
-    def produced(self, forward_batch):
-        return self.path_for(forward_batch).output
-
     @cached_property
     def output(self):
         return ExitPolicy(self)
