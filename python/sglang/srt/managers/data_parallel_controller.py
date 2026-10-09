@@ -23,7 +23,6 @@ from collections.abc import Callable
 from enum import Enum, auto
 from multiprocessing.connection import Connection, wait
 
-import psutil
 import setproctitle
 import zmq
 
@@ -68,6 +67,7 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
+    get_parent_process,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -844,7 +844,7 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
+    parent_process = get_parent_process()
 
     load_plugins()
     # This process reads the config namespaces before spawning schedulers.

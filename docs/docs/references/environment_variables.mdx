@@ -143,6 +143,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_EARLY_FORKSERVER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Start a multiprocessing forkserver at <code>sglang serve</code> entry with the scheduler, DP controller and detokenizer modules preloaded, and fork the worker processes from it instead of re-importing sglang and torch in every spawned worker. Linux and CUDA only. Ignored with <code>--enable-memory-saver</code>, whose hook is <code>LD_PRELOAD</code>ed into a spawned worker. Selects the in-process NUMA binding (<code>SGLANG_NUMA_BIND_V2=false</code>), since a forked worker is not exec'd through <code>numactl</code>. A forked worker's <code>/proc/&lt;pid&gt;/environ</code> shows the environment at CLI entry; <code>getenv</code> sees the launcher's.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_COMPILE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable torch.compile</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

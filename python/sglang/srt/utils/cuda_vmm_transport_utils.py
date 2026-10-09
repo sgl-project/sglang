@@ -24,10 +24,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
-    MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     get_mm_feature_pool_size_per_worker,
+    mm_feature_cache_size,
 )
 from sglang.srt.utils.cuda_vmm_utils import (
     _FD_SEND_TIMEOUT_S,
@@ -1004,7 +1004,7 @@ class CudaVmmFeatureTransport:
             )
 
         per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-            MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num
+            mm_feature_cache_size(), get_serving().tokenizer_worker_num
         )
         self.pool = CudaVmmMemoryPool(
             memory_size=per_worker_pool_size,
