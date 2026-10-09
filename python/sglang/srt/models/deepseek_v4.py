@@ -3968,6 +3968,10 @@ class DeepseekV4Model(nn.Module):
                     buckets=list(range(TAIL_ROW_STEP, tail_rows + 1, TAIL_ROW_STEP)),
                     tail_rows=True,
                 )
+            # Debug bisect aid: the graphs stop before this layer; the rest run eagerly.
+            self.full_graph_end = (
+                envs.SGLANG_DSV4_FULL_LAYER_GRAPH_END.get() or self.late_layer_start
+            )
             if full_tokens > 0:
                 self.full_layer_graphs = EagerReplayGraphs(
                     name="full-layer",
@@ -4049,7 +4053,7 @@ class DeepseekV4Model(nn.Module):
         hash_ids: Optional[torch.Tensor] = None,
     ) -> mhc.HcState:
         """The full-width layers before the tail: the full-layer graphs' body."""
-        for i in range(self.start_layer, self.late_layer_start):
+        for i in range(self.start_layer, self.full_graph_end):
             engram = self.layers[i].engram
             if engram is not None:
                 state = state.with_residual(
@@ -4190,7 +4194,7 @@ class DeepseekV4Model(nn.Module):
                 hash_ids=hash_ids,
             )
             if out is not None:
-                state, first_layer = out, self.late_layer_start
+                state, first_layer = out, self.full_graph_end
         for i in range(first_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
