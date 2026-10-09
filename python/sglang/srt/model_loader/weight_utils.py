@@ -1619,6 +1619,12 @@ def runai_safetensors_weights_iterator(
         )
 
         for name, tensor in tensor_iter:
+            if device == "cpu":
+                # On the CPU path the streamer yields views into its staging
+                # buffers, which it reuses once its memory limit is reached. A
+                # loader that keeps a tensor until its counterpart arrives (MoE
+                # experts, online quantization) would read later tensors' bytes.
+                tensor = tensor.clone()
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
             yield name, tensor
 
