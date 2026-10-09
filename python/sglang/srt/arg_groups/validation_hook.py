@@ -570,6 +570,12 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_prefill_max_requests(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.prefill_max_requests is not None and cfg.prefill_max_requests <= 0:
+        raise ValueError("--prefill-max-requests must be positive when set.")
+
+
 def default_unset_prefill_decode_interval(server_args: Any):
     """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
     from sglang.srt.arg_groups.overrides import declare_resolution
