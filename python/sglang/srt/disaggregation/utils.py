@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -1307,10 +1306,17 @@ def get_kv_transfer_buf_infos(pool):
     return pool.get_contiguous_buf_infos()
 
 
-def merge_npu_hybrid_dsa_tail(target_pool, draft_pool, pp_size):
-    """Register PP1 target+draft rings as one key-half/score-half component."""
-    if pp_size != 1:
-        raise ValueError("Ascend Hybrid DSA target+draft tail transfer requires PP1")
+def merge_npu_hybrid_dsa_tail(target_pool, draft_pool):
+    """Register this rank's target+draft rings as one interleaved component.
+
+    The merge is rank-local: the target half holds only the layers hosted by
+    this PP stage, while the draft half (1 layer) exists only on the last PP
+    stage. Cross-stage window alignment is handled at transfer time by
+    slice_dsa_tail_dst_ptrs_for_pp: decode registers the full model
+    [target keys, draft key, target scores, draft score], and the last stage's
+    merged src list has exactly one more layer than its target-only span, so
+    the slice pulls the trailing draft entry of each half into the window.
+    """
     geometry = None
     infos = []
     for name, pool in (("target", target_pool), ("draft", draft_pool)):
@@ -1536,7 +1542,7 @@ def setup_state_kv_args(
                         kv_args,
                         StateType.DSA_TAIL,
                         *merge_npu_hybrid_dsa_tail(
-                            dsa_pool, draft_token_to_kv_pool, get_parallel().pp_size
+                            dsa_pool, draft_token_to_kv_pool
                         ),
                     )
                 else:
