@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import math
 import time
 import uuid
 from collections import OrderedDict
@@ -46,6 +45,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
+from sglang.srt.entrypoints.openai.inkling_chat_adapter import InklingChatAdapter
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -342,13 +342,19 @@ class OpenAIServingChat(OpenAIServingBase):
             else None
         )
 
-        # Resolve the env-configured Inkling effort default once: the env var is
-        # frozen for the server's lifetime, and a misconfigured value should
-        # fail at boot, not 400 every request.
-        self._inkling_default_reasoning_effort: float | None = (
-            self._get_inkling_default_reasoning_effort()
+        self._inkling = (
+            InklingChatAdapter(
+                reasoning_parser=self.reasoning_parser,
+                tool_call_parser=self.tool_call_parser,
+                tool_call_parsing_active=self._tool_call_parsing_active,
+                history_tool_calls_cnt=self._get_history_tool_calls_cnt,
+                tool_call_id=self._process_tool_call_id,
+            )
             if self.chat_encoding_spec == "inkling"
             else None
+        )
+        self._inkling_token_output = (
+            self._inkling is not None and self._inkling.token_output
         )
         self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
             chat_encoding.default_dsv41_reasoning_effort_from_env(
@@ -586,43 +592,9 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns prompt_ids if handled, None to use default encoding.
         """
         if self.chat_encoding_spec == "inkling":
-            # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
-            # media (encoding/expansion happens later in InklingMultimodalProcessor). The
-            # server's tokenizer is the base tiktoken backend; wrap it so encode_special
-            # supplies the framing-token overlay.
-            from sglang.srt.parser.inkling_renderer import render_inkling_messages
-            from sglang.srt.parser.inkling_tokenizer import (
-                CONTENT_TEXT,
-                MESSAGE_MODEL,
-                InklingTokenizer,
+            return self._inkling.encode_messages(
+                messages=messages, request=request, tools=tools
             )
-
-            inkling_tokenizer = InklingTokenizer(
-                tokenizer=self.tokenizer_manager.tokenizer
-            )
-            reasoning_effort = self._parse_inkling_reasoning_effort(
-                request.reasoning_effort
-            )
-            if reasoning_effort is None:
-                reasoning_effort = self._inkling_default_reasoning_effort
-            assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
-            prompt_ids = render_inkling_messages(
-                messages,
-                inkling_tokenizer,
-                add_generation_prompt=False,
-                tools=tools,
-                reasoning_effort=reasoning_effort,
-            )
-            if assistant_prefix is not None:
-                # Continue the final assistant message inside an OPEN model text
-                # block: header + payload, no <|end_message|> and no
-                # <|content_model_end_sampling|>, so the model resumes the turn.
-                prompt_ids += [
-                    inkling_tokenizer.encode_special(MESSAGE_MODEL),
-                    inkling_tokenizer.encode_special(CONTENT_TEXT),
-                    *inkling_tokenizer.encode_text(assistant_prefix),
-                ]
-            return prompt_ids
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
@@ -690,63 +662,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return prompt_ids
         return None
 
-    @staticmethod
-    def _pop_inkling_assistant_prefix(
-        messages: list[dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> str | None:
-        """Extract the trailing assistant text for ``continue_final_message``.
-
-        Only a plain-string assistant message with no tool calls and no
-        reasoning content can be continued; anything else renders as a closed
-        historical turn. Mutates ``messages`` in place (callers pass a copy).
-        """
-        if not request.continue_final_message or not messages:
-            return None
-        last = messages[-1]
-        if (
-            last.get("role") != "assistant"
-            or not isinstance(last.get("content"), str)
-            or last.get("tool_calls")
-            or last.get("reasoning_content")
-        ):
-            return None
-        messages.pop()
-        return last["content"]
-
-    @staticmethod
-    def _parse_inkling_reasoning_effort(
-        value: str | float | None,
-    ) -> float | None:
-        """Convert an OpenAI-style reasoning_effort to an Inkling float."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError("Inkling reasoning_effort must not be a boolean")
-        if isinstance(value, (int, float)):
-            parsed = float(value)
-            if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-                raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-            return parsed
-        _EFFORT_MAP = {
-            "none": 0.0,
-            "minimal": 0.1,
-            "low": 0.2,
-            "medium": 0.7,
-            "high": 0.9,
-            "xhigh": 0.99,
-            "max": 0.99,
-        }
-        if value in _EFFORT_MAP:
-            return _EFFORT_MAP[value]
-        try:
-            parsed = float(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"invalid Inkling reasoning_effort: {value!r}") from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-        return parsed
-
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
         """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
         effort = chat_encoding.parse_dsv41_reasoning_effort(value)
@@ -761,26 +676,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._dsv41_default_reasoning_effort,
             )
         return self._dsv41_default_reasoning_effort
-
-    @staticmethod
-    def _get_inkling_default_reasoning_effort() -> float:
-        """Read the default Inkling reasoning effort from the environment."""
-        from sglang.srt.environ import envs
-
-        val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()
-        if not val:
-            return 0.9
-        try:
-            parsed = float(val)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be numeric"
-            ) from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be in [0.0, 0.99]"
-            )
-        return parsed
 
     def _decode_response(self, ret_item: dict[str, Any]) -> str | ErrorResponse:
         """Extract text from response."""
@@ -896,6 +791,28 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
+        if self._inkling_token_output:
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=self._reported_prompt_tokens(content["meta_info"]),
+                    reasoning_tokens=content["meta_info"].get("reasoning_tokens", 0),
+                    completion_tokens=content["meta_info"].get("completion_tokens", 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                ).model_dump()
+            for chunk in self._inkling.stream_chunks(
+                content=content,
+                index=index,
+                request=request,
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=choice_logprobs,
+                finish_reason_type=finish_reason_type,
+                usage=usage,
+            ):
+                yield chunk
+            return
+
         offset = stream_offsets.get(index, 0)
         if get_serving().incremental_streaming_output:
             delta = content["text"]
@@ -2393,7 +2310,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            if self.reasoning_parser and request.separate_reasoning:
+            tool_calls = None
+            if self._inkling_token_output:
+                reasoning_text, text, tool_calls, finish_reason = (
+                    self._inkling.parse_response(
+                        request=request,
+                        output_ids=ret_item["output_ids"],
+                        finish_reason=finish_reason,
+                    )
+                )
+            elif self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
                     or self._get_reasoning_from_request(request)
@@ -2417,9 +2343,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
             # Handle tool calls
-            tool_calls = None
             effective_tools = self._effective_tools(request)
-            if self._tool_call_parsing_active(request):
+            if not self._inkling_token_output and self._tool_call_parsing_active(
+                request
+            ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,

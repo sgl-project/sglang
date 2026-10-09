@@ -11,6 +11,7 @@ gsm8k accuracy lives in the 8-GPU nightly).
 """
 
 import base64
+import importlib.util
 import io
 import os
 import unittest
@@ -49,6 +50,14 @@ def _small_image_data_uri():
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
+_needs_tml_renderers = unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+
+
+@_needs_tml_renderers
 class TestInklingServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):

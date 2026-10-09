@@ -1,369 +1,243 @@
+import importlib.util
+import json
+import sys
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
-from sglang.srt.parser.inkling_renderer import render_inkling_messages
+from sglang.srt.parser.inkling_output import InklingOutputParser
+from sglang.srt.parser.inkling_renderer import (
+    TML_RENDERERS_INSTALL_HINT,
+    load_tml_renderers,
+    render_inkling_assistant_prefix,
+    render_inkling_messages,
+)
 from sglang.srt.parser.inkling_tokenizer import (
-    CONTENT_IMAGE,
-    CONTENT_INVOKE_TOOL_JSON,
-    CONTENT_MODEL_END_SAMPLING,
-    CONTENT_TEXT,
-    CONTENT_THINKING,
-    CONTENT_XML,
+    AUDIO_END,
+    AUDIO_TOKEN_ID,
+    CONTENT_AUDIO_INPUT,
     END_MESSAGE,
-    IMAGE_TOKEN_ID,
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
-    MESSAGE_SYSTEM,
-    MESSAGE_TOOL,
     MESSAGE_USER,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
+_needs_tml_renderers = unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+
+_GOLDEN = json.loads(
+    (Path(__file__).with_name("inkling_tmlv0_golden.json")).read_text()
+)
 
 
-def _text(value: str) -> list[int]:
-    return list(value.encode())
+class TestTmlRenderersLoader(unittest.TestCase):
+    def test_missing_tml_renderers_names_the_package(self):
+        load_tml_renderers.cache_clear()
+        self.addCleanup(load_tml_renderers.cache_clear)
+        with mock.patch.dict(sys.modules, {"tml_renderers": None}):
+            with self.assertRaises(ImportError) as ctx:
+                load_tml_renderers()
+        self.assertEqual(str(ctx.exception), TML_RENDERERS_INSTALL_HINT)
 
 
-class _InklingTokenizer:
-    def encode_special(self, token: str) -> int:
-        return INKLING_SPECIAL_TOKEN_IDS[token]
-
-    def encode_text(self, text: str) -> list[int]:
-        return _text(text)
-
-
-class _BaseTokenizer:
-    chat_template = None
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        return _text(text)
-
-
-def _block(role: str, kind: str, payload: str, author: str = "") -> list[int]:
-    return (
-        [INKLING_SPECIAL_TOKEN_IDS[role]]
-        + _text(author)
-        + [
-            INKLING_SPECIAL_TOKEN_IDS[kind],
-            *_text(payload),
-            INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE],
-        ]
-    )
-
-
+@_needs_tml_renderers
 class TestInklingRenderer(unittest.TestCase):
-    def setUp(self):
-        self.tokenizer = _InklingTokenizer()
+    def test_prompts_match_tmlv0_reference(self):
+        """Golden input_ids were produced by tml-renderers itself (see the
+        fixture's ``source``); sglang's message adaptation must not change a
+        single token."""
+        for case in _GOLDEN["prompts"]:
+            with self.subTest(case=case["name"]):
+                actual = render_inkling_messages(
+                    case["messages"],
+                    tools=case["tools"],
+                    reasoning_effort=case["reasoning_effort"],
+                )
+                self.assertEqual(actual, case["input_ids"])
 
-    def test_generation_prompt_is_not_prefilled(self):
-        actual = render_inkling_messages(
-            [{"role": "user", "content": "hello"}], self.tokenizer
-        )
-        self.assertEqual(
-            actual,
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-            + _block(MESSAGE_USER, CONTENT_TEXT, "hello"),
-        )
-        self.assertNotEqual(actual[-1], INKLING_SPECIAL_TOKEN_IDS[MESSAGE_MODEL])
-
-    def test_tool_system_and_effort_have_canonical_prefix_order(self):
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "weather",
-                    "description": "Lookup weather",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ]
-        actual = render_inkling_messages(
-            [
-                {"role": "system", "content": "original"},
-                {"role": "user", "content": "question"},
-            ],
-            self.tokenizer,
-            tools=tools,
-            reasoning_effort=0.8764,
-        )
-        tool_json = (
-            '[{"description":"Lookup weather","name":"weather",'
-            '"parameters":{"type":"object"},"type":"function"}]'
-        )
-        expected = (
-            _block(
-                MESSAGE_SYSTEM,
-                CONTENT_XML,
-                tool_json,
-                author="tool_declare",
-            )
-            + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "original")
-            + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.88")
-            + _block(MESSAGE_USER, CONTENT_TEXT, "question")
-        )
-        self.assertEqual(actual, expected)
-
-    def test_multiturn_conversation_has_one_fixed_effort_directive(self):
-        system = {"role": "system", "content": "system"}
-        user1 = {"role": "user", "content": "user1"}
-        assistant1 = {"role": "assistant", "content": "assistant1"}
-        user2 = {"role": "user", "content": "user2"}
-        prefix = (
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "system")
-            + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.2")
-            + _block(MESSAGE_USER, CONTENT_TEXT, "user1")
-        )
-
-        turn1 = render_inkling_messages(
-            [system, user1], self.tokenizer, reasoning_effort=0.2
-        )
-        turn2 = render_inkling_messages(
-            [system, user1, assistant1, user2],
-            self.tokenizer,
-            reasoning_effort=0.2,
-        )
-
-        self.assertEqual(turn1, prefix)
-        self.assertEqual(
-            turn2,
-            prefix
-            + _block(MESSAGE_MODEL, CONTENT_TEXT, "assistant1")
-            + [INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]]
-            + _block(MESSAGE_USER, CONTENT_TEXT, "user2"),
-        )
-
-    def test_historical_assistant_preserves_parts_and_ends_sampling(self):
+    def test_audio_part_keeps_mm_processor_framing(self):
+        """The MM processor expands one AUDIO_TOKEN_ID inside
+        <|content_audio_input|> ... <|audio_end|>; tml-renderers cannot render
+        audio without DMel-encoding the bytes, so this framing is sglang's."""
         actual = render_inkling_messages(
             [
                 {
-                    "role": "assistant",
+                    "role": "user",
                     "content": [
-                        {"type": "thinking", "thinking": "first"},
-                        {"type": "text", "text": "visible"},
-                        {"type": "reasoning", "text": "second"},
-                    ],
-                    "tool_calls": [
                         {
-                            "id": "call-1",
-                            "function": {
-                                "name": "weather",
-                                "arguments": '{"city":"SF"}',
-                            },
+                            "type": "input_audio",
+                            "input_audio": {"data": "", "format": "wav"},
                         }
                     ],
                 }
-            ],
-            self.tokenizer,
-        )
-        expected = (
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-            + _block(MESSAGE_MODEL, CONTENT_THINKING, "first")
-            + _block(MESSAGE_MODEL, CONTENT_TEXT, "visible")
-            + _block(MESSAGE_MODEL, CONTENT_THINKING, "second")
-            + _block(
-                MESSAGE_MODEL,
-                CONTENT_INVOKE_TOOL_JSON,
-                '{"name":"weather","args":{"city":"SF"}}',
-                author="weather",
-            )
-            + [INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]]
-        )
-        self.assertEqual(actual, expected)
-
-    def test_empty_assistant_message_does_not_emit_bare_terminator(self):
-        """Bug regression: an assistant message that renders zero blocks
-        (content None, no reasoning, no tool calls) appended a bare
-        <|content_model_end_sampling|> with no preceding model block —
-        injecting a malformed turn terminator into the prompt."""
-        actual = render_inkling_messages(
-            [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": None},
-                {"role": "user", "content": "again"},
-            ],
-            self.tokenizer,
-        )
-        self.assertNotIn(INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING], actual)
-
-    def test_tool_result_renders_image_parts_alongside_text(self):
-        """Bug regression: the tool branch coerced content to a string, so a
-        tool_result carrying an image (Claude Code screenshots / Read of a PNG)
-        raised TypeError and 500'd the request. Every part must render, and the
-        image must emit a placeholder for the MM processor to expand."""
-        actual = render_inkling_messages(
-            [
-                {
-                    "role": "tool",
-                    "tool_call_id": "call-1",
-                    "name": "screenshot",
-                    "content": [
-                        {"type": "text", "text": "captured"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": "data:image/png;base64,AAAA"},
-                        },
-                    ],
-                }
-            ],
-            self.tokenizer,
+            ]
         )
         self.assertEqual(
-            actual,
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-            + _block(MESSAGE_TOOL, CONTENT_TEXT, "captured", author="screenshot")
-            + [
-                INKLING_SPECIAL_TOKEN_IDS[MESSAGE_TOOL],
-                *_text("screenshot"),
-                INKLING_SPECIAL_TOKEN_IDS[CONTENT_IMAGE],
-                IMAGE_TOKEN_ID,
+            actual[-5:],
+            [
+                INKLING_SPECIAL_TOKEN_IDS[MESSAGE_USER],
+                INKLING_SPECIAL_TOKEN_IDS[CONTENT_AUDIO_INPUT],
+                AUDIO_TOKEN_ID,
+                INKLING_SPECIAL_TOKEN_IDS[AUDIO_END],
                 INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE],
             ],
         )
 
-    def test_tool_result_placeholder_count_matches_image_parts(self):
-        """The MM processor harvests media from tool messages and expands one
-        placeholder per item, so the counts have to agree or the two passes
-        desync."""
-        image = {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,AAAA"},
-        }
-        actual = render_inkling_messages(
-            [{"role": "tool", "name": "shot", "content": [image, image, image]}],
-            self.tokenizer,
-        )
-        self.assertEqual(actual.count(IMAGE_TOKEN_ID), 3)
-
-    def test_tool_result_with_multiple_text_blocks_renders_each(self):
-        """A tool_result with 2+ text blocks also arrives as a list and used to
-        raise, even with no image involved."""
-        actual = render_inkling_messages(
-            [
-                {
-                    "role": "tool",
-                    "name": "bash",
-                    "content": [
-                        {"type": "text", "text": "stdout"},
-                        {"type": "text", "text": "stderr"},
-                    ],
-                }
-            ],
-            self.tokenizer,
-        )
-        self.assertEqual(
-            actual,
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-            + _block(MESSAGE_TOOL, CONTENT_TEXT, "stdout", author="bash")
-            + _block(MESSAGE_TOOL, CONTENT_TEXT, "stderr", author="bash"),
-        )
-
-    def test_empty_tool_result_still_emits_a_block(self):
-        """An empty tool result must not vanish — the tool_call it answers
-        would be left dangling."""
-        for content in ("", None, []):
-            with self.subTest(content=content):
-                actual = render_inkling_messages(
-                    [{"role": "tool", "name": "noop", "content": content}],
-                    self.tokenizer,
-                )
-                self.assertEqual(
-                    actual,
-                    _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-                    + _block(MESSAGE_TOOL, CONTENT_TEXT, "", author="noop"),
-                )
-
-    def test_tool_result_author_falls_back_to_tool_call_id(self):
-        """String content still resolves the author from a prior tool_call."""
-        actual = render_inkling_messages(
-            [
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call-1",
-                            "function": {"name": "weather", "arguments": "{}"},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
-            ],
-            self.tokenizer,
-        )
-        self.assertEqual(
-            actual[
-                -len(_block(MESSAGE_TOOL, CONTENT_TEXT, "sunny", author="weather")) :
-            ],
-            _block(MESSAGE_TOOL, CONTENT_TEXT, "sunny", author="weather"),
-        )
-
-    def test_tool_result_rejects_thinking_parts(self):
-        with self.assertRaisesRegex(ValueError, "require role='assistant'"):
-            render_inkling_messages(
-                [
-                    {
-                        "role": "tool",
-                        "name": "t",
-                        "content": [{"type": "thinking", "thinking": "nope"}],
-                    }
-                ],
-                self.tokenizer,
-            )
-
-    def test_reasoning_content_cannot_reorder_thinking_parts(self):
-        with self.assertRaisesRegex(ValueError, "cannot mix"):
-            render_inkling_messages(
-                [
-                    {
-                        "role": "assistant",
-                        "reasoning_content": "legacy",
-                        "content": [{"type": "thinking", "thinking": "ordered"}],
-                    }
-                ],
-                self.tokenizer,
-            )
-
-    def test_reasoning_effort_is_two_decimal_quantized_and_validated(self):
-        for value, expected in (
-            (0.8766, "0.88"),
-            (0.0, "0"),
-            (0.99, "0.99"),
-            (0.125, "0.12"),
-            (0.875, "0.88"),
+    def test_audio_outside_user_messages_is_rejected(self):
+        """tml-renderers renders AudioPointer only as user input audio; a tool
+        or assistant audio part must fail instead of rendering a framing the
+        model never saw."""
+        audio = {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}
+        for message in (
+            {"role": "tool", "tool_call_id": "c", "name": "rec", "content": [audio]},
+            {"role": "assistant", "content": [audio]},
         ):
-            with self.subTest(value=value):
-                actual = render_inkling_messages(
-                    [{"role": "user", "content": "q"}],
-                    self.tokenizer,
-                    reasoning_effort=value,
-                )
-                directive = _block(
-                    MESSAGE_SYSTEM,
-                    CONTENT_TEXT,
-                    f"Thinking effort level: {expected}",
-                )
-                self.assertEqual(actual[: len(directive)], directive)
-        for value in (-0.1, 1.0, 1.1, float("nan")):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                render_inkling_messages(
-                    [{"role": "user", "content": "q"}],
-                    self.tokenizer,
-                    reasoning_effort=value,
-                )
+            with self.subTest(role=message["role"]):
+                with self.assertRaises(ValueError):
+                    render_inkling_messages([{"role": "user", "content": "x"}, message])
+
+    def test_assistant_prefix_text_is_ordinary_tokens(self):
+        tokenizer = load_tml_renderers().tokenizer
+        prefix = "The answer <|end_message|>"
+        self.assertEqual(
+            render_inkling_assistant_prefix(prefix),
+            [
+                INKLING_SPECIAL_TOKEN_IDS[MESSAGE_MODEL],
+                INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
+                *tokenizer.encode_ordinary(prefix),
+            ],
+        )
 
     def test_offline_encoder_uses_the_same_inkling_format(self):
-        actual = encode_simple_chat(
-            tokenizer=_BaseTokenizer(),
-            spec="inkling",
-            messages=[{"role": "user", "content": "hello"}],
-        )
+        messages = [{"role": "user", "content": "hi"}]
         self.assertEqual(
-            actual,
-            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
-            + _block(MESSAGE_USER, CONTENT_TEXT, "hello"),
+            encode_simple_chat(tokenizer=None, spec="inkling", messages=messages),
+            render_inkling_messages(messages),
         )
+
+
+def _ids(*parts: str | list[int]) -> list[int]:
+    tokenizer = load_tml_renderers().tokenizer
+    ids: list[int] = []
+    for part in parts:
+        if isinstance(part, list):
+            ids.extend(part)
+        elif part.startswith("<|") and part.endswith("|>"):
+            ids.append(tokenizer.encode_special(part[2:-2]))
+        else:
+            ids.extend(tokenizer.encode_ordinary(part))
+    return ids
+
+
+def _batch(token_ids: list[int], **kwargs):
+    parser = InklingOutputParser(**kwargs)
+    return parser.feed(token_ids).merge(parser.finish())
+
+
+def _stream(token_ids: list[int], **kwargs):
+    parser = InklingOutputParser(**kwargs)
+    deltas = [parser.feed([token_id]) for token_id in token_ids]
+    deltas.append(parser.finish())
+    merged = deltas[0]
+    for delta in deltas[1:]:
+        merged = merged.merge(delta)
+    return merged
+
+
+@_needs_tml_renderers
+class TestInklingOutputParser(unittest.TestCase):
+    def test_outputs_match_tmlv0_reference(self):
+        """Expected reasoning/content/tool_calls come from tml-renderers'
+        own parser; one-shot and per-token parsing must both reproduce them."""
+        for case in _GOLDEN["outputs"]:
+            for mode, parse in (
+                ("batch", _batch),
+                ("stream", _stream),
+            ):
+                with self.subTest(case=case["name"], mode=mode):
+                    parsed = parse(
+                        case["output_ids"],
+                        separate_reasoning=True,
+                        parse_tool_calls=True,
+                    )
+                    self.assertEqual(parsed.reasoning, case["reasoning"])
+                    self.assertEqual(parsed.content, case["content"])
+                    self.assertEqual(
+                        [
+                            {"name": call.name, "arguments": call.arguments}
+                            for call in parsed.tool_calls
+                        ],
+                        case["tool_calls"],
+                    )
+                    self.assertEqual(
+                        [call.index for call in parsed.tool_calls],
+                        list(range(len(case["tool_calls"]))),
+                    )
+
+    def test_unparseable_call_becomes_payload_text(self):
+        """A call payload the reference parser rejects (NaN, missing args) must
+        not surface as a tool call, and the header tool name must not leak
+        into content; parsing resumes at the next message."""
+        for payload in ('{"name":"f","args":{"a":NaN}}', '{"name":"f"}'):
+            output_ids = _ids(
+                "<|message_model|>",
+                "f",
+                "<|content_invoke_tool_json|>",
+                payload,
+                "<|end_message|>",
+                "<|message_model|>",
+                "<|content_text|>",
+                "after",
+                "<|end_message|>",
+                "<|content_model_end_sampling|>",
+            )
+            for mode, parse in (
+                ("batch", _batch),
+                ("stream", _stream),
+            ):
+                with self.subTest(payload=payload, mode=mode):
+                    parsed = parse(
+                        output_ids, separate_reasoning=True, parse_tool_calls=True
+                    )
+                    self.assertEqual(parsed.tool_calls, ())
+                    self.assertEqual(parsed.content, payload + "after")
+
+    def test_buffered_reasoning_survives_truncation(self):
+        """With stream_reasoning=False a thinking block is held until it
+        closes; a max_tokens cut inside it must still flush the held text."""
+        parser = InklingOutputParser(
+            separate_reasoning=True, parse_tool_calls=True, stream_reasoning=False
+        )
+        held = parser.feed(
+            _ids("<|message_model|>", "<|content_thinking|>", "long plan here")
+        )
+        self.assertEqual(held.reasoning, "")
+        self.assertEqual(parser.finish().reasoning, "long plan here")
+
+    def test_disabled_parsers_route_into_content(self):
+        output_ids = _ids(
+            "<|message_model|>",
+            "<|content_thinking|>",
+            "plan",
+            "<|end_message|>",
+            "<|message_model|>",
+            "f",
+            "<|content_invoke_tool_json|>",
+            '{"name":"f","args":{}}',
+            "<|end_message|>",
+            "<|content_model_end_sampling|>",
+        )
+        parsed = _batch(output_ids, separate_reasoning=False, parse_tool_calls=False)
+        self.assertEqual(parsed.reasoning, "")
+        self.assertEqual(parsed.tool_calls, ())
+        self.assertEqual(parsed.content, 'plan{"name":"f","args":{}}')
 
 
 if __name__ == "__main__":

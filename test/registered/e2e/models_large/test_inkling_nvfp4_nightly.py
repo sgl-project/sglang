@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
@@ -37,6 +38,14 @@ NVFP4_ARGS = [
 GSM8K_BASELINE = 0.95
 
 
+# tml-renderers ships cp311-abi3 wheels only; the Python 3.10 lanes lack it.
+_needs_tml_renderers = unittest.skipUnless(
+    importlib.util.find_spec("tml_renderers") is not None,
+    "tml-renderers is not installed (it requires Python >= 3.11)",
+)
+
+
+@_needs_tml_renderers
 class TestInklingNVFP4Nightly(unittest.TestCase):
     """Nightly test for Inkling-NVFP4 (975B MoE), TP=8, Blackwell only.
 
