@@ -77,6 +77,16 @@ def _row_layouts(variant):
     return axes, attention, local, Layout.sharded_over(axis_sizes=axes)
 
 
+def _ffn_on_rank_rows(sparse, dense_tp_size) -> bool:
+    """Whether an FFN computes on this rank's own rows (its attention-TP slice
+    of them, or an unpadded batch's rows) rather than on the attention's."""
+    if sparse:
+        return is_moe_input_scattered_across_dp_ranks()
+    if dense_tp_size is None:
+        return is_dense_ffn_fully_dp()
+    return dense_tp_size == 1
+
+
 def _resolve_ffn(
     variant,
     *,
@@ -100,11 +110,7 @@ def _resolve_ffn(
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
-    on_rank_rows = (
-        is_moe_input_scattered_across_dp_ranks()
-        if sparse
-        else (is_dense_ffn_fully_dp() if dense_tp_size is None else dense_tp_size == 1)
-    )
+    on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
     if parallel.attn_cp_size > 1 and sparse:
         _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
     on_cp_shards = (
@@ -214,6 +220,8 @@ class StageDeclaration:
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, and the full TP size means TP compute.
         exit_rows: Required FFN output rows at the layer or branch exit.
+        writes_at_handoff: Whether this FFN writes its output into the residual
+            at its exit because the next stage is on another pipeline rank.
         previous: Declaration whose output this stage consumes, as the stack
             records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
@@ -233,6 +241,7 @@ class StageDeclaration:
     tp_group: SumGroup = SumGroup.ATTN_TP
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
+    writes_at_handoff: bool = False
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -722,8 +731,26 @@ class _Chain:
     __slots__ = ("previous", "pending")
 
     def __init__(self, previous):
-        self.previous = _detached(previous)
+        self.previous = _detached(_handed_off(previous))
         self.pending = None
+
+
+def _handed_off(declaration):
+    """A stage whose output crosses to another pipeline rank: an FFN leaves it
+    on the attention's rows, which is what the handoff carries and the next
+    rank's first stage reads, even where it would otherwise stay on this
+    rank's attention-TP slice of them. An FFN on its own rows also writes its
+    output into the residual there, on every batch, so the handoff carries the
+    written stream and the receiver knows it from this declaration."""
+    if declaration is None or declaration.kind is not StageKind.FFN:
+        return declaration
+    return replace(
+        declaration,
+        exit_rows=ExitRows.ATTENTION,
+        writes_at_handoff=_ffn_on_rank_rows(
+            declaration.sparse, declaration.dense_tp_size
+        ),
+    )
 
 
 def _detached(declaration):
@@ -741,6 +768,10 @@ def _detached(declaration):
 def _bind_stack(appends, *, previous, following):
     """Bind every appended stage, in order, and fill in the boundaries each
     append returned."""
+    if following is not None:
+        # The last stage hands off to the next rank.
+        last = next(a for a in reversed(appends) if a.prepared_from is None)
+        last.declarations[-1] = _handed_off(last.declarations[-1])
     chain = _Chain(previous)
     # A returned declaration's boundary as bound, for the branches that read it.
     sources = {}
