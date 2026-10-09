@@ -722,13 +722,6 @@ mod tests {
                 dp_rank: Some(1),
             })
         );
-        // Cache maps use the API schema's defaults for omitted scalar fields.
-        let mut defaults = header.clone();
-        defaults[16][1][1] = serde_json::json!({});
-        let (decoded, events) = decode(&defaults);
-        assert!(decoded.ok);
-        let details = &events[1].metadata.as_ref().unwrap().cached_tokens_details;
-        assert_eq!(details.as_deref(), Some(&CachedTokensDetails::default()));
         for index in 0..5 {
             let mut bad = header.clone();
             bad[16][index].as_array_mut().unwrap().pop();

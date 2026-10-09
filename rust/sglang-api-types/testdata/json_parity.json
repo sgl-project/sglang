@@ -239,7 +239,7 @@
     },
     {
       "type": "GenerateResponse",
-      "name": "finish length",
+      "name": "finish length with default cache details",
       "input": {
         "text": "",
         "meta_info": {
@@ -249,10 +249,11 @@
           "finish_reason": {
             "type": "length",
             "length": 9
-          }
+          },
+          "cached_tokens_details": {}
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens_details\":null,\"dp_rank\":null}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens_details\":{\"device\":0,\"host\":0},\"dp_rank\":null}}"
     },
     {
       "type": "GenerateResponse",
