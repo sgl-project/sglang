@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import threading
 import time
@@ -142,6 +143,18 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+_HICACHE_PP_EXTRA_POOLS = tuple(pool for pool in PoolName if pool != PoolName.KV)
+_HICACHE_PP_PREFETCH_SLOTS = 32
+_HICACHE_PP_IDENTITY = torch.iinfo(torch.int64).max
+_HICACHE_PP_STORAGE_START = 4
+_HICACHE_PP_STORAGE_SLOTS = 4 + len(_HICACHE_PP_EXTRA_POOLS)
+_HICACHE_PP_QUEUE_SLOTS = 2 + _HICACHE_PP_STORAGE_SLOTS
+_HICACHE_PP_TERMINATE = _HICACHE_PP_STORAGE_START + _HICACHE_PP_STORAGE_SLOTS
+_HICACHE_PP_WRITE_READY = _HICACHE_PP_TERMINATE + 1
+_HICACHE_PP_LOAD_READY = _HICACHE_PP_TERMINATE + 2
+_HICACHE_PP_PREFETCH_START = _HICACHE_PP_TERMINATE + 3
+_HICACHE_PP_ENVELOPE_SIZE = _HICACHE_PP_PREFETCH_START + 2 * _HICACHE_PP_PREFETCH_SLOTS
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -168,6 +181,11 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+class _HiCachePPRingPayload(NamedTuple):
+    round_id: int
+    envelope: torch.Tensor
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -277,6 +295,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._hicache_storage_configured = False
+        self._hicache_pp_sync_round = 0
+        self._hicache_pp_prefetch_pending: dict[int, bool] = {}
+        self._hicache_pp_prefetch_results: dict[int, bool] = {}
+        self._hicache_pp_prefetch_keys: dict[int, tuple[str, str]] = {}
+        self._hicache_pp_prefetch_inflight: set[int] = set()
+        self._hicache_pp_write_acks_consumed = 0
+        self._hicache_pp_write_ack_snapshots: dict[int, int] = {}
+        self._hicache_pp_round_reservations: dict[int, tuple[int, ...]] = {}
+        self._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
+        self._hicache_pp_sync_state_logged = False
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -342,23 +371,47 @@ class UnifiedRadixCache(BasePrefixCache):
             work.wait()
         self.work_list.clear()
 
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
-        """
-        Synchronize data across all TP and PP ranks.
+    def _all_reduce(
+        self,
+        data: torch.Tensor,
+        tp_reduce_op: torch.distributed.ReduceOp,
+        *,
+        sync_key: str,
+    ) -> torch.Tensor | None:
+        """Broadcast PP0's value in buffer-only mode."""
+        if self.host_memory_mode == "buffer_only":
+            if self.pp_rank == 0:
+                self._all_reduce_attn_groups(data, tp_reduce_op)
+            self._pp_sync(data)
+            return data
+        raise RuntimeError(
+            f"cache-mode HiCache PP sync must use the fixed envelope: {sync_key}"
+        )
 
-        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
-        and then the result is propagated to all following PP ranks.
-
-        Must be called in the scheduler thread.
-        """
-        if self.pp_rank == 0:
-            self._all_reduce_attn_groups(data, tp_reduce_op)
-        self._pp_sync(data)
+    def _all_reduce_hicache_ready_counts(
+        self,
+        data: torch.Tensor,
+        pp0_only_count: int = 0,
+        *,
+        sync_key: str,
+        context: object = None,
+        record_timing: bool = False,
+    ) -> tuple[torch.Tensor, object] | None:
+        """MIN-reduce stage-local queue counts in buffer-only mode."""
+        if self.host_memory_mode == "buffer_only":
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+            return data, context
+        raise RuntimeError(
+            f"cache-mode HiCache PP sync must use the fixed envelope: {sync_key}"
+        )
 
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
         """
+        assert self.host_memory_mode == "buffer_only", (
+            "cache-mode HiCache PP synchronization must use the async sequencer"
+        )
         if self.pp_size <= 1 or self.pp_group is None:
             return
         if self.pp_rank > 0:
@@ -408,6 +461,14 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self._hicache_pp_prefetch_pending.clear()
+        self._hicache_pp_prefetch_results.clear()
+        self._hicache_pp_prefetch_keys.clear()
+        self._hicache_pp_prefetch_inflight.clear()
+        self._hicache_pp_write_acks_consumed = 0
+        self._hicache_pp_write_ack_snapshots.clear()
+        self._hicache_pp_round_reservations.clear()
+        self._hicache_pp_reserved_counts = [0] * _HICACHE_PP_QUEUE_SLOTS
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -449,6 +510,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        self._hicache_storage_configured = storage_backend is not None
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -2177,6 +2239,31 @@ class UnifiedRadixCache(BasePrefixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
+    @staticmethod
+    def _hicache_pp_prefetch_tag(kind: str, req_id: str) -> int:
+        digest = hashlib.blake2b(f"{kind}\0{req_id}".encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big") % (_HICACHE_PP_IDENTITY - 1) + 1
+
+    def _register_hicache_pp_prefetch_verdict(
+        self, kind: str, req_id: str, verdict: bool
+    ) -> bool | None:
+        tag = self._hicache_pp_prefetch_tag(kind, req_id)
+        key = (kind, req_id)
+        previous_key = self._hicache_pp_prefetch_keys.setdefault(tag, key)
+        if previous_key != key:
+            raise RuntimeError(
+                f"HiCache PP prefetch tag collision: {previous_key} vs {key}"
+            )
+        result = self._hicache_pp_prefetch_results.pop(tag, None)
+        if result is not None:
+            if result:
+                self._hicache_pp_prefetch_keys.pop(tag, None)
+                self._hicache_pp_prefetch_pending.pop(tag, None)
+            return result
+        if self.pp_rank == 0:
+            self._hicache_pp_prefetch_pending[tag] = verdict
+        return None
+
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
@@ -2186,15 +2273,23 @@ class UnifiedRadixCache(BasePrefixCache):
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
         if self.prefetch_stop_policy == "timeout":
-            # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
+            # Wall clocks differ across ranks, so PP0 owns the timeout verdict.
             should_terminate = False
             if self.pp_rank == 0:
                 should_terminate = self._prefetch_timeout_check_linear_func(operation)
+            if self.host_memory_mode != "buffer_only":
+                result = self._register_hicache_pp_prefetch_verdict(
+                    "terminate", operation.handle.rid, should_terminate
+                )
+                return bool(result)
             should_terminate_tensor = torch.tensor(
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            should_terminate_tensor = self._all_reduce(
+                should_terminate_tensor,
+                torch.distributed.ReduceOp.MAX,
+                sync_key=f"prefetch_terminate:{operation.handle.rid}",
+            )
             return should_terminate_tensor.item() == 1
         return True
 
@@ -2211,10 +2306,19 @@ class UnifiedRadixCache(BasePrefixCache):
     def _check_pp_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         req_id = request.rid
         ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
-        ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
-        self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
-        if ready_tensor.item() == 0:
-            return False
+        if self.host_memory_mode != "buffer_only":
+            result = self._register_hicache_pp_prefetch_verdict("ready", req_id, ready)
+            if not result:
+                return False
+        else:
+            ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
+            ready_tensor = self._all_reduce(
+                ready_tensor,
+                torch.distributed.ReduceOp.MAX,
+                sync_key=f"prefetch_ready:{req_id}",
+            )
+            if ready_tensor.item() == 0:
+                return False
 
         state = self.cache_controller.take_ready_pp_prefetch(req_id)
         if state is None:
@@ -3172,7 +3276,22 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_release()
         _drain_extra_release()
 
-    def drain_storage_control_queues(self) -> None:
+    def drain_storage_control_queues(self) -> bool:
+        if self.host_memory_mode != "buffer_only":
+            if self.pp_size <= 1:
+                return self._process_hicache_ready_counts()
+            cc = self.cache_controller
+            if cc is None:
+                return True
+            queues = (
+                getattr(cc, "prefetch_hit_queue", None),
+                getattr(cc, "ack_prefetch_queue", None),
+                getattr(cc, "ack_backup_queue", None),
+                getattr(cc, "host_mem_release_queue", None),
+                *getattr(cc, "extra_host_mem_release_queues", {}).values(),
+            )
+            return all(queue is None or queue.qsize() == 0 for queue in queues)
+
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
@@ -3190,7 +3309,13 @@ class UnifiedRadixCache(BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
+        reduced = self._all_reduce_hicache_ready_counts(
+            qsizes,
+            sync_key="storage_drain",
+        )
+        if reduced is None:
+            return False
+        qsizes, _ = reduced
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
@@ -3205,6 +3330,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_release_counts=extra_release_counts,
             log_metrics=True,
         )
+        return True
 
     def drain_storage_control_queues_local(self) -> None:
         """Drain the storage control queues without cross-rank synchronization.
@@ -3263,8 +3389,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
-        if self._storage_attachment is not None:
-            self._storage_attachment.shutdown()
+        try:
+            if self._storage_attachment is not None:
+                self._storage_attachment.shutdown()
+        except Exception:
+            logger.exception("Failed to shut down HiCache storage cleanly.")
 
     def clear_storage_backend(self) -> bool:
         if self._storage_attachment is None:
@@ -3288,76 +3417,240 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _sync_hicache_ready_counts(
         self,
-    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]] | None:
+        if self.host_memory_mode == "buffer_only":
+            return self._sync_buffer_only_hicache_ready_counts()
+
+        if self.pp_size > 1:
+            return None
+        payload = self._build_hicache_pp_ring_payload()
+        return self._finish_hicache_ready_count_reduction(payload)
+
+    def _build_hicache_pp_ring_payload(
+        self, upstream: _HiCachePPRingPayload | None = None
+    ) -> _HiCachePPRingPayload:
+        """Merge one fixed envelope into the scheduler's PP consensus ring."""
+        if upstream is None:
+            self._hicache_pp_sync_round += 1
+            round_id = self._hicache_pp_sync_round
+        else:
+            round_id = upstream.round_id
+
+        local_envelope = self._build_hicache_pp_envelope(round_id)
+        envelope = (
+            local_envelope
+            if upstream is None
+            else torch.minimum(upstream.envelope, local_envelope)
+        )
+        return _HiCachePPRingPayload(round_id=round_id, envelope=envelope)
+
+    def _apply_hicache_pp_ring_payload(
+        self, payload: _HiCachePPRingPayload | None
+    ) -> bool:
+        """Apply a finalized ring envelope once at the consensus consume point."""
+        if (
+            payload is None
+            or payload.round_id not in self._hicache_pp_round_reservations
+        ):
+            return False
+        ready_counts = self._finish_hicache_ready_count_reduction(payload)
+        self._apply_hicache_ready_counts(ready_counts)
+        return True
+
+    def _build_hicache_pp_envelope(self, round_id: int) -> torch.Tensor:
         cc = self.cache_controller
+        storage_configured = getattr(self, "_hicache_storage_configured", False)
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
-        extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
-        if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
+        extra_pool_names = _HICACHE_PP_EXTRA_POOLS
+        if storage_configured and not getattr(
+            self, "_hicache_pp_sync_state_logged", False
+        ):
+            logger.info(
+                "HiCache PP ready-count state: pp_rank=%d storage_configured=%s "
+                "enable_storage=%s host_memory_mode=%s cache_controller_none=%s "
+                "pp_group_none=%s",
+                self.pp_rank,
+                storage_configured,
+                self.enable_storage,
+                self.host_memory_mode,
+                cc is None,
+                self.pp_group is None,
+            )
+            self._hicache_pp_sync_state_logged = True
+
+        unavailable = _HICACHE_PP_IDENTITY
+        if cc is None:
             write_acks = 0
             load_acks = 0
-            # Zero placeholders shaped like PP0's slots: _pp_sync hands the
-            # received tensor back in place, so all ranks must build the same
-            # length or PP1+ would recv into a mismatched buffer.
-            storage_queue_sizes = (
-                (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
-            )
+            storage_queue_sizes = (unavailable,) * _HICACHE_PP_STORAGE_SLOTS
         else:
+            # Async completion can enqueue the same ACK at different times on each
+            # stage, so only the PP-wide ready prefix is safe to consume.
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
-            storage_queue_sizes = (
-                (
-                    cc.prefetch_hit_queue.qsize(),
-                    cc.ack_prefetch_queue.qsize(),
-                    cc.ack_backup_queue.qsize(),
-                    cc.host_mem_release_queue.qsize(),
-                    *(extra_release_queues[name].qsize() for name in extra_pool_names),
+            if storage_configured:
+                storage_queues = (
+                    getattr(cc, "prefetch_hit_queue", None),
+                    getattr(cc, "ack_prefetch_queue", None),
+                    getattr(cc, "ack_backup_queue", None),
+                    getattr(cc, "host_mem_release_queue", None),
+                    *(extra_release_queues.get(name) for name in extra_pool_names),
                 )
-                if self.enable_storage
-                else ()
-            )
+                storage_queue_sizes = tuple(
+                    queue.qsize()
+                    if getattr(self, "enable_storage", False) and queue is not None
+                    else unavailable
+                    for queue in storage_queues
+                )
+            else:
+                storage_queue_sizes = (0,) * _HICACHE_PP_STORAGE_SLOTS
+
+        # Scheduler rounds can overlap, so reserve each offered prefix until its
+        # result returns; otherwise a later round can claim the same queue items.
+        local_counts = (write_acks, load_acks, *storage_queue_sizes)
+        claims = tuple(
+            0
+            if count == unavailable
+            else max(0, count - self._hicache_pp_reserved_counts[index])
+            for index, count in enumerate(local_counts)
+        )
+        offered_counts = tuple(
+            unavailable if count == unavailable else claims[index]
+            for index, count in enumerate(local_counts)
+        )
+        assert round_id not in self._hicache_pp_round_reservations
+        self._hicache_pp_round_reservations[round_id] = claims
+        for index, count in enumerate(claims):
+            self._hicache_pp_reserved_counts[index] += count
+        write_acks, load_acks = offered_counts[:2]
+        storage_queue_sizes = offered_counts[2:]
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
-        ready_counts = torch.tensor(
-            [
-                write_acks,
-                load_acks,
-                *storage_queue_sizes,
-                digest,
-                -digest,
-            ],
+        envelope = torch.full(
+            (_HICACHE_PP_ENVELOPE_SIZE,),
+            _HICACHE_PP_IDENTITY,
             dtype=torch.int64,
             device="cpu",
         )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
-        else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        envelope[0] = write_acks
+        envelope[1] = load_acks
+        envelope[2] = digest
+        envelope[3] = -digest
+        envelope[_HICACHE_PP_STORAGE_START:_HICACHE_PP_TERMINATE] = torch.tensor(
+            storage_queue_sizes, dtype=torch.int64
+        )
+        terminate_pending = any(
+            verdict
+            for tag, verdict in self._hicache_pp_prefetch_pending.items()
+            if self._hicache_pp_prefetch_keys[tag][0] == "terminate"
+        )
+        if self.pp_rank == 0:
+            envelope[_HICACHE_PP_TERMINATE] = -int(terminate_pending)
+        envelope[_HICACHE_PP_WRITE_READY] = write_acks
+        envelope[_HICACHE_PP_LOAD_READY] = load_acks
+        self._hicache_pp_write_ack_snapshots[round_id] = (
+            self._hicache_pp_write_acks_consumed
+        )
 
-        count_values = list(map(int, ready_counts.tolist()))
-        assert digest == count_values[-2] and digest == -count_values[-1], (
+        if self.pp_rank == 0:
+            selected = [
+                item
+                for item in self._hicache_pp_prefetch_pending.items()
+                if item[0] not in self._hicache_pp_prefetch_inflight
+            ][:_HICACHE_PP_PREFETCH_SLOTS]
+            for slot, (tag, verdict) in enumerate(selected):
+                offset = _HICACHE_PP_PREFETCH_START + 2 * slot
+                envelope[offset] = tag
+                envelope[offset + 1] = int(verdict)
+                del self._hicache_pp_prefetch_pending[tag]
+                self._hicache_pp_prefetch_inflight.add(tag)
+
+        self._all_reduce_attn_groups(envelope, torch.distributed.ReduceOp.MIN)
+        return envelope
+
+    def _sync_buffer_only_hicache_ready_counts(
+        self,
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+        cc = self.cache_controller
+        extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
+        extra_pool_names = tuple(extra_release_queues)
+        write_acks = self._count_ready_acks(cc.ack_write_queue) if cc else 0
+        load_acks = self._count_ready_acks(cc.ack_load_queue) if cc else 0
+        storage_queue_sizes = (
+            tuple(
+                queue.qsize()
+                for queue in (
+                    cc.prefetch_hit_queue,
+                    cc.ack_prefetch_queue,
+                    cc.ack_backup_queue,
+                    cc.host_mem_release_queue,
+                    *(extra_release_queues[name] for name in extra_pool_names),
+                )
+            )
+            if cc is not None and getattr(self, "enable_storage", False)
+            else ()
+        )
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        counts = torch.tensor(
+            [write_acks, load_acks, digest, -digest, *storage_queue_sizes],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.MIN)
+        values = list(map(int, counts.tolist()))
+        assert digest == values[2] and digest == -values[3], (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
+        return values[0], values[1], tuple(values[4:]), extra_pool_names
+
+    def _finish_hicache_ready_count_reduction(
+        self,
+        payload: _HiCachePPRingPayload,
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+        values = list(map(int, payload.envelope.tolist()))
+        assert values[2] == -values[3], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        reservation = self._hicache_pp_round_reservations.pop(payload.round_id)
+        for index, count in enumerate(reservation):
+            self._hicache_pp_reserved_counts[index] -= count
+            assert self._hicache_pp_reserved_counts[index] >= 0
+        for slot in range(_HICACHE_PP_PREFETCH_SLOTS):
+            offset = _HICACHE_PP_PREFETCH_START + 2 * slot
+            tag = values[offset]
+            if tag == _HICACHE_PP_IDENTITY:
+                continue
+            self._hicache_pp_prefetch_results[tag] = bool(values[offset + 1])
+            self._hicache_pp_prefetch_inflight.discard(tag)
+        storage_counts = tuple(
+            0 if count == _HICACHE_PP_IDENTITY else count
+            for count in values[_HICACHE_PP_STORAGE_START:_HICACHE_PP_TERMINATE]
+        )
+        snapshot = self._hicache_pp_write_ack_snapshots.pop(payload.round_id)
+        consumed_since_snapshot = self._hicache_pp_write_acks_consumed - snapshot
+        write_acks = max(0, values[0] - consumed_since_snapshot)
         return (
-            count_values[0],
-            count_values[1],
-            tuple(count_values[2:-2]),
-            extra_pool_names,
+            write_acks,
+            values[1],
+            storage_counts,
+            _HICACHE_PP_EXTRA_POOLS,
         )
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
-    ) -> None:
+    ) -> bool:
         """Poll write-through completions."""
         cc = self.cache_controller
         if cc is None:
-            return
+            return True
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
             cc.start_writing()
             while self.ongoing_write_through:
+                consumed = len(cc.ack_write_queue)
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
@@ -3365,10 +3658,15 @@ class UnifiedRadixCache(BasePrefixCache):
                             self._finish_write_through_ack(ack_id)
                     self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
+                if self.host_memory_mode != "buffer_only":
+                    self._hicache_pp_write_acks_consumed += consumed
                 assert len(self.ongoing_write_through) == 0
-            return
+            return True
 
         if finish_count is None:
+            if self.host_memory_mode != "buffer_only":
+                return not self.ongoing_write_through
+
             # Every rank must enter the all_reduce below; ongoing_write_through can
             # diverge across ranks (e.g. write_backup returning 0 on a subset).
             finish_count = 0
@@ -3377,7 +3675,13 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count_tensor = self._all_reduce(
+                finish_count_tensor,
+                torch.distributed.ReduceOp.MIN,
+                sync_key="write_ready",
+            )
+            if finish_count_tensor is None:
+                return False
             finish_count = finish_count_tensor.item()
 
         # Process completed acks
@@ -3388,6 +3692,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
             finish_count -= 1
+        return True
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
@@ -3404,12 +3709,15 @@ class UnifiedRadixCache(BasePrefixCache):
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
-    def loading_check(self, finish_count: Optional[int] = None) -> None:
+    def loading_check(self, finish_count: Optional[int] = None) -> bool:
         """Poll load-back completions."""
         cc = self.cache_controller
         if cc is None:
-            return
+            return True
         if finish_count is None:
+            if self.host_memory_mode != "buffer_only":
+                return not self.ongoing_load_back
+
             # Every rank must enter the all_reduce below; ongoing_load_back can
             # diverge across ranks.
             finish_count = 0
@@ -3421,7 +3729,13 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            sync_tensor = self._all_reduce(
+                sync_tensor,
+                torch.distributed.ReduceOp.MIN,
+                sync_key="load_ready",
+            )
+            if sync_tensor is None:
+                return False
             finish_count = int(sync_tensor[0].item())
             assert sync_tensor[1].item() == -sync_tensor[2].item(), (
                 "write_back duplicate-reclaim victims diverged across TP ranks"
@@ -3456,6 +3770,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         duration_ms / 1000.0
                     )
             finish_count -= 1
+        return True
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -3523,18 +3838,35 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        if self.host_memory_mode == "buffer_only":
+            self._drain_async_work()
+        else:
+            assert not self.work_list, "cache mode must not issue HiCache PP sends"
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
 
+        self._process_hicache_ready_counts()
+
+    def _process_hicache_ready_counts(self) -> bool:
+        """Advance the sole cache-mode consumer of HiCache completion queues."""
+
+        ready_counts = self._sync_hicache_ready_counts()
+        if ready_counts is None:
+            return False
+        self._apply_hicache_ready_counts(ready_counts)
+        return True
+
+    def _apply_hicache_ready_counts(
+        self,
+        ready_counts: tuple[int, int, tuple[int, ...], tuple[PoolName, ...]],
+    ) -> None:
         (
             write_finish_count,
             load_finish_count,
             storage_queue_sizes,
             extra_pool_names,
-        ) = self._sync_hicache_ready_counts()
+        ) = ready_counts
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 

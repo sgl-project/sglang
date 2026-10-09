@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -89,6 +89,11 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+
+
+class _PPBootstrapPayload(NamedTuple):
+    rids: object
+    hicache: object
 
 
 class SchedulerPPMixin:
@@ -636,9 +641,13 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
 
-    def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[List[str]]
-    ):
+    def process_bootstrapped_queue(self: Scheduler, bootstrapped_rids: object):
+        hicache_payload = None
+        if isinstance(bootstrapped_rids, _PPBootstrapPayload):
+            hicache_payload = bootstrapped_rids.hicache
+            bootstrapped_rids = bootstrapped_rids.rids
+            self._pp_apply_hicache_ring_payload(hicache_payload)
+
         # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
             (
@@ -653,11 +662,31 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
-        return None
+            bootstrapped_rids = [
+                [req.rid for req in good_reqs],
+                [req.rid for req in failed_reqs],
+            ]
+        if hicache_payload is not None:
+            return _PPBootstrapPayload(bootstrapped_rids, hicache_payload)
+        return bootstrapped_rids
+
+    def _pp_merge_hicache_ring_payload(self: Scheduler, upstream=None):
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return None
+        tree_cache = self.tree_cache
+        merge = getattr(tree_cache, "_build_hicache_pp_ring_payload", None)
+        if not callable(merge) or tree_cache.host_memory_mode == "buffer_only":
+            return None
+        return merge(upstream)
+
+    def _pp_apply_hicache_ring_payload(self: Scheduler, payload) -> None:
+        apply = getattr(self.tree_cache, "_apply_hicache_pp_ring_payload", None)
+        if callable(apply):
+            apply(payload)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
+        upstream_hicache = None
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
@@ -669,6 +698,9 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            if isinstance(prev_bootstrapped_rids, _PPBootstrapPayload):
+                upstream_hicache = prev_bootstrapped_rids.hicache
+                prev_bootstrapped_rids = prev_bootstrapped_rids.rids
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -696,7 +728,11 @@ class SchedulerPPMixin:
         good_bootstrapped_rids, bad_bootstrapped_rids = self._route_aborts_to_bad(
             good_bootstrapped_rids, bad_bootstrapped_rids, aborted_rids
         )
-        return [good_bootstrapped_rids, bad_bootstrapped_rids]
+        bootstrapped_rids = [good_bootstrapped_rids, bad_bootstrapped_rids]
+        hicache_payload = self._pp_merge_hicache_ring_payload(upstream_hicache)
+        if hicache_payload is not None:
+            return _PPBootstrapPayload(bootstrapped_rids, hicache_payload)
+        return bootstrapped_rids
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
