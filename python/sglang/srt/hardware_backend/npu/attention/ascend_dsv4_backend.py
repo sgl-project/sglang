@@ -90,19 +90,28 @@ _walsh_hadamard_matrix._cache = {}
 
 
 def _read_page_table_md5(buf, tbl, pages, max_pages: int = 256):
-    """md5 of the LOGICAL content the request actually reads: gather the pages
-    its page table points at, so identical prompts hash equal regardless of
-    physical page reuse. CPU gather (A5 fp8 has no index_select)."""
+    """md5 of the LOGICAL content the request reads, in LOGICAL (page-table
+    column / first-occurrence) order -- NOT sorted by physical page id, so the
+    same logical content hashes equal hit vs miss regardless of physical
+    page-id allocation. CPU gather (A5 fp8 has no index_select)."""
     import hashlib
 
     if tbl is None or not torch.is_tensor(tbl) or not tbl.numel():
         return "none"
-    ids = torch.unique(tbl.reshape(-1).to(torch.int64))
-    ids = ids[(ids >= 0) & (ids < pages)]
-    if ids.numel() == 0:
+    t = tbl.reshape(1, -1) if tbl.dim() == 1 else tbl
+    ids_list = []
+    seen = set()
+    for row in t.to(torch.int64).tolist():
+        for v in row:
+            if v < 0 or v >= pages or v in seen:
+                continue
+            seen.add(v)
+            ids_list.append(v)
+    if not ids_list:
         return "empty"
-    if ids.numel() > max_pages:
-        ids = ids[-max_pages:]
+    if len(ids_list) > max_pages:
+        ids_list = ids_list[-max_pages:]
+    ids = torch.tensor(ids_list, dtype=torch.int64)
     slab = buf.detach().to("cpu")[ids.cpu()]
     try:
         raw = slab.contiguous().view(torch.uint8).numpy().tobytes()
