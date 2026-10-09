@@ -613,6 +613,7 @@ class ServingChatTestCase(CustomTestCase):
             self.basic_req.return_sampling_mask = True
             self.basic_req.sampling_logprobs_mode = "support"
             self.basic_req.return_indexer_topk = True
+            self.basic_req.return_outputs_via_store = True
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
@@ -620,6 +621,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertTrue(adapted.return_indexer_topk)
+            self.assertTrue(adapted.return_outputs_via_store)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -773,6 +775,20 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(
             self.chat._validate_request(req),
             "return_indexer_topk requires return_meta_info=true.",
+        )
+
+    def test_validate_request_rejects_output_store_without_meta_info(self):
+        """meta_info is the only place a chat response can carry the ref; without it
+        the stored object would leak."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_outputs_via_store=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_outputs_via_store requires return_meta_info=true.",
         )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):

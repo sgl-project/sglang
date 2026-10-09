@@ -264,6 +264,9 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
+    # Return routed experts, indexer top-k, and sampling mask through the server's
+    # --output-store-backend as meta_info.output_store_ref; non-streaming only.
+    return_outputs_via_store: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -978,6 +981,7 @@ class GenerateReqInput:
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
+            return_outputs_via_store=self.return_outputs_via_store,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -1762,6 +1766,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Unencoded routed_experts / indexer_topk, sent instead of the base64 fields when
+    # --output-store-backend is set; TokenizerManager encodes them per request.
+    routed_experts_raw: Optional[List[Optional[torch.Tensor]]] = None
+    indexer_topk_raw: Optional[List[Optional[torch.Tensor]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
