@@ -38,6 +38,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.layers.rotary_embedding import factory as rope_factory
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.utils import common
 from sglang.srt.utils.common import is_building_neighbour_layer, make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -303,6 +304,15 @@ class TestMakeLayers(CustomTestCase):
         self.planning = fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2))
         self.planning.__enter__()
         self.addCleanup(self.planning.__exit__, None, None, None)
+        # These layers are built again on the meta device, as a model's on the
+        # transitional list are, unless a test gives a declaration function.
+        allowed = patch.object(
+            common,
+            "_NEIGHBOUR_BUILD_MODULES",
+            common._NEIGHBOUR_BUILD_MODULES | {__name__},
+        )
+        allowed.start()
+        self.addCleanup(allowed.stop)
 
     def build(self, pp_rank=None, pp_size=None, *, declares=True):
         """Build the layers; layer 1 has a MoE. Returns each layer_fn call as
@@ -357,6 +367,56 @@ class TestMakeLayers(CustomTestCase):
         self.assertTrue(last[2][0].declaration.previous.sparse)
         self.assertFalse(last[2][0].plan.enters_stack)
         self.assertTrue(last[3][1].plan.terminal)
+
+    def test_a_shared_declaration_function_stands_in_for_the_neighbours(self):
+        built, stages = [], {}
+
+        def layer_fn(idx, prefix):
+            built.append(idx)
+            stages[idx] = layer(sparse=idx == 1)
+            return nn.Identity()
+
+        def stage_facts(idx):
+            # The stages layer() declares, without building the layer.
+            return (
+                declare_attn(),
+                declare_ffn(sparse=idx == 1, next_layer_sparse=idx == 1),
+            )
+
+        make_layers(
+            NUM_LAYERS,
+            layer_fn,
+            pp_rank=1,
+            pp_size=2,
+            prefix="layers",
+            stage_facts=stage_facts,
+        )
+        self.assertEqual(built, [2, 3])
+        # Layer 2's attention follows layer 1's MoE, on the other stage.
+        self.assertTrue(stages[2][0].declaration.previous.sparse)
+
+    def test_a_layer_must_declare_what_its_declaration_function_says(self):
+        def layer_fn(idx, prefix):
+            layer(sparse=idx == 2)
+            return nn.Identity()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"layer 2 declares stages .*: stage 1 \(FFN\): sparse is True, "
+            "the function says False",
+        ):
+            make_layers(
+                NUM_LAYERS,
+                layer_fn,
+                pp_rank=1,
+                pp_size=2,
+                stage_facts=lambda idx: (declare_attn(), declare_ffn()),
+            )
+
+    def test_a_model_off_the_list_needs_a_declaration_function(self):
+        with patch.object(common, "_NEIGHBOUR_BUILD_MODULES", frozenset()):
+            with self.assertRaisesRegex(ValueError, "stage_facts"):
+                self.build(pp_rank=1, pp_size=2)
 
     def test_layers_without_stages_build_no_neighbour(self):
         calls, _ = self.build(pp_rank=1, pp_size=2, declares=False)

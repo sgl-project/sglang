@@ -5,9 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, NamedTuple, Optional
+from typing import Callable, Mapping, NamedTuple, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -845,11 +845,14 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     stage ends the model's layer stack unless a later layer declares a stage.
 
     Args:
-        previous_layers: Callables that build, nearest first, the layers before
-            this stack that another pipeline rank holds. Called only if this
-            stack appended stages, after its own layers are built, until one of
-            them declares a stage: its last stage is the producer of this
-            stack's first. What they build is discarded.
+        previous_layers: For the layers before this stack that another
+            pipeline rank holds, nearest first, callables that return the
+            stages the layer declares as DeclaredStages (from the model's
+            shared declaration function), or else build the layer so that it
+            appends them. Called only if this stack appended stages, after its
+            own layers are built, until one of them declares a stage: its last
+            stage is the producer of this stack's first. Only what binding
+            reads of that stage is kept (see facts_of).
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
         final_read: The model's final read of the stack's output (a
@@ -876,23 +879,94 @@ def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
         _stack = outer
 
 
-def _neighbour_stage(build_layers, *, last):
+class DeclaredStages(NamedTuple):
+    """The stages a neighbouring layer declares, from the model's shared
+    declaration function, which stand in for building the layer."""
+
+    stages: Tuple[StageDeclaration, ...]
+
+
+def check_declared_stages(stack, appended: int, expected, where: str) -> None:
+    """Check that what a layer appended to ``stack`` since it held
+    ``appended`` appends is what its shared declaration function says it
+    declares, as far as binding reads it: another pipeline rank binds this
+    layer's stages from that function alone."""
+    declared = [
+        facts_of(declaration)
+        for append in stack.appends[appended:]
+        if append.prepared_from is None
+        for declaration in append.declarations
+    ]
+    expected = [facts_of(declaration) for declaration in expected]
+    if declared != expected:
+        raise ValueError(
+            f"{where} declares stages its shared declaration function does "
+            f"not: {_first_difference(declared, expected)}"
+        )
+
+
+def _first_difference(declared, expected) -> str:
+    """Where the stages a layer declares first differ from those its shared
+    declaration function gives, field by field."""
+    if len(declared) != len(expected):
+        return (
+            f"it declares {[stage.kind.name for stage in declared]}, the "
+            f"function {[stage.kind.name for stage in expected]}"
+        )
+    index, (stage, given) = next(
+        (index, pair)
+        for index, pair in enumerate(zip(declared, expected))
+        if pair[0] != pair[1]
+    )
+    return f"stage {index} ({stage.kind.name}): " + "; ".join(
+        f"{name} is {value!r}, the function says {given_value!r}"
+        for name, value, given_value in _differing_fields(stage, given)
+    )
+
+
+def _differing_fields(value, given, prefix=""):
+    """(dotted name, value, given value) for each leaf field that differs,
+    descending into declarations and the facts they hold."""
+    if is_dataclass(value):
+        names = [field.name for field in fields(value)]
+    else:
+        names = getattr(type(value), "__struct_fields__", None)
+    if names is None or type(value) is not type(given):
+        return [(prefix.rstrip("."), value, given)]
+    return [
+        difference
+        for name in names
+        if getattr(value, name) != getattr(given, name)
+        for difference in _differing_fields(
+            getattr(value, name), getattr(given, name), f"{prefix}{name}."
+        )
+    ]
+
+
+def _neighbour_stage(layers, *, last):
     """The stage a neighbouring layer declares next to this stack: the last
     one of the nearest layer before it, or the first of the nearest after.
     Branches are side paths, so they never stand next to the stack."""
     global _stack
-    for build_layer in build_layers:
+    for layer in layers:
         outer = _stack
         _stack = _LayerStack()
         try:
-            build_layer()
-            appends = [a for a in _stack.appends if a.prepared_from is None]
+            result = layer()
+            declared = (
+                result.stages
+                if isinstance(result, DeclaredStages)
+                else [
+                    declaration
+                    for append in _stack.appends
+                    if append.prepared_from is None
+                    for declaration in append.declarations
+                ]
+            )
         finally:
             _stack = outer
-        if appends:
-            return facts_of(
-                appends[-1].declarations[-1] if last else appends[0].declarations[0]
-            )
+        if declared:
+            return facts_of(declared[-1] if last else declared[0])
     return None
 
 
