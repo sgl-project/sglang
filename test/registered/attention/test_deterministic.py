@@ -24,7 +24,8 @@ from sglang.test.test_utils import (
     is_in_amd_ci,
 )
 
-register_cuda_ci(est_time=280, stage="base-b", runner_config="1-gpu-large")
+# The FA3 class (SM80/SM90 only) is in test_deterministic_fa3.py.
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=207, suite="stage-b-test-1-gpu-xpu")
 
@@ -42,22 +43,6 @@ class TestFlashinferDeterministic(TestDeterministicBase):
             [
                 "--attention-backend",
                 "flashinfer",
-            ]
-        )
-        return args
-
-
-@unittest.skipIf(_is_xpu, "CUDA runner only")
-@unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
-class TestFa3Deterministic(TestDeterministicBase):
-    # Test with fa3 attention backend
-    @classmethod
-    def get_server_args(cls):
-        args = COMMON_SERVER_ARGS
-        args.extend(
-            [
-                "--attention-backend",
-                "fa3",
             ]
         )
         return args
