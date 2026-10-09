@@ -252,8 +252,8 @@ inline auto set_prefer_l1_carveout_with_occupancy(
     const auto occupancy = get_blocks_per_sm(kernel_ptr, block_threads, dyn_smem_bytes);
     if (occupancy >= min_occupancy) return {p, occupancy};
   }
-  host::Error() << "no carveout in [" << lower_bound_percent << ", " << upper_bound_percent
-                << "] can satisfy target occupancy " << min_occupancy << " for kernel " << kernel_ptr;
+  SGL_PANIC << "no carveout in [" << lower_bound_percent << ", " << upper_bound_percent
+            << "] can satisfy target occupancy " << min_occupancy << " for kernel " << kernel_ptr;
   __builtin_unreachable();
 #endif
 }

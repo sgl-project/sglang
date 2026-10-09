@@ -98,7 +98,7 @@ struct CacheMap<Key, void, kThreadSafe> {
 };
 
 template <typename Key, bool kThreadSafe = true>
-using CachedSet = CacheMap<Key, void, kThreadSafe>;
+using CacheSet = CacheMap<Key, void, kThreadSafe>;
 
 /**
  * \brief A keyed `std::call_once` that also hands back the value.
