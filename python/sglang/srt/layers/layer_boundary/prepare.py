@@ -43,6 +43,7 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
+    _sum_group,
 )
 from sglang.srt.layers.layer_boundary.output import (
     DeferredFinalize,
@@ -105,6 +106,8 @@ def _reduce_update_read(
         )
     elif group is SumGroup.TP:
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+    elif group is not None:
+        hidden_states = _sum_group(group).all_reduce(hidden_states)
     if _is_npu and cache is not None:
         _ = prepare_weight_cache(hidden_states, cache)
     return read.update_and_read(
@@ -127,6 +130,7 @@ def _reduce_update_read_dp_gather(
     gathers_residual: bool,
     reduces_attention_tp: bool,
     places_cp_shards: bool = False,
+    group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
 ):
@@ -138,7 +142,11 @@ def _reduce_update_read_dp_gather(
         residual = update.gather_residual_attn_tp(residual)
     if hidden_states.shape[0] != 0:
         if reduces_attention_tp:
-            hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states = (
+                attention_tensor_model_parallel_all_reduce(hidden_states)
+                if group is SumGroup.ATTN_TP
+                else _sum_group(group).all_reduce(hidden_states)
+            )
         with use_symmetric_memory(
             get_parallel().tp_group,
             disabled=not is_allocation_symmetric(),
@@ -417,14 +425,23 @@ def _then_attn_cp_gather(
     cache=None,
     gather: Callable,
     update: ResidualUpdate = PLAIN_ADD,
+    **call,
 ):
     """DSA and MLA CP: complete this rank's shard, then gather the shards, of
     equal length, over the attention-CP group. The residual stays on the
     shard."""
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, norm, update=update, cache=cache
+        hidden_states, residual, forward_batch, norm, update=update, cache=cache, **call
     )
     return attn_cp_interleave_gather(hidden_states), residual
+
+
+def _move_before_read(
+    hidden_states, residual, forward_batch, norm, *, move, read, **call
+):
+    """Complete and place a producer contribution before its residual update."""
+    hidden_states, residual = move(hidden_states, residual, forward_batch)
+    return read(hidden_states, residual, forward_batch, norm, **call)
 
 
 def _then_moe_cp_gather(
