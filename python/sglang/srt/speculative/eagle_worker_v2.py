@@ -722,18 +722,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     f"forward_pass_id={target_iteration}"
                 )
                 _prof_iter(target_iteration)
-            else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+
+            # MIGRATION-FIX: 原 v0.5.21 NVTX 移植 (331b687f4c) 残留的重复 else 分支已删除。
+            # 上游原结构为 `if can_run_decode_cuda_graph: <graph> else: <eager>`；移植时把
+            # `if can_run_decode_cuda_graph:` 换成 `if _draft_prof:` 但未删旧 else，导致
+            # _draft_prof=False（日常部署/bench）时 draft_forward 被提前 eager 执行一次，
+            # 就地改写 forward_batch.out_cache_loc 为 per-step (bs*topk=70) 形状；随后
+            # execute() 中 grouped copy dst=raw_num_token*num_steps(350) vs src=70 形状不匹配，
+            # 触发 "The size of tensor a (350) must match the size of tensor b (70)" 崩溃。
+            # 正确结构同 v0.5.18 正确移植 26973b597c：NVTX if 块后无 else，draft 执行统一
+            # 由下方 try 块（graph / eager 二选一）负责。旧代码保留注释备查：
+            # else:
+            #     if (
+            #         not forward_batch.forward_mode.is_idle()
+            #         and self.speculative_num_steps > 1
+            #     ):
+            #         # Skip attention backend init for 1-step draft,
+            #         # `draft_forward` only does sample in this case.
+            #         self.draft_attn_backend.init_forward_metadata(forward_batch)
+            #         forward_batch.mark_forward_metadata_ready()
+            #     parent_list, top_scores_index, draft_tokens, draft_probs = (
+            #         self.draft_forward(forward_batch)
+            #     )
 
             try:
                 if can_run_decode_cuda_graph:
