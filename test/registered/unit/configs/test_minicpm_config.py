@@ -13,7 +13,11 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_spec_by_arch,
 )
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
-from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+from sglang.srt.configs.minicpm import (
+    MINICPM_SPARSE_CONFIG_DEFAULTS,
+    MiniCPMConfig,
+    MiniCPMHybridConfig,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
@@ -46,6 +50,15 @@ def test_minicpm_lightning_config_defaults_are_complete():
     assert config.qk_norm is True
 
 
+def test_minicpm_non_sala_config_preserves_registered_model_fields():
+    config = MiniCPMConfig(num_hidden_layers=2, mixer_types=["minicpm4"])
+
+    assert config.model_type == "minicpm"
+    assert config.scale_emb == 12
+    assert config.attn_use_rope is True
+    assert config.mixer_types == ["minicpm4", "minicpm4"]
+
+
 def test_minicpm_empty_mixer_types_default_to_full_attention():
     config = MiniCPMHybridConfig(num_hidden_layers=3, mixer_types=[])
 
@@ -68,6 +81,18 @@ def test_minicpm_sparse_config_uses_nested_fields_only():
     assert config.has_minicpm_sparse_attention
     assert config.sparse_config == sparse_config
     assert not hasattr(config, "sparse_dense_len")
+
+
+def test_minicpm_sparda_defaults_match_official_sparse_layout():
+    config = MiniCPMConfig(num_hidden_layers=2, sparse_config=None)
+    sparse_config = dict(MINICPM_SPARSE_CONFIG_DEFAULTS)
+    config.sparse_config = sparse_config
+
+    assert config.has_minicpm_sparse_attention
+    assert config.sparse_config["block_size"] == 64
+    assert config.sparse_config["window_size"] == 2048
+    assert config.sparse_config["topk"] == 64
+    assert config.sparse_config["dense_len"] == 8192
 
 
 def test_minicpm_short_mixer_pattern_repeats_to_layer_count():
