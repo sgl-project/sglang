@@ -374,6 +374,17 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        # A decode req in a mixed batch: same hook as on the
+                        # decode path.
+                        prepare_release = getattr(
+                            self.model_worker, "prepare_for_kv_cache_release", None
+                        )
+                        if (
+                            callable(prepare_release)
+                            and batch.decoding_reqs
+                            and req in batch.decoding_reqs
+                        ):
+                            prepare_release(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,

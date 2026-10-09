@@ -839,14 +839,17 @@ class MlxModelRunner:
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
 
-    def _sync_decode_kv_to_pool(self, req_id: str) -> None:
-        """Sync un-flushed decode KV for *req_id* to the shared pool."""
+    def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
+        """Sync un-flushed decode KV for *req_id* to the shared pool, up to
+        position *end* when given."""
         if self._attention_kv_pool is None or self._req_to_token_pool is None:
             return
         cache = self._req_caches.get(req_id)
         if cache is None:
             return
         current_offset = self._first_attention_cache(cache).offset
+        if end is not None:
+            current_offset = min(current_offset, end)
         synced_offset = self._req_synced_offset.get(req_id, 0)
         if current_offset <= synced_offset:
             return
@@ -864,12 +867,19 @@ class MlxModelRunner:
         self._sync_new_kv_to_pool(cache, synced_offset, slot_ids)
         self._req_synced_offset[req_id] = current_offset
 
-    def flush_all_decode_kv(self) -> None:
-        """Sync all active requests' un-flushed decode KV to the pool."""
-        if self.disable_radix_cache or self._attention_kv_pool is None:
-            return
-        for req_id in list(self._req_caches.keys()):
-            self._sync_decode_kv_to_pool(req_id)
+    def release_request_row(self, req_id: str, owned_len: int) -> None:
+        """Sync *req_id*'s decode KV to the pool, then forget its row.
+
+        Called right before the scheduler releases the request's
+        req_to_token row. Only the first *owned_len* positions of the row
+        hold slots the scheduler gave this request: chained decode steps get
+        none, so the rest is stale and may point at slots the radix tree or
+        another request owns. Forgetting the row makes later syncs no-ops,
+        since the row can be reused once released.
+        """
+        if not self.disable_radix_cache:
+            self._sync_decode_kv_to_pool(req_id, end=owned_len)
+        self._req_pool_idx.pop(req_id, None)
 
     def decode_batch(self, req_ids: list[str]) -> list[int]:
         """Decode one token per request.
