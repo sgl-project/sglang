@@ -272,7 +272,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
-        return [CPAttentionBackendKind.DSA]
+        return [CPAttentionBackendKind.DSA, CPAttentionBackendKind.FLASH_ATTENTION]
 
     def materialize_full_indexer_k_cache(self, key: Any, forward_batch) -> Any:
         return self.gather_kv_cache(
@@ -288,9 +288,37 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
         **kwargs,
     ) -> Any:
-        # No-op: run_attention is the FlashAttention/zigzag dispatch hook.
-        # Interleave serves the DSA backend, which runs attention itself.
-        return None
+        assert attention_backend == CPAttentionBackendKind.FLASH_ATTENTION
+        # One logical sequence per query gives FA's bottom-right causal mask
+        # the true query position. Treating a strided shard as a contiguous
+        # request suffix would expose future keys and shift the SWA window.
+        num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+        indices = self.local_q_indices(num_tokens, forward_batch)
+        ends = forward_batch.extend_seq_lens.cumsum(0)
+        request_indices = torch.searchsorted(ends, indices, right=True)
+        starts = ends - forward_batch.extend_seq_lens
+        lengths = (
+            forward_batch.extend_prefix_lens[request_indices]
+            + indices
+            - starts[request_indices]
+            + 1
+        ).to(torch.int32)
+        num_queries = indices.shape[0]
+        cu_q = torch.arange(num_queries + 1, dtype=torch.int32, device=device)
+        result = attn_fn(
+            q[:num_queries],
+            cu_q,
+            lengths,
+            1,
+            request_indices=request_indices,
+        )
+        # Physical collective padding must never become an attention query.
+        pad_size = q.shape[0] - num_queries
+        if pad_size:
+            result = torch.cat(
+                [result, result.new_zeros(pad_size, *result.shape[1:])], dim=0
+            )
+        return result
 
     def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any) -> Any:
         kv_lora_rank = k.shape[-1]
@@ -311,8 +339,20 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         v: Any = None,
         swa_loc: Optional[Any] = None,
     ) -> Any:
-        raise NotImplementedError(
-            f"{self.name} strategy does not support dense K/V materialization"
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        k_dim, v_dim = k.shape[-1], v.shape[-1]
+        full_k, full_v = self.gather_kv_cache(
+            torch.cat([k, v], dim=-1).contiguous(), forward_batch
+        ).split([k_dim, v_dim], dim=-1)
+        get_token_to_kv_pool().set_kv_buffer(
+            layer,
+            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
+            full_k.contiguous(),
+            full_v.contiguous(),
+            layer.k_scale,
+            layer.v_scale,
         )
 
     def materialize_full_mla_kv(
