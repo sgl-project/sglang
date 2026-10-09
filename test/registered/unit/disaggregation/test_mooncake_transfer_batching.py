@@ -417,11 +417,14 @@ class TestMooncakeEarlySend(unittest.TestCase):
             with self.subTest(last=last):
                 ready = MagicMock()
                 manager = MagicMock()
-                sender = SimpleNamespace(
+                sender = object.__new__(MooncakeKVSender)
+                vars(sender).update(
                     kv_mgr=manager,
                     bootstrap_room=1,
                     aux_index=0,
                     trace_ctx=MagicMock(),
+                    conclude_state=None,
+                    _transfer_start_time=None,
                     _early_send_wait_event=ready,
                     _prepare_send_indices=lambda ids, state: (
                         ids,
@@ -431,12 +434,12 @@ class TestMooncakeEarlySend(unittest.TestCase):
                     ),
                     _record_transfer_indices=MagicMock(),
                 )
-                MooncakeKVSender.send(sender, [0])
+                sender.send([0])
                 self.assertIs(
                     manager.add_transfer_request.call_args.kwargs["wait_event"], ready
                 )
                 ready.synchronize.assert_not_called()
-                MooncakeKVSender.send(sender, [1])
+                sender.send([1])
                 self.assertIsNone(
                     manager.add_transfer_request.call_args.kwargs["wait_event"]
                 )
