@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -64,6 +65,20 @@ def test_int4_tuner_filename_uses_runtime_down_projection_dimension(monkeypatch)
     )
 
     assert filename == "E=256,N=256.json"
+
+
+def test_block_scaled_profiles_keep_k_tiles_inside_scale_groups():
+    root = Path(fused_moe_triton_config.__file__).parent / "configs"
+    for path in root.rglob("*.json"):
+        match = re.search(
+            r"dtype=(?:fp8_w8a8|int8_w8a8).*block_shape=\[(\d+),\s*(\d+)\]",
+            path.name,
+        )
+        if not match or not all(map(int, match.groups())):
+            continue
+        group_k = int(match.group(2))
+        for rows, config in json.loads(path.read_text()).items():
+            assert group_k % config["BLOCK_SIZE_K"] == 0, (path, rows, config)
 
 
 if __name__ == "__main__":

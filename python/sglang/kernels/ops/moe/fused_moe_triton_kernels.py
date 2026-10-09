@@ -415,6 +415,13 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if (use_fp8_w8a8 or use_int8_w8a8) and group_k > 0 and group_n > 0:
+        # One dot applies one K-group scale, so tiles cannot cross groups.
+        tl.static_assert(
+            group_k % BLOCK_SIZE_K == 0,
+            "BLOCK_SIZE_K must divide the quantization group_k",
+        )
+
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
         if GDC_EARLY:
