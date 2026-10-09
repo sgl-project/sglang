@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -1681,8 +1682,8 @@ class MiniMaxM3Model(nn.Module):
             assert pp_proxy_tensors is not None
             first_layer = self.layers[self.start_layer]
             if (
-                first_layer.layer_scatter_modes.layer_input_mode
-                == ScatterMode.SCATTERED
+                first_layer.attn_boundary.plan.variant_for(forward_batch)
+                is BatchVariant.INPUT_SCATTERED
             ):
                 pp_proxy_tensors = _normalize_scattered_pp_proxy_tensors_for_cuda_graph(
                     pp_proxy_tensors,
