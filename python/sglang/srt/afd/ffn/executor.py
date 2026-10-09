@@ -9,10 +9,15 @@ from typing import TYPE_CHECKING, Iterable, NamedTuple
 
 import torch
 
-from sglang.srt.afd.afd_config import resolve_overlap_sm_partition
-from sglang.srt.afd.afd_handshake import AFDGraphCapturePlan, AFDHandshakeResult
+from sglang.srt.afd.afd_config import (
+    resolve_overlap_sm_partition,
+)
+from sglang.srt.afd.afd_handshake import (
+    AFDGraphCapturePlan,
+    AFDHandshakeResult,
+)
 from sglang.srt.afd.afd_sync import AFDSyncMsg
-from sglang.srt.afd.comm import AFDCommBackend
+from sglang.srt.afd.comm.base import AFDCommBackend
 from sglang.srt.afd.dispatcher import (
     AFDFixedBufferPool,
     AFDWorkHandle,
@@ -74,8 +79,8 @@ class AFDFFNExecutor:
         handshake: AFDHandshakeResult,
     ):
         self._comm = comm
-        self._decode_transport = comm.decode_transport
         self._session_id = handshake.session_id
+        self._decode_transport = comm.decode_transport
         self._compute = compute
         self._device = torch.device(self._comm.config.device)
         self._dtype = scheduler.tp_worker.model_runner.dtype
@@ -205,9 +210,10 @@ class AFDFFNExecutor:
             decode_token_buckets = [
                 capacity * source_count for capacity in decode_token_buckets
             ]
-            self._max_scattered_source_count = (
+            max_source_count = (
                 self._comm.config.num_attn_ranks + self._num_ranks - 1
             ) // self._num_ranks
+            self._max_scattered_source_count = max_source_count
         self._decode_token_buckets = tuple(decode_token_buckets)
         decode_pool_token_buckets = decode_token_buckets
         if self._decode_transport is None:
@@ -417,6 +423,91 @@ class AFDFFNExecutor:
             for attn_rank in self._attn_ranks
         )
 
+    def _prepare_decode_children(
+        self, msg: AFDSyncMsg
+    ) -> tuple[_PreparedDecodeChild, ...]:
+        forward_mode = ForwardMode(msg.forward_mode)
+        if not is_afd_fixed_shape_mode(forward_mode):
+            raise RuntimeError(
+                "AFD fixed-shape children require DECODE or TARGET_VERIFY"
+            )
+        child_wire_capacities = msg.effective_child_wire_capacities
+        num_children = len(child_wire_capacities)
+        if msg.child_wire_capacities and num_children != self._decode_num_microbatches:
+            raise RuntimeError(
+                "AFD child plan does not match the configured microbatch count: "
+                f"children={num_children}, "
+                f"configured={self._decode_num_microbatches}"
+            )
+        children = self._prepare_decode_children_for_capacities(child_wire_capacities)
+        if msg.child_wire_capacities and (
+            sum(child_wire_capacities) != msg.wire_capacity
+        ):
+            raise RuntimeError(
+                "AFD child capacities do not match the parent wire "
+                f"capacity: children={child_wire_capacities}, "
+                f"parent={msg.wire_capacity}"
+            )
+        dp_capacity = self._dp_capacity(msg)
+        local_wire_capacity = sum(child.local_wire_capacity for child in children)
+        if dp_capacity > local_wire_capacity:
+            raise RuntimeError(
+                f"AFD DP capacity {dp_capacity} exceeds local wire capacity "
+                f"{local_wire_capacity}"
+            )
+        return children
+
+    def _prepare_decode_children_for_capacities(
+        self,
+        child_wire_capacities: tuple[int, ...],
+    ) -> tuple[_PreparedDecodeChild, ...]:
+        num_children = len(child_wire_capacities)
+        if num_children not in (1, self._decode_num_microbatches):
+            raise RuntimeError(
+                "AFD decode child count must be one or the configured "
+                f"microbatch count {self._decode_num_microbatches}, got "
+                f"{num_children}"
+            )
+        if any(capacity <= 0 for capacity in child_wire_capacities):
+            raise RuntimeError(
+                f"AFD decode child capacities must be positive: {child_wire_capacities}"
+            )
+        return tuple(
+            self._prepare_decode_child(wire_capacity, slot_id)
+            for slot_id, wire_capacity in enumerate(child_wire_capacities)
+        )
+
+    def _prepare_decode_child(
+        self, edge_wire_capacity: int, slot_id: int = 0
+    ) -> _PreparedDecodeChild:
+        if edge_wire_capacity not in self._decode_edge_token_buckets:
+            raise RuntimeError(
+                "AFD wire capacity is not a negotiated decode bucket: "
+                f"{edge_wire_capacity}"
+            )
+        source_segments = self._decode_source_segments(edge_wire_capacity)
+        source_count = len(source_segments)
+        return _PreparedDecodeChild(
+            slot_id=slot_id,
+            source_segments=source_segments,
+            local_wire_capacity=sum(segment.capacity for segment in source_segments),
+            staging_capacity=max(source_count, 1) * edge_wire_capacity,
+        )
+
+    def _can_run_cohort(self, msg: AFDSyncMsg) -> bool:
+        if not is_afd_fixed_shape_mode(ForwardMode(msg.forward_mode)) or not sum(
+            msg.tokens_per_rank
+        ):
+            return False
+        if msg.communication_graph and self._decode_transport is None:
+            return False
+        if not msg.child_wire_capacities:
+            return True
+        return (
+            self._decode_num_microbatches > 1
+            and len(msg.child_wire_capacities) == self._decode_num_microbatches
+        )
+
     def _recv_source_inputs(
         self,
         source_segments: tuple[_SourceSegment, ...],
@@ -451,20 +542,6 @@ class AFDFFNExecutor:
             hidden_states[rows].copy_(views.hidden_states)
             topk_ids[rows].copy_(views.topk_ids)
             topk_weights[rows].copy_(views.topk_weights)
-
-    def _can_run_cohort(self, msg: AFDSyncMsg) -> bool:
-        if not is_afd_fixed_shape_mode(ForwardMode(msg.forward_mode)) or not sum(
-            msg.tokens_per_rank
-        ):
-            return False
-        if msg.communication_graph and self._decode_transport is None:
-            return False
-        if not msg.child_wire_capacities:
-            return True
-        return (
-            self._decode_num_microbatches > 1
-            and len(msg.child_wire_capacities) == self._decode_num_microbatches
-        )
 
     def _recv_decode_child(
         self,
@@ -718,7 +795,7 @@ class AFDFFNExecutor:
             return
         fixed_shape = is_afd_fixed_shape_mode(forward_mode)
         if msg.child_wire_capacities and not fixed_shape:
-            raise RuntimeError("AFD child plan requires DECODE")
+            raise RuntimeError("AFD child plan requires DECODE or TARGET_VERIFY")
 
         if self._direct_megamoe is not None and fixed_shape:
             child_wire_capacities = msg.effective_child_wire_capacities
@@ -818,7 +895,7 @@ class AFDFFNExecutor:
             )
 
         if len(decode_children) > 1:
-            child_wire_capacities = msg.child_wire_capacities or (msg.wire_capacity,)
+            child_wire_capacities = msg.effective_child_wire_capacities
             with torch.inference_mode():
                 if msg.communication_graph:
                     if (
@@ -1010,7 +1087,7 @@ class AFDFFNExecutor:
         source_segments: tuple[_SourceSegment, ...],
     ) -> None:
         wire_capacity = sum(segment.capacity for segment in source_segments)
-        fixed_shape = forward_mode.is_decode()
+        fixed_shape = is_afd_fixed_shape_mode(forward_mode)
         allow_compute_graph = (
             fixed_shape and not self._scattered and self._decode_step_graph is None
         )
@@ -1066,75 +1143,6 @@ class AFDFFNExecutor:
 
             if work is not None:
                 self._decode_pool.release(work)
-
-    def _prepare_decode_children(
-        self, msg: AFDSyncMsg
-    ) -> tuple[_PreparedDecodeChild, ...]:
-        forward_mode = ForwardMode(msg.forward_mode)
-        if not is_afd_fixed_shape_mode(forward_mode):
-            raise RuntimeError("AFD fixed-shape children require DECODE")
-        child_wire_capacities = msg.child_wire_capacities or (msg.wire_capacity,)
-        num_children = len(child_wire_capacities)
-        if msg.child_wire_capacities and num_children != self._decode_num_microbatches:
-            raise RuntimeError(
-                "AFD child plan does not match the configured microbatch count: "
-                f"children={num_children}, "
-                f"configured={self._decode_num_microbatches}"
-            )
-        children = self._prepare_decode_children_for_capacities(child_wire_capacities)
-        if msg.child_wire_capacities and (
-            sum(child_wire_capacities) != msg.wire_capacity
-        ):
-            raise RuntimeError(
-                "AFD child capacities do not match the parent wire "
-                f"capacity: children={child_wire_capacities}, "
-                f"parent={msg.wire_capacity}"
-            )
-        dp_capacity = self._dp_capacity(msg)
-        local_wire_capacity = sum(child.local_wire_capacity for child in children)
-        if dp_capacity > local_wire_capacity:
-            raise RuntimeError(
-                f"AFD DP capacity {dp_capacity} exceeds local wire capacity "
-                f"{local_wire_capacity}"
-            )
-        return children
-
-    def _prepare_decode_children_for_capacities(
-        self,
-        child_wire_capacities: tuple[int, ...],
-    ) -> tuple[_PreparedDecodeChild, ...]:
-        num_children = len(child_wire_capacities)
-        if num_children not in (1, self._decode_num_microbatches):
-            raise RuntimeError(
-                "AFD decode child count must be one or the configured "
-                f"microbatch count {self._decode_num_microbatches}, got "
-                f"{num_children}"
-            )
-        if any(capacity <= 0 for capacity in child_wire_capacities):
-            raise RuntimeError(
-                f"AFD decode child capacities must be positive: {child_wire_capacities}"
-            )
-        return tuple(
-            self._prepare_decode_child(wire_capacity, slot_id)
-            for slot_id, wire_capacity in enumerate(child_wire_capacities)
-        )
-
-    def _prepare_decode_child(
-        self, edge_wire_capacity: int, slot_id: int = 0
-    ) -> _PreparedDecodeChild:
-        if edge_wire_capacity not in self._decode_edge_token_buckets:
-            raise RuntimeError(
-                "AFD wire capacity is not a negotiated decode bucket: "
-                f"{edge_wire_capacity}"
-            )
-        source_segments = self._decode_source_segments(edge_wire_capacity)
-        source_count = len(source_segments)
-        return _PreparedDecodeChild(
-            slot_id=slot_id,
-            source_segments=source_segments,
-            local_wire_capacity=sum(segment.capacity for segment in source_segments),
-            staging_capacity=max(source_count, 1) * edge_wire_capacity,
-        )
 
     def _enqueue_overlap_request(
         self,

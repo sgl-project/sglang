@@ -139,6 +139,9 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # Splitting a full EAGLE mask also requires CPU sequence lengths.
+    needs_eagle_custom_mask: bool = True
+
     # True for backends that preallocate per-seq extend metadata at req-pool
     # size (e.g. triton's kv_indptr): dummy extend batches must then keep
     # batch_size <= req_to_token_pool.size.

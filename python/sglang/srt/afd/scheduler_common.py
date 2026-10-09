@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.afd.afd_config import (
     AFDRole,
+    get_afd_decode_num_tokens_per_bs,
     is_direct_afd_backend,
 )
 from sglang.srt.afd.afd_handshake import (
@@ -117,7 +118,9 @@ def build_local_handshake_info(
     decode_graph_token_buckets = []
     decode_config = get_exec().graph.cuda_graph_config.decode
     scattered = get_disagg().afd_ffn_moe_backend == "deepep"
-    decode_num_tokens_per_bs = 1
+    decode_num_tokens_per_bs = (
+        get_afd_decode_num_tokens_per_bs() if role.is_attn() else 1
+    )
     wire_token_multiplier = decode_num_tokens_per_bs * (
         1 if scattered else scheduler.ps.tp_size
     )

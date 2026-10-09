@@ -62,6 +62,15 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
+    from sglang.srt.afd.afd_config import (
+        check_afd_server_args,
+        finalize_afd_speculative_args,
+        normalize_afd_ffn_speculative_args,
+        prepare_afd_ffn_moe_backend,
+    )
+
+    normalize_afd_ffn_speculative_args(server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     handle_mega_moe(server_args)
@@ -295,10 +304,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_context_parallelism(server_args)
 
     # Handle MoE configurations.
-    from sglang.srt.afd.afd_config import (
-        check_afd_server_args,
-        prepare_afd_ffn_moe_backend,
-    )
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
@@ -325,6 +330,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     handle_speculative_decoding(server_args)
+    finalize_afd_speculative_args(server_args)
 
     # After the speculative hook so speculative_algorithm is final.
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp

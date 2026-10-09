@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_afd_fixed_shape_mode(forward_mode: ForwardMode) -> bool:
-    return forward_mode.is_decode()
+    return forward_mode.is_decode() or forward_mode.is_target_verify()
 
 
 def build_decode_token_buckets(

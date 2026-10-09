@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 import zmq
 
-from sglang.srt.afd.afd_config import AFDRole, is_direct_afd_backend
+from sglang.srt.afd.afd_config import (
+    AFDRole,
+    is_direct_afd_backend,
+)
 from sglang.srt.afd.afd_handshake import (
     AFDGraphCapturePlan,
     AFDHandshakeResult,
@@ -26,10 +29,13 @@ from sglang.srt.afd.afd_sync import (
     AFDSyncMsg,
     AFDSyncMsgReceiver,
 )
-from sglang.srt.afd.comm import AFDCommBackend
-from sglang.srt.afd.dispatcher import is_afd_fixed_shape_mode, select_token_bucket
-from sglang.srt.afd.ffn.compute import AFDFFNCompute
-from sglang.srt.afd.ffn.executor import AFDFFNExecutor
+from sglang.srt.afd.comm import (
+    AFDCommBackend,
+)
+from sglang.srt.afd.dispatcher import (
+    is_afd_fixed_shape_mode,
+    select_token_bucket,
+)
 from sglang.srt.afd.scheduler_common import (
     build_local_handshake_info,
     gather_nvshmem_topology,
@@ -45,43 +51,72 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_serving,
+)
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:
+    from sglang.srt.afd.ffn.executor import AFDFFNExecutor
     from sglang.srt.managers.scheduler import Scheduler
+
 
 logger = logging.getLogger(__name__)
 
 
 def init_ffn_model_worker_state(scheduler: Scheduler) -> None:
-    """Export worker state without allocating attention or KV-cache resources."""
+    """``Scheduler.init_model_worker`` branch for the ffn role.
+
+    The native model was already loaded by ``init_tp_model_worker``; export
+    the runtime state the ffn event loop needs, then let the caller return
+    before memory pools, attention backends and CUDA graphs.
+    """
     from sglang.srt.distributed.parallel_state import get_tp_group
 
     if scheduler.server_args.is_startup_weight_load_overlap:
         scheduler.tp_worker.start_startup_weight_load()
         scheduler.tp_worker.finalize_startup_weight_load()
+
     scheduler.draft_worker = None
     scheduler.model_worker = scheduler.tp_worker
+
     scheduler.device = scheduler.tp_worker.device
     scheduler.forward_stream = scheduler.tp_worker.model_runner.forward_stream
     scheduler.tp_group = get_tp_group()
     scheduler.tp_cpu_group = scheduler.tp_group.cpu_group
     scheduler.dp_tp_group = scheduler.tp_group
     scheduler.dp_tp_cpu_group = scheduler.tp_cpu_group
+
+    # No-KV semantics for get_init_info(): the ffn instance serves no
+    # generation requests and allocates no token pool.
     scheduler.max_total_num_tokens = 0
     scheduler.max_req_input_len = 0
     scheduler.kv_cache_allocation_time = 0.0
 
 
 def finish_ffn_scheduler_init(scheduler: Scheduler) -> None:
-    """Finish the lifecycle state needed by the FFN event loop and process exit."""
+    """``Scheduler.__init__`` early-return branch for the ffn role.
+
+    Completes the minimal lifecycle state used by ``run_event_loop`` and the
+    process exit path; KV cache, radix cache, schedule policy and request
+    components are never built.
+    """
     from sglang.srt.managers.scheduler_components.metrics_reporter import (
         SchedulerMetricsReporter,
     )
 
+    # run_event_loop creates the schedule stream from device_module (normally
+    # set in init_overlap, which the ffn role skips).
     scheduler.device_module = torch.get_device_module(scheduler.device)
+
+    # Prepare expert compute now; graph capture runs after the A/F handshake.
+    from sglang.srt.afd.ffn.compute import AFDFFNCompute
+
     scheduler.afd_ffn_compute = AFDFFNCompute(scheduler)
+
+    # run_scheduler_process's exit path shuts down the metrics reporter.
     scheduler.metrics_reporter = SchedulerMetricsReporter(
         scheduler=scheduler,
         tp_rank=scheduler.ps.tp_rank,
@@ -90,9 +125,11 @@ def finish_ffn_scheduler_init(scheduler: Scheduler) -> None:
         metrics_collector_context=scheduler.metrics_collector_context,
         metrics_collector=scheduler.metrics_collector,
     )
+
     scheduler.forward_ct = 0
     scheduler.gracefully_exit = False
     scheduler.init_profiler()
+
     scheduler.is_initializing = False
     scheduler.init_startup_timing_summary()
 
@@ -128,7 +165,8 @@ def _handle_ffn_scheduler_request(
         return True
     if is_rank0:
         logger.warning(
-            "AFD ffn scheduler ignores unsupported request: %s", type(req).__name__
+            "AFD ffn scheduler ignores unsupported request: %s",
+            type(req).__name__,
         )
     return False
 
@@ -238,6 +276,8 @@ class _AFDFFNCohortSelector:
 def _build_ffn_session(
     scheduler: Scheduler, handshake: AFDHandshakeResult, compute
 ) -> _AFDFFNSession:
+    from sglang.srt.afd.ffn.executor import AFDFFNExecutor
+
     plan = build_afd_graph_capture_plan(handshake)
     backend = init_afd_comm_backend(scheduler, AFDRole.FFN, handshake)
     executor = AFDFFNExecutor(scheduler, backend, compute, handshake)
@@ -732,7 +772,6 @@ def _event_loop_afd_ffn_direct_union(
     finally:
         for control in controls:
             control.close()
-        session.backend.close()
     if is_rank0:
         logger.info("AFD Direct union event loop exited")
 
@@ -748,16 +787,16 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     is_rank0 = rank == 0
     num_sessions = get_disagg().afd_attn_instances
     compute = scheduler.afd_ffn_compute
+    rank_node_ids, rank_nvshmem_fabric_keys = gather_nvshmem_topology(scheduler)
 
-    rank_node_ids, fabric_keys = gather_nvshmem_topology(scheduler)
-
-    # Negotiate shared capacity before any session captures graphs.
+    # Static membership lets joint-world backends build [F][A0][A1]... from
+    # the same handshake roster on every process.
     if is_rank0:
         local_info = build_local_handshake_info(
             scheduler,
             AFDRole.FFN,
             rank_node_ids,
-            fabric_keys,
+            rank_nvshmem_fabric_keys,
         )
         handshake_server = AFDHandshakeServer(afd_handshake_port(get_serving().port))
         try:
@@ -794,7 +833,7 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
         capacity_plan = build_afd_ffn_capacity_plan(
             handshakes[0].local,
             tuple(handshake.peer for handshake in handshakes),
-            use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
+            get_exec().moe.deepep_mode != "normal",
         )
         compute.configure_staged_capacity(capacity_plan)
 
@@ -805,7 +844,6 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     sessions: list[_AFDFFNSession] = [
         _build_ffn_session(scheduler, handshake, compute) for handshake in handshakes
     ]
-
     if num_sessions > 1 or not sessions[0].plan.enabled:
         # Capture after every backend and executor has initialized communication
         # and selected the compute SM budget.
@@ -823,58 +861,57 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
             )
             poller.register(session.receiver.socket, zmq.POLLIN)
 
+    if num_sessions > 1:
+        _event_loop_afd_ffn_cohort(
+            scheduler,
+            sessions,
+            poller,
+            scheduler_input_socket,
+        )
+        if is_rank0:
+            logger.info("AFD ffn event loop exited")
+        return
+
     if is_rank0:
         logger.info("AFD ffn event loop started: sessions=%d", num_sessions)
-    try:
-        if num_sessions > 1:
-            _event_loop_afd_ffn_cohort(
-                scheduler, sessions, poller, scheduler_input_socket
-            )
-            return
-        session = sessions[0]
-        while True:
-            if is_rank0:
-                events = dict(poller.poll())
-                if scheduler_input_socket in events:
-                    session_id = -1
-                    msg = sock_recv(scheduler_input_socket)
-                else:
-                    session_id = session.session_id
-                    msg = session.receiver.recv()
-                if scheduler.ps.tp_size > 1:
-                    broadcast_pyobj(
-                        [(session_id, msg)], rank, scheduler.tp_cpu_group, src=0
-                    )
+    session = sessions[0]
+    while True:
+        if is_rank0:
+            events = dict(poller.poll())
+            if scheduler_input_socket in events:
+                session_id = -1
+                msg = sock_recv(scheduler_input_socket)
             else:
-                ((session_id, msg),) = broadcast_pyobj(
-                    [], rank, scheduler.tp_cpu_group, src=0
+                session_id = session.session_id
+                msg = session.receiver.recv()
+            if scheduler.ps.tp_size > 1:
+                broadcast_pyobj(
+                    [(session_id, msg)], rank, scheduler.tp_cpu_group, src=0
                 )
+        else:
+            ((session_id, msg),) = broadcast_pyobj(
+                [], rank, scheduler.tp_cpu_group, src=0
+            )
 
-            if session_id == -1:
-                if _handle_ffn_scheduler_request(scheduler, msg, is_rank0):
-                    break
-                continue
+        if session_id == -1:
+            if _handle_ffn_scheduler_request(scheduler, msg, is_rank0):
+                break
+            continue
 
-            if not isinstance(msg, AFDSyncMsg):
-                if is_rank0:
-                    logger.warning(
-                        "AFD ffn session %d ignores unsupported control message: %s",
-                        session_id,
-                        type(msg).__name__,
-                    )
-                continue
+        if not isinstance(msg, AFDSyncMsg):
+            if is_rank0:
+                logger.warning(
+                    "AFD ffn session %d ignores unsupported control message: %s",
+                    session_id,
+                    type(msg).__name__,
+                )
+            continue
 
-            if is_rank0 and should_log_step(msg.step_id):
-                _log_ffn_step(session, compute, msg, rank)
-            # The executor keeps step order but skips data-plane I/O for a global
-            # 0-token batch, matching AFDAttnMoE.
-            session.executor.run_step(msg)
-
-    finally:
-        for session in sessions:
-            if session.receiver is not None:
-                session.receiver.close()
-            session.backend.close()
+        if is_rank0 and should_log_step(msg.step_id):
+            _log_ffn_step(session, compute, msg, rank)
+        # The executor keeps step order but skips data-plane I/O for a global
+        # 0-token batch, matching AFDAttnMoE.
+        session.executor.run_step(msg)
 
     if is_rank0:
         logger.info("AFD ffn event loop exited")

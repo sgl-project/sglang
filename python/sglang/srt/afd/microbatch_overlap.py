@@ -15,6 +15,8 @@ from sglang.srt.afd.dispatcher import (
 )
 from sglang.srt.batch_overlap.two_batch_overlap import (
     TboForwardBatchPreparer,
+    get_token_num_per_seq,
+    split_spec_info,
 )
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
@@ -100,6 +102,21 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
         return getattr(object.__getattribute__(self, "primary"), name)
 
     @property
+    def verify_mask(self):
+        return self.primary.verify_mask
+
+    @property
+    def needs_eagle_custom_mask(self):
+        verify_mask = self.verify_mask
+        return self.primary.needs_eagle_custom_mask and (
+            verify_mask is None or verify_mask.is_read
+        )
+
+    @property
+    def needs_cpu_seq_lens(self):
+        return self.primary.needs_cpu_seq_lens or self.needs_eagle_custom_mask
+
+    @property
     def forward_metadata(self):
         return self.primary.forward_metadata
 
@@ -125,9 +142,15 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
         prepare_afd_microbatch_forward_batch(
             forward_batch,
             self.num_microbatches,
+            needs_custom_mask=self.needs_eagle_custom_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.afd_microbatch_children is None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self.prepare_forward_batch(forward_batch)
         if forward_batch.afd_microbatch_children is None:
             self.primary.init_forward_metadata(forward_batch)
             return
@@ -152,7 +175,7 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
                 forward_batch, in_capture=in_capture
             )
             return
-        tokens_per_request = 1
+        tokens_per_request = _tokens_per_request(forward_batch)
         raw_batch_size = (
             forward_batch.batch_size
             if in_capture
@@ -183,6 +206,7 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
                 raw_num_tokens=raw_batch_size * tokens_per_request,
                 child_num_tokens_gpu=child_num_tokens,
                 child_global_num_tokens_gpu=child_global_num_tokens_gpu,
+                needs_custom_mask=self.needs_eagle_custom_mask,
             )
             child_batches = forward_batch.afd_microbatch_children
         else:
@@ -191,6 +215,7 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
                 child_num_tokens,
                 self.num_microbatches,
                 tokens_per_request,
+                needs_custom_mask=self.needs_eagle_custom_mask,
             )
         with compute_sm_budget(get_afd_dispatcher().compute_num_sms):
             for backend, child in zip(self.children, child_batches, strict=True):
@@ -257,8 +282,9 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
     def _check_parent_graph_child_plan(
         self, batch_size: int, child_plan: tuple[int, ...]
     ) -> None:
-        # Metadata loading and the batch plan prepared by begin_batch must
-        # resolve to the same child tuple.
+        # EAGLE preloads graph metadata before the final AFD graph decision.
+        # The runner bucket and the batch plan prepared by begin_batch must
+        # still resolve to the same child tuple.
         dispatcher_plan = get_afd_dispatcher().prepared_parent_graph_child_plan()
         backend_plan = child_plan if len(child_plan) == self.num_microbatches else None
         if dispatcher_plan != backend_plan:
@@ -315,11 +341,15 @@ def prepare_afd_microbatch_forward_batch(
     raw_num_tokens: Optional[int] = None,
     child_num_tokens_gpu: Optional[torch.Tensor] = None,
     child_global_num_tokens_gpu: Optional[torch.Tensor] = None,
+    needs_custom_mask: bool = True,
 ) -> None:
-    if not forward_batch.forward_mode.is_decode_or_idle():
-        raise RuntimeError("AFD microbatch overlap requires decode")
+    if not (
+        forward_batch.forward_mode.is_decode_or_idle()
+        or forward_batch.forward_mode.is_target_verify()
+    ):
+        raise RuntimeError("AFD microbatch overlap requires decode or target verify")
 
-    tokens_per_request = 1
+    tokens_per_request = _tokens_per_request(forward_batch)
     child_sizes = split_afd_batch_size(forward_batch.batch_size, num_microbatches)
     child_token_sizes = tuple(
         child_size * tokens_per_request for child_size in child_sizes
@@ -343,6 +373,16 @@ def prepare_afd_microbatch_forward_batch(
             global_child_sizes
         )
 
+    spec_info = forward_batch.spec_info
+    if not needs_custom_mask and spec_info is not None:
+        spec_info = replace(spec_info, custom_mask=None)
+    # Reuse upstream field slicing; AFD owns speculative child metadata.
+    batch_to_split = (
+        replace(forward_batch, spec_info=None)
+        if spec_info is not None
+        else forward_batch
+    )
+
     children = []
     start_seq = 0
     start_token = 0
@@ -352,13 +392,20 @@ def prepare_afd_microbatch_forward_batch(
         end_seq = start_seq + child_size
         end_token = start_token + child_token_size
         child = TboForwardBatchPreparer.filter_batch(
-            forward_batch,
+            batch_to_split,
             start_token_index=start_token,
             end_token_index=end_token,
             start_seq_index=start_seq,
             end_seq_index=end_seq,
             out_num_token_non_padded=child_num_tokens_gpu[child_index],
             out_num_token_non_padded_cpu=child_num_tokens[child_index],
+        )
+        child.spec_info = split_spec_info(
+            spec_info,
+            start_seq_index=start_seq,
+            end_seq_index=end_seq,
+            start_token_index=start_token,
+            end_token_index=end_token,
         )
         child.global_num_token_non_padded = child_num_tokens_gpu[child_index]
         child.global_num_tokens_cpu = global_child_sizes[child_index]
@@ -388,6 +435,8 @@ def _build_afd_microbatch_child_replay_views(
     child_num_tokens: torch.Tensor,
     num_microbatches: int,
     tokens_per_request: int,
+    *,
+    needs_custom_mask: bool = True,
 ) -> list[SimpleNamespace]:
     """Cheap per-step child views for out-of-graph replay metadata.
 
@@ -397,7 +446,11 @@ def _build_afd_microbatch_child_replay_views(
     A missing field fails loudly with AttributeError.
     """
     child_sizes = split_afd_batch_size(forward_batch.batch_size, num_microbatches)
+    spec_info = forward_batch.spec_info
+    if not needs_custom_mask and spec_info is not None:
+        spec_info = replace(spec_info, custom_mask=None)
     children = []
+    mask_offset_cache = {0: 0}
     start_seq = 0
     start_token = 0
     for child_index, child_size in enumerate(child_sizes):
@@ -436,7 +489,14 @@ def _build_afd_microbatch_child_replay_views(
                     if forward_batch.out_cache_loc is not None
                     else None
                 ),
-                spec_info=None,
+                spec_info=split_spec_info(
+                    spec_info,
+                    start_seq_index=start_seq,
+                    end_seq_index=end_seq,
+                    start_token_index=start_token,
+                    end_token_index=end_token,
+                    mask_offset_cache=mask_offset_cache,
+                ),
                 num_token_non_padded=child_num_tokens[child_index],
             )
         )
@@ -462,6 +522,14 @@ def _split_global_num_tokens(
     return [
         [sizes[child_id] for sizes in per_rank] for child_id in range(num_microbatches)
     ]
+
+
+def _tokens_per_request(forward_batch: ForwardBatch) -> int:
+    if forward_batch.forward_mode.is_target_verify():
+        return get_token_num_per_seq(
+            forward_batch.forward_mode, forward_batch.spec_info
+        )
+    return 1
 
 
 def run_afd_microbatch_serial_layers(

@@ -54,12 +54,14 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
 )
+from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.afd.afd_handshake import AFDGraphCaptureVariant
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 logger = logging.getLogger(__name__)
@@ -310,6 +312,7 @@ class _AFDDirectAttnCoordinator:
         )
         self._graph_eligible = torch.empty(1, dtype=torch.int32)
         self._pending: Optional[_AFDPreparedAttnStep] = None
+        self._target_graph_decision: Optional[bool] = None
 
     def stage(self, prepared: _AFDPreparedAttnStep) -> None:
         if self._pending is not None:
@@ -340,6 +343,24 @@ class _AFDDirectAttnCoordinator:
             self._run_inactive_plan(plan)
             if self._client is not None and not self._client.has_outstanding_proposal:
                 self._send_active_proposal(prepared, proposal_can_run_graph)
+
+    def coordinate_target(self, can_run_graph: bool) -> bool:
+        decision = self.coordinate(can_run_graph)
+        if self._target_graph_decision is not None:
+            raise RuntimeError("AFD Direct target graph decision is already pending")
+        self._target_graph_decision = decision
+        return decision
+
+    def select_model_graph(self, can_run_graph: bool) -> bool:
+        if self._target_graph_decision is not None:
+            decision = self._target_graph_decision
+            self._target_graph_decision = None
+            if decision and not can_run_graph:
+                raise RuntimeError(
+                    "AFD Direct target graph eligibility changed after preflight"
+                )
+            return decision
+        return self.coordinate(can_run_graph)
 
     def on_idle(self) -> None:
         if self._pending is not None:
@@ -603,6 +624,7 @@ def _prepare_afd_attn_step(
     tokens_per_rank: Sequence[int],
     forward_mode: ForwardMode,
     can_run_decode_cuda_graph: bool,
+    microbatch_tokens_per_rank: Optional[Sequence[int]] = None,
 ) -> bool:
     dispatcher = get_afd_dispatcher()
     num_attn_ranks = scheduler.afd_handshake.local.num_ranks
@@ -618,9 +640,24 @@ def _prepare_afd_attn_step(
 
     model_runner = scheduler.tp_worker.model_runner
     num_tokens_per_bs = scheduler.afd_handshake.local.decode_num_tokens_per_bs
-    model_runner.afd_cuda_graph_batch_size = (
-        max(tokens_per_rank) if forward_mode.is_decode() else None
-    )
+    if forward_mode.is_target_verify():
+        if any(num_tokens % num_tokens_per_bs != 0 for num_tokens in tokens_per_rank):
+            raise RuntimeError(
+                "AFD TARGET_VERIFY token counts must be divisible by the "
+                "negotiated rows per request: "
+                f"tokens_per_rank={tokens_per_rank}, "
+                f"rows_per_request={num_tokens_per_bs}"
+            )
+        logical_batch_sizes = [
+            num_tokens // num_tokens_per_bs for num_tokens in tokens_per_rank
+        ]
+        model_runner.afd_cuda_graph_batch_size = (
+            max(logical_batch_sizes) if total_tokens > 0 else None
+        )
+    else:
+        model_runner.afd_cuda_graph_batch_size = (
+            max(tokens_per_rank) if forward_mode.is_decode() else None
+        )
 
     scattered = get_disagg().afd_ffn_moe_backend == "deepep"
     dp_capacity = tokens_per_rank[scheduler.ps.tp_rank] if scattered else total_tokens
@@ -647,7 +684,7 @@ def _prepare_afd_attn_step(
     child_wire_capacities: tuple[int, ...] = ()
     parent_graph_variant: Optional[AFDGraphCaptureVariant] = None
     num_microbatches = get_disagg().afd_decode_num_microbatches
-    fixed_shape_decode = forward_mode.is_decode()
+    fixed_shape_decode = forward_mode.is_decode() or forward_mode.is_target_verify()
     # A captured parent bucket owns its child topology. Low-load DP ranks mask
     # padded children; only the eager fallback requires nonempty children.
     # Without padding, the runner requires an exact logical batch-size match.
@@ -665,10 +702,19 @@ def _prepare_afd_attn_step(
             parent_graph_variant = graph_variant
             child_wire_capacities = graph_variant.child_wire_capacities
 
+    eager_tokens_per_rank = (
+        tokens_per_rank
+        if microbatch_tokens_per_rank is None
+        else microbatch_tokens_per_rank
+    )
+    eager_rows_per_request = num_tokens_per_bs if forward_mode.is_target_verify() else 1
     can_split_eager = (
         num_microbatches > 1
         and fixed_shape_decode
-        and all(num_tokens >= num_microbatches for num_tokens in tokens_per_rank)
+        and all(
+            num_tokens >= num_microbatches * eager_rows_per_request
+            for num_tokens in eager_tokens_per_rank
+        )
     )
     eager_child_wire_capacities = (
         _select_child_wire_capacities(
@@ -676,6 +722,7 @@ def _prepare_afd_attn_step(
             scheduler.afd_handshake.local.decode_token_buckets,
             num_microbatches,
             scattered=scattered,
+            num_tokens_per_bs=eager_rows_per_request,
         )
         if can_split_eager
         else ()
@@ -737,10 +784,20 @@ def _prepare_afd_attn_step(
             child_wire_capacities=child_wire_capacities,
         )
 
-    return False
+    return paired_graph_preflight if forward_mode.is_target_verify() else False
 
 
 def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
+    if scheduler.spec_algorithm.is_speculative():
+        forward_mode = (
+            ForwardMode(batch.global_forward_mode)
+            if batch.global_forward_mode is not None
+            else batch.forward_mode
+        )
+        if not (
+            forward_mode.is_extend_without_speculative() or batch.is_extend_in_batch
+        ):
+            return
 
     num_attn_ranks = scheduler.afd_handshake.local.num_ranks
     tokens_per_rank = _tokens_per_rank(batch, num_attn_ranks)
@@ -751,6 +808,102 @@ def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
         forward_mode=forward_mode,
         can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
     )
+
+
+def init_afd_mlp_sync_metadata(
+    forward_batch: ForwardBatch,
+    batch: ScheduleBatch,
+    model_runner,
+) -> None:
+    if not model_runner.is_draft_worker:
+        forward_batch.init_mlp_sync_metadata(batch, model_runner.device)
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens_across_dp
+        return
+
+    global_num_tokens = batch.global_num_tokens_across_dp
+    forward_batch.original_global_num_tokens_cpu = global_num_tokens
+    global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob_across_dp
+    if batch.spec_info is not None:
+        global_num_tokens, global_num_tokens_for_logprob = spec_scale_global_num_tokens(
+            batch.spec_info, global_num_tokens, global_num_tokens_for_logprob
+        )
+
+    forward_batch.global_num_tokens_cpu = global_num_tokens
+    forward_batch.global_num_tokens_gpu = torch.tensor(
+        global_num_tokens, dtype=torch.int64
+    ).to(model_runner.device, non_blocking=True)
+    forward_batch.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+    forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+        global_num_tokens_for_logprob,
+        dtype=torch.int64,
+    ).to(model_runner.device, non_blocking=True)
+
+
+def prepare_afd_attn_forward_batch(
+    scheduler: Scheduler, forward_batch: ForwardBatch
+) -> bool:
+    spec_info = forward_batch.spec_info
+    if spec_info is None or not spec_info.is_verify_input():
+        raise RuntimeError("AFD target preparation requires speculative verify input")
+
+    num_tokens_per_bs = spec_info.num_tokens_per_req
+    negotiated_num_tokens_per_bs = (
+        scheduler.afd_handshake.local.decode_num_tokens_per_bs
+    )
+    if num_tokens_per_bs != negotiated_num_tokens_per_bs:
+        raise RuntimeError(
+            "AFD target verify width changed after startup: "
+            f"runtime={num_tokens_per_bs}, "
+            f"negotiated={negotiated_num_tokens_per_bs}"
+        )
+
+    num_attn_ranks = scheduler.afd_handshake.local.num_ranks
+    global_num_tokens = forward_batch.original_global_num_tokens_cpu
+    if global_num_tokens is not None:
+        tokens_per_rank = [count * num_tokens_per_bs for count in global_num_tokens]
+        microbatch_tokens_per_rank = list(tokens_per_rank)
+        model_uses_cross_dp_layout = (
+            forward_batch.global_num_tokens_cpu is not None
+            and len(forward_batch.global_num_tokens_cpu) > 1
+        )
+        if model_uses_cross_dp_layout:
+            from sglang.srt.layers.dp_attention import DpPaddingMode
+
+            padding_mode = DpPaddingMode.get_dp_padding_mode(
+                forward_batch.is_extend_in_batch,
+                tokens_per_rank,
+            )
+            if padding_mode.is_max_len():
+                tokens_per_rank = [max(tokens_per_rank)] * len(tokens_per_rank)
+    else:
+        if num_attn_ranks != 1:
+            raise RuntimeError(
+                "AFD multi-rank target verify requires global token counts"
+            )
+        tokens_per_rank = [forward_batch.input_ids.shape[0]]
+        microbatch_tokens_per_rank = list(tokens_per_rank)
+
+    forward_mode = (
+        ForwardMode.TARGET_VERIFY if sum(tokens_per_rank) > 0 else ForwardMode.IDLE
+    )
+    paired_graph_preflight = _prepare_afd_attn_step(
+        scheduler,
+        tokens_per_rank=tokens_per_rank,
+        forward_mode=forward_mode,
+        can_run_decode_cuda_graph=forward_batch.can_run_decode_cuda_graph,
+        microbatch_tokens_per_rank=microbatch_tokens_per_rank,
+    )
+    direct_coordinator = scheduler._afd_attn_coordinator
+    if direct_coordinator is None:
+        return paired_graph_preflight
+    model_runner = scheduler.tp_worker.model_runner
+    can_run_graph = bool(
+        paired_graph_preflight
+        and forward_batch.forward_mode.is_cuda_graph()
+        and model_runner.decode_cuda_graph_runner
+        and model_runner.decode_cuda_graph_runner.can_run_graph(forward_batch)
+    )
+    return direct_coordinator.coordinate_target(can_run_graph)
 
 
 def init_afd_attn(
@@ -819,6 +972,8 @@ def init_afd_attn(
         dispatcher,
         plan,
     )
+    if scheduler.draft_worker is not None:
+        scheduler.draft_worker.init_cuda_graphs()
 
     direct_coordinator = None
     if direct_multi_attn:
@@ -834,7 +989,7 @@ def init_afd_attn(
 
     def select_local_model_graph(can_run_graph: bool) -> bool:
         if direct_coordinator is not None:
-            return direct_coordinator.coordinate(can_run_graph)
+            return direct_coordinator.select_model_graph(can_run_graph)
         decision = _decide_afd_attn_graph(
             can_run_graph,
             dispatcher,
@@ -847,4 +1002,7 @@ def init_afd_attn(
     # Every A rank makes the same dispatcher decision. Only rank 0 owns the
     # control-plane sender and publishes it to F.
     scheduler.tp_worker.model_runner.afd_control_callback = select_local_model_graph
+    scheduler.tp_worker.model_runner.afd_target_verify_prepare_callback = (
+        lambda forward_batch: prepare_afd_attn_forward_batch(scheduler, forward_batch)
+    )
     return handshake, sync_sender

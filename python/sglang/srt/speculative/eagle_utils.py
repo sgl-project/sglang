@@ -595,10 +595,19 @@ def eagle_prepare_for_verify(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
+    # AFD must prepare its communication step before EAGLE preloads graph
+    # metadata. A false result means no paired A/F graph exists for this batch.
+    afd_prepare_callback = target_worker.model_runner.afd_target_verify_prepare_callback
+    afd_graph_preflight_allowed = (
+        afd_prepare_callback(verify_forward_batch)
+        if afd_prepare_callback is not None
+        else True
+    )
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
+        afd_graph_preflight_allowed
+        and target_worker.model_runner.decode_cuda_graph_runner
         and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
             verify_forward_batch
         )

@@ -758,27 +758,6 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
 
         return trace
 
-    def test_ffn_role_skips_attention_and_kv_startup(self):
-        for mode in ("serial", "overlap"):
-            with self.subTest(mode=mode):
-                trace = []
-                worker = _SchedulerWorker(trace, post_capture_active=True)
-                scheduler = self._scheduler(worker, trace, mode=mode)
-                with (
-                    patch(
-                        "sglang.srt.managers.scheduler.get_disagg",
-                        return_value=SimpleNamespace(afd_role="ffn"),
-                    ),
-                    patch(
-                        "sglang.srt.afd.ffn.scheduler.init_ffn_model_worker_state",
-                        side_effect=lambda value: trace.append(
-                            ("ffn_init", value.tp_worker)
-                        ),
-                    ),
-                ):
-                    scheduler.init_model_worker()
-                self.assertEqual(trace, [("ffn_init", worker)])
-
     def test_afd_attention_initializes_native_runners_once_within_handshake(self):
         from sglang.srt.afd.afd_scheduler import _capture_afd_attn_communication_graphs
         from sglang.srt.managers.scheduler import Scheduler

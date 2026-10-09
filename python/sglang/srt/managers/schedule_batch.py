@@ -2364,6 +2364,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_num_tokens_across_dp: Optional[List[int]] = None
+    global_num_tokens_for_logprob_across_dp: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
@@ -3611,6 +3612,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             global_num_tokens_across_dp=self.global_num_tokens_across_dp,
+            global_num_tokens_for_logprob_across_dp=(
+                self.global_num_tokens_for_logprob_across_dp
+            ),
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,

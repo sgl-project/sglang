@@ -12,7 +12,10 @@ from typing import TYPE_CHECKING, Callable
 import torch
 import tqdm
 
-from sglang.srt.afd.afd_config import AFDRole, is_direct_afd_backend
+from sglang.srt.afd.afd_config import (
+    AFDRole,
+    is_direct_afd_backend,
+)
 from sglang.srt.afd.afd_handshake import (
     AFDFFNCapacityPlan,
 )
@@ -110,8 +113,8 @@ class AFDFFNCompute:
         self._graph_buckets: list[int] = []
         self._graph_buffers: dict[tuple[int, int, int], _GraphBuffers] = {}
         self._graph_buffer_capacity = 0
-        self._graph_compute_num_sms: int | None = None
         self._graph_backend: FullCudaGraphBackend | None = None
+        self._graph_compute_num_sms: int | None = None
 
     @property
     def layers(self) -> list[AFDMoELayer]:

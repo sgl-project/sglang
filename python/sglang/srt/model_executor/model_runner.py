@@ -437,6 +437,9 @@ class ModelRunner:
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.afd_target_verify_prepare_callback: Optional[
+            Callable[[ForwardBatch], bool]
+        ] = None
         self.afd_control_callback: Optional[Callable[[bool], bool]] = None
         self.afd_cuda_graph_batch_size: Optional[int] = None
 

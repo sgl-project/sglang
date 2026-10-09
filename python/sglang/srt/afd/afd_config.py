@@ -90,6 +90,23 @@ def resolve_overlap_sm_partition(
     return compute_num_sms, communication_num_sms
 
 
+def normalize_afd_ffn_speculative_args(server_args: ServerArgs) -> None:
+    """Ignore speculative decoding arguments on the expert-only F instance."""
+    role = afd_role_from_args(server_args)
+    if role is None or not role.is_ffn():
+        return
+
+    declare_resolution(
+        server_args,
+        "normalize_afd_ffn_speculative_args",
+        speculative_algorithm=None,
+        speculative_draft_model_path=None,
+        speculative_num_steps=None,
+        speculative_eagle_topk=None,
+        speculative_num_draft_tokens=None,
+    )
+
+
 def prepare_afd_ffn_moe_backend(server_args: ServerArgs) -> None:
     """Separate AFD's logical expert layout from the local MoE backend."""
     cfg = resolving_view(server_args)
@@ -212,6 +229,13 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
     )
 
 
+def finalize_afd_speculative_args(server_args: ServerArgs) -> None:
+    """Validate AFD after speculative arguments have been normalized."""
+    role = afd_role_from_args(server_args)
+    if role is not None:
+        _check_speculative_args(server_args, role)
+
+
 def _check_comm_sm_budget_args(
     server_args: ServerArgs, role: Optional[AFDRole]
 ) -> None:
@@ -271,8 +295,6 @@ def _check_common_args(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     unsupported = {
         "pp_size": (cfg.pp_size, 1),
-        "speculative_algorithm": (cfg.speculative_algorithm, None),
-        "enable_torch_compile": (cfg.enable_torch_compile, False),
         "enable_eplb": (cfg.enable_eplb, False),
         "enable_waterfill": (cfg.enable_waterfill, False),
         "enable_two_batch_overlap": (cfg.enable_two_batch_overlap, False),
@@ -296,6 +318,90 @@ def _check_common_args(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args, "_check_common_args", disable_shared_experts_fusion=True
         )
+
+
+def _check_speculative_args(server_args: ServerArgs, role: AFDRole) -> None:
+    cfg = resolving_view(server_args)
+    algorithm = cfg.speculative_algorithm
+    if algorithm is None:
+        return
+    if not role.is_attn() or algorithm != "EAGLE":
+        raise ValueError(
+            "AFD speculative decoding requires an attn instance with "
+            f"speculative_algorithm='EAGLE'; got role={role.value!r}, "
+            f"speculative_algorithm={algorithm!r}"
+        )
+
+    topk = cfg.speculative_eagle_topk
+    if topk != 1:
+        raise ValueError(
+            f"AFD speculative_algorithm={algorithm!r} requires "
+            f"--speculative-eagle-topk 1; got {topk!r}"
+        )
+
+    unsupported = {
+        "speculative_adaptive": (
+            cfg.speculative_adaptive,
+            False,
+        ),
+        "enable_multi_layer_eagle": (
+            cfg.enable_multi_layer_eagle,
+            False,
+        ),
+        "speculative_skip_dp_mlp_sync": (
+            cfg.speculative_skip_dp_mlp_sync,
+            False,
+        ),
+        "enable_torch_compile": (
+            cfg.enable_torch_compile,
+            False,
+        ),
+        "decoupled_spec_role": (
+            cfg.decoupled_spec_role,
+            "null",
+        ),
+    }
+    for name, (value, allowed) in unsupported.items():
+        if value != allowed:
+            raise ValueError(
+                f"AFD {algorithm} does not support "
+                f"{name}={value!r} yet (requires {allowed!r})"
+            )
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if cfg.cuda_graph_config.decode.backend != Backend.FULL:
+        raise ValueError(
+            f"AFD {algorithm} attn instance requires decode CUDA graph backend 'full'; "
+            f"got {cfg.cuda_graph_config.decode.backend!r}"
+        )
+
+    draft_moe_backend = cfg.speculative_moe_a2a_backend
+    if draft_moe_backend is None:
+        declare_resolution(
+            server_args, "_check_speculative_args", speculative_moe_a2a_backend="none"
+        )
+    elif draft_moe_backend != "none":
+        raise ValueError(
+            f"AFD {algorithm} currently requires draft-local "
+            f"--speculative-moe-a2a-backend none; got {draft_moe_backend!r}"
+        )
+
+
+def get_afd_decode_num_tokens_per_bs() -> int:
+    """Return the fixed target-forward rows per request negotiated by AFD."""
+    from sglang.srt.runtime_context import get_disagg, get_spec
+
+    role = afd_role_from_args(get_disagg())
+    spec = get_spec()
+    if role is not None and role.is_attn() and spec.speculative_algorithm == "EAGLE":
+        num_tokens_per_bs = spec.speculative_num_draft_tokens
+        if not isinstance(num_tokens_per_bs, int) or num_tokens_per_bs <= 0:
+            raise RuntimeError(
+                "AFD speculative args were not validated before building the handshake"
+            )
+        return num_tokens_per_bs
+    return 1
 
 
 def _configure_cuda_graph(server_args: ServerArgs, role: AFDRole) -> None:

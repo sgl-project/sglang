@@ -1020,7 +1020,10 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_afd_attn()
             and forward_batch is not None
-            and forward_batch.forward_mode.is_decode()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and hidden_states.shape[0] > 0
             and not get_in_autotune_dummy_run()
         ):

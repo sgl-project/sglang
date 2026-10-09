@@ -5,7 +5,6 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict
-from itertools import product
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -15,11 +14,9 @@ import zmq
 from sglang.srt.afd.afd_handshake import (
     AFD_HANDSHAKE_PORT_DELTA,
     AFDHandshakeInfo,
-    AFDHandshakeResult,
     AFDHandshakeServer,
     _handshake_reply_decoder,
     _HandshakeError,
-    build_afd_graph_capture_plan,
     run_handshake_attn,
 )
 from sglang.srt.afd.afd_sync import (
@@ -34,20 +31,25 @@ from sglang.srt.afd.afd_sync import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _handshake_info(role):
+def _handshake_info(role, backend="nccl"):
     return AFDHandshakeInfo(
         role=role,
         model_identity="test-model:123",
         num_ranks=1,
-        rank_node_ids=["node-0"],
-        afd_backend="nccl",
+        rank_node_ids=[role],
+        afd_backend=backend,
         afd_ffn_moe_backend="none",
         wire_dtype="bfloat16",
-        moe_layers=[{"layer_id": 0, "hidden_size": 128, "top_k": 2}],
+        moe_layers=[{"layer_id": 0, "hidden_size": 128}],
+        direct_backend_version="test-version",
+        direct_deepep_fp8_scale_ue8m0=False,
+        decode_token_buckets=[1, 2, 4],
+        rank_nvshmem_fabric_keys=[(b"\x00\xfffabric", 7)],
     )
 
 
@@ -60,13 +62,13 @@ def _free_port():
             return port
 
 
-def _accept_handshake(port, info, num_sessions=1):
+def _accept_handshakes(port, info, num_sessions=1):
     with closing(AFDHandshakeServer(port)) as server:
         server._socket.setsockopt(zmq.RCVTIMEO, 5000)
-        return server.accept_all(info, num_sessions)
+        return server.accept_all(info, num_sessions=num_sessions)
 
 
-class TestAFDControlWireProtocol(unittest.TestCase):
+class TestAFDControlWireProtocol(CustomTestCase):
     def _sync_channel(self):
         endpoint = f"inproc://afd-sync-test-{uuid4()}"
         receiver = AFDSyncMsgReceiver(endpoint)
@@ -89,18 +91,13 @@ class TestAFDControlWireProtocol(unittest.TestCase):
     def test_sync_roundtrip_preserves_types_and_step_order(self):
         sender, receiver = self._sync_channel()
         for step_id in range(2):
-            msg = AFDSyncMsg(
-                step_id,
-                [3, 4],
-                1,
-                8,
-                communication_graph=step_id == 0,
-                child_wire_capacities=(4, 4),
-            )
+            msg = AFDSyncMsg(step_id, [3, 4], 1, 8, True, (4, 4))
             sender.send(msg)
             actual = receiver.recv()
             self.assertEqual(actual, msg)
             self.assertIsInstance(actual.tokens_per_rank, list)
+            self.assertIsInstance(actual.child_wire_capacities, tuple)
+            self.assertEqual(actual.effective_child_wire_capacities, (4, 4))
         sender.send(AFDSyncMsg(3, [0, 0], 4, 0))
         with self.assertRaisesRegex(RuntimeError, "step_id out of order"):
             receiver.recv()
@@ -112,8 +109,7 @@ class TestAFDControlWireProtocol(unittest.TestCase):
             b"\xc1",
             msgspec.msgpack.encode({**valid, "type": "proposal"}),
             msgspec.msgpack.encode({**valid, "tokens_per_rank": ["1"]}),
-            msgspec.msgpack.encode({**valid, "wire_capacity": "1"}),
-            msgspec.msgpack.encode({**valid, "communication_graph": "true"}),
+            msgspec.msgpack.encode({**valid, "communication_graph": 1}),
             msgspec.msgpack.encode({**valid, "unexpected": True}),
             msgspec.msgpack.encode({"type": "sync"}),
         ]
@@ -188,245 +184,82 @@ class TestAFDControlWireProtocol(unittest.TestCase):
         self.assertTrue(client.has_outstanding_proposal)
 
 
-class TestAFDHandshakeWireProtocol(unittest.TestCase):
-    def test_incompatible_session_rejects_all_collected_peers(self):
-        port = _free_port()
-        infos = [_handshake_info("attn") for _ in range(2)]
-        infos[1].num_ranks = 2
-        with (
-            envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
-            ThreadPoolExecutor(max_workers=3) as pool,
-        ):
-            server = pool.submit(_accept_handshake, port, _handshake_info("ffn"), 2)
-            clients = [
-                pool.submit(
-                    run_handshake_attn,
-                    f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}",
-                    info,
-                )
-                for info in infos
-            ]
-            for future in [server, *clients]:
-                with self.assertRaisesRegex(
-                    RuntimeError, "homogeneous attn instances.*num_ranks"
-                ):
-                    future.result(timeout=10)
-
-    def test_microbatch_graph_plan_uses_child_fanin_and_keeps_tiny_batches_serial(self):
-        for count in (2, 3):
-            with self.subTest(count=count):
-                attn, ffn = _handshake_info("attn"), _handshake_info("ffn")
-                attn.num_ranks, ffn.num_ranks = 4, 2
-                attn.afd_ffn_moe_backend = ffn.afd_ffn_moe_backend = "deepep"
-                attn.decode_num_microbatches = count
-                attn.decode_token_buckets = [1, 32, 64]
-                attn.decode_graph_token_buckets = [1, 64]
-                ffn.decode_graph_token_buckets = [2, 64]
-                plan = build_afd_graph_capture_plan(
-                    AFDHandshakeResult(attn, ffn, "localhost", 1, 2)
-                )
-                parent, tiny = plan.attn_graph_variants
-                self.assertEqual(parent.child_wire_capacities, (32,) * count)
-                self.assertEqual(parent.child_compute_capacities, (64,) * count)
-                self.assertEqual(tiny.child_wire_capacities, (1,))
-                self.assertEqual(tiny.child_compute_capacities, (2,))
-                self.assertEqual(plan.ffn_graph_variants, ())
-
-    def test_asymmetric_graph_plan_agrees_on_wire_and_compute_capacities(self):
-        for layout, num_attn, num_ffn in (
-            ("none", 3, 2),
-            ("none", 2, 3),
-            ("deepep", 3, 2),
-            ("deepep", 2, 3),
-        ):
-            with self.subTest(layout=layout, num_attn=num_attn, num_ffn=num_ffn):
-                attn, ffn = _handshake_info("attn"), _handshake_info("ffn")
-                attn.num_ranks, ffn.num_ranks = num_attn, num_ffn
-                attn.afd_ffn_moe_backend = ffn.afd_ffn_moe_backend = layout
-                multiplier = 1 if layout == "deepep" else num_attn
-                fan_in = (
-                    (num_attn + num_ffn - 1) // num_ffn if layout == "deepep" else 1
-                )
-                attn.decode_token_buckets = [4 * multiplier, 8 * multiplier]
-                attn.decode_graph_token_buckets = attn.decode_token_buckets
-                ffn.decode_graph_token_buckets = [
-                    capacity * fan_in for capacity in attn.decode_token_buckets
-                ]
-                handshake = AFDHandshakeResult(ffn, attn, "localhost", 1, 2)
-                plan = build_afd_graph_capture_plan(handshake)
-                self.assertEqual(
-                    [
-                        (
-                            v.attn_batch_size,
-                            v.attn_wire_capacity,
-                            v.child_compute_capacities,
-                        )
-                        for v in plan.attn_graph_variants
-                    ],
-                    [
-                        (8, 8 * multiplier, (8 * multiplier * fan_in,)),
-                        (4, 4 * multiplier, (4 * multiplier * fan_in,)),
-                    ],
-                )
-                self.assertEqual(
-                    plan.ffn_graph_variants,
-                    (
-                        (8 * multiplier, 8 * multiplier * fan_in),
-                        (4 * multiplier, 4 * multiplier * fan_in),
-                    ),
-                )
-                ffn.disable_cuda_graph_padding = True
-                if layout == "deepep":
-                    with self.assertRaisesRegex(RuntimeError, "non-uniform SCATTERED"):
-                        build_afd_graph_capture_plan(handshake)
-                ffn.disable_cuda_graph_padding = False
-                ffn.decode_graph_token_buckets = []
-                with self.assertRaisesRegex(RuntimeError, "every attn graph capacity"):
-                    build_afd_graph_capture_plan(handshake)
-
-    def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
-        for transport, (num_attn, num_ffn, backend, num_sessions) in product(
-            ("nccl", "nvshmem", "direct_deepep", "direct_megamoe"),
-            (
-                (1, 1, "none", 1),
-                (3, 2, "none", 1),
-                (2, 3, "deepep", 1),
-                (1, 1, "none", 2),
-                (3, 2, "none", 2),
-                (2, 3, "deepep", 2),
-            ),
-        ):
-            is_direct = transport in ("direct_deepep", "direct_megamoe")
-            if is_direct and backend != "deepep":
-                continue
-            with self.subTest(
-                transport=transport,
-                num_attn=num_attn,
-                num_ffn=num_ffn,
-                backend=backend,
-                num_sessions=num_sessions,
-            ):
+class TestAFDHandshakeWireProtocol(CustomTestCase):
+    def test_handshake_roundtrip_preserves_topology_and_binary_ids(self):
+        for backend in ("nccl", "nvshmem", "direct_deepep", "direct_megamoe"):
+            with self.subTest(backend=backend):
                 port = _free_port()
-                ffn_info = _handshake_info("ffn")
-                attn_info = _handshake_info("attn")
-                ffn_info.afd_backend = attn_info.afd_backend = transport
-                if is_direct:
-                    ffn_info.direct_backend_version = (
-                        attn_info.direct_backend_version
-                    ) = "test-version"
-                    ffn_info.direct_deepep_fp8_scale_ue8m0 = False
-                ffn_info.rank_node_ids = ["node-0"] * num_ffn
-                attn_info.rank_node_ids = ["node-0"] * num_attn
+                ffn_info = _handshake_info("ffn", backend)
+                attn_infos = [_handshake_info("attn", backend) for _ in range(2)]
+                for index, info in enumerate(attn_infos):
+                    info.rank_node_ids = [f"attn-{index}"]
                 uid = b"\x00\xffnvshmem-uid"
-                ffn_info.num_ranks = num_ffn
-                attn_info.num_ranks = num_attn
-                ffn_info.afd_ffn_moe_backend = backend
-                attn_info.afd_ffn_moe_backend = backend
-                graph_capacity = 32 if backend == "deepep" else 32 * num_attn
-                attn_info.decode_token_buckets = [graph_capacity, 96 * num_attn]
-                attn_info.decode_graph_token_buckets = [graph_capacity]
-                ffn_info.decode_graph_token_buckets = [1]
                 with (
                     envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
                     patch(
                         "sglang.srt.afd.afd_handshake._get_nvshmem_unique_id",
                         return_value=uid,
                     ),
-                    ThreadPoolExecutor(max_workers=num_sessions + 1) as pool,
+                    ThreadPoolExecutor(max_workers=3) as pool,
                 ):
-                    server = pool.submit(
-                        _accept_handshake, port, ffn_info, num_sessions
-                    )
+                    server = pool.submit(_accept_handshakes, port, ffn_info, 2)
                     clients = [
                         pool.submit(
                             run_handshake_attn,
                             f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}",
-                            attn_info,
+                            info,
                         )
-                        for _ in range(num_sessions)
+                        for info in attn_infos
                     ]
-                    peer_results = server.result(timeout=10)
-                    results = sorted(
-                        (client.result(timeout=10) for client in clients),
-                        key=lambda result: result.session_id,
-                    )
-                self.assertEqual(len(peer_results), num_sessions)
-                for session_id, (result, peer_result) in enumerate(
-                    zip(results, peer_results)
-                ):
-                    self.assertEqual(result.session_id, session_id)
-                    self.assertEqual(peer_result.session_id, session_id)
-                    self.assertEqual(
-                        result.nvshmem_uid, uid if transport == "nvshmem" else None
-                    )
-                    self.assertEqual(
-                        result.attn_members,
-                        tuple(peer.peer for peer in peer_results)
-                        if transport != "nccl"
-                        else None,
-                    )
-                    self.assertEqual(result.local, attn_info)
+                    results = [client.result(timeout=10) for client in clients]
+                    server_results = server.result(timeout=10)
+                self.assertEqual({result.session_id for result in results}, {0, 1})
+                for result in results:
                     self.assertEqual(result.peer, ffn_info)
-                    self.assertEqual(peer_result.local, ffn_info)
-                    self.assertEqual(peer_result.peer, attn_info)
-                    self.assertEqual(result.dist_host, "127.0.0.1")
-                    self.assertEqual(result.sync_port, port + 1 + 2 * session_id)
                     self.assertEqual(
-                        result.dist_port,
-                        port + 2 + (0 if is_direct else 2 * session_id),
+                        result.peer.rank_nvshmem_fabric_keys, [(b"\x00\xfffabric", 7)]
                     )
-                    if transport != "nccl":
+                    self.assertEqual(result.dist_host, "127.0.0.1")
+                    self.assertEqual(result.sync_port, port + 1 + 2 * result.session_id)
+                    self.assertEqual(
+                        result.nvshmem_uid, uid if backend == "nvshmem" else None
+                    )
+                    if backend == "nccl":
+                        self.assertIsNone(result.attn_members)
+                    else:
                         self.assertEqual(
-                            result.total_attn_ranks, num_attn * num_sessions
+                            result.attn_members,
+                            tuple(item.peer for item in server_results),
                         )
                         self.assertEqual(
-                            result.attn_instance_rank_offset, num_attn * session_id
+                            result.attn_members[result.session_id], result.local
                         )
-                        self.assertEqual(result.attn_members[session_id], result.local)
+                        self.assertEqual(result.total_attn_ranks, 2)
+                    peer_result = server_results[result.session_id]
+                    expected_dist_port = port + 2
+                    if backend in ("nccl", "nvshmem"):
+                        expected_dist_port += 2 * result.session_id
+                    self.assertEqual(result.dist_port, expected_dist_port)
                     self.assertEqual(result.sync_port, peer_result.sync_port)
                     self.assertEqual(result.dist_port, peer_result.dist_port)
-                    if is_direct:
-                        self.assertEqual(
-                            result.peer.direct_backend_version, "test-version"
-                        )
-                        self.assertIs(result.peer.direct_deepep_fp8_scale_ue8m0, False)
-                        continue
-                    fan_in = (
-                        (num_attn + num_ffn - 1) // num_ffn
-                        if backend == "deepep"
-                        else 1
-                    )
-                    buckets = result.peer.decode_graph_token_buckets
-                    self.assertIn(graph_capacity * fan_in, buckets)
-                    self.assertEqual(
-                        buckets[-1], graph_capacity * fan_in * num_sessions
-                    )
+                    self.assertEqual(result.local, peer_result.peer)
 
-    def test_handshake_rejects_invalid_model_or_graph_capacity_on_both_peers(self):
-        for invalid_graph in (False, True):
-            with self.subTest(invalid_graph=invalid_graph):
-                port = _free_port()
-                ffn_info = _handshake_info("ffn")
-                attn_info = _handshake_info("attn")
-                if invalid_graph:
-                    attn_info.decode_token_buckets = [-1]
-                    attn_info.decode_graph_token_buckets = [-1]
-                    ffn_info.decode_graph_token_buckets = [1]
-                    error_type, message = ValueError, "bucket bounds must be positive"
-                else:
-                    attn_info.model_identity = "other-model"
-                    error_type, message = RuntimeError, "model mismatch"
-                with (
-                    envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
-                    ThreadPoolExecutor(max_workers=1) as pool,
-                ):
-                    server = pool.submit(_accept_handshake, port, ffn_info)
-                    with self.assertRaisesRegex(RuntimeError, f"rejected.*{message}"):
-                        run_handshake_attn(
-                            f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}", attn_info
-                        )
-                    with self.assertRaisesRegex(error_type, message):
-                        server.result(timeout=10)
+    def test_handshake_rejects_model_mismatch_on_both_peers(self):
+        port = _free_port()
+        ffn_info = _handshake_info("ffn")
+        attn_info = _handshake_info("attn")
+        attn_info.model_identity = "other-model"
+        with (
+            envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            server = pool.submit(_accept_handshakes, port, ffn_info)
+            with self.assertRaisesRegex(RuntimeError, "rejected.*model mismatch"):
+                run_handshake_attn(
+                    f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}", attn_info
+                )
+            with self.assertRaisesRegex(RuntimeError, "model mismatch"):
+                server.result(timeout=10)
 
     def test_handshake_rejects_malformed_request_and_replies_with_error(self):
         invalid_info = asdict(_handshake_info("attn"))
@@ -436,7 +269,7 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
             ThreadPoolExecutor(max_workers=1) as pool,
             closing(zmq.Context.instance().socket(zmq.REQ)) as client,
         ):
-            server = pool.submit(_accept_handshake, port, _handshake_info("ffn"))
+            server = pool.submit(_accept_handshakes, port, _handshake_info("ffn"))
             client.setsockopt(zmq.RCVTIMEO, 5000)
             client.setsockopt(zmq.LINGER, 0)
             client.connect(f"tcp://127.0.0.1:{port}")

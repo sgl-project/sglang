@@ -205,13 +205,23 @@ def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) 
     if seq_index == 0:
         return 0
 
-    offset = 0
     max_seq_len = min(seq_index, spec_info.seq_lens_cpu.shape[0])
-    for i in range(max_seq_len):
-        offset += (
-            spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
-        ) * spec_info.draft_token_num
+    offset = int(spec_info.seq_lens_cpu[:max_seq_len].sum())
+    offset += max_seq_len * spec_info.draft_token_num
+    offset *= spec_info.draft_token_num
     return offset
+
+
+def _get_mask_offset(
+    seq_index: int,
+    spec_info: EagleVerifyInput,
+    mask_offset_cache: Optional[Dict[int, int]],
+) -> int:
+    if mask_offset_cache is None:
+        return _compute_mask_offset(seq_index, spec_info)
+    if seq_index not in mask_offset_cache:
+        mask_offset_cache[seq_index] = _compute_mask_offset(seq_index, spec_info)
+    return mask_offset_cache[seq_index]
 
 
 def split_spec_info(
@@ -220,6 +230,7 @@ def split_spec_info(
     end_seq_index: int,
     start_token_index: int,
     end_token_index: int,
+    mask_offset_cache: Optional[Dict[int, int]] = None,
 ):
     if spec_info is None:
         return None
@@ -228,11 +239,15 @@ def split_spec_info(
     else:
         draft_token = None
     if spec_info.custom_mask is not None and spec_info.draft_token is not None:
-        custom_mask_start = _compute_mask_offset(start_seq_index, spec_info)
+        custom_mask_start = _get_mask_offset(
+            start_seq_index, spec_info, mask_offset_cache
+        )
         if end_seq_index == spec_info.seq_lens_cpu.shape[0]:
             custom_mask_end = spec_info.custom_mask.shape[0]
         else:
-            custom_mask_end = _compute_mask_offset(end_seq_index, spec_info)
+            custom_mask_end = _get_mask_offset(
+                end_seq_index, spec_info, mask_offset_cache
+            )
 
         if custom_mask_end > custom_mask_start:
             custom_mask = spec_info.custom_mask[custom_mask_start:custom_mask_end]

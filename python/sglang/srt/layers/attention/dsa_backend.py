@@ -328,6 +328,7 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    needs_eagle_custom_mask: bool = False
 
     def __init__(
         self,

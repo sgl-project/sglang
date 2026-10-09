@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_lora,
     get_parallel,
@@ -892,7 +893,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        if (
+            get_disagg().afd_role == "attn"
+            and batch.global_num_tokens_across_dp is not None
+        ):
+            from sglang.srt.afd.afd_scheduler import init_afd_mlp_sync_metadata
+
+            init_afd_mlp_sync_metadata(ret, batch, model_runner)
+        else:
+            ret.init_mlp_sync_metadata(batch, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)

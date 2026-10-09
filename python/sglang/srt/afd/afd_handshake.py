@@ -490,6 +490,17 @@ def build_afd_graph_capture_plan(
             f"missing_edge_to_ffn={missing_capacities}, "
             f"ffn_buckets={ffn_buckets}"
         )
+    missing_target_graph_capacities = tuple(
+        missing for missing in missing_capacities if missing[0] in attn_graph_capacities
+    )
+    if attn.decode_num_tokens_per_bs > 1 and missing_target_graph_capacities:
+        raise RuntimeError(
+            "AFD fixed multi-token target forward requires an ffn graph bucket "
+            "for every attn graph capacity: "
+            f"missing_edge_to_ffn={missing_target_graph_capacities}, "
+            f"ffn_buckets={ffn_buckets}; configure the F decode CUDA graph "
+            "capacity in expert-input rows"
+        )
 
     attn_variants: list[AFDGraphCaptureVariant] = []
     for (
@@ -618,12 +629,25 @@ def _check_compatible(local: AFDHandshakeInfo, peer: AFDHandshakeInfo) -> None:
         raise RuntimeError(
             "AFD handshake: direct_deepep requires the FFN FP8 scale encoding"
         )
-    if attn.num_ranks <= 0 or ffn.num_ranks <= 0:
-        raise RuntimeError(
-            "AFD handshake: positive rank counts are required, "
-            f"attn={attn.num_ranks} ffn={ffn.num_ranks}"
-        )
+    _check_fixed_multi_token_forward_compatible(attn, ffn)
     _check_moe_layers_compatible(attn.moe_layers, ffn.moe_layers)
+
+
+def _check_fixed_multi_token_forward_compatible(
+    attn: AFDHandshakeInfo,
+    ffn: AFDHandshakeInfo,
+) -> None:
+    _attn_wire_tokens_per_bs(attn)
+    if attn.decode_num_tokens_per_bs == 1:
+        return
+    if not attn.decode_graph_token_buckets:
+        raise RuntimeError(
+            "AFD fixed multi-token target forward requires attn FULL CUDA graphs"
+        )
+    if not ffn.decode_graph_token_buckets:
+        raise RuntimeError(
+            "AFD fixed multi-token target forward requires ffn FULL CUDA graphs"
+        )
 
 
 def _get_nvshmem_unique_id(remote_transport: str) -> bytes:
