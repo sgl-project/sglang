@@ -1566,6 +1566,10 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def next_output_finishes_by_length(self) -> bool:
+        # Whether committing one more output token reaches max_new_tokens
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+
     @property
     def extend_len(self) -> int:
         return self.extend_end - self.prefix_len
@@ -3627,20 +3631,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+            if isinstance(reqs_to_exclude, Req):
+                reqs_to_exclude = [reqs_to_exclude]
+            elif reqs_to_exclude is None:
+                reqs_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
