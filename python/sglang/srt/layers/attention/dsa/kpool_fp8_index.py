@@ -1762,6 +1762,8 @@ def kpool_write_tail_and_maybe_compress(
     write_loc: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
+    # [patch #8 ac5a621fa1 - frozen batch size from KPoolWritePlan]
+    plan_bs: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
@@ -1780,11 +1782,21 @@ def kpool_write_tail_and_maybe_compress(
     bn = key.shape[0]
     if bn == 0:
         return
-    assert bn % num_draft_tokens == 0
-    bs = bn // num_draft_tokens
+
+    # [patch #8 ac5a621fa1 - use frozen plan_bs instead of bn // num_draft_tokens] 旧代码：
+    # assert bn % num_draft_tokens == 0
+    # bs = bn // num_draft_tokens
+    bs = plan_bs
+    assert bs > 0, f"plan_bs must be positive, got {bs} (bn={bn})"
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)
     assert write_loc.shape == (bs, max_closed_pools), write_loc.shape
     assert write_loc.stride(1) == 1, write_loc.stride()
+
+    assert bn >= bs * num_draft_tokens, (
+        f"token buffer too small for the write plan: bn={bn} < "
+        f"plan_bs({bs}) * num_draft_tokens({num_draft_tokens}) = "
+        f"{bs * num_draft_tokens}"
+    )
 
     key = key.contiguous()
     score = score.contiguous()

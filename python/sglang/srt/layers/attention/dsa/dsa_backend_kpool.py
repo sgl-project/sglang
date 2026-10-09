@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+# [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] PPU flashmla_kv KPool tail support
+from sglang.srt.utils import is_ppu
+
+_is_ppu = is_ppu()
+
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
@@ -44,12 +49,17 @@ class DeepseekSparseAttnBackendKPoolMixin:
             # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
             # [PPU-int8] allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] allow FlashMLA-KV KPool tails on PPU
+            or (_is_ppu and dsa_impl == "flashmla_kv")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] 旧代码：
+            # f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            # "backend."
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
+            "backend (plus FlashMLA-KV on PPU)."
         )
 
     def _resolve_kpool_tail_backend(

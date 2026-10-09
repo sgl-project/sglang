@@ -226,6 +226,8 @@ class DSAMetadataManagementMixin:
             and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
             and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
             and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
+            # [patch #8 ac5a621fa1 - also check plan_bs equality for sibling replay]
+            and dst_plan.plan_bs == src_plan.plan_bs
         ):
             return False
         return True

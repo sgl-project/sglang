@@ -1647,6 +1647,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_loc=plan.write_loc,
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
+                plan_bs=plan.plan_bs,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
             )

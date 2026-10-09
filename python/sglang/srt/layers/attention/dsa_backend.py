@@ -3065,10 +3065,33 @@ class DeepseekSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
+        topk_length = None
+        if _is_ppu and self.dsa_index_kpool > 1:
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] KPool tails: pad the
+            # index list to a kernel-friendly multiple and pass per-item lengths.
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
+            )
+            padding = (-page_table_1.shape[-1]) % 64
+            if padding:
+                page_table_1 = torch.cat(
+                    (
+                        page_table_1,
+                        page_table_1.new_full((page_table_1.shape[0], padding), -1),
+                    ),
+                    dim=1,
+                )
+            topk_length = cache_seqlens[: page_table_1.shape[0]]
+        else:
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48 - replace strict topk assert with KPool tail padding] 旧代码：
+            # indices = page_table_1.unsqueeze(1)
+            # assert (
+            #     indices.shape[-1] == self.dsa_index_topk
+            # )  # requirement of FlashMLA decode kernel
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk
+            )  # requirement of FlashMLA decode kernel
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
@@ -3084,6 +3107,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            topk_length=topk_length,
         )
 
         if target_q_heads != num_q_heads:
@@ -3801,6 +3825,24 @@ class DeepseekSparseAttnBackend(
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
+        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] Pass topk_length to
+        # scheduler so it builds metadata based on actual per-item token counts
+        # instead of global topk=2048, eliminating the scheduler/kernel topk
+        # semantic mismatch that causes SM80 HS64 page-walk faults on odd batch
+        # sizes. Condition mirrors _forward_flashmla_kv: only PPU with kpool>1.
+        topk_length = cache_seqlens if (_is_ppu and self.dsa_index_kpool > 1) else None
+
+        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
+        # flashmla_metadata, num_splits = get_mla_metadata(
+        #     cache_seqlens=cache_seqlens,
+        #     # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
+        #     #      but the name looks like need seq_len_q?
+        #     num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
+        #     num_heads_k=1,
+        #     num_heads_q=num_heads_q,
+        #     is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+        #     topk=self.dsa_index_topk,
+        # )
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
@@ -3810,6 +3852,8 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             topk=self.dsa_index_topk,
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            topk_length=topk_length,
         )
 
         return DSAFlashMLAMetadata(

@@ -59,6 +59,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -68,6 +69,9 @@ def get_mla_metadata(
         num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
         is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
         topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
+        topk_length: (batch_size), dtype torch.int32. If provided, scheduler will use
+            per-item actual token counts instead of global topk, eliminating the
+            scheduler/kernel topk semantic mismatch that causes SM80 HS64 page-walk faults.
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.

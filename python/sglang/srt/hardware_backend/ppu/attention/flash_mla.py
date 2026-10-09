@@ -50,12 +50,19 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] kpool scheduler metadata
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return MLA tile scheduler metadata for PPU.
 
     Delegates to ``flash_mla.get_mla_metadata``.
 
     Arguments mirror :func:`sgl_kernel.flash_mla.get_mla_metadata`.
+
+    topk_length: (batch_size), torch.int32. When provided, scheduler uses
+    per-item actual token counts instead of global topk, eliminating the
+    scheduler(topk=2048) / kernel(topk_length=2..7) semantic mismatch that
+    causes SM80 HS64 page-walk faults on odd batch sizes.
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
@@ -71,6 +78,15 @@ def get_mla_metadata(
             "FlashMLA dense FP8 get_mla_metadata is not supported on PPU."
         )
 
+    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
+    # return _flashmla.get_mla_metadata(
+    #     cache_seqlens,
+    #     num_q_tokens_per_head_k,
+    #     num_heads_k,
+    #     num_heads_q=num_heads_q,
+    #     is_fp8_kvcache=is_fp8_kvcache,
+    #     topk=topk,
+    # )
     return _flashmla.get_mla_metadata(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -78,6 +94,7 @@ def get_mla_metadata(
         num_heads_q=num_heads_q,
         is_fp8_kvcache=is_fp8_kvcache,
         topk=topk,
+        topk_length=topk_length,
     )
 
 
