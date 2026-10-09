@@ -2013,11 +2013,6 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
-    ):
-        if custom_kv_indices is not None:
-            raise RuntimeError(
-                "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
-            )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             # Spec verify keeps its query block outside seq_lens, so an unset
@@ -2118,6 +2113,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                custom_kv_indices=custom_kv_indices,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2340,7 +2336,7 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool and not use_swa_source:
+        if use_sliding_window_kv_pool and not use_swa_source and custom_kv_indices is None:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
