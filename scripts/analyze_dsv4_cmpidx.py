@@ -20,7 +20,7 @@ import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID)\]")
+TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
@@ -42,8 +42,9 @@ def parse(path):
     """
     recs = defaultdict(list)
     cur_lp = None
-    with open(path, "r", errors="replace") as fh:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         for ln in fh:
+            ln = ln.lstrip("\ufeff")
             mt = TAG.search(ln)
             if not mt:
                 continue
@@ -174,9 +175,9 @@ def report_lhid(rows):
     report_group(rows, "md5", "LHID")
 
 
-def _parse_blkx(rec):
-    """Parse a ``blkx=[<block>:<hash>, ...]`` field into {block: hash}."""
-    v = rec.get("blkx")
+def _parse_blkx(rec, field="blkx"):
+    """Parse a ``<field>=[<block>:<hash>, ...]`` field into {block: hash}."""
+    v = rec.get(field)
     if not v:
         return {}
     s = v.strip().replace('"', "'")
@@ -197,7 +198,7 @@ def _parse_blkx(rec):
     return out
 
 
-def report_blkx(rows, label):
+def report_blkx(rows, label, field="blkx"):
     """Per-c128-block (``position // 128``) hit==miss verdict.
 
     A block's hash must be unique across all requests (deterministic), so a
@@ -209,7 +210,7 @@ def report_blkx(rows, label):
     groups = defaultdict(set)
     for r in rows:
         ly = _int(r, "layer")
-        for b, h in _parse_blkx(r).items():
+        for b, h in _parse_blkx(r, field).items():
             groups[(ly, b)].add(h)
     if not groups:
         print(f"  [{label}] no blkx= field (probe without per-block hashing)")
@@ -234,9 +235,26 @@ def report_blkx(rows, label):
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
 
 
+def report_uniq(rows, label, fields, key="mode"):
+    """Print the distinct tuples of ``fields`` grouped by ``key``.
+
+    For scalar probes ([IDXIN]/[LIMETA]) the whole line differs by construction
+    (hit vs miss have different lengths), so we only surface WHICH values appear
+    -- enough to see e.g. slq=1139 (hit) vs slq=17523 (miss).
+    """
+    by = defaultdict(set)
+    for r in rows:
+        by[r.get(key, "?")].add(tuple(r.get(f, "?") for f in fields))
+    for k in sorted(by, key=str):
+        vals = sorted(by[k], key=str)
+        print(f"  [{label}] {key}={k}  distinct({','.join(fields)})={len(vals)}")
+        for t in vals[:MAX_DIFF_SHOWN]:
+            print("     " + "  ".join(f"{f}={v}" for f, v in zip(fields, t)))
+
+
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -255,9 +273,23 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA"):
         rows = recs.get(tag, [])
         if not rows:
+            continue
+        if tag == "IDXIN":
+            print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")
+            report_blkx(rows, "IDXIN.q_quant", field="qblk")
+            report_blkx(rows, "IDXIN.weights", field="wblk")
+            report_uniq(rows, "IDXIN", ("slq", "slk", "qshape", "wshape"))
+            continue
+        if tag == "LIMETA":
+            print("\n== [LIMETA] metadata core-partition ==")
+            report_uniq(
+                rows, "LIMETA", ("slq", "slk", "base", "nLI", "nLD"), key="bs"
+            )
+            report_uniq(rows, "LIMETA.LI", ("LI",), key="bs")
+            report_uniq(rows, "LIMETA.LD", ("LD",), key="bs")
             continue
         if tag == "LHID":
             print("\n== [LHID] per-layer hidden (order-independent) ==")
