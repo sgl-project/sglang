@@ -11,6 +11,12 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    maybe_skinny_gemm as _maybe_skinny_gemm,
+)
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    sm121_skinny_enabled as _sm121_skinny_enabled,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
@@ -371,6 +377,13 @@ def _bf16_gemm_dispatch_impl(
         output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
             *x.shape[:-1], -1
         )
+    elif (
+        bias is None
+        and _sm121_skinny_enabled()
+        and x.is_cuda
+        and (skinny_out := _maybe_skinny_gemm(x, weight)) is not None
+    ):
+        output = skinny_out
     elif addend is not None:
         # cuBLAS folds the addend in through the GEMM beta input;
         # a bias would need a third operand, so callers must exclude it.
@@ -533,6 +546,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if bias is None and _sm121_skinny_enabled() and x.is_cuda:
+            out = _maybe_skinny_gemm(x, layer.weight)
+            if out is not None:
+                return out
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
@@ -548,6 +565,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         returning ``addend`` itself; the other routes add separately,
         leaving it untouched. Callers must treat it as consumed either way.
         """
+        if bias is None and _sm121_skinny_enabled() and x.is_cuda:
+            out = _maybe_skinny_gemm(x, layer.weight)
+            if out is not None:
+                return out.add_(addend)
         if _can_accumulate_into_addend(
             weight=layer.weight, x=x, addend=addend, bias=bias
         ):
@@ -562,6 +583,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            bias is None
+            and _sm121_skinny_enabled()
+            and x.is_cuda
+            and x.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+        ):
+            out = _maybe_skinny_gemm(x, layer.weight, out=output)
+            if out is not None:
+                return out
         if (
             _enable_bf16_splitk_gemm
             and bias is None

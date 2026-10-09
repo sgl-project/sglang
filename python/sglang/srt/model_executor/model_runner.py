@@ -1107,6 +1107,9 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        from sglang.kernels.ops.gemm.sm121_skinny_gemm import warmup_for_model
+
+        warmup_for_model(self.model)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
