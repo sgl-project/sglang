@@ -7,11 +7,13 @@ You can specify a JSON schema, [regular expression](https://en.wikipedia.org/wik
 
 SGLang supports three grammar backends:
 
-- [XGrammar](https://github.com/mlc-ai/xgrammar)(default): Supports JSON schema, regular expression, and EBNF constraints.
+- [XGrammar](https://github.com/mlc-ai/xgrammar)(default): Supports JSON schema, regular expression, EBNF, and Lark grammar constraints.
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 - [Llguidance](https://github.com/guidance-ai/llguidance): Supports JSON schema, regular expression, and EBNF constraints.
 
-We suggest using XGrammar for its better performance and utility. XGrammar currently uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
+We suggest using XGrammar for its better performance and utility. For EBNF, XGrammar uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
+
+With XGrammar, the `ebnf` parameter also accepts Lark grammars. SGLang parses the grammar as EBNF first and falls back to Lark if that fails. XGrammar supports [a dialect of Lark](https://github.com/mlc-ai/xgrammar/blob/v0.2.7/docs/defining_structures/lark_grammar.md) rather than the full language, and the grammar must define a `start` rule. Lark support requires xgrammar 0.2.6 or later; with older versions, `ebnf` accepts EBNF only.
 
 To use Outlines, simply add `--grammar-backend outlines` when launching the server.
 To use llguidance, add `--grammar-backend llguidance`  when launching the server.
