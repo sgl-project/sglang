@@ -206,7 +206,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 eps=self.layer_norm_epsilon,
                 group_size=None,
                 norm_before_gate=True,
-                device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
                 **(
                     {"activation": self.output_gate_type}
@@ -223,7 +222,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                     if self.output_gate_type is not None
                     else self.activation
                 ),
-                device=torch.get_device_module().current_device(),
                 dtype=config.torch_dtype,
             )
         )
