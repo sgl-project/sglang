@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical boundaries for the one-pass Ref2VA media path."""
 
+import base64
+import io
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -306,3 +309,82 @@ def test_reference_audio_encode_sets_forward_context(monkeypatch):
 
     assert result["rows"].shape == (8, 32)
     assert result["ref_audio_t"] == 4
+
+
+def _decode_base64_payload(write, uri):
+    output = io.BytesIO()
+    result = write(uri, uri.index(",") + 1, output)
+    return output.getvalue(), result
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 11, 12, 13, 47, 48, 49])
+@pytest.mark.parametrize("alphabet", ["standard", "urlsafe", "unpadded"])
+def test_plain_base64_material_matches_per_character_path(monkeypatch, size, alphabet):
+    # 16-character windows, so every size crosses window boundaries.
+    monkeypatch.setattr(material_io, "MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS", 16)
+    data = np.random.default_rng(size).integers(0, 256, size, dtype=np.uint8).tobytes()
+    encode = base64.urlsafe_b64encode if alphabet == "urlsafe" else base64.b64encode
+    payload = encode(data).decode()
+    if alphabet == "unpadded":
+        payload = payload.rstrip("=")
+    uri = "data:image/png;base64," + payload
+
+    assert material_io._PLAIN_BASE64_PAYLOAD.fullmatch(uri, uri.index(",") + 1)
+    plain = _decode_base64_payload(material_io._write_plain_base64, uri)
+    assert plain == _decode_base64_payload(material_io._write_escaped_base64, uri)
+    assert plain[0] == data
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ("", "payload is empty"),
+        ("A", "invalid base64 payload length"),
+        ("QQ=", "invalid base64 payload length"),
+        ("QQ===", "invalid base64 padding"),
+        ("QQ==QQ==", "data after base64 padding"),
+        ("QU*D", "invalid base64 character"),
+    ],
+)
+def test_base64_material_rejects_invalid_payloads(
+    tmp_path, monkeypatch, payload, message
+):
+    monkeypatch.setattr(material_io.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    with pytest.raises(ValueError, match=message):
+        material_io._stream_base64_material(
+            SimpleNamespace(extra={}),
+            "data:image/png;base64," + payload,
+            condition_type="image",
+            condition_index=0,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_base64_material_decodes_escapes_and_whitespace(tmp_path, monkeypatch):
+    monkeypatch.setattr(material_io.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    data = bytes(range(256)) * 4
+    payload = base64.b64encode(data).decode()
+    escaped = f"%{ord(payload[0]):02X}" + payload[1:20] + "\n " + payload[20:]
+    path = material_io._stream_base64_material(
+        SimpleNamespace(extra={}),
+        "data:image/png;base64," + escaped,
+        condition_type="image",
+        condition_index=0,
+    )
+    assert Path(path).read_bytes() == data
+
+
+def test_plain_base64_material_skips_the_per_character_loop(tmp_path, monkeypatch):
+    def per_character(*_args):
+        raise AssertionError("a plain base64 payload took the per-character path")
+
+    monkeypatch.setattr(material_io.tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+    monkeypatch.setattr(material_io, "_iter_base64_payload_bytes", per_character)
+    data = np.random.default_rng(0).integers(0, 256, 3 << 20, dtype=np.uint8).tobytes()
+    path = material_io._stream_base64_material(
+        SimpleNamespace(extra={}),
+        "data:image/png;base64," + base64.b64encode(data).decode(),
+        condition_type="image",
+        condition_index=0,
+    )
+    assert Path(path).read_bytes() == data

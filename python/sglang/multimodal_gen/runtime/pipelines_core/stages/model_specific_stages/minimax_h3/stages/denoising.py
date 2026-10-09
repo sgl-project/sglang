@@ -560,7 +560,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
@@ -1077,7 +1076,10 @@ def _maybe_prepare_vsa_h3_step_metadata(
             "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
             f"geometry; got vsa_tile_size={tile_size}."
         )
-    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    default_sparsity = server_args.pipeline_config.vsa_sparsity
+    sparsity = float(
+        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
+    )
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
     mode = str(config.get("vsa_mode", "exempt"))
