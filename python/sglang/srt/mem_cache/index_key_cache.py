@@ -42,7 +42,7 @@ class IndexKeyCache:
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         # Layers that reuse the previous layer's top-k never write index-K, so
         # they get a 0-row placeholder that keeps ``buffer`` layer-aligned.
-        return 0 if self.pool.skip_topk_layers[layer_idx] else num_pages
+        return num_pages if self.pool._should_allocate_index_layer(layer_idx) else 0
 
     def clear(self) -> None:
         del self.buffer

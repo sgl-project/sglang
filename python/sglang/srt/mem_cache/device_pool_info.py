@@ -1,11 +1,69 @@
+"""Device buffer facts consumed by host assembly and direct linker.
+
+PagedLayerBufferInfo defines the per-layer paging contract. Concrete descriptors
+own format validation and zero-copy views. Consumers own allocation, transfer
+scheduling and the decision to pack drafts. Checkpoint buffers without token
+pages are outside this contract.
+"""
+
 from __future__ import annotations
 
 from enum import Enum
+from typing import Protocol
 
 import msgspec
 import torch
+from typing_extensions import Self
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
+
+
+class PagedLayerBufferInfo(Protocol):
+    """Common capability for buffers with one tensor per owning model layer.
+
+    Binding validates descriptors before any page access. Frozen implementations
+    retain tensor references without owning their allocation or copying data.
+    """
+
+    @property
+    def buffers(self) -> tuple[torch.Tensor, ...]:
+        """Physical tensors in the same order as DevicePoolInfo.layer_ids."""
+        ...
+
+    @property
+    def page_size(self) -> int:
+        """Original tokens covered by one page, before index compression."""
+        ...
+
+    @property
+    def page_bytes(self) -> int:
+        """Bytes per page of one layer, used for host sizing after validation."""
+        ...
+
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        """Binding/adapter entry check for tensor format and optional layer count.
+
+        Raise ValueError with the failing field and actual value. Layer IDs are
+        model layer numbers, including PP offsets, in physical-buffer order.
+        """
+        ...
+
+    def page_views(self) -> tuple[torch.Tensor, ...]:
+        """Linker transfer views: contiguous uint8 [page, page_bytes], zero-copy.
+
+        Call after validate(). Return one view per owning layer. Exclude any
+        trailing rows that do not form a complete page.
+        """
+        ...
+
+    def packed_with(self, drafts: tuple[Self, ...]) -> Self:
+        """Host packed-draft assembly of validated, same-format descriptors.
+
+        Preserve target-then-draft order and tensor identity. Return a validated
+        descriptor of the same type or raise ValueError for incompatible formats.
+        Linker handles heterogeneous buffers separately and does not call this.
+        """
+        ...
 
 
 class IndexKeyFormat(Enum):
@@ -26,32 +84,52 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     page_size: int
     buffers: tuple[torch.Tensor, ...]
 
+    @property
+    def page_bytes(self) -> int:
+        buffer = self.buffers[0]
+        return self.page_size * buffer.shape[-1] * buffer.element_size()
+
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         if layer_ids is not None and len(layer_ids) != len(self.buffers):
             raise ValueError(
                 f"{len(layer_ids)} model layers must match {len(self.buffers)} buffers"
             )
-        if self.page_size <= 0 or not self.buffers:
-            raise ValueError(
-                "MLA buffers require a positive page size and at least one tensor"
-            )
+        if self.page_size <= 0:
+            raise ValueError(f"MLA page_size must be positive, got {self.page_size}")
+        if not self.buffers:
+            raise ValueError("MLA buffers must contain at least one tensor")
         first = self.buffers[0]
-        for buffer in self.buffers:
+        for layer, buffer in enumerate(self.buffers):
             if (
                 buffer.ndim != 3
                 or buffer.shape[0] <= 0
                 or buffer.shape[1] != 1
                 or buffer.shape[2] < 1
-                or not buffer.is_contiguous()
-                or buffer.shape[1:] != first.shape[1:]
-                or buffer.dtype != first.dtype
-                or buffer.device != first.device
             ):
                 raise ValueError(
-                    "MLA buffers require contiguous [token, 1, width] with matching rows, dtype and device"
+                    f"MLA buffer[{layer}]: expected [token > 0, 1, width > 0], "
+                    f"got shape={tuple(buffer.shape)}"
+                )
+            if not buffer.is_contiguous():
+                raise ValueError(
+                    f"MLA buffer[{layer}]: expected contiguous tensor, "
+                    f"got stride={buffer.stride()}"
+                )
+            if buffer.shape[1:] != first.shape[1:]:
+                raise ValueError(
+                    f"MLA buffer[{layer}]: expected row shape={tuple(first.shape[1:])}, "
+                    f"got {tuple(buffer.shape[1:])}"
+                )
+            if buffer.dtype != first.dtype:
+                raise ValueError(
+                    f"MLA buffer[{layer}]: expected dtype={first.dtype}, got {buffer.dtype}"
+                )
+            if buffer.device != first.device:
+                raise ValueError(
+                    f"MLA buffer[{layer}]: expected device={first.device}, got {buffer.device}"
                 )
 
-    def page_buffers(self) -> tuple[torch.Tensor, ...]:
+    def page_views(self) -> tuple[torch.Tensor, ...]:
         """Zero-copy byte views of complete pages, after validate()."""
         pages = []
         for buffer in self.buffers:
@@ -106,7 +184,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
         page_bytes = self.page_bytes
-        for buffer in buffers:
+        for layer, buffer in enumerate(buffers):
             if (
                 buffer.dtype != torch.uint8
                 or buffer.ndim != 2
@@ -116,12 +194,12 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 or buffer.device != buffers[0].device
             ):
                 raise ValueError(
-                    f"expected contiguous uint8 index pages of {page_bytes} bytes "
+                    f"index buffer[{layer}]: expected contiguous uint8 index pages of {page_bytes} bytes "
                     f"on {buffers[0].device}, got {tuple(buffer.shape)} "
-                    f"{buffer.dtype} on {buffer.device}"
+                    f"{buffer.dtype} on {buffer.device}, stride={buffer.stride()}"
                 )
 
-    def page_buffers(self) -> tuple[torch.Tensor, ...]:
+    def page_views(self) -> tuple[torch.Tensor, ...]:
         return self.buffers
 
     def packed_with(self, drafts: tuple[IndexKeyBufferInfo, ...]) -> IndexKeyBufferInfo:
@@ -154,6 +232,9 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     # Model layer IDs, including the PP stage offset, in buffer-axis order.
     layer_ids: tuple[int, ...]
     buffer_info: DeviceBufferInfo
+    # (reader model layer ID, owner model layer ID), including PP offsets.
+    # Readers reuse owner buffers and are excluded from layer_ids.
+    # Current transfer binding rejects nonempty mappings.
     shared_layer_to_owner: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:

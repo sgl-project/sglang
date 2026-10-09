@@ -95,6 +95,9 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         dsa_device_pool.get_device_pool_infos = lambda: (
             DSATokenToKVPool.get_device_pool_infos(dsa_device_pool)
         )
+        dsa_device_pool._should_allocate_index_layer = lambda layer: (
+            DSATokenToKVPool._should_allocate_index_layer(dsa_device_pool, layer)
+        )
         indexer_host = DSAIndexerPoolHost(
             decl=make_dsa_indexer_pool_decl(dsa_device_pool),
             anchor_host=mla_host,

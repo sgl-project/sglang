@@ -20,8 +20,9 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLABufferInfo
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_buffer_binding import pack_host_pool_buffers
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -196,6 +197,51 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self._buffer_info is not None:
             return self._buffer_info.buffers[0].device
         return torch.device(self.device_pool.device)
+
+    @classmethod
+    def from_pool_infos(
+        cls,
+        *,
+        target: DevicePoolInfo,
+        drafts: tuple[DevicePoolInfo, ...],
+        target_model_layer_ids: tuple[int, ...],
+        device_capacity: int,
+        host_to_device_ratio: float,
+        host_size: float,
+        layout: str,
+        pin_memory: bool = True,
+        allocator_type: str = "default",
+        pool_label: str = "kv",
+    ) -> MLATokenToKVPoolHost:
+        """Host assembly entry for MLA-format target and packed draft descriptors.
+
+        The caller supplies capacity and model-layer order. This constructor
+        neither reads a device pool nor selects model-specific assembly policy.
+        """
+        buffers, layer_mapping = pack_host_pool_buffers(
+            target=target,
+            drafts=drafts,
+            target_model_layer_ids=target_model_layer_ids,
+        )
+        if not isinstance(buffers, MLABufferInfo):
+            raise TypeError(
+                f"MLA host requires MLABufferInfo, got {type(buffers).__name__}"
+            )
+        if layer_mapping != {layer: layer for layer in range(len(buffers.buffers))}:
+            raise ValueError(
+                f"MLA host requires an identity transfer-layer mapping, got {layer_mapping}"
+            )
+        return cls.from_buffer_info(
+            buffers,
+            target_layer_num=len(target_model_layer_ids),
+            device_capacity=device_capacity,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            allocator_type=allocator_type,
+            pool_label=pool_label,
+        )
 
     @classmethod
     def from_buffer_info(

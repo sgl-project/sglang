@@ -2038,6 +2038,16 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Describe owned buffers for host assembly and direct linker.
+
+        See device_pool_info.py for the buffer capability contract. Entries use
+        model layer IDs in physical-buffer order and retain tensor references.
+        Unmigrated pools raise instead of claiming an empty buffer inventory.
+        Assembly must select a supported path before calling this interface.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no device pool infos")
+
     def host_pool_decls(self):
         """Host pools HiCache keeps for the buffers this device pool (and its
         sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
@@ -4185,6 +4195,10 @@ class HybridLinearKVPool(KVCache):
                 if full_kv_pool_class is not None
                 else DSATokenToKVPool
             )
+            # Other DSA implementations retain their existing constructor contract.
+            model_layer_kwargs = {}
+            if DSAPoolClass is DSATokenToKVPool:
+                model_layer_kwargs["model_layer_ids"] = tuple(full_attention_layer_ids)
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4201,11 +4215,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
-                **(
-                    {"model_layer_ids": tuple(full_attention_layer_ids)}
-                    if DSAPoolClass is DSATokenToKVPool
-                    else {}
-                ),
+                **model_layer_kwargs,
             )
         else:
             MLAPoolClass = (
@@ -5117,6 +5127,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         model_layer_ids: Optional[tuple[int, ...]] = None,
     ):
+        if model_layer_ids is not None and len(model_layer_ids) != layer_num:
+            raise ValueError(
+                f"model_layer_ids has {len(model_layer_ids)} entries, "
+                f"expected layer_num={layer_num}"
+            )
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -5219,25 +5234,33 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 buffers=tuple(self.kv_buffer),
             ),
         )
-        owned_layers = tuple(
-            layer for layer, skip in enumerate(self.skip_topk_layers) if not skip
+        # Local buffer positions, translated to model layer IDs below.
+        index_buffer_layer_ids = tuple(
+            layer
+            for layer in range(self.layer_num)
+            if self._should_allocate_index_layer(layer)
         )
-        if not owned_layers or not self.index_key_cache.buffer:
+        if not index_buffer_layer_ids or not self.index_key_cache.buffer:
             return (kv_info,)
         index_info = DevicePoolInfo(
             pool_name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
-            layer_ids=tuple(self.model_layer_ids[layer] for layer in owned_layers),
+            layer_ids=tuple(
+                self.model_layer_ids[layer] for layer in index_buffer_layer_ids
+            ),
             buffer_info=IndexKeyBufferInfo(
                 page_size=self.page_size,
                 compress_ratio=self.index_kpool,
-                buffers=tuple(self.index_key_cache.buffer[i] for i in owned_layers),
+                buffers=tuple(
+                    self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
+                ),
                 format=IndexKeyFormat.DSA_FP8,
             ),
         )
         return kv_info, index_info
 
     def host_pool_decls(self):
+        # Compatibility bridge until host assembly no longer consumes declarations.
         from sglang.srt.mem_cache.pool_host.dsa import make_dsa_host_pool_decls
 
         return make_dsa_host_pool_decls(self)

@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
-from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -20,15 +19,14 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.pool_assembly_policy import (
+    can_use_dsa_buffer_infos,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
-)
-from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_host_pool_buffers,
-    can_use_dsa_buffer_infos,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
@@ -161,6 +159,8 @@ def build_kv_host_pool(
     check_packed_kv_rows(
         kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
     )
+    # N1 enables descriptor construction only for the validated DSA path.
+    # The host constructor itself depends on MLA format, not the model family.
     if (
         use_mla
         and override_kv_cache_dim == kv_pool.kv_cache_dim
@@ -170,12 +170,34 @@ def build_kv_host_pool(
     ):
         if page_size != kv_pool.page_size:
             raise ValueError("DSA transfer page coverage must match its buffer input")
-        return build_dsa_kv_host_from_infos(
-            kv_pool,
-            drafts=mtp_draft_device_pools,
-            host_size=host_size,
+        target_info = next(
+            info
+            for info in kv_pool.get_device_pool_infos()
+            if info.pool_name is PoolName.KV
+        )
+        draft_infos = tuple(
+            next(
+                info
+                for info in draft.get_device_pool_infos()
+                if info.pool_name is PoolName.KV
+            )
+            for draft in mtp_draft_device_pools
+        )
+        host = kv_host_pool_cls.from_pool_infos(
+            target=target_info,
+            drafts=draft_infos,
+            target_model_layer_ids=target_info.layer_ids,
+            device_capacity=kv_pool.size,
+            host_to_device_ratio=get_memory().hicache_ratio,
+            host_size=get_memory().hicache_size if host_size is None else host_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
             pool_label=pool_label,
         )
+        host.start_layer, host.end_layer = kv_pool.start_layer, kv_pool.end_layer
+        return host
+    # Unmigrated formats, backends, DCP and explicit row overrides keep the
+    # existing constructor until their transfer paths support buffer descriptors.
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -199,47 +221,6 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
-
-
-def build_dsa_kv_host_from_infos(
-    pool: DSATokenToKVPool,
-    *,
-    drafts: tuple[DSATokenToKVPool, ...],
-    host_size: float | None,
-    pool_label: str = "kv",
-) -> MLATokenToKVPoolHost:
-    target = next(
-        info for info in pool.get_device_pool_infos() if info.pool_name is PoolName.KV
-    )
-    draft_infos = tuple(
-        next(
-            info
-            for info in draft.get_device_pool_infos()
-            if info.pool_name is PoolName.KV
-        )
-        for draft in drafts
-    )
-    buffers, layer_mapping = bind_host_pool_buffers(
-        target=target,
-        drafts=draft_infos,
-        target_model_layer_ids=target.layer_ids,
-    )
-    if layer_mapping != {layer: layer for layer in range(len(buffers.buffers))}:
-        raise ValueError("MLA host buffers require an identity device-layer mapping")
-    if not isinstance(buffers, MLABufferInfo):
-        raise TypeError("DSA main KV assembly requires MLA buffers")
-    host = MLATokenToKVPoolHost.from_buffer_info(
-        buffers,
-        target_layer_num=pool.layer_num,
-        device_capacity=pool.size,
-        host_to_device_ratio=get_memory().hicache_ratio,
-        host_size=get_memory().hicache_size if host_size is None else host_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label=pool_label,
-    )
-    host.start_layer, host.end_layer = pool.start_layer, pool.end_layer
-    return host
 
 
 def _split_hicache_size(
@@ -1520,7 +1501,7 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     pool = draft_kv_pool
@@ -2127,7 +2108,6 @@ class _PlainKvStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.memory_pool import (
-            DSATokenToKVPool,
             HybridLinearKVPool,
             MiniMaxSparseKVPool,
         )
@@ -2189,7 +2169,6 @@ class _PlainKvStrategy(StackStrategy):
 
 class _DsaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
         return isinstance(kvcache, DSATokenToKVPool) and components == {
             ComponentType.FULL

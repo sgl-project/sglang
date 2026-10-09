@@ -13,6 +13,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.pool_assembly_policy import (
+    can_use_dsa_buffer_infos,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
 
@@ -406,8 +409,7 @@ def _build_dsa_device_pool_group(
             f"{kvcache.page_size} != {page_size}."
         )
     from sglang.srt.mem_cache.pool_buffer_binding import (
-        bind_pool_layers,
-        can_use_dsa_buffer_infos,
+        build_transfer_layer_mapping,
     )
 
     if not can_use_dsa_buffer_infos(
@@ -431,7 +433,7 @@ def _build_dsa_device_pool_group(
     entries = []
     for info in target_infos:
         drafts = tuple(infos[info.pool_name] for infos in draft_infos)
-        layer_mapping = bind_pool_layers(
+        layer_mapping = build_transfer_layer_mapping(
             target=info,
             drafts=drafts,
             target_model_layer_ids=target_model_layer_ids,
@@ -449,7 +451,7 @@ def _build_dsa_device_pool_group(
         page_buffers = tuple(
             buffer
             for source in (info, *drafts)
-            for buffer in source.buffer_info.page_buffers()
+            for buffer in source.buffer_info.page_views()
         )
         entries.append(
             DevicePoolEntry(

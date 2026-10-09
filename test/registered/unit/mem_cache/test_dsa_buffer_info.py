@@ -2,6 +2,12 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import (
+    DevicePoolInfo,
+    IndexKeyBufferInfo,
+    IndexKeyFormat,
+    MLABufferInfo,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import prepare_host_pool_config
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -10,7 +16,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_host_pool_buffers,
+    pack_host_pool_buffers,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -23,6 +29,73 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDSABufferInfoTransfer(CustomTestCase):
+    def test_format_constructors_need_no_device_pool(self):
+        # Model coordinates and buffer ownership must suffice without a DSA object.
+        def kv(layers):
+            return DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=layers,
+                buffer_info=MLABufferInfo(
+                    page_size=64,
+                    buffers=tuple(
+                        torch.zeros((320, 1, 160), device="cuda", dtype=torch.bfloat16)
+                        for _ in layers
+                    ),
+                ),
+            )
+
+        def index(layers):
+            return DevicePoolInfo(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                layer_ids=layers,
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=64,
+                    compress_ratio=1,
+                    format=IndexKeyFormat.DSA_FP8,
+                    buffers=tuple(
+                        torch.zeros((5, 8448), device="cuda", dtype=torch.uint8)
+                        for _ in layers
+                    ),
+                ),
+            )
+
+        target, draft = kv((21, 25)), kv((0,))
+        host = MLATokenToKVPoolHost.from_pool_infos(
+            target=target,
+            drafts=(draft,),
+            target_model_layer_ids=(21, 25),
+            device_capacity=256,
+            host_to_device_ratio=2,
+            host_size=0,
+            layout="layer_first",
+            pin_memory=False,
+        )
+        try:
+            self.assertIsNone(host.device_pool)
+            self.assertEqual(host.layer_num, 3)
+            self.assertEqual(host.target_layer_num, 2)
+            self.assertIs(host._buffer_info.buffers[2], draft.buffer_info.buffers[0])
+            index_host = DSAIndexerPoolHost.from_pool_infos(
+                target=index((25,)),
+                drafts=(index((0,)),),
+                target_model_layer_ids=(21, 25),
+                transfer_page_size=64,
+                num_host_pages=host.page_num,
+                layout=host.layout,
+                pin_memory=False,
+            )
+            try:
+                self.assertIsNone(index_host.device_pool)
+                self.assertEqual(index_host._device_to_host_layer, {1: 0, 2: 1})
+                self.assertEqual(index_host.target_layer_num, 1)
+                self.assertEqual(index_host.size, host.size)
+            finally:
+                index_host.destroy()
+        finally:
+            host.destroy()
+
     def test_hybrid_keeps_model_ids_separate_from_compact_transfer_layers(self):
         pool = HybridLinearKVPool(
             size=256,
@@ -46,7 +119,7 @@ class TestDSABufferInfoTransfer(CustomTestCase):
         self.assertEqual(kv.layer_ids, (21, 25, 29))
         self.assertEqual(index.layer_ids, (21, 29))
         self.assertEqual(pool.host_pool_decls()[1].owned_device_layers, (0, 2))
-        packed, mapping = bind_host_pool_buffers(
+        packed, mapping = pack_host_pool_buffers(
             target=index,
             drafts=(),
             target_model_layer_ids=kv.layer_ids,
@@ -276,7 +349,7 @@ class TestDSABufferInfoTransfer(CustomTestCase):
                     drafts = [self._pool(ratio=ratio, layers=1) for _ in range(2)]
                     target_info = target.get_device_pool_infos()[1]
                     self.assertEqual(target_info.pool_name, PoolName.INDEXER)
-                    info, mapping = bind_host_pool_buffers(
+                    info, mapping = pack_host_pool_buffers(
                         target=target_info,
                         drafts=tuple(
                             pool.get_device_pool_infos()[1] for pool in drafts

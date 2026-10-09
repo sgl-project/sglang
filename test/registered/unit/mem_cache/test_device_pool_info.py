@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyBufferInfo,
     IndexKeyFormat,
     MLABufferInfo,
+    PagedLayerBufferInfo,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_buffer_binding import (
-    bind_host_pool_buffers,
+    pack_host_pool_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,6 +63,44 @@ class TestDevicePoolInfo(CustomTestCase):
             )
         )
 
+    def test_page_views_preserve_bytes_and_alias_complete_pages(self):
+        # Linker must transfer original bytes without copying or including a tail.
+        mla = MLABufferInfo(
+            page_size=4,
+            buffers=(torch.arange(27, dtype=torch.bfloat16).reshape(9, 1, 3),),
+        )
+        for buffers in (mla, _pool_infos()[1].buffer_info):
+            descriptor: PagedLayerBufferInfo = buffers
+            descriptor.validate()
+            for original, pages in zip(descriptor.buffers, descriptor.page_views()):
+                with self.subTest(descriptor=type(descriptor).__name__):
+                    self.assertEqual(pages.dtype, torch.uint8)
+                    self.assertEqual(pages.shape[1], descriptor.page_bytes)
+                    self.assertEqual(pages.data_ptr(), original.data_ptr())
+                    self.assertTrue(pages.is_contiguous())
+            self.assertEqual(len(descriptor.page_views()), len(descriptor.buffers))
+        self.assertEqual(mla.page_views()[0].shape, (2, 24))
+        self.assertTrue(
+            torch.equal(
+                mla.page_views()[0].flatten(),
+                mla.buffers[0][:8].view(torch.uint8).flatten(),
+            )
+        )
+
+    def test_mla_validation_identifies_bad_buffer_and_field(self):
+        good = torch.empty((8, 1, 3))
+        cases = (
+            (torch.empty((8, 3)), "shape="),
+            (torch.empty((8, 1, 4)), "row shape="),
+            (torch.empty((8, 1, 3), dtype=torch.float16), "dtype="),
+            (torch.empty((16, 1, 3))[::2], "stride="),
+        )
+        for bad, field in cases:
+            with self.subTest(field=field), self.assertRaises(ValueError) as error:
+                MLABufferInfo(page_size=4, buffers=(good, bad)).validate()
+            self.assertIn("MLA buffer[1]", str(error.exception))
+            self.assertIn(field, str(error.exception))
+
     def test_model_layers_match_physical_layers_for_each_buffer_format(self):
         from msgspec.structs import replace
 
@@ -71,7 +110,7 @@ class TestDevicePoolInfo(CustomTestCase):
                     self.subTest(pool=info.pool_name, layers=layers),
                     self.assertRaisesRegex(ValueError, "model layers must match"),
                 ):
-                    bind_host_pool_buffers(
+                    pack_host_pool_buffers(
                         target=replace(info, layer_ids=layers),
                         drafts=(),
                         target_model_layer_ids=(20, 21, 22, 23),
@@ -86,7 +125,7 @@ class TestDevicePoolInfo(CustomTestCase):
                 self.subTest(pool=target.pool_name),
                 self.assertRaisesRegex(ValueError, "model layers must match"),
             ):
-                bind_host_pool_buffers(
+                pack_host_pool_buffers(
                     target=target,
                     drafts=(draft,),
                     target_model_layer_ids=(20, 21, 22),
@@ -101,7 +140,7 @@ class TestDevicePoolInfo(CustomTestCase):
             target, buffer_info=replace(target.buffer_info, buffers=strided)
         )
         with self.assertRaisesRegex(ValueError, "contiguous"):
-            bind_host_pool_buffers(
+            pack_host_pool_buffers(
                 target=target,
                 drafts=(),
                 target_model_layer_ids=(20, 21, 22),
@@ -138,7 +177,7 @@ class TestDevicePoolInfo(CustomTestCase):
     def test_packed_layer_coordinates_preserve_source_context(self):
         target = _pool_infos()[1]
         draft = _pool_infos(layers=(0,))[1]
-        packed, mapping = bind_host_pool_buffers(
+        packed, mapping = pack_host_pool_buffers(
             target=target,
             drafts=(draft, draft),
             target_model_layer_ids=(20, 21, 22),
@@ -149,6 +188,33 @@ class TestDevicePoolInfo(CustomTestCase):
         self.assertEqual(target.layer_ids, (20, 22))
         self.assertEqual(draft.layer_ids, (0,))
 
+    def test_packed_draft_errors_identify_the_entry_and_field(self):
+        from msgspec.structs import replace
+
+        target = _pool_infos()[1]
+        draft = _pool_infos(layers=(0,))[1]
+        cases = (
+            (replace(draft, pool_name=PoolName.KV), "pool_name="),
+            (replace(draft, indices_from_pool=PoolName.DRAFT), "indices_from_pool="),
+            (
+                replace(draft, buffer_info=_pool_infos()[0].buffer_info),
+                "buffer_info type=",
+            ),
+            (_pool_infos(layers=(0, 1))[1], "layer_ids=(0, 1)"),
+            (replace(draft, shared_layer_to_owner=((1, 0),)), "shared_layer_to_owner"),
+            (_pool_infos(layers=(0,), page_size=128, ratio=2)[1], "page_size="),
+        )
+        for invalid, field in cases:
+            with self.subTest(field=field), self.assertRaises(ValueError) as error:
+                pack_host_pool_buffers(
+                    target=target,
+                    drafts=(draft, invalid),
+                    target_model_layer_ids=(20, 21, 22),
+                )
+            self.assertIn("draft[1]", str(error.exception))
+            self.assertIn(field, str(error.exception))
+            self.assertIn("got", str(error.exception))
+
     def test_packed_pages_do_not_match_by_bytes_alone(self):
         target = _pool_infos()[1]
         draft = _pool_infos(layers=(0,), page_size=128, ratio=2)[1]
@@ -157,7 +223,7 @@ class TestDevicePoolInfo(CustomTestCase):
             draft.buffer_info.buffers[0].shape,
         )
         with self.assertRaisesRegex(ValueError, "page coverage differs"):
-            bind_host_pool_buffers(
+            pack_host_pool_buffers(
                 target=target,
                 drafts=(draft,),
                 target_model_layer_ids=(20, 21, 22),
@@ -246,8 +312,10 @@ class TestDevicePoolInfo(CustomTestCase):
                             previous.prepare_locations(indices), layer
                         ),
                     )
-        with self.assertRaisesRegex(ValueError, "matching rows"):
-            bind_host_pool_buffers(
+        with self.assertRaisesRegex(
+            ValueError, r"MLA buffer\[2\]: expected row shape="
+        ):
+            pack_host_pool_buffers(
                 target=target.get_device_pool_infos()[0],
                 drafts=tuple(draft.get_device_pool_infos()[0] for draft in drafts),
                 target_model_layer_ids=target.model_layer_ids,

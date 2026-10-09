@@ -4,6 +4,10 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+from sglang.srt.mem_cache.hybrid_cache.pool_assembly_policy import (
+    can_use_dsa_buffer_infos,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -18,6 +22,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, IndexKeyBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.pool_buffer_binding import pack_host_pool_buffers
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -83,11 +88,6 @@ class DSAIndexerHostPoolBuilder:
         packed_draft_device_pools: tuple[DSATokenToKVPool, ...],
     ) -> DSAIndexerPoolHost:
         target = decl.device_pool
-        from sglang.srt.mem_cache.pool_buffer_binding import (
-            bind_host_pool_buffers,
-            can_use_dsa_buffer_infos,
-        )
-
         if not anchor_host._is_dummy and can_use_dsa_buffer_infos(
             target,
             packed_draft_device_pools,
@@ -103,17 +103,11 @@ class DSAIndexerHostPoolBuilder:
                 )
                 for pool in packed_draft_device_pools
             )
-            buffer_info, layer_mapping = bind_host_pool_buffers(
+            host = DSAIndexerPoolHost.from_pool_infos(
                 target=target_info,
                 drafts=draft_infos,
                 target_model_layer_ids=infos[PoolName.KV].layer_ids,
-            )
-            if buffer_info.page_size != anchor_host.page_size:
-                raise ValueError("DSA index page coverage must match the host KV page")
-            host = DSAIndexerPoolHost.from_buffer_info(
-                buffer_info,
-                layer_mapping=layer_mapping,
-                target_device_layer_num=target.layer_num,
+                transfer_page_size=anchor_host.page_size,
                 num_host_pages=anchor_host.page_num,
                 layout=anchor_host.layout,
                 allocator_type=allocator_type,
@@ -367,6 +361,48 @@ class DSAIndexerPoolHost(HostKVCache):
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    @classmethod
+    def from_pool_infos(
+        cls,
+        *,
+        target: DevicePoolInfo,
+        drafts: tuple[DevicePoolInfo, ...],
+        target_model_layer_ids: tuple[int, ...],
+        transfer_page_size: int,
+        num_host_pages: int,
+        layout: str,
+        allocator_type: str = "default",
+        pin_memory: bool = True,
+    ) -> DSAIndexerPoolHost:
+        """Build index host pages from descriptors and the anchor's page geometry.
+
+        The existing declaration builder supplies dependency-derived capacity.
+        Buffer packing and transfer-layer mapping use the common composition path.
+        """
+        buffers, layer_mapping = pack_host_pool_buffers(
+            target=target,
+            drafts=drafts,
+            target_model_layer_ids=target_model_layer_ids,
+        )
+        if not isinstance(buffers, IndexKeyBufferInfo):
+            raise TypeError(
+                f"index host requires IndexKeyBufferInfo, got {type(buffers).__name__}"
+            )
+        if buffers.page_size != transfer_page_size:
+            raise ValueError(
+                f"index page_size={buffers.page_size} must match "
+                f"anchor page_size={transfer_page_size}"
+            )
+        return cls.from_buffer_info(
+            buffers,
+            layer_mapping=layer_mapping,
+            target_device_layer_num=len(target_model_layer_ids),
+            num_host_pages=num_host_pages,
+            layout=layout,
+            allocator_type=allocator_type,
+            pin_memory=pin_memory,
+        )
 
     @classmethod
     def from_buffer_info(
