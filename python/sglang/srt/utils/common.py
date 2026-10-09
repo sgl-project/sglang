@@ -1008,15 +1008,42 @@ def is_mnnvl_fabric_device() -> bool:
     return any(tag in name for tag in ("GB200", "GB300"))
 
 
-def is_fi_a2a_supported(
+def fi_a2a_platform_blocker(
     *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
+) -> Optional[str]:
+    """Why this host cannot run the fused fi_a2a DCP reduce, or None if it can.
+
+    Runs at argument resolution, so it finds FlashInfer's op without importing it.
+    """
     if not get_platform().is_sm100:
+        return "requires a Blackwell (SM100-family) GPU"
+    if not is_mnnvl_fabric_device():
+        tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
+        if tp_size_per_node % dcp_size != 0:
+            return (
+                "requires the DCP group inside one NVLink domain (MNNVL fabric or "
+                f"one node); dcp_size={dcp_size} does not divide the "
+                f"{tp_size_per_node} TP ranks per node (tp_size={tp_size}, "
+                f"pp_size={pp_size}, nnodes={nnodes})"
+            )
+    if not _flashinfer_has_fused_dcp_reduce():
+        return (
+            "requires a FlashInfer build that provides "
+            "flashinfer.comm.decode_cp_a2a_lse_reduce"
+        )
+    return None
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_has_fused_dcp_reduce() -> bool:
+    # A top-level find_spec locates the package without importing it.
+    spec = find_spec("flashinfer")
+    if spec is None or spec.submodule_search_locations is None:
         return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
+    return any(
+        os.path.isfile(os.path.join(path, "comm", "dcp_lse_reduce.py"))
+        for path in spec.submodule_search_locations
+    )
 
 
 @lru_cache(maxsize=1)

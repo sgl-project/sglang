@@ -398,41 +398,6 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                     torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
                 )
 
-    def test_pack_serves_the_split_peer_inside_layout(self):
-        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
-
-        for N, B, H_per_rank, D in ((2, 4, 8, 128), (4, 1, 16, 512)):
-            with self.subTest(N=N, B=B, H_per_rank=H_per_rank, D=D):
-                H = H_per_rank * N
-                out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-                lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-                partial_o = torch.empty(
-                    B, H_per_rank, N, D, dtype=torch.bfloat16, device=self.device
-                )
-                stats = torch.zeros(
-                    B, H_per_rank, N, 2, dtype=torch.float32, device=self.device
-                )
-                dcp_pack_a2a_send(
-                    out,
-                    lse,
-                    partial_o.permute(2, 0, 1, 3),
-                    stats[..., 0].permute(2, 0, 1),
-                )
-
-                want_o = out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3)
-                want_lse = lse.view(B, N, H_per_rank).permute(0, 2, 1)
-                self.assertTrue(
-                    torch.equal(
-                        partial_o.view(torch.uint8),
-                        want_o.contiguous().view(torch.uint8),
-                    )
-                )
-                self.assertTrue(torch.equal(stats[..., 0], want_lse))
-                self.assertTrue(
-                    torch.equal(stats[..., 1], torch.zeros_like(stats[..., 1]))
-                )
-
     def test_buffers_have_fixed_data_ptrs(self):
         """Pre-allocated buffer data_ptr must not change -- required for graph replay."""
         from sglang.srt.layers.dcp import dcp_a2a_lse_reduce

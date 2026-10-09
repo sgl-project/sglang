@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
+    fi_a2a_blocker,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -247,13 +248,13 @@ def handle_decode_context_parallelism(server_args: Any):
             "requires --dcp-size / --decode-context-parallel-size > 1, but "
             f"got dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
-        raise ValueError(
-            "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
-            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
-            "the flag unset to resolve it."
-        )
+    if cfg.dcp_comm_backend == "fi_a2a":
+        blocker = fi_a2a_blocker(cfg)
+        if blocker is not None:
+            raise ValueError(
+                f"--dcp-comm-backend fi_a2a {blocker}. Use --dcp-comm-backend a2a, "
+                "or leave the flag unset to resolve a supported backend."
+            )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")

@@ -795,7 +795,7 @@ class DeepseekMLAForwardMixin:
                     self.current_attention_backend
                 )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    # Exchange head partials + LSE across DCP ranks and merge them.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),

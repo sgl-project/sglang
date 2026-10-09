@@ -4062,10 +4062,25 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
 
 
 class TestDcpCommBackendDefault(CustomTestCase):
+    _NO_FUSED_OP = (
+        "requires a FlashInfer build that provides "
+        "flashinfer.comm.decode_cp_a2a_lse_reduce"
+    )
+
     def _resolved(self, **fields):
         args = ServerArgs(model_path="dummy", tp_size=8, **fields)
         parallel_hook.handle_decode_context_parallelism(args)
         return resolution_result(args, "dcp_comm_backend")
+
+    def _fused_reduce(self, *, platform_blocker=None, mla=True):
+        """Patch what fi_a2a needs: the host check and the model's attention arch."""
+        return (
+            patch(
+                "sglang.srt.arg_groups.overrides.fi_a2a_platform_blocker",
+                return_value=platform_blocker,
+            ),
+            patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla),
+        )
 
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
@@ -4075,31 +4090,63 @@ class TestDcpCommBackendDefault(CustomTestCase):
         self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
-    def test_fi_a2a_where_supported(self):
-        with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
-        ):
+    def test_fi_a2a_where_the_fused_reduce_can_run(self):
+        host, mla = self._fused_reduce()
+        with host, mla:
             self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
-    def test_a2a_on_cuda_without_mnnvl(self):
-        with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
-        ):
+    def test_a2a_when_the_fused_reduce_cannot_run(self):
+        """fi_a2a has no fallback kernel, so resolving to it on a host that
+        cannot run the fused reduce would fail every default DCP start."""
+        host, mla = self._fused_reduce(platform_blocker=self._NO_FUSED_OP)
+        with host, mla:
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_configs_the_fused_reduce_cannot_serve_resolve_to_a2a(self):
+        cases = {
+            "non-MLA model": ({}, False, False),
+            "--enable-pdmux": ({"enable_pdmux": True}, False, True),
+            "PP DeepGEMM warmup at pp_size 2": ({"pp_size": 2}, True, True),
+        }
+        for name, (fields, pp_warmup, is_mla) in cases.items():
+            with self.subTest(name):
+                host, mla = self._fused_reduce(mla=is_mla)
+                warmup = envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.override(pp_warmup)
+                with host, mla, warmup:
+                    self.assertEqual(self._resolved(dcp_size=4, **fields), "a2a")
+                    with self.assertRaisesRegex(ValueError, "--dcp-comm-backend a2a"):
+                        self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a", **fields)
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_pp_without_the_deepgemm_warmup_keeps_fi_a2a(self):
+        """Only the PP DeepGEMM warmup's third stream blocks fi_a2a; PP alone
+        must not."""
+        host, mla = self._fused_reduce()
+        warmup = envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.override(False)
+        with host, mla, warmup:
+            self.assertEqual(self._resolved(dcp_size=4, pp_size=2), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_fi_a2a_names_the_blocker(self):
+        host, mla = self._fused_reduce(platform_blocker=self._NO_FUSED_OP)
+        with host, mla:
+            with self.assertRaisesRegex(
+                ValueError, "fi_a2a requires a FlashInfer build that provides"
+            ):
+                self._resolved(dcp_size=4, dcp_comm_backend="fi_a2a")
 
     @override_platform(is_cuda=False, is_hip=False)
     def test_ag_rs_off_cuda(self):
-        with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
-        ):
+        host, mla = self._fused_reduce(platform_blocker="requires a Blackwell GPU")
+        with host, mla:
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
-        with patch(
-            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
-        ):
+        host, mla = self._fused_reduce()
+        with host, mla:
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
             )
