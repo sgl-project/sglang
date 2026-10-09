@@ -560,7 +560,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
