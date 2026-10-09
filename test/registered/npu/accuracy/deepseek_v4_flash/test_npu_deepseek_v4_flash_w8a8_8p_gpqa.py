@@ -21,20 +21,8 @@ register_npu_ci(
     nightly=True,
 )
 
-# TEMP: single-file suite used to verify this script on the nightly pipeline while the other
-# nightly jobs are disabled. Remove it together with the `nightly-acc-16-npu-a3-dsv4verify`
-# job once the verification is done.
-register_npu_ci(
-    est_time=3600,
-    suite="nightly-acc-16-npu-a3-dsv4verify",
-    nightly=True,
-)
-
-# The nightly pipeline is path-triggered by pull requests too, so the dataset must follow the
-# pipeline that invoked the test rather than the triggering event. Reusable workflows inherit
-# the caller's github context, so GITHUB_WORKFLOW_REF identifies the caller's workflow file.
-# TEMP: both pipelines run GSM8K for now; the nightly run (full 1319 questions) calibrates the
-# PR subset threshold before GPQA is restored for nightly.
+# The nightly pipeline can also be triggered by pull requests, so use GITHUB_WORKFLOW_REF
+# (which inherits the caller's github context) to identify the invoking workflow.
 _is_pr_pipeline = (
     "/.github/workflows/nightly-test-npu.yml"
     not in os.environ.get("GITHUB_WORKFLOW_REF", "")
@@ -151,11 +139,11 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
-    accuracy = 0.85 if _is_pr_pipeline else 0.874
-    datasets = ["gsm8k"]
+    accuracy = 0.95 if _is_pr_pipeline else 0.874
+    datasets = ["gsm8k"] if _is_pr_pipeline else ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
-    limit = 100 if _is_pr_pipeline else 200
+    limit = 300 if _is_pr_pipeline else 100000
     eval_batch_size = 128
     stream = True
     timeout = 6000
