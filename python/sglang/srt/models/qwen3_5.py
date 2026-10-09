@@ -41,6 +41,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1184,8 +1185,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.pp_group = get_pp_group()
-        self.calculated_pp_groups = []
+        # rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+        # once, at the first full-attention layer this PP stage owns. Drafts keep the
+        # unsplit numbering.
+        stage_start = 0
+        if not is_nextn:
+            stage_start, _ = get_pp_indices(
+                config.num_hidden_layers,
+                get_parallel().pp_rank,
+                get_parallel().pp_size,
+            )
+        interval = config.full_attention_interval
+        self.refreshes_rope_cos_sin = (
+            layer_id == stage_start + (interval - 1 - stage_start) % interval
+        )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
@@ -1459,12 +1472,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        # Calculate once for each pp group
-        if (self.attn.layer_id + 1) % self.config.full_attention_interval == 0:
-            if self.pp_group.rank_in_group not in self.calculated_pp_groups:
-                self.rotary_emb.get_cos_sin_with_position(positions)
-                self.calculated_pp_groups.append(self.pp_group.rank_in_group)
+        if self.refreshes_rope_cos_sin:
+            self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
