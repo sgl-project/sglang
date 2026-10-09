@@ -24,10 +24,10 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 class StreamingSessionKitMixin:
     """Streaming-session KV-inheritance + retract/abort-recovery suite."""
 
-    # Allowed inherited-cache offsets vs the previous turn's total. Non-overlap
-    # spec decode can be off by 1: the bonus token's KV is only computed by the
-    # next forward, which sync skips at finish (overlap drains it, so it's 0).
-    kv_inherit_offsets = (0,)
+    # Allowed inherited-cache offsets vs the previous turn's total. The last
+    # output token's KV is only computed by a later forward: a turn that ends
+    # by length skips that forward, so the next turn prefills the token (-1).
+    kv_inherit_offsets = (0, -1)
 
     def test_kv_cache_inheritance(self, gen_len=12):
         """Each turn's cached_tokens must equal previous turn's prompt+completion

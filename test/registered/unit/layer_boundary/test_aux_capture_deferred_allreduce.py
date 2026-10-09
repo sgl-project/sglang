@@ -11,7 +11,8 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import StageKind
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.ops import identity_output
+from sglang.srt.layers.layer_boundary.ops import keep_output
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
@@ -68,43 +69,42 @@ class DeferringLayer(nn.Module):
         self.layer_communicator = stub_plan()
         self.layer_communicator.norm = None
         self.attn_boundary = stub_stage(self.layer_communicator, StageKind.ATTENTION)
-        self.layer_communicator._paths[BatchVariant.ORDINARY] = comm.StageSteps(
-            entry=comm.StageEntry(
+        self.layer_communicator.paths[BatchVariant.ORDINARY] = comm.StagePath(
+            entry=comm.EntryPath(
                 prepare=partial(
-                    comm_ops._consumer_step,
+                    comm_ops._run_entry,
                     step=partial(
-                        comm_ops._read_input,
-                        layer_input=None,
+                        comm_ops._update_read,
+                        pre_move=None,
                         enters_stack=False,
-                        read=comm.NORM_QUANT_READ,
-                        update=comm.ADD,
+                        read=comm.NORM_QUANT_READOUT,
+                        update=comm.PLAIN_ADD,
                     ),
                     carried_fusions=(),
                 ),
                 input_rows=comm.Layout(frozenset()),
                 input_move=identity_input,
-                handoff=comm_ops._hand_qkv_hook_its_input,
+                attn_input_adapter=comm_ops._attn_input_default,
             ),
-            output=comm.StageOutput(
+            output=comm.OutputContract(
                 comm.Layout(frozenset()),
                 group=comm.SumGroup.TP,
-                leaves_for_next_layer=True,
+                may_defer_to_next=True,
             ),
-            output_move=identity_output,
+            output_move=keep_output,
         )
-        self.layer_communicator.output._ffn_sum_moves_to_next_layer = (
-            lambda batch, steps, **_: defer
-        )
+        self.layer_communicator.output._defers_sum = lambda batch, steps, **_: defer
         self.layer_communicator.terminal = False
-        self.layer_communicator._paths[BatchVariant.SEQUENCE_PARALLEL] = None
-        self.layer_communicator._paths[BatchVariant.INPUT_SCATTERED] = None
-        self.layer_communicator._paths[BatchVariant.CONTEXT_PARALLEL] = None
+        self.layer_communicator.paths[BatchVariant.SEQUENCE_PARALLEL] = None
+        self.layer_communicator.paths[BatchVariant.INPUT_SCATTERED] = None
+        self.layer_communicator.paths[BatchVariant.CONTEXT_PARALLEL] = None
         self.layer_communicator.output.ffn_reduction_group = lambda forward_batch: GROUP
-        self.layer_communicator.output._ffn_leaves_sum_to_reduce_scatter = (
-            lambda batch, dp_step: False
+        self.layer_communicator.output._sum_in_reduce_scatter = lambda batch, dp_step: (
+            False
         )
-        self.layer_communicator.output._complete_ffn_output_now = (
-            lambda hidden, residual, **_: (all_reduce(hidden), residual)
+        self.layer_communicator.output._complete_now = lambda hidden, residual, **_: (
+            all_reduce(hidden),
+            residual,
         )
 
     def forward(
@@ -121,7 +121,7 @@ class DeferringLayer(nn.Module):
             residual = stream
         if isinstance(residual, ResidualStream):
             hidden_states, residual = residual.input(hidden_states)
-        hidden_states = comm.reduce_output(hidden_states)
+        hidden_states = comm.complete_owed(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:
@@ -199,8 +199,8 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
         boundary.norm = None
         partial = torch.empty(0, 4)
         batch = SimpleNamespace(residual_stream=ResidualStream(partial))
-        owed = batch.residual_stream.leave(
-            comm.UnreducedOutput(partial, group=GROUP), comm.ADD
+        owed = batch.residual_stream.record(
+            comm.UnreducedOutput(partial, group=GROUP), comm.PLAIN_ADD
         )
         with patch.object(GROUP, "all_reduce") as reduce:
             hidden, captured = stub_stage(boundary, StageKind.ATTENTION).capture_output(
@@ -209,6 +209,22 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
         self.assertIs(hidden, owed)
         self.assertIsNone(captured)
         reduce.assert_not_called()
+
+    def test_an_empty_final_norm_still_captures(self):
+        # A rank without rows takes the same number of captures as the others.
+        stream = ResidualStream(torch.empty(0, 4))
+        hidden = stream.record(torch.empty(0, 4), comm.PLAIN_ADD)
+        batch = SimpleNamespace(residual_stream=stream)
+        captured = AuxHiddenStateList()
+        hidden = residual_batch.final_norm(
+            hidden,
+            batch,
+            SumNorm(),
+            capture=captured.capture,
+            skip_empty=True,
+        )
+        self.assertEqual(tuple(hidden.shape), (0, 4))
+        self.assertEqual([tuple(c.shape) for c in captured], [(0, 4)])
 
     def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
         hidden = torch.ones(2, 4)
@@ -393,8 +409,8 @@ class TestPipelineResidualReception(CustomTestCase):
     def test_written_streams_do_not_read_a_separate_residual(self):
         comm_instance = stub_plan()
         comm_instance.norm = None
-        comm_instance._batch_steps = lambda batch: SimpleNamespace(
-            entry=SimpleNamespace(input_sum=None)
+        comm_instance.path_for = lambda batch: SimpleNamespace(
+            entry=SimpleNamespace(declared_sum=None)
         )
         batch = SimpleNamespace(residual_stream=None)
         streams = torch.randn(2, 4, 3)
@@ -405,7 +421,7 @@ class TestPipelineResidualReception(CustomTestCase):
         stage = stub_stage(comm_instance, StageKind.ATTENTION)
         stage.declaration = replace(
             stage.declaration,
-            previous=declare_ffn(update=SimpleNamespace(at_producer=True)),
+            previous=declare_ffn(update=SimpleNamespace(applied_at_exit=True)),
         )
         hidden = stage.from_pp(PPProxyTensors({"hidden_states": streams}), batch)
         residual = batch.residual_stream
@@ -416,8 +432,8 @@ class TestPipelineResidualReception(CustomTestCase):
     def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
         comm_instance = stub_plan()
         comm_instance.norm = None
-        comm_instance._batch_steps = lambda batch: SimpleNamespace(
-            entry=SimpleNamespace(input_sum=None)
+        comm_instance.path_for = lambda batch: SimpleNamespace(
+            entry=SimpleNamespace(declared_sum=None)
         )
         batch = SimpleNamespace(residual_stream=None)
         partial = torch.randn(2, 4)

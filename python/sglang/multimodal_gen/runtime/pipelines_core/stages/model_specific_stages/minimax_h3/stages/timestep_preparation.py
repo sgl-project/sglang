@@ -26,12 +26,17 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None) -> None:
+    def __init__(
+        self,
+        sigma_shift_scales=None,
+        dmd_denoising_steps: tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
+        self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
         pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
@@ -197,12 +202,20 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
+        dmd_steps = self.dmd_denoising_steps
+        num_steps = requested_num_steps
+        if dmd_steps is not None and batch.is_warmup:
+            # warmup truncates the trained rungs instead of rescaling a shorter grid
+            num_steps = len(dmd_steps) + 1
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
-                num_steps=requested_num_steps,
+                num_steps=num_steps,
                 shift_scale=scales[modality],
+                dmd_steps=dmd_steps,
             )
+            if num_steps != requested_num_steps:
+                sigmas[modality] = sigmas[modality][: max(2, requested_num_steps)]
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

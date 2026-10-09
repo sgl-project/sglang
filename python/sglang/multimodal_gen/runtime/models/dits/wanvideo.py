@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_temb_table_slices,
     can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -204,7 +203,6 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
         tp_size = get_tp_world_size()
 
         # layers
@@ -410,7 +408,8 @@ def _wan_temb_table_slices(
     verified = _WAN_TEMB_SLICES.verified
     if (
         not _WAN_TEMB_SLICES.disabled
-        and can_use_fused_temb_table_slices(table, temb)
+        and _is_cuda
+        and temb.is_cuda
         and (verified or _WAN_TEMB_SLICES.can_attempt_once())
     ):
         try:
@@ -1137,19 +1136,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         width_local: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_start = rank * local_len
-        token_indices = torch.arange(
-            token_start,
-            token_start + local_len,
-            device=device,
-            dtype=torch.long,
+        return self.rotary_emb.forward_3d_sequence_shard(
+            local_len, rank, frame_stride_local, width_local, device
         )
-        t_idx = token_indices // frame_stride_local
-        rem = token_indices % frame_stride_local
-        h_idx = rem // width_local
-        w_idx = rem % width_local
-        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-        return self.rotary_emb.forward_uncached(positions)
 
     def forward(
         self,

@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
@@ -554,6 +555,12 @@ def _recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
+    if i_t * BT >= T:
+        return
+
     p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
@@ -797,6 +804,11 @@ def chunk_gla_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
+    if i_t * BT >= T:
+        return
+
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
@@ -973,6 +985,11 @@ def kda_gate_chunk_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    # Padded chunk_indices rows (kda_prefill_graph.py) start past T, where every
+    # store below is masked; this early exit only skips their wasted work.
+    if i_t * BT >= T:
+        return
+
     p_s = tl.make_block_ptr(
         s + (bos * H + i_h) * S,
         (T, S),
@@ -1031,9 +1048,11 @@ def kda_gate_chunk_cumsum_vector_kernel(
                 mask=offsets_t < T,
                 other=0.0,
             ).to(tl.float32)
+            # Not tl.sigmoid: tl.exp and Triton's / are approximate on CUDA. This
+            # matches the unfused path's beta.float().sigmoid() bit for bit.
             tl.store(
                 beta_out + (bos + offsets_t) * H + i_h,
-                tl.sigmoid(b_beta),
+                tl.div_rn(1.0, 1.0 + libdevice.exp(-b_beta)),
                 mask=offsets_t < T,
             )
 
@@ -1143,15 +1162,16 @@ def chunk_kda_fwd(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
-    # Without this, each of the 4 callees would recompute independently.
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    # Without this, each of the 4 callees would recompute independently. A
+    # CUDA-graph caller passes padded chunk_indices / chunk_offsets it rebuilds
+    # before every replay (kda_prefill_graph.py).
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if A_log is not None:
         # Fused: gate activation + chunk-local cumsum in one kernel.
@@ -1225,6 +1245,7 @@ def chunk_kda_fwd(
         use_exp2=True,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
+        chunk_offsets=chunk_offsets,
     )
     del w, u, kg
 
@@ -1269,6 +1290,8 @@ def chunk_kda(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1296,4 +1319,6 @@ def chunk_kda(
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
         beta_is_raw=beta_is_raw,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
     )

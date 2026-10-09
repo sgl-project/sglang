@@ -7,13 +7,15 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.layer_boundary import (
+    PLAIN_ADD,
     Layout,
     MixerExit,
-    StageOutput,
+    OutputContract,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
 )
+from sglang.srt.layers.layer_boundary import exit as exit_module
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
@@ -26,7 +28,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 def layer_stage(pattern, index):
     from sglang.srt.layers.layer_boundary.construction import BatchVariant
-    from sglang.srt.layers.layer_boundary.factories import _connections
+    from sglang.srt.layers.layer_boundary.factories import _connect, _incoming
 
     previous = utils._declaration(pattern, index - 1) if index else None
     declaration = replace(
@@ -39,7 +41,8 @@ def layer_stage(pattern, index):
         if index + 1 < len(pattern)
         else None
     )
-    incoming, outgoing = _connections(declaration, following)
+    incoming = _incoming(declaration)
+    outgoing = _connect(declaration, following, residual_from=incoming)
     return SimpleNamespace(
         kind=declaration.kind,
         edges=(
@@ -54,7 +57,7 @@ def sizes(*, dp=1, tp=1):
     return {
         TokenAxis.ATTN_DP: dp,
         TokenAxis.ATTN_CP: 1,
-        TokenAxis.ATTN_TP_SCATTER: tp,
+        TokenAxis.ATTN_TP: tp,
     }
 
 
@@ -63,12 +66,14 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
 
     parallel = SimpleNamespace(
         attn_dp_size=dp,
+        attn_dp_enabled=dp > 1,
         attn_tp_size=tp,
         attn_cp_size=1,
         tp_size=dp * tp,
         moe_dp_size=1,
         moe_dense_tp_size=None,
         enable_attn_tp_input_scattered=False,
+        disable_attn_tp_gather=False,
         enable_prefill_cp=False,
     )
     with (
@@ -86,8 +91,8 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
         patch_communicator("get_parallel", return_value=parallel),
         patch.object(utils, "get_parallel", return_value=parallel),
         patch_communicator("is_moe_input_scattered_across_dp_ranks", return_value=a2a),
-        patch_communicator("enable_moe_dense_fully_dp", return_value=False),
-        patch_communicator("_generic_prefill_cp_shards_tokens", return_value=False),
+        patch_communicator("is_dense_ffn_fully_dp", return_value=False),
+        patch_communicator("_prefill_cp_shards_tokens", return_value=False),
     ):
         return [layer_stage(pattern, i) for i in range(len(pattern))]
 
@@ -114,27 +119,27 @@ class TestStageEdges(CustomTestCase):
                     self.assertEqual(into.residual, rows)
                     self.assertEqual(into.produced.layout, rows)
                     produced = out_of.produced
-                    may_leave = produced.always_leaves or produced.leaves_for_next_layer
+                    may_leave = produced.always_partial or produced.may_defer_to_next
                     self.assertEqual(
                         into.produced.group, produced.group if may_leave else None
                     )
                     self.assertEqual(
-                        into.produced.always_leaves, produced.always_leaves
+                        into.produced.always_partial, produced.always_partial
                     )
                     self.assertEqual(
-                        into.produced.leaves_for_next_layer,
-                        produced.leaves_for_next_layer,
+                        into.produced.may_defer_to_next,
+                        produced.may_defer_to_next,
                     )
                 self.assertEqual(
-                    layers[0].edges[0].produced, StageOutput(rows, update=None)
+                    layers[0].edges[0].produced, OutputContract(rows, update=None)
                 )
                 self.assertTrue(layers[0].enters_stack)
                 self.assertFalse(any(layer.enters_stack for layer in layers[1:]))
                 last = layers[-1].edges[1].produced
-                self.assertFalse(last.always_leaves or last.leaves_for_next_layer)
+                self.assertFalse(last.always_partial or last.may_defer_to_next)
 
     def test_what_each_kind_of_boundary_carries(self):
-        # (pattern, boundary after layer 0): group, always_leaves, leaves_for_next_layer
+        # (pattern, boundary after layer 0): group, always_partial, may_defer_to_next
         cases = {
             "M-": (SumGroup.ATTN_TP, True, False),
             "*E": (SumGroup.ATTN_TP, True, False),
@@ -148,27 +153,28 @@ class TestStageEdges(CustomTestCase):
             with self.subTest(pattern=pattern):
                 into = stages(pattern, tp=2)[1].edges[0].produced
                 self.assertEqual(
-                    (into.group, into.always_leaves, into.leaves_for_next_layer),
+                    (into.group, into.always_partial, into.may_defer_to_next),
                     expected,
                 )
         # Without attention TP a mixer's output is complete.
         into = stages("M-", tp=1)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout, update=None))
+        self.assertEqual(into, OutputContract(into.layout, update=None))
         # A MoE on this rank's own rows hands on a complete output; an a2a
         # backend dispatches only the MoE, so an MLP still sums over TP.
         into = stages("EM", tp=2, a2a=True)[1].edges[0].produced
-        self.assertEqual(into, StageOutput(into.layout, update=None))
+        self.assertEqual(into, OutputContract(into.layout, update=None))
         into = stages("-M", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(
-            (into.group, into.always_leaves, into.leaves_for_next_layer),
+            (into.group, into.always_partial, into.may_defer_to_next),
             (SumGroup.TP, False, True),
         )
 
 
 class TestMixerExit(CustomTestCase):
-    """A mixer skips its output all-reduce when its output always leaves the sum
-    (to an FFN stage), and when it may leave it and the fused kernel takes it;
-    what it hands on says which."""
+    """A mixer never runs its output all-reduce. The exit carries the sum to the
+    next attention stage when its declaration permits deferring and the fused
+    kernel takes it, hands it on as the declared sum when it always leaves it
+    (to an FFN stage), and otherwise completes it itself."""
 
     def test_decision_table(self):
         tp_group = object()
@@ -177,37 +183,44 @@ class TestMixerExit(CustomTestCase):
             if always and may:
                 continue
             with self.subTest(
-                always_leaves=always, leaves_for_next_layer=may, movable=movable
+                always_partial=always, may_defer_to_next=may, movable=movable
             ):
-                produced = StageOutput(
+                produced = OutputContract(
                     attention,
                     group=SumGroup.ATTN_TP if always or may else None,
-                    always_leaves=always,
-                    leaves_for_next_layer=may,
+                    always_partial=always,
+                    may_defer_to_next=may,
+                    update=PLAIN_ADD,
                 )
                 communicator = SimpleNamespace(
                     plan=SimpleNamespace(
-                        _batch_steps=lambda batch: SimpleNamespace(output=produced),
+                        path_for=lambda batch: SimpleNamespace(output=produced),
                     ),
-                    _ffn_sum_can_move_to_next_layer=MagicMock(return_value=movable),
+                    _sum_deferral_allowed=MagicMock(return_value=movable),
                 )
                 hidden = torch.ones(2, 4)
-                with get_parallel().override(tp_group=tp_group, tp_size=2):
+                summed = MagicMock(side_effect=lambda h, *args, **kwargs: h * 2)
+                with (
+                    get_parallel().override(tp_group=tp_group, tp_size=2),
+                    patch.object(exit_module, "sum_output", summed),
+                ):
                     with MixerExit(
                         communicator, None, stream=ResidualStream()
                     ) as mixer_exit:
                         skipped = should_skip_mlp_all_reduce()
                     output = mixer_exit.finish(hidden)
                     output, _ = mixer_exit._stream.input(output)
-                self.assertFalse(should_skip_mlp_all_reduce())
-                hands_on = may and movable
-                self.assertEqual(mixer_exit.skips_reduction, always or hands_on)
-                self.assertEqual(skipped, always or hands_on)
-                if hands_on:
+                self.assertFalse(skipped)
+                if may and movable:
                     self.assertIsInstance(output, UnreducedOutput)
                     self.assertIs(output.group, tp_group)
+                    summed.assert_not_called()
+                elif may:
+                    self.assertEqual(summed.call_args.args[1], SumGroup.ATTN_TP)
+                    torch.testing.assert_close(output, hidden * 2)
                 else:
                     self.assertIs(output, hidden)
+                    summed.assert_not_called()
 
 
 if __name__ == "__main__":
