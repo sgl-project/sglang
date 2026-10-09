@@ -862,7 +862,8 @@ class TestEncoderDelivery(CustomTestCase):
             req_id = "test-zmq-delivery-cleanup"
             rid_to_receive_endpoint[req_id] = {"127.0.0.1:1"}
             rid_to_receive_count[req_id] = 1
-            rid_to_cond[req_id] = asyncio.Condition()
+            condition = asyncio.Condition()
+            rid_to_cond[req_id] = condition
             state = ReqState(req_id)
             encoder = SimpleNamespace()
 
