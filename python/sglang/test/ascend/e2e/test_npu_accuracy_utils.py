@@ -118,13 +118,16 @@ def run_evalscope(
     timeout=60000,
     stream=True,
     eval_type="openai_api",
+    judge_model_args=None,
+    api_key=None,
+    api_url_path="/v1/chat/completions",
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_path = "./evalscope_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    api_url = f"http://{host}:{port}/v1/chat/completions"
+    api_url = f"http://{host}:{port}{api_url_path}"
 
     if generation_config is None:
         generation_config = {"max_tokens": 512}
@@ -145,6 +148,14 @@ def run_evalscope(
         config_dict["dataset_args"] = dataset_args
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
+    if judge_model_args:
+        judge_url = judge_model_args.get("api_url", "")
+        if "127.0.0.1" in judge_url or "localhost" in judge_url:
+            judge_model_args = dict(judge_model_args)
+            judge_model_args["api_url"] = f"http://{host}:{port}/v1"
+        config_dict["judge_model_args"] = judge_model_args
+    if api_key:
+        config_dict["api_key"] = api_key
 
     config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
     config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
@@ -318,6 +329,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     # (get_max_retries); set to 1 to fail fast on first measurement.
     max_retries = None
     test_type = "accuracy"
+    judge_model_args = None
+    api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def _get_tc_name(cls):
@@ -501,6 +515,9 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    judge_model_args=getattr(self, "judge_model_args", None),
+                    api_key=getattr(self, "api_key", None),
+                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -534,6 +551,9 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     accuracy = 0.1
+    judge_model_args = None
+    api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def setUpClass(cls):
@@ -603,6 +623,8 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    judge_model_args=getattr(self, "judge_model_args", None),
+                    api_key=getattr(self, "api_key", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -635,6 +657,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     accuracy = 0.1
+    judge_model_args = None
+    api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def setUpClass(cls):
@@ -720,6 +745,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
+                    judge_model_args=getattr(self, "judge_model_args", None),
+                    api_key=getattr(self, "api_key", None),
+                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
