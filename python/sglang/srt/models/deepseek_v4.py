@@ -179,6 +179,7 @@ from sglang.srt.models.deepseek_v4_replay_graphs import (
     TAIL_ROW_STEP,
     TOKEN_STEP,
     EagerReplayGraphs,
+    _late_kv_store,
     bcg_late_kv_store,
     in_decoder_replay_graph,
 )
@@ -773,6 +774,16 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+def _late_kv_store_then_attention(attention, x, positions, qkv_a, *attn_args) -> None:
+    # One break per late layer: nothing between the SWA store and the attention
+    # reads the SWA cache (the low-ratio sources write the compressed caches).
+    _late_kv_store(attention, x, positions, qkv_a)
+    deepseek_v4_attention_with_output(*attn_args)
+
+
+bcg_late_kv_store_then_attention = eager_on_graph(True)(_late_kv_store_then_attention)
+
+
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -1169,6 +1180,8 @@ class MQALayer(MqaAttentionBase):
         else:
             self.alt_streams = None
             self.alt_streams_indexer = None
+        # Eager replay graphs: the deferred SWA store's inputs, for the attention break.
+        self._deferred_late_kv = None
 
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
@@ -2102,7 +2115,10 @@ class MQALayer(MqaAttentionBase):
                 kv = None
             elif in_decoder_replay_graph():
                 assert not fuse_q_rope
-                bcg_late_kv_store(self, x_linear, positions, qkv_a)
+                if envs.SGLANG_DSV4_EAGER_GRAPH_MERGED_KV_STORE.get():
+                    self._deferred_late_kv = (x_linear, positions, qkv_a)
+                else:
+                    bcg_late_kv_store(self, x_linear, positions, qkv_a)
                 kv = None
             else:
                 self._compute_kv_to_cache(
@@ -2459,7 +2475,7 @@ class MQALayer(MqaAttentionBase):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
-                bcg_deepseek_v4_attention_with_output(
+                attn_args = (
                     attn_q,
                     attn_k,
                     o,
@@ -2468,7 +2484,15 @@ class MQALayer(MqaAttentionBase):
                     attn_sink,
                     save_kv_cache,
                 )
+                deferred, self._deferred_late_kv = self._deferred_late_kv, None
+                if deferred is not None:
+                    bcg_late_kv_store_then_attention(self, *deferred, *attn_args)
+                else:
+                    bcg_deepseek_v4_attention_with_output(*attn_args)
             else:
+                deferred, self._deferred_late_kv = self._deferred_late_kv, None
+                if deferred is not None:
+                    _late_kv_store(self, *deferred)
                 o = attn_backend.forward(
                     q=attn_q,
                     k=attn_k,
