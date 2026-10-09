@@ -1,0 +1,208 @@
+{
+  "model": "Cloudflare/clef-flash",
+  "revision": "17f0b0ad64efb65d273590632833508766b2aae6",
+  "provenance": "Synthetic invoice requests evaluated with the pinned Cloudflare native Transformers joint-head implementation, BF16 on NVIDIA RTX 3090, 2026-10-03. Native API probabilities are rounded to four decimals.",
+  "cases": [
+    {
+      "request": {
+        "model": "clef-flash",
+        "state": {
+          "invoice": {
+            "amount_usd": 1500,
+            "status": "paid"
+          }
+        },
+        "questions": {
+          "status": {
+            "type": "choice",
+            "instructions": "What is the invoice status?",
+            "criteria": {
+              "paid": "The invoice is paid.",
+              "overdue": "The invoice is overdue.",
+              "draft": "The invoice is a draft."
+            }
+          },
+          "above1000": {
+            "type": "noul",
+            "instructions": "Is the invoice amount strictly greater than 1000 USD?"
+          },
+          "amount_category": {
+            "type": "score",
+            "instructions": "Classify the invoice amount in USD using these levels.",
+            "criteria": [
+              "Amount is at most 100 USD.",
+              "Amount is greater than 100 and at most 1000 USD.",
+              "Amount is greater than 1000 USD."
+            ]
+          }
+        }
+      },
+      "answers": {
+        "status": {
+          "type": "choice",
+          "choice": "paid",
+          "confidence": 0.9881,
+          "probabilities": {
+            "paid": 0.9881,
+            "overdue": 0.0057,
+            "draft": 0.0062
+          }
+        },
+        "above1000": {
+          "type": "noul",
+          "noul": 0.9649
+        },
+        "amount_category": {
+          "type": "score",
+          "score": 1.9267,
+          "confidence": 0.9496,
+          "legend": {
+            "0": "Amount is at most 100 USD.",
+            "1": "Amount is greater than 100 and at most 1000 USD.",
+            "2": "Amount is greater than 1000 USD."
+          },
+          "probabilities": {
+            "0": 0.0229,
+            "1": 0.0276,
+            "2": 0.9496
+          }
+        }
+      },
+      "input_tokens": 380
+    },
+    {
+      "request": {
+        "model": "clef-flash",
+        "state": {
+          "invoice": {
+            "amount_usd": 50,
+            "status": "overdue"
+          }
+        },
+        "questions": {
+          "status": {
+            "type": "choice",
+            "instructions": "What is the invoice status?",
+            "criteria": {
+              "paid": "The invoice is paid.",
+              "overdue": "The invoice is overdue.",
+              "draft": "The invoice is a draft."
+            }
+          },
+          "above1000": {
+            "type": "noul",
+            "instructions": "Is the invoice amount strictly greater than 1000 USD?"
+          },
+          "amount_category": {
+            "type": "score",
+            "instructions": "Classify the invoice amount in USD using these levels.",
+            "criteria": [
+              "Amount is at most 100 USD.",
+              "Amount is greater than 100 and at most 1000 USD.",
+              "Amount is greater than 1000 USD."
+            ]
+          }
+        }
+      },
+      "answers": {
+        "status": {
+          "type": "choice",
+          "choice": "overdue",
+          "confidence": 0.976,
+          "probabilities": {
+            "paid": 0.0124,
+            "overdue": 0.976,
+            "draft": 0.0116
+          }
+        },
+        "above1000": {
+          "type": "noul",
+          "noul": 0.0025
+        },
+        "amount_category": {
+          "type": "score",
+          "score": 0.074,
+          "confidence": 0.9505,
+          "legend": {
+            "0": "Amount is at most 100 USD.",
+            "1": "Amount is greater than 100 and at most 1000 USD.",
+            "2": "Amount is greater than 1000 USD."
+          },
+          "probabilities": {
+            "0": 0.9505,
+            "1": 0.0249,
+            "2": 0.0246
+          }
+        }
+      },
+      "input_tokens": 379
+    },
+    {
+      "request": {
+        "model": "clef-flash",
+        "state": {
+          "invoice": {
+            "amount_usd": 500,
+            "status": "draft"
+          }
+        },
+        "questions": {
+          "status": {
+            "type": "choice",
+            "instructions": "What is the invoice status?",
+            "criteria": {
+              "paid": "The invoice is paid.",
+              "overdue": "The invoice is overdue.",
+              "draft": "The invoice is a draft."
+            }
+          },
+          "above1000": {
+            "type": "noul",
+            "instructions": "Is the invoice amount strictly greater than 1000 USD?"
+          },
+          "amount_category": {
+            "type": "score",
+            "instructions": "Classify the invoice amount in USD using these levels.",
+            "criteria": [
+              "Amount is at most 100 USD.",
+              "Amount is greater than 100 and at most 1000 USD.",
+              "Amount is greater than 1000 USD."
+            ]
+          }
+        }
+      },
+      "answers": {
+        "status": {
+          "type": "choice",
+          "choice": "draft",
+          "confidence": 0.9777,
+          "probabilities": {
+            "paid": 0.0117,
+            "overdue": 0.0107,
+            "draft": 0.9777
+          }
+        },
+        "above1000": {
+          "type": "noul",
+          "noul": 0.0029
+        },
+        "amount_category": {
+          "type": "score",
+          "score": 0.9873,
+          "confidence": 0.9341,
+          "legend": {
+            "0": "Amount is at most 100 USD.",
+            "1": "Amount is greater than 100 and at most 1000 USD.",
+            "2": "Amount is greater than 1000 USD."
+          },
+          "probabilities": {
+            "0": 0.0393,
+            "1": 0.9341,
+            "2": 0.0266
+          }
+        }
+      },
+      "input_tokens": 379
+    }
+  ]
+}

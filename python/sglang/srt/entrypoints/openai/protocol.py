@@ -1500,8 +1500,8 @@ class DecisionChoiceQuestion(BaseModel):
     id: Annotated[str, AfterValidator(_nonblank_decision_text)]
     type: Literal["choice"]
     question: RequiredDecisionText
-    # Options are labeled A to Z in order, so at most 26.
-    options: List[DecisionOption] = Field(min_length=2, max_length=26)
+    # Model-specific answer-label limits are checked by the serving handler.
+    options: List[DecisionOption] = Field(min_length=2)
 
     @model_validator(mode="after")
     def _option_names_distinct(self):
@@ -1541,7 +1541,7 @@ DecisionQuestion = Annotated[
 class DecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    input: RequiredDecisionText
+    input: DecisionText
     images: List[DecisionImage] = Field(default_factory=list)
     questions: List[DecisionQuestion] = Field(min_length=1)
     # Scales option probabilities only, not label_mass.
@@ -1569,8 +1569,8 @@ class DecisionRequest(BaseModel):
 class DecisionAnswer(BaseModel):
     type: Literal["choice", "score", "yes_no"]
     probabilities: Dict[str, float]
-    # Full-vocabulary probability of all answer labels at the answer position.
-    label_mass: float
+    # Full-vocabulary probability of answer labels; absent for a joint head.
+    label_mass: Optional[float] = None
     choice: Optional[str] = None
     score: Optional[float] = None
     # The exact /v1/score inputs, with return_prompt_token_ids.

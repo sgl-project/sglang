@@ -86,6 +86,8 @@ class SamplingBatchInfo:
     has_custom_logit_processor: bool = False
     # Custom parameters
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Joint decision records, independent of custom logit processors.
+    clef_records: Optional[List[Any]] = None
     # Custom logit processor
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
@@ -267,6 +269,17 @@ class SamplingBatchInfo:
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
+            clef_records=[
+                (
+                    (
+                        r.sampling_params.custom_params["clef_record"],
+                        r.cache_request_handle,
+                    )
+                    if "clef_record" in (r.sampling_params.custom_params or {})
+                    else None
+                )
+                for r in reqs
+            ],
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
@@ -419,6 +432,8 @@ class SamplingBatchInfo:
         return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
+        if self.clef_records is not None:
+            self.clef_records = [self.clef_records[i] for i in keep_indices]
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
@@ -494,6 +509,10 @@ class SamplingBatchInfo:
             self.has_custom_logit_processor = False
 
     def merge_batch(self, other: SamplingBatchInfo):
+        if self.clef_records is not None or other.clef_records is not None:
+            self.clef_records = (self.clef_records or [None] * len(self)) + (
+                other.clef_records or [None] * len(other)
+            )
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists

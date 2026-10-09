@@ -3,7 +3,7 @@ title: Decision models
 description: Answer typed choice, score, and yes or no questions with a probability for every option from a chat model, without generating text.
 ---
 
-`/v1/decisions` turns a chat model into a decision model. You send an input and a list of typed questions, and each answer comes back with the probability of every option, read from the model's next-token scores at the answer position. No text is generated and no output is parsed. It needs no special checkpoint: any generation model served with a Jinja chat template can answer, as long as the checks below pass for it.
+`/v1/decisions` answers typed questions with a probability for every option, without generating text. For ordinary chat models, it reads next-token scores at the answer position. [Clef](/cookbook/autoregressive/Cloudflare/Clef) instead uses its trained joint decision head. The ordinary chat-model path needs no special checkpoint: any generation model served with a Jinja chat template can answer, as long as the checks below pass for it.
 
 <Note>
   `/v1/decisions` is an SGLang extension under `/v1`, like `/v1/score` and `/v1/rerank`. It is not part of the OpenAI API, so call it over HTTP rather than through an OpenAI SDK method. Until a release contains it, install a [nightly build](/docs/get-started/install#nightly-builds), which is built from the main branch.
@@ -15,8 +15,11 @@ description: Answer typed choice, score, and yes or no questions with a probabil
 | --- | --- | --- |
 | **Qwen3.8-27B** | `Qwen/Qwen3.8-27B` | Validated on one H200 in BF16, with and without NEXTN speculative decoding. See the [model page](/cookbook/autoregressive/Qwen/Qwen3.8-27B). |
 | **Qwen3.5-35B-A3B** | `Qwen/Qwen3.5-35B-A3B` | Validated on one H200 in BF16. See the [model page](/cookbook/autoregressive/Qwen/Qwen3.5). |
+| **Clef** | `Cloudflare/clef-flash` | Trained joint head; text-only BF16 on one CUDA GPU. See [Clef](/cookbook/autoregressive/Cloudflare/Clef) for API semantics and support constraints. |
 
 Other chat models are served when the answer labels are single tokens at the answer position and the answer does not start inside a reasoning block. The server checks these per request and returns a 400 that names the reason when one fails, see [Errors](#errors). It does not check how the chat template renders the question or where the template itself would put an answer, so inspect `prompt_token_ids` from `return_prompt_token_ids` before relying on a new model.
+
+The remaining sections describe ordinary chat-model scoring unless they explicitly mention Clef.
 
 ## Launch command
 
@@ -75,9 +78,9 @@ Each answer contains:
 - `type`: the question type, `choice`, `score`, or `yes_no`.
 - `probabilities`: one value per option name, level index, or `yes` and `no`, summing to 1. For a yes or no question, `probabilities["yes"]` is the answer.
 - `choice` for a choice question (the most probable option) or `score` for a score question (the probability-weighted mean level index).
-- `label_mass`: the full-vocabulary probability of the answer labels at the answer position. A low value means the model puts most of its probability outside the offered answers.
+- `label_mass` (ordinary chat models): the full-vocabulary probability of the answer labels at the answer position. A low value means the model puts most of its probability outside the offered answers. Clef omits this field.
 
-Questions are answered independently and scored together in one batch. To route the ticket in this example, send it to the chosen team, and hand it to a person when the top probability falls below a threshold you validate on your own labeled tickets.
+Ordinary chat models answer questions independently and score them together in one batch; Clef answers them jointly. To route the ticket in this example, send it to the chosen team, and hand it to a person when the top probability falls below a threshold you validate on your own labeled tickets.
 
 ## Image inputs
 
@@ -246,7 +249,7 @@ What to expect from this route:
 - Beyond 26 options, every option gets a two-letter label (`AA`, `AB`, and so on) checked to be one token for the served tokenizer. These labels include common words and have unequal priors, so answers above 26 options can depend on option order. More than 26 options also need a Hugging Face tokenizer that reports its added tokens, and a chat template with an added token between the message and the answer position whose following text tokenizes the same on its own, as the Qwen models do with `</think>`. Without them, a choice is limited to 26 options.
 - `instructions` are optional. A choice or score question without them drops its question line, and a `noul` question is answered from its `true` and `false` descriptions. A `noul` question with neither, such as the SDK's bare `Noul()`, is refused.
 - Unknown top-level fields are ignored. Unknown keys inside a question or inside `noul` criteria are refused, and so are the `/v1/decisions` fields `temperature`, `prompt_format_version`, and `return_prompt_token_ids` with any value other than null. `chat_template_kwargs` and `images` are accepted as SGLang extensions.
-- Unlike `/v1/decisions`, an empty `state` and empty or blank question ids are accepted, as the System One schema allows.
+- Unlike ordinary chat-model `/v1/decisions`, an empty `state` and empty or blank question ids are accepted, as the System One schema allows. Clef also accepts empty structured input through `/v1/decisions`.
 - Invalid requests return 422 with the location of the error, other refusals return 400, and neither is retried by the SDKs.
 - `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, and `usage.output_tokens` is 0.
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.

@@ -549,6 +549,13 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        from sglang.srt.layers.clef import load_clef_config
+
+        self.clef_config = (
+            load_clef_config(self.model_path, revision)
+            if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]
+            else None
+        )
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
             self.decision_config = load_decision_config(self.model_path, revision)

@@ -1617,5 +1617,11 @@ def create_memory_pool_configurator(
         if SWARequestCapPoolConfigurator.is_applicable(kvc):
             return SWARequestCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if getattr(kvc.model_config, "clef_config", None) is not None:
+        from sglang.srt.model_executor.clef_pool_configurator import (
+            ClefPoolConfigurator,
+        )
+
+        return ClefPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

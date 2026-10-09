@@ -671,7 +671,11 @@ class _GenerationStreamAccumulator:
                 self.customized_info[key].append(
                     [None] * current_output_len
                     if req_values is None
-                    else req_values[send_token_offset : len(output_ids_)]
+                    else (
+                        req_values
+                        if (req.is_prefill_only and req.finished())
+                        else req_values[send_token_offset : len(output_ids_)]
+                    )
                 )
 
         for per_request_values in self.customized_info.values():

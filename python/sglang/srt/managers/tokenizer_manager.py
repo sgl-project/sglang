@@ -867,6 +867,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        params = getattr(obj, "sampling_params", None)
+        if isinstance(params, (dict, list)):
+            from sglang.srt.layers.clef import validate_clef_request
+
+            validate_clef_request(obj, self.model_config)
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
