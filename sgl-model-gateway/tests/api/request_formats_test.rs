@@ -1,8 +1,14 @@
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header::CONTENT_TYPE, StatusCode},
+};
 use serde_json::json;
+use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    WorkerTestContext,
+    AppTestContext, WorkerTestContext,
 };
 
 #[cfg(test)]
@@ -152,6 +158,41 @@ mod request_format_tests {
 
         let result = ctx.make_request("/v1/completions", payload).await;
         assert!(result.is_ok());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_gateway_accepts_completion_token_id_prompts() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19006,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        for prompt in [json!([1, 2, 3, 4]), json!([[1, 2], [3, 4]])] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model",
+                        "prompt": prompt,
+                        "max_tokens": 10,
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
 
         ctx.shutdown().await;
     }
