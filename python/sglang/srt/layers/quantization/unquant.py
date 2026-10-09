@@ -70,6 +70,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 
+
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
@@ -659,6 +660,188 @@ def _empty_xpu_moe_expert_weight(
         return torch.empty(num_experts, n_dim, k_dim, dtype=dtype)
     # The view is non-contiguous; only the K slice is ever read or written.
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
+
+
+class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
+    """Opt-in gfx950 PTPC method for GLM-5.3 KDA projections."""
+
+    def __init__(self, module_name: str, bf16_max_m: int):
+        super().__init__()
+        self.module_name = module_name
+        self.bf16_max_m = bf16_max_m
+        self._fp8_ptpc_ready = False
+
+    def is_active(self, num_tokens: int) -> bool:
+        return self._fp8_ptpc_ready and num_tokens > self.bf16_max_m
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        if self._fp8_ptpc_ready:
+            return
+        weight = layer.weight.data
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            raise ValueError(
+                f"GLM-5.3 KDA PTPC requires a 2-D BF16 weight for "
+                f"{self.module_name}, got dtype={weight.dtype}, "
+                f"shape={tuple(weight.shape)}"
+            )
+        self.output_size = weight.shape[0]
+        padded_output_size = (self.output_size + 15) // 16 * 16
+        if padded_output_size != self.output_size:
+            weight = F.pad(weight, (0, 0, 0, padded_output_size - self.output_size))
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            weight, quant_dtype=aiter.dtypes.fp8
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight",
+            shuffle_weight(fp8_weight, (16, 16)).contiguous(),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight_scale",
+            weight_scale.contiguous(),
+            persistent=False,
+        )
+        self._fp8_ptpc_ready = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        use_fp8 = not isinstance(x, torch.Tensor)
+        if isinstance(x, torch.Tensor):
+            use_fp8 = self.is_active(x.numel() // x.shape[-1])
+        if use_fp8:
+            assert self._fp8_ptpc_ready, (
+                "quantized PTPC input requires repacked FP8 weights"
+            )
+            from sglang.srt.layers.quantization.fp8_utils import (
+                apply_fp8_ptpc_linear,
+            )
+
+            fp8_bias = bias
+            if bias is not None and bias.shape[0] != layer._fp8_ptpc_weight.shape[0]:
+                fp8_bias = F.pad(
+                    bias,
+                    (0, layer._fp8_ptpc_weight.shape[0] - bias.shape[0]),
+                )
+            output = apply_fp8_ptpc_linear(
+                x,
+                layer._fp8_ptpc_weight,
+                layer._fp8_ptpc_weight_scale,
+                bias=fp8_bias,
+            )
+            return (
+                output
+                if output.shape[-1] == self.output_size
+                else output[..., : self.output_size]
+            )
+        assert isinstance(x, torch.Tensor), (
+            "quantized PTPC input requires the FP8 path to be active"
+        )
+        return super().apply(layer, x, bias)
+
+
+class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
+    """No-copy packed qkv/f/g PTPC prefill with fused BF16 decode."""
+
+    def __init__(
+        self,
+        bf16_max_m: int,
+        fp8_max_m: int,
+        qkv_size: int,
+        beta_size: int,
+        fg_size: int,
+    ):
+        super().__init__("qkv_proj,f_a_proj,g_a_proj", bf16_max_m)
+        self.fp8_max_m = fp8_max_m
+        self.qkv_size = qkv_size
+        self.beta_size = beta_size
+        self.fg_size = fg_size
+
+    def is_active(self, num_tokens: int) -> bool:
+        return super().is_active(num_tokens) and num_tokens <= self.fp8_max_m
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        if self._fp8_ptpc_ready:
+            return
+        weight = layer.weight.data
+        expected_size = self.qkv_size + self.beta_size + self.fg_size
+        if (
+            weight.dtype != torch.bfloat16
+            or weight.dim() != 2
+            or weight.shape[0] != expected_size
+        ):
+            raise ValueError(
+                "GLM-5.3 KDA packed PTPC requires a 2-D BF16 fused weight with "
+                f"{expected_size} rows, got dtype={weight.dtype}, "
+                f"shape={tuple(weight.shape)}"
+            )
+        packed_weight = torch.cat(
+            (
+                weight[: self.qkv_size],
+                weight[self.qkv_size + self.beta_size :],
+            )
+        )
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            packed_weight,
+            quant_dtype=aiter.dtypes.fp8,
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight",
+            shuffle_weight(fp8_weight, (16, 16)).contiguous(),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_fp8_ptpc_weight_scale",
+            weight_scale.contiguous(),
+            persistent=False,
+        )
+        self._fp8_ptpc_ready = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return UnquantizedLinearMethod.apply(self, layer, x, bias)
+
+    def apply_ptpc_prefill(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        q_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.is_active(x.numel() // x.shape[-1]), (
+            "GLM-5.3 KDA packed PTPC prefill requires an active token shape"
+        )
+        import aiter
+
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+        if q_input is None:
+            q_input = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+        packed_output = apply_fp8_ptpc_linear(
+            q_input,
+            layer._fp8_ptpc_weight,
+            layer._fp8_ptpc_weight_scale,
+        )
+        qkv, fg_a = torch.split(
+            packed_output,
+            (self.qkv_size, self.fg_size),
+            dim=-1,
+        )
+        beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
+        beta = tgemm.mm(x, beta_weight, otype=x.dtype)
+        return qkv, beta, fg_a
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
