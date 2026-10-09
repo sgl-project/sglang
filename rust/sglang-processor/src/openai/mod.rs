@@ -76,6 +76,26 @@ pub struct OpenAiSettings {
     pub tokenizer_metrics_custom_labels_header: Option<String>,
     pub tokenizer_metrics_allowed_custom_labels: Option<Vec<String>>,
     pub tool_call_parser: Option<String>,
+    /// The env vars the engine's OpenAI layer reads; `None` from engines that predate the field.
+    pub openai_env: Option<OpenAiEnv>,
+}
+
+/// `/server_info` `openai_env`, as the engine resolved each env var.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OpenAiEnv {
+    #[serde(rename = "SGLANG_DEFAULT_THINKING")]
+    pub default_thinking: bool,
+    #[serde(rename = "SGLANG_DSV4_REASONING_EFFORT")]
+    pub dsv4_reasoning_effort: Option<String>,
+    #[serde(rename = "SGLANG_DSV41_REASONING_EFFORT")]
+    pub dsv41_reasoning_effort: Option<String>,
+    /// Tool parsing here assumes this is off.
+    #[serde(rename = "SGLANG_FORWARD_UNKNOWN_TOOLS")]
+    pub forward_unknown_tools: bool,
+    /// Tool calls here are unconstrained, as at level 0.
+    #[serde(rename = "SGLANG_TOOL_STRICT_LEVEL")]
+    pub tool_strict_level: u64,
 }
 
 /// The request headers Python's OpenAI layer reads.

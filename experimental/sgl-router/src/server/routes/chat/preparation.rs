@@ -11,6 +11,7 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::tokenizer::chat_formatter::EngineDefaults;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -20,7 +21,9 @@ use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
 };
-use std::collections::HashMap;
+use sglang_processor::RenderEnv;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
@@ -85,6 +88,7 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
+        adopt_engine_defaults(ctx, &model);
         let lowered = lower_openai(ctx, path, &model, headers, &with_defaults);
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
@@ -103,8 +107,16 @@ impl PreparedRequest {
                 ..Self::generate_value(ctx, model, generate, None)?
             });
         }
-        // Router-rendered `input_ids` go only into chat; completions are forwarded as sent.
-        let forwarding_scope = (path == CHAT_PATH).then(|| forwarding_scope(ctx, &model));
+        // Router-rendered `input_ids` go only into chat, and only to engines that
+        // render it alike; completions are forwarded as sent.
+        let renders_alike = ctx
+            .registry
+            .workers_for(&model)
+            .iter()
+            .filter_map(|worker| worker.openai_settings())
+            .all(|settings| renders_as_router(ctx, &model, settings));
+        let forwarding_scope =
+            (path == CHAT_PATH && renders_alike).then(|| forwarding_scope(ctx, &model));
         let can_forward_input_ids =
             forwarding_scope.is_some_and(|scope| scope != ForwardingScope::Never);
         let needs_tokens = should_tokenize_request(
@@ -414,14 +426,8 @@ fn lower_openai(
     if forwarding_scope(ctx, model) != ForwardingScope::AllText {
         return Err("chat_rendering_unverified");
     }
-    let engine_kwargs = settings
-        .default_chat_template_kwargs
-        .clone()
-        .unwrap_or_default();
-    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
-        != ctx.config.model.default_chat_template_kwargs
-    {
-        return Err("default_chat_template_kwargs_differ");
+    if !renders_as_router(ctx, model, &settings) {
+        return Err("chat_defaults_differ");
     }
     let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
     let chat_model = ctx.tokenizers.chat_model();
@@ -430,13 +436,115 @@ fn lower_openai(
         .map_err(|unsupported| unsupported.0)
 }
 
+/// Whether an engine with `settings` renders chats with the defaults the router uses now.
+fn renders_as_router(ctx: &AppContext, model: &ModelId, settings: &OpenAiSettings) -> bool {
+    let (Some(configured), Some(current)) = (
+        ctx.tokenizers.configured_defaults(&model.0),
+        ctx.tokenizers.engine_defaults(&model.0),
+    ) else {
+        return true;
+    };
+    reported_defaults(settings, &configured) == *current
+}
+
+/// The chat defaults an engine with `settings` renders with. Engines that
+/// predate `openai_env` are taken to share the router's env.
+fn reported_defaults(settings: &OpenAiSettings, configured: &EngineDefaults) -> EngineDefaults {
+    let set = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+    let env = settings.openai_env.as_ref().map_or_else(
+        || configured.env.clone(),
+        |env| RenderEnv {
+            default_thinking: env.default_thinking,
+            dsv4_reasoning_effort: set(&env.dsv4_reasoning_effort),
+            dsv41_reasoning_effort: set(&env.dsv41_reasoning_effort),
+        },
+    );
+    let kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    EngineDefaults {
+        kwargs: kwargs.into_iter().collect(),
+        env,
+    }
+}
+
+/// Render `model`'s chats with the defaults its workers agree on, warning when
+/// the router's own differ: the engines' values decide what Python would render.
+fn adopt_engine_defaults(ctx: &AppContext, model: &ModelId) {
+    let (Some(settings), Some(configured)) = (
+        model_openai_settings(ctx, model),
+        ctx.tokenizers.configured_defaults(&model.0),
+    ) else {
+        return;
+    };
+    static UNREPORTED: AtomicBool = AtomicBool::new(false);
+    if settings.openai_env.is_none() && !UNREPORTED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(model = %model.0, "workers do not report openai_env (SGLang predating it); \
+            chats render with the router's own SGLANG_DEFAULT_THINKING and \
+            SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT, unverified");
+    }
+    let reported = reported_defaults(&settings, &configured);
+    let differ = differing_defaults(&configured, &reported);
+    if !ctx.tokenizers.adopt_engine_defaults(&model.0, reported) {
+        return;
+    }
+    let fields: Vec<_> = differ.iter().map(|(field, ..)| *field).collect();
+    ctx.metrics.set_chat_defaults_mismatch(&model.0, &fields);
+    if differ.is_empty() {
+        tracing::info!(model = %model.0, "chats render with the workers' default kwargs and env");
+    }
+    for (field, router, engine) in differ {
+        tracing::warn!(model = %model.0, field, router = %router, engine = %engine,
+            "ALERT: the router's chat default differs from the workers'; \
+             rendering with the workers' value");
+    }
+}
+
+/// Each default `engine` sets differently from `router`: name, router value, engine value.
+fn differing_defaults(
+    router: &EngineDefaults,
+    engine: &EngineDefaults,
+) -> Vec<(&'static str, String, String)> {
+    let kwargs = |defaults: &EngineDefaults| {
+        let sorted: BTreeMap<_, _> = defaults.kwargs.iter().collect();
+        serde_json::to_string(&sorted).unwrap_or_default()
+    };
+    let (a, b) = (&router.env, &engine.env);
+    [
+        (
+            "default_chat_template_kwargs",
+            kwargs(router),
+            kwargs(engine),
+        ),
+        (
+            "SGLANG_DEFAULT_THINKING",
+            a.default_thinking.to_string(),
+            b.default_thinking.to_string(),
+        ),
+        (
+            "SGLANG_DSV4_REASONING_EFFORT",
+            format!("{:?}", a.dsv4_reasoning_effort),
+            format!("{:?}", b.dsv4_reasoning_effort),
+        ),
+        (
+            "SGLANG_DSV41_REASONING_EFFORT",
+            format!("{:?}", a.dsv41_reasoning_effort),
+            format!("{:?}", b.dsv41_reasoning_effort),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, router, engine)| router != engine)
+    .collect()
+}
+
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
 fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
     let workers = ctx.registry.workers_for(model);
     let first = Arc::clone(workers.first()?.openai_settings()?);
     let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !agree && !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
             serving OpenAI requests through the engines' own routes");
     }

@@ -409,13 +409,16 @@ continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
 only.
 
-Use matching model files on the router and workers, and set
-the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
-`SGLANG_DSV4_REASONING_EFFORT`, and `SGLANG_DSV41_REASONING_EFFORT` on both.
-The router reads these render defaults from its own configuration and environment;
-it does not discover the workers' settings. Point `--tokenizer-path` at the workers'
-model snapshot so the V4 effort profile is read from the same
-`encoding/encoding_dsv4.py`.
+Use matching model files on the router and workers. Chats render with the
+defaults the workers report in `/server_info`: `--default-chat-template-kwargs`,
+and from `openai_env`, `SGLANG_DEFAULT_THINKING`, `SGLANG_DSV4_REASONING_EFFORT`
+and `SGLANG_DSV41_REASONING_EFFORT`. The router's own flag and env apply until
+the workers agree on theirs, and stand in for `openai_env` from workers that
+predate it (with a warning). When the router's own value differs, it logs an
+`ALERT` warning per default and sets `sgl_router_chat_defaults_mismatch{field}`.
+Workers that disagree with each other get chats as sent, without router
+`input_ids`. Point `--tokenizer-path` at the workers' model snapshot so the V4
+effort profile is read from the same `encoding/encoding_dsv4.py`.
 
 Set `--disable-input-ids-forwarding` for this router's model when worker-side
 rendering has not been verified to match. This disables router-generated IDs
@@ -497,17 +500,18 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope, DeepSeek-V4 and V4.1 today), router `--default-chat-template-kwargs`
-equal to the workers', a reasoning parser the processor reproduces
+`AllText` scope, DeepSeek-V4 and V4.1 today), workers that agree on their chat
+defaults (outcome `chat_defaults_differ` otherwise), a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
 parser the processor reproduces (`deepseekv4`, `deepseekv41`); `required`, named and strict
 tools take a constraint from the engine's xgrammar, so they go to the engine.
 The router reads the model's `config.json` and `generation_config.json` beside
 `--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
-path should point into the model's directory. Engine env vars that change the
-layer (`SGLANG_TOOL_STRICT_LEVEL`, `SGLANG_FORWARD_UNKNOWN_TOOLS`) are taken as
-unset. `sgl_router_openai_route_total` counts each outcome.
+path should point into the model's directory. Chats with tools go to the engine
+(outcome `tool_env`) when its `openai_env` reports `SGLANG_FORWARD_UNKNOWN_TOOLS`
+or a nonzero `SGLANG_TOOL_STRICT_LEVEL`, which the processor does not reproduce.
+`sgl_router_openai_route_total` counts each outcome.
 
 ## Embeddings
 

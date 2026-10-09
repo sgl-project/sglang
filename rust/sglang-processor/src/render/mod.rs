@@ -27,6 +27,31 @@ pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
 
+/// The engine env vars SGLang's chat rendering reads, as `/server_info`
+/// reports them under `openai_env`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderEnv {
+    /// `SGLANG_DEFAULT_THINKING`.
+    pub default_thinking: bool,
+    /// `SGLANG_DSV4_REASONING_EFFORT`.
+    pub dsv4_reasoning_effort: Option<String>,
+    /// `SGLANG_DSV41_REASONING_EFFORT`.
+    pub dsv41_reasoning_effort: Option<String>,
+}
+
+impl RenderEnv {
+    /// This process's own values, for engines that do not report theirs.
+    pub fn from_process() -> Self {
+        let set = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        Self {
+            default_thinking: std::env::var("SGLANG_DEFAULT_THINKING")
+                .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str())),
+            dsv4_reasoning_effort: set("SGLANG_DSV4_REASONING_EFFORT"),
+            dsv41_reasoning_effort: set("SGLANG_DSV41_REASONING_EFFORT"),
+        }
+    }
+}
+
 /// Legacy stop strings: a single separator-style stop or a list of stops.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OneOrMany<T> {
@@ -99,7 +124,8 @@ impl ChatFormatter {
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
                 body["messages"] = messages;
-                let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
+                let env = RenderEnv::from_process();
+                let (prompt, prefix) = self.render_request(body, &HashMap::new(), &env)?;
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
                 if prefix.is_empty() {
@@ -115,7 +141,7 @@ impl ChatFormatter {
     }
 
     /// Render an SGLang chat request body under the server's default
-    /// `chat_template_kwargs`, returning the prompt and the
+    /// `chat_template_kwargs` and env, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
     /// re-validated. Only DeepSeek-V4 and V4.1 render this way; others use [`Self::render_prompt`].
@@ -123,12 +149,13 @@ impl ChatFormatter {
         &self,
         request: Value,
         default_kwargs: &HashMap<String, Value>,
+        env: &RenderEnv,
     ) -> Result<(String, String), TemplateError> {
         match self {
             ChatFormatter::DeepSeekV4(profile) => {
-                render_deepseek_v4(*profile, request, default_kwargs)
+                render_deepseek_v4(*profile, request, default_kwargs, env)
             }
-            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs),
+            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs, env),
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| TemplateError::Renderer { message })
@@ -165,6 +192,7 @@ impl ChatFormatter {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
                     &HashMap::new(),
+                    &RenderEnv::from_process(),
                 );
                 args.get_or_insert_default()
                     .insert("thinking".into(), Value::Bool(enabled));

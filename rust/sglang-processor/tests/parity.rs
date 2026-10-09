@@ -9,18 +9,13 @@ use std::path::Path;
 use serde_json::Value;
 use sglang_processor::dynamo_tokenizers::Tokenizer;
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, RenderEnv, load_tokenizer, resolve_model_file,
+    select_chat_formatter,
 };
 use sha2::{Digest, Sha256};
 
 #[test]
 fn fixtures_match_sglang() {
-    // The generator pins these; SGLang's defaults apply, not this machine's.
-    unsafe {
-        std::env::remove_var("SGLANG_DEFAULT_THINKING");
-        std::env::remove_var("SGLANG_DSV4_REASONING_EFFORT");
-        std::env::remove_var("SGLANG_DSV41_REASONING_EFFORT");
-    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity");
     for entry in std::fs::read_dir(dir).unwrap() {
         let fixture: Value =
@@ -71,7 +66,12 @@ fn check_case(
     bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
-    let rendered = formatter.render_request(case["request"].clone(), &Default::default());
+    // The generator pins SGLang's default env.
+    let rendered = formatter.render_request(
+        case["request"].clone(),
+        &Default::default(),
+        &RenderEnv::default(),
+    );
     if !case["error"].is_null() {
         return match rendered {
             Ok(_) => Err("SGLang rejects this request".into()),

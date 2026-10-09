@@ -7,7 +7,7 @@ mod kimi;
 pub mod stats;
 
 use anyhow::Result;
-use chat_formatter::ChatFormatter;
+use chat_formatter::{ChatFormatter, EngineDefaults};
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use sglang_processor::openai::{ChatModel, OpenAiTokenizer, TokenPieces};
@@ -182,8 +182,7 @@ impl TokenizerRegistry {
             match me.forwarding_scope(&m.id) {
                 ForwardingScope::AllText => tracing::info!(model = %m.id,
                     "router-generated input_ids forwarding enabled for all text chats; requires the \
-                     workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
-                     and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
+                     workers' model files, and renders with the chat defaults the workers report"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
                      for DeepSeek-V4 and V4.1, so this model forwards only guarded request shapes (plain text \
@@ -256,6 +255,24 @@ impl TokenizerRegistry {
                 None
             }
         }
+    }
+
+    /// The router's own chat defaults for `model_id`, if it renders chats.
+    pub fn configured_defaults(&self, model_id: &str) -> Option<EngineDefaults> {
+        let entry = self.formatters.get(model_id)?;
+        Some(entry.formatter.configured_defaults().clone())
+    }
+
+    /// The defaults `model_id`'s chats render with.
+    pub fn engine_defaults(&self, model_id: &str) -> Option<Arc<EngineDefaults>> {
+        Some(self.formatters.get(model_id)?.formatter.engine_defaults())
+    }
+
+    /// Render `model_id`'s chats with `defaults`; `false` if already in use.
+    pub fn adopt_engine_defaults(&self, model_id: &str, defaults: EngineDefaults) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|entry| entry.formatter.adopt(defaults))
     }
 
     pub fn ids(&self) -> Vec<String> {

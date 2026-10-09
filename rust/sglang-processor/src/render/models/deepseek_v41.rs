@@ -9,6 +9,7 @@ use super::deepseek_v4::{
     check_tool_arguments, drop_merged_tasks, engine_message, normalize_messages, pydantic_bool,
     split_continuation, thinking,
 };
+use crate::render::RenderEnv;
 use crate::render::reasoning::requested_effort;
 
 /// Render an SGLang chat request body. Returns the prompt and the
@@ -16,6 +17,7 @@ use crate::render::reasoning::requested_effort;
 pub(crate) fn render(
     mut request: Value,
     defaults: &HashMap<String, Value>,
+    env: &RenderEnv,
 ) -> Result<(String, String), String> {
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
@@ -62,12 +64,12 @@ pub(crate) fn render(
     if let Some(tools) = tools {
         messages[0]["tools"] = tools.iter().map(tool_payload).collect::<Result<_, _>>()?;
     }
-    let mode = if thinking(request, defaults) {
+    let mode = if thinking(request, defaults, env) {
         ThinkingMode::Thinking
     } else {
         ThinkingMode::Chat
     };
-    let prompt = v41::encode_messages(&messages, mode, true, budget(request, defaults))
+    let prompt = v41::encode_messages(&messages, mode, true, budget(request, defaults, env))
         .map_err(|error| error.to_string())?;
     Ok((prompt, prefix))
 }
@@ -98,7 +100,7 @@ fn tool_payload(tool: &Value) -> Result<Value, String> {
 /// `serving_chat._resolve_dsv41_reasoning_effort` as the encoder's 1-100 budget:
 /// kwargs effort replaces the request's verbatim, then the server's default
 /// kwargs, then `SGLANG_DSV41_REASONING_EFFORT`, else `high`.
-fn budget(request: &Value, defaults: &HashMap<String, Value>) -> u8 {
+fn budget(request: &Value, defaults: &HashMap<String, Value>, env: &RenderEnv) -> u8 {
     let kwargs = request["chat_template_kwargs"]
         .get("reasoning_effort")
         .filter(|effort| !effort.is_null());
@@ -110,8 +112,7 @@ fn budget(request: &Value, defaults: &HashMap<String, Value>) -> u8 {
             .cloned()
     });
     let env = || {
-        let raw = std::env::var("SGLANG_DSV41_REASONING_EFFORT").ok()?;
-        let raw = raw.trim();
+        let raw = env.dsv41_reasoning_effort.as_deref()?.trim();
         let value = match raw.parse::<u64>() {
             Ok(budget) => Value::from(budget),
             Err(_) => Value::from(raw),
@@ -153,5 +154,27 @@ fn effort_budget(effort: &Value) -> Option<u8> {
                 .map(|effort| (effort * 100.0).round_ties_even().max(1.0) as u8),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn budget_falls_back_to_the_engine_env_last() {
+        let low = RenderEnv {
+            dsv41_reasoning_effort: Some("low".into()),
+            ..Default::default()
+        };
+        let none = HashMap::new();
+        assert_eq!(budget(&json!({}), &none, &low), 50);
+        assert_eq!(budget(&json!({}), &none, &RenderEnv::default()), 75);
+        assert_eq!(
+            budget(&json!({"reasoning_effort": "max"}), &none, &low),
+            100
+        );
     }
 }

@@ -173,6 +173,12 @@ pub fn lower_chat(
         return Err(Unsupported("reasoning_parser"));
     }
     let tools = request_tools(&raw)?;
+    let tool_env = settings.openai_env.as_ref();
+    if tools.is_some()
+        && tool_env.is_some_and(|env| env.forward_unknown_tools || env.tool_strict_level > 0)
+    {
+        return Err(Unsupported("tool_env"));
+    }
     let tool_names = match (settings.tool_call_parser.as_deref(), &tools) {
         (Some(parser), Some(names)) => {
             tool_detector(parser, names.clone()).ok_or(Unsupported("tool_parser"))?;
@@ -1026,6 +1032,7 @@ fn tool_call(index: i64, call: &ToolCallItem) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai::OpenAiEnv;
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
     fn unsupported(messages: Value) -> Option<&'static str> {
@@ -1042,6 +1049,39 @@ mod tests {
         )
         .err()
         .map(|reason| reason.0)
+    }
+
+    #[test]
+    fn tool_chats_go_to_the_engine_when_its_tool_env_differs() {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);
+        let body =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "tools": tools});
+        let body = serde_json::to_vec(&body).unwrap();
+        for env in [
+            OpenAiEnv {
+                forward_unknown_tools: true,
+                ..Default::default()
+            },
+            OpenAiEnv {
+                tool_strict_level: 1,
+                ..Default::default()
+            },
+        ] {
+            let settings = OpenAiSettings {
+                tool_call_parser: Some("deepseekv41".into()),
+                openai_env: Some(env),
+                ..Default::default()
+            };
+            let lowered = lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &settings,
+                &ChatModel::default(),
+                |_: &Value| Some(vec![1]),
+                None,
+            );
+            assert_eq!(lowered.err().map(|reason| reason.0), Some("tool_env"));
+        }
     }
 
     #[test]
