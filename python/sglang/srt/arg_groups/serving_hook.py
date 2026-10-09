@@ -116,6 +116,13 @@ def handle_asr_validation(server_args: Any):
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
+    for name in (
+        "max_mm_patch_tokens_per_request",
+        "max_prefill_mm_patch_tokens",
+    ):
+        value = getattr(cfg, name)
+        if value is not None and value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if (
         cfg.mm_preprocess_cache_size_mb is not None
         and cfg.mm_preprocess_cache_size_mb < 0
