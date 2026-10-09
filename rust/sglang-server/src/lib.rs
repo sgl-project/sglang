@@ -12,11 +12,8 @@
 //! a `PyObject`.
 
 mod api_server;
-mod frontend;
-mod grpc;
 mod message;
 mod multi_modality;
-mod native_generation;
 mod tokenizer_manager;
 mod utils;
 
@@ -24,8 +21,8 @@ pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RustServerServerArgs, ServerArgs,
 };
-pub use message::multimodal::MmItem;
-pub use message::request::{MmData, ProcessorExtensions};
+pub use message::multimodal::{MediaHints, MmItem};
+pub use message::request::MmData;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
@@ -41,7 +38,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
-use crate::utils::startup::{listen_addr, value_error};
+use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
@@ -194,10 +191,13 @@ impl Server {
         // their offset so this boundary has one source of truth for the address.
         let http_addr = listen_addr(&server_args, port_offset)
             .map_err(|e| value_error("bad listen address", e))?;
+        let grpc_addr = grpc_listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad gRPC listen address", e))?;
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr,
+                grpc_addr,
                 http_api_worker_num: server_args.http_api_worker_num(),
                 to_scheduler_cap,
                 from_scheduler_cap,

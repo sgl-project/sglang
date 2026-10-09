@@ -26,14 +26,14 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.kernels.ops.activation.softcap import (
+    softcap_to_float32_logits,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
-from sglang.srt.layers.aux_hidden_states import (
-    AuxHiddenStates,
-    pack_aux_hidden_states,
-)
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -945,11 +945,19 @@ class LogitsProcessor(nn.Module):
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
 
+        fuse_cast_softcap = (
+            self.final_logit_softcapping
+            and logits.is_cuda
+            and logits.dtype in (torch.float16, torch.bfloat16)
+        )
         logits = self._copy_logits_to_buffer(
-            logits, logits_metadata, use_buffer=use_logits_buffer
+            logits,
+            logits_metadata,
+            use_buffer=use_logits_buffer,
+            softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
         )
 
-        if self.final_logit_softcapping:
+        if self.final_logit_softcapping and not fuse_cast_softcap:
             if not (_is_npu or _is_cpu):
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
@@ -1148,11 +1156,19 @@ class LogitsProcessor(nn.Module):
         logits: torch.Tensor,
         logits_metadata: LogitsMetadata,
         use_buffer: bool = True,
+        softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
+        if softcap is not None:
+            if logits_buffer is None or tuple(logits_buffer.shape) != tuple(
+                logits.shape
+            ):
+                logits_buffer = torch.empty_like(logits, dtype=torch.float32)
+            assert logits_buffer.dtype == torch.float
+            return softcap_to_float32_logits(logits, softcap, logits_buffer)
         # The shared logits buffer is keyed by vocab width and rows; skip it
         # when this batch has a different logits shape than the graph buffer.
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(

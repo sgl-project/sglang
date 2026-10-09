@@ -45,7 +45,6 @@ from sglang.srt.layers.layer_boundary.ops import (
     update_attn_tp_gather_output,
 )
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
@@ -53,6 +52,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
     finish_exit,
     make_test_stages,
@@ -85,6 +85,7 @@ def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
         dwdp_size=1,
         attn_dp_enabled=attn_dp > 1,
         enable_attn_tp_input_scattered=False,
+        disable_attn_tp_gather=False,
         tp_group=SimpleNamespace(
             name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
         ),
@@ -368,7 +369,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 max_len, communicator.ffn.plan.output.plan.path_for(max_len)
             )
             self.assertTrue(
-                communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                communicator.ffn.plan.output._sum_in_reduce_scatter(
                     communicator.ffn.plan.output.plan.path_for(max_len), step
                 )
             )
@@ -415,7 +416,9 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     with communicator.ffn.plan.output.ffn_exit(
                         forward_batch, stream=ResidualStream()
                     ) as ffn_exit:
-                        self.assertTrue(ffn_exit.mlp_reduce_scatter)
+                        # The reduce-scatter on the way back completes the sum;
+                        # the FFN never runs or skips it.
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
                     hidden, residual = finish_exit(
                         ffn_exit, torch.ones(4, 4), torch.full((2, 4), 2.0)
                     )
@@ -572,15 +575,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 # The write-back consumes this layer's coefficients.
                 self.assertIsNone(communicator.mhc.h_res)
 
-    def test_a_gather_over_attention_cp_is_rejected(self):
+    def test_mhc_can_keep_its_residual_on_attention_cp_shards(self):
         # A MoE on the TP group under DSA prefill CP gathers its input over
-        # attention CP, which MHC has not been run with.
+        # attention CP while MHC retains its residual and coefficients locally.
         parallel = parallel_of(
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
         )
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
-        with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_cp=True)
+        build_mhc(facts, parallel, dsa_cp=True)
         # A dense layer on every rank computes on its own shard: nothing moves.
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
         build_mhc(facts, parallel, dsa_cp=True)
@@ -1122,7 +1124,7 @@ class TestPrefillCP(CustomTestCase):
                     patch_communicator("_batch_shards_over_cp", lambda fb: shards),
                 ):
                     self.assertIs(
-                        communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                        communicator.ffn.plan.output._sum_in_reduce_scatter(
                             communicator.ffn.plan.output.plan.path_for(
                                 SimpleNamespace(forward_mode=ForwardMode.DECODE)
                             ),
@@ -1420,7 +1422,11 @@ class TestBranchRows(CustomTestCase):
             branch_output = branch.branch_output
             merge_branch = branch.merge_branch
 
-        moe = Communicator(branch_rows=lambda fb: (self.local, self.local, self.local))
+        moe = Communicator(
+            branch_rows=lambda fb: (self.local, self.local, self.local),
+            # The a2a combine already summed the MoE output.
+            path_for=lambda fb: SimpleNamespace(output=comm.OutputContract(self.local)),
+        )
         dense = Communicator(
             branch_rows=lambda fb: (self.full, self.attention, self.attention)
         )
@@ -1584,7 +1590,6 @@ class Flags:
     """The per-forward flags an FFN exit publishes, one set per rank."""
 
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
@@ -1641,6 +1646,12 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         "get_forward": lambda: state().flags,
         "attention_tensor_model_parallel_all_reduce": lambda x: (
             state().parallel.attn_tp_group.all_reduce(x)
+        ),
+        "tensor_model_parallel_all_reduce": lambda x: (
+            state().parallel.tp_group.all_reduce(x)
+        ),
+        "sum_post_experts_output": lambda x: (
+            comm_layout.post_experts_reduction_group().all_reduce(x)
         ),
         "get_global_dp_buffer": lambda g: torch.zeros(
             state().global_rows, HIDDEN, dtype=torch.double
@@ -1709,21 +1720,15 @@ def attention(x, state):
 
 
 def dense_mlp(x, state):
-    """A dense MLP on the TP group: 5 * x, reduced unless a published flag asks
-    it to leave the sum, as RowParallelLinear does."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return state.parallel.tp_group.all_reduce(partial_sum)
+    """A dense MLP on the TP group: 5 * x, as this rank's partial sum; the
+    stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def moe(x, state):
-    """A MoE block not dispatched per DP shard: 5 * x, reduced over the MoE
-    output's group unless a published flag asks it to leave the sum."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return comm_layout.post_experts_reduction_group().all_reduce(partial_sum)
+    """A MoE block not dispatched per DP shard: 5 * x, as this rank's partial
+    sum over the MoE output's group; the stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def reference(x):
@@ -1853,7 +1858,7 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = finish_exit(ffn_exit, hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = export_output(hidden, residual, forward_batch)
+            hidden, residual = residual.export(hidden)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
@@ -1967,7 +1972,7 @@ class TestTheFfnInputReduction(CustomTestCase):
             with self.subTest(is_plain_add=is_plain_add):
                 update = SimpleNamespace(is_plain_add=is_plain_add)
                 read = SimpleNamespace(
-                    update_and_read=lambda update, h, r, norm: (h, r)
+                    update_and_read=lambda update, h, r, norm, **read_kwargs: (h, r)
                 )
                 calls = []
                 with (

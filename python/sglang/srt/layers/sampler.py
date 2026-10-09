@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -22,7 +23,7 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.async_probe import sanitize_nan_logits
+from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -162,6 +163,7 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+        maybe_detect_nan(logits, "sampler: next_token_logits")
         _trace_e2e_sampler(
             "forward_enter",
             logits_shape=tuple(logits.shape),
@@ -263,7 +265,11 @@ class Sampler(nn.Module):
                     )
 
                 # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
+                logits[:] = (
+                    torch.softmax(logits, dim=-1)
+                    if self.enable_deterministic
+                    else sampler_softmax(logits)
+                )
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(

@@ -358,6 +358,9 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # Hand-built batch bypasses ForwardBatch.init_new: rebind the write
+        # loc to the draft's kernel-facing ids (no-op on plain pools).
+        self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -431,6 +434,11 @@ class DraftBlockProposer:
                 draft_num_tokens, device
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
+        )
+        verify_window.kv_loc_plan.bind(
+            draft_forward_batch,
+            self.draft_model_runner.kv_index_translator,
+            cols=slice(0, query_token_num),
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
