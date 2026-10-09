@@ -136,8 +136,17 @@ async def simulator_get_request(
             created_time_ms += np.random.exponential(1.0 / request_rate) * 1000.0
 
 
+# `/generate` nests sampling under `sampling_params`; the OpenAI chat schema is
+# flat and carries `custom_params` at the top level (protocol.py ChatCompletionRequest),
+# so the metadata lands in the same place on the scheduler either way.
+# Multi-turn replay (`wrap_multi_turn_request_func`) only runs on chat backends.
+_SUPPORTED_BACKENDS = {"sglang", "sglang-oai-chat"}
+_CHAT_URL_REGEX = r"/v1/chat/completions(?:\?.*)?$"
+_DEFAULT_HIJACK_URL_REGEX = rf"(?:/generate(?:\?.*)?$)|(?:{_CHAT_URL_REGEX})"
+
+
 def install_aiohttp_json_hijack(
-    *, hijack_url_regex: Optional[str] = r"/generate(?:\?.*)?$"
+    *, hijack_url_regex: Optional[str] = _DEFAULT_HIJACK_URL_REGEX
 ) -> None:
     """Move transient metadata into the already-built sampling parameters."""
     global _ORIGINAL_AIOHTTP_REQUEST
@@ -145,6 +154,7 @@ def install_aiohttp_json_hijack(
         return
 
     pattern = re.compile(hijack_url_regex) if hijack_url_regex else None
+    chat_pattern = re.compile(_CHAT_URL_REGEX)
     _ORIGINAL_AIOHTTP_REQUEST = aiohttp.ClientSession._request
 
     async def patched_request(self, method, url, **kwargs):
@@ -152,8 +162,11 @@ def install_aiohttp_json_hijack(
             payload = kwargs.get("json")
             if isinstance(payload, dict) and "simulation" in payload:
                 simulation = payload.pop("simulation")
-                sampling_params = payload.setdefault("sampling_params", {})
-                custom_params = sampling_params.setdefault("custom_params", {})
+                if chat_pattern.search(str(url)):
+                    custom_params = payload.setdefault("custom_params", {})
+                else:
+                    sampling_params = payload.setdefault("sampling_params", {})
+                    custom_params = sampling_params.setdefault("custom_params", {})
                 custom_params["simulation"] = simulation
                 kwargs["json"] = payload
         return await _ORIGINAL_AIOHTTP_REQUEST(self, method, url, **kwargs)
@@ -197,9 +210,10 @@ def _replace_output_file_duration(
 
 def simulator_run_benchmark(args: argparse.Namespace):
     global _USE_TRACE_TIMESTAMPS
-    if args.backend != "sglang":
+    if args.backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
-            "benchmark/simulator/bench_serving.py requires --backend sglang"
+            "benchmark/simulator/bench_serving.py requires --backend one of "
+            f"{sorted(_SUPPORTED_BACKENDS)}"
         )
     if args.dataset_name == "mooncake":
         raise ValueError(
