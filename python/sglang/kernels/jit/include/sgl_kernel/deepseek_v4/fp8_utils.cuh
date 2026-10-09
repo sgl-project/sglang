@@ -5,9 +5,7 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
-#if defined(USE_MUSA)
-#include <musa_fp8.h>
-#elif !defined(USE_ROCM)
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
 #elif defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
 // Only on the arches that take the hardware branch below. hip_fp8.h is what defines

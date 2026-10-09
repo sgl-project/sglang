@@ -5,9 +5,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
-#if defined(USE_MUSA)
-#include <musa_fp4.h>
-#elif !defined(USE_ROCM)
+#ifndef USE_ROCM
 #include <cuda_fp4.h>
 #endif
 
