@@ -36,6 +36,8 @@ class TestLongcatShortcut(CustomTestCase):
             prepare_attn=lambda h, r, batch: (h, r),
             prepare_mlp=lambda h, r, batch: (fork_hidden, fork_residual),
             branch_rows=lambda batch: (local, local, attention),
+            # Each rank's own tokens: the MoE output owes no sum.
+            path_for=lambda batch: SimpleNamespace(output=comm.OutputContract(local)),
         )
         dense_communicator = Communicator(
             branch_rows=lambda batch: (attention, attention, attention)
@@ -76,7 +78,12 @@ class TestLongcatShortcut(CustomTestCase):
             ),
             patch_communicator(
                 "get_parallel",
-                return_value=SimpleNamespace(attn_tp_group=object()),
+                return_value=SimpleNamespace(
+                    attn_tp_group=object(),
+                    attn_tp_size=tp,
+                    attn_dp_enabled=False,
+                    disable_attn_tp_gather=False,
+                ),
             ),
         ):
             hidden, _ = layer(
