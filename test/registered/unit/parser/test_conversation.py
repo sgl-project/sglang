@@ -212,6 +212,64 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("Q1 ", prompt)
         # i=1: tag + " " + message + sep2
         self.assertIn("[/INST] A1 </s><s>", prompt)
+        self.assertEqual(
+            prompt,
+            "[INST] <<SYS>>\nSys\n<</SYS>>\n\nQ1 [/INST] A1 </s><s>[INST] Q2 [/INST]",
+        )
+
+    def test_llama2_consecutive_user_messages(self):
+        """Consecutive users keep their role and open an assistant response."""
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "Here is my code."},
+                {"role": "user", "content": "Please review it."},
+            ],
+        )
+        for template in ("llama-2", "mistral", "devstral"):
+            with self.subTest(template=template):
+                conv = generate_chat_conv(request, template)
+                self.assertEqual(
+                    conv.get_prompt(),
+                    "[INST] Here is my code. [INST] Please review it. [/INST]",
+                )
+
+    def test_llama2_consecutive_assistant_messages(self):
+        """Each assistant response receives its own end-of-turn separator."""
+        conv = Conversation(
+            name="test",
+            roles=("[INST]", "[/INST]"),
+            messages=[
+                ["[INST]", "Q"],
+                ["[/INST]", "A1"],
+                ["[/INST]", "A2"],
+                ["[INST]", "Q2"],
+                ["[/INST]", None],
+            ],
+            sep_style=SeparatorStyle.LLAMA2,
+            sep=" ",
+            sep2=" </s><s>",
+        )
+        self.assertEqual(
+            conv.get_prompt(),
+            "[INST] Q [/INST] A1 </s><s>[/INST] A2 </s><s>[INST] Q2 [/INST]",
+        )
+
+    def test_llama2_leading_assistant_message(self):
+        """An assistant-first history must not relabel its content as a user."""
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                {"role": "assistant", "content": "Previous answer."},
+                {"role": "user", "content": "Follow up."},
+            ],
+        )
+        conv = generate_chat_conv(request, "llama-2")
+        self.assertEqual(
+            conv.get_prompt(),
+            "[INST] [/INST] Previous answer. </s><s>[INST] Follow up. [/INST]",
+        )
 
     def test_llama4(self):
         """Test prompt generation with LLAMA4 style."""
