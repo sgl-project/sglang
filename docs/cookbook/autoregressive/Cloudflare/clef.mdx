@@ -48,8 +48,9 @@ Choose your GPU, then Clef or Clef Flash. The wizard updates the model in the la
 
 import { Deployment } from "/src/snippets/_deployment.jsx"
 import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
+import { benchmarks } from "/src/snippets/configs/Cloudflare/clef-benchmarks.jsx"
 
-<Deployment config={config} />
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## 1. Model introduction
 

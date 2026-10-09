@@ -1,7 +1,6 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
-// BF16, TP=1 recipes tested on B300 and H200 in lmsysorg/sglang:dev-clef (bd2d73daa5af).
-// B200 tested at PR #42721 / e122069670a7. Each model passed text and image requests,
-// including 16,384-token prompts.
+// BF16, TP=1 recipes validated on one H200, B200, or B300.
+// See clef-benchmarks.jsx for accuracy results and serving revisions.
 export const config = {
   modelName: "Clef",
   showPlaygroundLink: false,
@@ -26,6 +25,9 @@ export const config = {
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/systemone \\
   -H 'Content-Type: application/json' \\
   -d '{"model":"{{MODEL_NAME}}","state":"My Stripe integration keeps failing. Please help ASAP.","questions":{"urgency":{"type":"noul","instructions":"Does this message express urgency?"}}}'`,
+  accuracyLabels: [
+    ["gsm8k_decision_pct", "GSM8K (Decision Index 0.2.1)", "%"],
+  ],
   dockerImages: {
     h200: "lmsysorg/sglang:dev-clef",
     b200: "lmsysorg/sglang:dev-clef",
