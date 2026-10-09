@@ -545,22 +545,12 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
         )
         self.assertEqual(len(results), len(full_ids))
 
+        # The device tree was flushed: every hit comes back from L3, on the
+        # checkpoint grid and within the seed.
         cached = [r["meta_info"]["cached_tokens"] for r in results]
         print(f"buffer_only storage hits: {cached}")
-        for i, hit in enumerate(cached):
-            self.assertGreater(
-                hit,
-                0,
-                f"buffer_only[{i}] took no storage hit: the device tree was "
-                "flushed, so this run never exercised the buffer-mode read path",
-            )
-            self.assertEqual(
-                hit % TRACK_INTERVAL,
-                0,
-                f"buffer_only[{i}]: hit of {hit} tokens is off the "
-                f"{TRACK_INTERVAL}-token checkpoint grid",
-            )
-            self.assertLessEqual(hit, BUFFER_ONLY_SEED_TOKENS)
+        self.assertTrue(all(0 < h <= BUFFER_ONLY_SEED_TOKENS for h in cached), cached)
+        self.assertTrue(all(h % TRACK_INTERVAL == 0 for h in cached), cached)
 
         # Drain this pass's storage writes here: the replay's own flush uses
         # the 30s default, which they can outlast.
