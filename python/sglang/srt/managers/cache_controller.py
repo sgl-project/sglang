@@ -1209,6 +1209,8 @@ class HiCacheController:
         return producer_id
 
     def _mla_layer_loader(self, device_indices: torch.Tensor):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
         broadcaster = self.mla_dedup.broadcaster
         prepared_broadcast = None
 
@@ -1222,6 +1224,14 @@ class HiCacheController:
                 if not getattr(transfer.host_pool, "_is_dummy", False)
             ]
             self.l2_transfer_engine._load_layer(real_transfers, layer_id)
+            if isinstance(broadcaster, V4HostDedupBroadcaster):
+                # V4 has multiple physical side pools behind a logical anchor.
+                # Each transfer already carries its translated indices and
+                # global-to-pool layer mapping. Draft pools remain rank-local.
+                for transfer in transfers:
+                    if not transfer.is_draft:
+                        broadcaster.broadcast_transfer(transfer, layer_id)
+                return
             # Hybrid models interleave MLA with rank-local state layers.
             # Use the same global-to-pool mapping as the physical H2D copy.
             target = next(
