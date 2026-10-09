@@ -980,6 +980,8 @@ class UnifiedRadixCache(BasePrefixCache):
         params: Optional[DecLockRefParams] = None,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
+        if params is None:
+            params = DecLockRefParams()
         result = self.session.try_dec_lock_ref(node_id, params)
         if result is not None:
             return result
