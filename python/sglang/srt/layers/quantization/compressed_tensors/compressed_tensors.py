@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8MoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16DeepGemmMoE,
@@ -911,9 +912,20 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
+            # [batch8 PPU W8A8 INT8 MoE - migrated from v0.5.18_rel dirty WIP] 旧代码：
+            # else:
+            #     raise NotImplementedError(
+            #         "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+            #     )
+            # PPU uses the generic Triton/DeepGEMM W8A8 INT8 MoE scheme
+            # (validated on GLM-5.3-Flash INT8 W8A8 workloads).
+            elif _is_ppu:
+                logger.info_once("Using CompressedTensorsW8A8Int8MoE (PPU)")
+                return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(
-                    "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W8A8Int8 Fused MoE scheme is implemented only for "
+                    "NPU and PPU for now."
                 )
         elif self._is_wint4afp8(weight_quant, input_quant):
             # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.
