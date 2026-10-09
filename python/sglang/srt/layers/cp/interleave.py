@@ -314,6 +314,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         )
         # Physical collective padding must never become an attention query.
         pad_size = q.shape[0] - num_queries
+        assert pad_size >= 0
         if pad_size:
             result = torch.cat(
                 [result, result.new_zeros(pad_size, *result.shape[1:])], dim=0

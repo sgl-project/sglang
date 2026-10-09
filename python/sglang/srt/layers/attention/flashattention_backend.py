@@ -393,9 +393,9 @@ class FlashAttentionBackend(AttentionBackend):
             "--enable-unified-memory does not support local-attention models "
             "on the fa3/fa4 backend."
         )
-        assert (
-            model_runner.attention_chunk_size is not None
-        ), "Attention chunk size is required for local attention"
+        assert model_runner.attention_chunk_size is not None, (
+            "Attention chunk size is required for local attention"
+        )
         return LocalAttentionMetadataBuilder(
             attention_chunk_size=model_runner.attention_chunk_size,
             page_size=self.page_size,
@@ -1069,9 +1069,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # create expand page table
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
@@ -1214,9 +1212,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             text_col = forward_batch.encoder_lens.long().unsqueeze(
                 1
-            ) + arange_text.unsqueeze(
-                0
-            )  # (bs, max_seq_len_k)
+            ) + arange_text.unsqueeze(0)  # (bs, max_seq_len_k)
             text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 text_row, text_col
@@ -1423,6 +1419,22 @@ class FlashAttentionBackend(AttentionBackend):
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
         if cp_active and is_interleave():
+            if (
+                self.use_mla
+                and self.fa_impl_ver == 4
+                and (
+                    (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size >= 0
+                    )
+                    or layer.logit_cap != 0
+                    or self.num_splits > 1
+                )
+            ):
+                raise NotImplementedError(
+                    "FA4 dense interleave MLA does not support sliding windows, "
+                    "softcaps, or forced split-KV."
+                )
             if (
                 layer.is_cross_attention
                 or layer.attn_type
@@ -1903,15 +1915,12 @@ class FlashAttentionBackend(AttentionBackend):
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
                 if cp_active:
-                    # MLA CP: q is rank-local zigzag-split; run the
-                    # absorbed-MLA kernel twice (prev/next halves) against
-                    # the full latent KV pool through the selected strategy.
-                    # Concat q_nope + q_rope along dim=-1 so the wrapper's
-                    # chunk(2, dim=0) keeps their alignment; split back
-                    # inside the closure.
-                    assert (
-                        not use_cascade_attn
-                    ), "Cascade attention under MLA CP is not supported."
+                    # The strategy selects local query groups against the full
+                    # latent cache. Keep nope/rope aligned through that dispatch
+                    # and split them again at the absorbed-MLA kernel boundary.
+                    assert not use_cascade_attn, (
+                        "Cascade attention under MLA CP is not supported."
+                    )
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
@@ -3176,9 +3185,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # metadata_expand.cu_seqlens_q already set in capture
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
@@ -3372,9 +3379,9 @@ class FlashAttentionBackend(AttentionBackend):
         metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
-        assert (
-            self.page_size == 1
-        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        assert self.page_size == 1, (
+            "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        )
 
         cache_seqlens_int32 = (
             metadata.cache_seqlens_int32.repeat_interleave(
