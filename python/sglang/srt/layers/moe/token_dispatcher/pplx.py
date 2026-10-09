@@ -190,13 +190,6 @@ class PplxAllToAllManager:
 def _pplx_routing(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (indices, weights, bound_m) for pplx dispatch/combine.
-
-    pplx-kernels has no skip for topk_ids == -1. Padded rows are all -1 and
-    form a suffix, so bound_m stops the kernel before them. Any other -1 slot
-    is sent to a distinct expert with zero weight (distinct keeps per-expert
-    capacity). Dispatch and combine must derive bound_m from the same ids.
-    """
     invalid = topk_ids < 0
     bound_m = (~invalid).any(dim=1).sum().to(torch.uint32).reshape(1)
     fill = torch.arange(
