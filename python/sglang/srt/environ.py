@@ -1425,7 +1425,7 @@ class Envs:
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs
-    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-6".
+    # and numbers, each negatable with a leading "-": "all,-dspark-plan,-dspark-draft".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more

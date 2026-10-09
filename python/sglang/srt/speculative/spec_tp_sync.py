@@ -43,7 +43,6 @@ _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
 # Sites that draw from the RNG, so they can differ under identical logits.
 _RNG = frozenset(
     {
-        SpecTpSyncSite.DSPARK_DRAFT,
         SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
         SpecTpSyncSite.DSPARK_TARGET,
         SpecTpSyncSite.DFLASH_SELECTOR,
@@ -78,6 +77,7 @@ _RETIRED = {
         "6",
     )
 }
+assert not _RETIRED.keys() & (_BY_SLUG.keys() | _BY_NUMBER.keys())
 
 
 def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
