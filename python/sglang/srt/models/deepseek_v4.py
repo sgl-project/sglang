@@ -3299,12 +3299,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
         seam_open: bool = True,
+        mega_mhc_seam_open: bool = True,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
-        this layer, so nothing precomputed for the next one would still describe it."""
+        pre-mix. ``seam_open`` preserves the existing tail-mode boundary policy;
+        ``mega_mhc_seam_open`` disables Mega mHC for both sublayers in the layer
+        immediately before row selection."""
         self._init_boundaries()
-        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(self.hc_cfg, forward_batch)
+        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(
+            self.hc_cfg, seam_open=mega_mhc_seam_open
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -3370,7 +3374,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=nxt,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
-                mega_mhc=mega_mhc_prefill,
+                mega_next=self.next_boundary if mega_mhc_prefill else None,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -4125,7 +4129,8 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None or i + 1 != self.late_layer_start,
+                    seam_open=tail is None,
+                    mega_mhc_seam_open=i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:
