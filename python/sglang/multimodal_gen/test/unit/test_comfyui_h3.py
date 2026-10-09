@@ -84,6 +84,9 @@ class ComfyUIPackedLayout:
     def __init__(
         self, text_len, latent_t, latent_h, latent_w, audio_t, keyframes=None, refs=None
     ):
+        # ComfyUI builds PackedLayout from its patch-padded latent dimensions.
+        latent_h = (latent_h + 1) // 2 * 2
+        latent_w = (latent_w + 1) // 2 * 2
         frame, w_grid = _frame_grid(latent_h, latent_w)
         frame_rows = frame.shape[0]
 
@@ -767,6 +770,35 @@ def test_keyframes_with_serialized_layout_build_kwargs():
     fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
     assert set(fk) <= _FORWARD_SUPPORTED_KWARGS
     assert branch.video_target_start == 4
+
+
+def test_odd_latent_keyframes_keep_comfyui_layout():
+    video = torch.randn(1, 24, 2, 5, 7)
+    audio = torch.randn(1, 32, 2, 3)
+    context = torch.randn(1, 8, 16)
+    timestep = torch.tensor([500.0])
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0])
+    kf_latent = torch.randn(1, 24, 1, 5, 7)
+    keyframes = [{"resolved_frame_index": 0, "latent": kf_latent}]
+    layout = ComfyUIPackedLayout(8, 2, 5, 7, 3, keyframes=keyframes)
+
+    inputs = comfyui_payload_to_branch_inputs(
+        video,
+        audio,
+        context,
+        minimax_payload={
+            "keyframes": keyframes,
+            "cond_video_latents": [kf_latent],
+            "visual_cond_noise_aug": 1.0,
+        },
+        sample_sigmas=sample_sigmas,
+        timestep=timestep,
+        layout=serialize_comfyui_layout(layout),
+    )
+
+    assert tuple(layout.signature[2:4]) == (6, 8)
+    assert inputs["padded_video_shape"][-2:] == (6, 8)
+    assert inputs["video_rows"].shape[0] == 12 + 2 * 3 * 4
 
 
 def test_uniform_denoise_mask_scales_video_timestep():
