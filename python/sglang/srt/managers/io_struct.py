@@ -1276,10 +1276,16 @@ class EmbeddingReqInput:
             )
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
+        # at least one of text, input_ids, image, video, or audio should be provided
+        if (
+            self.text is None
+            and self.input_ids is None
+            and self.image_data is None
+            and self.video_data is None
+            and self.audio_data is None
+        ):
             raise ValueError(
-                "At least one of text, input_ids, or image should be provided"
+                "At least one of text, input_ids, image, video, or audio should be provided"
             )
 
         # text and input_ids cannot be provided at the same time
@@ -1293,18 +1299,37 @@ class EmbeddingReqInput:
         # check the batch size of text
         if self.text is not None:
             if isinstance(self.text, list):
-                self.batch_size += len(self.text)
+                self.batch_size = len(self.text)
                 self.is_single = False
             else:
-                self.batch_size += 1
-
-        # check the batch size of input_ids
-        if self.input_ids is not None:
+                self.batch_size = 1
+        elif self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
-                self.batch_size += len(self.input_ids)
+                self.batch_size = len(self.input_ids)
                 self.is_single = False
             else:
-                self.batch_size += 1
+                self.batch_size = 1
+        else:
+            # Without text, a flat media list is one request carrying all items
+            # (the HF processor reading); only a list of per-request lists is a batch.
+            media = next(
+                data
+                for data in (self.image_data, self.video_data, self.audio_data)
+                if data is not None
+            )
+            if (
+                isinstance(media, list)
+                and len(media) > 0
+                and all(isinstance(item, list) for item in media)
+            ):
+                self.batch_size = len(media)
+                self.is_single = False
+            else:
+                self.batch_size = 1
+                self.is_single = True
+
+        if not self.is_single:
+            self._validate_mm_batch_lengths()
 
         # Fill in default arguments
         if self.is_single:
@@ -1329,6 +1354,19 @@ class EmbeddingReqInput:
             self._normalize_lora_paths(self.batch_size)
 
         self._validate_rid_uniqueness()
+
+    def _validate_mm_batch_lengths(self):
+        # A scalar media item is broadcast to every request; a list is per-request.
+        for field_name, data in (
+            ("image_data", self.image_data),
+            ("video_data", self.video_data),
+            ("audio_data", self.audio_data),
+        ):
+            if isinstance(data, list) and len(data) != self.batch_size:
+                raise ValueError(
+                    f"{field_name} has {len(data)} entries but the batch has "
+                    f"{self.batch_size} requests; pass one entry (or None) per request."
+                )
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1366,6 +1404,17 @@ class EmbeddingReqInput:
         if i in cache:
             return cache[i]
 
+        # Lengths were checked in _validate_mm_batch_lengths; scalars broadcast.
+        image_item = (
+            self.image_data[i] if isinstance(self.image_data, list) else self.image_data
+        )
+        video_item = (
+            self.video_data[i] if isinstance(self.video_data, list) else self.video_data
+        )
+        audio_item = (
+            self.audio_data[i] if isinstance(self.audio_data, list) else self.audio_data
+        )
+
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
                 rid=self.rid[i],
@@ -1395,9 +1444,9 @@ class EmbeddingReqInput:
                 rid=self.rid[i],
                 text=self.text[i] if self.text is not None else None,
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
-                image_data=self.image_data[i] if self.image_data is not None else None,
-                video_data=self.video_data[i] if self.video_data is not None else None,
-                audio_data=self.audio_data[i] if self.audio_data is not None else None,
+                image_data=image_item,
+                video_data=video_item,
+                audio_data=audio_item,
                 embed_override_token_id=self.embed_override_token_id,
                 embed_overrides=(
                     self.embed_overrides[i]
