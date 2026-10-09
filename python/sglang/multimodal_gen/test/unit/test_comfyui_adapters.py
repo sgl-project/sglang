@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
@@ -56,3 +57,26 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
 
     default = adapter.pack(x, timestep, context, y=y)
     assert default.guidance_scale == 3.5
+
+
+def test_flux_pack_rejects_kontext_reference_latents() -> None:
+    """ComfyUI's Flux forward passes ref_latents from the ReferenceLatent node;
+    FluxAdapter must reject it instead of silently running plain T2I."""
+    adapter = FluxAdapter()
+    x = torch.ones(1, 16, 8, 8)
+    timestep = torch.tensor([0.5])
+    context = torch.ones(1, 8, 4096)
+    ref_latents = [torch.ones(1, 16, 8, 8)]
+    with pytest.raises(ValueError, match="Kontext"):
+        adapter.pack(x, timestep, context, ref_latents=ref_latents)
+
+
+def test_flux_pack_rejects_controlnet_control() -> None:
+    """ComfyUI's Flux forward passes a control dict for ControlNet; FluxAdapter
+    must reject it instead of silently running unconditioned T2I."""
+    adapter = FluxAdapter()
+    x = torch.ones(1, 16, 8, 8)
+    timestep = torch.tensor([0.5])
+    context = torch.ones(1, 8, 4096)
+    with pytest.raises(ValueError, match="ControlNet"):
+        adapter.pack(x, timestep, context, control={"input": []})

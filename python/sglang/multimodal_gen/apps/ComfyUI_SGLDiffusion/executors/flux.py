@@ -19,8 +19,29 @@ class FluxAdapter(ComfyUIModelAdapter):
     pipeline_class_name = "FluxPipeline"
 
     def pack(
-        self, x, timestep, context, y=None, guidance=None, **kwargs
+        self,
+        x,
+        timestep,
+        context,
+        y=None,
+        guidance=None,
+        ref_latents=None,
+        control=None,
+        **kwargs,
     ) -> PackedForward:
+        if ref_latents:
+            raise ValueError(
+                "FluxAdapter does not support FLUX.1 Kontext reference latents "
+                "(ComfyUI's ReferenceLatent node). Running the workflow would "
+                "silently drop the reference images and produce a plain "
+                "text-to-image result instead of a Kontext edit."
+            )
+        if control is not None:
+            raise ValueError(
+                "FluxAdapter does not support ControlNet conditioning. Running "
+                "the workflow would silently drop the ControlNet and produce an "
+                "unconditioned text-to-image result."
+            )
         packed = self._pack_latents(x)
         t5_seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
         clip_batch = int(y.shape[0]) if y is not None else 1
