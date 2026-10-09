@@ -455,6 +455,127 @@ def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
     assert all(tensor.device.type == "cpu" for tensor in module.state_dict().values())
 
 
+@pytest.mark.parametrize(
+    "margin_bytes, expect_preload", [(0, True), (8 * 1024**3, False)]
+)
+def test_component_offload_warmup_preload_uses_configured_margin(
+    monkeypatch, margin_bytes, expect_preload
+):
+    monkeypatch.setattr(residency_strategies, "_empty_device_cache", Mock())
+    monkeypatch.setattr(residency_strategies, "_device_free_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(
+        residency_strategies,
+        "_module_ready_on_local_device",
+        lambda *args, **kwargs: False,
+    )
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    module = torch.nn.Linear(2, 2)
+    use = ComponentUse("denoise", "transformer")
+    state = ResidencyState(
+        batch_is_warmup=True, warmup_preload_margin_bytes=margin_bytes
+    )
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    assert strategy.prepare_for_use.called is expect_preload
+    assert strategy.finish_use.called is not expect_preload
+
+
+@pytest.mark.parametrize(
+    "policy, is_warmup, expected",
+    [
+        ("auto", True, {"text_encoder": True, "vae": False}),
+        ("none", True, {"text_encoder": False, "vae": False}),
+        ("vae", True, {"text_encoder": False, "vae": True}),
+        ("text_encoder,vae", True, {"text_encoder": True, "vae": True}),
+        # the policy only changes warmup; regular requests keep the hints
+        ("none", False, {"text_encoder": True, "vae": False}),
+    ],
+)
+def test_warmup_preload_components_policy(policy, is_warmup, expected):
+    encode = ComponentUse("encode", "text_encoder", preferred_ready_after_request=True)
+    decode = ComponentUse("decode", "vae")
+    stage = _Stage(encode, decode)
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    server_args.warmup_preload_components = policy
+    manager = ComponentResidencyManager(pipeline, server_args)
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = False
+    manager.strategy_for = Mock(return_value=strategy)
+    modules = {"text_encoder": torch.nn.Linear(2, 2), "vae": torch.nn.Linear(2, 2)}
+
+    batch = SimpleNamespace(is_warmup=is_warmup)
+    manager.begin_request([stage], batch, server_args)
+    for use in (encode, decode):
+        manager.ensure_ready(use, module=modules[use.component_name])
+    manager.finish_request()
+
+    preferred = {
+        call.args[1].component_name: call.kwargs["preferred"]
+        for call in strategy.finish_request.call_args_list
+    }
+    assert preferred == expected
+
+
+def test_warmup_preload_margin_reaches_request_state():
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args()
+    server_args.warmup_preload_margin_gib = 2.5
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+
+    assert manager.state.warmup_preload_margin_bytes == int(2.5 * 1024**3)
+
+
+@pytest.mark.parametrize(
+    "components, margin, expected",
+    [
+        ("auto", "1", "auto"),
+        ("NONE", "0", "none"),
+        (" text_encoder , transformer ", "4.5", "text_encoder,transformer"),
+        ("text_encoder,,vae", "1", ValueError),
+        ("auto", "-1", ValueError),
+    ],
+)
+def test_warmup_preload_server_args(monkeypatch, components, margin, expected):
+    monkeypatch.setattr(
+        PipelineConfig, "from_kwargs", lambda _: QwenImagePipelineConfig()
+    )
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    argv = [
+        "--model-path",
+        "/unused/model",
+        "--warmup-preload-components",
+        components,
+        "--warmup-preload-margin-gib",
+        margin,
+    ]
+    monkeypatch.setattr(sys, "argv", ["sglang", *argv])
+    parsed, unknown = parser.parse_known_args(argv)
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="warmup-preload"):
+            ServerArgs.from_cli_args(parsed, unknown)
+        return
+    args = ServerArgs.from_cli_args(parsed, unknown)
+    assert args.warmup_preload_components == expected
+    assert args.warmup_preload_margin_gib == float(margin)
+
+
 def test_request_tail_uses_dynamic_component_instance():
     pipeline = SimpleNamespace(
         modules={},
