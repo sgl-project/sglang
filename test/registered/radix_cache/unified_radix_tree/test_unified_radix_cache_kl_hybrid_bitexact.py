@@ -275,22 +275,26 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     """
 
     tree_core_backend = "python"
+    io_backend = "direct"
+    mem_layout = "page_first_direct"
+    extra_args = []
 
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            *cls.extra_args,
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
             "--hicache-write-policy",
             "write_through",
             "--hicache-io-backend",
-            "direct",
+            cls.io_backend,
             # The mamba host pool only supports page_first and page_first_direct.
             "--hicache-mem-layout",
-            "page_first_direct",
+            cls.mem_layout,
             # Tight pools and a small budget so decode crosses a track boundary and
             # the host tier is actually exercised instead of everything staying
             # resident on device.
@@ -346,6 +350,14 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedMemoryMXFP8HiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
+    """MXFP8 scales require the kernel backend and page-first host layout."""
+
+    io_backend = "kernel"
+    mem_layout = "page_first"
+    extra_args = ["--enable-unified-memory", "--kv-cache-dtype", "mxfp8"]
 
 
 class TestUnifiedHybridMTPBitExact(CustomTestCase):

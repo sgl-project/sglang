@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -43,6 +44,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.layout.token_major import (
+    ENTRY_ALIGN_BYTES,
     ROW_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
@@ -58,6 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
     MLATokenToKVPool,
     unwrap_write_loc,
     write_loc_is_physical,
@@ -157,6 +160,8 @@ class MHASubPoolSpec(SubPoolSpec):
     store_dtype: torch.dtype
     kv_cache_dtype: Optional[torch.dtype] = None
     v_head_dim: Optional[int] = None
+    # MXFP8: one UE8M0 scale byte per this many payload elements. None = unscaled.
+    scale_block_size: Optional[int] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -175,6 +180,15 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.v_head_dim > 0, (
             f"v_head_dim must be positive; got {self.v_head_dim}"
         )
+        if self.scale_block_size is not None:
+            assert self.head_dim == self.v_head_dim, (
+                "block-scaled KV requires uniform K/V rows; got "
+                f"head_dim={self.head_dim}, v_head_dim={self.v_head_dim}"
+            )
+            assert self.head_dim % self.scale_block_size == 0, (
+                f"head_dim {self.head_dim} must be a multiple of "
+                f"scale_block_size {self.scale_block_size}"
+            )
         if self.draft_region is not None:
             self.draft_region.validate()
 
@@ -203,6 +217,22 @@ class MHASubPoolSpec(SubPoolSpec):
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
+    def view_dtype(self) -> torch.dtype:
+        """Dtype the K/V views carry: block-scaled kernels type-check against
+        the fp8 payload dtype, not the uint8 storage alias."""
+        if self.scale_block_size is None:
+            return self.store_dtype
+        return self.kv_cache_dtype
+
+    def scale_shape(self, page_size: int, num_pages: int) -> Tuple[int, ...]:
+        """One layer's K (or V) UE8M0 scales, in the FA4 interleaved layout."""
+        sbs = self.scale_block_size
+        assert sbs is not None
+        assert page_size % sbs == 0, (
+            f"page_size {page_size} must be a multiple of scale_block_size {sbs}"
+        )
+        return (num_pages, self.head_num, sbs, page_size // sbs, self.head_dim // sbs)
+
     def layout(self) -> DenseEntryLayout:
         """Token-major entry ``[K_0 | V_0 | K_1 | V_1 | ...]`` per slot; a page
         is ``page_size`` such entries back to back."""
@@ -215,7 +245,7 @@ class MHASubPoolSpec(SubPoolSpec):
                 layer_stride_bytes=layer_stride,
                 layer_num=self.layer_num,
                 row_shape=(self.head_num, self.head_dim),
-                dtype=self.store_dtype,
+                dtype=self.view_dtype(),
             ),
             DensePart(
                 name="v",
@@ -223,7 +253,7 @@ class MHASubPoolSpec(SubPoolSpec):
                 layer_stride_bytes=layer_stride,
                 layer_num=self.layer_num,
                 row_shape=(self.head_num, self.v_head_dim),
-                dtype=self.store_dtype,
+                dtype=self.view_dtype(),
             ),
         )
         if self.draft_region is not None:
@@ -450,6 +480,23 @@ class UnifiedKVPool:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        # Scales live outside this buffer, so shrink it to keep the pair inside
+        # the budget; each scaled sub-pool costs payload/scale_block_size more.
+        scale_share = sum(
+            Fraction(1, s.scale_block_size)
+            for s in sub_pool_specs
+            if isinstance(s, MHASubPoolSpec) and s.scale_block_size is not None
+        )
+        if scale_share:
+            payload = int(total_bytes / (1 + scale_share))
+            total_bytes = payload // ENTRY_ALIGN_BYTES * ENTRY_ALIGN_BYTES
+            self.total_bytes = total_bytes
+        _check_bs1_feasibility_floor(
+            total_bytes=total_bytes,
+            floor_terms=self._bs1_floor_terms,
+            factory="UnifiedKVPool",
+        )
+
         # Slot-0 dummy writes for both pools land in the reserved low-byte sink;
         # each pool's first allocatable slot is chosen so real data starts past it.
         # A page-aware sub-pool allocates whole pages, so the sink is all of page
@@ -501,6 +548,9 @@ class UnifiedKVPool:
         # MHA: (k_buffer, v_buffer); MLA: [per-layer views];
         # Mamba: (conv_state_list, temporal_state)
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
+        self._mha_scale_views: Dict[
+            str, Tuple[List[torch.Tensor], List[torch.Tensor]]
+        ] = {}
         self._mla_views: Dict[str, List[torch.Tensor]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
 
@@ -519,6 +569,10 @@ class UnifiedKVPool:
             self._anchor_bytes[spec.name] = anchor
             self._min_slot_index[spec.name] = min_slot_index
             if isinstance(spec, MHASubPoolSpec):
+                if spec.scale_block_size is not None:
+                    self._mha_scale_views[spec.name] = self._alloc_mha_scale_buffers(
+                        spec, max_slots, page_size
+                    )
                 self._mha_views[spec.name] = self._build_mha_views(
                     spec,
                     anchor,
@@ -669,6 +723,23 @@ class UnifiedKVPool:
         anchor = self._anchor_bytes[name]
         assert anchor == 0, f"current design assumes all anchors are 0; got {anchor}"
         return anchor
+
+    def mha_scale_views_for(
+        self, name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        return self._mha_scale_views[name]
+
+    def _alloc_mha_scale_buffers(
+        self, spec: MHASubPoolSpec, max_slots: int, page_size: int
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        # Zero-init: a garbage 0xFF byte is e8m0 NaN.
+        shape = spec.scale_shape(page_size, max_slots // page_size)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            per_layer = [
+                torch.zeros(shape, dtype=torch.float8_e8m0fnu, device=self.device)
+                for _ in range(2 * spec.layer_num)
+            ]
+        return per_layer[: spec.layer_num], per_layer[spec.layer_num :]
 
     def mha_views_for(self, name: str) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         return self._mha_views[name]
@@ -874,6 +945,62 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             "prefix-valid commit is unsupported under the unified layout "
             "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
         )
+
+
+class UnifiedMHATokenToKVPoolMXFP8(UnifiedMHATokenToKVPool, MHATokenToKVPoolMXFP8):
+    """Unified token-major payload with separate, page-contiguous MXFP8 scales."""
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        self.k_scale_buffer, self.v_scale_buffer = (
+            self._unified_buffer.mha_scale_views_for(self._sub_pool_name)
+        )
+        self.store_dtype = torch.float8_e4m3fn
+        self.mxfp8_sf_interleaved = True
+        self._kv_buffer_descs = self._build_kv_buffer_descs()
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move payload and scales by the same physical page ids."""
+        super().move_kv_cache(tgt_loc, src_loc)
+        if tgt_loc.numel() == 0:
+            return
+        ps = self.page_size
+        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
+        src_pages = src_loc.view(-1, ps)[:, 0] // ps
+        with record_function("UnifiedMHAMXFP8.move_scale_cache"):
+            for buf in self.k_scale_buffer + self.v_scale_buffer:
+                copy_pages(
+                    buf.view(torch.uint8).flatten(),
+                    tgt_pages,
+                    src_pages,
+                    self._num_pages,
+                    buf[0].numel(),
+                )
+
+
+def build_unified_mha_pool(
+    *,
+    unified_buffer: UnifiedKVPool,
+    sub_pool_name: str,
+    page_size: int = 1,
+    start_layer: Optional[int] = None,
+    end_layer: Optional[int] = None,
+    enable_alt_stream: bool = True,
+) -> MHATokenToKVPool:
+    """Pick the unified MHA pool class from the sub-pool's spec."""
+    cls = (
+        UnifiedMHATokenToKVPoolMXFP8
+        if unified_buffer.mha_spec(sub_pool_name).scale_block_size is not None
+        else UnifiedMHATokenToKVPool
+    )
+    return cls(
+        unified_buffer=unified_buffer,
+        sub_pool_name=sub_pool_name,
+        page_size=page_size,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_alt_stream=enable_alt_stream,
+    )
 
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
@@ -1585,7 +1712,7 @@ def init_unified_mamba_pools(
             page_size=page_size,
         )
     else:
-        unified_full_kv_pool = UnifiedMHATokenToKVPool(
+        unified_full_kv_pool = build_unified_mha_pool(
             unified_buffer=shared_pool,
             sub_pool_name="full",
             page_size=page_size,
@@ -1744,14 +1871,14 @@ class UnifiedSWAKVPool(SWAKVPool):
         self.head_dim = full_spec.head_dim
         self.device = unified_buffer.device
 
-        self.full_kv_pool = UnifiedMHATokenToKVPool(
+        self.full_kv_pool = build_unified_mha_pool(
             unified_buffer=unified_buffer,
             sub_pool_name="full",
             page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
         )
-        self.swa_kv_pool = UnifiedMHATokenToKVPool(
+        self.swa_kv_pool = build_unified_mha_pool(
             unified_buffer=unified_buffer,
             sub_pool_name="swa",
             page_size=page_size,
@@ -1975,6 +2102,7 @@ def init_unified_swa_pools(
     *,
     device: str,
     kv_cache_dtype: torch.dtype,
+    scale_block_size: Optional[int] = None,
     head_num: int,
     head_dim: int,
     v_head_dim: int,
@@ -2029,6 +2157,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        scale_block_size=scale_block_size,
         grow_direction="down",
         draft_region=None if fused_draft is None else fused_draft.region,
     )
@@ -2040,6 +2169,7 @@ def init_unified_swa_pools(
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        scale_block_size=scale_block_size,
         grow_direction="up",
     )
     legacy_allocator_capacities = {}
@@ -2154,6 +2284,7 @@ def init_unified_mamba_swa_pools(
     *,
     device: str,
     kv_cache_dtype: torch.dtype,
+    scale_block_size: Optional[int] = None,
     head_num: int,
     head_dim: int,
     v_head_dim: int,
@@ -2227,6 +2358,7 @@ def init_unified_mamba_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        scale_block_size=scale_block_size,
         grow_direction="down",
         draft_region=None if fused_draft is None else fused_draft.region,
     )
@@ -2238,6 +2370,7 @@ def init_unified_mamba_swa_pools(
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
         kv_cache_dtype=kv_cache_dtype,
+        scale_block_size=scale_block_size,
         grow_direction="float",
     )
     cp = mamba2_cache_params
@@ -2272,18 +2405,14 @@ def init_unified_mamba_swa_pools(
         if sliding_window_size is not None
         else model_context_len
     )
-    _check_bs1_feasibility_floor(
-        total_bytes=total_bytes,
-        floor_terms=[
-            ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
-            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
-            (
-                "sink",
-                _reserved_floor_bytes([full_spec, swa_spec, mamba_spec], page_size),
-            ),
-        ],
-        factory="init_unified_mamba_swa_pools",
-    )
+    bs1_floor_terms = [
+        ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+        ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+        (
+            "sink",
+            _reserved_floor_bytes([full_spec, swa_spec, mamba_spec], page_size),
+        ),
+    ]
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec, mamba_spec],
@@ -2291,6 +2420,7 @@ def init_unified_mamba_swa_pools(
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
         fused_draft=fused_draft,
+        bs1_floor_terms=bs1_floor_terms,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,

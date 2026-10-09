@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
 )
 from sglang.srt.mem_cache.pool_host.mha import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
     MHATokenToKVPoolHost,
     _is_cuda,
     _is_hip,
@@ -87,13 +88,15 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
                 f"({self.page_size}) must equal the device page size "
                 f"({device_pool.page_size})."
             )
-        if not self.can_use_write_back_jit or not all(
+        # The scales move through their own staging over their own contiguous
+        # buffers, so this does not depend on the payload rows being packed.
+        if not all(
             can_use_write_back_jit_kernel(element_size=size)
             for size in (self.k_sf_page_bytes, self.v_sf_page_bytes)
         ):
             raise NotImplementedError(
-                "MXFP8 KV host pool needs the staged JIT write-back kernel "
-                "(io_backend='kernel', page_first layout, CUDA or HIP)."
+                "MXFP8 KV host pool needs the staged JIT write-back kernel for "
+                f"{self.k_sf_page_bytes}/{self.v_sf_page_bytes}-byte scale pages."
             )
         self._init_scale_buffers()
 
@@ -143,13 +146,14 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        scale_staging_pages = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.k_scale_staging = torch.empty(
-            (self.staging_page_capacity, self.layer_num, self.k_sf_page_bytes),
+            (scale_staging_pages, self.layer_num, self.k_sf_page_bytes),
             dtype=torch.uint8,
             device=self.device_pool.device,
         )
         self.v_scale_staging = torch.empty(
-            (self.staging_page_capacity, self.layer_num, self.v_sf_page_bytes),
+            (scale_staging_pages, self.layer_num, self.v_sf_page_bytes),
             dtype=torch.uint8,
             device=self.device_pool.device,
         )
