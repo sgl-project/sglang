@@ -2199,6 +2199,9 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
+            # Its fused K store reads the step's slots inside the captured segment;
+            # eager replay graphs keep that store an eager break.
+            and not in_decoder_replay_graph()
             and (
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
