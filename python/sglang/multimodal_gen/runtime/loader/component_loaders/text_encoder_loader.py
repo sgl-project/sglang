@@ -5,7 +5,7 @@ from collections.abc import Generator
 import torch
 import transformers
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
@@ -34,8 +34,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
     KitchenW4A4Config,
@@ -83,7 +83,6 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_config,
     get_diffusers_component_config,
     load_dict,
 )
@@ -107,7 +106,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 
 logger = init_logger(__name__)
 
-_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
+_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "convrot_int8", "mxfp4"})
 
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
@@ -398,12 +397,13 @@ def _require_quantized_encoder_layers(
         (
             ComfyFp8Config,
             ComfyNvfp4Config,
-            KitchenInt8Config,
+            ConvRotInt8Config,
             KitchenW4A4Config,
             KitchenW4A8Config,
         ),
     ):
-        expected = set(quant_config.layer_markers)
+        # Online convrot_int8 carries no markers; there is nothing to consume.
+        expected = set(quant_config.layer_markers or ())
         selected = set(quant_config.selected)
     elif isinstance(quant_config, QuantoInt8Config):
         expected = quant_config.layer_prefixes
@@ -567,7 +567,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ) -> EncoderConfig:
-        diffusers_pretrained_config = get_config(
+        diffusers_pretrained_config = AutoConfig.from_pretrained(
             component_model_path, trust_remote_code=True
         )
         encoder_index = self._extract_encoder_index(
@@ -744,7 +744,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device
                 if isinstance(quant_config, (ComfyNvfp4Config, QuantoInt8Config)) or (
-                    isinstance(quant_config, KitchenInt8Config)
+                    isinstance(quant_config, ConvRotInt8Config)
                     and quant_config.is_checkpoint_int8_serialized
                 ):
                     postprocess_device = None

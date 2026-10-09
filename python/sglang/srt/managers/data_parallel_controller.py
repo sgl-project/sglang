@@ -49,6 +49,7 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -102,11 +103,11 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self, dp_size: int):
-        self.dp_size = dp_size
-        self.total_requests = [0] * dp_size
-        self.total_tokens = [0] * dp_size
-        self.last_timestamp = [0.0] * dp_size
+    def __init__(self, num_dp_ranks: int):
+        self.num_dp_ranks = num_dp_ranks
+        self.total_requests = [0] * num_dp_ranks
+        self.total_tokens = [0] * num_dp_ranks
+        self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -125,7 +126,7 @@ class DPBudget:
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.dp_size),
+                range(self.num_dp_ranks),
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -155,7 +156,7 @@ class DataParallelController:
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + get_parallel().dp_size)
+        self.context = zmq.Context(1 + get_parallel().num_dp_ranks)
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -175,8 +176,10 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        self.launch_dp_size: int = get_parallel().dp_size
-        self.max_dp_size: int = get_parallel().max_ep_size or get_parallel().dp_size
+        self.launch_dp_size: int = get_parallel().num_dp_ranks
+        self.max_dp_size: int = (
+            get_parallel().max_ep_size or get_parallel().num_dp_ranks
+        )
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
@@ -186,7 +189,7 @@ class DataParallelController:
             self.max_dp_size - self.launch_dp_size
         )
 
-        self.dp_budget = DPBudget(get_parallel().dp_size)
+        self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -198,12 +201,13 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
 
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
@@ -374,7 +378,7 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(get_parallel().dp_size):
+        for dp_rank in range(get_parallel().num_dp_ranks):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -577,7 +581,7 @@ class DataParallelController:
             bind_count = (
                 self.max_dp_size
                 if get_exec().moe.elastic_ep_backend is not None
-                else get_parallel().dp_size
+                else get_parallel().num_dp_ranks
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
@@ -607,7 +611,7 @@ class DataParallelController:
         dp_rank: int | None,
         worker_ports: list[int] | None = None,
     ):
-        if not get_parallel().enable_dp_attention:
+        if not get_parallel().attn_dp_enabled:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -639,13 +643,12 @@ class DataParallelController:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if get_parallel().enable_dp_attention:
+                if get_parallel().attn_dp_enabled:
                     # dp attention has different sharding logic
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        get_parallel().enable_dp_attention,
                         tp_rank,
                         get_parallel().tp_size,
-                        get_parallel().dp_size,
+                        get_parallel().attn_dp_size,
                         get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
@@ -721,6 +724,15 @@ class DataParallelController:
         scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
+
+        # Pure-DP TP groups launch concurrently. Their ready replies contain
+        # only publishers owned by schedulers on this node.
+        with self.env_lock:
+            self.local_kv_event_sources.extend(
+                source
+                for info in scheduler_info
+                for source in info.get("kv_event_sources", [])
+            )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -812,6 +824,7 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    load_plugins()
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)
@@ -835,15 +848,20 @@ def run_data_parallel_controller_process(
         scheduler_pids = [
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-                "startup_time": controller.startup_time,
-                SCHEDULER_PIDS_ARG: scheduler_pids,
-            }
-        )
+        init_info = {
+            "status": "ready",
+            "max_total_num_tokens": controller.max_total_num_tokens,
+            "max_req_input_len": controller.max_req_input_len,
+            "startup_time": controller.startup_time,
+            SCHEDULER_PIDS_ARG: scheduler_pids,
+        }
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            init_info["kv_event_sources"] = sorted(
+                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            )
+        pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()

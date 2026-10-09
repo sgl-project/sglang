@@ -41,10 +41,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
-    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -140,6 +140,24 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
 
+    def test_hopper_super_t2i_tp2_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True, hidden_size=5120, tp_size=2))
+
+    def test_hopper_super_t2i_unsupported_topologies_disabled(self):
+        for overrides in (
+            {"hidden_act": "relu2"},
+            {"hidden_act": "gelu"},
+            {"hidden_size": 4096},
+            {"tp_size": 4},
+            {"sp_size": 2},
+            {"is_compiled": True},
+            {"is_hopper": False},
+        ):
+            with self.subTest(overrides=overrides):
+                settings = dict(is_hopper=True, hidden_size=5120, tp_size=2)
+                settings.update(overrides)
+                self.assertFalse(self._can_enable(**settings))
+
     def test_hopper_edge_single_gpu_enabled(self):
         self.assertTrue(
             self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
@@ -162,7 +180,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
         )
 
-    def test_hopper_tensor_parallel_disabled(self):
+    def test_hopper_other_tensor_parallel_shapes_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
 
     def test_hopper_sequence_parallel_disabled(self):
@@ -1041,7 +1059,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
@@ -1099,7 +1117,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 0.0)

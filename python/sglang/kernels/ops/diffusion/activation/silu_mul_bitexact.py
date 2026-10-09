@@ -60,20 +60,6 @@ def _packed_silu_mul_kernel(
     tl.store(out_ptr + row * D + cols, s * b, mask=mask)
 
 
-def can_use_fused_silu_mul(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return (
-        a.dtype is torch.bfloat16
-        and b.dtype is torch.bfloat16
-        and a.is_cuda
-        and b.is_cuda
-        and a.device == b.device
-        and a.shape == b.shape
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and a.numel() > 0
-    )
-
-
 def _fake_silu_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(a)
 
@@ -85,6 +71,18 @@ def _fake_silu_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 )
 def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """``silu(a) * b``, bit-exact vs the eager two-kernel chain."""
+    if not (
+        a.dtype is torch.bfloat16
+        and b.dtype is torch.bfloat16
+        and a.is_cuda
+        and b.is_cuda
+        and a.device == b.device
+        and a.shape == b.shape
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and a.numel() > 0
+    ):
+        raise RuntimeError("invalid input for fused_silu_mul_bitexact")
     out = torch.empty_like(a)
     numel = a.numel()
     with torch.cuda.device(a.device):

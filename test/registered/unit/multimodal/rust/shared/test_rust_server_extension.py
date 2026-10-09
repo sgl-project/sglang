@@ -45,7 +45,7 @@ class TestRustServerExtension(CustomTestCase):
                 return_value=SimpleNamespace(
                     nnodes=1,
                     pp_size=1,
-                    dp_size=2,
+                    num_dp_ranks=2,
                     attn_dp_rank=1,
                     tp_size=2,
                     tp_rank=1,

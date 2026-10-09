@@ -75,6 +75,23 @@ class TestWanNormSiLUPost(CustomTestCase):
                             self.assertTrue(torch.equal(original + 0.125, x))
 
     @torch.inference_mode()
+    def test_first_sight_check_runs_once_per_layout(self):
+        # a request at a new resolution must not pay the reference chain and
+        # the host sync again
+        module = self.module(bias=True, dtype=torch.float32)
+        shapes = ((1, 64, 1, 8, 12), (1, 64, 2, 10, 20), (2, 64, 3, 16, 4))
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for shape in shapes:
+                for layout in (torch.contiguous_format, torch.channels_last_3d):
+                    x = torch.randn(shape, device="cuda").to(memory_format=layout)
+                    self.assertBitsEqual(
+                        module(x),
+                        reference(x, module.gamma, module.bias, module.scale),
+                    )
+        self.assertEqual(len(module._post_gate.verified_sigs), 2)
+        self.assertFalse(module._post_gate.disabled)
+
+    @torch.inference_mode()
     def test_all_finite_bf16_and_fp32_silu_boundaries(self):
         bits = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16)
         values = bits.view(torch.bfloat16)

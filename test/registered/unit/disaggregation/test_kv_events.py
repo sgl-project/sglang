@@ -7,24 +7,130 @@ the router can subscribe per replica (the `dp_size` it reads from
 `/server_info`).
 """
 
+import atexit
+import json
+import tempfile
+import time
 import unittest
+import uuid
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    EventPublisherFactory,
     KVEventBatch,
+    NullEventPublisher,
     StorageMedium,
     ZmqEventPublisher,
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.runtime_context import describe_kv_events_publisher
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestLocalKvEventSource(CustomTestCase):
+    def _publisher(self, attn_dp_rank=0, **config):
+        publisher = EventPublisherFactory.create(
+            json.dumps({"publisher": "zmq", **config}), attn_dp_rank=attn_dp_rank
+        )
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        return publisher
+
+    def test_advertised_source_delivers_events(self):
+        for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
+            with self.subTest(host=host):
+                with zmq.Context.instance().socket(zmq.PUB) as probe:
+                    port = probe.bind_to_random_port("tcp://127.0.0.1")
+                publisher = self._publisher(
+                    attn_dp_rank=4,
+                    endpoint=f"tcp://{host}:{port - 4}",
+                    bind=bind,
+                    topic=topic,
+                )
+                source = publisher.describe_local_source(64)
+                self.assertEqual(
+                    source,
+                    dict(
+                        dp_rank=4,
+                        endpoint=f"tcp://127.0.0.1:{port}",
+                        topic=topic,
+                        block_size=64,
+                    ),
+                )
+                self._assert_event_received(publisher, source)
+
+    def _assert_event_received(self, publisher, source):
+        with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
+            subscriber.setsockopt_string(zmq.SUBSCRIBE, source["topic"])
+            subscriber.connect(source["endpoint"])
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+                if subscriber.poll(100):
+                    topic, _, payload = subscriber.recv_multipart()
+                    self.assertEqual(topic, source["topic"].encode())
+                    batch = msgspec.msgpack.decode(payload, type=KVEventBatch)
+                    self.assertEqual(batch.attn_dp_rank, source["dp_rank"])
+                    self.assertEqual(batch.events, [AllBlocksCleared()])
+                    break
+            else:
+                self.fail("No event received from the advertised local source")
+
+    def test_ipc_is_advertised_only_when_bound(self):
+        directory = tempfile.TemporaryDirectory(prefix="kv-", dir="/tmp")
+        self.addCleanup(directory.cleanup)
+        endpoint = f"ipc://{directory.name}/events"
+        for bind in (None, False):
+            with self.subTest(bind=bind):
+                publisher = self._publisher(endpoint=endpoint, bind=bind)
+                source = publisher.describe_local_source(64)
+                if bind is False:
+                    self.assertIsNone(source)
+                else:
+                    self.assertEqual(source["endpoint"], endpoint)
+
+    def test_ephemeral_bind_and_replay_report_resolved_ports(self):
+        publisher = self._publisher(
+            attn_dp_rank=0,
+            endpoint="tcp://0.0.0.0:0",
+            replay_endpoint="tcp://*:0",
+        )
+        source = publisher.describe_local_source(64)
+        self.assertEqual(
+            source["endpoint"],
+            publisher._pub.getsockopt_string(zmq.LAST_ENDPOINT).replace(
+                "0.0.0.0", "127.0.0.1"
+            ),
+        )
+        self.assertEqual(
+            source["replay_endpoint"],
+            publisher._replay.getsockopt_string(zmq.LAST_ENDPOINT).replace(
+                "0.0.0.0", "127.0.0.1"
+            ),
+        )
+        self.assertNotEqual(source["endpoint"], source["replay_endpoint"])
+        self.assertFalse(source["endpoint"].endswith(":0"))
+
+    def test_non_subscribable_publishers_are_not_advertised(self):
+        for endpoint in (
+            "tcp://127.0.0.1:5557",  # Connect-style PUB, not a listening source.
+            f"inproc://kv-source-{uuid.uuid4().hex}",  # Same-process only.
+        ):
+            with self.subTest(endpoint=endpoint):
+                publisher = self._publisher(attn_dp_rank=0, endpoint=endpoint)
+                self.assertIsNone(publisher.describe_local_source(64))
+        self.assertIsNone(NullEventPublisher().describe_local_source(64))
 
 
 class TestResolveLoadPubRange(CustomTestCase):
@@ -247,6 +353,43 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded[2], 0)
         self.assertIsInstance(decoded[1][0], dict)
         self.assertEqual(len(decoded), 3)
+
+
+class TestReplay(CustomTestCase):
+    def test_descriptor_advertises_replay_port(self):
+        def descriptor(**cfg):
+            cfg = msgspec.json.encode({"publisher": "zmq", **cfg}).decode()
+            args = ServerArgs(model_path="dummy", page_size=16, kv_events_config=cfg)
+            return describe_kv_events_publisher(args)
+
+        self.assertNotIn("replay_endpoint_port_base", descriptor())
+        self.assertEqual(
+            descriptor(replay_endpoint="tcp://*:6000")["replay_endpoint_port_base"],
+            6000,
+        )
+
+    def test_router_serves_buffered_batches_then_end_seq(self):
+        # The router's DEALER client relies on this exact framing.
+        replay = f"tcp://127.0.0.1:{get_free_port()}"
+        publisher = ZmqEventPublisher(
+            attn_dp_rank=0, endpoint="inproc://kv-replay-test", replay_endpoint=replay
+        )
+        dealer = zmq.Context.instance().socket(zmq.DEALER)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
+        dealer.connect(replay)
+        try:
+            for _ in range(3):
+                publisher.publish(KVEventBatch(ts=1.0, events=[AllBlocksCleared()]))
+            publisher._event_queue.join()
+            dealer.send_multipart([b"", (1).to_bytes(8, "big")])
+            frames = [dealer.recv_multipart() for _ in range(3)]
+        finally:
+            dealer.close(linger=0)
+            publisher.shutdown()
+        seqs = [int.from_bytes(f[1], "big", signed=True) for f in frames]
+        self.assertEqual(seqs, [1, 2, -1])
+        self.assertEqual([f[0] for f in frames], [b""] * 3)
+        self.assertEqual(frames[2][2], b"")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ def test_attention_gate_uses_attention_tp(monkeypatch):
         def __init__(self, input_size, output_size, **kwargs):
             super().__init__()
             captured.update(kwargs)
-            self.output_size_per_partition = output_size // kwargs["tp_size"]
+            self.output_size_per_partition = output_size // parallel.attn_tp_size
 
     monkeypatch.setattr(
         hunyuan_v4.DeepseekV2AttentionMLA, "__init__", fake_attention_init
@@ -56,8 +56,7 @@ def test_attention_gate_uses_attention_tp(monkeypatch):
 
     attention = hunyuan_v4.HYV4Attention(config, layer_id=0)
 
-    assert captured["tp_rank"] == parallel.attn_tp_rank
-    assert captured["tp_size"] == parallel.attn_tp_size
+    assert captured["parallel_group"] == "attn_tp"
     assert attention.local_gate_width == (64 // attn_tp_size) * 256
     assert attention.linear_gate.output_size_per_partition == attention.local_gate_width
 

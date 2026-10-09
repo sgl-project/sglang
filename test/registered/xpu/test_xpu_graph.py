@@ -19,7 +19,15 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(
+    est_time=600,
+    suite="stage-b-test-1-gpu-xpu",
+    disabled=(
+        "tc_piecewise prefill graph breaks since #42301: Dynamo cannot build the "
+        "msgspec.Struct layer-boundary values under fullgraph=True. tc_piecewise "
+        "is being removed in #41634; refactor this test once that lands."
+    ),
+)
 
 _COMMON_ARGS = [
     "--device",

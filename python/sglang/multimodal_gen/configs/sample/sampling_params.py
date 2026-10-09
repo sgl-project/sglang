@@ -13,10 +13,11 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -52,12 +53,29 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
-# Validated request-level quality levels, ordered from the strictest numerical
-# contract to the broadest optimization set. "lossless" keeps the exact
-# reference path; "extra-high" adds only request-gated kernel fusions; "high"
-# is cumulative and may also enable model-owned approximate optimizations.
-QUALITY_LEVELS: tuple[str, ...] = ("lossless", "extra-high", "high")
-KERNEL_FUSION_QUALITY_LEVELS = frozenset({"extra-high", "high"})
+# Request-level quality levels, ordered from the strictest numerical contract to
+# the broadest optimization set; each level includes the fast paths of the ones
+# before it:
+# - "exact": bit-identical to the reference path in the same environment
+# - "lossless": the same math; fast paths may change rounding order or position
+# - "high": may also change what is computed (precision, sparsity, reuse)
+QUALITY_LEVELS: tuple[str, ...] = ("exact", "lossless", "high")
+# "extra-high" is the pre-rename name of "lossless"
+QUALITY_ALIASES: dict[str, str] = {"extra-high": "lossless"}
+# libx264 presets, fastest first: each spends more encode time for a smaller
+# file at the same CRF.
+X264_PRESETS: tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
 
 
 @dataclass(frozen=True)
@@ -111,9 +129,20 @@ def resolve_skip_softmax_params(
     return SkipSoftmaxParams(float(threshold), start_step)
 
 
-def quality_allows_kernel_fusions(quality: str) -> bool:
-    """Return whether a quality level includes request-gated kernel fusions."""
-    return quality in KERNEL_FUSION_QUALITY_LEVELS
+def normalize_quality(quality: str) -> str:
+    """Return the canonical quality level for ``quality``, resolving aliases."""
+    level = QUALITY_ALIASES.get(quality, quality)
+    if level not in QUALITY_LEVELS:
+        raise ValueError(
+            f"quality must be one of {[*QUALITY_LEVELS, *QUALITY_ALIASES]}, "
+            f"got {quality!r}"
+        )
+    return level
+
+
+def quality_allows(quality: str, tier: str) -> bool:
+    """Whether a request at ``quality`` may run a fast path of class ``tier``."""
+    return QUALITY_LEVELS.index(quality) >= QUALITY_LEVELS.index(tier)
 
 
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
@@ -189,22 +218,6 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
-class DataType(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    MESH = auto()
-    ACTION = auto()
-
-    def get_default_extension(self) -> str:
-        if self == DataType.IMAGE:
-            return "png"
-        if self == DataType.VIDEO:
-            return "mp4"
-        if self == DataType.ACTION:
-            return "json"
-        return "glb"
-
-
 @dataclass
 class SamplingParams:
     """
@@ -222,6 +235,8 @@ class SamplingParams:
     """
 
     data_type: DataType = DataType.VIDEO
+    # Included in the dynamic batching signature and retained by replace/pickle.
+    task_type: ModelTaskType | str | None = None
 
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
@@ -245,18 +260,22 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped quality level.
+    # MP4 encode speed; None keeps the server's default preset
+    x264_preset: str | None = None
+    # Model-owned, request-scoped quality level (see QUALITY_LEVELS).
     #
-    # - "lossless" (default): the exact reference path. Output is expected to
-    #   be bit-identical to the HF reference implementation and to pass the
-    #   CI golden/ground-truth comparisons.
-    # - "extra-high": add only validated kernel fusions. These may change
-    #   half-precision rounding order, so output is not bit-exact versus the
-    #   reference, but this tier does not itself enable sparse or approximate
-    #   optimizations.
-    # - "high": include every "extra-high" fusion and allow model-owned
-    #   approximate optimizations such as sparse computation or feature
-    #   caching. These paths require model-specific quality validation.
+    # - "exact": the reference path, plus the fast paths that reproduce its
+    #   rounding exactly. Output is bit-identical to it in the same
+    #   environment; ask for this when a run has to be reproducible or when
+    #   bisecting a numerical bug.
+    # - "lossless" (default): also mount the fast paths that keep the
+    #   reference math and the precision of every operand and accumulator,
+    #   and only move where the rounding happens. Output matches the
+    #   reference to rounding error rather than bit for bit, by less than the
+    #   same path already moves between two legal environments.
+    # - "high": also allow model-owned approximate optimizations (lower
+    #   precision, sparse computation, feature caching), which need
+    #   model-specific quality validation.
     #
     # It intentionally participates in the dynamic-batch signature.
     quality: str = "lossless"
@@ -291,6 +310,13 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
+    # Fewest denoising steps the model's schedule accepts. Warmup requests are
+    # clamped to it, so a generic 1-step warmup stays a valid request.
+    min_num_inference_steps: ClassVar[int] = 1
+
+    # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
+    # ``True`` so the multipart video-generation route does not require ``prompt``.
+    prompt_optional: ClassVar[bool] = False
 
     height: int | None = None
     width: int | None = None
@@ -512,6 +538,14 @@ class SamplingParams:
         """Number of final samples produced by one expanded scheduler request."""
         return 1
 
+    def should_use_classifier_free_guidance(self) -> bool:
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        return cfg_scale > 1.0 and self.negative_prompt is not None
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""
@@ -583,7 +617,12 @@ class SamplingParams:
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
-        return output_quality_mapper.get(output_quality)
+        if output_quality not in output_quality_mapper:
+            valid = list(output_quality_mapper.keys()) + ["default"]
+            raise ValueError(
+                f"Invalid output_quality {output_quality!r}. Expected one of: {valid}"
+            )
+        return output_quality_mapper[output_quality]
 
     def _validate(self):
         """
@@ -594,10 +633,7 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if self.quality not in QUALITY_LEVELS:
-            raise ValueError(
-                f"quality must be one of {list(QUALITY_LEVELS)}, got {self.quality!r}"
-            )
+        self.quality = normalize_quality(self.quality)
 
         resolve_skip_softmax_params(self.skip_softmax_params)
 
@@ -625,6 +661,12 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"seed must be a non-negative int or list of ints, got {self.seed!r}"
+            )
+
+        if self.x264_preset is not None and self.x264_preset not in X264_PRESETS:
+            raise ValueError(
+                f"x264_preset must be one of {', '.join(X264_PRESETS)}, "
+                f"got {self.x264_preset!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -724,21 +766,17 @@ class SamplingParams:
 
         RLRolloutArgs.validate_sampling_params(self)
 
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
-
     def _validate_with_pipeline_config(self, pipeline_config):
         """
         check if the sampling params is compatible and valid with server_args
         """
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
             # requires image input
-            if self.image_path is None:
+            if not self.image_path:
                 raise ValueError(
                     f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
@@ -749,6 +787,34 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {task_type.name} models."
                 )
+
+        if task_type.requires_video_input() and not self.video_path:
+            raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+        # Legacy pipelines retain their model-owned video conditioning checks.
+        # Explicit multi-task declarations use the standard per-task contract.
+        if (
+            self.video_path
+            and (
+                getattr(pipeline_config, "supported_task_types", None) is not None
+                or (
+                    hasattr(pipeline_config, "get_supported_task_types")
+                    and len(pipeline_config.get_supported_task_types()) > 1
+                )
+            )
+            and not task_type.accepts_video_input()
+        ):
+            raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+    def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+        resolver = getattr(pipeline_config, "resolve_task_type", None)
+        if resolver is None:
+            # Compatibility with integrations that supply a lightweight config.
+            return ModelTaskType.parse(self.task_type or pipeline_config.task_type)
+        return resolver(
+            self.task_type,
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+        )
 
     def _adjust(
         self,
@@ -761,7 +827,8 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
+        self.task_type = task_type
         self.data_type = task_type.data_type()
 
         self._adjust_output_path(server_args)
@@ -864,7 +931,7 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if self.resolve_task_type(pipeline_config).is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -1007,6 +1074,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        add_argument(
+            "--task-type",
+            type=str,
+            help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
+        )
         # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
         add_argument("--auto-duration", action="store_true")
@@ -1187,6 +1259,7 @@ class SamplingParams:
         add_argument(
             "--output-quality",
             type=str,
+            choices=["maximum", "high", "medium", "low", "default"],
             help="Output quality setting (default, low, medium, high, maximum)",
         )
         add_argument(
@@ -1195,18 +1268,29 @@ class SamplingParams:
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         add_argument(
+            "--x264-preset",
+            type=str,
+            choices=list(X264_PRESETS),
+            help=(
+                "libx264 preset for MP4 output. Faster presets encode sooner "
+                "and produce larger files at the same quality setting; "
+                "unset keeps the default (fast)."
+            ),
+        )
+        add_argument(
             "--quality",
             type=str,
-            choices=list(QUALITY_LEVELS),
+            choices=[*QUALITY_LEVELS, *QUALITY_ALIASES],
             help=(
-                "Request-level quality: 'lossless' (default) keeps the exact "
-                "reference path, bit-exact against the reference "
-                "implementation; 'extra-high' adds only request-gated kernel "
-                "fusions and does not itself enable sparse or approximate "
-                "optimization; 'high' includes every extra-high fusion and "
-                "may also enable "
-                "model-owned approximate paths. Support and validated "
-                "deployment constraints are model-specific."
+                "Request-level quality: 'lossless' (default) runs every fast "
+                "path that keeps the reference math and operand precision and "
+                "only moves the rounding, so output matches the reference to "
+                "rounding error; 'exact' restricts it to the fast paths that "
+                "reproduce the reference's rounding exactly, giving "
+                "bit-identical output in the same environment; 'high' may "
+                "also enable model-owned approximate paths. 'extra-high' is "
+                "accepted as the former name of 'lossless'. Support and "
+                "validated deployment constraints are model-specific."
             ),
         )
         add_argument(
@@ -1385,6 +1469,42 @@ class SamplingParams:
                 "The first/last frames of the video become the conditioning "
                 "frames for the generated output."
             ),
+        )
+        # Kandinsky6 video super-resolution (ignored by other models)
+        add_argument(
+            "--sr-resolution-scale",
+            type=float,
+            help="Kandinsky6 SR total upscale factor: 2, 4 or 2.25 (default: 2.25).",
+        )
+        add_argument(
+            "--sr-num-steps",
+            type=int,
+            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
+            "pi-Flow checkpoints.",
+        )
+        add_argument(
+            "--sr-tiles-batch-size",
+            type=int,
+            help="Kandinsky6 SR: number of tiles denoised together (default: 1).",
+        )
+        add_argument(
+            "--sr-tile-min-overlap",
+            type=float,
+            help="Kandinsky6 SR: minimum tile overlap fraction in [0, 1) "
+            "(default: 0.2).",
+        )
+        add_argument(
+            "--sr-target-resolution",
+            type=str,
+            help="Kandinsky6 SR delivery resolution: hd, fullhd, 2k or WxH; the "
+            "result is only ever downscaled to it (default: keep the SR size).",
+        )
+        add_argument(
+            "--sr-target-resize-mode",
+            type=str,
+            choices=["fit", "exact"],
+            help="Kandinsky6 SR: 'fit' keeps the aspect ratio inside the target "
+            "resolution, 'exact' resizes to it exactly (default: fit).",
         )
         add_argument(
             "--action-mode",

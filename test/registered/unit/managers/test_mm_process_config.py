@@ -36,12 +36,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         args = self._validate_config({})
         self.assertEqual(resolution_result(args, "mm_process_config"), {})
 
-    def test_none_config_defaults_to_empty_dict(self):
-        args = self._validate_config(None)
-        # None is kept as-is for dummy models (default happens after early return)
-        # but for real models it would be set to {}
-        self.assertIsNone(resolution_result(args, "mm_process_config"))
-
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config("bad")

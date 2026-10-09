@@ -179,6 +179,9 @@ def _make_model_runner(
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
     )
+    # Fused draft KV is off unless a test opts in (a bare MagicMock return
+    # would read as a truthy entry size and take the fused pricing branch).
+    mr.fused_entry_bytes.return_value = None
 
     return mr
 
@@ -298,6 +301,24 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
+
+    def test_fused_draft_entry_overrides_the_layer_ratio(self):
+        """A fused draft prices the exact fused entry (host + draft + pad);
+        the per-draft-layer ratio under-reserves the pad."""
+        mr = _make_model_runner(self, speculative_algorithm="EAGLE")
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            77777 if name == "full" else None
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            fused = create_memory_pool_configurator(mr)
+        self.assertEqual(fused._cell_size, 77777)
 
 
 class TestHybridSWAConfigurator(CustomTestCase):
@@ -537,7 +558,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             int(config.full_max_total_num_tokens * 0.5),
         )
 
-    def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
+    def test_swa_request_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -572,7 +593,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 104)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
+    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
         # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
         # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
         # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
@@ -608,7 +629,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+    def test_swa_request_cap_accounts_for_draft_swa_layers(self):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
         mr = _make_model_runner(
@@ -642,7 +663,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
-    def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
+    def test_swa_request_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -670,7 +691,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 100)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_prefill_holds_window_plus_chunk(self):
+    def test_swa_request_cap_prefill_holds_window_plus_chunk(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -701,7 +722,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 76)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_disagg_decode_pre_alloc(self):
+    def test_swa_request_cap_disagg_decode_pre_alloc(self):
         # decode adds disaggregation_decode_extra_slots in-transfer slots to the
         # request count (num_reserved_decode_tokens is a full-pool concern, not SWA).
         available = 2_000_000
@@ -982,8 +1003,8 @@ class TestFactory(CustomTestCase):
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
 
     def test_chunk_cap_configurator_selection(self):
-        # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
-        def _cfg(max_running_requests):
+        # SWARequestCapPoolConfigurator is selected only when max_running_requests is set.
+        def _cfg(max_running_requests, chunked_prefill_size=4):
             mr = _make_model_runner(
                 self,
                 is_hybrid_swa=True,
@@ -991,7 +1012,7 @@ class TestFactory(CustomTestCase):
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
                 disable_radix_cache=True,
-                chunked_prefill_size=4,
+                chunked_prefill_size=chunked_prefill_size,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
             )
@@ -1003,11 +1024,15 @@ class TestFactory(CustomTestCase):
                 return create_memory_pool_configurator(mr)
 
         from sglang.srt.model_executor.pool_configurator import (
-            SWAChunkCapPoolConfigurator,
+            SWARequestCapPoolConfigurator,
         )
 
-        self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
-        self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(_cfg(2), SWARequestCapPoolConfigurator)
+        self.assertNotIsInstance(_cfg(None), SWARequestCapPoolConfigurator)
+        # Chunked prefill off: a whole prompt can exceed the cap.
+        self.assertNotIsInstance(
+            _cfg(2, chunked_prefill_size=-1), SWARequestCapPoolConfigurator
+        )
 
 
 class TestDflashDraftKvBudget(CustomTestCase):
@@ -1392,6 +1417,130 @@ class TestSWAPoolFloor(CustomTestCase):
         slots = cfg._get_num_req_slots(mrr)
         target = slots * cfg._swa_ring_size * 640 * cfg.num_layers_total
         self.assertEqual(cfg._fixed_swa_bytes(mrr), int(target * cfg._spec_infl))
+
+    def test_dsv4_fp8_pd_refuses_pp_and_hisparse(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            check_dsv4_unified_fp8_pd_supported,
+        )
+
+        base = dict(
+            unified_fp8=True,
+            disaggregation_mode="prefill",
+            pp_size=1,
+            enable_hisparse=False,
+        )
+        check_dsv4_unified_fp8_pd_supported(**base)
+        # bf16 PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{**base, "unified_fp8": False, "pp_size": 2, "enable_hisparse": True}
+        )
+        # fp8 without PD keeps both
+        check_dsv4_unified_fp8_pd_supported(
+            **{
+                **base,
+                "disaggregation_mode": "null",
+                "pp_size": 2,
+                "enable_hisparse": True,
+            }
+        )
+        for mode in ("prefill", "decode"):
+            for key, value, message in (
+                ("pp_size", 2, "pp_size=2"),
+                ("enable_hisparse", True, "enable-hisparse"),
+            ):
+                with self.subTest(disaggregation_mode=mode, refused=key):
+                    with self.assertRaisesRegex(ValueError, message):
+                        check_dsv4_unified_fp8_pd_supported(
+                            **{**base, "disaggregation_mode": mode, key: value}
+                        )
+
+
+class TestFusedDraftPricing(unittest.TestCase):
+    """A fused full-side entry (host + draft + pad) replaces both the
+    per-token full term and the per-draft-layer approximation in every solve:
+    charging both over-reserves, charging only the approximation under-reserves."""
+
+    def _make(self, fused_entry, draft_layers, **runner_kwargs):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(4)),
+            swa_attention_layer_ids=list(range(4, 12)),
+            swa_num_kv_heads=4,
+            page_size=1,
+            swa_full_tokens_ratio=0.5,
+            **runner_kwargs,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            fused_entry if name == "full" else None
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return mr, create_memory_pool_configurator(mr)
+
+    def _expected_cell(self, cfg, full_term):
+        return (
+            full_term
+            + cfg._swa_per_token * cfg._draft_swa_full_layers_num
+            + cfg._swa_full_tokens_ratio * cfg._swa_per_token * cfg._swa_layers_num
+            + cfg._draft_cell_size
+        )
+
+    def test_fused_entry_replaces_full_and_draft_terms(self):
+        fused_entry = 54_321
+        _, cfg = self._make(fused_entry=fused_entry, draft_layers=2)
+        self.assertEqual(cfg._draft_full_layers_num, 0)
+        self.assertEqual(cfg._cell_size, self._expected_cell(cfg, fused_entry))
+
+    def _assert_unified_bytes_price_the_fused_entry(self, cfg, config, available):
+        """The unified pool's bytes buy every full token at the fused entry
+        (the factory divides by it) without leaving a full token unspent."""
+        fused_entry = cfg._fused_full_entry
+        swa_bytes = (
+            config.swa_max_total_num_tokens * cfg._swa_per_token * cfg._swa_layers_num
+        )
+        self.assertEqual(
+            config.unified_memory_pool_bytes,
+            config.full_max_total_num_tokens * fused_entry + swa_bytes,
+        )
+        self.assertLessEqual(config.unified_memory_pool_bytes, available)
+        self.assertGreater(
+            config.unified_memory_pool_bytes + 2 * fused_entry, available
+        )
+
+    def test_unified_solve_prices_the_fused_entry(self):
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321, draft_layers=2, enable_unified_memory=True
+        )
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_chunk_cap_solve_prices_the_fused_entry(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            SWARequestCapPoolConfigurator,
+        )
+
+        available = 50_000_000
+        _, cfg = self._make(
+            fused_entry=54_321,
+            draft_layers=2,
+            enable_unified_memory=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=4,
+            sliding_window_size=8,
+            max_running_requests=2,
+        )
+        self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
+        config = cfg.calculate_pool_sizes(available, 1)
+        self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
 
 
 if __name__ == "__main__":

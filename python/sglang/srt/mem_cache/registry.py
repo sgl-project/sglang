@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,6 @@ class TreeCacheBuildContext:
     is_hybrid_ssm: bool
     enable_hierarchical_cache: bool
     disable_radix_cache: bool
-    effective_chunked_prefill_size: Optional[int]
     tp_worker: Any
     model_config: ModelConfig
     tp_size: int
@@ -78,48 +78,52 @@ def registered_radix_cache_backends() -> list[str]:
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
-    server_args = ctx.server_args
     params = ctx.params
 
-    if (
-        ctx.disable_radix_cache
-        and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-    ):
-        return _create_unified_radix_cache(ctx, server_args, params)
+    is_pure_swa = ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0
+    # A disabled cache publishes nothing, so no storage backend applies.
+    # Host-pool retraction goes to UnifiedRadixCache, which validates it (and
+    # rejects pure-SWA).
+    if ctx.disable_radix_cache:
+        if (
+            is_pure_swa
+            and get_disagg().disaggregation_decode_retraction_backup != "host_pool"
+        ):
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
-    if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
-        if not ctx.is_hybrid_swa:
-            from sglang.srt.mem_cache.chunk_cache import ChunkCache
+            return PureSWARadixCache(params=params)
+        return create_unified_radix_cache(ctx)
 
-            return ChunkCache(params)
-        if ctx.full_tokens_per_layer == 0:
-            from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+    if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
-            return PureSWAChunkCache(params)
-        from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-        return SWAChunkCache(params)
+        tree_components = []
+        if not is_pure_swa:
+            tree_components.append(ComponentType.FULL)
+        if ctx.is_hybrid_swa:
+            tree_components.append(ComponentType.SWA)
+        if ctx.is_hybrid_ssm:
+            tree_components.append(ComponentType.MAMBA)
+        params.tree_components = tuple(tree_components)
+        return LMCacheUnifiedRadixCache(
+            params,
+            model_config=ctx.model_config,
+            tp_size=ctx.tp_size,
+            tp_rank=ctx.tp_rank,
+            lmcache_config_file=get_memory().lmcache_config_file,
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
+        )
 
     if get_memory().enable_unified_cache_external_linker:
-        return _create_unified_radix_cache(ctx, server_args, params)
+        return create_unified_radix_cache(ctx)
 
-    if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+    if is_pure_swa:
         from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
         return PureSWARadixCache(params=params)
-
-    if get_memory().enable_lmcache:
-        from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
-            LMCRadixCache,
-        )
-
-        return LMCRadixCache(
-            params=params,
-            model_config=ctx.model_config,
-            tp_size=ctx.tp_size,
-            rank=ctx.tp_rank,
-            tp_group=ctx.tp_group,
-        )
 
     if get_memory().enable_flexkv:
         # Importing the package side-effect registers the explicit
@@ -135,15 +139,16 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
 
-    return _create_unified_radix_cache(ctx, server_args, params)
+    return create_unified_radix_cache(ctx)
 
 
-def _create_unified_radix_cache(
+def create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
-    server_args: ServerArgs,
-    params: CacheInitParams,
+    *,
+    cache_class: type[UnifiedRadixCache] | None = None,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
+    server_args, params = ctx.server_args, ctx.params
     if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
         if ctx.is_hybrid_ssm:
             raise ValueError("Host-pool retraction does not support Mamba models.")
@@ -179,7 +184,7 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
-    cache = UnifiedRadixCache(params)
+    cache = (cache_class or UnifiedRadixCache)(params)
     if (
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
@@ -267,25 +272,32 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "option that selected another tree cache for this model."
             )
 
-    hicache_attached = cache.cache_controller is not None
-    streaming_wrapped = False
-    if (
-        get_serving().enable_streaming_session
-        and not cache.supports_streaming_session()
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if get_serving().enable_streaming_session and not isinstance(
+        cache, UnifiedRadixCache
     ):
-        from sglang.srt.session.streaming_session import StreamingSession
+        raise NotImplementedError(
+            f"--enable-streaming-session is not verified with {type(cache).__name__}; "
+            "streaming sessions run on UnifiedRadixCache. Please open an issue or "
+            "a PR at https://github.com/sgl-project/sglang if you need this."
+        )
 
-        cache = StreamingSession(cache)
-        streaming_wrapped = True
+    if ctx.is_hybrid_ssm and not cache.supports_mamba():
+        raise NotImplementedError(
+            f"Models with mamba state are not verified with {type(cache).__name__}; "
+            "mamba state lives in UnifiedRadixCache. Please open an issue or a PR "
+            "at https://github.com/sgl-project/sglang if you need this."
+        )
 
+    hicache_attached = cache.cache_controller is not None
     logger.info(
         "Tree cache initialized: source=%s impl=%s hybrid_swa=%s hybrid_ssm=%s "
-        "hicache_attached=%s streaming_wrapped=%s",
+        "hicache_attached=%s",
         source,
         type(cache).__name__,
         ctx.is_hybrid_swa,
         ctx.is_hybrid_ssm,
         hicache_attached,
-        streaming_wrapped,
     )
     return cache

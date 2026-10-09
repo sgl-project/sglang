@@ -767,11 +767,6 @@ def get_sequence_parallel_world_size() -> int:
     return get_sp_world_size()
 
 
-def get_sequence_parallel_rank() -> int:
-    """Return my rank for the sequence parallel group."""
-    return get_sp_parallel_rank()
-
-
 def get_ulysses_parallel_world_size() -> int:
     return get_sp_group().ulysses_world_size
 
@@ -803,32 +798,6 @@ def get_ring_ctx() -> tuple[int, int]:
     return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
-# PP
-def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
-
-
-def get_pipeline_parallel_world_size() -> int:
-    """Return world size for the pipeline model parallel group."""
-    return get_pp_group().world_size
-
-
-def get_pipeline_parallel_rank() -> int:
-    """Return my rank for the pipeline model parallel group."""
-    return get_pp_group().rank_in_group
-
-
-def is_pipeline_first_stage() -> bool:
-    """Return True if in the first pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == 0
-
-
-def is_pipeline_last_stage() -> bool:
-    """Return True if in the last pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-
-
 # CFG
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, (
@@ -850,47 +819,6 @@ def get_classifier_free_guidance_rank() -> int:
 def get_data_parallel_world_size() -> int:
     """Return world size for the data parallel group."""
     return get_dp_world_size()
-
-
-def get_data_parallel_rank() -> int:
-    """Return my rank for the data parallel group."""
-    return get_dp_rank()
-
-
-def is_dp_last_group() -> bool:
-    """Return True if in the last data parallel group, False otherwise."""
-    return (
-        get_sequence_parallel_rank() == (get_sequence_parallel_world_size() - 1)
-        and get_classifier_free_guidance_rank()
-        == (get_classifier_free_guidance_world_size() - 1)
-        and get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-    )
-
-
-def get_dit_world_size() -> int:
-    """Return world size for the DiT model (excluding VAE)."""
-    return (
-        get_data_parallel_world_size()
-        * get_classifier_free_guidance_world_size()
-        * get_sequence_parallel_world_size()
-        * get_pipeline_parallel_world_size()
-        * get_tensor_model_parallel_world_size()
-    )
-
-
-def get_vae_parallel_group() -> ProcessGroup:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
-
-
-def get_vae_parallel_world_size() -> int:
-    """Return world size for the VAE parallel group."""
-    return torch.distributed.get_world_size(group=get_vae_parallel_group())
-
-
-def get_vae_parallel_rank() -> int:
-    """Return my rank for the VAE parallel group."""
-    return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
 def get_decode_parallel_group_coordinator() -> GroupCoordinator:
@@ -940,9 +868,11 @@ def destroy_model_parallel() -> None:
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
+    from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
+    IPC_A2A_MULTI.reset()
 
     destroyed_groups = []
     for group in (

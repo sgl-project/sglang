@@ -58,6 +58,67 @@ def set_kv_buffer_prefix_valid_tiled(
 
 
 @triton.jit
+def set_kv_buffer_prefix_valid_tiled_fp8(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_ptr,
+    dst_v_ptr,
+    loc_2d_ptr,
+    commit_len_ptr,
+    k_scale,
+    v_scale,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    block_size,
+    ROW_ELEMS: tl.constexpr,
+    ELEMS_PER_TILE: tl.constexpr,
+    K_SCALE_IS_TENSOR: tl.constexpr = False,
+    V_SCALE_IS_TENSOR: tl.constexpr = False,
+):
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    tid = tl.program_id(2)
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    elem_off = tid * ELEMS_PER_TILE + tl.arange(0, ELEMS_PER_TILE)
+    mask_elem = elem_off < ROW_ELEMS
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    src_row = bid * block_size + row
+
+    src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + elem_off
+    src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + elem_off
+    dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + elem_off
+    dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + elem_off
+
+    # Tensor division rounds the divisor first and uses correctly rounded division.
+    k_val = tl.load(src_k_row_ptr, mask=mask_elem, other=0).to(tl.float32)
+    if K_SCALE_IS_TENSOR:
+        k_scale = k_scale.to(src_k_ptr.dtype.element_ty).to(tl.float32)
+        k_val = tl.div_rn(k_val, k_scale)
+    else:
+        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
+        k_val = k_val * tl.div_rn(1.0, k_scale)
+    k_val = k_val.to(src_k_ptr.dtype.element_ty).to(dst_k_ptr.dtype.element_ty)
+
+    v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0).to(tl.float32)
+    if V_SCALE_IS_TENSOR:
+        v_scale = v_scale.to(src_v_ptr.dtype.element_ty).to(tl.float32)
+        v_val = tl.div_rn(v_val, v_scale)
+    else:
+        v_val = v_val * tl.div_rn(1.0, v_scale)
+    v_val = v_val.to(src_v_ptr.dtype.element_ty).to(dst_v_ptr.dtype.element_ty)
+
+    tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
+    tl.store(dst_v_row_ptr, v_val, mask=mask_elem)
+
+
+@triton.jit
 def copy_all_layer_kv_cache_tiled(
     data_ptrs,
     strides,

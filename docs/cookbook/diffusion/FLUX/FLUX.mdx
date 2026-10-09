@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --enable-torch-compile false \
   --enable-breakable-cuda-graph \
   --warmup-resolutions 1024x1024 \
-  --quality lossless \
+  --quality exact \
   --width 1024 --height 1024 \
   --num-inference-steps 50 --guidance-scale 3.5 --seed 42 \
   --prompt "A futuristic cyberpunk city at night, neon lights reflecting on wet streets"
@@ -72,7 +72,7 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
 
 Confirm `[Diffusion BCG] captured` in the log, then compare warmed request latency with eager execution on the same GPUs. Capture time and graph memory are additional startup costs. Add other served resolutions to `--warmup-resolutions`; a request with an uncaptured signature falls back to eager.
 
-FLUX.1-dev uses a fixed 512-token T5 conditioning sequence, so changing `--bcg-text-buckets` does not create additional prompt-length graphs. Its request-gated DiT fusions at `quality=high` and `extra-high` cannot be combined with BCG: the runtime rejects those requests because the captured graph uses the lossless branches. FLUX.2 and quantized transformer overrides require separate validation.
+FLUX.1-dev uses a fixed 512-token T5 conditioning sequence, so changing `--bcg-text-buckets` does not create additional prompt-length graphs. Its request-gated DiT fusions at `quality=high` and `lossless` cannot be combined with BCG: the runtime rejects those requests because the captured graph uses the lossless branches. FLUX.2 and quantized transformer overrides require separate validation.
 
 ## 4. API Usage
 

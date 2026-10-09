@@ -82,7 +82,7 @@ python3 -m sglang.launch_server \
     --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --disable-piecewise-cuda-graph \
-    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode normal
 ```
 
@@ -110,7 +110,7 @@ python3 -m sglang.launch_server \
     --disaggregation-mode decode --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --moe-a2a-backend deepep --deepep-mode low_latency \
-    --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --speculative-algorithm DFLASH \
     --speculative-num-draft-tokens 8
 ```

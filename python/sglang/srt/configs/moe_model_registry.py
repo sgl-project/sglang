@@ -22,6 +22,8 @@ _DEEPEP_V2_MODELS: dict[str, _DeepEPv2ModelPolicy] = {
     "DeepseekV4ForCausalLM": _DeepEPv2ModelPolicy(),
     "Qwen3MoeForCausalLM": _DeepEPv2ModelPolicy(),
     "Glm5NextForConditionalGeneration": _DeepEPv2ModelPolicy(),
+    "MiMoV2ForCausalLM": _DeepEPv2ModelPolicy(),
+    "MiMoV2FlashForCausalLM": _DeepEPv2ModelPolicy(),
 }
 
 
@@ -36,7 +38,8 @@ def register_deepep_v2_model(
     ``prefill_dispatch_tokens(cfg, tokens)`` receives a read-only resolved
     configuration and the prefill-buffer ceiling. It returns the maximum
     tokens one rank dispatches, without changing scheduler/buffer settings.
-    Omitting it preserves the default, unsharded ceiling.
+    Omitting it keeps the default: the ceiling split across the ranks each
+    per-DP chunk is scattered over before dispatch.
     """
 
     policy = _DeepEPv2ModelPolicy(
@@ -69,11 +72,12 @@ def model_requires_fp32_silu_mul(hf_config: Any) -> bool:
 
 
 def model_deepep_v2_prefill_dispatch_tokens(
-    hf_config: Any, cfg: Any, default_tokens: int
+    hf_config: Any, cfg: Any, *, ceiling: int, default_tokens: int
 ) -> int:
-    """Apply the primary model's dispatch sizing, or keep the buffer ceiling."""
+    """Apply the primary model's dispatch sizing to the prefill-buffer ceiling,
+    or return default_tokens when the model registers none."""
 
     policy = _policy_of(hf_config)
     if policy is None or policy.prefill_dispatch_tokens is None:
         return default_tokens
-    return policy.prefill_dispatch_tokens(cfg, default_tokens)
+    return policy.prefill_dispatch_tokens(cfg, ceiling)

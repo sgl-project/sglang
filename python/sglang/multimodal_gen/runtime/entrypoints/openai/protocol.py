@@ -46,6 +46,9 @@ class ImageGenerationsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     prompt: str
+    task_type: Optional[str] = Field(
+        default=None, description="Requested task from the server supported_task_types."
+    )
     enhance_prompt: bool = False
     model: Optional[str] = None
     n: Optional[int] = 1
@@ -119,6 +122,9 @@ class VideoGenerationsRequest(BaseModel):
     reference_url: Optional[str] = None
     video_path: Optional[str] = None
     video_url: Optional[str] = None
+    task_type: Optional[str] = Field(
+        default=None, description="Requested task from the server supported_task_types."
+    )
     model: Optional[str] = None
     n: Optional[int] = 1
     num_outputs_per_prompt: Optional[int] = None
@@ -152,6 +158,7 @@ class VideoGenerationsRequest(BaseModel):
     upscaling_scale: Optional[int] = 4
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
+    x264_preset: Optional[str] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
@@ -164,10 +171,6 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
-
-
-class VideoRemixRequest(BaseModel):
-    prompt: str
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):

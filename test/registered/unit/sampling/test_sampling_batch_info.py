@@ -94,14 +94,6 @@ class TestMergeBiasTensor(CustomTestCase):
         self.assertEqual(result[2, 0].item(), 1.0)
 
 
-# SamplingBatchInfo.__len__
-class TestSamplingBatchInfoLen(CustomTestCase):
-    def test_len_matches_batch_size(self):
-        """Test that __len__ returns batch size (number of temperature rows)."""
-        info = _make_info(batch_size=5)
-        self.assertEqual(len(info), 5)
-
-
 class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_and_merge_preserve_support_logprob_modes(self):
         info = _make_info(

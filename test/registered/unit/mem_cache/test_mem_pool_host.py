@@ -4,18 +4,27 @@ import threading
 import unittest
 import unittest.mock
 from functools import partial
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,6 +56,40 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             allocator_type="default",
         )
+
+    def test_index_k_host_pool_joins_a_host_pool_group(self):
+        """Grouping a main KV pool with a K-only index pool raised AttributeError."""
+        index_pool = MHATokenToKOnlyPool(
+            size=self.page_size * 2,
+            page_size=self.page_size,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        index_host = MHATokenToKOnlyPoolHost(
+            index_pool, self.host_pool, "layer_first", pin_memory=False
+        )
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=self.host_pool,
+                    device_pool=self.device_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=index_host,
+                    device_pool=index_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        self.assertFalse(group.can_use_write_back_jit)
 
     def test_multiple_attention_rows_per_token(self):
         for rows_per_token in (1, 3):
@@ -422,6 +465,104 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertIsNone(transfers[1].host_indices)
         self.assertEqual(group.available_size(PoolName.SWA), 1)
         self.assertEqual(group.available_size(PoolName.MAMBA), 2)
+
+
+class TestDSAIndexerPoolDecl(CustomTestCase):
+    """The declaration is the single source of indexer host bytes. The mirror
+    must not re-derive them."""
+
+    def _stub(self):
+        return SimpleNamespace(
+            layer_num=5,
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            size=64 * 8,
+            start_layer=0,
+            end_layer=5,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False] * 5,
+        )
+
+    def test_host_bytes_match_observed_allocation(self):
+        # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
+        # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
+        storage_info = make_dsa_indexer_pool_decl(self._stub()).storage_info
+        self.assertEqual(storage_info.bytes_per_token_per_layer, 132)
+        self.assertEqual(storage_info.page_bytes(64), 8448)
+        self.assertEqual(
+            storage_info.host_bytes(page_num=284256, layer_num=5, page_size=64),
+            12006973440,
+        )
+
+    def test_mirror_consumes_decl(self):
+        stub = self._stub()
+        decl = make_dsa_indexer_pool_decl(stub)
+        storage_info = decl.storage_info
+        anchor = MLATokenToKVPoolHost(
+            stub,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+        mirror = DSAIndexerPoolHost(
+            decl=decl,
+            anchor_host=anchor,
+            pin_memory=False,
+            is_dummy=True,
+        )
+        self.assertEqual(mirror.layout, anchor.layout)
+        self.assertEqual(mirror.indexer_page_stride_size, storage_info.page_bytes(64))
+        self.assertEqual(
+            mirror.get_size_per_token(), storage_info.bytes_per_token_per_layer * 5
+        )
+        self.assertEqual(
+            storage_info.host_bytes(
+                page_num=anchor.page_num, layer_num=5, page_size=64
+            ),
+            anchor.page_num * mirror.indexer_layout_dim,
+        )
+
+    def test_mirror_is_compact_over_layers_that_own_index_buffers(self):
+        """Shared-topk layers have 0-row device buffers. Mirroring or
+        transferring them dereferences a null pointer. The mirror must cover
+        only the declared layers and translate packed-draft layer ids
+        relative to that compact count."""
+        stub = self._stub()
+        stub.skip_topk_layers = [False, True, True, False, True]
+        decl = make_dsa_indexer_pool_decl(stub)
+        self.assertEqual(decl.owned_device_layers, (0, 3))
+        anchor = MLATokenToKVPoolHost(
+            stub,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+        mirror = DSAIndexerPoolHost(
+            decl=decl,
+            anchor_host=anchor,
+            pin_memory=False,
+            is_dummy=True,
+        )
+        self.assertEqual(mirror.layer_num, 2)
+        self.assertEqual(
+            mirror.get_size_per_token(), decl.storage_info.bytes_per_token_per_layer * 2
+        )
+        self.assertEqual(mirror._owned_device_layer_ids(stub), [0, 3])
+        self.assertEqual(mirror._host_layer_index(3), 1)
+        self.assertFalse(mirror._is_device_layer_owned(stub, 1))
+        # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
+        self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
 
 
 if __name__ == "__main__":

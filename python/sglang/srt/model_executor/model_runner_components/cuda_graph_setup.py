@@ -15,6 +15,7 @@ from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
@@ -42,6 +43,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -252,7 +254,7 @@ def sync_elastic_cuda_graph_config(
     gathered_hashes = torch.empty(
         dist.get_world_size(world_group), dtype=torch.int64, device=device
     )
-    dist.all_gather_into_tensor(gathered_hashes, local_hash, group=world_group)
+    all_gather_single(gathered_hashes, local_hash, group=world_group)
     hashes = gathered_hashes.cpu().tolist()
     if any(value != hashes[0] for value in hashes[1:]):
         raise RuntimeError(
@@ -407,11 +409,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
+        if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
@@ -721,10 +719,13 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
-        GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
-    else:
+    GraphRunnerCls = current_platform.get_graph_runner_cls()
+    if GraphRunnerCls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_graph_runner_cls()",
+            subsystem="CUDA graph runner",
+        )
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
@@ -733,7 +734,8 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        GraphRunnerCls = graph_runners[model_runner.device]
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem

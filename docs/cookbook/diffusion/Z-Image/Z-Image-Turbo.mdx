@@ -73,6 +73,12 @@ with open("output.png", "wb") as f:
 
 ### 4.2 Advanced Usage
 
+Z-Image uses `positive + guidance_scale * (positive - negative)` guidance, unlike
+the standard CFG convention. Any positive `guidance_scale` enables CFG; omitted
+negative prompts use an empty string. Z-Image-Turbo defaults to `guidance_scale=0`
+and does not run the negative branch. Enabling CFG adds a second DiT branch, so
+expect additional inference cost; it is not automatically recommended for Turbo.
+
 #### 4.2.1 Cache-DiT Acceleration
 
 SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).

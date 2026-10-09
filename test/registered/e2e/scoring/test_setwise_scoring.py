@@ -14,11 +14,16 @@ dedicated id). All model/dtype/tolerance knobs are overridable via env.
 """
 
 import asyncio
+import math
 import os
 import unittest
 
 import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -30,6 +35,8 @@ _SEQCLS_MODEL = os.environ.get(
     "TEST_CLASSIFICATION_BASE_MODEL",
     "tomaarsen/Qwen3-Reranker-0.6B-seq-cls",
 )
+# CausalLM base (same tokenizer / anchor special token as the reranker above).
+_CAUSAL_MODEL = os.environ.get("TEST_CAUSAL_LM_MODEL", "Qwen/Qwen3-0.6B")
 _ANCHOR_TOKEN = os.environ.get("TEST_SCORE_EXTRACTION_TOKEN", "<|object_ref_start|>")
 # float16 on flashinfer (no float32 prefill kernel); HF golden is float32 and the
 # tolerance below covers the fp16-vs-fp32 gap. All overridable via env.
@@ -294,6 +301,185 @@ class TestSetwiseScoringHFParity(CustomTestCase):
                 self.assertEqual(len(r.scores[0]), 3)
             else:  # pointwise: one score row per item (flat)
                 self.assertEqual(len(r.scores), 2)
+
+
+class TestGenerationSetwiseScoringHFParity(CustomTestCase):
+    """CausalLM setwise scores must match an HF LM-head-at-anchor reference.
+
+    At each anchor the engine reads label-token logprobs from the LM head
+    (P(next | prefix up to the anchor)); the HF reference gathers the same
+    log_softmax(logits) rows and exponentiates them (apply_softmax=False ->
+    probabilities), so a wrong pooling position changes the numbers.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(_CAUSAL_MODEL)
+        cls.anchor_id = cls.tokenizer.convert_tokens_to_ids(_ANCHOR_TOKEN)
+        assert (
+            cls.anchor_id is not None and cls.anchor_id != cls.tokenizer.unk_token_id
+        ), f"{_ANCHOR_TOKEN!r} did not resolve to a dedicated token id"
+        # Two arbitrary single-token labels to score at each anchor.
+        cls.label_token_ids = [
+            cls.tokenizer.encode("yes", add_special_tokens=False)[-1],
+            cls.tokenizer.encode("no", add_special_tokens=False)[-1],
+        ]
+        cls.engine = Engine(
+            model_path=_CAUSAL_MODEL,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            attention_backend="flashinfer",
+            dtype=_DTYPE,
+            mem_fraction_static=0.15,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "engine", None) is not None:
+            cls.engine.shutdown()
+        torch.cuda.empty_cache()
+
+    def _build_prompt(self, n_anchors: int) -> str:
+        candidates = " ".join(f"Candidate {i}." for i in range(n_anchors))
+        return f"Rank the candidates. {candidates} Scores:" + (
+            _ANCHOR_TOKEN * n_anchors
+        )
+
+    def _hf_causal_setwise_reference(self, prompt: str):
+        """Reference: exp(log_softmax(LM-head logits)[anchor])[label] per anchor."""
+        input_ids = self.tokenizer.encode(prompt)
+        anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
+        self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            _CAUSAL_MODEL, torch_dtype=torch.float32
+        ).eval()
+        try:
+            ids = torch.tensor([input_ids], dtype=torch.long)
+            with torch.no_grad():
+                logits = model(input_ids=ids).logits[0]  # [seq, vocab]
+            logprobs = torch.log_softmax(logits.float(), dim=-1)
+            ref = [
+                [math.exp(logprobs[p, t].item()) for t in self.label_token_ids]
+                for p in anchor_positions
+            ]
+            return ref, anchor_positions
+        finally:
+            model.cpu()
+            del model
+            torch.cuda.empty_cache()
+
+    def _assert_close(self, ref, sgl, atol=_ATOL, rtol=_RTOL):
+        self.assertEqual(len(ref), len(sgl), "row count mismatch")
+        for i, (rrow, srow) in enumerate(zip(ref, sgl)):
+            self.assertEqual(len(rrow), len(srow), f"row {i} width mismatch")
+            for r, s in zip(rrow, srow):
+                self.assertLessEqual(abs(r - s), atol + rtol * abs(r))
+
+    def test_generation_setwise_matches_hf_reference(self):
+        prompt = self._build_prompt(3)
+        ref, anchor_positions = self._hf_causal_setwise_reference(prompt)
+
+        sgl = self.engine.score(
+            query="",
+            items=[prompt],
+            label_token_ids=self.label_token_ids,
+            apply_softmax=False,
+            score_extraction_token_id=self.anchor_id,
+        ).scores
+
+        self.assertEqual(len(sgl), 1)  # one item
+        self.assertEqual(len(sgl[0]), len(anchor_positions))  # one row per anchor
+        self._assert_close(ref, sgl[0])
+
+    def test_generation_setwise_multiple_items_match_hf(self):
+        prompt0 = self._build_prompt(3)
+        prompt1 = self._build_prompt(2)
+        ref0, anchors0 = self._hf_causal_setwise_reference(prompt0)
+        ref1, anchors1 = self._hf_causal_setwise_reference(prompt1)
+
+        sgl = self.engine.score(
+            query="",
+            items=[prompt0, prompt1],
+            label_token_ids=self.label_token_ids,
+            apply_softmax=False,
+            score_extraction_token_id=self.anchor_id,
+        ).scores
+
+        self.assertEqual(len(sgl), 2)  # one matrix per item
+        self.assertEqual(len(sgl[0]), len(anchors0))
+        self.assertEqual(len(sgl[1]), len(anchors1))
+        self._assert_close(ref0, sgl[0])
+        self._assert_close(ref1, sgl[1])
+
+
+class TestGenerationSetwiseMISScoring(CustomTestCase):
+    """Fused CausalLM setwise under ``--enable-mis``.
+
+    Items are fused into one sequence; the LM head is read at each anchor with the
+    block-diagonal mask isolating sets. Asserts set isolation (the property only a
+    real fused forward exercises); shape/grouping is covered by the unit tests.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(_CAUSAL_MODEL)
+        cls.anchor_id = cls.tokenizer.convert_tokens_to_ids(_ANCHOR_TOKEN)
+        cls.label_token_ids = [
+            cls.tokenizer.encode("yes", add_special_tokens=False)[-1],
+            cls.tokenizer.encode("no", add_special_tokens=False)[-1],
+        ]
+        cls.engine = Engine(
+            model_path=_CAUSAL_MODEL,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            dtype=_DTYPE,
+            mem_fraction_static=0.15,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "engine", None) is not None:
+            cls.engine.shutdown()
+        torch.cuda.empty_cache()
+
+    @staticmethod
+    def _set_prompt(n_anchors: int) -> str:
+        candidates = " ".join(f"Candidate {i}." for i in range(n_anchors))
+        return f"Rank the candidates. {candidates} Scores:" + (
+            _ANCHOR_TOKEN * n_anchors
+        )
+
+    def _assert_matrix_close(self, a, b, atol=5e-2):
+        self.assertEqual(len(a), len(b), "row count mismatch")
+        for ra, rb in zip(a, b):
+            self.assertEqual(len(ra), len(rb), "width mismatch")
+            for x, y in zip(ra, rb):
+                self.assertLessEqual(abs(x - y), atol, f"{x} vs {y}")
+
+    def test_mis_generation_set_isolation(self):
+        # The block-diagonal mask means set0's scores are unchanged by a second set.
+        set0 = self._set_prompt(3)
+        alone = self.engine.score(
+            query="Rank:",
+            items=[set0],
+            label_token_ids=self.label_token_ids,
+            apply_softmax=False,
+            score_extraction_token_id=self.anchor_id,
+        ).scores
+        fused = self.engine.score(
+            query="Rank:",
+            items=[set0, self._set_prompt(2)],
+            label_token_ids=self.label_token_ids,
+            apply_softmax=False,
+            score_extraction_token_id=self.anchor_id,
+        ).scores
+
+        self.assertEqual(len(alone), 1)
+        self.assertEqual([len(m) for m in fused], [3, 2])  # nested per item
+        self._assert_matrix_close(alone[0], fused[0])
 
 
 class TestSetwiseMultiItemMISScoring(CustomTestCase):
