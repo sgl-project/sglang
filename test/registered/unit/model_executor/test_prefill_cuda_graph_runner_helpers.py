@@ -274,7 +274,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             },
             {
                 "hidden_states": (16, 8),
-                "residual": (16, 3, 8),
+                "attn_res_bank": (16, 3, 8),
                 "dspark_hidden_states": (16, 16),
             },
         )
