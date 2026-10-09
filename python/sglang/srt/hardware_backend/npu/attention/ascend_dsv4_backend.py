@@ -739,6 +739,43 @@ class CompressorAscendBackendMixin:
             )
             return
 
+        if compressor.ratio == 128 and loc is not None:
+            import os as _os
+
+            _env = _os.environ.get("DSV4_DUMP_C128W")
+            if _env is not None and (
+                _env in ("", "all") or _env == str(compressor.layer_id)
+            ):
+                try:
+                    _lp = (
+                        int(forward_batch.positions.reshape(-1)[-1].item())
+                        if forward_batch.positions.numel()
+                        else -1
+                    )
+                    _lo = int(_os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+                    _hi = int(_os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+                    if _lo <= _lp <= _hi:
+                        _c128 = getattr(self.token_to_kv_pool, "c128_kv_pool", None)
+                        _ps = int(getattr(_c128, "kernel_page_size", 16))
+                        _w = loc.to(torch.int64).reshape(-1)
+                        _w = _w[_w > 0]
+                        _wp = torch.unique(_w // _ps).cpu().tolist()
+                        _t = getattr(self.forward_metadata, "c128_page_table", None)
+                        _tp = []
+                        if torch.is_tensor(_t) and _t.numel():
+                            _row = _t.reshape(_t.shape[0], -1)[0].to(torch.int64)
+                            _tp = torch.unique(_row[_row > 0]).cpu().tolist()
+                        _inter = sorted(set(_wp) & set(_tp))
+                        print(
+                            f"[C128W] layer={compressor.layer_id} lastpos={_lp} "
+                            f"nslots={int(_w.numel())} "
+                            f"wpages={_wp[:16]} ppages={_tp[:16]} "
+                            f"inter={_inter[:16]}",
+                            flush=True,
+                        )
+                except Exception as _exc:
+                    print(f"[C128W] skipped: {_exc}", flush=True)
+
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
