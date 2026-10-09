@@ -2,6 +2,21 @@
 
 use std::path::{Path, PathBuf};
 
+use hf_hub::Cache;
+
+/// Select the Hugging Face cache with Python's directory override precedence.
+///
+/// `HF_HUB_CACHE` takes priority over `HUGGINGFACE_HUB_CACHE`, followed by
+/// `Cache::from_env()` (`HF_HOME/hub` or the default cache directory).
+pub fn hf_cache() -> Cache {
+    ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(PathBuf::from)
+        .map(Cache::new)
+        .unwrap_or_else(Cache::from_env)
+}
+
 /// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
 /// its sibling, else an HF Hub repo id → the local cache. `None` if not found.
 pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
@@ -135,17 +150,9 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
 }
 
 fn hub_file(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<PathBuf> {
-    use hf_hub::{Cache, Repo, RepoType};
+    use hf_hub::{Repo, RepoType};
 
-    // Python resolves the cache dir as HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE >
-    // HF_HOME/hub > ~/.cache/huggingface/hub; the hf-hub crate only knows
-    // HF_HOME. Honor the explicit cache-dir overrides first, or the Rust
-    // server misses models the Python scheduler already downloaded.
-    let cache = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
-        .iter()
-        .find_map(|var| std::env::var(var).ok())
-        .map(|dir| Cache::new(dir.into()))
-        .unwrap_or_else(Cache::from_env);
+    let cache = hf_cache();
     let repo = Repo::with_revision(
         repo_id.to_string(),
         RepoType::Model,

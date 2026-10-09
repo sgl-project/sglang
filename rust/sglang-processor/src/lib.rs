@@ -19,7 +19,7 @@ mod think;
 mod tokenizer;
 
 pub use error::ProcessorError;
-pub use model_files::{resolve_model_file, resolve_tokenizer_file};
+pub use model_files::{hf_cache, resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
