@@ -895,7 +895,12 @@ def _dsv4_low_ratio_regions(
 
 
 def _dsv4_low_ratio_entries(
-    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+    *,
+    is_dummy: bool = False,
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
@@ -914,6 +919,7 @@ def _dsv4_low_ratio_entries(
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
+                    is_dummy=is_dummy,
                 ),
                 device_pool=device_pool,
                 layer_mapping=layer_mapping,
@@ -952,6 +958,7 @@ def _build_dsv4_rope_entry(
     num_host_pages: int,
     slot_page_size: int,
     transfer_layer_id_max: int,
+    is_dummy: bool = False,
 ) -> Optional[PoolEntry]:
     sibling = _dsv4_rope_sibling(kvcache, ratio)
     if sibling is None:
@@ -968,6 +975,7 @@ def _build_dsv4_rope_entry(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=True,
+            is_dummy=is_dummy,
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
@@ -990,6 +998,12 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
     layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if get_memory().enable_mla_hicache_host_dedup and params.mtp_draft_device_pools:
+        raise ValueError(
+            "V4 host dedup requires rank-local draft sidecars, not packed drafts"
+        )
+    mla_dedup = _create_mla_dedup_context(kvcache, params, storage_backend)
+    is_dummy = mla_dedup.is_dummy_rank if mla_dedup is not None else False
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
     transfer_layer_id_max = layer_mappings.transfer_layer_id_max
@@ -1069,6 +1083,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -1101,6 +1116,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
@@ -1125,6 +1141,7 @@ def build_deepseek_v4_hicache_stack(
                         slot_page_size=region.slot_page_size,
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
+                        is_dummy=is_dummy,
                         page_aligned_only=region.page_aligned_only,
                     ),
                     device_pool=kvcache.c4_indexer_kv_pool,
@@ -1142,6 +1159,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
@@ -1157,6 +1175,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -1168,6 +1187,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             entries.extend(
                 [
@@ -1208,6 +1228,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
@@ -1247,13 +1268,18 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c128_rope_entry is not None:
             entries.append(c128_rope_entry)
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache, page_size, num_host_pages, transfer_layer_id_max
+            kvcache,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
     )
 
@@ -1276,6 +1302,7 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 

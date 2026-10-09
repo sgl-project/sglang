@@ -68,6 +68,127 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
                 consumer="test consumer",
             )
 
+    def test_low_ratio_dummy_pools_keep_all_regions_without_host_buffers(self):
+        kv = SimpleNamespace(kv_buffer=[torch.zeros((4, 16), dtype=torch.uint8)])
+        index = SimpleNamespace(
+            page_size=2,
+            index_k_with_scale_buffer=None,
+            index_k_payload_buffer=[torch.zeros((4, 8), dtype=torch.uint8)],
+            index_k_scale_buffer=[torch.zeros((4, 4), dtype=torch.uint8)],
+        )
+        cache = SimpleNamespace(
+            sources_by_ratio={2: [3]},
+            start_layer=0,
+            kv_pools={2: kv},
+            index_pools={2: index},
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_mem_layout="layer_first",
+                ),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            entries = hybrid_pool_assembler._dsv4_low_ratio_entries(
+                cache,
+                4,
+                4,
+                8,
+                is_dummy=True,
+            )
+        self.assertEqual(
+            {entry.name for entry in entries},
+            {
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            },
+        )
+        for entry in entries:
+            pool = entry.host_pool
+            self.assertTrue(pool._is_dummy)
+            self.assertIsNone(pool.kv_buffer)
+            self.assertEqual(pool.layer_num, 1)
+            self.assertEqual(pool.alloc(4).tolist(), [0, 1, 2, 3])
+
+    def test_low_ratio_shared_sources_restore_once_with_stage_local_layers(self):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
+        # Global layers 8/14 own keys; later indexer layers only rescore them.
+        # Two source layers, four physical pages per source, split index scales.
+        kv = SimpleNamespace(
+            kv_buffer=[torch.zeros((4, 16), dtype=torch.uint8) for _ in range(2)]
+        )
+        index = SimpleNamespace(
+            page_size=2,
+            index_k_with_scale_buffer=None,
+            index_k_payload_buffer=[
+                torch.zeros((4, 8), dtype=torch.uint8) for _ in range(2)
+            ],
+            index_k_scale_buffer=[
+                torch.zeros((4, 4), dtype=torch.uint8) for _ in range(2)
+            ],
+        )
+        cache = SimpleNamespace(
+            sources_by_ratio={2: [8, 14]},
+            start_layer=8,
+            kv_pools={2: kv},
+            index_pools={2: index},
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="layer_first"),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            entries = hybrid_pool_assembler._dsv4_low_ratio_entries(
+                cache, 4, 4, 20, is_dummy=True
+            )
+        broadcaster = V4HostDedupBroadcaster.__new__(V4HostDedupBroadcaster)
+        broadcaster.device = "cpu"
+        broadcaster.is_src = False
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.chunk_tokens = 8
+        broadcaster._page_staging = {}
+        # Restore noncontiguous physical pages 1/3, preserving pages 0/2.
+        indices = torch.tensor([4, 5, 6, 7, 12, 13, 14, 15])
+        calls = []
+
+        def receive(chunk, **kwargs):
+            calls.append(tuple(chunk.shape))
+            chunk.fill_(len(calls))
+
+        with patch("torch.distributed.broadcast", side_effect=receive):
+            for layer in range(20):
+                for entry in entries:
+                    broadcaster.broadcast_transfer(
+                        SimpleNamespace(
+                            host_pool=entry.host_pool,
+                            layer_mapper=entry.layer_mapper,
+                            device_indices=indices,
+                        ),
+                        layer,
+                    )
+                # Source IDs are stage-local 0/6; all other layers are aliases.
+                self.assertEqual(len(calls), 3 if layer < 6 else 6)
+        for region, entry in enumerate(entries):
+            self.assertTrue(entry.host_pool._is_dummy)
+            self.assertIsNone(entry.host_pool.kv_buffer)
+            for source, buffer in enumerate(entry.host_pool.device_buffers):
+                expected = torch.zeros_like(buffer)
+                expected[[1, 3]] = 1 + source * 3 + region
+                torch.testing.assert_close(buffer, expected)
+
     def test_matching_page_geometry_is_supported(self):
         _require_single_row_dsv4_swa_pages(
             logical_page_size=256,
