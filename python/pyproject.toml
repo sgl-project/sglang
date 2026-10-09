@@ -157,7 +157,6 @@ http2 = [
 ]
 
 fastokens = [
-  # 0.3.2 counts vocab_size over distinct ids and decodes unknown ids to "".
   "fastokens>=0.3.2",
 ]
 
