@@ -177,7 +177,15 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        load_layer: Optional[Callable[[list[L2Transfer], int], None]] = None,
     ) -> TransferCompletion:
+        """Submit a load, including any custom per-layer transfer work.
+
+        A custom loader receives prepared physical indices and must enqueue its
+        copies/collectives on the current transfer stream. Layer and final
+        completion events then cover that work, under the same layout leases.
+        """
+        load_layer = self._load_layer if load_layer is None else load_layer
         stream = (
             device_module.current_stream()
             if self._h2d_on_current_stream
@@ -187,34 +195,37 @@ class L2TransferEngine:
             transfers,
             completion,
         ):
-            primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):
                 if delay_cycles:
                     torch.cuda._sleep(delay_cycles)
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                load_layer(transfers, layer_id)
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
+
+    def _load_layer(self, transfers: list[L2Transfer], layer_id: int) -> None:
+        primary = transfers[0] if transfers else None
+        for transfer in transfers:
+            local_layer_id = (
+                transfer.layer_mapper(layer_id)
+                if transfer.layer_mapper is not None
+                else layer_id
+            )
+            if local_layer_id is None or (
+                transfer is not primary
+                and transfer.layer_mapper is None
+                and layer_id >= transfer.host_pool.layer_num
+            ):
+                continue
+            transfer.host_pool.load_to_device_per_layer_physical(
+                transfer.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                self.io_backend,
+                is_draft=transfer.is_draft,
+            )
 
     @staticmethod
     def _start_event(start_event):

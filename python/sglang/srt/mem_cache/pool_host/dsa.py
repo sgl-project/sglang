@@ -107,6 +107,7 @@ class DSAIndexerHostPoolBuilder:
             anchor_host=anchor_host,
             packed_draft_device_pools=packed_draft_device_pools,
             allocator_type=allocator_type,
+            is_dummy=getattr(anchor_host, "_is_dummy", False),
         )
 
 

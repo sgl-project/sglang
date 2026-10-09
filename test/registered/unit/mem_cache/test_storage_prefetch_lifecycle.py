@@ -6,6 +6,7 @@ from array import array
 from collections import defaultdict, deque
 from datetime import timedelta
 from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=46, suite="base-a-test-cpu")
 
@@ -752,6 +754,129 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
             6, "unservable_prefix"
         )
+
+
+class TestPrefetchQueryFailure(CustomTestCase):
+    def test_failed_query_still_syncs_and_next_request_completes(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 2
+        controller.storage_stop_event = Event()
+        controller.storage_stop_event.set()
+        controller.prefetch_queue = Queue()
+        controller.prefetch_hit_queue = Queue()
+        operations = [
+            SimpleNamespace(request_id=rid, is_terminated=lambda: False)
+            for rid in ("failed-query", "next-query")
+        ]
+        for operation in operations:
+            controller.prefetch_queue.put(operation)
+        controller._storage_hit_query = Mock(
+            side_effect=[OSError("injected storage failure"), (["a", "b"], 4)]
+        )
+        controller._sync_prefetch_hit_query = Mock(
+            side_effect=lambda operation, count: count
+        )
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            self.assertLogs(module, level="ERROR"),
+        ):
+            controller.prefetch_thread_func()
+        self.assertEqual(
+            [
+                call.args[1]
+                for call in controller._sync_prefetch_hit_query.call_args_list
+            ],
+            [0, 4],
+        )
+        for operation, expected_hashes, expected_count in (
+            (operations[0], [], 0),
+            (operations[1], ["a", "b"], 4),
+        ):
+            self.assertIs(controller.prefetch_hit_queue.get_nowait(), operation)
+            self.assertEqual(operation.hash_value, expected_hashes)
+            self.assertEqual(operation.storage_hit_count, expected_count)
+        self.assertTrue(controller.prefetch_hit_queue.empty())
+
+
+class TestPrefetchTransferFailure(CustomTestCase):
+    def test_failed_sidecar_read_emits_ack_and_allows_next_request(self):
+        """A failed state read must still publish a verdict for waiting peers."""
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        module = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 2
+        controller.prefetch_sync_queue = Queue()
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=SimpleNamespace(page_size=1))
+            }
+        )
+        controller.storage_backend = SimpleNamespace(
+            batch_get_v2=Mock(
+                side_effect=[
+                    OSError("injected state read failure"),
+                    {PoolName.MAMBA: [True]},
+                ]
+            )
+        )
+        operations = []
+        for rid in ("failed-state", "next-state"):
+            operation = PrefetchOperation(CacheRequestHandle(rid, 0), list(range(4)))
+            operation.hash_value = ["a", "b"]
+            operation.pool_transfers = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=torch.tensor([0]),
+                    keys=["b"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+            operations.append(operation)
+        with (
+            self.assertLogs(module, level="ERROR"),
+        ):
+            for operation in operations:
+                controller._page_transfer_sidecar(operation, 2)
+        acks = [controller.prefetch_sync_queue.get_nowait() for _ in range(2)]
+        self.assertEqual([ack.rid for ack in acks], ["failed-state", "next-state"])
+        self.assertEqual([ack.pool_hits for ack in acks], [{}, {PoolName.MAMBA: 1}])
+        self.assertTrue(controller.prefetch_sync_queue.empty())
+        self.assertEqual(controller.storage_backend.batch_get_v2.call_count, 2)
+
+    def test_failed_batch_preserves_ack_sequence_and_next_request(self):
+        from sglang.srt.managers.cache_controller import (
+            HiCacheController,
+            PrefetchOperation,
+        )
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.page_size = 2
+        controller.prefetch_sync_queue = Queue()
+        controller._page_transfer_kv_batch = Mock(
+            side_effect=[2, OSError("injected read failure"), 2]
+        )
+        failed = PrefetchOperation("failed-read", list(range(12)))
+        failed.hash_value = [str(i) for i in range(6)]
+        failed.host_indices = torch.arange(12)
+        following = PrefetchOperation("next-read", list(range(4)))
+        following.hash_value = ["next-a", "next-b"]
+        following.host_indices = torch.arange(4)
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            patch(module + ".STORAGE_BATCH_SIZE", 2),
+            self.assertLogs(module, level="ERROR"),
+        ):
+            self.assertEqual(controller._page_transfer(failed), 2)
+            self.assertEqual(controller._page_transfer(following), 2)
+        acks = [controller.prefetch_sync_queue.get_nowait() for _ in range(4)]
+        self.assertEqual([ack.rid for ack in acks], ["failed-read"] * 3 + ["next-read"])
+        self.assertEqual([ack.completed_tokens for ack in acks], [4, 4, 4, 4])
+        self.assertTrue(controller.prefetch_sync_queue.empty())
+        self.assertEqual(controller._page_transfer_kv_batch.call_count, 3)
 
 
 if __name__ == "__main__":
