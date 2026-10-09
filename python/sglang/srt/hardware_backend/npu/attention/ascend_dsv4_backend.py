@@ -89,19 +89,42 @@ def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
 _walsh_hadamard_matrix._cache = {}
 
 
-def _read_page_table_md5(buf, tbl, pages, max_pages: int = 256):
-    """md5 of the LOGICAL content the request reads, in LOGICAL (page-table
-    column / first-occurrence) order -- NOT sorted by physical page id, so the
-    same logical content hashes equal hit vs miss regardless of physical
-    page-id allocation. CPU gather (A5 fp8 has no index_select)."""
+def _read_page_table_md5(
+    buf, tbl, pages, max_pages: int = 256, page_size: int = 0, n_tokens: int = 0
+):
+    """md5 of the LOGICAL content the request actually reads.
+
+    When ``page_size`` and ``n_tokens`` are given (compressed-KV tags), only the
+    ROWS that each compressed position maps to are hashed -- NOT the whole
+    physical page -- so the unused padding rows of a partial page cannot create
+    a false hit!=miss. Otherwise whole logical pages are hashed in column order
+    (NOT sorted by physical page id). CPU gather (A5 fp8 has no index_select).
+    """
     import hashlib
 
     if tbl is None or not torch.is_tensor(tbl) or not tbl.numel():
         return "none"
     t = tbl.reshape(1, -1) if tbl.dim() == 1 else tbl
+    t = t.to(torch.int64)
+    if page_size and n_tokens:
+        row = t[0]
+        pos = torch.arange(int(n_tokens), device=row.device)
+        page_ids = row[pos // int(page_size)]
+        rows = pos % int(page_size)
+        ok = (page_ids >= 0) & (page_ids < pages)
+        page_ids = page_ids[ok].cpu()
+        rows = rows[ok].cpu()
+        if page_ids.numel() == 0:
+            return "empty"
+        slab = buf.detach().to("cpu")[page_ids, rows]
+        try:
+            raw = slab.contiguous().view(torch.uint8).numpy().tobytes()
+        except Exception:
+            raw = slab.to(torch.float32).numpy().tobytes()
+        return hashlib.md5(raw).hexdigest()[:16]
     ids_list = []
     seen = set()
-    for row in t.to(torch.int64).tolist():
+    for row in t.tolist():
         for v in row:
             if v < 0 or v >= pages or v in seen:
                 continue
@@ -112,7 +135,7 @@ def _read_page_table_md5(buf, tbl, pages, max_pages: int = 256):
     if len(ids_list) > max_pages:
         ids_list = ids_list[-max_pages:]
     ids = torch.tensor(ids_list, dtype=torch.int64)
-    slab = buf.detach().to("cpu")[ids.cpu()]
+    slab = buf.detach().to("cpu")[ids]
     try:
         raw = slab.contiguous().view(torch.uint8).numpy().tobytes()
     except Exception:
@@ -2707,7 +2730,19 @@ class DeepseekV4AscendAttnBackend(
                         _ntok = int(forward_batch.positions.numel())
                         _pages = int(cmp_kv.shape[0])
                         _tbl = getattr(fm, "c128_page_table", None)
-                        _logical = _read_page_table_md5(cmp_kv, _tbl, _pages)
+                        _seq = getattr(forward_batch, "seq_lens", None)
+                        _pos_max = (
+                            int(_seq.max().item())
+                            if torch.is_tensor(_seq) and _seq.numel()
+                            else 0
+                        )
+                        _logical = _read_page_table_md5(
+                            cmp_kv,
+                            _tbl,
+                            _pages,
+                            page_size=int(cmp_kv.shape[1]),
+                            n_tokens=max(0, _pos_max // compress_ratio),
+                        )
                         _nblk = 0
                         _ptab = "none"
                         if torch.is_tensor(_tbl) and _tbl.numel():
