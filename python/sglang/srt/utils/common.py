@@ -3646,6 +3646,25 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
+# Env vars the OpenAI layer (`entrypoints/openai`, `function_call`, `parser`)
+# reads. A router rendering or parsing for this server takes them from
+# `/server_info`; a unit test keeps the list complete.
+OPENAI_LAYER_ENVS = (
+    "SGLANG_DEFAULT_THINKING",
+    "SGLANG_DSV4_REASONING_EFFORT",
+    "SGLANG_DSV41_REASONING_EFFORT",
+    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT",
+    "SGLANG_FORWARD_UNKNOWN_TOOLS",
+    "SGLANG_TOOL_STRICT_LEVEL",
+    "SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES",
+)
+
+
+def describe_openai_env() -> Dict[str, Any]:
+    """Each of `OPENAI_LAYER_ENVS` as this process resolves it."""
+    return {name: getattr(envs, name).get() for name in OPENAI_LAYER_ENVS}
+
+
 def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
     """Build server metadata shared by HTTP and native gRPC.
 
@@ -3655,6 +3674,7 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)
+    result["openai_env"] = describe_openai_env()
     return result
 
 

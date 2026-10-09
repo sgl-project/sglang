@@ -14,6 +14,9 @@ Current coverage:
   port edge cases / missing-or-non-positive page_size) because the
   helper has no separate test target; the handler is its only caller.
 
+* `TestServerInfoOpenAiEnvField` — the `openai_env` block: the env vars the
+  OpenAI layer reads, as resolved, and a scan that keeps the list complete.
+
 * `TestServerInfoExistingFieldsPreserved` — regression guard that no
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
@@ -22,7 +25,9 @@ Current coverage:
 
 import asyncio
 import json
+import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,6 +37,7 @@ import msgspec.structs
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
@@ -491,6 +497,30 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 )
                 info = _call_server_info_with(args)
                 self.assertIsNone(info["kv_events"])
+
+
+class TestServerInfoOpenAiEnvField(CustomTestCase):
+    def test_reports_each_openai_layer_env_as_resolved(self):
+        with (
+            envs.SGLANG_DEFAULT_THINKING.override(True),
+            envs.SGLANG_DSV41_REASONING_EFFORT.override("low"),
+        ):
+            info = _call_server_info_with(ServerArgs(model_path="dummy"))
+        env = json.loads(json.dumps(info["openai_env"]))
+        self.assertEqual(set(env), set(common.OPENAI_LAYER_ENVS))
+        self.assertIs(env["SGLANG_DEFAULT_THINKING"], True)
+        self.assertEqual(env["SGLANG_DSV41_REASONING_EFFORT"], "low")
+        self.assertIs(env["SGLANG_FORWARD_UNKNOWN_TOOLS"], False)
+        self.assertEqual(env["SGLANG_TOOL_STRICT_LEVEL"], 0)
+
+    def test_lists_every_env_the_openai_layer_reads(self):
+        srt = Path(common.__file__).resolve().parents[1]
+        read = set()
+        for package in ("entrypoints/openai", "function_call", "parser"):
+            for path in (srt / package).rglob("*.py"):
+                read |= set(re.findall(r"envs\.(SGLANG_\w+)", path.read_text()))
+        self.assertTrue(read)
+        self.assertEqual(read - set(common.OPENAI_LAYER_ENVS), set())
 
 
 class TestServerInfoControlPlaneUpdates(CustomTestCase):
