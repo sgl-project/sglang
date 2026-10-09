@@ -471,6 +471,10 @@ class CompressorAscendBackendMixin:
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
+        # `os` is used by the S186 [C4ST] dump below and by the DSV4_DUMP block
+        # further down; bind it at the top so both see the module (a later
+        # `import os` alone would make it function-local and shadow earlier uses).
+        import os
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
