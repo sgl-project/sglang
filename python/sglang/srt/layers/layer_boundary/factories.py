@@ -652,22 +652,27 @@ def _arrival(producer, flow, variant):
     ):
         # The output owes its sum, and the residual is where it ran.
         return _Arrival(output, flow.during, None, False)
-    owes = (
-        variant is BatchVariant.INPUT_SCATTERED and not producer.update.applied_at_exit
-    )
-    carries = (
-        (
-            producer.kind is StageKind.ATTENTION
-            and producer.reduction is ProducerReduction.EXIT_SCOPED
+    if (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.EXIT_SCOPED
+        and (output.always_partial or output.may_defer_to_next)
+    ):
+        # A mixer's exit leaves the next entry the sum it declares; a sum it
+        # may carry on arrives with the value, if at all.
+        owes, group = output.always_partial, output.group
+    else:
+        # On an input-scattered batch, the next entry's reduce-scatter
+        # completes the TP sum of an output not written at its exit.
+        owes = (
+            variant is BatchVariant.INPUT_SCATTERED
+            and not producer.update.applied_at_exit
         )
-        or resolve_exit_rows(producer.exit_rows) is ExitRows.ATTENTION
-    ) and (output.always_partial or output.may_defer_to_next)
+        group = SumGroup.TP
     return _Arrival(
         OutputContract(
             flow.returned,
-            group=output.group if carries else (SumGroup.TP if owes else None),
-            always_partial=output.always_partial if carries else owes,
-            may_defer_to_next=output.may_defer_to_next if carries else False,
+            group=group if owes else None,
+            always_partial=owes,
             update=None,
         ),
         flow.returned,

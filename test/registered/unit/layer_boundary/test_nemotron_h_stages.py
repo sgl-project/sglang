@@ -119,17 +119,14 @@ class TestStageEdges(CustomTestCase):
                     self.assertEqual(out_of.residual_to, rows)
                     self.assertEqual(into.residual, rows)
                     self.assertEqual(into.produced.layout, rows)
+                    # The next entry owes the sum the exit always leaves.
                     produced = out_of.produced
-                    may_leave = produced.always_partial or produced.may_defer_to_next
-                    self.assertEqual(
-                        into.produced.group, produced.group if may_leave else None
-                    )
                     self.assertEqual(
                         into.produced.always_partial, produced.always_partial
                     )
                     self.assertEqual(
-                        into.produced.may_defer_to_next,
-                        produced.may_defer_to_next,
+                        into.produced.group,
+                        produced.group if produced.always_partial else None,
                     )
                 self.assertEqual(
                     layers[0].edges[0].produced, OutputContract(rows, update=None)
@@ -140,7 +137,7 @@ class TestStageEdges(CustomTestCase):
                 self.assertFalse(last.always_partial or last.may_defer_to_next)
 
     def test_what_each_kind_of_boundary_carries(self):
-        # (pattern, boundary after layer 0): group, always_partial, may_defer_to_next
+        # (pattern, layer 0's output): group, always_partial, may_defer_to_next
         cases = {
             "M-": (SumGroup.ATTN_TP, True, False),
             "*E": (SumGroup.ATTN_TP, True, False),
@@ -152,9 +149,9 @@ class TestStageEdges(CustomTestCase):
         }
         for pattern, expected in cases.items():
             with self.subTest(pattern=pattern):
-                into = stages(pattern, tp=2)[1].edges[0].produced
+                out = stages(pattern, tp=2)[0].edges[1].produced
                 self.assertEqual(
-                    (into.group, into.always_partial, into.may_defer_to_next),
+                    (out.group, out.always_partial, out.may_defer_to_next),
                     expected,
                 )
         # Without attention TP a mixer's output is complete.
@@ -164,9 +161,9 @@ class TestStageEdges(CustomTestCase):
         # backend dispatches only the MoE, so an MLP still sums over TP.
         into = stages("EM", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(into, OutputContract(into.layout, update=None))
-        into = stages("-M", tp=2, a2a=True)[1].edges[0].produced
+        out = stages("-M", tp=2, a2a=True)[0].edges[1].produced
         self.assertEqual(
-            (into.group, into.always_partial, into.may_defer_to_next),
+            (out.group, out.always_partial, out.may_defer_to_next),
             (SumGroup.TP, False, True),
         )
 
