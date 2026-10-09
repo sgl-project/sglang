@@ -162,9 +162,11 @@ def _allocate_decode_buffers(
             encoder_lens = None
 
         if require_mlp_tp_gather:
-            global_num_tokens_gpu = torch.zeros((parallel.dp_size,), dtype=torch.int32)
+            global_num_tokens_gpu = torch.zeros(
+                (parallel.num_dp_ranks,), dtype=torch.int32
+            )
             global_num_tokens_for_logprob_gpu = torch.zeros(
-                (parallel.dp_size,), dtype=torch.int32
+                (parallel.num_dp_ranks,), dtype=torch.int32
             )
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -226,9 +228,8 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = get_parallel().tp_size
-        # elastic-EP scale-up rewrites dp_size on the published config
-        self.dp_size = get_parallel().dp_size
+        # elastic-EP scale-up widens num_dp_ranks on the published config
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
         self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
@@ -238,7 +239,6 @@ class BaseRunner(ABC):
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
     def warmup(self) -> None:
@@ -601,9 +601,9 @@ class BaseRunner(ABC):
             if (
                 capture_forward_mode == ForwardMode.EXTEND
                 and get_parallel().pp_rank != 0
-                and mr.attn_cp_size > 1
+                and get_parallel().attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // get_parallel().attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -615,7 +615,7 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
+            global_num_tokens_cpu = [num_tokens] * get_parallel().num_dp_ranks
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -697,6 +697,7 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        mr.kv_index_translator.bind_runner_slots(forward_batch)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
@@ -743,7 +744,7 @@ class BaseRunner(ABC):
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(mr.device).synchronize()
-        mr.tp_group.barrier()
+        get_parallel().tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             with run_ctx or empty_context():
                 run_once()

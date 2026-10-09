@@ -364,7 +364,7 @@ export const config = {
             config.isNpuHw(s) ||
             ["h100", "h200", "mi350x", "mi355x"].includes(s.hw) ||
             config.isPipelined(s) ||
-            !!config.flagOf(config.cellFor(s), "--enable-dp-attention"),
+            config.sizeOf(config.cellFor(s), "--attn-dp-size") > 1,
           disableReason: (s) =>
             config.isNpuHw(s)
               ? "Only DSPARK is supported on this recipe."
@@ -536,7 +536,7 @@ export const config = {
   playgroundFeatures: {
 
     // ----- Card: "Attention Parallelism" -----
-    // DP-Attention is a combined knob: value = DP degree AND toggles `--enable-dp-attention`.
+    // DP-Attention is a single knob: value = attention DP size, emitted as `--attn-dp-size N`.
     // K3's MLA latent KV is TP-replicated, so DP-attention RAISES per-GPU KV pressure —
     // dp=8/attn_tp=1 OOMs on a single node; use dp=2/attn_tp=4. No CP knob: K3 uses
     // decode context parallel (`--dcp-size`), a different lever from prefill `--attn-cp-size`.
@@ -603,21 +603,11 @@ export const config = {
           values: [
             null,
             {
-              // 950PR/DT Series only: the recipe enables DP-Attention at dp=1
-              // (attn-TP 32), unlike A3's dp=4.
-              value: 1,
-              hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"] },
-            },
-            {
               value: false,
               get disable() { return [
                 {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 (2 on Prefill) is supported on this recipe.",
-                },
-                {
-                  when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
                 },
               ]; },
             },
@@ -632,7 +622,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
               ]; },
             },
@@ -641,7 +631,7 @@ export const config = {
               get disable() { return [
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["a3"], pdMode: ["prefill"] },
@@ -658,7 +648,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -680,7 +670,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["a5"] },
-                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                  reason: "This recipe runs without DP-Attention.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -994,10 +984,10 @@ export const config = {
         // dispatch. Env var, not a flag, so it emits via env/stripEnv.
         id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
         showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
-        stripEnv: ["SGLANG_K3_KDA_FUSED_BACKEND"],
+        stripEnv: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND"],
         options: [
           { id: "off",   label: "Off" },
-          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_K3_KDA_FUSED_BACKEND=aiter"] },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_ROCM_K3_KDA_FUSED_BACKEND=aiter"] },
         ],
       },
       {
@@ -1023,13 +1013,13 @@ export const config = {
         ],
       },
       {
-        // A decode server runs a chunk cache by default (1 state slot/req);
+        // A decode server disables the radix cache by default (1 state slot/req);
         // radix restores prefix reuse at the unified per-request slot cost.
         id: "pdDecodeRadix", title: "PD Decode Radix Cache",
         showWhen: (b) => b.pdMode === "decode",
         stripPrefixes: ["--disaggregation-decode-enable-radix-cache"],
         options: [
-          { id: "off", label: "Off (chunk cache)" },
+          { id: "off", label: "Off" },
           { id: "on",  label: "On", flags: ["--disaggregation-decode-enable-radix-cache"] },
         ],
       },
@@ -1058,7 +1048,7 @@ export const config = {
         stripPrefixes: [
           "--tp-size", "--tp", "--tensor-parallel-size",
           "--ep-size", "--ep", "--expert-parallel-size",
-          "--enable-dp-attention", "--dp-size", "--enable-dp-lm-head",
+          "--attn-dp-size", "--enable-dp-lm-head",
           "--dcp-size", "--dcp-comm-backend",
           // Every B200 Unified cell carries --pp-size 2; left standing it
           // multiplies against the preset's --tp-size for a world size the
@@ -1083,7 +1073,7 @@ export const config = {
               const nnodes = n / gpusPerNode;
               return [
                 `--tp-size ${n}`, `--ep-size ${n}`,
-                ...(dp > 1 ? ["--enable-dp-attention", `--dp-size ${dp}`, "--enable-dp-lm-head"] : []),
+                ...(dp > 1 ? [`--attn-dp-size ${dp}`, "--enable-dp-lm-head"] : []),
                 ...(nnodes > 1 ? [`--nnodes ${nnodes}`, "--node-rank {{NODE_RANK}}", "--dist-init-addr {{NODE0_IP}}:20000"] : []),
                 "--moe-a2a-backend megamoe", "--moe-runner-backend deep_gemm",
                 "--kv-cache-dtype fp8_e4m3", "--mamba-ssm-dtype bfloat16",
@@ -1115,7 +1105,7 @@ export const config = {
               const nnodes = n / gpusPerNode;
               return [
                 `--tp-size ${n}`, `--ep-size ${n}`,
-                ...(dp > 1 ? ["--enable-dp-attention", `--dp-size ${dp}`, "--enable-dp-lm-head"] : []),
+                ...(dp > 1 ? [`--attn-dp-size ${dp}`, "--enable-dp-lm-head"] : []),
                 "--dcp-size 8",
                 ...(nnodes > 1 ? [`--nnodes ${nnodes}`, "--node-rank {{NODE_RANK}}", "--dist-init-addr {{NODE0_IP}}:20000"] : []),
                 "--moe-a2a-backend megamoe", "--moe-runner-backend deep_gemm",
@@ -1927,7 +1917,7 @@ export const config = {
     // shared PP2 x TP8 prefill. Comparisons hold; absolutes would be higher
     // behind the PP16 x TP1 prefill cell above.
     //
-    // Decode runs the KV cache as a chunk cache, so the unified 5-slots-per-
+    // Decode runs with the radix cache disabled, so the unified 5-slots-per-
     // request reservation (1 state + ping-pong copies for radix reuse) drops to
     // a single slot, and --mamba-radix-cache-strategy stops having any effect.
     // In-transfer requests holding a slot before decode starts are the only
@@ -2452,8 +2442,7 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
         "--dcp-size 8",
-        "--dp-size 2",
-        "--enable-dp-attention",
+        "--attn-dp-size 2",
         "--ep-size 16",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
@@ -2507,8 +2496,7 @@ export const config = {
         "--quantization modelslim",
         "--dtype bfloat16",
         "--tp-size 64",
-        "--enable-dp-attention",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--enable-shared-experts-attn-tp",
         "--enable-dense-mlp-attn-tp",
@@ -2578,8 +2566,7 @@ export const config = {
         "--dtype bfloat16",
         "--tp-size 16",
         "--pp-size 2",
-        "--dp-size 2",
-        "--enable-dp-attention",
+        "--attn-dp-size 2",
         "--enable-dp-lm-head",
         "--enable-shared-experts-attn-tp",
         "--enable-dense-mlp-attn-tp",
@@ -2646,8 +2633,7 @@ export const config = {
         "--dtype bfloat16",
         "--tp-size 64",
         "--pp-size 1",
-        "--dp-size 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--enable-shared-experts-attn-tp",
         "--enable-dense-mlp-attn-tp",
@@ -2672,8 +2658,8 @@ export const config = {
       // Ascend 950PR/DT Series: 4 nodes × 8 cards, one rank per card (TP32).
       // Unified PD, Balanced, DSPARK-only, with the product-line kernels armed
       // per env: FIAS V2 BSND for the DSpark target-verify/draft attention
-      // paths and the fine-grained dual-stream MoE overlap. DP-attention runs
-      // at dp=1 (attn-TP 32), and the shared experts / dense MLP shard across
+      // paths and the fine-grained dual-stream MoE overlap. It runs without
+      // attention DP (attn-TP 32), and the shared experts / dense MLP shard across
       // attention-TP through the server flags (--shared-experts-tp-size 4).
       // Checkpoint: the official Moonshot MXFP4 build (moonshotai/Kimi-K3,
       // fetched from ModelScope by SGLANG_USE_MODELSCOPE=1 above). Its routed
@@ -2729,7 +2715,6 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.9",
         "--chunked-prefill-size 8192",
@@ -2800,7 +2785,6 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",
@@ -2872,7 +2856,6 @@ export const config = {
         "--device npu",
         "--dtype bfloat16",
         "--tp-size 32",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 8192",

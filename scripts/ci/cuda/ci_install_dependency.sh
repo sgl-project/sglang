@@ -148,6 +148,27 @@ cleanup_stale_shm() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+repair_stale_nvidia_dkms() {
+    # GDRCopy used to install nvidia-dkms-580, whose nvidia-firmware-580
+    # dependency collides with the host firmware the NVIDIA container runtime
+    # mounts in. The failed install leaves packages unpacked but unconfigured,
+    # and apt then refuses every later install. Drop those packages and finish
+    # configuring the rest. Removable once no runner still has them.
+    local -a stale_nvidia_packages
+    mapfile -t stale_nvidia_packages < <(
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+            'nvidia-dkms-*' 'nvidia-kernel-common-*' 'nvidia-kernel-source-*' 2>/dev/null |
+            awk 'substr($1, 2, 1) !~ /[nci]/ || substr($1, 3, 1) != "" {print $2}'
+    )
+    if [ "${#stale_nvidia_packages[@]}" -gt 0 ]; then
+        echo "Removing half-installed packages: ${stale_nvidia_packages[*]}"
+        dpkg --remove --force-depends "${stale_nvidia_packages[@]}"
+        dpkg --configure -a
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 is_apt_package_installed() {
     local name
     # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
@@ -195,7 +216,7 @@ install_apt_packages() {
 
 install_gdrcopy() {
     # DeepEP tests only run on 4+ GPU hosts. Keep GDRCopy in the shared CUDA
-    # bootstrap while avoiding a DKMS/package build on the 1- and 2-GPU jobs.
+    # bootstrap while avoiding the libgdrapi package build on the 1- and 2-GPU jobs.
     local gpu_count=0
     if command -v nvidia-smi >/dev/null 2>&1; then
         gpu_count=$(
@@ -217,10 +238,10 @@ install_gdrcopy() {
 
     local gdrcopy_root=/opt/gdrcopy
     local gdrcopy_version=2.5.1
-    local -a gdrcopy_packages=(
-        nvidia-dkms-580 devscripts debhelper fakeroot dkms
-        check libsubunit0 libsubunit-dev python3-venv
-    )
+    # Userspace libgdrapi only: the gdrdrv kernel module comes from the host
+    # and must be exposed to the container, and the gdrcopy test tools are
+    # unused.
+    local -a gdrcopy_packages=(devscripts debhelper fakeroot)
 
     apt-get update || true
     apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
@@ -237,11 +258,8 @@ install_gdrcopy() {
     git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
+        CUDA=/usr/local/cuda ./build-deb-packages.sh -k -t
         dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
     )
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
@@ -318,7 +336,13 @@ setup_cargo_cache() {
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
-    export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    # Runner containers built from different images share ${HOME}/.cache, and
+    # cargo reruns a cached build-script binary without rebuilding it when only
+    # the libc changed, so each glibc gets its own tree.
+    local cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+    local libc_tag
+    libc_tag="$(getconf GNU_LIBC_VERSION 2>/dev/null | tr ' ' '-')"
+    export CARGO_TARGET_DIR="${cargo_target_root}/${libc_tag:-unknown-libc}"
     local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
     mkdir -p "${HOME}/.cache"
     exec 9>"${cargo_target_lock}"
@@ -326,6 +350,12 @@ setup_cargo_cache() {
     flock --exclusive 9
     CARGO_TARGET_LOCK_HELD=1
     echo "Acquired cargo target lock"
+    # Drop the flat layout from before the per-libc split; its artifacts may
+    # come from another glibc.
+    if [ -d "${cargo_target_root}" ]; then
+        find "${cargo_target_root}" -mindepth 1 -maxdepth 1 \
+            ! -name 'glibc-*' ! -name 'unknown-libc' -exec rm -rf {} +
+    fi
     mkdir -p "${CARGO_TARGET_DIR}"
 
     # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
@@ -334,8 +364,8 @@ setup_cargo_cache() {
     local used
     used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
     if [ "${used:-0}" -ge 85 ]; then
-        echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
-        rm -rf "${CARGO_TARGET_DIR}"
+        echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
+        rm -rf "${cargo_target_root}"
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
@@ -424,9 +454,9 @@ uninstall_stale_flashinfer() {
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
     FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
-    FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
-    FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
+    FLASHINFER_CUBIN_INSTALLED=$(python3 -m pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    FLASHINFER_JIT_INSTALLED=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+    FLASHINFER_JIT_CU_VERSION=$(python3 -m pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
 
     UNINSTALL_CUBIN=true
     UNINSTALL_JIT_CACHE=true
@@ -439,8 +469,13 @@ uninstall_stale_flashinfer() {
     fi
 
     if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLASHINFER_PYTHON_REQUIRED" ]; then
-        echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
-        UNINSTALL_JIT_CACHE=false
+        # Since 0.7.0 that version is the shim's; it does not imply a provider.
+        if bash "${SCRIPT_DIR}/ci_check_flashinfer_jit_cache.sh"; then
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} already installed, keeping it"
+            UNINSTALL_JIT_CACHE=false
+        else
+            echo "flashinfer-jit-cache==${FLASHINFER_PYTHON_REQUIRED} installed but serves no cubins, will reinstall"
+        fi
     else
         echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
     fi
@@ -452,7 +487,16 @@ uninstall_stale_flashinfer() {
 
     FLASHINFER_UNINSTALL="flashinfer-python"
     [ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
-    [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
+    if [ "$UNINSTALL_JIT_CACHE" = true ]; then
+        # Which per-arch packages exist varies by release, so drop whatever is
+        # installed rather than a fixed list.
+        JIT_CACHE_PKGS=$(python3 -m pip list --format=freeze) || {
+            echo "ERROR: pip list failed; cannot enumerate per-arch jit-cache packages"
+            return 1
+        }
+        JIT_CACHE_ARCH=$(printf '%s\n' "$JIT_CACHE_PKGS" | sed -n 's/^\(flashinfer-jit-cache-[0-9a-z]*\)==.*/\1/p' | tr '\n' ' ')
+        FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache $JIT_CACHE_ARCH"
+    fi
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
@@ -557,8 +601,8 @@ install_sglang() {
 }
 
 install_nccl() {
-    # PyTorch pins 2.29.7, so this override must run after every command
-    # that resolves Python dependencies (including lmms-eval).
+    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # after every command that resolves Python dependencies (including lmms-eval).
     $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
@@ -776,17 +820,6 @@ install_extra_deps() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_test_tools() {
-    # Download kernels from kernels community
-    kernels download python || true
-    kernels lock python || true
-    [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
-    mkdir -p "${HOME}/.cache/sglang/"
-    mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -883,6 +916,7 @@ main() {
     detect_host
     kill_existing_processes
     cleanup_stale_shm
+    repair_stale_nvidia_dkms
     install_apt_packages
     install_gdrcopy
     clean_site_packages
@@ -905,7 +939,6 @@ main() {
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
-    install_test_tools
     install_nccl
     prepare_runner
     setup_ld_library_path
