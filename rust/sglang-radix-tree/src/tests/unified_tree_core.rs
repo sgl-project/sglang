@@ -5,7 +5,7 @@ use tch::Tensor;
 use super::*;
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
-use crate::test_utils::{accumulate_step, action_kinds};
+use crate::test_utils::{accumulate_step, action_kinds, matched_device_indices};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
@@ -1243,11 +1243,7 @@ fn match_prefix_returns_the_full_hit() {
     let mut tc = core();
     let (_a, b) = matched_chain(&mut tc);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert_eq!(result.last_device_node_id, tc.arena.node(b).id);
     assert_eq!(result.last_host_node_id, tc.arena.node(b).id);
     assert_eq!(result.best_match_node_id, tc.arena.node(b).id);
@@ -1260,11 +1256,7 @@ fn match_prefix_stops_at_the_matched_depth() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 9]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
 }
 
@@ -1274,7 +1266,7 @@ fn match_prefix_miss_anchors_at_the_root() {
     matched_chain(&mut tc);
     let root = tc.arena.root();
     let result = tc.match_prefix(&match_params(&vec![9]));
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(root).id);
 }
@@ -1287,7 +1279,7 @@ fn match_prefix_splits_on_a_partial_match() {
     // The walk split a at 1: the new prefix node holds [10] and anchors the result.
     let prefix_node = result.best_match_node_id;
     assert_ne!(prefix_node, tc.arena.node(a).id);
-    assert!(result.device_indices.equal(&Tensor::from_slice(&[10i64])));
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64])));
     assert_eq!(
         tc.arena
             .node(tc.arena.resolve(prefix_node).expect("live test node"))
@@ -1336,7 +1328,7 @@ fn match_prefix_stops_at_a_dead_node() {
         .unwrap();
     let _ = a;
     let result = tc.match_prefix(&match_params(&vec![1, 2]));
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
 }
 
@@ -1357,11 +1349,7 @@ fn match_prefix_page_aligns_the_query() {
     );
     // The trailing partial page is dropped before the walk.
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
 }
 
@@ -1395,7 +1383,7 @@ fn insert_first_write_creates_the_namespace() {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
     });
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.root_node_handle(None));
 }
 
@@ -1425,11 +1413,7 @@ fn match_prefix_skips_host_only_nodes_without_hicache() {
     let taken = tc.arena.take_device_value(b, FULL);
     tc.arena.set_host_value(b, FULL, taken);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
 }
@@ -1444,11 +1428,7 @@ fn match_prefix_with_hicache_advances_best_match_onto_host_nodes() {
     let taken = tc.arena.take_device_value(b, FULL);
     tc.arena.set_host_value(b, FULL, taken);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
     assert_eq!(result.best_match_node_id, tc.arena.node(b).id);
     assert_eq!(result.last_host_node_id, tc.arena.node(b).id);
@@ -1490,11 +1470,7 @@ fn match_prefix_with_hicache_sums_the_host_span_length() {
     let taken = tc.arena.take_device_value(c, FULL);
     tc.arena.set_host_value(c, FULL, taken);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
     assert_eq!(result.best_match_node_id, tc.arena.node(c).id);
     assert_eq!(result.last_host_node_id, tc.arena.node(c).id);
@@ -1605,11 +1581,7 @@ fn match_walk_swa_state_resets_at_a_full_rejected_node() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
 }
 
 #[test]
@@ -1643,11 +1615,7 @@ fn match_prefix_swa_tombstone_holds_the_best_match_below_the_window() {
     set_swa_device_and_list(&mut tc, c);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
 }
 
 #[test]
@@ -1682,9 +1650,7 @@ fn match_prefix_swa_best_match_advances_at_the_window() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5]));
     assert_eq!(result.best_match_node_id, tc.arena.node(c).id);
     assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14]))
+        matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14]))
     );
 }
 
@@ -1838,9 +1804,7 @@ fn repeated_deep_swa_matches_keep_the_tree_sane() {
     for _ in 0..3 {
         let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
         assert!(
-            result
-                .device_indices
-                .equal(&Tensor::from_slice(&[10i64, 11, 12, 13]))
+            matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11, 12, 13]))
         );
         tc.sanity_check(&[], &[]);
     }
@@ -1874,11 +1838,7 @@ fn swa_host_backed_node_advances_best_match_but_keeps_the_device_anchor() {
         .value = Some(Tensor::from_slice(&[0i64]));
     tc.host_lru_list_mut(SWA).insert_mru(b);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
     assert_eq!(result.best_match_node_id, tc.arena.node(b).id);
     assert_eq!(result.host_hit_length, 0);
@@ -2189,11 +2149,7 @@ fn insert_creates_a_leaf_and_matches_back() {
     assert_eq!(tc.evictable_size_(FULL), 3);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
     assert_eq!(result.last_device_node_id, Some(matched.best_match_node_id));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12])));
 }
 
 #[test]
@@ -2248,9 +2204,7 @@ fn insert_extends_an_existing_prefix() {
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5]));
     assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14]))
+        matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14]))
     );
 }
 
@@ -2307,17 +2261,9 @@ fn insert_splits_on_a_partial_overlap() {
     assert_eq!(result.prefix_len, 2);
     // Both suffixes live under the split prefix node.
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 9]));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 29]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 29])));
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12])));
 }
 
 #[test]
@@ -4548,11 +4494,7 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     assert!(tc.full_coexisting_host_nodes.contains(child));
     tc.sanity_check(&[], &[]);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[50i64, 51, 52, 53]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[50i64, 51, 52, 53])));
 }
 
 #[test]
@@ -4776,7 +4718,7 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     tc.demote(leaf).expect("backuped live test node");
     // The partial match splits the host-only node; the host prefix stays usable.
     let result = tc.match_prefix(&match_params(&vec![1, 2, 9]));
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     let root = tc.arena.root();
     assert_eq!(result.last_device_node_id, tc.arena.node(root).id);
     assert_eq!(result.host_hit_length, 2);
@@ -4856,14 +4798,12 @@ fn mixed_backup_evict_insert_keeps_the_leaf_sets_disjoint() {
     // The unbacked chains died outright.
     assert_eq!(
         tc.match_prefix(&match_params(&vec![301, 302]))
-            .device_indices
-            .numel(),
+            .device_prefix_len,
         0
     );
     assert_eq!(
         tc.match_prefix(&match_params(&vec![401, 402]))
-            .device_indices
-            .numel(),
+            .device_prefix_len,
         0
     );
     tc.insert(&insert_params(&vec![501, 502], &[60, 61]));
@@ -4930,7 +4870,7 @@ fn drop_subtree_no_host_frees_the_leaf_and_its_host_descendants() {
     assert!(hf[&FULL][0].equal(&Tensor::from_slice(&[20i64, 21])));
     assert_eq!(tc.arena.len(), 1);
     let result = tc.match_prefix(&match_params(&vec![1, 2]));
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     tc.sanity_check(&[], &[]);
 }
 
@@ -5180,12 +5120,12 @@ fn insert_into_a_named_namespace_is_isolated() {
     });
     // The default namespace stays empty; the named namespace hits.
     let miss = tc.match_prefix(&match_params(&vec![1, 2]));
-    assert_eq!(miss.device_indices.numel(), 0);
+    assert_eq!(miss.device_prefix_len, 0);
     let hit = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
     });
-    assert!(hit.device_indices.equal(&Tensor::from_slice(&[10i64, 11])));
+    assert!(matched_device_indices(&tc, &hit).equal(&Tensor::from_slice(&[10i64, 11])));
 }
 
 fn page2_core() -> UnifiedTreeCore<Vec<i64>> {
@@ -5263,17 +5203,9 @@ fn insert_page_size_two_splits_mid_page_divergence_at_the_page_boundary() {
         vec![1, 2]
     );
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12, 13]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 9]));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 22, 29]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 22, 29])));
     tc.sanity_check(&[], &[]);
 }
 
@@ -5283,11 +5215,7 @@ fn match_prefix_page_size_two_splits_at_a_page_boundary() {
     tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
     // The query shares 3 atoms; pages quantize the split down to 2.
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 9]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(
         tc.arena
             .node(
@@ -5300,11 +5228,7 @@ fn match_prefix_page_size_two_splits_at_a_page_boundary() {
     );
     // The split child stays reachable through its own page key.
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
-    assert!(
-        matched
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11, 12, 13]))
-    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
     tc.sanity_check(&[], &[]);
 }
 
@@ -5314,7 +5238,7 @@ fn match_prefix_page_size_two_sub_page_query_is_an_empty_match() {
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let root = tc.arena.root();
     let result = tc.match_prefix(&match_params(&vec![1]));
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
 }
 
@@ -6234,8 +6158,8 @@ fn empty_match_result_anchors_all_boundaries_at_the_root() {
     assert_eq!(result.last_host_node_id, tc.arena.node(root).id);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
     assert_eq!(result.host_hit_length, 0);
-    assert_eq!(result.device_indices.numel(), 0);
-    assert_eq!(result.device_indices.kind(), Kind::Int64);
+    assert_eq!(result.device_prefix_len, 0);
+    assert_eq!(matched_device_indices(&tc, &result).kind(), Kind::Int64);
 }
 
 #[test]
@@ -7010,7 +6934,7 @@ fn reset_restores_a_fresh_tree() {
     assert_eq!(tc.device_lru_list(SWA).len(), 0);
     assert_eq!(tc.host_lru_list(SWA).len(), 0);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert_eq!(matched.device_indices.numel(), 0);
+    assert_eq!(matched.device_prefix_len, 0);
     // The tree accepts fresh inserts after the reset.
     tc.insert(&insert_params(&vec![4, 5], &[30, 31]));
     assert_eq!(tc.evictable_size(), 2);
@@ -8001,7 +7925,7 @@ fn match_prefix_on_an_unknown_namespace_allocates_nothing() {
         key: &vec![1, 2, 3],
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
     });
-    assert_eq!(result.device_indices.numel(), 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(tc.arena.len(), arena_len);
     // The empty result anchors at the default root (the namespace has no root).
     let default_root = tc.arena.root();
@@ -8328,11 +8252,7 @@ fn match_ragged_query_stops_at_the_aligned_window_page_size_two() {
     tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
     // The node key runs past the query's aligned window; the ragged atom matches too.
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    assert!(
-        result
-            .device_indices
-            .equal(&Tensor::from_slice(&[10i64, 11]))
-    );
+    assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
 }
 
 #[test]
@@ -8615,7 +8535,7 @@ fn full_kv_hit_length_counts_the_split_fragment() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 99]));
     // The mid-node partial match splits the node; the fragment still counts.
     assert_eq!(result.full_kv_hit_length, 2);
-    assert_eq!(result.device_indices.size()[0], 2);
+    assert_eq!(result.device_prefix_len, 2);
 }
 
 #[test]
@@ -8744,8 +8664,7 @@ fn reset_invalidates_every_prior_handle() {
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     assert_eq!(
         tc.match_prefix(&match_params(&vec![1, 2]))
-            .device_indices
-            .size()[0],
+            .device_prefix_len,
         2
     );
 }
@@ -8886,8 +8805,8 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
             }
             1 => {
                 // Consecutive matches of the same key agree (idempotency).
-                let first = tc.match_prefix(&match_params(&key)).device_indices.numel();
-                let second = tc.match_prefix(&match_params(&key)).device_indices.numel();
+                let first = tc.match_prefix(&match_params(&key)).device_prefix_len;
+                let second = tc.match_prefix(&match_params(&key)).device_prefix_len;
                 assert_eq!(first, second);
             }
             2 => {
@@ -8904,7 +8823,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 // Insert-while-locked churn, the cache_finished_req shape.
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
-                let matched_len = matched.device_indices.numel() as usize;
+                let matched_len = matched.device_prefix_len;
                 let lock = tc
                     .inc_lock_ref(anchor, ComponentSet::EMPTY)
                     .expect("live match anchor");

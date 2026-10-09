@@ -116,8 +116,9 @@ pub struct DecLockRefResult {}
 
 /// Result of a prefix match.
 pub struct MatchResult {
-    /// Device KV indices matched by the common prefix.
-    pub device_indices: Tensor,
+    /// Length of the device-resident matched prefix; its KV indices are read
+    /// off the path to `last_device_node_id` (`collect_full_device_indices`).
+    pub device_prefix_len: usize,
     /// Last matched node still resident on device.
     pub last_device_node_id: NodeId,
     /// Last matched node on host; equals `last_device_node_id` without HiCache.
@@ -1159,7 +1160,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(DecLockRefResult::default())
     }
 
-    /// Match a key against the tree; returns device indices + boundary NodeIds.
+    /// Match a key; returns the device prefix length + boundary NodeIds.
     pub fn match_prefix(&mut self, params: &MatchPrefixParams<'_, K>) -> MatchResult {
         // Bigram view conversion happens at the boundary; the key arrives typed.
         let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
@@ -1422,13 +1423,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id
         };
 
-        let device_indices = if best_match_device_value_len > 0 {
-            Tensor::cat(&value[..best_match_device_value_len], 0)
-        } else {
-            self.empty_device_indices.shallow_clone()
-        };
+        let device_prefix_len = value[..best_match_device_value_len]
+            .iter()
+            .map(|chunk| chunk.size()[0] as usize)
+            .sum();
         let mut result = MatchResult {
-            device_indices,
+            device_prefix_len,
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
             last_host_node_id: self.arena.node(last_host_node_id).id,
             best_match_node_id: self.arena.node(best_match_node_id).id,
@@ -1456,11 +1456,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result
     }
 
-    /// An empty match: no device indices, every boundary anchored at the root.
+    /// An empty match: no device prefix, every boundary anchored at the root.
     pub fn empty_match_result(&self) -> MatchResult {
         let root_id = self.arena.node(self.arena.root()).id;
         MatchResult {
-            device_indices: self.empty_device_indices.shallow_clone(),
+            device_prefix_len: 0,
             last_device_node_id: root_id,
             last_host_node_id: root_id,
             best_match_node_id: root_id,
