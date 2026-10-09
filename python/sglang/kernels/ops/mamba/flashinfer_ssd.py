@@ -167,11 +167,9 @@ def flashinfer_ssd_prefill(
         D=D.to(torch.bfloat16) if D is not None else None,
         dt_bias=dt_bias,
         dt_softplus=True,
-        # FlashInfer's prefix-factorized short-input route computes exp/rcp
-        # separately and can overflow for strong decay. A negative lower bound
-        # selects its stable exact-scan route. Softplus is already nonnegative,
-        # so disabling this redundant clamp does not change the recurrence.
-        dt_limit=(-float("inf"), float("inf")),
+        # Upstream Cake SSD uses exact scan with FP16 processed delta. Keep
+        # normal nonnegative step sizes; no clamp-based dispatch workaround.
+        dt_limit=(0.0, float("inf")),
         initial_states=initial_states,
         seq_idx=metadata.seq_idx,
         chunk_indices=metadata.chunk_indices,

@@ -1,4 +1,4 @@
-"""Isolated validation of the pinned FlashInfer 0.7.0.post1 replay contract.
+"""Isolated validation of the supported FlashInfer replay contract.
 
 No model or server is loaded. JSON measurements distinguish numerical error
 from exact state/buffer lifetime invariants. Run directly with Python on CUDA.
@@ -190,10 +190,11 @@ class FlashInferCase:
 class TestFlashInferReplayContract(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        from sglang.kernels.ops.mamba.mamba2_spec_replay import checkpointing_kernel
+
         version = importlib.metadata.version("flashinfer-python")
-        assert version == "0.7.0.post1", (
-            f"Test requires our pinned release, got {version}"
-        )
+        # Exercise the same compatibility gate as memory-pool construction.
+        checkpointing_kernel()
         print(
             json.dumps({"flashinfer": version, "gpu": torch.cuda.get_device_name()}),
             flush=True,

@@ -242,9 +242,9 @@ class TestFlashInferSSDPrefill(CustomTestCase):
     def test_short_strong_decay(self):
         """exp(-sum(A*dt)) can overflow although exp(A*dt) is bounded.
 
-        H128/G8 selects FlashInfer's prefix-factorized short-input route with
-        the default lower clamp. The adapter must use a stable scan instead;
-        the long model-shape test never exercises this route.
+        Older FlashInfer selected an unstable prefix-factorized short-input
+        route with the default lower clamp. Upstream exact scan must remain
+        finite with that normal clamp; the long model-shape test misses this.
         """
         case = SSDCase([13], [13], heads=128, groups=8, warm=False)
         case.A.fill_(-100)

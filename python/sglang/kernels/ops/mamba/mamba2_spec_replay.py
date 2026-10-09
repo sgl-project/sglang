@@ -14,10 +14,9 @@ from sglang.srt.runtime_context import get_exec
 @lru_cache(maxsize=1)
 def checkpointing_kernel():
     installed = version("flashinfer-python")
-    if installed.split("+")[0] != "0.7.0.post1":
+    if installed.split("+")[0] not in ("0.7.0.post1", "0.7.2"):
         raise ValueError(
-            "--enable-mamba2-spec-replay requires FlashInfer 0.7.0.post1; "
-            f"found {installed}"
+            f"Mamba2 replay requires FlashInfer 0.7.0.post1 or 0.7.2; found {installed}"
         )
     from flashinfer.mamba import checkpointing_ssu
 
