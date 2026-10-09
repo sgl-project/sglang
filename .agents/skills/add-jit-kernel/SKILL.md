@@ -640,7 +640,7 @@ if __name__ == "__main__":
 
 ## Step 5: Add a benchmark (required)
 
-Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
+Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-small`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-small`); use `base-b-kernel-benchmark-test-1-gpu-large` only for SM90-only kernels.
 
 Every benchmark must account for L2 cache reuse — see [`rules/kernel-benchmark.md`](../../rules/kernel-benchmark.md).
 
@@ -669,7 +669,7 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.elementwise.scale import scale as jit_scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-small")
 
 
 @torch.compile()
@@ -723,7 +723,7 @@ python test/registered/kernels/benchmark/elementwise/bench_scale.py
 Run the benchmark suite the way CI does:
 
 ```bash
-cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
+cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-small
 ```
 
 ---
