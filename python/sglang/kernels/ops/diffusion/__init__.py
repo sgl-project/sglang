@@ -57,6 +57,20 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Packed BF16 SwiGLU with both BF16 rounding boundaries, rowwise E4M3 quantization and padding.",
     ),
     (
+        "diffusion.residual_gate_fp32",
+        KernelBackend.TRITON,
+        "modulate.residual_gate_fp32:residual_gate_fp32",
+        _CUDA,
+        "Residual gating with separate FP32 product and sum rounding.",
+    ),
+    (
+        "diffusion.matrix_rope",
+        KernelBackend.TRITON,
+        "rope.matrix_rope:apply_matrix_rope",
+        _CUDA,
+        "Interleaved FP32 matrix RoPE with separate product and sum rounding.",
+    ),
+    (
         "diffusion.fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.fp8_rowwise_triton:fp8_rowwise",
@@ -244,6 +258,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
         _CUDA,
         "Fused in-place QK RMS-norm + RoPE.",
+    ),
+    (
+        "diffusion.vsa_block_sparse_sm100",
+        KernelBackend.JIT,
+        "attention.vsa_block_sparse_sm100_jit:vsa_block_sparse_sm100",
+        frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}),
+        "FastVideo's warp-specialized tcgen05 block-sparse VSA forward (64-token tiles).",
     ),
     (
         "diffusion.h3_vae_rmsnorm",
@@ -598,6 +619,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
+    "apply_matrix_rope": "rope.matrix_rope",
+    "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
@@ -634,6 +657,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
     "fused_scale_residual_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
@@ -706,6 +730,8 @@ _EXPORTS: dict[str, str] = {
     "prepare_rope_tables": "attention.sana_wm_gdn_triton",
     "_attn_fwd": "attention.sparse_linear_attn_triton",
     "get_block_map": "attention.sparse_linear_attn_triton",
+    "can_use_vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
+    "vsa_block_sparse_sm100": "attention.vsa_block_sparse_sm100_jit",
     # MoE routing
     "can_use_group_limited_topk": "routing.group_limited_topk_triton",
     "group_limited_topk": "routing.group_limited_topk_triton",
