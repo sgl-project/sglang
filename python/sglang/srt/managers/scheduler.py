@@ -107,7 +107,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_distribution import (
+    _ExpertDistributionRecorderNoop,
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
@@ -5714,16 +5717,31 @@ class Scheduler(
                 )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        recorder = get_global_expert_distribution_recorder()
+
+        if isinstance(recorder, _ExpertDistributionRecorderNoop):
+            return ExpertDistributionReqOutput(
+                success=False,
+                message=(
+                    "Expert distribution recording is disabled. "
+                    "Set --expert-distribution-recorder-mode to enable it."
+                ),
+            )
+
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
-            get_global_expert_distribution_recorder().start_record()
+            recorder.start_record()
         elif action == ExpertDistributionReqType.STOP_RECORD:
-            get_global_expert_distribution_recorder().stop_record()
+            recorder.stop_record()
         elif action == ExpertDistributionReqType.DUMP_RECORD:
-            get_global_expert_distribution_recorder().dump_record()
+            recorder.dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
-        return ExpertDistributionReqOutput()
+
+        return ExpertDistributionReqOutput(
+            success=True,
+            message="Success",
+        )
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
