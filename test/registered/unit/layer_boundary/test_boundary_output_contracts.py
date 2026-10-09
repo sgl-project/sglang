@@ -51,36 +51,35 @@ class TestBoundaryIntegrations(unittest.TestCase):
             self.assertEqual(summed.call_args.args[1], SumGroup.ATTN_TP)
             self.assertIsNone(stream.pending.owed)
 
-    def test_pipeline_preserves_declared_sum_for_one_receiver_completion(self):
-        parallel = fixture.parallel_of(
-            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
-        )
-        with fixture.planning(parallel):
-            attn, _ = build_stages(
-                (declare_attn(), fixture.Norm()),
-                (declare_ffn(), fixture.Norm()),
-                previous=declare_ffn(),
-            )
-        attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
-        fb = SimpleNamespace(residual_stream=ResidualStream(torch.full((4, 4), 3.0)))
-        hidden = fb.residual_stream.record(
-            torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
-        )
-        wire = batch.to_pp(hidden, fb)
-        self.assertIsNone(fb.residual_stream)
-        torch.testing.assert_close(wire["hidden_states"], torch.ones(4, 4))
-        hidden = attn.from_pp(wire, fb)
-        reductions = []
+    def test_a_pipeline_handoff_carries_its_sum_completed(self):
+        # The pipeline sends each tensor as one slice per attention-TP rank and
+        # gathers the slices back, so the sender completes a declared sum; the
+        # next rank's entry takes the value as complete and only slices it.
+        calls = []
+
+        def all_reduce(value):
+            calls.append("AR")
+            return value * 2
 
         def reduce_scatter(value, residual):
-            reductions.append("RS")
+            calls.append("RS")
             return value.chunk(2)[0] * 2, residual.chunk(2)[0]
 
+        def slice_rows(value, residual):
+            calls.append("slice")
+            return value.chunk(2)[0], residual.chunk(2)[0]
+
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=2,
+            enable_attn_tp_input_scattered=True,
+            tp_group=SimpleNamespace(name="tp", ranks=[0, 1], all_reduce=all_reduce),
+        )
         with (
             fixture.planning(parallel),
             patch_communicator("tp_reduce_scatter", reduce_scatter),
+            patch_communicator("tp_slice", slice_rows),
         ):
-            # Rebind the path with the numerical collective stand-in.
             attn, _ = build_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), fixture.Norm()),
@@ -88,6 +87,16 @@ class TestBoundaryIntegrations(unittest.TestCase):
             )
             attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
             attn.plan.qkv_latent_func = None
+            fb = SimpleNamespace(
+                residual_stream=ResidualStream(torch.full((4, 4), 3.0))
+            )
+            hidden = fb.residual_stream.record(
+                torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
+            )
+            wire = batch.to_pp(hidden, fb)
+            self.assertIsNone(fb.residual_stream)
+            torch.testing.assert_close(wire["hidden_states"], torch.full((4, 4), 2.0))
+            hidden = attn.from_pp(wire, fb)
             entry = attn.entry(fb)
             hidden, residual = fb.residual_stream.input(hidden)
             output, _ = entry.prepare(
@@ -98,7 +107,8 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 pending=fb.residual_stream.pending,
                 update=PLAIN_ADD,
             )
-        self.assertEqual(reductions, ["RS"])
+        self.assertEqual(calls, ["AR", "slice"])
+        # Norm: 2 * (h + r) on the slice, with h the completed sum.
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
 
     def test_terminal_finalize_requires_explicit_final_consumer(self):

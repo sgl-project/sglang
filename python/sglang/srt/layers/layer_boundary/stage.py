@@ -220,8 +220,11 @@ class StageBoundary:
                 model paths that explicitly support it.
 
         Returns:
-            Tensor or owed handle for prepare. A producer-written residual and a
-            declared partial sum are reconstructed from the incoming contract.
+            The received output, complete: the sender completes every sum
+            before transport (see residual_batch.to_pp), so where this stage's
+            entry declares a sum its producer leaves, it takes the path for a
+            sum already completed. A producer-written residual is
+            reconstructed from the producer's declaration.
         """
         previous = self.declaration.previous
         hidden_states, residual = from_pp(
@@ -231,9 +234,8 @@ class StageBoundary:
             and (previous.update.applied_at_exit or previous.writes_at_handoff),
             allow_missing_residual=allow_missing_residual,
         )
-        declared_sum = self.entry(forward_batch).declared_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
-            hidden_states, residual, PLAIN_ADD, declared_sum=declared_sum
+            hidden_states, residual, PLAIN_ADD
         )
         return hidden_states
 
