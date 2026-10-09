@@ -1291,11 +1291,15 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         else:
+            quant_method = self._build_mha_quant_method(
+                num_layers=self.layer_info.num_effective_layers
+            )
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_hybrid_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
+                    quant_method=quant_method,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
@@ -1308,9 +1312,6 @@ class KVCacheConfigurator:
                     mha_pool_class=mha_pool_class,
                 )
             else:
-                quant_method = self._build_mha_quant_method(
-                    num_layers=self.layer_info.num_effective_layers
-                )
                 if quant_method is not None and is_float4_e2m1fn_x2(
                     self.kv_cache_dtype
                 ):
@@ -1778,10 +1779,15 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
         mha_pool_class: type,
+        quant_method=None,
     ) -> KVCache:
         kwargs = {}
+        if quant_method is not None:
+            kwargs["quant_method"] = quant_method
+        else:
+            kwargs["post_capture_active"] = self.post_capture_kv_active
         if self.is_hybrid_swa_compress:
-            kwargs = {
+            kwargs.update({
                 "swa_head_num": max(
                     1,
                     self.model_config.hf_text_config.swa_num_key_value_heads
@@ -1790,7 +1796,7 @@ class KVCacheConfigurator:
                 "swa_head_dim": self.model_config.swa_head_dim,
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
-            }
+            })
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8"

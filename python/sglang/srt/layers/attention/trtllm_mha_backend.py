@@ -109,6 +109,11 @@ def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
         pool._wait_for_layer(layer_id)
         layer_id = pool._transfer_full_attention_id(layer_id)
         pool = pool.full_kv_pool
+    elif hasattr(pool, "layers_mapping"):
+        pool._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = pool.layers_mapping[layer_id]
+        pool = pool.swa_kv_pool if is_swa_layer else pool.full_kv_pool
+        layer_id = layer_id_pool
     elif pool.layer_transfer_counter is not None:
         pool.layer_transfer_counter.wait_until(layer_id - pool.start_layer)
 

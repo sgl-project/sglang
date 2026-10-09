@@ -269,7 +269,7 @@ class SWAKVPool(BaseSWAKVPool):
             )
         else:
             pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
@@ -277,6 +277,65 @@ class SWAKVPool(BaseSWAKVPool):
                 v_scale,
                 layer_id_override=layer_id_pool,
             )
+
+    @property
+    def is_quantized_kv_cache(self) -> bool:
+        return getattr(self.full_kv_pool, "is_quantized_kv_cache", False)
+
+    @property
+    def quant_method(self):
+        return getattr(self.full_kv_pool, "quant_method", None)
+
+    @property
+    def k_scale_buffer(self):
+        return getattr(self.full_kv_pool, "k_scale_buffer", None)
+
+    @property
+    def v_scale_buffer(self):
+        return getattr(self.full_kv_pool, "v_scale_buffer", None)
+
+    @property
+    def native_k_scale_buffer(self):
+        return getattr(self.full_kv_pool, "native_k_scale_buffer", None)
+
+    @property
+    def native_v_scale_buffer(self):
+        return getattr(self.full_kv_pool, "native_v_scale_buffer", None)
+
+    @property
+    def dq_k_buffer(self):
+        return getattr(self.full_kv_pool, "dq_k_buffer", None)
+
+    @property
+    def dq_v_buffer(self):
+        return getattr(self.full_kv_pool, "dq_v_buffer", None)
+
+    def get_raw_kv_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return pool.get_raw_kv_buffer(layer_id_pool)
+
+    def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.full_kv_pool.get_dequant_workspace()
+
+    def get_flashinfer_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return pool.get_flashinfer_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=layer_id_pool, **kwargs
+        )
+
+    def get_flashinfer_decode_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        self._wait_for_layer(layer.layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=layer_id_pool, **kwargs
+        )
 
     def set_mla_kv_buffer(
         self,
