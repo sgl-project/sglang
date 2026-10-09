@@ -359,7 +359,7 @@ def ar_sconv_norm_fused(
             activation=sconv.activation,
             use_residual=sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
-            track_indices=forward_batch.mamba_track_indices,
+            track_indices=sconv._conv_state(forward_batch).track_cache_indices,
             shared=shared,
         )
     res.v5_cur = 1 - cur
@@ -834,7 +834,7 @@ def ar_scattered_sconv_fused(
     if fm.is_decode() and forward_batch.mamba_track_mask is not None:
         b = forward_batch.batch_size
         track_mask = forward_batch.mamba_track_mask[:b]
-        track_dst = forward_batch.mamba_track_indices[:b]
+        track_dst = sconv._conv_state(forward_batch).track_cache_indices[:b]
         track_from_cache = True
 
     esz = comm.buffer.element_size()

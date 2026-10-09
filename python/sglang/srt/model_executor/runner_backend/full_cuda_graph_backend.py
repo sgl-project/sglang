@@ -36,6 +36,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -47,15 +48,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
-    if not torch.is_tensor(output) or output.ndim == 0:
-        return None
-    return torch.empty_like(output)
+def _allocate_output_buffer(output: Any) -> Optional[Any]:
+    """Same-structure buffer for a tensor or a (nested) list/tuple of
+    row-major tensors; None when any leaf is something else."""
+    if torch.is_tensor(output):
+        return None if output.ndim == 0 else torch.empty_like(output)
+    if isinstance(output, (list, tuple)) and output:
+        buffers = [_allocate_output_buffer(item) for item in output]
+        if any(buffer is None for buffer in buffers):
+            return None
+        return tuple(buffers) if isinstance(output, tuple) else buffers
+    return None
 
 
-def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
+def _output_fits_buffer(output: torch.Tensor, output_buffer: Any) -> bool:
     return (
-        torch.is_tensor(output)
+        torch.is_tensor(output_buffer)
         and output.ndim == output_buffer.ndim
         and output.shape[1:] == output_buffer.shape[1:]
         and output.shape[0] <= output_buffer.shape[0]
@@ -64,14 +72,28 @@ def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
     )
 
 
-def _copy_output_to_buffer(
-    output: Any, output_buffer: torch.Tensor
-) -> Optional[torch.Tensor]:
-    if not _output_fits_buffer(output, output_buffer):
-        return None
-    shared_output = output_buffer[: output.shape[0]]
-    shared_output.copy_(output)
-    return shared_output
+def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
+    """Copy ``output`` leaf-wise into the leading rows of ``output_buffer`` and
+    return the same structure of buffer views; None when it does not fit."""
+    if torch.is_tensor(output):
+        if not _output_fits_buffer(output, output_buffer):
+            return None
+        shared_output = output_buffer[: output.shape[0]]
+        shared_output.copy_(output)
+        return shared_output
+    if isinstance(output, (list, tuple)):
+        if not isinstance(output_buffer, (list, tuple)) or len(output) != len(
+            output_buffer
+        ):
+            return None
+        shared = [
+            _copy_output_to_buffer(item, buffer)
+            for item, buffer in zip(output, output_buffer)
+        ]
+        if any(item is None for item in shared):
+            return None
+        return tuple(shared) if isinstance(output, tuple) else shared
+    return None
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):
@@ -91,11 +113,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
-        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")

@@ -146,8 +146,8 @@ class ComponentLoader(ABC):
     # the list of possible name of the component in model_index.json, e.g., scheduler
     component_names: list[str] = []
 
-    # diffusers or transformers
-    expected_library: str = ""
+    # diffusers or transformers (a tuple lists several accepted spellings)
+    expected_library: str | tuple[str, ...] = ""
 
     _loaders_registered = False
 
@@ -681,7 +681,12 @@ class ComponentLoader(ABC):
         if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
-            assert transformers_or_diffusers == expected_library, (
+            allowed = (
+                (expected_library,)
+                if isinstance(expected_library, str)
+                else tuple(expected_library)
+            )
+            assert transformers_or_diffusers in allowed, (
                 f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             )
             loader = loader_cls()
@@ -705,6 +710,9 @@ class WeightOverrideComponentLoader(ComponentLoader):
     """Base for loaders that consume an exact weights-only override."""
 
     ignored_checkpoint_prefixes: tuple[str, ...] = ()
+    # True: a checkpoint key that maps to no model parameter fails the load instead
+    # of being logged and skipped.
+    strict_checkpoint_keys: bool = False
 
     def load_state_dict_model(
         self,
@@ -733,7 +741,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
             fsdp_inference=server_args.should_use_fsdp_for_component(component_name),
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            strict=False,
+            strict=self.strict_checkpoint_keys,
             weight_load_plan=weight_load_plan,
             checkpoint_key_filter=checkpoint_key_filter,
             weights_iterator=weights_iterator,
