@@ -546,6 +546,17 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+def _validate_w8a8_block_fp8_config(block_k: int, config: Dict[str, Any]) -> None:
+    tile_k = config["BLOCK_SIZE_K"]
+    if block_k <= 0 or tile_k <= 0 or block_k % tile_k != 0:
+        raise ValueError(
+            "This block-FP8 Triton kernel requires a positive "
+            "BLOCK_SIZE_K that divides group_k; got "
+            f"BLOCK_SIZE_K={tile_k}, group_k={block_k}. "
+            "Use a supported tile or remove the custom tuned config."
+        )
+
+
 @functools.lru_cache
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
@@ -583,6 +594,11 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
+            if cfg["BLOCK_SIZE_K"] <= 0:
+                raise ValueError(
+                    f"BLOCK_SIZE_K must be positive in {json_file_name} "
+                    f"at M={m_key}; got {cfg['BLOCK_SIZE_K']}."
+                )
             if cfg["BLOCK_SIZE_K"] < block_k and (
                 not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
             ):
@@ -592,7 +608,7 @@ def get_w8a8_block_fp8_configs(
         if clamped_ms:
             logger.warning(
                 "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
-                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
+                "(the smaller tile did not meet this platform's config constraints).",
                 block_k,
                 json_file_name,
                 clamped_ms,
@@ -806,7 +822,7 @@ def w8a8_block_fp8_matmul_triton(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        # These kernels require BLOCK_SIZE_K to divide block_size[1].
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],
@@ -828,6 +844,13 @@ def w8a8_block_fp8_matmul_triton(
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+
+    if (
+        kernel is _w8a8_block_fp8_matmul
+        or kernel is _w8a8_block_fp8_matmul_hopper
+        or kernel is _w8a8_block_fp8_matmul_gfx1250
+    ):
+        _validate_w8a8_block_fp8_config(block_k, config)
 
     split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
     if split_k > 1:
