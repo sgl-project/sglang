@@ -646,7 +646,18 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = is_shared_experts_fusion_disabled()
+        # GLM target kernels consume the appended shared slot for both EP1 and
+        # EP, while other Gluon EP implementations keep shared execution native.
+        # NextN always keeps its BF16 shared expert native.
+        explicitly_disabled = is_shared_experts_fusion_disabled()
+        gluon_requires_native_shared = get_moe_runner_backend().is_gluon() and (
+            is_nextn
+            or (
+                self.moe_ep_size > 1
+                and getattr(config, "model_type", None) != "glm_moe_dsa"
+            )
+        )
+        _fusion_disabled = explicitly_disabled or gluon_requires_native_shared
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -941,6 +952,19 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+        if get_moe_runner_backend().is_gluon():
+            if getattr(config, "model_type", None) != "glm_moe_dsa":
+                raise RuntimeError(
+                    "--moe-runner-backend gluon supports only GLM-5.2/5.3 "
+                    "Quark MXFP4 checkpoints"
+                )
+            from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+                GlmMxfp4GluonMoeBackend,
+            )
+            from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
+
+            bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -986,7 +1010,43 @@ class DeepseekV2MoE(nn.Module):
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
         the V2/V3 layer-boundary handoff."""
+        from sglang.srt.layers.moe.gluon_backend import (
+            forward_gluon_moe,
+            should_use_gluon_moe,
+        )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
+        )
+        # Gluon is a strict whole-layer backend.  Select it before MegaMoE,
+        # DeepEP, or CUDA-graph dual-stream routing so none of those paths can
+        # bypass the bound implementation and silently execute native MoE.
+        if should_use_gluon_moe(self):
+            output = forward_gluon_moe(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=num_token_non_padded,
+            )
+            if return_moe_output:
+                # Gluon returns a fully materialized rank-local result: routed
+                # scaling and the shared expert are already applied.
+                return MoEOutput(
+                    routed=output,
+                    shared=None,
+                    experts=self.experts,
+                    routed_scaling_factor=1.0,
+                    shared_is_replicated=False,
+                )
+            if self.reduce_results:
+                output = post_experts_all_reduce(output)
+            return output
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -996,11 +1056,6 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
@@ -3315,7 +3370,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def determine_num_fused_shared_experts(self):
         # The decision was installed by the loader; this only reads it.
         self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+            0
+            if is_shared_experts_fusion_disabled()
+            or (get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1)
+            else self.config.n_shared_experts
         )
 
     def get_input_embeddings(self) -> nn.Embedding:

@@ -886,6 +886,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
