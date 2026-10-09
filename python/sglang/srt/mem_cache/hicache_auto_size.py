@@ -64,6 +64,75 @@ def _draft_bytes(target, draft) -> int:
     return _pool_bytes(draft) * target.size // draft.size
 
 
+def _v4_host_bytes(params, pool) -> int:
+    """Physical host mirrors at ratio one, using the assembler's page geometry."""
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _dsv4_compressed_region_buffers,
+        _dsv4_indexer_regions,
+        _dsv4_rope_sibling,
+        _resolve_deepseek_v4_layer_mappings,
+    )
+
+    page_size = params.page_size
+    allocator = params.token_to_kv_pool_allocator
+    full_size = getattr(allocator, "size_full", pool.size)
+    full_pages = (full_size + page_size - 1) // page_size
+    swa_pages = (pool.swa_size + pool.swa_page_size - 1) // pool.swa_page_size
+    mappings = _resolve_deepseek_v4_layer_mappings(pool)
+    unified = getattr(pool, "_unified_kv", False)
+    total = 0
+    if not unified and pool.swa_kv_pool is not None:
+        total += (
+            swa_pages
+            * len(pool.swa_kv_pool.kv_buffer)
+            * pool.swa_kv_pool.bytes_per_page_padded
+        )
+    for ratio, mapping in ((4, mappings.c4), (128, mappings.c128)):
+        if not mapping:
+            continue
+        pages = full_pages
+        if ratio == 128 and getattr(allocator, "c128_attn_allocator", None) is not None:
+            pages = allocator.c128_attn_allocator.num_pages
+        buffers, item_bytes = _dsv4_compressed_region_buffers(pool, ratio)
+        total += pages * len(buffers) * item_bytes
+        rope = _dsv4_rope_sibling(pool, ratio)
+        if rope is not None:
+            _, buffers, item_bytes = rope
+            total += pages * len(buffers) * item_bytes
+    if mappings.c4:
+        for region in _dsv4_indexer_regions(pool, page_size):
+            total += full_pages * len(region.device_buffers) * region.item_bytes
+        if not unified:
+            for states in (
+                pool.compress_state_pools,
+                pool.indexer_compress_state_pools,
+            ):
+                for layer in mappings.c4_state_global_layers:
+                    state = states[layer]
+                    total += (
+                        swa_pages
+                        * state.ring_size
+                        * state.kv_score_buffer.kv_score[0].nbytes
+                    )
+    for ratio in (1, 2):
+        if not getattr(pool, "sources_by_ratio", {}).get(ratio):
+            continue
+        kv = pool.kv_pools[ratio]
+        total += full_pages * sum(
+            buf.shape[1] * buf.element_size() for buf in kv.kv_buffer
+        )
+        index = pool.index_pools[ratio]
+        index_pages = (page_size // ratio) // index.page_size
+        regions = (
+            [index.index_k_with_scale_buffer]
+            if index.index_k_with_scale_buffer is not None
+            else [index.index_k_payload_buffer, index.index_k_scale_buffer]
+        )
+        for buffers in regions:
+            total += full_pages * index_pages * sum(buf[0].nbytes for buf in buffers)
+    return int(total)
+
+
 def _estimate_hicache_bytes(
     params: CacheInitParams,
     draft_plan: HiCacheDraftPlan | None,
@@ -71,13 +140,16 @@ def _estimate_hicache_bytes(
     physical: bool = False,
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
     pool = params.token_to_kv_pool_allocator.get_kvcache()
-    if not isinstance(pool, _SIZEABLE_POOLS):
+    is_v4 = isinstance(pool, DeepSeekV4TokenToKVPool)
+    if not is_v4 and not isinstance(pool, _SIZEABLE_POOLS):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
             "set --hicache-ratio or --hicache-size explicitly."
         )
-    total = _pool_bytes(pool)
+    total = _v4_host_bytes(params, pool) if is_v4 else _pool_bytes(pool)
     target_bytes = total
     if physical and get_memory().enable_mla_hicache_host_dedup:
         target = pool
@@ -91,6 +163,16 @@ def _estimate_hicache_bytes(
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
+    if is_v4:
+        # V4 draft sidecars mirror SWA only, with target host-page capacity.
+        swa_pages = (pool.swa_size + pool.swa_page_size - 1) // pool.swa_page_size
+        return total + sum(
+            swa_pages
+            * len(draft.swa_kv_pool.kv_buffer)
+            * draft.swa_kv_pool.bytes_per_page_padded
+            for draft in drafts
+            if draft.swa_kv_pool is not None
+        )
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 

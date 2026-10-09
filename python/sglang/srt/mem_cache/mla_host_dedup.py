@@ -40,10 +40,14 @@ def mla_dedup_rank_and_size() -> tuple[int, int]:
 
 
 def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
-    """Rank-independent gate. CUDA only; FP4 excluded (its per-rank scale
-    buffer is not covered by the broadcast)."""
+    """Rank-independent CUDA gate; classic MLA FP4 has unhandled scale buffers.
+
+    V4 uses explicit side-pool transfers, including its FP4 indexer scales.
+    """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
     return (
-        isinstance(kv_cache, MLATokenToKVPool)
+        isinstance(kv_cache, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
         and not isinstance(kv_cache, MLATokenToKVPoolFP4)
         and is_cuda()
         and storage_supports_host_dedup(storage_backend)
@@ -422,6 +426,100 @@ class MLAHostDedupBroadcaster:
         self.group = None
 
 
+class V4HostDedupBroadcaster(MLAHostDedupBroadcaster):
+    """Broadcast V4 side pools using their prepared physical transfer indices."""
+
+    def __init__(self, device_pool, group, src_global_rank):
+        self.device_pool = device_pool
+        self.group = group
+        self.src_global_rank = src_global_rank
+        self.is_src = mla_dedup_rank_and_size()[0] == 0
+        self.device = device_pool.device
+        self.layer_num = device_pool.layer_num
+        self.chunk_tokens = envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.get()
+        if self.chunk_tokens <= 0:
+            raise ValueError("SGLANG_MLA_DEDUP_CHUNK_TOKENS must be positive")
+        self.kv_staging = torch.empty(1, dtype=torch.uint8, device=self.device)
+        self._page_staging = {}
+
+    def broadcast_transfer(self, transfer, layer_id):
+        from sglang.srt.mem_cache.memory_pool_host import (
+            DeepSeekV4PagedHostPool,
+            DeepSeekV4StateHostPool,
+        )
+
+        pool = transfer.host_pool
+        if not isinstance(pool, (DeepSeekV4PagedHostPool, DeepSeekV4StateHostPool)):
+            return
+        local_layer = (
+            transfer.layer_mapper(layer_id)
+            if transfer.layer_mapper is not None
+            else layer_id
+        )
+        indices = transfer.device_indices
+        if local_layer is None or indices is None or indices.numel() == 0:
+            return
+        if local_layer >= pool.layer_num:
+            return
+        is_state = isinstance(pool, DeepSeekV4StateHostPool)
+        buffers = pool.device_page_views if is_state else pool.device_buffers
+        page_size = pool.swa_page_size if is_state else pool.slot_page_size
+        item_bytes = pool.state_page_bytes if is_state else pool.item_bytes
+        buffer = buffers[local_layer].view(torch.uint8).reshape(-1, item_bytes)
+        rows_per_chunk = min(
+            max(1, math.ceil(self.chunk_tokens / page_size)), buffer.shape[0]
+        )
+        key = (rows_per_chunk, item_bytes)
+        if key not in self._page_staging:
+            self._page_staging[key] = torch.empty(
+                key, dtype=torch.uint8, device=self.device
+            )
+        staging = self._page_staging[key]
+        indices = indices.to(device=self.device, dtype=torch.int64)
+        if not is_state and indices.numel() % page_size:
+            if pool.page_aligned_only:
+                raise ValueError("V4 dedup requires whole pages for this pool")
+            # Reuse the C4 token codec; a full-page scatter here would overwrite
+            # unrelated live tokens sharing the destination page.
+            if page_size != 64 or item_bytes != 37440:
+                raise ValueError("Unsupported partial V4 C4 page format")
+            from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+
+            buffer_ptr = torch.tensor(
+                [buffer.data_ptr()], dtype=torch.uint64, device=self.device
+            )
+            staging_ptr = torch.tensor(
+                [staging.data_ptr()], dtype=torch.uint64, device=self.device
+            )
+            chunk_tokens = rows_per_chunk * page_size
+            for start in range(0, indices.numel(), chunk_tokens):
+                selected = indices[start : start + chunk_tokens]
+                packed = torch.arange(
+                    selected.numel(), dtype=torch.int64, device=self.device
+                )
+                if self.is_src:
+                    staging.zero_()
+                    transfer_cache_dsv4_mla(buffer_ptr, staging_ptr, selected, packed)
+                chunk = staging[: math.ceil(selected.numel() / page_size)]
+                torch.distributed.broadcast(
+                    chunk, src=self.src_global_rank, group=self.group
+                )
+                if not self.is_src:
+                    transfer_cache_dsv4_mla(staging_ptr, buffer_ptr, packed, selected)
+            return
+        rows = pool._to_page_indices(indices)
+        for start in range(0, rows.numel(), rows_per_chunk):
+            selected = rows[start : start + rows_per_chunk]
+            chunk = staging[: selected.numel()]
+            if self.is_src:
+                torch.index_select(buffer, 0, selected, out=chunk)
+            torch.distributed.broadcast(
+                chunk, src=self.src_global_rank, group=self.group
+            )
+            if not self.is_src:
+                buffer.index_copy_(0, selected, chunk)
+
+
 @dataclass
 class MLAHostDedupContext:
     """All state owned by the optional MLA host-dedup path."""
@@ -591,7 +689,14 @@ def maybe_create_mla_host_dedup_context(
     if mla_dedup_rank_and_size()[1] <= 1:
         return None
 
-    broadcaster = MLAHostDedupBroadcaster.build(kv_cache, tp_group, attn_tp_group)
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    broadcaster_cls = (
+        V4HostDedupBroadcaster
+        if isinstance(kv_cache, DeepSeekV4TokenToKVPool)
+        else MLAHostDedupBroadcaster
+    )
+    broadcaster = broadcaster_cls.build(kv_cache, tp_group, attn_tp_group)
     prefetch_hits_sync_groups = None
     prefetch_completion_sync_groups = None
     if storage_backend is not None:

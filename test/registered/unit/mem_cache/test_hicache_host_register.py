@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -657,6 +658,69 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+
+class TestV4DummyHostPools(CustomTestCase):
+    def test_dummy_keeps_logical_capacity_without_host_allocation(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with (
+                self.subTest(layout=layout),
+                mock.patch.dict(
+                    ALLOC_MEMORY_FUNCS,
+                    {
+                        "cpu": mock.Mock(
+                            side_effect=AssertionError("physical allocation")
+                        )
+                    },
+                ),
+                mock.patch.object(
+                    memory_pool_host,
+                    "host_memory_budget_bytes",
+                    side_effect=AssertionError("dummy must not charge physical budget"),
+                ),
+            ):
+                paged = DeepSeekV4PagedHostPool(
+                    "kv",
+                    [torch.empty((4, 6), dtype=torch.uint8)],
+                    item_bytes=6,
+                    num_host_pages=4,
+                    slot_page_size=2,
+                    layout=layout,
+                    is_dummy=True,
+                )
+                self.assertEqual(paged.size, 8)
+                self.assertEqual(paged.available_size(), 8)
+                slots = paged.alloc(3)
+                self.assertEqual(slots.numel(), 4)
+                self.assertEqual(paged.available_size(), 4)
+                paged.free(slots)
+                self.assertEqual(paged.available_size(), 8)
+                state = DeepSeekV4StateHostPool(
+                    "state",
+                    [
+                        SimpleNamespace(
+                            ring_size=2,
+                            kv_score_buffer=SimpleNamespace(
+                                kv_score=torch.empty((4, 3), dtype=torch.uint8)
+                            ),
+                        )
+                    ],
+                    num_host_pages=4,
+                    swa_page_size=2,
+                    layout=layout,
+                    is_dummy=True,
+                )
+                self.assertEqual(state.size, 8)
+                self.assertEqual(state.state_page_bytes, 6)
+                self.assertEqual(state.device_page_views[0].shape, (2, 6))
+                for pool in (paged, state):
+                    self.assertIsNone(pool.kv_buffer)
+                    self.assertIsNone(pool.staging_buffer)
+                    self.assertEqual(pool.get_hybrid_pool_buffer(), [])
+                    with self.assertRaisesRegex(AssertionError, "no physical storage"):
+                        pool.get_dummy_flat_data_page()
+                    with self.assertRaisesRegex(AssertionError, "no physical storage"):
+                        pool.get_data_page(0)
 
 
 if __name__ == "__main__":

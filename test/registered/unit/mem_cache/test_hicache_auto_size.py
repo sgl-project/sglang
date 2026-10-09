@@ -27,6 +27,76 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiCacheAutoSize(CustomTestCase):
+    def test_v4_capacity_counts_host_pages_and_keeps_draft_physical(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.size = 8
+        pool.swa_size = 8
+        pool.swa_page_size = 2
+        pool.start_layer, pool.end_layer = 0, 2
+        pool._unified_kv = False
+        pool.layer_mapping = [
+            SimpleNamespace(compress_ratio=4, compress_layer_id=0),
+            SimpleNamespace(compress_ratio=128, compress_layer_id=0),
+        ]
+        pool.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[None, None], bytes_per_page_padded=12
+        )
+        pool.c4_kv_pool = SimpleNamespace(kv_buffer=[None], bytes_per_page_padded=20)
+        pool.c128_kv_pool = SimpleNamespace(kv_buffer=[None], bytes_per_page_padded=30)
+        pool.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[torch.zeros((4, 8), dtype=torch.uint8)],
+        )
+        state = SimpleNamespace(
+            ring_size=2,
+            kv_score_buffer=SimpleNamespace(
+                kv_score=torch.zeros((8, 3), dtype=torch.int16)
+            ),
+        )
+        pool.compress_state_pools = [state, None]
+        pool.indexer_compress_state_pools = [state, None]
+        pool.sources_by_ratio = {2: [1]}
+        pool.kv_pools = {
+            2: SimpleNamespace(kv_buffer=[torch.zeros((4, 16), dtype=torch.uint8)])
+        }
+        pool.index_pools = {
+            2: SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=None,
+                index_k_payload_buffer=[torch.zeros((4, 8), dtype=torch.uint8)],
+                index_k_scale_buffer=[torch.zeros((4, 4), dtype=torch.uint8)],
+            )
+        }
+        draft = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(kv_buffer=[None], bytes_per_page_padded=5)
+        )
+        params = SimpleNamespace(
+            page_size=4,
+            req_to_token_pool=None,
+            mtp_draft_device_pools=(draft,),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: pool, size_full=8
+            ),
+        )
+        # Target: SWA 96 + C4 40 + C128 60 + indexer 16 + states 96
+        # + C2 KV 32 + C2 indexer/scale 24 = 364. Draft adds 20.
+        self.assertEqual(sizing._estimate_hicache_bytes(params, None), 384)
+        for rank, expected in ((0, 384), (1, 20)):
+            with (
+                patch.object(
+                    sizing,
+                    "get_memory",
+                    return_value=SimpleNamespace(enable_mla_hicache_host_dedup=True),
+                ),
+                patch.object(sizing, "mla_dedup_rank_and_size", return_value=(rank, 2)),
+                patch.object(sizing, "mla_host_dedup_eligible", return_value=True),
+            ):
+                self.assertEqual(
+                    sizing._estimate_hicache_bytes(params, None, physical=True),
+                    expected,
+                )
+
     def test_physical_estimate_keeps_rank_local_draft_and_state(self):
         target = Mock(
             spec=MLATokenToKVPool,

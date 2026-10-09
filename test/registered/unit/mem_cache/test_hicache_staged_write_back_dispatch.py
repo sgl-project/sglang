@@ -486,6 +486,80 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     trace, (["target"] if not dummy else []) + ["broadcast", "draft"]
                 )
 
+    def test_v4_loader_restores_all_side_pools_using_physical_indices(self):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
+        controller = HiCacheController.__new__(HiCacheController)
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        broadcaster = V4HostDedupBroadcaster.__new__(V4HostDedupBroadcaster)
+        broadcaster.device_pool = object()
+        broadcaster.layer_num = 4
+        broadcaster.device = "cpu"
+        broadcaster.is_src = False
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.chunk_tokens = 2
+        broadcaster._page_staging = {}
+        controller.mla_dedup = SimpleNamespace(broadcaster=broadcaster)
+        transfers = []
+        buffers = []
+        for page_size, item_bytes in ((2, 8), (4, 12)):
+            buffer = torch.zeros((4, item_bytes), dtype=torch.uint8)
+            pool = DeepSeekV4PagedHostPool(
+                "test", [buffer], item_bytes, 4, page_size, is_dummy=True
+            )
+            buffers.append(buffer)
+            transfers.append(
+                L2Transfer(
+                    pool,
+                    object(),
+                    _indices(0, page_size),
+                    _indices(2 * page_size, 3 * page_size),
+                    layer_mapper={3: 0}.get,
+                )
+            )
+        state_tensor = torch.zeros((8, 3), dtype=torch.int16)
+        state_pool = DeepSeekV4StateHostPool(
+            "state",
+            [
+                SimpleNamespace(
+                    kv_score_buffer=SimpleNamespace(kv_score=state_tensor), ring_size=2
+                )
+            ],
+            4,
+            4,
+            is_dummy=True,
+        )
+        transfers.append(
+            L2Transfer(
+                state_pool,
+                object(),
+                _indices(0, 4),
+                _indices(4, 8),
+                layer_mapper={3: 0}.get,
+            )
+        )
+        load = controller._mla_layer_loader(_indices(0, 4))
+
+        # Only the communication boundary is replaced: real pool mapping,
+        # staging and scatter must restore the destination physical rows.
+        def receive(tensor, **kwargs):
+            tensor.fill_(17)
+
+        with mock.patch.object(torch.distributed, "broadcast", side_effect=receive):
+            load(transfers, 2)
+            self.assertTrue(all(not bool(buf.any()) for buf in buffers))
+            self.assertFalse(bool(state_tensor.any()))
+            load(transfers, 3)
+        for buffer in buffers:
+            expected = torch.zeros_like(buffer)
+            expected[2].fill_(17)
+            self.assertTrue(torch.equal(buffer, expected))
+        expected_state = torch.zeros_like(state_pool.device_page_views[0])
+        expected_state[1].fill_(17)
+        self.assertTrue(torch.equal(state_pool.device_page_views[0], expected_state))
+
     def test_custom_l2_loader_preserves_submission_lifetime(self):
         for fail in (False, True):
             with self.subTest(fail=fail):
