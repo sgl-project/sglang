@@ -556,6 +556,43 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
+        from sglang.srt.elastic_ep.topology import physical_ep_size_to_dp_size
+
+        try:
+            divisor = cfg.attn_dp_size * resolved.attn_cp_size
+            if (
+                cfg.tp_size <= 0
+                or cfg.attn_dp_size <= 0
+                or resolved.attn_cp_size <= 0
+                or cfg.tp_size % divisor
+            ):
+                raise ValueError(
+                    "Invalid attention topology: "
+                    f"tp_size={cfg.tp_size}, attn_dp_size={cfg.attn_dp_size}, "
+                    f"attn_cp_size={resolved.attn_cp_size}."
+                )
+            attn_tp_size = derive_attn_tp_size(
+                tp_size=cfg.tp_size,
+                attn_cp_size=resolved.attn_cp_size,
+                attn_dp_size=cfg.attn_dp_size,
+            )
+            attn_replica_size = attn_tp_size * resolved.attn_cp_size
+            physical_ep_size_to_dp_size(cfg.max_ep_size, attn_replica_size)
+            physical_ep_size_to_dp_size(
+                cfg.elastic_ep_initial_size or cfg.tp_size, attn_replica_size
+            )
+            if cfg.ep_join_mode == "scale":
+                physical_ep_size_to_dp_size(cfg.ep_join_rank_offset, attn_replica_size)
+        except ValueError as exc:
+            raise AssertionError(str(exc)) from exc
+
+        if attn_tp_size > 1:
+            assert cfg.moe_dense_tp_size == 1, (
+                "Elastic EP scale-up with attention TP greater than one requires "
+                "--moe-dense-tp-size 1 "
+                f"(got moe_dense_tp_size={cfg.moe_dense_tp_size})."
+            )
+
         assert cfg.elastic_ep_scale_timeout > 0, (
             "--elastic-ep-scale-timeout must be greater than zero."
         )
@@ -620,6 +657,11 @@ def handle_elastic_ep(server_args: Any):
             "Elastic EP scale-up requires --pp-size 1 "
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
+        assert attn_tp_size % cfg.dcp_size == 0, (
+            "Elastic EP scale-up requires --dcp-size to divide the fixed "
+            "attention TP width "
+            f"(got dcp_size={cfg.dcp_size}, attn_tp_size={attn_tp_size})."
+        )
 
         decode_backend = cfg.cuda_graph_config.decode.backend
         assert decode_backend in (Backend.DISABLED, Backend.FULL), (
@@ -671,12 +713,8 @@ def handle_elastic_ep(server_args: Any):
         )
         assert resolved.ep_size == cfg.tp_size, (
             "Elastic EP scale-up requires ep_size == tp_size "
-            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
-            "and the attention DP group must all coincide with WORLD."
-        )
-        assert cfg.attn_dp_size == cfg.tp_size, (
-            "Elastic EP scale-up requires attn_dp_size == tp_size "
-            f"(got attn_dp_size={cfg.attn_dp_size}, tp_size={cfg.tp_size})."
+            f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); "
+            "physical EP membership must coincide with the launch-time TP span."
         )
         assert resolved.moe_a2a_backend == "nixl", (
             "Elastic EP scale-up requires --moe-a2a-backend nixl "

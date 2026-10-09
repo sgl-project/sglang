@@ -63,6 +63,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
@@ -495,7 +499,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().num_dp_ranks
+        parallel = get_parallel()
+        self.elastic_worker_count = parallel.num_dp_ranks
+        self.attn_replica_size = attn_replica_size()
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -3546,16 +3552,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
         self._dispatch_to_scheduler(msg)
-        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_worker_count = physical_ep_size_to_dp_size(
+            msg.effective_ep_size, self.attn_replica_size
+        )
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "serving_expanded"
         self.elastic_last_error = None
-        self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def get_elastic_ep_state(self):
         return {
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
-            "effective_ep_size": self.elastic_worker_count,
+            "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
@@ -3572,7 +3580,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
-                old_ep_size=self.elastic_worker_count,
+                old_ep_size=self.elastic_worker_count * self.attn_replica_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,

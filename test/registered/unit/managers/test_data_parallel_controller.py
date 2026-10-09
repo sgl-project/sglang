@@ -29,6 +29,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    WorkerPortHandshake,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
@@ -65,6 +66,75 @@ def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
     )
+
+
+class TestJoinerWorkerPortAdmission(CustomTestCase):
+    def _launch_joiner(self, parallel, handshake, launch):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._receive_ports_as_client = MagicMock(return_value=handshake)
+        controller.launch_tensor_parallel_group = launch
+        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=execution,
+            ),
+        ):
+            controller.launch_dp_attention_schedulers(
+                SimpleNamespace(), SimpleNamespace()
+            )
+
+    def test_topology_mismatch_is_rejected_before_scheduler_launch(self):
+        mismatches = [
+            # A wider joiner would map physical offset 4 onto active primary slot 2.
+            ((1, 1), (2, 1), 1),
+            # A narrower joiner would select beyond the primary's reserved slots.
+            ((2, 1), (1, 1), 2),
+        ]
+        for primary, joining, num_dp_ranks in mismatches:
+            with self.subTest(primary=primary, joining=joining):
+                parallel = SimpleNamespace(
+                    dist_init_addr="127.0.0.1:20000",
+                    ep_join_rank_offset=4,
+                    num_dp_ranks=num_dp_ranks,
+                    attn_tp_size=joining[0],
+                    attn_cp_size=joining[1],
+                )
+                handshake = WorkerPortHandshake(
+                    worker_ports=[1000, 1001, 1002, 1003],
+                    attn_tp_size=primary[0],
+                    attn_cp_size=primary[1],
+                )
+                launch = MagicMock()
+
+                with self.assertRaisesRegex(ValueError, "same attention topology"):
+                    self._launch_joiner(parallel, handshake, launch)
+
+                launch.assert_not_called()
+
+    def test_matching_topology_selects_reserved_logical_dp_slot(self):
+        parallel = SimpleNamespace(
+            dist_init_addr="127.0.0.1:20000",
+            ep_join_rank_offset=4,
+            num_dp_ranks=1,
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        handshake = WorkerPortHandshake(
+            worker_ports=[1000, 1001, 1002, 1003],
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        launch = MagicMock()
+
+        self._launch_joiner(parallel, handshake, launch)
+
+        self.assertEqual(launch.call_args.args[-1], [1002])
 
 
 class TestLocalKvEventSources(CustomTestCase):
@@ -114,6 +184,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
         # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
         readers = [
             MagicMock(
