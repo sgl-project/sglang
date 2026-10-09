@@ -824,6 +824,35 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(response.usage.total_tokens, 2073)
         self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
+    def test_usage_reports_image_tokens_for_any_chat_encoding(self):
+        """GLM vision requests must report their image-token split.
+
+        Multimodal token counts come from schedule_batch offsets, not from a
+        model-specific serving path. If meta_info carries image_tokens, the
+        generic chat response must expose it under
+        usage.prompt_tokens_details.image_tokens (CoralBricks audit M12,
+        2026-09-26)."""
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-image-usage",
+                    "prompt_tokens": 197,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 184,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 197)
+        self.assertEqual(response.usage.total_tokens, 198)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 184)
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True
