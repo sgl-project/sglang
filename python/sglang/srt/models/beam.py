@@ -324,7 +324,7 @@ class BeamMoE(nn.Module):
             )
         if defer_sum:
             if (
-                envs.SGLANG_BEAM_DECODE_GEMV.get()
+                envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
                 and hidden_states.shape == (1, 5120)
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
