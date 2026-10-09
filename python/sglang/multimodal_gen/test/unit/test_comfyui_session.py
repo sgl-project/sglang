@@ -288,37 +288,6 @@ def test_cond_key_repeat_still_uses_cache() -> None:
     release_comfyui_session(ex.sid)
 
 
-def test_cond_key_flux_without_pooled_keeps_t5_apart() -> None:
-    ex = _Executor(FluxAdapter())
-    x, t = torch.zeros(1, 16, 8, 8), torch.tensor([0.5])
-    ctx_a, ctx_b = torch.randn(1, 8, 4096), torch.randn(1, 8, 4096)
-    first = ex.send(ex.adapter.pack(x, t, ctx_a, y=None))
-    second = ex.send(ex.adapter.pack(x, t, ctx_b, y=None))
-    assert torch.equal(first.prompt_embeds[1], ctx_a)
-    assert torch.equal(second.prompt_embeds[1], ctx_b)
-    repeat = ex.adapter.pack(x, t, ctx_a.clone(), y=None)
-    restored = ex.send(repeat)
-    assert repeat.prompt_embeds == []  # cached now that y is a tensor
-    assert torch.equal(restored.prompt_embeds[1], ctx_a)
-    release_comfyui_session(ex.sid)
-
-
-def _h3_packed(text, payload):
-    return PackedForward(
-        latents=torch.zeros(1, 4, 2, 2),
-        timesteps=torch.tensor([500.0]),
-        prompt_embeds=[text],
-        prompt_seq_lens=[[int(text.shape[0])]],
-        height=2,
-        width=2,
-        extra_req={
-            "h3_payload": payload,
-            "h3_context": text,
-            "comfyui_cache_fp": {"spatial": (1, 2, 2)},
-        },
-    )
-
-
 def test_h3_cache_hit_restores_own_extras() -> None:
     ex = _Executor(MiniMaxH3Adapter())
     pos, neg = torch.ones(3, 4), torch.zeros(3, 4)
@@ -371,6 +340,37 @@ def test_extras_cached_per_cond_key() -> None:
     bind_comfyui_session(later_pos)
     assert torch.equal(later_pos.extra["h3_context"], pos_ctx)
     release_comfyui_session(sid)
+
+
+def test_cond_key_flux_without_pooled_keeps_t5_apart() -> None:
+    ex = _Executor(FluxAdapter())
+    x, t = torch.zeros(1, 16, 8, 8), torch.tensor([0.5])
+    ctx_a, ctx_b = torch.randn(1, 8, 4096), torch.randn(1, 8, 4096)
+    first = ex.send(ex.adapter.pack(x, t, ctx_a, y=None))
+    second = ex.send(ex.adapter.pack(x, t, ctx_b, y=None))
+    assert torch.equal(first.prompt_embeds[1], ctx_a)
+    assert torch.equal(second.prompt_embeds[1], ctx_b)
+    repeat = ex.adapter.pack(x, t, ctx_a.clone(), y=None)
+    restored = ex.send(repeat)
+    assert repeat.prompt_embeds == []  # cached now that y is a tensor
+    assert torch.equal(restored.prompt_embeds[1], ctx_a)
+    release_comfyui_session(ex.sid)
+
+
+def _h3_packed(text, payload):
+    return PackedForward(
+        latents=torch.zeros(1, 4, 2, 2),
+        timesteps=torch.tensor([500.0]),
+        prompt_embeds=[text],
+        prompt_seq_lens=[[int(text.shape[0])]],
+        height=2,
+        width=2,
+        extra_req={
+            "h3_payload": payload,
+            "h3_context": text,
+            "comfyui_cache_fp": {"spatial": (1, 2, 2)},
+        },
+    )
 
 
 class _FakePipeline:

@@ -40,24 +40,6 @@ def test_zimage_pack_sets_seq_lens_and_time_dim() -> None:
     assert out.shape == x.shape
 
 
-def test_flux_pack_and_unpack_roundtrip() -> None:
-    adapter = FluxAdapter()
-    x = torch.arange(1 * 16 * 8 * 8, dtype=torch.float32).reshape(1, 16, 8, 8)
-    timestep = torch.tensor([0.5])
-    context = torch.ones(1, 8, 4096)
-    y = torch.ones(1, 768)
-    packed = adapter.pack(x, timestep, context, y=y, guidance=torch.tensor([1.0]))
-    assert packed.latents.ndim == 3
-    assert packed.pooled_embeds[0] is y
-    assert packed.guidance_scale == 1.0
-    out = adapter.unpack(packed.latents, packed, x)
-    assert out.shape == x.shape
-    assert torch.equal(out, x)
-
-    default = adapter.pack(x, timestep, context, y=y)
-    assert default.guidance_scale == 3.5
-
-
 def test_flux_pack_zero_fills_missing_pooled() -> None:
     from sglang.multimodal_gen.runtime.layers.visual_embedding import (
         CombinedTimestepGuidanceTextProjEmbeddings,
@@ -76,8 +58,33 @@ def test_flux_pack_zero_fills_missing_pooled() -> None:
     assert packed.prompt_embeds[0] is y
     assert packed.prompt_seq_lens == [[2], [8]]
 
+    # The JIT timestep_embedding kernel only accepts CUDA tensors, so run the
+    # embedding where the kernel can run.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     embed = CombinedTimestepGuidanceTextProjEmbeddings(
         embedding_dim=32, pooled_projection_dim=768
+    ).to(device)
+    out = embed(
+        torch.tensor([500.0, 500.0], device=device),
+        torch.tensor([3.5, 3.5], device=device),
+        y.float().to(device),
     )
-    out = embed(torch.tensor([500.0, 500.0]), torch.tensor([3.5, 3.5]), y.float())
     assert out.shape == (2, 32)
+
+
+def test_flux_pack_and_unpack_roundtrip() -> None:
+    adapter = FluxAdapter()
+    x = torch.arange(1 * 16 * 8 * 8, dtype=torch.float32).reshape(1, 16, 8, 8)
+    timestep = torch.tensor([0.5])
+    context = torch.ones(1, 8, 4096)
+    y = torch.ones(1, 768)
+    packed = adapter.pack(x, timestep, context, y=y, guidance=torch.tensor([1.0]))
+    assert packed.latents.ndim == 3
+    assert packed.pooled_embeds[0] is y
+    assert packed.guidance_scale == 1.0
+    out = adapter.unpack(packed.latents, packed, x)
+    assert out.shape == x.shape
+    assert torch.equal(out, x)
+
+    default = adapter.pack(x, timestep, context, y=y)
+    assert default.guidance_scale == 3.5
