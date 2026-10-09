@@ -31,6 +31,11 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
 
 logger = logging.getLogger(__name__)
 
+# Group counts tried, in order, when the caller leaves the choice to the
+# transport: MiniMax-H3's 56 heads give 28, 14 and 7 per rank at Ulysses 2, 4
+# and 8, and 7 groups divide all three.
+_AUTO_PIPELINE_GROUPS = (7, 4, 2)
+
 
 def _member_devices(group, device: int) -> list[int]:
     """Local CUDA ordinal of every member of a same-host group."""
@@ -143,6 +148,8 @@ class IpcA2AMultiState:
         self.memops = None
         self.pipe_in = None
         self.pipe_group_streams = []
+        # pipeline shapes whose buffers did not fit on some rank; agreed by all
+        self.declined = set()
 
     def reset(self) -> None:
         """Drop mappings that belong to a model-parallel group being replaced."""
@@ -255,6 +262,8 @@ class IpcA2AMultiState:
         each group attends on its own stream and sends its output from there,
         so no stream waits on a kernel still running on another. Returns
         [s_local, heads, head_dim], or None when this call cannot pipeline.
+        ``groups < 0`` picks the count and steps aside, on every rank, when
+        the buffers would not fit.
 
         ``fill(head_start, head_count, dst)``, when given, writes those heads'
         q/k/v into a [s_local, head_count, 3 * head_dim] block in place of the
@@ -264,12 +273,31 @@ class IpcA2AMultiState:
         """
         world, r = self.world, self.rank
         s_local, heads, head_dim = q.shape
-        if heads % (world * groups) or not (q.shape == k.shape == v.shape):
+        auto = groups < 0
+        if auto:
+            groups = next(
+                (n for n in _AUTO_PIPELINE_GROUPS if heads % (world * n) == 0), 0
+            )
+        if (
+            not groups
+            or heads % (world * groups)
+            or not (q.shape == k.shape == v.shape)
+        ):
             return None
         key = ("pipeline", s_local, heads, head_dim, groups, q.dtype)
         bufs = self.staging.get(key)
         if bufs is None:
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_current_stream_capturing() or key in self.declined:
+                return None
+            # send + both receive and output slots: 11 * s_local * heads * head_dim
+            need = 11 * s_local * heads * head_dim * q.element_size()
+            if auto and not self._fits_on_every_rank(need):
+                logger.info(
+                    "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
+                    "sequential exchange for this shape",
+                    need / 2**30,
+                )
+                self.declined.add(key)
                 return None
             bufs = _PipelineBuffers(self, s_local, heads, head_dim, groups, q.dtype)
             self._insert(key, bufs)
@@ -359,6 +387,17 @@ class IpcA2AMultiState:
         # the next call's pack rewrites `send`, which the copy stream reads
         main.wait_stream(cin)
         return merged
+
+    def _fits_on_every_rank(self, nbytes: int) -> bool:
+        """Whether every rank can spare twice `nbytes`, counting the allocator's
+        cached blocks; a group collective, so all ranks reach the same answer."""
+        free, _ = torch.cuda.mem_get_info()
+        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        fits = torch.tensor(
+            [int(free + cached >= 2 * nbytes)], dtype=torch.int32, device="cuda"
+        )
+        dist.all_reduce(fits, op=dist.ReduceOp.MIN, group=self.group)
+        return bool(fits.item())
 
     def exchange(self, send: torch.Tensor) -> torch.Tensor | None:
         """``all_to_all_single`` with equal splits: row p of the contiguous

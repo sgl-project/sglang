@@ -133,6 +133,18 @@ def _worker() -> int:
                     f"filled pipeline {(s_local, heads, head_dim, groups)} call {call}"
                 )
 
+    # groups=-1 picks a count that divides the heads per rank (4 for 16 heads at
+    # 2 ranks, 2 at 4) and still matches
+    torch.manual_seed(77)
+    full = [
+        torch.randn(64 * world, 16, 64, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    ]
+    q, k, v = (t.narrow(0, rank * 64, 64).contiguous() for t in full)
+    got = ulysses_pipelined_attention(q, k, v, _attend, -1)
+    if got is None or not torch.equal(sequential(q, k, v), got):
+        failures.append("auto group count")
+
     # a head count the groups cannot split must decline, not mis-shard
     q = torch.randn(32, 12, 64, dtype=torch.bfloat16, device="cuda")
     if ulysses_pipelined_attention(q, q, q, _attend, 4) is not None:

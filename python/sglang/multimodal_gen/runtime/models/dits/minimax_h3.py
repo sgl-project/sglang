@@ -685,7 +685,7 @@ def _minimax_h3_pipelined_dense_attention(
     pipelining is enabled and the dense FlashAttention path would run.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups <= 1 or torch.compiler.is_compiling():
+    if groups in (0, 1) or torch.compiler.is_compiling():
         return None
     if attention._attention_backend_enum is not AttentionBackendEnum.FA:
         return None
@@ -730,7 +730,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS <= 1
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
