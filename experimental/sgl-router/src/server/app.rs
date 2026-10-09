@@ -242,6 +242,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             post(crate::server::routes::cache::flush_cache),
         )
         .route(
+            "/abort_request",
+            post(crate::server::routes::abort::abort_request),
+        )
+        .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
             get(crate::server::routes::cache::kv_snapshot),
         );
