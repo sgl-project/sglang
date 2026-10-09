@@ -1069,6 +1069,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
         if ragged_layout is None:
+            physical_num_tokens = seq_len
+            # Derive logical token count via host-side arithmetic to avoid
+            # GPU->CPU sync (illegal during CUDA graph capture).  In the dense
+            # verify branch, query_start_loc == arange(0, physical+1,
+            # draft_token_num), so logical = floor(physical / draft) * draft.
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
@@ -1126,6 +1131,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     lower_bound=layer.lower_bound,
                     **ring_kwargs,
                 )
+            logical_num_tokens = batch_size * draft_token_num
+            if logical_num_tokens < physical_num_tokens:
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens] if a.ndim >= 3 else a[:logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+                seq_len = logical_num_tokens
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1222,6 +1233,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # stay finite. Uncovered == clamped-to-ghost.
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
+
+        # Pad output back to physical length if we trimmed (mirrors forward_extend)
+        if ragged_layout is None and logical_num_tokens < physical_num_tokens:
+            pad = core_attn_out.new_zeros(
+                (1, physical_num_tokens - logical_num_tokens)
+                + tuple(core_attn_out.shape[2:])
+            )
+            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+
         return core_attn_out
 
     def _can_run_fused_chain_verify(

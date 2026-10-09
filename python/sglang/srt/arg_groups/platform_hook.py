@@ -77,6 +77,11 @@ def handle_ppu_backends(server_args: Any):
     # Use CUDA PLA fast path by default on PPU.
     if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
         envs.SGLANG_SAIL_PLA_CUDA.set(True)
+    # Use CUDA FLA (Flash Linear Attention) fast path by default on PPU.
+    # Migrated from v0.5.18_rel/glm-5.3-flash dirty WIP: the source set both
+    # PLA and FLA to True when running on PPU.
+    if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
+        envs.SGLANG_SAIL_FLA_CUDA.set(True)
     # Disable DeepSeek-V4 topk_v2 on PPU by default.
     if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)

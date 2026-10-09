@@ -492,18 +492,95 @@ def fused_sigmoid_gating_delta_rule_update(
     # KDA and GDN recurrent paths.
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
-    sail_pla_supported = lower_bound is None and not cache_ring
-    if envs.SGLANG_SAIL_PLA_CUDA.get() and sail_pla_supported:
+    # SAIL PLA CUDA kernel supports lower_bound (KDA safe gate); only ReplaySSM ring needs Triton fallback
+    #
+    # (ROOT CAUSE, 3rd round): the SAIL mega kernel reads the SSM
+    # state through hard-typed float pointers -- launch_ppu_mega_cfg<T, ...> in
+    # pla/decode/_C.so takes `float const*` for the state while q/k/v/a/b stay
+    # `void const*` (dtype-templated). The state is therefore Float32-ONLY.
+    # Under --mamba-ssm-dtype bfloat16 both initial_state_source (temporal_state,
+    # memory_pool.py:586) and intermediate_states_buffer (intermediate_ssm,
+    # memory_pool.py:718) are BFloat16, so the kernel's data_ptr<float>() raises
+    # the generic "expected scalar type Float but found BFloat16" from inside
+    # capture_decode_graph and the server never comes up.
+    # Gate on the state dtype and fall back to the community Triton kernel, which
+    # is dtype-generic. Evidence: verify_v16/VERIFICATION_REPORT.md V1a vs V1e.
+    _sail_state_fp32 = all(
+        t is None or t.dtype == torch.float32
+        for t in (initial_state_source, intermediate_states_buffer)
+    )
+    # [fla SAIL chain #11+#16+#19 net effect - KDA bf16-state triton fallback + fp32-state guard + kda_lower_bound] 旧代码：
+    # sail_pla_supported = lower_bound is None and not cache_ring
+    sail_pla_supported = not cache_ring and _sail_state_fp32
+    # [batch8 SAIL_FLA_CUDA gate - migrated from v0.5.18_rel dirty WIP] 旧代码：
+    # if envs.SGLANG_SAIL_PLA_CUDA.get() and sail_pla_supported:
+    # SGLANG_SAIL_FLA_CUDA is the top-level SAIL FLA gate (defaults True on PPU);
+    # SGLANG_SAIL_PLA_CUDA is the sub-gate for the PLA decode fast-path.
+    # Both must be True, plus sail_pla_supported, to enter the SAIL PLA kernel.
+    if (
+        envs.SGLANG_SAIL_FLA_CUDA.get()
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and sail_pla_supported
+    ):
         from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last
 
         logger.info_once(
             f"USE PPU SAIL CUDA PLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
         )
 
+        # SAIL PLA 内核仅在 is_kda=True 时接受非 None 的 lower_bound；
+        # GDN(is_kda=False)必须传 None，否则内核 host 端抛
+        # RuntimeError: lower_bound is only supported for KDA（传 0.0 也会触发）。
+        kda_lower_bound = (
+            (lower_bound if lower_bound is not None else 0.0) if is_kda else None
+        )
+
+        # (2nd round REVERTED): pla's host-side check_dt_bias_dtype
+        # requires dt_bias to be q's dtype on EVERY path except KDA MTP verify, which
+        # reads it as float32. The rule is compiled verbatim into pla/decode/_C.so:
+        #   "dt_bias must be <dtype> here (is_kda=N, mtp_verify=N): only KDA MTP
+        #    verify reads it as float32, every other path reads it as q's dtype. Got X"
+        # The previous "cast SAIL PLA gate tensors to Float32 in target_verify path"
+        # change (25e2fa639b on glm-5.3-flash / a3480210e8 on v0.5.18_rel) therefore had
+        # the direction INVERTED for GDN: it did not fix the crash, it replaced
+        # "expected scalar type Float but found BFloat16" with
+        # "dt_bias must be BFloat16 here (is_kda=0, mtp_verify=1)".
+        # Revert to the pre-25e2fa639b conditional: decode casts to q.dtype, verify
+        # passes the gate tensors through untouched -- GDN dt_bias is already BFloat16
+        # (== q.dtype) and KDA dt_bias is Float32, exactly what KDA MTP verify wants.
+        # Evidence: verify_v16/VERIFICATION_REPORT.md cases V1b / V1f / B.
+        def _sail_gate_cast(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None:
+                return None
+            return t.to(q.dtype) if not disable_state_update else t
+
+        # [fla SAIL chain #11+#16+#19 net effect - SAIL kernel 20→21 args, add _sail_gate_cast + kda_lower_bound] 旧代码：
+        # output = fused_sigmoid_gating_delta_rule_forward_k_last(
+        #     A_log,
+        #     a,
+        #     dt_bias,
+        #     softplus_beta,
+        #     softplus_threshold,
+        #     q,
+        #     k,
+        #     v,
+        #     b,
+        #     initial_state_source,
+        #     initial_state_indices,
+        #     scale,
+        #     use_qk_l2norm_in_kernel,
+        #     cu_seqlens,
+        #     is_kda,
+        #     disable_state_update,
+        #     intermediate_states_buffer,
+        #     intermediate_state_indices,
+        #     cache_steps,
+        #     retrieve_parent_token,
+        # )
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
-            A_log,
+            _sail_gate_cast(A_log),
             a,
-            dt_bias,
+            _sail_gate_cast(dt_bias),
             softplus_beta,
             softplus_threshold,
             q,
@@ -521,14 +598,28 @@ def fused_sigmoid_gating_delta_rule_update(
             intermediate_state_indices,
             cache_steps,
             retrieve_parent_token,
+            kda_lower_bound,
         )
         return output
 
-    if envs.SGLANG_SAIL_PLA_CUDA.get() and not sail_pla_supported:
+    # Fallback to Triton when SAIL PLA does not support current config
+    # [batch8 SAIL_FLA_CUDA gate - migrated from v0.5.18_rel dirty WIP] 旧代码：
+    # if envs.SGLANG_SAIL_PLA_CUDA.get() and not sail_pla_supported:
+    if (
+        envs.SGLANG_SAIL_FLA_CUDA.get()
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and not sail_pla_supported
+    ):
+        # [fla SAIL chain #11+#16+#19 net effect - fallback log updated] 旧代码：
+        # logger.info_once(
+        #     "Using the Triton recurrent kernel for this call: the PLA "
+        #     "fused_sigmoid_gating_delta_rule_forward_k_last adapter requires "
+        #     "lower_bound=None and cache_ring=False."
+        # )
         logger.info_once(
-            "Using the Triton recurrent kernel for this call: the PLA "
-            "fused_sigmoid_gating_delta_rule_forward_k_last adapter requires "
-            "lower_bound=None and cache_ring=False."
+            "PPU SAIL CUDA FLA does not support this config (ReplaySSM ring "
+            "semantics, or a non-Float32 SSM state from --mamba-ssm-dtype); "
+            "using the community Triton recurrent kernel."
         )
 
     logger.info_once(
