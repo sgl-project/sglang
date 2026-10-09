@@ -37,12 +37,15 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def _make_prefill_runner(self, backend):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
+        runner.max_context_size = None
         runner.max_num_tokens = 16
         return runner
 
@@ -52,6 +55,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=[object()],
+            contains_mm_inputs=lambda: True,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
@@ -165,6 +169,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
+            joint_head_config=None,
             is_multimodal=False,
             context_len=2048,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
@@ -201,6 +206,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
                 is_embedding_requested=False,
                 is_embedding_gemma=False,
             ),
+            joint_head_config=None,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )

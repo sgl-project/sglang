@@ -36,6 +36,8 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
 
     return SimpleNamespace(
         page_size=page_size,
+        # alloc_extend reads _swa_req_ring; pin the paged-SWA path.
+        _swa_req_ring=False,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,
             alloc_extend=MagicMock(return_value=full_indices),

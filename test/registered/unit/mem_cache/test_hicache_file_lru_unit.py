@@ -286,8 +286,9 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
 
         controller = HiCacheController.__new__(HiCacheController)
         controller.mem_pool_host = mock.Mock(layout="page_first")
+        controller.storage_host_pool = mock.Mock(storage_format_tag="testformat")
         controller.enable_storage_metrics = False
-        parallel = mock.Mock(attn_tp_rank=0, attn_tp_size=1, pp_rank=0)
+        parallel = mock.Mock(attn_tp_rank=0, attn_tp_size=1, attn_dp_rank=0, pp_rank=0)
 
         for backend, is_dsv4, supports_shared_cp, cp_rank, cp_size, pp_size, shared in [
             ("file", True, True, 0, 8, 1, True),
@@ -324,14 +325,14 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
                         "sglang.srt.managers.cache_controller.get_parallel",
                         return_value=parallel,
                     ),
-                    mock.patch(
-                        "sglang.srt.managers.cache_controller.get_attention_dp_rank",
-                        return_value=0,
-                    ),
                 ):
-                    cfg = controller._generate_storage_config(backend)
+                    cfg = controller._generate_storage_config(
+                        backend, model_name="testmodel"
+                    )
 
                 self.assertEqual(cfg.use_shared_cp_storage, shared)
+                self.assertEqual(cfg.pp_size, pp_size)
+                self.assertEqual(cfg.model_name, "testmodel-testformat")
                 self.assertEqual(cfg.is_storage_owner, not shared or cp_rank == 0)
                 if backend == "file":
                     b = HiCacheFile(cfg, file_path=self.tmpdir)

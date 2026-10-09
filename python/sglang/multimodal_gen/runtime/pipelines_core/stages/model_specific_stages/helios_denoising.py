@@ -18,7 +18,7 @@ from sglang.kernels.ops.diffusion import (
     unmount_helios_gated_residual,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows_kernel_fusions,
+    quality_allows,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -36,8 +36,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -116,11 +116,12 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         self._quality_fusions_mounted = False
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
-        # Mount the request-scoped Helios gated-residual fast path for
-        # quality="extra-high"/"high"; "lossless" keeps the reference
-        # FP32-multiply form bit-for-bit.
+        # The gated-residual fusion rounds the FP32 gate and update to BF16
+        # before multiplying, which moves a rounding without lowering the
+        # reference's own operand precision: tier "lossless". The "exact"
+        # default keeps the reference FP32-multiply form bit-for-bit.
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        want = quality_allows_kernel_fusions(quality)
+        want = quality_allows(quality, "lossless")
         if want == self._quality_fusions_mounted:
             return
         self._quality_fusions_mounted = want
@@ -128,7 +129,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             return
         if want:
             if mount_helios_gated_residual(self.transformer):
-                logger.info(
+                logger.debug(
                     "Mounted Helios per-token gated residual for quality=%s", quality
                 )
         else:

@@ -35,7 +35,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb_complex,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -86,14 +86,8 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-class SelfAttention(nn.Module):
-    """
-    Self-Attention module for MOVA DiT with Sequence Parallelism support.
-
-    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
-    USPAttention internally handles the all-to-all communication for distributed attention.
-    Input x should already be the local shard [B, S_local, D] when SP is enabled.
-    """
+class _MOVAAttention(nn.Module):
+    """shared projections, normalization and TP head partitioning for MOVA"""
 
     def __init__(
         self,
@@ -129,6 +123,33 @@ class SelfAttention(nn.Module):
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
+
+
+class SelfAttention(_MOVAAttention):
+    """
+    Self-Attention module for MOVA DiT with Sequence Parallelism support.
+
+    SP is handled at the pipeline level (latents are pre-sharded before DiT forward).
+    USPAttention internally handles the all-to-all communication for distributed attention.
+    Input x should already be the local shard [B, S_local, D] when SP is enabled.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
+        super().__init__(dim, num_heads, eps, quant_config)
+
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+            complex_dtype=torch.float64,
+        )
 
         self.attn = USPAttention(
             # Local heads per TP rank.
@@ -172,8 +193,11 @@ class SelfAttention(nn.Module):
         v = v.view(b, s, self.num_heads_per_rank, self.head_dim)
 
         # Apply RoPE
-        q = _apply_rotary_emb_complex(q, freqs)
-        k = _apply_rotary_emb_complex(k, freqs)
+        q, k = self.rotary_emb(
+            query=q,
+            key=k,
+            complex_freqs=freqs,
+        )
 
         # USPAttention expects [B, S_local, H, D] format
         # USPAttention handles SP communication internally; the tail meta keeps
@@ -185,7 +209,7 @@ class SelfAttention(nn.Module):
         return out
 
 
-class CrossAttention(nn.Module):
+class CrossAttention(_MOVAAttention):
     """
     Cross-Attention module for MOVA DiT.
 
@@ -203,32 +227,7 @@ class CrossAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
     ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.tp_size = get_tp_world_size()
-        if self.num_heads % self.tp_size != 0:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})."
-            )
-        self.num_heads_per_rank = self.num_heads // self.tp_size
-
-        self.q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
-        )
-        self.o = RowParallelLinear(
-            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
-        )
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
+        super().__init__(dim, num_heads, eps, quant_config)
 
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
@@ -394,9 +393,6 @@ class Conv3dLocalIsland(nn.Conv3d):
       but placements can be customized).
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     def forward(self, input):
         if isinstance(input, DTensor):
             # NOTE: DTensor typing stubs are incomplete; at runtime DTensor has
@@ -488,21 +484,6 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = num_heads
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients = []
-        self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = None
-        self.previous_resiual = None
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = False
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
     def _init_freqs(self):

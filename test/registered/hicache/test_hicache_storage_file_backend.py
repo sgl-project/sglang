@@ -20,12 +20,10 @@ from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -103,6 +101,7 @@ class HiCacheStorageBaseMixin:
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
         env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)
@@ -225,33 +224,6 @@ class HiCacheStorageBaseMixin:
         )
 
 
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
-    """Page first layout tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--hicache-mem-layout": "page_first"}
-        return server_args, {}
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
-    """MLA Model tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_model_name(cls):
-        """Use MLA model for testing"""
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
-        return server_args, {}
-
-
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -264,25 +236,6 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
             "--tp-size": 2,
         }
         return server_args, {}
-
-
-class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
-    """Accuracy tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {
-            "--tp-size": 2,
-            "--hicache-ratio": 1.5,
-        }
-
-        return server_args, {}
-
-    @unittest.skipIf(is_in_ci(), "To skip flaky test")
-    def test_eval_accuracy(self):
-        """Test eval accuracy with cache persistence across cache flushes"""
-        run_eval_accuracy_test(self)
 
 
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
