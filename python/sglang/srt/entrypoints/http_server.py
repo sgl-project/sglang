@@ -180,6 +180,7 @@ from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
     build_server_info,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -241,6 +242,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     publish(server_args, role="tokenizer")
+    # An ASGI worker process keeps its server's logging config, root at WARNING;
+    # configure it as every other process does, before anything here logs.
+    configure_logger(server_args, prefix=f" TokenizerWorker-{os.getpid()}")
 
     # API key authentication is not supported in multi-tokenizer mode
     assert get_serving().api_key is None, (
