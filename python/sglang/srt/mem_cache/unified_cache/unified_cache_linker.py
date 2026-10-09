@@ -193,7 +193,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
-        device_hit_len = int(result.device_indices.numel())
+        device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
             return result
 
@@ -287,12 +287,11 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
-    def load_back(self, req: Req) -> tuple[torch.Tensor, NodeId]:
+    def load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
-        empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
-            return empty_indices, req.last_node
+            return 0, req.last_node
 
         device_hit_len = hit.device_hit_len
         tail_hashes = hit.tail_hashes
@@ -311,7 +310,7 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
-                return empty_indices, req.last_node
+                return 0, req.last_node
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
@@ -391,7 +390,7 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
         )
-        return canonical_tail, insert_result.last_device_node
+        return len(canonical_tail), insert_result.last_device_node
 
     def _queue_load(
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]

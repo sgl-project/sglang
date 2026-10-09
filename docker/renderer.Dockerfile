@@ -44,6 +44,7 @@ RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/carg
 # Run the existing unit suite in the same Linux toolchain used for the image.
 # This sibling stage is selected by CI and is not a dependency of the runtime.
 FROM build AS test
+COPY rust/sglang-processor/tests/ rust/sglang-processor/tests/
 COPY rust/sglang-renderer/tests/ rust/sglang-renderer/tests/
 COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json experimental/sgl-router/tests/fixtures/tiny_tokenizer.json
 RUN --mount=type=cache,id=renderer-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \

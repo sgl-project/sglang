@@ -340,12 +340,11 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._empty_device_indices = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
         self._empty_match_result = MatchResult(
-            device_indices=torch.empty(
-                (0,),
-                dtype=torch.int64,
-                device=self.device,
-            ),
+            device_prefix_len=0,
             last_device_node=self.root_node,
             last_host_node=self.root_node,
             best_match_node=self.root_node,
@@ -374,9 +373,8 @@ class RadixCache(BasePrefixCache):
                 empty result with the root as the last node.
 
         Returns:
-            MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
-            the concatenated KV cache indices corresponding to the longest
-            cached prefix (may be length 0).
+            MatchResult: ``device_prefix_len`` is the length of the longest
+            cached prefix (may be 0).
             ``last_device_node`` and ``last_host_node`` (currently the same) are the tree node objects
             representing the terminal node of the matched prefix. This method
             may mutate internal structure by splitting an existing node if the
@@ -401,16 +399,21 @@ class RadixCache(BasePrefixCache):
             return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
-        else:
-            value = self._empty_match_result.device_indices
         return MatchResult(
-            device_indices=value,
+            device_prefix_len=sum(len(v) for v in value),
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
         )
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if self.disable or len(key) == 0:
+            return
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return
+        self._match_prefix_helper(self.root_node, key)
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -509,10 +512,8 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+        new_last_node = match_result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
         assert len(new_indices) == len(radix_key), (
             f"{len(new_indices)=}, {len(radix_key)=}"
         )
@@ -604,6 +605,9 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
+
     def evictable_size(self):
         return self.evictable_size_
 
@@ -624,16 +628,15 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+    def path_device_indices(self, node: TreeNode) -> torch.Tensor:
         values = []
-        node = req.last_node
         while node is not self.root_node:
             values.append(node.value)
             node = node.parent
+        if not values:
+            return self._empty_device_indices
         values.reverse()
-        path = torch.cat(values)
-        assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
-        return path[: req.prefix_len]
+        return torch.cat(values)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
