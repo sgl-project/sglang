@@ -126,6 +126,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
         """One token per row from ``step_logits(base_logits, bias)``: the argmax
         at temperature 0, a Gumbel-max sample otherwise. ``logits_out`` receives
@@ -139,6 +140,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             step=step,
             step_dtype=self.step_logits_dtype(base_logits.dtype, bias.dtype),
             logits_out=logits_out,
+            has_sampled_rows=has_sampled_rows,
             **self._vocab_shard_args(),
         )
 
