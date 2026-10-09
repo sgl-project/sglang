@@ -305,6 +305,52 @@ def _c4st_suffix(blks):
     return ",".join(f"{b}:{_c4st_md5(blks, b) or '?'}" for b in range(128, 137))
 
 
+def _c4st_slots(recs, block, field="locx"):
+    """Parse ``locx=[<block>:n<count>:[a, b, ...], ...]`` slot ids for ``block``.
+
+    Takes an iterable of records (a side may dump several rows), unions the
+    integer slot ids found for ``block``, and returns them SORTED.  Returns
+    ``None`` when no record carries the block, so callers can print ``NONE``.
+    Tolerates spaces, missing entries, list/quotes noise and unparseable tokens.
+    """
+    found = False
+    slots = set()
+    for rec in recs:
+        v = rec.get(field)
+        if not v:
+            continue
+        s = v.strip().replace('"', "'")
+        for item in s.split("'"):
+            item = item.strip().strip(",").strip()
+            if item.startswith("["):
+                item = item[1:].strip()
+            if not item or ":" not in item:
+                continue
+            head, _, rest = item.partition(":")
+            try:
+                b = int(head)
+            except ValueError:
+                continue
+            if b != block:
+                continue
+            _n, _, lst = rest.partition(":")
+            lst = lst.strip()
+            if lst.startswith("["):
+                lst = lst[1:]
+            if lst.endswith("]"):
+                lst = lst[:-1]
+            for tok in lst.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    slots.add(int(tok))
+                except ValueError:
+                    continue
+            found = True
+    return sorted(slots) if found else None
+
+
 def verdict_c4st(rows):
     """Deterministic device A/B verdict for the [C4ST] post-op state.
 
@@ -319,25 +365,27 @@ def verdict_c4st(rows):
         st = _c4st_start(r)
         if st is None:
             continue
-        parsed.append((_int(r, "layer"), st, _parse_blkx(r)))
+        parsed.append((_int(r, "layer"), st, _parse_blkx(r), r))
     if not parsed:
         print("[C4ST-VERDICT] no C4ST post data")
         return
 
     # the runbook dumps a single layer (DSV4_DUMP_C4ST=2); keep the densest one
     counts = {}
-    for ly, _, _ in parsed:
+    for ly, _, _, _ in parsed:
         counts[ly] = counts.get(ly, 0) + 1
     layer = max(counts, key=lambda k: counts[k])
     parsed = [p for p in parsed if p[0] == layer]
 
-    starts = sorted({st for _, st, _ in parsed})
+    starts = sorted({st for _, st, _, _ in parsed})
     if len(starts) < 2:
         print("[C4ST-VERDICT] no C4ST post data")
         return
     miss_st, hit_st = starts[0], starts[-1]
-    miss_blks = [b for _, st, b in parsed if st == miss_st]
-    hit_blks = [b for _, st, b in parsed if st == hit_st]
+    miss_blks = [b for _, st, b, _ in parsed if st == miss_st]
+    hit_blks = [b for _, st, b, _ in parsed if st == hit_st]
+    miss_recs = [r for _, st, _, r in parsed if st == miss_st]
+    hit_recs = [r for _, st, _, r in parsed if st == hit_st]
 
     miss127 = _c4st_md5(miss_blks, 127)
     hit127 = _c4st_md5(hit_blks, 127)
@@ -349,6 +397,26 @@ def verdict_c4st(rows):
     print(f"[C4ST-VERDICT] suffix128_136 post "
           f"miss={_c4st_suffix(miss_blks)} hit={_c4st_suffix(hit_blks)} "
           f"(must be equal)")
+
+    # S197b: compare the raw compress-state SLOT ids (addresses) for block 127.
+    # Content (md5) can be equal while the state lives at a different address on
+    # the reuse (hit) side -> distinguishes stale CONTENT from shifted ADDRESS.
+    miss_slots = _c4st_slots(miss_recs, 127)
+    hit_slots = _c4st_slots(hit_recs, 127)
+    slots_differ = miss_slots != hit_slots
+    content_differs = miss127 != hit127
+    print(f"[C4ST-VERDICT] block127 slots "
+          f"miss={miss_slots if miss_slots is not None else 'NONE'} "
+          f"hit={hit_slots if hit_slots is not None else 'NONE'} "
+          f"addr={'SHIFTED' if slots_differ else 'SAME'}")
+    if content_differs:
+        branch = "A"  # stale content: reused boundary state differs
+    elif slots_differ:
+        branch = "B"  # content equal but address shifted
+    else:
+        branch = "NONE"  # no divergence reproduced
+    print(f"[C4ST-VERDICT] DECISION branch={branch} "
+          f"content_differs={content_differs} slots_differ={slots_differ}")
 
 
 def main(path):
