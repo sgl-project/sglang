@@ -48,6 +48,7 @@ from sglang.srt.parser.jinja_template_utils import (
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
+    REQUEST_NGRAM_CORPUS_SEEDS_KEY,
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
 from sglang.srt.server_args import ServerArgs
@@ -5059,6 +5060,78 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class TestNgramCorpusSeedingTransport(CustomTestCase):
+    """Serving-side transport of ngram corpus seeds into custom_params."""
+
+    def _make_chat(self, speculative_algorithm):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                default_chat_template_kwargs=None,
+                speculative_algorithm=speculative_algorithm,
+            ),
+            role="tokenizer",
+        )
+        manager = _MockTokenizerManager()
+        tokenizer = manager.tokenizer
+        tokenizer.chat_template = "template"
+        tokenizer.apply_chat_template.side_effect = lambda messages, **_: (
+            "P" + ("|C" if any(m.get("tool_calls") for m in messages) else "")
+        )
+        tokenizer.encode.side_effect = lambda text, **_: [ord(c) for c in text]
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        return OpenAIServingChat(manager, template_manager)
+
+    def _request(self, **overrides):
+        kwargs = dict(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+        kwargs.update(overrides)
+        return ChatCompletionRequest(**kwargs)
+
+    def test_ngram_server_attaches_the_rendered_call(self):
+        chat = self._make_chat("NGRAM")
+        adapted, _ = chat._convert_to_internal_request(self._request())
+        self.assertEqual(
+            adapted.sampling_params["custom_params"][REQUEST_NGRAM_CORPUS_SEEDS_KEY],
+            [ord(c) for c in "|C"],
+        )
+
+    def test_other_servers_do_not_render(self):
+        """Rendering is one template pass per tool on every request; a server
+        whose worker never reads the seeds must not render them."""
+        for algorithm in (None, "EAGLE"):
+            with self.subTest(algorithm=algorithm):
+                chat = self._make_chat(algorithm)
+                adapted, _ = chat._convert_to_internal_request(self._request())
+                self.assertIsNone(adapted.sampling_params["custom_params"])
+
+    def test_tool_choice_none_does_not_render(self):
+        """tool_choice="none" leaves the template without tools; the hook must
+        use the same filtered tool list the prompt was rendered with."""
+        chat = self._make_chat("NGRAM")
+        adapted, _ = chat._convert_to_internal_request(
+            self._request(tool_choice="none")
+        )
+        self.assertIsNone(adapted.sampling_params["custom_params"])
 
 
 if __name__ == "__main__":

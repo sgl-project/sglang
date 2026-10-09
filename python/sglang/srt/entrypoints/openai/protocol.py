@@ -2273,6 +2273,7 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    ngram_corpus_seeds: Optional[List[List[int]]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

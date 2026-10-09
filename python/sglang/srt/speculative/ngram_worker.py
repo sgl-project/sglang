@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.sampling_params import get_request_ngram_corpus_seeds
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -79,6 +80,21 @@ def _derive_tree_links(
     return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
+def _collect_corpus_seeds(
+    *, reqs: list, seeded_rids: set[str]
+) -> tuple[list[list[int]], set[str]]:
+    seeds: list[list[int]] = []
+    new_rids: set[str] = set()
+    for req in reqs:
+        if req.rid in seeded_rids:
+            continue
+        # Remembered even without seeds, so custom_params is read once per
+        # request rather than on every decode step it stays in the batch.
+        new_rids.add(req.rid)
+        seeds.extend(get_request_ngram_corpus_seeds(req.sampling_params.custom_params))
+    return seeds, seeded_rids | new_rids
+
+
 class NGRAMWorker(BaseSpecWorker):
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
@@ -115,6 +131,8 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+        # Forgotten with _prev_decode_rids when the request leaves the batch.
+        self._seeded_rids: set = set()
         self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
@@ -156,6 +174,7 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+        self._seeded_rids = set()
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -279,6 +298,13 @@ class NGRAMWorker(BaseSpecWorker):
             # _update_ngram_corpus still reads the staging; fill it empty.
             self.prev_token_ids = []
             self.prev_accept_lens = [0] * bs
+
+        # Insert request seeds before the first draft, so it can already match them.
+        seeds, self._seeded_rids = _collect_corpus_seeds(
+            reqs=batch.reqs, seeded_rids=self._seeded_rids
+        )
+        if seeds:
+            self.ngram_corpus.batch_put(seeds)
 
         self.ngram_corpus.synchronize()
         batch_tokens = []
@@ -520,6 +546,7 @@ class NGRAMWorker(BaseSpecWorker):
             departed_rids = self._prev_decode_rids - cur_rids
             if departed_rids:
                 self.ngram_corpus.erase_match_state(list(departed_rids))
+                self._seeded_rids = self._seeded_rids - departed_rids
             self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 
