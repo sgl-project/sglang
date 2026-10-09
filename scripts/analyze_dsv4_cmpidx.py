@@ -112,17 +112,18 @@ def compare(tag, a_steps, b_steps):
     return n_lp, same_shape, prefill, n_pre
 
 
-def report_lhid(rows):
-    """Order-independent [LHID] verdict.
+def report_group(rows, key, label):
+    """Order-independent verdict for any md5-carrying tag.
 
-    Every request (4 miss + 1 hit) runs deterministically, so at a given
-    (ntok, lastpos, layer) the hidden-state md5 must be a *single* value across
-    all requests. A group with >1 distinct md5 is a REAL divergence at that
-    layer/step. This needs no request segmentation (robust to interleaving).
+    All requests are deterministic, so at a given (ntok, lastpos, layer) the
+    ``key`` value (md5 / logical) must be a SINGLE value across all requests.
+    A group with >1 distinct value is a REAL divergence at that layer/step.
+    Needs no request segmentation (robust to warmup/interleaving).
     """
     groups = defaultdict(set)
     for r in rows:
-        if "md5" not in r or r["md5"] == "empty":
+        v = r.get(key)
+        if v is None or v == "empty":
             continue
         try:
             ntok = int(r.get("ntok", "-1"))
@@ -131,23 +132,28 @@ def report_lhid(rows):
             continue
         if ntok <= 0 or lp < 0:
             continue
-        groups[(ntok, lp, _int(r, "layer"))].add(r["md5"])
+        groups[(ntok, lp, _int(r, "layer"))].add(v)
     div = [(lp, ly, sorted(s)) for (ntok, lp, ly), s in groups.items() if len(s) > 1]
     if not div:
-        print("  no divergence: every (ntok,lastpos,layer) group has one md5")
-        print("  -> hit and miss hidden IDENTICAL on all sampled layers/steps")
+        print(f"  [{label}] no divergence: every (ntok,lastpos,layer) group "
+              f"has one {key}")
+        print("  -> hit and miss identical on all sampled layers/steps")
         return
     div.sort(key=lambda t: (t[0], t[1]))
     lp0 = div[0][0]
-    print(f"  groups={len(groups)}  divergent_groups={len(div)}"
+    print(f"  [{label}] groups={len(groups)}  divergent={len(div)}"
           f"  first_lastpos={lp0}")
     print(f"  FIRST divergent step lastpos={lp0}; layers there = "
           f"{sorted(ly for lp, ly, _ in div if lp == lp0)}")
-    print("  sample (lastpos, layer, distinct_md5):")
+    print(f"  sample (lastpos, layer, distinct_{key}):")
     for lp, ly, s in div[:MAX_DIFF_SHOWN]:
-        print(f"     lastpos={lp} layer={ly}  md5s={s}")
+        print(f"     lastpos={lp} layer={ly}  {key}s={s}")
     if len(div) > MAX_DIFF_SHOWN:
         print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
+def report_lhid(rows):
+    report_group(rows, "md5", "LHID")
 
 
 def main(path):
@@ -178,6 +184,10 @@ def main(path):
         if tag == "LHID":
             print("\n== [LHID] per-layer hidden (order-independent) ==")
             report_lhid(rows)
+            continue
+        if tag == "C128KV":
+            print("\n== [C128KV] c128 compressed-KV (order-independent) ==")
+            report_group(rows, "logical", "C128KV")
             continue
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")
