@@ -264,8 +264,6 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
         with mock.patch.dict(
             os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
         ):
-            # capture_one_shape captures each tier once per attention variant;
-            # each capture's graph reads the layout returned for it.
             captured = {
                 variant: runner._capture_ragged_verify_layout(24)
                 for variant in ("candidate_unfiltered", "candidate_filtered")
