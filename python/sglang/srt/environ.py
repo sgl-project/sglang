@@ -602,6 +602,7 @@ class Envs:
     # ===================================================================
     # Scheduler token budgeting and admission
     # ===================================================================
+    SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
