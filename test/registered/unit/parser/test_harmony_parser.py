@@ -1,5 +1,6 @@
 """Unit tests for srt/parser/harmony_parser.py"""
 
+import re
 import unittest
 
 from sglang.srt.parser.harmony_parser import (
@@ -558,12 +559,87 @@ class TestEdgeCases(CustomTestCase):
         """Test handling of malformed channel headers."""
         parser = HarmonyParser()
 
-        # Unknown channel type
+        # Unknown channel type: parsed as reasoning, not held.
         text = "<|channel|>unknown<|message|>content<|end|>"
         events = parser.parse(text)
 
-        # Should be held as incomplete since channel is unknown
-        self.assertEqual(len(events), 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "reasoning")
+        self.assertEqual(events[0].content, "content")
+
+    def test_unknown_first_channel_keeps_later_final(self):
+        """A response that opens on an invented channel keeps its final answer.
+
+        gpt-oss models sometimes open on a channel outside the Harmony set
+        (``verdict``, ``partial``, ...) before a valid final block. Holding the
+        unknown block used to drop everything after it, so the client received
+        an empty message although tokens were generated.
+        """
+        text = (
+            "<|channel|>verdict<|message|>Deciding.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>0<|return|>"
+        )
+
+        strategy = CanonicalStrategy()
+        events, remaining = strategy.parse(text)
+        self.assertEqual(
+            [(e.event_type, e.content) for e in events],
+            [("reasoning", "Deciding."), ("normal", "0")],
+        )
+        self.assertEqual(remaining, "")
+
+        parser = HarmonyParser()
+        events = parser.parse(text) + parser.parse("")
+        self.assertEqual(
+            [(e.event_type, e.content) for e in events],
+            [("reasoning", "Deciding."), ("normal", "0")],
+        )
+
+    def test_unknown_channel_ending_in_return_is_the_answer(self):
+        """An unknown channel closed by <|return|> carries the final answer."""
+        strategy = CanonicalStrategy()
+        events, remaining = strategy.parse("<|channel|>raw<|message|>1<|return|>")
+        self.assertEqual([(e.event_type, e.content) for e in events], [("normal", "1")])
+        self.assertEqual(remaining, "")
+
+    def test_unknown_channel_without_terminator_is_held(self):
+        """A truncated unknown block is still incomplete, not emitted."""
+        strategy = CanonicalStrategy()
+        events, remaining = strategy.parse("<|channel|>partial<|message|>cut off")
+        self.assertEqual(events, [])
+        self.assertEqual(remaining, "<|channel|>partial<|message|>cut off")
+
+    def test_unknown_first_channel_streams_like_oneshot(self):
+        """Chunked parsing of an unknown-first response matches one-shot parsing."""
+        text = (
+            "<|channel|>backward<|message|>Thinking it through.<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>0<|return|>"
+        )
+        oneshot = HarmonyParser()
+        expected = oneshot.parse(text) + oneshot.parse("")
+        # Stream in token-sized pieces: special tokens arrive whole, as the
+        # tokenizer emits them, and plain text arrives a few characters at a time.
+        pieces = []
+        for part in re.split(r"(<\|[a-z]+\|>)", text):
+            if part.startswith("<|"):
+                pieces.append(part)
+            else:
+                pieces.extend(part[i : i + 4] for i in range(0, len(part), 4))
+        streamed = HarmonyParser()
+        events = []
+        for piece in pieces:
+            events += streamed.parse(piece)
+        events += streamed.parse("")
+        self.assertEqual(
+            [
+                (kind, "".join(e.content for e in events if e.event_type == kind))
+                for kind in ("reasoning", "normal")
+            ],
+            [
+                (kind, "".join(e.content for e in expected if e.event_type == kind))
+                for kind in ("reasoning", "normal")
+            ],
+        )
 
     def test_mixed_unknown_tokens(self):
         """Test handling of mixed unknown tokens."""
