@@ -929,8 +929,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
-                        if written > 0:
+                        if written is not None:
                             self.writing_check(write_back=True)
+                            self._demote(node_id, tracker)
+                        elif self.tree_core.is_backuped(node_id):
+                            # The Full KV is on host, so only component state is lost.
+                            logger.warning(
+                                "write_back: component state backup failed under "
+                                "host memory pressure, demoting node %d with its "
+                                "Full KV only",
+                                node_id,
+                            )
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
@@ -1551,7 +1560,7 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        if written is None:
             return False
         self.writing_check(write_back=True)
         return True
@@ -1574,8 +1583,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
-    ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+    ) -> Optional[int]:
+        """Run a backup action top-down, stopping at the first failed backup.
+        Returns the Full KV tokens written (0 for a component-only backup), or
+        None when nothing reached host."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -1583,7 +1594,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
-            return 0
+            return None
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -1596,7 +1607,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
-                return 0
+                return None
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
