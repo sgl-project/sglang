@@ -249,16 +249,14 @@ class Siglip2MLP(nn.Module):
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
-            tp_rank=0 if use_data_parallel else None,
-            tp_size=1 if use_data_parallel else None,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
-            tp_rank=0 if use_data_parallel else None,
-            tp_size=1 if use_data_parallel else None,
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

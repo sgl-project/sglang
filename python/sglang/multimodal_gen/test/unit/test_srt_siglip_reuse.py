@@ -109,8 +109,9 @@ def test_siglip2_propagates_backend_and_parallelism(replicated):
     assert attn.call_args.kwargs["qkv_backend"] == ("sdpa" if replicated else None)
     assert attn.call_args.kwargs["use_data_parallel"] is replicated
     for linear in (fc1, fc2):
-        assert linear.call_args.kwargs["tp_size"] == (1 if replicated else None)
-        assert linear.call_args.kwargs["tp_rank"] == (0 if replicated else None)
+        assert linear.call_args.kwargs["parallel_group"] == (
+            "replicated" if replicated else "tp"
+        )
 
 
 @pytest.mark.parametrize("mask_ndim", [1, 2, 3])
