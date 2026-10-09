@@ -12,7 +12,8 @@ export const MiniMaxM25Deployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     gpuCount: {
@@ -20,6 +21,9 @@ export const MiniMaxM25Deployment = () => {
       title: 'GPU Count',
       getDynamicItems: (values) => {
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
+        if (values.hardware === 'xeon') {
+          return [{ id: 'tp6', label: 'TP=6', default: true, disabled: false }];
+        }
         return [
           {
             id: '2gpu',
@@ -66,6 +70,7 @@ export const MiniMaxM25Deployment = () => {
     const { hardware, gpuCount, thinking, toolcall } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
+    const isXeon = hardware === 'xeon';
     if (gpuCount === '2gpu' && !isAMD) {
       return '# Please select compatible hardware\n# 2-GPU requires AMD MI300X/MI325X/MI355X';
     }
@@ -82,7 +87,10 @@ export const MiniMaxM25Deployment = () => {
     cmd += 'python -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelName}`;
 
-    if (gpuCount === '8gpu') {
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      cmd += ` \\\n  --tp 6`;
+    } else if (gpuCount === '8gpu') {
       cmd += ` \\\n  --tp 8`;
       cmd += ` \\\n  --ep 8`;
     } else if (gpuCount === '4gpu') {
@@ -107,6 +115,10 @@ export const MiniMaxM25Deployment = () => {
 
     cmd += ` \\\n  --trust-remote-code`;
     cmd += ` \\\n  --mem-fraction-static 0.85`;
+
+    if (isXeon) {
+      cmd += ` \\\n  --dtype bfloat16`;
+    }
 
     if (isBlackwell) {
       cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm_routed`;

@@ -50,12 +50,13 @@ export const Qwen3NextDeployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
       ],
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null
+      commandRule: (value, values) => value !== 'enabled' ? null : values.hardware === 'xeon'
+        ? '--speculative-algorithm NGRAM'
+        : '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4'
     },
     mambaCache: {
       name: 'mambaCache',
@@ -127,7 +128,7 @@ export const Qwen3NextDeployment = () => {
         continue;
       }
       if (option.commandRule) {
-        const rule = option.commandRule(values[key]);
+        const rule = option.commandRule(values[key], values);
         if (rule) {
           cmd += ` \\\n  ${rule}`;
         }

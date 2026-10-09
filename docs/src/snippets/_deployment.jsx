@@ -817,7 +817,8 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     const modelName = resolveModelName(sel);
     if (cell.pd && cell.commands) return interpolate(cell.commands[mode] || cell.commands.python, envValues, modelName);
     const nnodes = cellNnodes(cell, sel);
-    const multinode = nnodes > 1;
+    // Xeon's "nodes" selector sizes --tp-size, not a real multi-machine launch.
+    const multinode = nnodes > 1 && sel.hw !== "xeon";
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
     const flags = overlayCompose(cell.flags, sel);
     if (multinode) {
@@ -926,6 +927,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             "  -v /etc/ascend_install.info:/etc/ascend_install.info",
             "  -v /var/queue_schedule:/var/queue_schedule",
             "  -v ~/.cache/:/root/.cache/",
+          ]
+        : vendorOf(sel.hw) === "cpu"
+        ? [
+            // CPU-only hardware (e.g. Xeon): no GPU device passthrough.
+            "docker run",
+            "  --shm-size 32g",
           ]
         : [
             "docker run --gpus all",
@@ -1319,9 +1326,21 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       }
     }
     for (const [key, bounds] of Object.entries(commandBuilder.resource?.limits || {})) {
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(out)) {
+        out[key] = bounds.disabledValue ?? 0;
+        continue;
+      }
       const fallback = Number(commandBuilder.defaultSelection?.[key] ?? bounds.min ?? 1);
       const value = Number.parseInt(out[key], 10);
-      out[key] = Math.min(bounds.max, Math.max(bounds.min, Number.isFinite(value) ? value : fallback));
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(out)
+        : (bounds.allowedValues || []);
+      const bounded = Math.min(bounds.max, Math.max(bounds.min, Number.isFinite(value) ? value : fallback));
+      out[key] = values.length
+        ? values.reduce((closest, candidate) =>
+            Math.abs(candidate - bounded) < Math.abs(closest - bounded) ? candidate : closest,
+          values[0])
+        : bounded;
     }
     for (const key of ["tp_size", "ulysses_degree", "ring_degree"]) {
       const value = Number.parseInt(out[key], 10);
@@ -1651,9 +1670,15 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             nodes: resourcesFollowPlatformDefault
               ? (nextRecipe?.nodes ?? next.nodes)
               : next.nodes,
-            gpus_per_node: resourcesFollowPlatformDefault
-              ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
-              : next.gpus_per_node,
+            gpus_per_node: (() => {
+              const bounds = commandBuilder.resource?.limits?.gpus_per_node;
+              if (typeof bounds?.disabledWhen === "function" && bounds.disabledWhen(next)) {
+                return bounds.disabledValue ?? 0;
+              }
+              return resourcesFollowPlatformDefault
+                ? (nextRecipe?.gpus_per_node ?? next.gpus_per_node)
+                : next.gpus_per_node;
+            })(),
             topology_mode: "auto",
             tp_size: resourcesFollowPlatformDefault
               ? (nextRecipe?.tp_size ?? 1)
@@ -1700,11 +1725,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     commit(value);
   };
 
-  const renderBuilderNumberInput = ({ identity, value, min, max, label, onCommit }) => (
+  const renderBuilderNumberInput = ({ identity, value, min, max, label, disabled, onCommit }) => (
     <input
       key={identity}
       type="number"
       inputMode="numeric"
+      disabled={disabled}
       min={min}
       max={max}
       step="1"
@@ -1727,7 +1753,15 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     if (!commandBuilder) return;
     const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
     setSel((prev) => {
-      const value = Math.min(bounds.max, Math.max(bounds.min, Number(prev[key]) + delta));
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(prev)) return prev;
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(prev)
+        : (bounds.allowedValues || []);
+      const current = Number(prev[key]);
+      const value = values.length
+        ? values[Math.max(0, Math.min(values.length - 1,
+            values.findIndex((candidate) => candidate === current) + delta))]
+        : Math.min(bounds.max, Math.max(bounds.min, current + delta));
       return normalizeBuilderSelection({ ...prev, [key]: value, topology_mode: "auto" });
     });
   };
@@ -1737,11 +1771,22 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     const value = Number.parseInt(rawValue, 10);
     if (!Number.isFinite(value)) return;
     const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
-    setSel((prev) => normalizeBuilderSelection({
+    setSel((prev) => {
+      if (typeof bounds.disabledWhen === "function" && bounds.disabledWhen(prev)) return prev;
+      const values = typeof bounds.allowedValues === "function"
+        ? bounds.allowedValues(prev)
+        : (bounds.allowedValues || []);
+      const bounded = Math.min(bounds.max, Math.max(bounds.min, value));
+      return normalizeBuilderSelection({
       ...prev,
-      [key]: Math.min(bounds.max, Math.max(bounds.min, value)),
+      [key]: values.length
+        ? values.reduce((closest, candidate) =>
+            Math.abs(candidate - bounded) < Math.abs(closest - bounded) ? candidate : closest,
+          values[0])
+        : bounded,
       topology_mode: "auto",
-    }));
+      });
+    });
   };
 
   const editBuilderTopology = (key, value) => {
@@ -1964,6 +2009,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
 
     const renderStepper = (key, label, detail) => {
       const bounds = commandBuilder.resource?.limits?.[key] || { min: 1, max: 8 };
+      const disabled = typeof bounds.disabledWhen === "function" && bounds.disabledWhen(sel);
       return (
         <div className="sgd-builder-stepper-field">
           <div>
@@ -1974,7 +2020,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             <button
               type="button"
               aria-label={`Decrease ${label}`}
-              disabled={Number(sel[key]) <= bounds.min}
+              disabled={disabled || Number(sel[key]) <= bounds.min}
               onClick={() => updateBuilderResource(key, -1)}
             >−</button>
             {renderBuilderNumberInput({
@@ -1983,12 +2029,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               min: bounds.min,
               max: bounds.max,
               label,
+              disabled,
               onCommit: (value) => setBuilderResource(key, value),
             })}
             <button
               type="button"
               aria-label={`Increase ${label}`}
-              disabled={Number(sel[key]) >= bounds.max}
+              disabled={disabled || Number(sel[key]) >= bounds.max}
               onClick={() => updateBuilderResource(key, 1)}
             >+</button>
           </div>
@@ -2284,7 +2331,11 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             <div className="sgd-builder-node-fields">
               <label>
                 <span>Head address</span>
-                <input value={builderHeadAddress} onChange={(event) => setBuilderHeadAddress(event.target.value)} />
+                <input
+                  value={builderHeadAddress}
+                  disabled={sel.hw === "xeon"}
+                  onChange={(event) => setBuilderHeadAddress(event.target.value)}
+                />
               </label>
               <label>
                 <span>Node rank</span>
@@ -2294,6 +2345,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
                   min: 0,
                   max: Number(sel.nodes) - 1,
                   label: "Node rank",
+                  disabled: sel.hw === "xeon",
                   onCommit: setBuilderNodeRank,
                 })}
               </label>

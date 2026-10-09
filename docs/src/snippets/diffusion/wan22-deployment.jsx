@@ -8,6 +8,7 @@
             { id: 'b200', label: 'B200', default: true },
             { id: 'b300', label: 'B300', default: false },
             { id: 'h200', label: 'H200', default: false },
+            { id: 'xeon', label: 'XEON', default: false },
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
             { id: 'mi355x', label: 'MI355X', default: false },
@@ -105,7 +106,13 @@
 
       const handleRadioChange = (optionName, itemId) => {
         setValues((prev) => {
+          if (optionName === 'bestPractice' && prev.hardware === 'xeon') {
+            return prev;
+          }
           const next = { ...prev, [optionName]: itemId };
+          if (optionName === 'hardware' && itemId === 'xeon') {
+            next.bestPractice = 'off';
+          }
           if (optionName === 'task') {
             next.modelsize = itemId === 'ti2v' ? '5b' : '14b';
           }
@@ -133,6 +140,16 @@
         const config = modelConfigs[configKey];
         if (!config) {
           return '# Error: Invalid configuration';
+        }
+
+        if (hardware === 'xeon') {
+          let command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size 4`;
+          if (selectedLoraPath && selectedLoraPath !== 'none') {
+            command += ` \\\n  --lora-path ${selectedLoraPath}`;
+          }
+          return command;
         }
 
 
@@ -220,13 +237,15 @@ const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark 
                 <div style={titleStyle}>{option.title}</div>
                 <div style={itemsStyle}>
                   {itemsToDisplay.map((item) => {
+                    const isDisabled = key === 'bestPractice' && values.hardware === 'xeon';
                     const isChecked = values[option.name] === item.id;
                     return (
-                      <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                      <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}>
                         <input
                           type="radio"
                           name={option.name}
                           checked={isChecked}
+                          disabled={isDisabled}
                           onChange={() => handleRadioChange(key, item.id)}
                           style={{ display: 'none' }}
                         />
@@ -254,12 +273,14 @@ const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark 
               )}
               {availableLoras.map((lora) => {
                 const isSelected = values.selectedLoraPath === lora.path;
+                const isDisabled = values.hardware === 'xeon';
                 return (
                   <label
                     key={lora.id}
-                    style={{ ...labelBaseStyle, ...(isSelected ? checkedStyle : {}) }}
+                    style={{ ...labelBaseStyle, ...(isSelected ? checkedStyle : {}), ...(isDisabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}
                     onClick={(event) => {
                       event.preventDefault();
+                      if (isDisabled) return;
                       handleLoraToggle(lora.path);
                     }}
                   >
@@ -267,6 +288,7 @@ const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark 
                       type="radio"
                       name="loraModelSelection"
                       checked={isSelected}
+                      disabled={isDisabled}
                       readOnly
                       style={{ display: 'none' }}
                     />
