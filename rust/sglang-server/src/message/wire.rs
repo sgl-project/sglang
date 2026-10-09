@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use sglang_api_types::api::v1 as api;
 
-use super::multimodal::{MmDataInput, MmItem};
+use super::multimodal::{MediaHints, MmDataInput, MmItem};
 use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
 use super::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
@@ -81,10 +81,13 @@ pub fn string_list_or_list(v: api::StringListOrList) -> Option<OneOrMany<Vec<Str
 pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
     use api::media_item::Value;
     match item.value {
-        // Only `url` reaches the Rust MM pipeline: the hints are read by model
-        // families it does not run (Python's `load_image` reduces an item to
-        // `.url` the same way).
-        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref { url: r.url }),
+        // Only `url` and the hints a Rust processor reads reach the MM
+        // pipeline; the rest serve model families it does not run (Python's
+        // `load_image` reduces an item to `.url` the same way).
+        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
+            url: r.url,
+            hints: MediaHints { fps: r.fps },
+        }),
         Some(Value::Ref(_)) => Err(Error::Validation(
             "a multimodal item object needs a non-empty `url`".into(),
         )),
@@ -353,8 +356,11 @@ mod tests {
         let src = |s: &str| MmItem::Source(s.to_owned());
         assert_eq!(conv(r#""u""#), MmDataInput::One(src("u")));
         assert_eq!(
-            conv(r#"{"url": "u", "detail": "high"}"#),
-            MmDataInput::One(MmItem::Ref { url: "u".into() })
+            conv(r#"{"url": "u", "detail": "high", "fps": 2.0}"#),
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                hints: MediaHints { fps: Some(2.0) },
+            })
         );
         assert_eq!(
             conv(r#"["a", null, "b"]"#),

@@ -1007,7 +1007,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
     ]:
-        if not texts or self.tokenizer is None:
+        if (
+            texts is None
+            or (isinstance(texts, list) and len(texts) == 0)
+            or self.tokenizer is None
+        ):
             raise ValueError("texts cannot be empty and tokenizer must be initialized")
 
         # Step 1: Detect input format and prepare for tokenization

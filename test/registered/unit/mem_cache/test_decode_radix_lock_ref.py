@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.common import Range
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -91,7 +90,7 @@ class MockReq:
         self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None, lock=None
     ):
         self.full_untruncated_fill_ids = array("q", fill_ids)
-        self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
+        self.extend_end = len(self.full_untruncated_fill_ids)
         self.origin_input_ids = array(
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
@@ -111,7 +110,7 @@ class MockReq:
         self.kv_rotation_base = None
 
     def get_fill_ids(self):
-        return self.full_untruncated_fill_ids[: self.extend_range.end]
+        return self.full_untruncated_fill_ids[: self.extend_end]
 
     rid = "mock-req"
     skip_radix_cache_insert = False
@@ -243,7 +242,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Match prefix (simulates _match_prefix_and_lock in pop_preallocated)
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
         self.assertEqual(prefix_len, 3)
 
         # Step 1: lock (pop_preallocated locks the matched node)
@@ -264,7 +263,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Step 2: checkpoint (dec old lock, inc new lock)
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         # Step 3: release_kv_cache (insert, free the rest, dec lock)
         req.finished_reason = "finished"
@@ -292,7 +291,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             MatchPrefixParams(key=RadixKey(array("q", full_ids)))
         )
         matched_node = result.last_device_node
-        self.assertEqual(len(result.device_indices), 0)  # no match
+        self.assertEqual(result.device_prefix_len, 0)  # no match
         # matched_node is root
 
         root_lock_before = cache.root_node.lock_ref
@@ -315,7 +314,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Step 2: checkpoint (dec root=no-op, inc new leaf)
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         # Step 3: cache_finished_req (dec leaf)
         req.finished_reason = "finished"
@@ -345,7 +344,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # Match and lock
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
 
         lock = cache.lock(matched_node)
         # Prefix tokens should now be protected (locked)
@@ -394,7 +393,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
-        prefix_len = len(result.device_indices)
+        prefix_len = result.device_prefix_len
         lock = cache.lock(matched_node)
 
         # Token sequence is 5 long; a 6th KV slot is committed with no token id.
@@ -661,7 +660,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
                 scheduler, SimpleNamespace(batch_size=lambda: 0)
             )
-        cache.checkpoint(req, up_to=req.extend_range.end)
+        cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
@@ -679,7 +678,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 MatchPrefixParams(key=RadixKey(array("q", prefix)))
             )
             matched_node = result.last_device_node
-            prefix_len = len(result.device_indices)
+            prefix_len = result.device_prefix_len
 
             lock = cache.lock(matched_node)
 
@@ -698,7 +697,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
                 lock=lock,
             )
 
-            cache.checkpoint(req, up_to=req.extend_range.end)
+            cache.checkpoint(req, up_to=req.extend_end)
             req.finished_reason = "finished"
             release_kv_cache(req, cache, checkpoint=True)
 

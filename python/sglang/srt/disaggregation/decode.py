@@ -1453,7 +1453,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
+                required_alloc_tokens = self._required_alloc_tokens(
+                    fill_len=self._pre_alloc_fill_len(decode_req.req), prefix_len=0
+                )
 
             full_required_for_admission = self._required_admission_tokens(
                 decode_req.req, required_alloc_tokens, prefix_len, retractable_tokens
@@ -1841,7 +1843,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def num_tokens_pre_allocated(self):
         return sum(
-            decode_req.req.extend_range.end
+            decode_req.req.extend_end
             for decode_req in self.transfer_queue.queue
             if not decode_req.host_staged
         )
@@ -2205,7 +2207,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Decode-disagg allocates before batch assembly, so it binds the prefix
         # here instead of in init_next_round_input.
         req.prefix_len = prefix_len
-        req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
+        req.extend_end = req.kv.kv_committed_len
         self.tree_cache.maybe_hand_to_session(req)
 
         # Return the transfer destination indices:
@@ -3158,7 +3160,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:
-                    req.set_extend_range(req.prefix_len, req.kv.kv_committed_len)
+                    req.extend_end = req.kv.kv_committed_len
             else:
                 waiting_queue.append(req)
 
