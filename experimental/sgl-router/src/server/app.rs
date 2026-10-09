@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
@@ -182,6 +182,16 @@ async fn log_413(req: Request, next: Next) -> Response {
     resp
 }
 
+/// A Messages route: body limit, 413 logging and the Anthropic 413 envelope.
+fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppContext>> {
+    route
+        .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+        .layer(middleware::from_fn(log_413))
+        .layer(middleware::from_fn(
+            crate::server::routes::messages::envelope_413,
+        ))
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
@@ -204,6 +214,14 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             post(crate::server::routes::chat::chat_completions)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/messages",
+            messages_route(post(crate::server::routes::messages::messages)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            messages_route(post(crate::server::routes::messages::count_tokens)),
         )
         .route(
             "/generate",
