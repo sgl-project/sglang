@@ -205,3 +205,6 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[patch.crates-io]
+openai-protocol = { path = "vendor/openai-protocol" }

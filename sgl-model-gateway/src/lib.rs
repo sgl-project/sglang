@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod chat_protocol_tests;
 pub mod app_context;
 pub use smg_auth as auth;
 pub mod config;
