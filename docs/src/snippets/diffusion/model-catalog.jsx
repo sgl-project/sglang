@@ -174,6 +174,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
     },
     {
+      name: "Wan-Animate-2",
+      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
+    },
+    {
       name: "FastWan / TurboWan",
       modelIds: [
         "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",

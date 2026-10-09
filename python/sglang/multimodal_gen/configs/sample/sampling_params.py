@@ -538,6 +538,14 @@ class SamplingParams:
         """Number of final samples produced by one expanded scheduler request."""
         return 1
 
+    def should_use_classifier_free_guidance(self) -> bool:
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        return cfg_scale > 1.0 and self.negative_prompt is not None
+
     @classmethod
     def default_image_output_format(cls) -> str | None:
         """Return a model-owned default format for the image API, if any."""

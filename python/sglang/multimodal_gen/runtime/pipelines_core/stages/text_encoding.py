@@ -411,11 +411,7 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: (
-                not batch.do_classifier_free_guidance
-                or V.string_not_none(x)
-                or isinstance(x, str)
-            ),
+            lambda x: not batch.do_classifier_free_guidance or isinstance(x, str),
         )
         result.add_check(
             "do_classifier_free_guidance",

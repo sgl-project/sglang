@@ -394,13 +394,7 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        # Prefer true_cfg_scale when it is explicitly provided.
-        cfg_scale = (
-            self.true_cfg_scale
-            if self.true_cfg_scale is not None
-            else self.guidance_scale
-        )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if self.sampling_params.should_use_classifier_free_guidance():
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
