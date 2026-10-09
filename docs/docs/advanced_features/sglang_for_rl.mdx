@@ -21,6 +21,99 @@ This philosophy empowers innovation by providing SGLang as flexible tools, not r
 
 The following sections cover these aspects in detail.
 
+## Use SGLang with Halo
+
+[Halo](https://github.com/whitecircle/halo) is an open-source, Hugging Face-native framework for training language and multimodal models. Its shared launcher and YAML config system cover pre-training, SFT, LoRA, preference optimization, self-distillation, online RL, and asynchronous environmental GRPO.
+
+One model integration works across these methods and their supported parallelism modes. Halo adds FSDP2, EP, CP, TP, and ETP around the original Transformers model instead of maintaining a separate Megatron implementation. It runs on one GPU or multiple nodes, and its checkpoints still load with standard `from_pretrained`. Advanced parallelism support for a new model family usually needs 40 to 140 lines of wrapper code.
+
+In [published benchmarks](https://github.com/whitecircle/halo/blob/main/human-docs/performance.md), Halo trained the measured models at 2.3–2.8× stock TRL throughput with lower peak memory. The comparison matched models, data, precision, and kernels.
+
+For asynchronous environmental GRPO, Halo runs SGLang as a separate rollout service and sends current model weights over NCCL. This keeps rollout generation on the latest policy without saving and reloading a checkpoint after each training step.
+
+### Prerequisites
+
+- An NVIDIA CUDA system with separate GPUs for the rollout server and trainer
+- Docker with the NVIDIA Container Toolkit and Docker Compose
+
+### Start the rollout server
+
+Clone Halo and pull its SGLang image. The image uses the same NCCL runtime as the Halo training image, which is required for live weight synchronization.
+
+```bash
+git clone --branch main https://github.com/whitecircle/halo.git
+cd halo
+docker pull public.ecr.aws/whitecircle/halo:sglang-0.5.17
+```
+
+This example serves the public `Qwen/Qwen3-4B-Instruct-2507` model on GPU 0. The compose file defaults to tensor parallel size 1.
+
+```bash
+SGLANG_IMAGE=public.ecr.aws/whitecircle/halo:sglang-0.5.17 \
+SGLANG_MODEL=Qwen/Qwen3-4B-Instruct-2507 \
+SGLANG_CUDA_DEVICES=0 \
+  docker compose -f docker-compose.sglang.yml up -d sglang-server
+
+curl --fail http://localhost:30000/health
+```
+
+Run the Halo trainer on different GPUs from those in `SGLANG_CUDA_DEVICES`.
+
+### Configure Halo
+
+Copy Halo's complete environmental GRPO template, then set its dataset and environment fields for your task:
+
+```bash
+cp examples/grpo/environmental/environmental-grpo-template.yaml qwen3-sglang-grpo.yaml
+```
+
+In `qwen3-sglang-grpo.yaml`, use the same model as the server, select SGLang, and synchronize after every optimizer step:
+
+```yaml
+model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+rollout_backend: sglang
+rollout_server_configs:
+  - url: http://localhost:30000
+    group_port: 51216
+sync_weights_every_n_steps: 1
+train_on_sampled_tokens: true
+```
+
+### Launch training
+
+Halo runs training inside an architecture-specific image. This command uses the Hopper image and GPU 1 for the trainer, while the rollout server continues to use GPU 0:
+
+```bash
+docker pull public.ecr.aws/whitecircle/halo:hopper
+
+docker run --rm --gpus all \
+  --network host \
+  --ipc=host \
+  --shm-size=128g \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  -e CUDA_VISIBLE_DEVICES=1 \
+  -v "$PWD:/workspace" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -w /workspace \
+  public.ecr.aws/whitecircle/halo:hopper \
+  halo launch environmental-grpo qwen3-sglang-grpo.yaml -n 1 --report_to=none
+```
+
+On B200 or B300, replace the `hopper` image tag with `blackwell`. To use more trainer GPUs, add them to `CUDA_VISIBLE_DEVICES` and set `-n` to the number of listed GPUs. Do not include a GPU used by the rollout server.
+
+### Enable routed-expert replay
+
+For a supported MoE model, set `SGLANG_ENABLE_R3=1` when you start the server and keep the compose file's `SGLANG_MOE_RUNNER_BACKEND=triton` default. Then add this setting to the Halo config:
+
+```yaml
+routing_replay: rollout
+```
+
+This makes the training forward pass reuse the experts selected during rollout. The dense Qwen model in the base example does not use routing replay. Model support and required server settings are listed in Halo's [rollout server reference](https://github.com/whitecircle/halo/blob/main/human-docs/rollout-servers.md).
+
+For a complete multi-turn workflow with dataset preparation, model-specific settings, training commands, and evaluation, follow the [Halo environmental GRPO cookbook](https://github.com/whitecircle/halo/blob/main/human-docs/cookbooks/halo-gpt-oss-cookbook.md).
+
 ## Fine-Grained Engine Sleep and Wake Up
 
 Rollout and training are both memory-intensive, and co-locating them on the same GPUs often leads to memory pressure and slow handoffs. SGLang provides a memory-aware sleep/wake mechanism that releases KV cache and weights while keeping the server process alive, then resumes them for rollout without a full restart. This avoids repeated disk I/O and CUDA graph recapture during each RL step.
