@@ -35,7 +35,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.cont
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -149,6 +149,17 @@ class DecoderReplayGraphs:
         self._stream = None
         self.capture_seconds = 0.0
         self.capture_bytes = 0
+        self._warm = False
+
+    def ready(self, num_tokens: int) -> bool:
+        """Whether graphs may run from this step on. Some kernels size their cached
+        workspaces lazily by row count and reallocate them when a bigger step
+        comes, which would leave an earlier capture reading freed memory; a step
+        of a full prefill chunk has grown them all, so capture waits for one."""
+        if not self._warm:
+            chunk = get_schedule().chunked_prefill_size
+            self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
+        return self._warm
 
     def bucket_rows(self, num_rows: int) -> Optional[int]:
         if num_rows == 0 or num_rows > self.max_rows:
