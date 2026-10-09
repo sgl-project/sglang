@@ -48,6 +48,7 @@ limitations under the License.
 #include <cutlass/util/packed_stride.hpp>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
