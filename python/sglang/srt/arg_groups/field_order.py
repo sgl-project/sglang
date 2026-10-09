@@ -205,6 +205,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_lean_attention",
     "prefill_attention_backend",
     "sampling_backend",
+    "sampling_filter_order",
     "grammar_backend",
     "radix_cache_backend",
     "mm_attention_backend",

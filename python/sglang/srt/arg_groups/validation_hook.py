@@ -265,6 +265,8 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    if cfg.sampling_filter_order not in ("top_k_first", "joint"):
+        raise ValueError("--sampling-filter-order must be top_k_first or joint")
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.

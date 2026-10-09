@@ -21,7 +21,8 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.sampling.filtered_probs import renorm_top_k_top_p
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -934,22 +935,23 @@ def eagle_sample(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+        target_probs = renorm_top_k_top_p(
+            target_probs,
+            torch.repeat_interleave(
+                sampling_info.top_ks, verify_input.draft_token_num, dim=0
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+            if sampling_info.need_top_k_sampling
+            else None,
+            torch.repeat_interleave(
+                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+            )
+            if sampling_info.need_top_p_sampling
+            else None,
+            get_exec().kernel.sampling_filter_order,
+            top_k_renorm=top_k_renorm_prob,
+            top_p_renorm=top_p_renorm_prob,
+        )
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k/top_p")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
