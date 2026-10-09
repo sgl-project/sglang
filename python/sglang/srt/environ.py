@@ -1336,6 +1336,9 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # SM100: DSA / DeepSeek-V4.1 decode index top-k from DeepGEMM's score histogram
+    # (LiteTopK); needs a DeepGEMM whose paged MQA logits take `histogram=`.
+    SGLANG_OPT_LITETOPK_DECODE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

@@ -2139,6 +2139,28 @@ class DeepseekV4AttnBackend(
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
 
+        litetopk = self.full_topk_indexer.litetopk
+        mode = forward_batch.forward_mode
+        if (
+            litetopk is not None
+            and isinstance(metadata, DSV4Metadata)
+            and (mode.is_decode() or mode.is_target_verify())
+            and metadata.core_metadata.low_ratios
+        ):
+            request_indices = metadata.low_ratio_req_indices
+            if request_indices is None:
+                request_indices = token_req_indices(forward_batch)
+            tokens_per_request = (
+                int(forward_batch.spec_info.draft_token_num)
+                if mode.is_target_verify()
+                else 1
+            )
+            for paged in (metadata.c1_indexer_metadata, metadata.c2_indexer_metadata):
+                if paged is not None:
+                    litetopk.prepare_metadata(
+                        paged, request_indices, tokens_per_request
+                    )
+
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
     ) -> torch.Tensor:
