@@ -42,13 +42,55 @@ def _hash_value(digest, value) -> None:
         digest.update(text)
 
 
-def _row(value, index: int, batch: int):
-    """Row ``index`` of a batched ComfyUI argument; unbatched values pass through."""
-    if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch:
-        return value[index : index + 1]
+# transformer_options entries with one item per cond chunk; the rest is shared
+# apart from "sigmas", which holds one item per row of a single chunk.
+_PER_CHUNK_TRANSFORMER_OPTIONS = ("cond_or_uncond", "uuids")
+
+
+def _slice_batch_row(value, index: int, batch: int):
+    """Row ``index`` of a batched ComfyUI argument.
+
+    ComfyUI concatenates every cond-derived kwarg to the full batch, so a
+    leading dim of ``batch`` is per-row and 1 is shared; any other size is
+    ambiguous and rejected rather than guessed.
+    """
+    if torch.is_tensor(value):
+        if value.ndim == 0 or value.shape[0] == 1:
+            return value
+        if value.shape[0] == batch:
+            return value[index : index + 1]
+        raise ValueError(
+            f"cannot split a batch of {batch} on a tensor of shape {tuple(value.shape)}"
+        )
     if type(value) in (list, tuple):
-        return type(value)(_row(item, index, batch) for item in value)
+        return type(value)(_slice_batch_row(item, index, batch) for item in value)
+    if type(value) is dict:
+        return {
+            key: _slice_batch_row(item, index, batch) for key, item in value.items()
+        }
     return value
+
+
+def _slice_transformer_options(options, index: int, batch: int):
+    """Shared options pass through; only the per-chunk entries are sliced."""
+    if not isinstance(options, dict):
+        return options
+    sliced = dict(options)
+    for key in _PER_CHUNK_TRANSFORMER_OPTIONS:
+        value = options.get(key)
+        if type(value) in (list, tuple) and value and batch % len(value) == 0:
+            # Each chunk holds batch // len rows.
+            sliced[key] = type(value)([value[index // (batch // len(value))]])
+    # ComfyUI sets sigmas to the timestep before repeating it per chunk.
+    sigmas = options.get("sigmas")
+    if torch.is_tensor(sigmas) and sigmas.ndim > 0 and sigmas.shape[0] > 1:
+        if batch % sigmas.shape[0] != 0:
+            raise ValueError(
+                f"cannot split a batch of {batch} on sigmas of shape {tuple(sigmas.shape)}"
+            )
+        row = index % sigmas.shape[0]
+        sliced["sigmas"] = sigmas[row : row + 1]
+    return sliced
 
 
 class SGLDiffusionExecutor(torch.nn.Module):
@@ -202,10 +244,17 @@ class SGLDiffusionExecutor(torch.nn.Module):
         return torch.cat(
             [
                 self._forward_one(
-                    _row(x, i, batch),
-                    _row(timestep, i, batch),
-                    _row(context, i, batch),
-                    **{key: _row(value, i, batch) for key, value in kwargs.items()},
+                    _slice_batch_row(x, i, batch),
+                    _slice_batch_row(timestep, i, batch),
+                    _slice_batch_row(context, i, batch),
+                    **{
+                        key: (
+                            _slice_transformer_options(value, i, batch)
+                            if key == "transformer_options"
+                            else _slice_batch_row(value, i, batch)
+                        )
+                        for key, value in kwargs.items()
+                    },
                 )
                 for i in range(batch)
             ]
