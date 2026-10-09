@@ -714,9 +714,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def deepseek_v4_attention_with_output(
+def _attention_with_output(
     query: torch.Tensor,
     key_value: torch.Tensor,
     output: torch.Tensor,
@@ -769,16 +767,31 @@ def deepseek_v4_attention_with_output(
     return
 
 
-bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
-    deepseek_v4_attention_with_output
-)
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def deepseek_v4_attention_with_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    _attention_with_output(
+        query, key_value, output, layer_id, compress_ratio, attn_sink, save_kv_cache
+    )
+
+
+# Eager breaks call the body directly; the op's dispatch is for the compiled split path.
+bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(_attention_with_output)
 
 
 def _late_kv_store_then_attention(attention, x, positions, qkv_a, *attn_args) -> None:
     # One break per late layer: nothing between the SWA store and the attention
     # reads the SWA cache (the low-ratio sources write the compressed caches).
     _late_kv_store(attention, x, positions, qkv_a)
-    deepseek_v4_attention_with_output(*attn_args)
+    _attention_with_output(*attn_args)
 
 
 bcg_late_kv_store_then_attention = eager_on_graph(True)(_late_kv_store_then_attention)
