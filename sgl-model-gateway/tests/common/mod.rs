@@ -24,13 +24,12 @@ use data_connector::{
 use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
 use smg::{
-    app_context::AppContext,
+    app_context::{request_limiters_from_config, AppContext},
     config::{RouterConfig, RoutingMode},
     core::{
         BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
         WorkerType,
     },
-    middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -291,20 +290,7 @@ impl AppTestContext {
 pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
-    // Initialize rate limiter
-    let rate_limiter = match config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let request_limiters = request_limiters_from_config(&config);
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -332,7 +318,8 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
-            .rate_limiter(rate_limiter)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
@@ -410,20 +397,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
-    // Initialize rate limiter
-    let rate_limiter = match config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let request_limiters = request_limiters_from_config(&config);
 
     // Initialize registries
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
@@ -456,7 +430,8 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
-            .rate_limiter(rate_limiter)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(reasoning_parser_factory)
             .tool_parser_factory(tool_parser_factory)
@@ -539,20 +514,7 @@ pub async fn create_test_context_with_mcp_config(
 
     let client = reqwest::Client::new();
 
-    // Initialize rate limiter
-    let rate_limiter = match config.max_concurrent_requests {
-        n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
-        }
-    };
+    let request_limiters = request_limiters_from_config(&config);
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -580,7 +542,8 @@ pub async fn create_test_context_with_mcp_config(
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
-            .rate_limiter(rate_limiter)
+            .admission_limiter(request_limiters.admission_limiter)
+            .rate_limiter(request_limiters.rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory

@@ -216,6 +216,7 @@ impl RouterConfigBuilder {
 
     pub fn disable_rate_limiting(mut self) -> Self {
         self.config.max_concurrent_requests = -1;
+        self.config.rate_limit_tokens_per_second = None;
         self
     }
 
@@ -862,5 +863,17 @@ mod tests {
             }
             _ => panic!("Expected CacheAware policy"),
         }
+    }
+
+    #[test]
+    fn disable_rate_limiting_disables_admission_and_local_qps() {
+        let config = RouterConfigBuilder::new()
+            .max_concurrent_requests(8)
+            .rate_limit_tokens_per_second(5)
+            .disable_rate_limiting()
+            .build_unchecked();
+
+        assert_eq!(config.max_concurrent_requests, -1);
+        assert_eq!(config.rate_limit_tokens_per_second, None);
     }
 }

@@ -90,13 +90,13 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
-    # Max concurrent requests for rate limiting (-1 to disable)
+    # Hard in-flight request lifecycle limit per Router Pod (<= 0, including -1, disables)
     max_concurrent_requests: int = -1
-    # Queue size for pending requests when max concurrent limit reached
+    # Total outstanding waiter cap when the hard in-flight limit is reached
     queue_size: int = 100
-    # Maximum time (in seconds) a request can wait in queue before timing out
+    # Per-request queue deadline in seconds
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Independent local QPS; unset/0 disables, positive R sets capacity/refill to R
     rate_limit_tokens_per_second: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
@@ -548,30 +548,30 @@ class RouterArgs:
             help="TCP keepalive idle time in seconds for upstream HTTP connections",
         )
 
-        # Rate limiting configuration
+        # Admission and local rate limiting configuration
         rate_limit_group.add_argument(
             f"--{prefix}max-concurrent-requests",
             type=int,
             default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
+            help="Hard in-flight request lifecycle limit per Router Pod. Values <= 0 (including -1) disable admission control.",
         )
         rate_limit_group.add_argument(
             f"--{prefix}queue-size",
             type=int,
             default=RouterArgs.queue_size,
-            help="Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)",
+            help="Total outstanding waiter cap when the hard in-flight limit is reached (0 = no queue, return 429 immediately)",
         )
         rate_limit_group.add_argument(
             f"--{prefix}queue-timeout-secs",
             type=int,
             default=RouterArgs.queue_timeout_secs,
-            help="Maximum time (in seconds) a request can wait in queue before timing out",
+            help="Per-request admission queue deadline in seconds",
         )
         rate_limit_group.add_argument(
             f"--{prefix}rate-limit-tokens-per-second",
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
-            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+            help="Optional independent local QPS. Unset/0 disables it; positive R sets token bucket capacity and refill rate to R.",
         )
 
         # Retry configuration
