@@ -3,7 +3,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_aware
+from sglang.srt.eplb.eplb_algorithms import (
+    deepseek,
+    deepseek_vec,
+    elasticity_aware,
+    topology_aware,
+)
 
 
 class EplbAlgorithm(Enum):
@@ -13,6 +18,7 @@ class EplbAlgorithm(Enum):
     deepseek_vec_hierarchical = auto()
     elasticity_aware = auto()
     elasticity_aware_hierarchical = auto()
+    topology_aware = auto()
     # TODO may have more algorithm later
 
 
@@ -23,7 +29,22 @@ def rebalance_experts(
     num_groups: Optional[int],
     num_nodes: int,
     algorithm: EplbAlgorithm,
+    tokens_per_source_expert: Optional[torch.Tensor] = None,
+    rank_cost_matrix: Optional[torch.Tensor] = None,
 ):
+    if algorithm == EplbAlgorithm.topology_aware:
+        if tokens_per_source_expert is None or rank_cost_matrix is None:
+            raise ValueError(
+                "topology-aware EPLB requires source-rank expert counts and "
+                "a rank cost matrix"
+            )
+        return topology_aware.rebalance_experts_topology_aware(
+            tokens_per_source_expert=tokens_per_source_expert,
+            rank_cost_matrix=rank_cost_matrix,
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+        )
+
     if algorithm in [EplbAlgorithm.deepseek, EplbAlgorithm.deepseek_hierarchical]:
         return deepseek.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),

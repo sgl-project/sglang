@@ -821,6 +821,11 @@ class ExecMoe(msgspec.Struct):
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
+    eplb_topology: A[
+        Optional[str],
+        "JSON file containing the EP rank-to-rank communication cost matrix for "
+        "topology-aware EPLB.",
+    ] = None
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
     ] = 1000

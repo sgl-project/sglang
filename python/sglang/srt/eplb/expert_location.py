@@ -178,6 +178,7 @@ class ExpertLocationMetadata:
         model_config: ModelConfig,
         logical_count: torch.Tensor,
         *,
+        logical_count_by_rank: Optional[torch.Tensor] = None,
         use_flat_topology: bool = False,
     ):
         if not isinstance(logical_count, torch.Tensor):
@@ -198,6 +199,45 @@ class ExpertLocationMetadata:
 
         from sglang.srt.eplb import eplb_algorithms
 
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=get_exec().moe.eplb_algorithm,
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+        )
+        rank_cost_matrix = None
+        tokens_per_source_expert = None
+        if algorithm == eplb_algorithms.EplbAlgorithm.topology_aware:
+            if use_flat_topology:
+                raise ValueError(
+                    "topology-aware EPLB does not support elastic flat topology"
+                )
+            if logical_count_by_rank is None:
+                raise ValueError("topology-aware EPLB requires logical_count_by_rank")
+            if get_exec().moe.eplb_topology is None:
+                raise ValueError("topology-aware EPLB requires --eplb-topology")
+            from sglang.srt.eplb.topology import load_rank_cost_matrix
+
+            rank_cost_matrix = load_rank_cost_matrix(
+                get_exec().moe.eplb_topology,
+                expected_num_ranks=common["ep_size"],
+            )
+            # The recorder exposes [source-rank, layer, expert], while the
+            # planner works layer-major to match the other EPLB algorithms.
+            if not isinstance(logical_count_by_rank, torch.Tensor):
+                logical_count_by_rank = torch.as_tensor(logical_count_by_rank)
+            expected_source_shape = (
+                common["ep_size"],
+                logical_count.shape[-2],
+                model_config_for_expert_location.num_logical_experts,
+            )
+            if tuple(logical_count_by_rank.shape) != expected_source_shape:
+                raise ValueError(
+                    "topology-aware EPLB source counts must have shape "
+                    f"{expected_source_shape}, got "
+                    f"{tuple(logical_count_by_rank.shape)}"
+                )
+            tokens_per_source_expert = logical_count_by_rank.movedim(0, 1)
+
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             eplb_algorithms.rebalance_experts(
                 tokens_per_expert=logical_count,
@@ -205,11 +245,9 @@ class ExpertLocationMetadata:
                 num_local_physical_experts=num_physical_experts // common["ep_size"],
                 num_groups=num_groups,
                 num_nodes=num_nodes,
-                algorithm=eplb_algorithms.compute_algorithm(
-                    raw_algorithm=get_exec().moe.eplb_algorithm,
-                    num_groups=num_groups,
-                    num_nodes=num_nodes,
-                ),
+                algorithm=algorithm,
+                tokens_per_source_expert=tokens_per_source_expert,
+                rank_cost_matrix=rank_cost_matrix,
             )
         )
 
@@ -793,7 +831,9 @@ def compute_initial_expert_location_metadata(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
         return ExpertLocationMetadata.init_by_eplb(
-            model_config, logical_count=data_dict["logical_count"]
+            model_config,
+            logical_count=data_dict["logical_count"],
+            logical_count_by_rank=data_dict.get("logical_count_by_rank"),
         )
     else:
         raise NotImplementedError(
