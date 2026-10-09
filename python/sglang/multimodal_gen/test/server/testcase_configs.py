@@ -37,6 +37,10 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.srt.environ import envs
+from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REPO,
+    SGL_TEST_FILES_CI_DATA_REVISION,
+)
 
 
 @dataclass
@@ -904,6 +908,35 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     output_size="960x960",
     num_frames=4,
     fps=4,
+)
+
+# Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
+# so the pinned revision must point at a commit that carries them.
+_WAN_2_2_ANIMATE_2_CI_INPUT_BASE = (
+    "https://raw.githubusercontent.com/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/inputs/wan_animate_2"
+)
+WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "Character appearance description: a smiling young woman with shoulder-length "
+        "dark hair, a mustard-yellow knit sweater, blue jeans and white sneakers. "
+        "Background description: a plain light-gray studio backdrop."
+    ),
+    image_path=f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/reference_short.jpg",
+    # The model reads `size` as an area budget and emits the 16-aligned canvas fitted to
+    # the reference aspect; 576x1024 (9:16, like the image) maps onto itself.
+    output_size="576x1024",
+    fps=16,
+    output_format="mp4",
+    # 24 driving frames at 16 fps pad to one 29-frame clip (get_padding_len),
+    # so the request denoises a single clip; output length follows the driving video.
+    extras={
+        "video_url": f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/driving_video_short.mp4",
+        "clip_len": 37,
+        "num_inference_steps": 8,
+        "seed": 42,
+    },
 )
 
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(

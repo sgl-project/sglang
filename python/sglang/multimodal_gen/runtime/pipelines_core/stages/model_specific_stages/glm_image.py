@@ -923,14 +923,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
-        self.default_sample_size = (
-            self.transformer.config.sample_size
-            if hasattr(self, "transformer")
-            and self.transformer is not None
-            and hasattr(self.transformer.config, "sample_size")
-            else 128
-        )
-
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
