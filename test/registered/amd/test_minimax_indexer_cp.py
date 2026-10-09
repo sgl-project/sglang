@@ -6,7 +6,8 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
+# indexer CP is gfx950-only, and the native selector needs more LDS than gfx942 has
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
