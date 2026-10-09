@@ -96,6 +96,43 @@ def _worker() -> int:
                     f"pipelined {(s_local, heads, head_dim, groups)} call {call}"
                 )
 
+    # fill: the caller writes each destination block itself (H3's QK-norm does),
+    # own blocks straight into this rank's receive slot
+    def transform(t, scale):
+        return (t.float() * scale + 1).to(t.dtype)
+
+    for s_local, heads, head_dim, groups in cases:
+        for call in range(3):
+            torch.manual_seed(2000 + 1000 * call + s_local)
+            full = [
+                torch.randn(
+                    s_local * world,
+                    heads,
+                    head_dim,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                for _ in range(3)
+            ]
+            q, k, v = (t.narrow(0, rank * s_local, s_local).contiguous() for t in full)
+
+            def fill(head_start, head_count, dst):
+                h = slice(head_start, head_start + head_count)
+                dst[..., :head_dim].copy_(transform(q[:, h], 2))
+                dst[..., head_dim : 2 * head_dim].copy_(transform(k[:, h], 3))
+                dst[..., 2 * head_dim :].copy_(v[:, h])
+
+            ref = sequential(transform(q, 2), transform(k, 3), v)
+            got = ulysses_pipelined_attention(q, k, v, _attend, groups, fill=fill)
+            if got is None:
+                failures.append(
+                    f"filled pipeline returned None for {(s_local, heads, head_dim, groups)}"
+                )
+            elif not torch.equal(ref, got):
+                failures.append(
+                    f"filled pipeline {(s_local, heads, head_dim, groups)} call {call}"
+                )
+
     # a head count the groups cannot split must decline, not mis-shard
     q = torch.randn(32, 12, 64, dtype=torch.bfloat16, device="cuda")
     if ulysses_pipelined_attention(q, q, q, _attend, 4) is not None:

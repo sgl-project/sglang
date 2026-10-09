@@ -27,6 +27,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_mxfp8_swizzled,
     can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
+    fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
@@ -653,6 +654,20 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+def _minimax_h3_bind_attention_backend(
+    attention: MiniMaxH3Attention, dtype: torch.dtype
+) -> None:
+    if attention._attention_impl is None:
+        attention._set_attention_backend(
+            get_attn_backend(
+                attention.head_dim,
+                dtype,
+                selected_attention_backend=attention._selected_attention_backend,
+                attention_requirements=AttentionRequirements(packed_varlen=True),
+            )
+        )
+
+
 def _minimax_h3_pipelined_dense_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -662,6 +677,7 @@ def _minimax_h3_pipelined_dense_attention(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    fill=None,
 ) -> torch.Tensor | None:
     """Dense FA with the Ulysses exchange pipelined over head groups.
 
@@ -690,7 +706,68 @@ def _minimax_h3_pipelined_dense_attention(
             cu_seqlens_host=cu_seqlens_host,
         )
 
-    return ulysses_pipelined_attention(q, k, v, attend, groups)
+    return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+
+
+def _minimax_h3_qknorm_rope_pipelined_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rope_cache: tuple[torch.Tensor, torch.Tensor],
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor | None:
+    """The pipelined attention with QK-norm + RoPE writing into the exchange.
+
+    q/k are the raw projections. Each destination block gets its heads'
+    normalized q/k and v written in place, so the in-place norm and the pack
+    become one pass. Same kernel arithmetic, so the result is bit-identical.
+    Returns None, having written nothing, when the call cannot pipeline.
+    """
+    # under graph capture the forward keeps the in-place norm, and the pipeline
+    # runs from the attention core's eager break point instead
+    if (
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS <= 1
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    _minimax_h3_bind_attention_backend(attention, q.dtype)
+    cos_sin_cache, positions = rope_cache
+    head_dim = attention.head_dim
+    q_weight, k_weight = attention.q_norm.weight, attention.k_norm.weight
+
+    def fill(head_start: int, head_count: int, dst: torch.Tensor) -> None:
+        heads = slice(head_start, head_start + head_count)
+        fused_qknorm_rope_out_of_place(
+            q[:, heads],
+            k[:, heads],
+            dst[..., :head_dim],
+            dst[..., head_dim : 2 * head_dim],
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=attention.q_norm.eps,
+            head_dim=head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+        dst[..., 2 * head_dim :].copy_(v[:, heads])
+
+    return _minimax_h3_pipelined_dense_attention(
+        attention,
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+        fill=fill,
+    )
 
 
 def _minimax_h3_attention_core_impl(
@@ -714,15 +791,7 @@ def _minimax_h3_attention_core_impl(
     kernel and sequence-parallel collectives execute eagerly.
     """
 
-    if attention._attention_impl is None:
-        attention._set_attention_backend(
-            get_attn_backend(
-                attention.head_dim,
-                q.dtype,
-                selected_attention_backend=attention._selected_attention_backend,
-                attention_requirements=AttentionRequirements(packed_varlen=True),
-            )
-        )
+    _minimax_h3_bind_attention_backend(attention, q.dtype)
 
     if ulysses_active and not ring_active and gate_compress is None:
         out = _minimax_h3_pipelined_dense_attention(
@@ -1212,6 +1281,22 @@ class MiniMaxH3Attention(nn.Module):
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+                if ulysses_active and not ring_active:
+                    out = _minimax_h3_qknorm_rope_pipelined_attention(
+                        self,
+                        q,
+                        k,
+                        v,
+                        rope_cache,
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_host=cu_seqlens_host,
+                        max_seqlen=max_seqlen,
+                    )
+                    if out is not None:
+                        out, _ = self.out_proj(
+                            out.reshape(total, self.num_heads * self.head_dim)
+                        )
+                        return out
                 fused_inplace_qknorm_rope(
                     q,
                     k,

@@ -244,7 +244,7 @@ class IpcA2AMultiState:
             self.staging.popitem(last=False)
         self.staging[key] = value
 
-    def pipelined_attention(self, q, k, v, attend, groups: int):
+    def pipelined_attention(self, q, k, v, attend, groups: int, fill=None):
         """Ulysses attention with the head exchange pipelined against it.
 
         q/k/v are [s_local, heads, head_dim], sequence-sharded with every head.
@@ -255,6 +255,12 @@ class IpcA2AMultiState:
         each group attends on its own stream and sends its output from there,
         so no stream waits on a kernel still running on another. Returns
         [s_local, heads, head_dim], or None when this call cannot pipeline.
+
+        ``fill(head_start, head_count, dst)``, when given, writes those heads'
+        q/k/v into a [s_local, head_count, 3 * head_dim] block in place of the
+        pack (the caller's QK-norm writes its output there); blocks for this
+        rank go straight into its own receive slot. It is only called once the
+        call is known to pipeline.
         """
         world, r = self.world, self.rank
         s_local, heads, head_dim = q.shape
@@ -277,23 +283,45 @@ class IpcA2AMultiState:
         base = bufs.calls * groups
         bufs.calls += 1
         call = bufs.calls
-        # block p * groups + g is contiguous: group g of the heads rank p owns
-        send = pack_qkv_destination_major(q, k, v, world * groups, out=bufs.send)
         peers = [(r + step) % world for step in range(1, world)]
-        cin.wait_stream(main)
         own = []
-        with torch.cuda.stream(cin):
-            for g in range(groups):
-                bufs.inb[r][slot, g, r].copy_(
-                    send[r * groups + g].view(-1), non_blocking=True
-                )
-                own.append(cin.record_event())
-                for p in peers:
-                    bufs.inb[p][slot, g, r].copy_(
-                        send[p * groups + g].view(-1), non_blocking=True
+        if fill is None:
+            # block p * groups + g is contiguous: group g of the heads rank p owns
+            send = pack_qkv_destination_major(q, k, v, world * groups, out=bufs.send)
+            cin.wait_stream(main)
+            with torch.cuda.stream(cin):
+                for g in range(groups):
+                    bufs.inb[r][slot, g, r].copy_(
+                        send[r * groups + g].view(-1), non_blocking=True
                     )
+                    own.append(cin.record_event())
+                    for p in peers:
+                        bufs.inb[p][slot, g, r].copy_(
+                            send[p * groups + g].view(-1), non_blocking=True
+                        )
+                    for p in peers:
+                        mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
+        else:
+            # Group by group: the peers' blocks first, so their copies start
+            # while this rank fills its own block straight into its slot.
+            send = bufs.send
+            block = lambda t: t.view(s_local, hg, 3 * head_dim)
+            sent = []
+            for g in range(groups):
                 for p in peers:
-                    mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
+                    fill((p * groups + g) * hg, hg, block(send[p * groups + g]))
+                sent.append(main.record_event())
+                fill((r * groups + g) * hg, hg, block(bufs.inb[r][slot, g, r]))
+                own.append(main.record_event())
+            with torch.cuda.stream(cin):
+                for g in range(groups):
+                    cin.wait_event(sent[g])
+                    for p in peers:
+                        bufs.inb[p][slot, g, r].copy_(
+                            send[p * groups + g].view(-1), non_blocking=True
+                        )
+                    for p in peers:
+                        mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
         done = []
         for g in range(groups):
             stream = self.pipe_group_streams[g]
@@ -421,7 +449,7 @@ def ipc_a2a_multi_ready(group, enabled: bool | None = None) -> bool:
     return True
 
 
-def ulysses_pipelined_attention(q, k, v, attend, groups: int):
+def ulysses_pipelined_attention(q, k, v, attend, groups: int, fill=None):
     """Pipelined Ulysses attention over the copy-engine transport, or None
     when the Ulysses group cannot use it (the caller keeps its NCCL path)."""
     from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
@@ -429,4 +457,4 @@ def ulysses_pipelined_attention(q, k, v, attend, groups: int):
     group = get_sp_group().ulysses_group
     if group is None or not ipc_a2a_multi_ready(group, enabled=True):
         return None
-    return IPC_A2A_MULTI.pipelined_attention(q, k, v, attend, groups)
+    return IPC_A2A_MULTI.pipelined_attention(q, k, v, attend, groups, fill=fill)
