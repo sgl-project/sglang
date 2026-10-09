@@ -2549,7 +2549,9 @@ class MQALayer(MqaAttentionBase):
                     self.wo_a.weight_scale_inv.data,
                 )
             elif self.wo_a_fp8:
-                import deep_gemm
+                from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                    einsum_bhr_hdr_bhd_f8f8bf16,
+                )
 
                 T, G, D = o.shape
                 R = self.o_lora_rank
@@ -2569,8 +2571,7 @@ class MQALayer(MqaAttentionBase):
                     o_s = o_s.view(T, G, -1)
                     recipe = (1, 128, 128)
                 output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-                deep_gemm.fp8_einsum(
-                    "bhr,hdr->bhd",
+                einsum_bhr_hdr_bhd_f8f8bf16(
                     (o_fp8, o_s),
                     (
                         self.wo_a.weight.view(G, R, D),

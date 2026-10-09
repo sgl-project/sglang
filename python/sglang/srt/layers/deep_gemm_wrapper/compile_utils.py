@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -112,9 +112,12 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16BF16F32 = auto()
+    EINSUM_BHR_HDR_BHD_F8F8BF16 = auto()
 
 
-_INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+_INITIALIZATION_DICT: Dict[
+    Tuple[DeepGemmKernelType, int, int, int, Optional[Tuple[int, int, int]]], bool
+] = dict()
 
 
 @contextmanager
@@ -146,11 +149,12 @@ def _maybe_compile_deep_gemm_one_type_all(
     n: int,
     k: int,
     num_groups: int,
+    recipe: Optional[Tuple[int, int, int]] = None,
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
-    query_key = (kernel_type, n, k, num_groups)
+    query_key = (kernel_type, n, k, num_groups, recipe)
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
@@ -183,6 +187,7 @@ def _maybe_compile_deep_gemm_one_type_all(
                 k=k,
                 num_groups=num_groups,
                 m_list=_BUILTIN_M_LIST,
+                recipe=recipe,
             )
 
 
@@ -193,6 +198,7 @@ def _compile_deep_gemm_one_type_all(
     k: int,
     num_groups: int,
     m_list: List[int],
+    recipe: Optional[Tuple[int, int, int]] = None,
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
@@ -234,8 +240,14 @@ def _compile_deep_gemm_one_type_all(
             m_list = [m for m in m_list if m <= max_m]
 
         # Need some methods to estimate needed memory for warmup
+        executor_kwargs = {} if recipe is None else {"recipe": recipe}
         executor = _BaseWarmupExecutor.create(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+            kernel_type,
+            max_m=max_m,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            **executor_kwargs,
         )
 
         has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
@@ -270,6 +282,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.EINSUM_BHR_HDR_BHD_F8F8BF16: _EinsumBhrHdrBhdWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -302,6 +315,11 @@ class _BaseWarmupExecutor:
                 + num_groups * n * k * 2
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.EINSUM_BHR_HDR_BHD_F8F8BF16:
+            # fp8 lhs [m, g, k] + fp8 rhs [g, n, k] + bf16 out [m, g, n]
+            return (
+                max_m * num_groups * k + num_groups * n * k + max_m * num_groups * n * 2
             ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
@@ -401,6 +419,47 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
+class _EinsumBhrHdrBhdWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(
+        self,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        recipe: Tuple[int, int, int],
+    ):
+        _, gran_n, gran_k = recipe
+        self.recipe = recipe
+        self.lhs_q = torch.empty(
+            (max_m, num_groups, k), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        self.lhs_s = torch.ones(
+            (max_m, num_groups, ceil_div(k, gran_k)),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        self.rhs_q = torch.empty(
+            (num_groups, n, k), device="cuda", dtype=torch.float8_e4m3fn
+        )
+        self.rhs_s = torch.ones(
+            (num_groups, ceil_div(n, gran_n), ceil_div(k, gran_k)),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        self.out = torch.empty(
+            (max_m, num_groups, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.fp8_einsum(
+            "bhr,hdr->bhd",
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            recipe=self.recipe,
+        )
+
+
 class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
@@ -434,20 +493,30 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 
 
 def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+    kernel_type: DeepGemmKernelType,
+    recipe: Optional[Tuple[int, int, int]] = None,
 ):
     if _is_musa:
         return nullcontext()
 
-    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
+    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type, recipe)
 
 
 @contextmanager
 def _deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+    kernel_type: DeepGemmKernelType,
+    recipe: Optional[Tuple[int, int, int]] = None,
 ):
     if m > 0:
-        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups, recipe)
     yield
 
 
