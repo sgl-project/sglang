@@ -36,7 +36,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 def next_layer():
     """The next layer's attention, which a stack that does not end the
     model hands its output to."""
-    append_stages((declare_attn(), fixture.Norm()))
+    return (declare_attn(),)
 
 
 class TestIndependentStageConstruction(CustomTestCase):
@@ -174,7 +174,7 @@ class TestIndependentStageConstruction(CustomTestCase):
                     )[1]
 
                 def previous_layer():
-                    append_stages((declare_ffn(sparse=True), fixture.Norm()))
+                    return (declare_ffn(sparse=True),)
 
                 neighbours = dict(
                     previous_layers=[previous_layer], next_layers=[next_layer]
@@ -294,7 +294,7 @@ def cut_stages(kinds):
 def held_by_another_rank(kinds):
     """The layers another pipeline rank holds, declaring ``kinds``: the
     neighbours of a stack cut next to them."""
-    return [lambda: append_stages(*cut_stages(kinds))] if kinds else []
+    return [lambda: tuple(CUT_STAGES[kind]() for kind in kinds)] if kinds else []
 
 
 def bind_rank(kinds, *, before=(), after=()):
@@ -473,11 +473,7 @@ class TestPipelineCuts(CustomTestCase):
                         "a pipeline rank that ends on an attention transforming "
                         "the output whose sum it leaves",
                     ),
-                    layer_stack(
-                        previous_layers=[
-                            lambda: append_stages((transformed(), fixture.Norm()))
-                        ]
-                    ),
+                    layer_stack(previous_layers=[lambda: (transformed(),)]),
                 ):
                     append_stages(*cut_stages((kind,)))
 
