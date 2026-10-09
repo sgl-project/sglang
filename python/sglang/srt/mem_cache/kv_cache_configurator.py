@@ -2165,7 +2165,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+        from sglang.srt.server_args import (
+            m3_fp8_attn_gemm_enabled,
+            m3_sgl_native_q8kv8_step1_enabled,
+        )
 
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
@@ -2186,8 +2189,11 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=get_minimax_sparse_index_dtype(
-                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                    resolving_view(self.server_args)
+                fp8_attn_gemm=(
+                    m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
+                    or m3_sgl_native_q8kv8_step1_enabled(
+                        resolving_view(self.server_args)
+                    )
                 ),
                 kv_cache_dtype=self.kv_cache_dtype,
                 model_dtype=self.model_dtype,

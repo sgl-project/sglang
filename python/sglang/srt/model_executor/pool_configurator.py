@@ -384,7 +384,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
-            from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+            from sglang.srt.server_args import (
+                m3_fp8_attn_gemm_enabled,
+                m3_sgl_native_q8kv8_step1_enabled,
+            )
 
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
@@ -416,8 +419,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
                 get_minimax_sparse_index_dtype(
-                    fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                        resolving_view(kvc.server_args)
+                    fp8_attn_gemm=(
+                        m3_fp8_attn_gemm_enabled(resolving_view(kvc.server_args))
+                        or m3_sgl_native_q8kv8_step1_enabled(
+                            resolving_view(kvc.server_args)
+                        )
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,

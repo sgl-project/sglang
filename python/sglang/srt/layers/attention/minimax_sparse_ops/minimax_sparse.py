@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
+    topk_prefill_from_score,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
@@ -27,6 +28,8 @@ _use_aiter_gfx95 = envs.SGLANG_USE_AITER.get() and is_hip() and is_gfx95_support
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
 _gluon_fallback_warned = False
+_sgl_native_q8kv8_fallback_warned = False
+_sgl_native_q8kv8_hit_logged = False
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -50,6 +53,32 @@ def _warn_gluon_fallback(msg: str) -> None:
         msg,
     )
     _gluon_fallback_warned = True
+
+
+def _warn_sgl_native_q8kv8_fallback(err: Exception) -> None:
+    global _sgl_native_q8kv8_fallback_warned
+    if _sgl_native_q8kv8_fallback_warned:
+        return
+    logger.warning(
+        "SGL native Q8KV8 sparse attention is unavailable (%s); "
+        "falling back to the existing sparse-attention provider chain.",
+        err,
+    )
+    _sgl_native_q8kv8_fallback_warned = True
+
+
+def _log_sgl_native_q8kv8_hit(q: torch.Tensor, k_cache: torch.Tensor) -> None:
+    global _sgl_native_q8kv8_hit_logged
+    if _sgl_native_q8kv8_hit_logged:
+        return
+    logger.info(
+        "SGL native Q8KV8 sparse prefill Step 3 active: "
+        "q_shape=%s, kv_shape=%s, local_gqa_group_size=%d.",
+        tuple(q.shape),
+        tuple(k_cache.shape),
+        q.shape[1] // k_cache.shape[1],
+    )
+    _sgl_native_q8kv8_hit_logged = True
 
 
 def minimax_sparse_prefill(
@@ -80,6 +109,8 @@ def minimax_sparse_prefill(
     score_type: str = "max",
     disable_index_value: bool = False,
     use_msa: bool = False,
+    use_sgl_native_q8kv8_step1: bool = False,
+    use_sgl_native_q8kv8_step3: bool = False,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
@@ -128,35 +159,85 @@ def minimax_sparse_prefill(
         idx_o = None
         topk_idx = cached_topk_idx
     else:
-        # Step 1: Flash attention with topk index (using index head)
-        idx_o, topk_idx = flash_prefill_with_topk_index(
-            q=idx_q,
-            k_cache=idx_k_cache,
-            v_cache=idx_v_cache,
-            sink=idx_sink,
-            req_to_token=req_to_token,
-            slot_ids=slot_ids,
-            cu_seqlens=cu_seqlens,
-            seq_lens=seq_lens,
-            prefix_lens=prefix_lens,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            block_size_q=block_size_q,
-            block_size_k=block_size_k,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            sm_scale=idx_sm_scale,
-            score_type=score_type,
-            disable_index_value=disable_index_value,
-            cu_seqblocks_q=cu_seqblocks_q,
-            max_seqblock_q=max_seqblock_q,
-            all_seqblock_q=all_seqblock_q,
-            page_size=page_size,
-            q_scale=idx_q_scale,
-            k_scale=idx_k_scale,
-            v_scale=idx_v_scale,
+        # Step 1: the native provider replaces only score generation. Step 2
+        # remains the existing Triton top-k over the precomputed FP32 scores.
+        native_step1 = (
+            use_sgl_native_q8kv8_step1
+            and score_type == "max"
+            and disable_index_value
+            and idx_sink is None
+            and loc_mapping is None
         )
+        if native_step1:
+            from .sgl_native_q8kv8 import (
+                SglNativeQ8KV8UnavailableError,
+                sgl_native_q8kv8_sparse_prefill_score,
+            )
+
+            try:
+                score = sgl_native_q8kv8_sparse_prefill_score(
+                    q=idx_q,
+                    k_cache=idx_k_cache,
+                    req_to_token=req_to_token,
+                    slot_ids=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    block_size_k=block_size_k,
+                    page_size=page_size,
+                    sm_scale=idx_sm_scale,
+                    q_scale=idx_q_scale,
+                    k_scale=idx_k_scale,
+                )
+                idx_o = None
+                topk_idx = topk_prefill_from_score(
+                    score=score,
+                    block_size_q=block_size_q,
+                    block_size_k=block_size_k,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqblocks_q=cu_seqblocks_q,
+                    prefix_lens=prefix_lens,
+                    topk=topk,
+                    init_blocks=init_blocks,
+                    local_blocks=local_blocks,
+                    max_seqblock_q=max_seqblock_q,
+                    all_seqblock_q=all_seqblock_q,
+                )
+            except SglNativeQ8KV8UnavailableError as err:
+                _warn_sgl_native_q8kv8_fallback(err)
+                native_step1 = False
+
+        if not native_step1:
+            idx_o, topk_idx = flash_prefill_with_topk_index(
+                q=idx_q,
+                k_cache=idx_k_cache,
+                v_cache=idx_v_cache,
+                sink=idx_sink,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                block_size_q=block_size_q,
+                block_size_k=block_size_k,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                sm_scale=idx_sm_scale,
+                score_type=score_type,
+                disable_index_value=disable_index_value,
+                cu_seqblocks_q=cu_seqblocks_q,
+                max_seqblock_q=max_seqblock_q,
+                all_seqblock_q=all_seqblock_q,
+                page_size=page_size,
+                q_scale=idx_q_scale,
+                k_scale=idx_k_scale,
+                v_scale=idx_v_scale,
+            )
         # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
         num_idx_heads = idx_q.shape[1]
         num_kv_heads = k_cache.shape[1]
@@ -168,11 +249,38 @@ def minimax_sparse_prefill(
 
     # Reduced top-k cached by the caller for subsequent skip layers.
     reduced_topk_idx = topk_idx
-    # Step 3: Sparse attention using topk index (main head). The Gluon and
-    # MSA paths only replace this step; the indexer above is unchanged. MSA has
-    # no attn-sink input, so keep the Triton path when sink is present.
+    # Step 3: Native providers replace only main sparse attention; the
+    # indexer and top-k reduction above are unchanged.
     o = None
-    if (
+    if use_sgl_native_q8kv8_step3 and sink is None and loc_mapping is None:
+        from .sgl_native_q8kv8 import (
+            SglNativeQ8KV8UnavailableError,
+            sgl_native_q8kv8_sparse_prefill_main,
+        )
+
+        try:
+            o = sgl_native_q8kv8_sparse_prefill_main(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                topk_idx=topk_idx,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                block_size_k=block_size_k,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            _log_sgl_native_q8kv8_hit(q, k_cache)
+        except SglNativeQ8KV8UnavailableError as err:
+            _warn_sgl_native_q8kv8_fallback(err)
+
+    if o is None and (
         _use_aiter_gfx95
         and envs.SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL.get()
         # the scratch gather reads pool slots without the HiSparse remap
