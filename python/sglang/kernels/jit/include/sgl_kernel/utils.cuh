@@ -30,14 +30,7 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-#include <tvm/ffi/extra/cuda/device_guard.h>
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
-#elif defined(USE_ROCM)
+#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -65,14 +58,11 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #endif
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
-#else // USE_MUSA
+#elif defined(USE_MUSA)
 #include <musa_bf16.h>
 #include <musa_fp16.h>
 #include <musa_fp8.h>
 #include <musa_runtime.h>
-#endif // USE_MUSA
-
-#if defined(USE_MUSA)
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
@@ -86,7 +76,6 @@ inline constexpr auto cudaSuccess = musaSuccess;
 #define cudaGetLastError musaGetLastError
 #define cudaLaunchKernel musaLaunchKernel
 #define cudaLaunchKernelEx musaLaunchKernelEx
-#define cudaSetDevice musaSetDevice
 #define cudaMemcpy musaMemcpy
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
@@ -104,31 +93,18 @@ inline constexpr auto cudaSuccess = musaSuccess;
 #define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
 #define cudaFuncSetAttribute musaFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
-#define cudaFuncAttributePreferredSharedMemoryCarveout musaFuncAttributePreferredSharedMemoryCarveout
-#define cudaSharedmemCarveoutDefault musaSharedmemCarveoutDefault
-#define cudaSharedmemCarveoutMaxL1 musaSharedmemCarveoutMaxL1
-#define cudaSharedmemCarveoutMaxShared musaSharedmemCarveoutMaxShared
+#else
+#include <tvm/ffi/extra/cuda/device_guard.h>
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #endif
 
 namespace sglang {
 
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __nv_bfloat16;
-using fp8_e4m3_t = __nv_fp8_e4m3;
-using fp8_e5m2_t = __nv_fp8_e5m2;
-
-using fp32x2_t = float2;
-using fp16x2_t = __half2;
-using bf16x2_t = __nv_bfloat162;
-using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
-using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
-using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
-using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
-
-using fp32x4_t = float4;
-#elif defined(USE_ROCM)
+#ifdef USE_ROCM
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __hip_bfloat16;
@@ -142,7 +118,7 @@ using fp8x2_e5m2_t = uint16_t;
 using fp8x4_e4m3_t = uint32_t;
 using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
-#else
+#elif defined(USE_MUSA)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __mt_bfloat16;
@@ -158,15 +134,31 @@ using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
 using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
 
 using fp32x4_t = float4;
+#else
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __nv_bfloat16;
+using fp8_e4m3_t = __nv_fp8_e4m3;
+using fp8_e5m2_t = __nv_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __nv_bfloat162;
+using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
+using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
+using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
+
+using fp32x4_t = float4;
 #endif
 
 /*
  * LDG Support
  */
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-#define SGLANG_LDG(arg) __ldg(arg)
-#else
+#if defined(USE_ROCM) || defined(USE_MUSA)
 #define SGLANG_LDG(arg) *(arg)
+#else
+#define SGLANG_LDG(arg) __ldg(arg)
 #endif
 
 // DLPack device type for the current platform
@@ -187,7 +179,13 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
+#ifdef USE_ROCM
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#elif defined(USE_MUSA)
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#else
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -197,12 +195,6 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#elif defined(USE_ROCM)
-#define SGL_ARCH_HOPPER_OR_GREATER 0
-#define SGL_ARCH_BLACKWELL_OR_GREATER 0
-#else  // USE_MUSA
-#define SGL_ARCH_HOPPER_OR_GREATER 0
-#define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
 
 // Maximum vector size in bytes supported by current architecture.
@@ -402,21 +394,12 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
-#if !defined(USE_MUSA)
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
     host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
-#else
-inline void RuntimeDeviceCheck(::musaError_t error, DebugInfo location = {}) {
-  if (error != ::musaSuccess) {
-    [[unlikely]];
-    host::panic(location, "MUSA error: ", ::musaGetErrorString(error));
-  }
-}
-#endif
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
@@ -440,18 +423,12 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     RuntimeDeviceCheck(::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, block_threads, dyn_smem_bytes));
     return static_cast<uint32_t>(blocks);
   };
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(USE_MUSA)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
   // The attribute and the occupancy query both act on the current device.
-#if !defined(USE_MUSA)
   tvm::ffi::CUDADeviceGuard guard(device_id);
-#else
-  int previous_device = -1;
-  RuntimeDeviceCheck(::cudaGetDevice(&previous_device));
-  if (device_id >= 0 && previous_device != device_id) RuntimeDeviceCheck(::cudaSetDevice(device_id));
-#endif
   const auto set_carveout = [&](int pct) {
     RuntimeDeviceCheck(::cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, pct));
   };
@@ -460,12 +437,7 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
   RuntimeCheck(occupancy > 0, "kernel does not fit on an SM");
   for (int pct = cudaSharedmemCarveoutMaxL1;; ++pct) {
     set_carveout(pct);
-    if (const uint32_t now = blocks_per_sm(); now >= occupancy) {
-#if defined(USE_MUSA)
-      if (device_id >= 0 && previous_device != device_id) RuntimeDeviceCheck(::cudaSetDevice(previous_device));
-#endif
-      return {pct, now};
-    }
+    if (const uint32_t now = blocks_per_sm(); now >= occupancy) return {pct, now};
     RuntimeCheck(pct < cudaSharedmemCarveoutMaxShared, "no carveout restores occupancy ", occupancy);
   }
 #endif
@@ -539,20 +511,16 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-    if (enabled) {
-      auto& attr = m_attrs[m_config.numAttrs++];
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr.val.programmaticStreamSerializationAllowed = true;
-      m_config.attrs = m_attrs;
-    }
-#elif defined(USE_ROCM)
+#ifdef USE_ROCM
+    (void)enabled;
+    m_config.numAttrs = 0;
+#elif defined(USE_MUSA)
     (void)enabled;
     m_config.numAttrs = 0;
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
-      attr.id = musaLaunchAttributeIgnore;
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
       attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
     }
@@ -561,13 +529,13 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
+#if defined(USE_ROCM) || defined(USE_MUSA)
+    (void)cluster_dim;
+#else
     auto& attr = m_attrs[m_config.numAttrs++];
     attr.id = cudaLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
-#else
-    (void)cluster_dim;
 #endif
     return *this;
   }
@@ -595,9 +563,7 @@ struct LaunchKernel {
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
     if (m_prefer_l1) apply_prefer_l1(kernel);
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
-#elif defined(USE_ROCM)
+#ifdef USE_ROCM
     hipLaunchKernelGGL(
         std::forward<T>(kernel),
         m_config.gridDim,
@@ -607,7 +573,7 @@ struct LaunchKernel {
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
 #else
-    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
   }
 
@@ -649,17 +615,10 @@ struct LaunchKernel {
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
-#if !defined(USE_MUSA)
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
     host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
-#else
-#define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::musaSuccess) [[likely]] { \
-  } else                                                              \
-    host::Error() << "MUSA error: " << ::musaGetErrorString(error) << ". "
-#endif
 
 }  // namespace host
 

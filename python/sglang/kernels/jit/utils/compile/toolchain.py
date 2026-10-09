@@ -88,13 +88,11 @@ def device_compiler_path() -> str:
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
-    if not is_hip_runtime() and not is_musa_runtime():
-        return os.path.join(cuda_home(), "bin", "nvcc")
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
     if is_musa_runtime():
         return os.path.join(musa_home(), "bin", "mcc")
-    raise RuntimeError("Unsupported JIT runtime")
+    return os.path.join(cuda_home(), "bin", "nvcc")
 
 
 @cache_once
@@ -115,8 +113,6 @@ def gpu_arch_name() -> str:
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
     """
-    if not is_hip_runtime() and not is_musa_runtime():
-        return get_jit_cuda_arch().target_name
     if is_hip_runtime():
         try:
             device = torch.cuda.current_device()
@@ -139,7 +135,7 @@ def gpu_arch_name() -> str:
                 "Cannot detect MUSA architecture; the JIT cache target degrades."
             )
             return "unknown"
-    raise RuntimeError("Unsupported JIT runtime")
+    return get_jit_cuda_arch().target_name
 
 
 @cache_once
@@ -169,15 +165,13 @@ def target_flags() -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
-    if not is_hip_runtime() and not is_musa_runtime():
-        arch = get_jit_cuda_arch()
-        target = f"{arch.major}{arch.minor}{arch.suffix}"
-        return [f"-gencode=arch=compute_{target},code=sm_{target}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     if is_musa_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
-    raise RuntimeError("Unsupported JIT runtime")
+    arch = get_jit_cuda_arch()
+    target = f"{arch.major}{arch.minor}{arch.suffix}"
+    return [f"-gencode=arch=compute_{target},code=sm_{target}"]
 
 
 def base_cxx_flags() -> List[str]:
@@ -191,24 +185,20 @@ def base_cxx_flags() -> List[str]:
 
 
 def base_cuda_flags() -> List[str]:
-    if not is_hip_runtime() and not is_musa_runtime():
-        return ["-Xcompiler", "-fPIC"]
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
     if is_musa_runtime():
         return ["-fPIC", "-x", "musa"]
-    raise RuntimeError("Unsupported JIT runtime")
+    return ["-Xcompiler", "-fPIC"]
 
 
 def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
-    if not is_hip_runtime() and not is_musa_runtime():
-        return list(includes)
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
     if is_musa_runtime():
         return [*includes, f"{musa_home()}/include"]
-    raise RuntimeError("Unsupported JIT runtime")
+    return list(includes)
 
 
 def base_link_flags(*, with_device: bool) -> List[str]:
@@ -222,13 +212,11 @@ def base_link_flags(*, with_device: bool) -> List[str]:
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
     if not with_device:
         return flags
-    if not is_hip_runtime() and not is_musa_runtime():
-        return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
     if is_musa_runtime():
         return flags + [f"-L{musa_home()}/lib", "-lmusa", "-lmusart"]
-    raise RuntimeError("Unsupported JIT runtime")
+    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
 
 
 def compilers() -> Tuple[str, str]:

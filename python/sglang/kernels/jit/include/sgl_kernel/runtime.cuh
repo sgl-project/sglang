@@ -13,9 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-#include <cuda_runtime.h>
-#elif defined(USE_ROCM)
+#ifdef USE_ROCM
 #include <hip/hip_runtime.h>
 #ifndef cudaOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
@@ -53,8 +51,10 @@ cudaOccupancyAvailableDynamicSMemPerBlock(std::size_t* smem, const void* func, i
   return hipSuccess;
 }
 #endif
-#else
+#elif defined(USE_MUSA)
 #include <musa_runtime.h>
+#else
+#include <cuda_runtime.h>
 #endif
 
 namespace sglang {

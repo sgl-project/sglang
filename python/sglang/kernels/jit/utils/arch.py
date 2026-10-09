@@ -119,16 +119,7 @@ def _init_jit_cuda_arch_once():
 
 def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
     """Default compile flags for `arch`, defaulting to the detected local GPU."""
-    if not is_hip_runtime() and not is_musa_runtime():
-        if arch is None:
-            arch = get_jit_cuda_arch()
-        return [
-            arch.jit_flag,
-            "-std=c++20",
-            "-O3",
-            "--expt-relaxed-constexpr",
-        ]
-    elif is_hip_runtime():
+    if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
         try:
@@ -141,8 +132,16 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
-    else:
+    if is_musa_runtime():
         return ["-DUSE_MUSA", "-std=c++20", "-O3"]
+    if arch is None:
+        arch = get_jit_cuda_arch()
+    return [
+        arch.jit_flag,
+        "-std=c++20",
+        "-O3",
+        "--expt-relaxed-constexpr",
+    ]
 
 
 def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:

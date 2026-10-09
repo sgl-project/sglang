@@ -32,10 +32,7 @@
 #else  // __CUDACC__ && CUDA_VERSION > 12010
 #include "source_location.h"
 #endif
-#elif defined(__MUSACC__)
-#include "source_location.h"
-#include <musa_runtime.h>
-#else  // no device compiler
+#else  // no __CUDACC__
 #include "source_location.h"
 #endif
 
@@ -168,46 +165,6 @@ namespace stdr = std::ranges;
 namespace stdv = stdr::views;
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
-#if defined(USE_MUSA)
-template <std::integral T>
-struct IntegerRange {
-  T begin_value;
-  T end_value;
-
-  struct iterator {
-    T value;
-
-    constexpr T operator*() const {
-      return value;
-    }
-    constexpr iterator& operator++() {
-      ++value;
-      return *this;
-    }
-    constexpr bool operator!=(const iterator& other) const {
-      return value != other.value;
-    }
-  };
-
-  constexpr iterator begin() const {
-    return iterator{begin_value};
-  }
-  constexpr iterator end() const {
-    return iterator{end_value};
-  }
-};
-
-template <std::integral T>
-inline auto irange(T end) {
-  return IntegerRange<T>{static_cast<T>(0), end};
-}
-
-/// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
-template <std::integral T>
-inline auto irange(T start, T end) {
-  return IntegerRange<T>{start, end};
-}
-#else
 template <std::integral T>
 inline auto irange(T end) {
   return stdv::iota(static_cast<T>(0), end);
@@ -218,7 +175,6 @@ template <std::integral T>
 inline auto irange(T start, T end) {
   return stdv::iota(start, end);
 }
-#endif
 
 /** \brief Error class for stream-style error logging. */
 struct Error {
