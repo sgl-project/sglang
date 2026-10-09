@@ -3695,8 +3695,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=state.positions,
             hidden_states=hidden_states,
             # DSV4 non-fused layers carry no residual across layers; the key is
-            # required by the next layer's op_mhc_prepare_attn (ignored) and by
-            # _model_forward_tbo_merge_outputs (None -> None).
+            # required by the next layer's op_mhc_prepare_attn (ignored).
             residual=None,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -4176,7 +4175,7 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
             _model_forward_filter_inputs,
-            _model_forward_tbo_merge_outputs,
+            _model_forward_tbo_merge_key,
         )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
@@ -4250,10 +4249,9 @@ class DeepseekV4Model(nn.Module):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-        hidden_states, _ = _model_forward_tbo_merge_outputs(
-            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+        return _model_forward_tbo_merge_key(
+            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
         )
-        return hidden_states
 
     @torch.no_grad()
     def forward(
