@@ -1599,7 +1599,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     (
                         chat_encoding.dsv41_tool_payload(tool)
                         if is_dsv41
-                        else tool.model_dump()
+                        else tool.model_dump(exclude_unset=True, by_alias=True)
                     )
                     for tool in request.tools
                 ]
