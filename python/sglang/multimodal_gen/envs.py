@@ -5,11 +5,20 @@
 
 import logging
 import os
+import warnings
 from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
+    warnings.warn(
+        "SGLANG_DIFFUSION_TRACE_FUNCTION was unused and has been removed. "
+        "Use Python profiling tools for function-level tracing.",
+        FutureWarning,
+        stacklevel=2,
+    )
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
@@ -20,7 +29,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
@@ -35,6 +43,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
@@ -56,6 +65,14 @@ if TYPE_CHECKING:
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
+    # default while it is validated. Falls back to NCCL when unavailable.
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
+    # attention over the copy-engine transport: -1 picks a count that divides
+    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
+    # keeps the sequential exchange, N >= 2 forces N groups
+    SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -228,10 +245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
     "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
-    # Trace function calls
-    # If set to 1, sgl_diffusion will trace function calls
-    # Useful for debugging
-    "SGLANG_DIFFUSION_TRACE_FUNCTION": _lazy_int("SGLANG_DIFFUSION_TRACE_FUNCTION", 0),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
@@ -254,6 +267,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For image generation task depends on image quality and the model config
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+    # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
+    # the padded layout, instead of the packed-varlen path. Applies only when
+    # sequence parallelism is active and the mask is derived purely from the
+    # shard pad span.
+    "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
@@ -393,6 +413,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    ),
+    "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),

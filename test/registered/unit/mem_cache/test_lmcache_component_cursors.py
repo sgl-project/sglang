@@ -66,6 +66,7 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
         ),
         priority=0,
         last_node=None,
+        lock=None,
     )
     if swa_enabled:
         req.kv.set_evicted_seqlen(ComponentType.SWA, swa_cursor)
@@ -97,13 +98,16 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     cache.insert = mock.Mock(return_value=InsertResult(prefix_len=8))
     cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=42))
     matched = MatchResult(
-        device_indices=torch.arange(8),
+        device_prefix_len=8,
         last_device_node=42,
         last_host_node=None,
         best_match_node=None,
     )
 
-    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=matched):
+    with (
+        mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=matched),
+        mock.patch.object(cache, "path_device_indices", return_value=torch.arange(8)),
+    ):
         cache._publish_external_loaded_prefix(req, token_ids_len=12)
 
     insert_params = cache.insert.call_args.args[0]
@@ -117,10 +121,9 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 99)
     assert insert_params.get_evicted_seqlen(ComponentType.AUXILIARY_SWA) == 6
     assert req.kv.cache_protected_len == 8
-    assert req.lock_receipt.node_id == 42
+    assert req.lock.receipt.node_id == 42
     assert flow.prefix_published
     assert flow.mamba_value is None
-    assert req.prefix_indices.tolist() == list(range(12))
 
 
 if __name__ == "__main__":

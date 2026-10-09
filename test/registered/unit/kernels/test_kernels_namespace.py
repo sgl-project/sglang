@@ -172,7 +172,13 @@ def test_import_stays_metadata_only():
         "import sys, sglang.kernels.ops; "
         "print('DIRTY' if any(m in sys.modules for m in "
         "('sgl_kernel', 'cutlass', 'flydsl', 'aiter', "
-        "'sglang.kernels.ops.gemm.kimi_k3')) or any("
+        "'sglang.kernels.ops.gemm.kimi_k3', "
+        "'sglang.kernels.ops.activation.softcap', "
+        "'sglang.kernels.ops.attention.dllm_kv_pack', "
+        "'sglang.kernels.ops.attention.flash_attention_v4', "
+        "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
+        "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
+        "'sglang.kernels.ops.speculative.row_argmax')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -239,6 +245,8 @@ def test_reclassified_public_entry_points_are_inventoried():
     root = Path(K.__file__).resolve().parent / "ops"
     targets = {spec.target for spec in K.registry.all_specs()}
     modules = (
+        "attention.dllm_kv_pack",
+        "attention.gemma_qkv_norm_rope",
         "attention.minicpm_sala.get_block_table",
         "attention.fast_topk",
         "attention.dsa.kpool_topk_transform",
@@ -247,6 +255,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "embeddings.qwen4_ngram",
         "elementwise.qwen4_gate",
         "elementwise.row_scale",
+        "elementwise.hc_combine_decode",
         "mamba.qwen4_short_conv",
         "mamba.lfm_short_conv",
         "gemm.dsv4_wo_a",
@@ -256,12 +265,15 @@ def test_reclassified_public_entry_points_are_inventoried():
         "gemm.fp8_blockwise_gemm",
         "gemm.gptq_marlin",
         "layernorm.rmsnorm_hf",
+        "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
         "moe.gemma4_routing",
+        "moe.shared_expert_gate",
         "memory.adler32",
         "memory.row_compact",
         "mm.process.image",
+        "speculative.row_argmax",
     )
     for module in modules:
         tree = ast.parse(
@@ -283,6 +295,10 @@ def test_reclassified_public_entry_points_are_inventoried():
     [
         ("gemm.hopper_bf16_gemv", (9, 0), True),
         ("gemm.hopper_bf16_gemv", (10, 0), False),
+        ("elementwise.hc_combine_apply_norm", (8, 9), False),
+        ("elementwise.hc_combine_apply_norm", (9, 0), True),
+        ("communication.moe_finalize_shared_gate_all_reduce", (8, 9), False),
+        ("communication.moe_finalize_shared_gate_all_reduce", (10, 3), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 0), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 1), True),
         ("gemm.fp8_blockwise_scaled_mm", (10, 0), False),

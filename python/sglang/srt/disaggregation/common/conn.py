@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -356,7 +357,7 @@ class CommonKVManager(BaseKVManager):
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
-        self.request_status: Dict[int, KVPoll] = {}
+        self.request_status: Union[Dict[int, KVPoll], PPConsensusStore] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -403,6 +404,10 @@ class CommonKVManager(BaseKVManager):
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
+            if self.pp_size > 1:
+                self.request_status = PPConsensusStore(
+                    self.pp_size, self.pp_rank, self.pp_group
+                )
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -546,6 +551,12 @@ class CommonKVManager(BaseKVManager):
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
+
+    def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
+        statuses = self.request_status.collect(bootstrap_room)
+        if any(status is None for status in statuses):
+            return KVPoll.Bootstrapping
+        return min(statuses)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -1199,9 +1210,17 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
+            if info.attn_cp_size != 1 or self.attn_cp_size != 1:
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                    "DeepSeek-V4.1 DP-only DSpark PD requires CP=1 on both servers"
+                )
+            non_cp_mla_layout = info.attn_cp_size == self.attn_cp_size == 1 and (
+                self.is_mla_backend or self.is_hybrid_mla_backend
+            )
+            if info.attn_tp_size != self.attn_tp_size and not non_cp_mla_layout:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD requires matching attention TP "
+                    "unless both servers use CP=1 with an MLA KV layout"
                 )
 
         if self.dcp_size > 1:

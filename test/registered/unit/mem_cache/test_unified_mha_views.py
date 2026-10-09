@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -37,7 +38,9 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
+    build_unified_mha_pool,
 )
+from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -335,12 +338,12 @@ _SBS = 32  # MXFP8 scale block size
 _SCALE_PS = 128  # the interleaved scale layout's page size
 
 
-def _scaled_spec(name, grow):
+def _scaled_spec(name, grow, head_dim=128):
     return MHASubPoolSpec(
         name=name,
         layer_num=_L,
         head_num=_H,
-        head_dim=128,
+        head_dim=head_dim,
         store_dtype=torch.uint8,
         kv_cache_dtype=torch.float8_e4m3fn,
         scale_block_size=_SBS,
@@ -348,7 +351,7 @@ def _scaled_spec(name, grow):
     )
 
 
-class TestUnifiedMXFP8ScaleBuffers(unittest.TestCase):
+class TestUnifiedMXFP8ScaleBuffers(CustomTestCase):
     def setUp(self):
         full = _scaled_spec("full", "down")
         self.budget = 64 * _SCALE_PS * full.entry_bytes()
@@ -380,8 +383,89 @@ class TestUnifiedMXFP8ScaleBuffers(unittest.TestCase):
         self.assertLessEqual(self.pool._raw.numel() + scales, self.budget)
         self.assertAlmostEqual(scales / self.pool._raw.numel(), 2 / _SBS, places=2)
 
+    def test_scales_cannot_consume_the_single_request_floor(self):
+        """The gross budget fits one request, but its payload after scales does not."""
+        with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
+            UnifiedKVPool(
+                total_bytes=self.budget,
+                sub_pool_specs=[
+                    _scaled_spec("full", "down"),
+                    _scaled_spec("swa", "up"),
+                ],
+                device=_DEV,
+                enable_memory_saver=False,
+                page_size=_SCALE_PS,
+                bs1_floor_terms=[("swa_window_kv", self.budget)],
+            )
+
     def test_unscaled_pool_allocates_no_scales(self):
         self.assertEqual(_make_pool(ps=4)._mha_scale_views, {})
+
+    def test_page_move_preserves_payload_and_scales(self):
+        """Token-major MXFP8 views must construct with page-major metadata,
+        then relocate whole pages without losing scales or touching other pages.
+        Scale widths above four bytes must not depend on per-token unpacking.
+        """
+        generator = torch.Generator().manual_seed(42)
+        for head_dim in (128, 256):
+            specs = [
+                _scaled_spec("full", "down", head_dim),
+                _scaled_spec("swa", "up", head_dim),
+            ]
+            buffer = UnifiedKVPool(
+                total_bytes=8 * _SCALE_PS * specs[0].entry_bytes(),
+                sub_pool_specs=specs,
+                device=_DEV,
+                enable_memory_saver=False,
+                page_size=_SCALE_PS,
+            )
+            pools = {
+                name: build_unified_mha_pool(
+                    unified_buffer=buffer,
+                    sub_pool_name=name,
+                    page_size=_SCALE_PS,
+                    enable_alt_stream=False,
+                )
+                for name in ("full", "swa")
+            }
+            for name, pool in pools.items():
+                with self.subTest(head_dim=head_dim, sub_pool=name):
+                    buffer._raw.random_(0, 255, generator=generator)
+                    scale_bytes = {
+                        key: [
+                            buf.view(torch.uint8)
+                            for buf in other.k_scale_buffer + other.v_scale_buffer
+                        ]
+                        for key, other in pools.items()
+                    }
+                    for tensors in scale_bytes.values():
+                        for tensor in tensors:
+                            tensor.random_(0, 255, generator=generator)
+                    expected_raw = buffer._raw.clone()
+                    expected_scales = {
+                        key: [tensor.clone() for tensor in tensors]
+                        for key, tensors in scale_bytes.items()
+                    }
+                    src_pages = torch.tensor([1, 3])
+                    dst_pages = torch.tensor([4, 2])
+                    page_bytes = _SCALE_PS * specs[0].entry_bytes()
+                    for src, dst in zip(src_pages.tolist(), dst_pages.tolist()):
+                        expected_raw[dst * page_bytes : (dst + 1) * page_bytes] = (
+                            buffer._raw[src * page_bytes : (src + 1) * page_bytes]
+                        )
+                        for expected, original in zip(
+                            expected_scales[name], scale_bytes[name]
+                        ):
+                            expected[dst] = original[src]
+                    offsets = torch.arange(_SCALE_PS)
+                    pool.move_kv_cache(
+                        (dst_pages[:, None] * _SCALE_PS + offsets).flatten(),
+                        (src_pages[:, None] * _SCALE_PS + offsets).flatten(),
+                    )
+                    self.assertTrue(torch.equal(buffer._raw, expected_raw))
+                    for key, tensors in scale_bytes.items():
+                        for actual, expected in zip(tensors, expected_scales[key]):
+                            self.assertTrue(torch.equal(actual, expected))
 
 
 class TestUnifiedKVPoolViews(unittest.TestCase):
@@ -603,10 +687,10 @@ class TestFactoryViews(unittest.TestCase):
             self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)
 
     def test_rebind_emits_physical_full_and_build_derives_swa(self):
-        """End-to-end over the real factory: rebind_write_loc rebinds
-        out_cache_loc to FULL-side physical ids (phase 1), and the per-batch
-        build derives the SWA write loc pointwise from those values (phase 2)
-        -- both checked against the v2p tables over the VIRTUAL ids."""
+        """End-to-end over the real factory: a batch's own plan binds
+        out_cache_loc to FULL-side physical ids and derives the SWA write ids
+        from the virtual window -- both checked against the v2p tables over
+        the VIRTUAL ids."""
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
         from sglang.srt.runtime_context import get_parallel
 
@@ -637,11 +721,11 @@ class TestFactoryViews(unittest.TestCase):
                 device="cpu",
             )
             self.assertTrue(source.is_translating)
-            source.rebind_write_loc(fb)
+            source.bind_own_plan(fb)
             self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
             self.assertTrue(
                 torch.equal(
-                    source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+                    source.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), expected_swa
                 )
             )
 
