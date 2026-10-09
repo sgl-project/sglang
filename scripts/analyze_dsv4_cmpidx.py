@@ -121,18 +121,29 @@ def report_group(rows, key, label):
     Needs no request segmentation (robust to warmup/interleaving).
     """
     groups = defaultdict(set)
+    have_ntok = any("ntok" in r for r in rows)
     for r in rows:
         v = r.get(key)
         if v is None or v == "empty":
             continue
         try:
-            ntok = int(r.get("ntok", "-1"))
             lp = int(r.get("lastpos", "-1"))
         except (TypeError, ValueError):
             continue
-        if ntok <= 0 or lp < 0:
+        if lp < 0:
+            continue
+        ntok = None
+        if "ntok" in r:
+            try:
+                ntok = int(r["ntok"])
+            except (TypeError, ValueError):
+                ntok = None
+        if ntok is not None and ntok <= 0:
             continue
         groups[(ntok, lp, _int(r, "layer"))].add(v)
+    if not have_ntok:
+        print(f"  [{label}] NOTE: log has no ntok (old probe) -> grouped by "
+              "(lastpos,layer); the prefill row may be shape-confounded")
     div = [(lp, ly, sorted(s)) for (ntok, lp, ly), s in groups.items() if len(s) > 1]
     if not div:
         print(f"  [{label}] no divergence: every (ntok,lastpos,layer) group "
