@@ -16,6 +16,7 @@ Usage:
 
 import unittest
 from concurrent.futures import Future
+from types import MethodType
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -26,6 +27,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
@@ -403,6 +405,24 @@ class TestAbortRequests(unittest.TestCase):
         mgr.abort_requests(abort_req)
         future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
+
+    def test_abort_is_not_reported_as_bad_request(self):
+        """Aborting a request still in the grammar queue should not report a 400."""
+        mgr = self._make_mgr_with_queue()
+        req = _make_req(rid="req-123")
+        req.grammar = MagicMock(spec=Future)
+        req.set_finish_with_abort = MethodType(Req.set_finish_with_abort, req)
+        mgr.grammar_queue.append(req)
+
+        abort_req = MagicMock()
+        abort_req.abort_all = False
+        abort_req.rid = "req-123"
+
+        mgr.abort_requests(abort_req)
+        finish_reason = req.to_finish.to_json()
+        self.assertEqual(finish_reason["type"], "abort")
+        self.assertIsNone(finish_reason["status_code"])
+        self.assertIsNone(finish_reason["err_type"])
 
     def test_abort_non_matching_rid(self):
         mgr = self._make_mgr_with_queue()
