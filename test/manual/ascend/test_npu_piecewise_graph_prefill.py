@@ -11,7 +11,6 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-
 TOKENS_TO_CAPTURE = [i for i in range(128, 4096, 128)]
 
 
