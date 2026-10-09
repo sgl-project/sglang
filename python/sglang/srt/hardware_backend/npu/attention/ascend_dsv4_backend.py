@@ -2789,10 +2789,32 @@ class DeepseekV4AscendAttnBackend(
                             _ptab = _hl.md5(
                                 _valid.contiguous().cpu().numpy().tobytes()
                             ).hexdigest()[:16]
+                        _pgmd5 = []
+                        if torch.is_tensor(_tbl) and _tbl.numel():
+                            _ps2 = int(cmp_kv.shape[1])
+                            _n2 = max(0, _pos_max // compress_ratio)
+                            _r0 = _tbl.reshape(_tbl.shape[0], -1)[0].to(torch.int64)
+                            _pos = torch.arange(_n2, device=_r0.device)
+                            if _pos.numel():
+                                _pg = _r0[_pos // _ps2]
+                                _rw = _pos % _ps2
+                                _cpu = cmp_kv.detach().to("cpu")
+                                for _g in torch.unique(_pg).cpu().tolist():
+                                    _m = (_pg == _g).cpu()
+                                    _slab = _cpu[_pg.cpu()[_m], _rw.cpu()[_m]]
+                                    _pgmd5.append(
+                                        f"{_g}:"
+                                        + _hl.md5(
+                                            _slab.contiguous()
+                                            .view(torch.uint8)
+                                            .numpy()
+                                            .tobytes()
+                                        ).hexdigest()[:8]
+                                    )
                         print(
                             f"[C128KV] layer={layer.layer_id} lastpos={_lp} "
                             f"ntok={_ntok} pages={_pages} nblk={_nblk} "
-                            f"ptab={_ptab} logical={_logical}",
+                            f"ptab={_ptab} logical={_logical} pgmd5={_pgmd5}",
                             flush=True,
                         )
                 except Exception as _exc:
