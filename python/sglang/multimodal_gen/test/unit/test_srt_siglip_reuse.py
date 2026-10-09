@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.models.encoders.hunyuan_image3 import (
     _PerImageSDPA,
 )
 from sglang.srt.models import siglip, siglip2
+from sglang.srt.runtime_context import get_parallel
 
 
 def _vision_config():
@@ -163,17 +164,18 @@ def test_hunyuan_siglip2_attention_does_not_mix_images():
 
 
 def test_hunyuan_siglip2_loads_unfused_checkpoint_weights():
-    model = HunyuanImage3VisionModel(
-        dict(
-            hidden_size=16,
-            intermediate_size=32,
-            num_attention_heads=2,
-            num_hidden_layers=1,
-            num_patches=16,
-            patch_size=2,
-            use_return_dict=True,
+    with get_parallel().override(tp_size=1):
+        model = HunyuanImage3VisionModel(
+            dict(
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+                num_patches=16,
+                patch_size=2,
+                use_return_dict=True,
+            )
         )
-    )
     checkpoint = {}
     expected = {}
     for name, param in model.named_parameters():
