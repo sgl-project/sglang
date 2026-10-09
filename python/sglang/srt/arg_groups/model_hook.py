@@ -643,6 +643,7 @@ def handle_model_specific_adjustments(server_args: Any):
         accepted_backends = (
             "trtllm_mha",
             "triton",
+            "flashinfer",
             "ascend",
             "intel_xpu",
             "intel_amx",

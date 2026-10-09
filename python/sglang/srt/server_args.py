@@ -326,6 +326,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via

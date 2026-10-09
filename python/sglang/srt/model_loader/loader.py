@@ -1044,6 +1044,46 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
+        try:
+            from sglang.srt.runtime_context import get_model
+            model_bag = get_model()
+            runtime_kv_dtype = getattr(model_bag, "kv_cache_dtype", None)
+
+            kv_scheme = None
+            if quant_config is not None and hasattr(quant_config, "kv_cache_scheme"):
+                kv_scheme = quant_config.kv_cache_scheme
+            elif hasattr(model, "config") and hasattr(model.config, "hf_config"):
+                quant_cfg = getattr(model.config.hf_config, "quantization_config", None)
+                if isinstance(quant_cfg, dict):
+                    kv_scheme = quant_cfg.get("kv_cache_scheme")
+                elif hasattr(quant_cfg, "kv_cache_scheme"):
+                    kv_scheme = getattr(quant_cfg, "kv_cache_scheme", None)
+
+            if isinstance(kv_scheme, dict) and runtime_kv_dtype:
+                checkpoint_bits = kv_scheme.get("num_bits")
+                expected_bits = None
+                if "fp8" in runtime_kv_dtype or "int8" in runtime_kv_dtype:
+                    expected_bits = 8
+                elif "fp4" in runtime_kv_dtype:
+                    expected_bits = 4
+
+                if checkpoint_bits and expected_bits and checkpoint_bits != expected_bits:
+                    logger.info(
+                        "ignoring kv cache scales from checkpoint (checkpoint_bits=%s, runtime_dtype=%s). "
+                        "mismatch prevents scale corruption; falling back to dynamic scales.",
+                        checkpoint_bits, runtime_kv_dtype
+                    )
+
+                def _filter_kv_scales(ws):
+                    for n, w in ws:
+                        if n.endswith("k_scale") or n.endswith("v_scale") or n.endswith("kv_scale"):
+                            continue
+                        yield n, w
+
+                weights = _filter_kv_scales(weights)
+        except ValueError:
+            pass
+
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.

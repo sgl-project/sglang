@@ -168,6 +168,10 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             m.resolve_attention_access("prefill", "flashinfer").kind,
             KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
         )
+        self.assertEqual(
+            m.resolve_attention_access("decode", "flashinfer").kind,
+            KVCacheAttentionAccessKind.DEQUANT_WORKSPACE,
+        )
 
     def test_create_buffers_shapes(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
