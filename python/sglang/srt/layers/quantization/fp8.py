@@ -2013,6 +2013,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
+        # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+        # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+        runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -2037,7 +2043,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
@@ -2048,16 +2054,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.is_shuffled = True
                 layer._aiter_gate_up_interleaved = False
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-            layer._aiter_gate_up_interleaved = False
+            if runner_is_aiter:
+                # Pre-shuffle weights
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                layer._aiter_gate_up_interleaved = False
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
