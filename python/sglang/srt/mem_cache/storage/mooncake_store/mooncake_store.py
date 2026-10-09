@@ -700,6 +700,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
+    @staticmethod
+    def _kv_buffer_range(host_pool: Any) -> Optional[tuple[int, int]]:
+        """Byte range of the pool's merged kv_buffer, or None.
+
+        MHA pools allocate K and V as one merged (2, ...) tensor; MambaPoolHost
+        keeps a list of state buffers (no single range); logical anchors and
+        dummy pools carry None.
+        """
+        kv_buffer = getattr(host_pool, "kv_buffer", None)
+        if not isinstance(kv_buffer, torch.Tensor) or kv_buffer.numel() == 0:
+            return None
+        lo = kv_buffer.data_ptr()
+        return lo, lo + kv_buffer.numel() * kv_buffer.element_size()
+
+    def _register_pool_buffers(self, host_pool: HostKVCache) -> None:
+        """Register a pool's host buffers at allocation granularity.
+
+        Standalone (dummy-client) mode validates every register_buffer(addr,
+        size) against the client's per-alloc records and requires an exact
+        match. MHA pools allocate K and V as one merged (2, ...) kv_buffer;
+        their get_hybrid_pool_buffer() halves are subviews of it, so
+        registering a half fails that check. Register the merged allocation
+        once (same total bytes as the two halves) and skip its subviews;
+        buffers outside its range (Mamba temporal/conv, DSA index) are
+        separate allocations and register as-is.
+        """
+        kv_range = self._kv_buffer_range(host_pool)
+        if kv_range is not None:
+            super().register_buffer(getattr(host_pool, "kv_buffer"))
+        for buf in self._iter_host_pool_buffers(host_pool):
+            if kv_range is not None and kv_range[0] <= buf.data_ptr() < kv_range[1]:
+                continue
+            super().register_buffer(buf)
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
@@ -707,8 +741,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tensors are registered through register_mem_host_pool_v2().
             return
         try:
-            for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+            self._register_pool_buffers(self.mem_pool_host)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -732,8 +765,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
-        for buf in self._iter_host_pool_buffers(host_pool):
-            super().register_buffer(buf)
+        # MHA-style side pools hit the same merged K/V allocation as the
+        # anchor, so registration must use allocation granularity too.
+        self._register_pool_buffers(host_pool)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
