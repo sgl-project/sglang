@@ -513,7 +513,7 @@ class MlxTpModelWorker(TpModelWorker):
             else:  # "prefill"
                 # The allocation wrote the matched prefix into the request's row.
                 prefix_slot_ids = (
-                    self.req_to_token_pool.req_to_token[
+                    self._model_runner.req_to_token_pool.req_to_token[
                         req.kv.req_pool_idx, : req.prefix_len
                     ].tolist()
                     if req.prefix_len
