@@ -2679,7 +2679,10 @@ fn dec_window_lock_only_ignores_root_and_skipped_window() {
     tc.dec_window_lock_only(
         tc.arena.node(tc.arena.root()).id,
         SWA,
-        &DecLockRefParams::default(),
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(tc.arena.root()).id),
+            ..Default::default()
+        },
         &mut device_frees,
         &mut host_frees,
     )
@@ -2797,6 +2800,7 @@ fn dec_swa_lock_only_is_a_noop_without_the_swa_component() {
     tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(root).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },

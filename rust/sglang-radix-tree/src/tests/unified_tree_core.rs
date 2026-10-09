@@ -641,6 +641,7 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(root).id),
             component_lock_uuids: HashMap::from([(SWA.idx() as u8, Some(7))]),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
@@ -9067,16 +9068,13 @@ fn a_zero_length_match_anchors_at_the_root() {
         .best_match_node_id;
     assert_eq!(anchor, tc.root_node_handle(Some("salted")));
     // The root handle stays valid across a full namespace eviction.
-    tc.inc_lock_ref(anchor, ComponentSet::EMPTY)
+    let lock = tc
+        .inc_lock_ref(anchor, ComponentSet::EMPTY)
         .expect("live root");
     drain_full_device(&mut tc);
     tc.dec_lock_ref(
         anchor,
-        /* params = */
-        &DecLockRefParams {
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        /* params = */ &lock.to_dec_params(),
         /* skip_swa = */ false,
     )
     .expect("live root");

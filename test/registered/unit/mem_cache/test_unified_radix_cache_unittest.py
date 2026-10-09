@@ -11317,14 +11317,13 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         cache, _, _ = build_fixture(self.cfg)
         core = cache.tree_core
         root = cache.root_node_handle()
-        core.dec_lock_ref(root, DecLockRefParams())
-        core.dec_host_lock_ref(root, DecLockRefParams())
-        released = core.dec_swa_lock_only(root, DecLockRefParams())
+        receipt = DecLockRefParams(node_id=root)
+        core.dec_lock_ref(root, receipt)
+        core.dec_host_lock_ref(root, receipt)
+        released = core.dec_swa_lock_only(root, receipt)
         self.assertFalse(released.device_frees)
         self.assertFalse(released.host_frees)
-        released = core.dec_window_lock_only(
-            root, ComponentType.SWA, DecLockRefParams()
-        )
+        released = core.dec_window_lock_only(root, ComponentType.SWA, receipt)
         self.assertFalse(released.device_frees)
         self.assertFalse(released.host_frees)
         cache.sanity_check()
@@ -11466,12 +11465,14 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
             lambda: cache.dec_lock_ref(leaf, lock),
         )
 
-    def test_receipt_anchored_off_root_fails_loud_on_root(self):
-        cache, _, leaf = self._leaf_with_lock_path()
-        lock = cache.inc_lock_ref(leaf).to_dec_params()
+    def test_unanchored_root_release_fails_loud(self):
+        """Every acquire anchors its receipt, root included; an unanchored
+        receipt lost its anchor upstream even where releasing is a no-op."""
+        cache, _, _ = build_fixture(self.cfg)
         root = cache.root_node_handle()
         self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(root, lock), "released on root"
+            lambda: cache.tree_core.dec_lock_ref(root, DecLockRefParams()),
+            "lock receipt anchored on node",
         )
 
     def test_double_release_fails_loud(self):

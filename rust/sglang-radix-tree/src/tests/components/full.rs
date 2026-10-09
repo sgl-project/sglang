@@ -865,11 +865,7 @@ fn lock_round_trips_on_a_root_anchor_are_noops() {
     assert_eq!(tc.arena.device_lock_ref(root, FULL), 1);
     tc.dec_lock_ref(
         tc.arena.node(root).id,
-        /* params = */
-        &DecLockRefParams {
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        /* params = */ &result.to_dec_params(),
         /* skip_swa = */ false,
     )
     .expect("live test node");

@@ -1270,9 +1270,10 @@ def test_empty_match_result_is_root_anchored(swa):
     assert empty.best_match_node == probe.best_match_node
     assert empty.last_device_node == probe.last_device_node
     assert empty.last_host_node == probe.last_host_node
-    core.dec_lock_ref(empty.best_match_node, DecLockRefParams())
-    core.dec_host_lock_ref(empty.best_match_node, DecLockRefParams())
-    released = core.dec_swa_lock_only(empty.best_match_node, DecLockRefParams())
+    receipt = DecLockRefParams(node_id=empty.best_match_node)
+    core.dec_lock_ref(empty.best_match_node, receipt)
+    core.dec_host_lock_ref(empty.best_match_node, receipt)
+    released = core.dec_swa_lock_only(empty.best_match_node, receipt)
     assert not released.device_frees
     assert not released.host_frees
     core.sanity_check([], [])
