@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.sampling.markov import run_markov_block
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -184,7 +185,8 @@ def sample_draft_block(
                     torch.where(greedy_mask, argmax_tokens, sampled_tokens),
                 )
 
-    draft_tokens, corrected_logits = markov_head.sample_block(
+    draft_tokens, corrected_logits = run_markov_block(
+        markov_head,
         base_logits,
         first_prev_tokens=anchor_tokens,
         hidden_states=draft_hidden,

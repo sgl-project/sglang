@@ -718,6 +718,7 @@ class FlashInferAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        cg_key = self._cg_metadata_key(bs)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -745,7 +746,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrappers=self.decode_cuda_graph_metadata[cg_key],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
                 fixed_split_size=None,
@@ -760,7 +761,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[cg_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -773,7 +774,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[cg_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
@@ -786,7 +787,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.draft_extend_cuda_graph_metadata[bs],
+                prefill_wrappers=self.draft_extend_cuda_graph_metadata[cg_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -817,7 +818,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
-            for w in self.decode_cuda_graph_metadata[bs]:
+            for w in self.decode_cuda_graph_metadata[cg_key]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
         if (
@@ -831,7 +832,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
-            for w in self.draft_extend_cuda_graph_metadata[bs]:
+            for w in self.draft_extend_cuda_graph_metadata[cg_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         if (
@@ -858,7 +859,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # EAGLE target-verify keeps the plain plan(): its spec input is
             # not DFLASH_VERIFY, and this branch keys off the capture-time
             # spec_info of these per-bs wrappers.
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            for w in self.prefill_cuda_graph_metadata[cg_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1120,7 +1121,8 @@ class FlashInferAttnBackend(AttentionBackend):
         bs: int,
         num_tokens: int,
     ) -> list:
-        wrappers = self.decode_cuda_graph_metadata.get(bs)
+        cg_key = self._cg_metadata_key(bs)
+        wrappers = self.decode_cuda_graph_metadata.get(cg_key)
         if wrappers is None:
             self._prepare_cuda_graph_metadata(
                 bs,
@@ -1128,7 +1130,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 ForwardMode.DECODE,
                 spec_info=None,
             )
-            wrappers = self.decode_cuda_graph_metadata[bs]
+            wrappers = self.decode_cuda_graph_metadata[cg_key]
         return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
@@ -1272,6 +1274,17 @@ class FlashInferAttnBackend(AttentionBackend):
             for i in range(self.num_wrappers)
         ]
 
+    def _cg_metadata_key(self, bs: int):
+        """Identity of the graph these wrappers belong to.
+
+        Speculative verify graphs that differ only in a sampling variant share a
+        batch size, so keying on bs alone lets a later capture replace an earlier
+        graph's wrappers; the earlier graph then replays against a page table
+        planned for a different one. The runner publishes the variant before each
+        capture and replay-prep; 0 when the model has no verify epilogue.
+        """
+        return (bs, getattr(self, "cuda_graph_variant", 0))
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
@@ -1279,9 +1292,10 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        cg_key = self._cg_metadata_key(bs)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.decode_cuda_graph_metadata[cg_key] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -1290,14 +1304,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[cg_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
-            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            self.draft_extend_cuda_graph_metadata[cg_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_extend():
             if self.full_cg_prefill_wrappers is None:

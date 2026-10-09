@@ -212,9 +212,12 @@ class ConfidenceRelay(msgspec.Struct):
         if not self.initialized or stream is None or publish_ready is None:
             return
         slot = self.ring_pos % CONFIDENCE_RELAY_RING_DEPTH
-        stream.wait_event(publish_ready)
+        # The next publication may overwrite the source before D2H finishes.
+        confidence = self.confidence_buf.clone()
+        stream.wait_stream(torch.get_device_module(self.device).current_stream())
         with torch.get_device_module(self.device).stream(stream):
-            self.conf_ring[slot].copy_(self.confidence_buf, non_blocking=True)
+            self.conf_ring[slot].copy_(confidence, non_blocking=True)
+            confidence.record_stream(stream)
             self.copy_done[slot].record()
         self.gen_ring[slot].copy_(self.pool.req_generation)
         self.ring_pos += 1

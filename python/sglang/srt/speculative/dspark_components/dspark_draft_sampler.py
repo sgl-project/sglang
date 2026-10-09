@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.sampling.markov import run_markov_block, sample_markov_block_greedy
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -131,8 +132,8 @@ class DsparkDraftSampler:
             and isinstance(self.markov_head, VanillaMarkov)
         )
         if not self.folded_sampling and fused_greedy:
-            draft_tokens = self.markov_head.sample_block_greedy_fused(
-                base_logits, first_prev_tokens=anchor
+            draft_tokens = sample_markov_block_greedy(
+                self.markov_head, base_logits, first_prev_tokens=anchor
             )
 
         if draft_tokens is None:
@@ -161,7 +162,8 @@ class DsparkDraftSampler:
                         greedy_step_sampler(step_logits, step_idx),
                     )
 
-            draft_tokens, corrected_logits = self.markov_head.sample_block(
+            draft_tokens, corrected_logits = run_markov_block(
+                self.markov_head,
                 base_logits,
                 first_prev_tokens=anchor,
                 hidden_states=sample_hidden,

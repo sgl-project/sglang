@@ -49,10 +49,8 @@ from sglang.srt.models.deepseek_v4 import (
 )
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
-    StepSampler,
     gather_and_crop_vocab,
     project_through_lm_head,
-    run_markov_block,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -497,12 +495,15 @@ class DSparkV4MarkovHead(nn.Module):
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self._tp_shard is not None:
-            return self._apply_step_logits_sharded(
+            logits = self._apply_step_logits_sharded(
                 base_local=logits, token_ids=token_ids
             )
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        else:
+            logits = logits + self.compute_step_bias(token_ids, hidden_states)
+        return logits, state
 
     def _apply_step_logits_sharded(
         self, *, base_local: torch.Tensor, token_ids: torch.Tensor
@@ -526,8 +527,8 @@ class DSparkV4MarkovHead(nn.Module):
             self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
         )
 
-    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
-        if not self.supports_sharded_greedy or not base_logits.is_cuda:
+    def compute_greedy_step(self, logits, *, token_ids):
+        if not self.supports_sharded_greedy:
             return None
         from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
             sharded_greedy_step,
@@ -535,44 +536,21 @@ class DSparkV4MarkovHead(nn.Module):
 
         shard = self._tp_shard
         weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
-        prev = first_prev_tokens.long()
-        tokens = []
-        for step in range(base_logits.shape[1]):
-            latent = self.get_prev_embeddings(prev)
-            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
-            bias = F.linear(latent.to(weight.dtype), weight)
-            prev = sharded_greedy_step(
-                bias,
-                base_logits[:, step],
-                group=self._shard_group,
-                vocab_start=shard.org_vocab_start,
-                gather=self._vocab_gather.gather_stacked,
-            )
-            tokens.append(prev)
-        return torch.stack(tokens, dim=1)
+        latent = self.get_prev_embeddings(token_ids)
+        # Preserve BF16 GEMM rounding before the FP32 logits add.
+        bias = F.linear(latent.to(weight.dtype), weight)
+        return sharded_greedy_step(
+            bias,
+            logits,
+            group=self._shard_group,
+            vocab_start=shard.org_vocab_start,
+            gather=self._vocab_gather.gather_stacked,
+        )
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
         return logits, embed
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
 
 def build_dspark_v4_confidence_head(

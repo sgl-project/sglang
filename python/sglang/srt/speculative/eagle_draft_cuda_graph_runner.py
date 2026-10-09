@@ -547,6 +547,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
+    @staticmethod
+    def _snapshot_draft_probs(out, raw_bs):
+        """Detach proposal probabilities from shared CUDA-graph output storage."""
+        parent_list, top_scores_index, draft_tokens, draft_probs = out
+        if draft_probs is not None:
+            draft_probs = draft_probs[:raw_bs].clone()
+        return parent_list, top_scores_index, draft_tokens, draft_probs
+
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
@@ -748,5 +756,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
             forward_batch.seq_lens_sum = raw_seq_lens_sum
             forward_batch.out_cache_loc = raw_out_cache_loc
+
+        # All full CUDA graphs share the global graph memory pool. The target
+        # verify graph replays before eagle_sample consumes the proposal q, so
+        # a draft_probs view into captured output storage can be overwritten.
+        # Snapshot it after every replay, including exact (unpadded) graph
+        # batches where _postprocess_output_to_raw_bs is skipped.
+        out = self._snapshot_draft_probs(out, raw_bs)
 
         return out

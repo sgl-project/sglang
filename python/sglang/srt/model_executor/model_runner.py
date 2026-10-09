@@ -373,6 +373,7 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        self.spec_verify_epilogue = None
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator

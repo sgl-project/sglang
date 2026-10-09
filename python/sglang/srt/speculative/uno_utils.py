@@ -9,9 +9,9 @@ from flashinfer import top_k as _flashinfer_top_k
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
+from sglang.srt.sampling.verify_probs import build_verify_target_probs
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
-    build_speculative_verify_target_probs,
 )
 from sglang.srt.speculative.spec_utils import fast_sample
 
@@ -277,7 +277,7 @@ def _build_dense_probs(
     uniform_top_k_value: int | None,
 ) -> torch.Tensor:
     """Build the dense sampling distribution used by SGLang verification."""
-    return build_speculative_verify_target_probs(
+    return build_verify_target_probs(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
         draft_token_num=forward_width,

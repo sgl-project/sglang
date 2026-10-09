@@ -598,6 +598,8 @@ def run_eagle_verify(
     bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
+    epilogue = target_worker.model_runner.spec_verify_epilogue
+    folded = epilogue is not None and epilogue.prepare(batch)
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
         if plan_stream is not None:
@@ -642,6 +644,10 @@ def run_eagle_verify(
             ),
         )
 
+    folded = folded and can_run_cuda_graph
+    if folded:
+        epilogue.arm(batch, grammar_barrier, draft_probs=verify_input.draft_probs)
+
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
@@ -649,7 +655,7 @@ def run_eagle_verify(
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
-        if batch.has_grammar
+        if batch.has_grammar and not folded
         else None
     )
 
@@ -679,7 +685,7 @@ def run_eagle_verify(
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
-    if batch.has_grammar:
+    if batch.has_grammar and not folded:
         grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
             tree=grammar_tree,
@@ -691,41 +697,48 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(
-        verify_input,
-        batch,
-        logits_output,
-        grammar_mask,
-        uno_target_max_top_k=uno_target_max_top_k,
-    )
-    fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
-    if fused_commit_outputs and topk == 1:
-        track_interval = (
-            mamba_track_grid(batch.tree_cache.page_size)
-            if batch.mamba_track_indices is not None
-            else 0
-        )
-        new_seq_lens, bonus_tokens, prepared_commit_steps, prepared_draft_inputs = (
-            prepare_verify_commit_outputs(
-                predict,
-                accept_index,
-                accept_lens,
-                batch.seq_lens,
-                num_draft_tokens=num_draft_tokens,
-                mamba_track_interval=track_interval,
-            )
-        )
-    elif fused_commit_outputs:
-        new_seq_lens, bonus_tokens = prepare_verify_commit_outputs(
-            predict, accept_index, accept_lens, batch.seq_lens
+    fused_commit_outputs = folded
+    if folded:
+        predict, accept_lens, accept_index, bonus_tokens, new_seq_lens = epilogue.read(
+            batch
         )
     else:
-        new_seq_lens = batch.seq_lens + accept_lens
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            grammar_mask,
+            uno_target_max_top_k=uno_target_max_top_k,
+        )
+        fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
+        prepared_commit_steps = prepared_draft_inputs = None
+        if fused_commit_outputs and topk == 1:
+            track_interval = (
+                mamba_track_grid(batch.tree_cache.page_size)
+                if batch.mamba_track_indices is not None
+                else 0
+            )
+            new_seq_lens, bonus_tokens, prepared_commit_steps, prepared_draft_inputs = (
+                prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    batch.seq_lens,
+                    num_draft_tokens=num_draft_tokens,
+                    mamba_track_interval=track_interval,
+                )
+            )
+        elif fused_commit_outputs:
+            new_seq_lens, bonus_tokens = prepare_verify_commit_outputs(
+                predict, accept_index, accept_lens, batch.seq_lens
+            )
+        else:
+            new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -740,14 +753,15 @@ def run_eagle_verify(
         )
 
     # Update mamba state for hybrid GDN models after verification
-    commit_mamba_states_after_verify(
-        target_worker,
-        batch,
-        accept_lens,
-        accept_index,
-        num_draft_tokens,
-        prepared_step_indices=prepared_commit_steps,
-    )
+    if not folded:
+        commit_mamba_states_after_verify(
+            target_worker,
+            batch,
+            accept_lens,
+            accept_index,
+            num_draft_tokens,
+            prepared_step_indices=prepared_commit_steps,
+        )
 
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]

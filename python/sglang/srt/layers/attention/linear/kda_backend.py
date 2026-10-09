@@ -1122,6 +1122,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                max_verify_tokens=(
+                    min(draft_token_num, mixed_qkv.shape[0])
+                    if ragged_layout is not None
+                    else None
+                ),
                 replayssm_rawv=replayssm_rawv,
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
@@ -1550,11 +1555,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if torch.cuda.get_device_capability()[0] != 10:
             return False
-        if ragged_layout is not None or retrieve_parent_token is not None:
+        if retrieve_parent_token is not None:
             return False
+        if ragged_layout is not None:
+            draft_token_num = min(draft_token_num, mixed_qkv.shape[0])
         # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
         # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        if not 1 <= draft_token_num <= 8:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -1627,6 +1634,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        max_verify_tokens: Optional[int] = None,
         replayssm_rawv: Optional[torch.Tensor] = None,
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
@@ -1694,6 +1702,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_conv_v=ic_v,
             ssm_state_indices=cache_indices.to(torch.int32),
             cu_seqlens=query_start_loc.to(torch.int32),
+            max_verify_tokens=max_verify_tokens,
             lower_bound=float(layer.lower_bound),
             scale=layer.head_q_dim**-0.5,
             replayssm_rawv=replayssm_rawv,
