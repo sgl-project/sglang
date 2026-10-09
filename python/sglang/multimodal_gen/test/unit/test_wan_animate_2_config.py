@@ -48,7 +48,13 @@ from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
     _supported_init_kwargs,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    component_name_to_loader_cls,
+    get_param_names_mapping,
+)
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
     WanAnimate2Transformer3DModel,
 )
@@ -60,6 +66,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multi
 )
 from sglang.multimodal_gen.runtime.pipelines.wan_animate_2_pipeline import (
     WanAnimate2Pipeline,
+    WanAnimate2TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
@@ -102,6 +109,16 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 
 # Wan_Animate_2_14B_Config
+
+
+def test_pipeline_local_loader_preserves_shared_transformer_registry():
+    for name in TransformerLoader.component_names:
+        assert component_name_to_loader_cls[name] is TransformerLoader
+    assert not TransformerLoader.strict_checkpoint_keys
+    assert WanAnimate2TransformerLoader.strict_checkpoint_keys
+    assert WanAnimate2Pipeline.component_loaders == {
+        "transformer": WanAnimate2TransformerLoader
+    }
 
 
 def test_text_encoder_counts_tokens_before_device_transfer():

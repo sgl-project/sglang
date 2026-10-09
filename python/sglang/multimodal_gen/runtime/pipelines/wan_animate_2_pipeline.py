@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 class WanAnimate2TransformerLoader(TransformerLoader):
     """The checkpoint is the plain Wan2.2-I2V-14B backbone, so every key must map."""
 
+    component_names = []
     strict_checkpoint_keys = True
 
 
