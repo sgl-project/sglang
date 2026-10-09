@@ -7,10 +7,14 @@
 
 mod error;
 mod model_files;
+#[cfg(feature = "openai")]
+pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
 #[cfg(feature = "render")]
 mod render;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod think;
 #[cfg(feature = "tokenizer")]
 mod tokenizer;
 
@@ -19,7 +23,8 @@ pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    dynamo_tool_parser_name,
+    ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
+    dynamo_tool_parser_name, split_reasoning, tool_constraint,
 };
 #[cfg(feature = "render")]
 pub use render::{
@@ -27,6 +32,8 @@ pub use render::{
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
+#[cfg(any(feature = "parser", feature = "openai"))]
+pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 

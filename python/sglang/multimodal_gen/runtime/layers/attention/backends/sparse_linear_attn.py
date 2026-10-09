@@ -247,12 +247,6 @@ class SparseLinearAttentionMetadata(AttentionMetadata):
 class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
     """Builder for SparseLinearAttentionMetadata."""
 
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(
         self,
         current_timestep: int,
@@ -264,6 +258,24 @@ class SparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
             topk_ratio=topk_ratio,
             protect_upto=int(kwargs.get("protect_upto", 0) or 0),
         )
+
+
+def _initialize_linear_attention(model, head_size: int, feature_map: str) -> None:
+    model.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
+    model.feature_map_q: Callable[[torch.Tensor], torch.Tensor]
+    model.feature_map_k: Callable[[torch.Tensor], torch.Tensor]
+    if feature_map == "elu":
+        model.feature_map_q = lambda x: F.elu(x) + 1
+        model.feature_map_k = lambda x: F.elu(x) + 1
+    elif feature_map == "relu":
+        model.feature_map_q = F.relu
+        model.feature_map_k = F.relu
+    elif feature_map == "softmax":
+        model.feature_map_q = lambda x: F.softmax(x, dim=-1)
+        model.feature_map_k = lambda x: F.softmax(x, dim=-1)
+    else:
+        raise ValueError(f"Unknown feature map: {feature_map}")
+    model._init_weights()
 
 
 class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
@@ -302,28 +314,12 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
         self.linear_mix = sla.linear_mix
         self.head_size = head_size
 
-        # Learnable linear projection for combining sparse + linear attention
-        self.proj_l: nn.Linear | None
-        # Feature map for linear attention
-        # Type annotation for callables
+        # The linear-branch projection and feature maps exist only with linear_mix.
+        self.proj_l: nn.Linear | None = None
         self.feature_map_q: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.feature_map_k: Callable[[torch.Tensor], torch.Tensor] | None = None
         if self.linear_mix:
-            self.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
-            if feature_map == "elu":
-                self.feature_map_q = lambda x: F.elu(x) + 1
-                self.feature_map_k = lambda x: F.elu(x) + 1
-            elif feature_map == "relu":
-                self.feature_map_q = F.relu
-                self.feature_map_k = F.relu
-            elif feature_map == "softmax":
-                self.feature_map_q = lambda x: F.softmax(x, dim=-1)
-                self.feature_map_k = lambda x: F.softmax(x, dim=-1)
-            else:
-                raise ValueError(f"Unknown feature map: {feature_map}")
-            self._init_weights()
-        else:
-            self.proj_l = None
+            _initialize_linear_attention(self, head_size, feature_map)
 
     def _init_weights(self) -> None:
         """Initialize projection weights to zero for residual-like behavior."""
@@ -534,12 +530,6 @@ class SageSparseLinearAttentionMetadata(AttentionMetadata):
 class SageSparseLinearAttentionMetadataBuilder(AttentionMetadataBuilder):
     """Builder for SageSparseLinearAttentionMetadata."""
 
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(
         self,
         current_timestep: int,
@@ -581,42 +571,12 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
         self.topk_ratio = topk_ratio
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
 
-        # Learnable linear projection for combining sparse + linear attention
-        self.proj_l = nn.Linear(head_size, head_size, dtype=torch.float32)
+        _initialize_linear_attention(self, head_size, feature_map)
 
-        # Feature map for linear attention
-        # Type annotation for callables
-        self.feature_map_q: Callable[[torch.Tensor], torch.Tensor]
-        self.feature_map_k: Callable[[torch.Tensor], torch.Tensor]
-        if feature_map == "elu":
-            self.feature_map_q = lambda x: F.elu(x) + 1
-            self.feature_map_k = lambda x: F.elu(x) + 1
-        elif feature_map == "relu":
-            self.feature_map_q = F.relu
-            self.feature_map_k = F.relu
-        elif feature_map == "softmax":
-            self.feature_map_q = lambda x: F.softmax(x, dim=-1)
-            self.feature_map_k = lambda x: F.softmax(x, dim=-1)
-        else:
-            raise ValueError(f"Unknown feature map: {feature_map}")
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize projection weights to zero for residual-like behavior."""
-        with torch.no_grad():
-            nn.init.zeros_(self.proj_l.weight)
-            nn.init.zeros_(self.proj_l.bias)  # type: ignore[arg-type]
-
-    def _calc_linear_attention_with_torch(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ):
-        kv = torch.matmul(k.transpose(-1, -2), v)
-        k_sum = torch.sum(k, dim=-2, keepdim=True)
-        return torch.matmul(q, kv) / (1e-5 + torch.matmul(q, k_sum.transpose(-1, -2)))
+    _init_weights = SparseLinearAttentionImpl._init_weights
+    _calc_linear_attention_with_torch = (
+        SparseLinearAttentionImpl._calc_linear_attention_with_torch
+    )
 
     def forward(
         self,
