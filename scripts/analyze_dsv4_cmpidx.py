@@ -20,7 +20,7 @@ import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|OSHAPE|XIN|LHID)\]")
+TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|OSHAPE|XIN|LHID)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
@@ -79,7 +79,7 @@ def oshape_sig(rec):
 def tag_sig(tag, rec):
     if tag == "OSHAPE":
         return oshape_sig(rec)
-    if tag in ("IDXK", "C4KV"):
+    if tag in ("IDXK", "C4KV", "C128KV"):
         # logical = md5 of the pages the request actually reads (via its page table)
         return f"logical={rec.get('logical')}"
     return rec.get("md5")
@@ -152,24 +152,26 @@ def report_lhid(rows):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "OSHAPE", "XIN", "LHID"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
-    if not recs.get("CMPIDX"):
-        print("\nno [CMPIDX] lines found. Enable DSV4_DUMP_CMPIDX and re-run.")
-        return
+    if recs.get("CMPIDX"):
+        cmp_reqs = segment(recs["CMPIDX"])
+        miss_i = max(range(len(cmp_reqs)), key=lambda i: (cmp_reqs[i]["ntok0"] or 0))
+        print("\n== requests (classified by [CMPIDX] prefill ntok) ==")
+        for i, rq in enumerate(cmp_reqs[:MAX_REQ_SHOWN]):
+            role = "MISS" if i == miss_i else "HIT "
+            print(f"  req{i:<2} {role} prefill_ntok={rq['ntok0']}"
+                  f"  steps={len(rq['steps'])}")
+        if len(cmp_reqs) > MAX_REQ_SHOWN:
+            print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
+        print(f"\nMISS = req{miss_i} (largest prefill ntok); each HIT compared to it.")
+    else:
+        # No [CMPIDX]: fall back to per-tag segments; req0 = MISS (best effort).
+        cmp_reqs = None
+        miss_i = 0
+        print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    cmp_reqs = segment(recs["CMPIDX"])
-    miss_i = max(range(len(cmp_reqs)), key=lambda i: (cmp_reqs[i]["ntok0"] or 0))
-    print("\n== requests (classified by [CMPIDX] prefill ntok) ==")
-    for i, rq in enumerate(cmp_reqs[:MAX_REQ_SHOWN]):
-        role = "MISS" if i == miss_i else "HIT "
-        print(f"  req{i:<2} {role} prefill_ntok={rq['ntok0']}"
-              f"  steps={len(rq['steps'])}")
-    if len(cmp_reqs) > MAX_REQ_SHOWN:
-        print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
-    print(f"\nMISS = req{miss_i} (largest prefill ntok); each HIT compared to it.")
-
-    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "OSHAPE", "XIN", "LHID"):
         rows = recs.get(tag, [])
         if not rows:
             continue
@@ -177,16 +179,16 @@ def main(path):
             print("\n== [LHID] per-layer hidden (order-independent) ==")
             report_lhid(rows)
             continue
-        reqs = cmp_reqs if tag == "CMPIDX" else segment(rows)
+        reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")
-        if tag != "CMPIDX" and len(reqs) != len(cmp_reqs):
+        if cmp_reqs is not None and tag != "CMPIDX" and len(reqs) != len(cmp_reqs):
             print(f"  note: {len(reqs)} requests here vs {len(cmp_reqs)} in "
                   "[CMPIDX]; aligning by index")
-        if miss_i >= len(reqs):
+        if not reqs or miss_i >= len(reqs):
             print(f"  req{miss_i} missing for [{tag}]; cannot compare")
             continue
         for i, rq in enumerate(reqs):
-            if i == miss_i or i >= len(cmp_reqs):
+            if i == miss_i or (cmp_reqs is not None and i >= len(cmp_reqs)):
                 continue
             n, same, pre, n_pre = compare(tag, reqs[miss_i]["steps"], rq["steps"])
             print(f"  MISS(req{miss_i}) vs HIT(req{i}): lastpos={n}"

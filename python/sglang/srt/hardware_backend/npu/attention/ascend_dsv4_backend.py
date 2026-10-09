@@ -2690,15 +2690,19 @@ class DeepseekV4AscendAttnBackend(
                         if forward_batch.positions.numel()
                         else -1
                     )
-                    _pages = int(cmp_kv.shape[0])
-                    _logical = _read_page_table_md5(
-                        cmp_kv, getattr(fm, "c128_page_table", None), _pages
-                    )
-                    print(
-                        f"[C128KV] layer={layer.layer_id} lastpos={_lp} "
-                        f"pages={_pages} logical={_logical}",
-                        flush=True,
-                    )
+                    _lo = int(_os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+                    _hi = int(_os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+                    if _lo <= _lp <= _hi:
+                        _ntok = int(forward_batch.positions.numel())
+                        _pages = int(cmp_kv.shape[0])
+                        _logical = _read_page_table_md5(
+                            cmp_kv, getattr(fm, "c128_page_table", None), _pages
+                        )
+                        print(
+                            f"[C128KV] layer={layer.layer_id} lastpos={_lp} "
+                            f"ntok={_ntok} pages={_pages} logical={_logical}",
+                            flush=True,
+                        )
                 except Exception as _exc:
                     print(f"[C128KV] skipped: {_exc}", flush=True)
 
