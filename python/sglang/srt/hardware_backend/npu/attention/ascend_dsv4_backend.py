@@ -543,6 +543,53 @@ class CompressorAscendBackendMixin:
             )
         state_block_table = table_cache[ratio]
 
+        # S186: per-c128-block dump of the c4 compress STATE rows the compressor
+        # reads, keyed by ABSOLUTE token block (position // 128), so the full
+        # miss and the suffix hit compare the SAME positions. ([CIN] state_rows
+        # is not comparable: the table spans different position ranges.) Env
+        # DSV4_DUMP_C4ST = layer id or "all". Only meaningful for the INDEXER
+        # compressor (idx=1) which produces the c4 index-K.
+        _want_st = os.environ.get("DSV4_DUMP_C4ST")
+        if _want_st and (
+            _want_st in ("all", "") or _want_st == str(compressor.layer_id)
+        ):
+            try:
+                import hashlib as _hlst
+
+                _hist = coff * ratio
+                _width = int(state_block_table.shape[1])
+                _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+                _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
+                _flat = state_cache.reshape(-1, state_cache.shape[-1])
+                _rows_n = _flat.shape[0]
+                _by_blk = {}
+                for _b in range(_tbl_cpu.shape[0]):
+                    _base = int(_sp[_b]) - _hist
+                    for _c in range(_width):
+                        _p = _base + _c
+                        if _p < 0:
+                            continue
+                        _sl = int(_tbl_cpu[_b, _c])
+                        if _sl < 0 or _sl >= _rows_n:
+                            continue
+                        _by_blk.setdefault(_p // 128, []).append(_sl)
+                _out = []
+                for _bk in sorted(_by_blk):
+                    _idxs = torch.tensor(sorted(set(_by_blk[_bk])), dtype=torch.int64)
+                    _r = _flat.index_select(0, _idxs)
+                    _h = _hlst.md5(
+                        _r.detach().to(torch.float32).cpu().numpy().tobytes()
+                    ).hexdigest()[:16]
+                    _out.append(f"{_bk}:{_h}")
+                print(
+                    f"[C4ST] layer={compressor.layer_id} "
+                    f"idx={int(compressor.is_in_indexer)} start={_sp.tolist()} "
+                    f"blkx={_out[-10:]}",
+                    flush=True,
+                )
+            except Exception as _exc:
+                print(f"[C4ST] skipped: {_exc}", flush=True)
+
         import os
 
         # A full DSV4_DUMP is tens of thousands of lines. DSV4_DUMP_LAYERS keeps
