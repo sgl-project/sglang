@@ -343,6 +343,17 @@ not disable those preferences for other components. On-demand loading and
 prefetch for upcoming uses within a request are unchanged; explicit offload may
 therefore add weight-transfer latency to the first real request after warmup.
 
+Two options tune the warmup preload for components without an explicit placement:
+
+- `--warmup-preload-components {auto|none|<names>}`: which components warmup keeps
+  on device after it finishes. `auto` (default) follows the pipeline's
+  preferences, `none` keeps none, and a comma-separated list such as
+  `text_encoder,transformer` keeps only those components. Regular requests are not
+  affected.
+- `--warmup-preload-margin-gib`: free device memory, in GiB, that a warmup preload
+  must leave (default `1.0`). Raise it if the first real request runs out of
+  memory after warmup kept a component on device.
+
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
 #### Snapshot offload
