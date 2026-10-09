@@ -288,6 +288,22 @@ def test_cond_key_repeat_still_uses_cache() -> None:
     release_comfyui_session(ex.sid)
 
 
+def _h3_packed(text, payload):
+    return PackedForward(
+        latents=torch.zeros(1, 4, 2, 2),
+        timesteps=torch.tensor([500.0]),
+        prompt_embeds=[text],
+        prompt_seq_lens=[[int(text.shape[0])]],
+        height=2,
+        width=2,
+        extra_req={
+            "h3_payload": payload,
+            "h3_context": text,
+            "comfyui_cache_fp": {"spatial": (1, 2, 2)},
+        },
+    )
+
+
 def test_h3_cache_hit_restores_own_extras() -> None:
     ex = _Executor(MiniMaxH3Adapter())
     pos, neg = torch.ones(3, 4), torch.zeros(3, 4)
@@ -355,22 +371,6 @@ def test_cond_key_flux_without_pooled_keeps_t5_apart() -> None:
     assert repeat.prompt_embeds == []  # cached now that y is a tensor
     assert torch.equal(restored.prompt_embeds[1], ctx_a)
     release_comfyui_session(ex.sid)
-
-
-def _h3_packed(text, payload):
-    return PackedForward(
-        latents=torch.zeros(1, 4, 2, 2),
-        timesteps=torch.tensor([500.0]),
-        prompt_embeds=[text],
-        prompt_seq_lens=[[int(text.shape[0])]],
-        height=2,
-        width=2,
-        extra_req={
-            "h3_payload": payload,
-            "h3_context": text,
-            "comfyui_cache_fp": {"spatial": (1, 2, 2)},
-        },
-    )
 
 
 class _FakePipeline:
