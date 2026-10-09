@@ -623,10 +623,10 @@ def verdict_c4stp(recs):
     carried boundary (pos 16380..16383) and the block-136 commit steps, then
     prints ONE rule line mapping the divergence to its root cause::
 
-        carry DIFF                             -> READ
-        first pre SAME / post DIFF commit step -> WRITE
-        pre itself already DIFF                -> UPSTREAM
-        no per-position state diff             -> NON_STATE
+        carry DIFF                         -> READ
+        first block136 step with content=DIFF -> WRITE (post-only probe included)
+        carry/block136 data but no diff    -> NON_STATE
+        pre streams already DIFF (no data) -> UPSTREAM
 
     Additive only: it never touches the [C4ST] report above.
     """
@@ -669,26 +669,34 @@ def verdict_c4stp(recs):
                   f"content={content}")
 
     pre_m, pre_h = miss_by_tag["pre"], hit_by_tag["pre"]
-    post_m, post_h = miss_by_tag["post"], hit_by_tag["post"]
-    positions = sorted(set(pre_m) | set(pre_h) | set(post_m) | set(post_h))
-    first_commit, any_pre_diff = None, False
-    for p in positions:
-        pre_cmp = _c4stp_cmp(pre_m, pre_h, p)
-        if pre_cmp == "DIFF":
-            any_pre_diff = True
-        elif (first_commit is None and pre_cmp == "SAME"
-              and _c4stp_cmp(post_m, post_h, p) == "DIFF"):
-            first_commit = p
 
+    # First block136 step (sorted) whose paired MISS-vs-HIT content diverges.
+    # The COMMIT-ROW probe only emits ``tag=post``, so this must not depend on a
+    # pre/post pair at the same step.
+    first_diff_step, block136_seen = None, False
+    for step in sorted(C4STP_BLOCK136_STEPS):
+        cmp = _c4stp_cmp(miss_map, hit_map, step)
+        if cmp is not None:
+            block136_seen = True
+        if cmp == "DIFF" and first_diff_step is None:
+            first_diff_step = step
+
+    # UPSTREAM probe: both ``pre`` streams already diverged at a block136 step.
+    pre_diff = any(_c4stp_cmp(pre_m, pre_h, step) == "DIFF"
+                   for step in sorted(C4STP_BLOCK136_STEPS))
+
+    has_state_data = carry != "N/A" or block136_seen
     if carry == "DIFF":
         verdict = "READ"
-    elif first_commit is not None:
+    elif first_diff_step is not None:
         verdict = "WRITE"
-    elif any_pre_diff:
+    elif has_state_data:
+        verdict = "NON_STATE"
+    elif pre_diff:
         verdict = "UPSTREAM"
     else:
         verdict = "NON_STATE"
-    first_txt = "NONE" if first_commit is None else str(first_commit)
+    first_txt = "NONE" if first_diff_step is None else str(first_diff_step)
     print(f"[C4STP-BINRULE] carry={carry} "
           f"first_commit_diff_step={first_txt} verdict={verdict}")
     print(C4STP_RUNBOOK)
