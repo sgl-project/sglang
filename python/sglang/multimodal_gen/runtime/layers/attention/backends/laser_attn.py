@@ -1,5 +1,6 @@
+
+import sgl_kernel_npu  # noqa: F401
 import torch
-import torch_npu
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -42,12 +43,11 @@ class LaserAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        if torch_npu.npu.get_soc_version() == 260:
+        if torch.npu.get_soc_version() == 260:
             raise ValueError(
                 "Laser Attention is unavailable on Ascend 950 (A5). "
                 "Use --attention-backend fa or rain_fusion_attn."
             )
-        import sgl_kernel_npu  # noqa: F401
 
         self.softmax_scale = softmax_scale
 

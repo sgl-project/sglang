@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch_npu
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -118,7 +117,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.block_size = 128
         self.tile_size = 8
-        self._is_a5 = torch_npu.npu.get_soc_version() == 260
+        self._is_a5 = torch.npu.get_soc_version() == 260
 
         sparse_config = get_global_server_args().attention_backend_config or {}
         self.skip_first_steps = int(sparse_config.get("skip_first_steps", 10))
@@ -382,7 +381,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         if not actual_seq_lengths:
             return torch.empty_like(query)
 
-        output, _ = torch_npu.npu_block_sparse_attention(
+        output, _ = torch.ops.npu.npu_block_sparse_attention(
             query.contiguous(),
             key.contiguous(),
             value.contiguous(),
@@ -411,7 +410,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         actual_seq_lengths = [query.shape[1]] * query.shape[0]
         actual_seq_lengths_kv = [key.shape[1]] * key.shape[0]
 
-        output, _ = torch_npu.npu_block_sparse_attention(
+        output, _ = torch.ops.npu.npu_block_sparse_attention(
             query.permute(0, 2, 1, 3).contiguous(),
             key.permute(0, 2, 1, 3).contiguous(),
             value.permute(0, 2, 1, 3).contiguous(),
