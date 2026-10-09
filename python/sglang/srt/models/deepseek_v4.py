@@ -4799,6 +4799,7 @@ class DeepseekV4Model(nn.Module):
                     if _win and _hi is not None and _lastpos > int(_hi):
                         _win = False
                     if _win:
+                        _parts = []
                         if hidden_states.numel():
                             _arr = (
                                 hidden_states.detach()
@@ -4808,11 +4809,22 @@ class DeepseekV4Model(nn.Module):
                                 .numpy()
                             )
                             _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
+                            _hp = _pos.reshape(-1).to(torch.int64).cpu() // 128
+                            _hh = hidden_states.detach().to(torch.float32).cpu()
+                            for _b in torch.unique(_hp).tolist():
+                                _m = _hp == _b
+                                _parts.append(
+                                    f"{_b}:"
+                                    + _hl.md5(
+                                        _hh[_m].contiguous().numpy().tobytes()
+                                    ).hexdigest()[:8]
+                                )
                         else:
                             _h = "empty"
                         print(
                             f"[LHID] layer={i} lastpos={_lastpos} "
-                            f"ntok={int(hidden_states.shape[0])} md5={_h}",
+                            f"ntok={int(hidden_states.shape[0])} md5={_h} "
+                            f"blkx={_parts[-8:]}",
                             flush=True,
                         )
                 if capture_dspark and i in self.dspark_layers_to_capture:
