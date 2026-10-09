@@ -64,6 +64,12 @@ class DSANPUIndexerMixin:
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+        # DSA prefill CP metadata is Ascend-local and is first consumed by this
+        # indexer (before the attention backend's forward_extend), so prepare it
+        # here rather than in the shared eager runner.
+        attn_backend = get_attn_backend()
+        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
+            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
