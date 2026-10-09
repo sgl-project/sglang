@@ -10,25 +10,112 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu")
 
 
-@pytest.mark.parametrize("topk", [0, 1, 6, 24])
-def test_compact_topk_padding(topk):
-    from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import compact_topk
+@pytest.mark.parametrize("width", [0, 24])
+@pytest.mark.parametrize("write_pages", [False, True])
+def test_compact_prefill_dispatch(width, write_pages):
+    from types import SimpleNamespace
+    from unittest.mock import patch
 
-    blocks = torch.tensor([[2, -1, 0], [-1, -1, -1]], dtype=torch.int32)
-    positions = (blocks.long()[:, :, None] * 8 + torch.arange(8)).flatten(1)
-    lengths = torch.tensor([19, 0])
+    from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+    chunk = SimpleNamespace(
+        scores=torch.empty(2, width),
+        lens=torch.tensor([3, 19]),
+        tok=torch.tensor([3, 1]),
+        candidate_blocks=torch.zeros(2, width // 8, dtype=torch.int32),
+    )
+    inputs = SimpleNamespace(
+        req_rows=torch.tensor([0, 1, 0, 2]),
+        out_page_indices=torch.empty(4, 8, dtype=torch.int32) if write_pages else None,
+        out_raw_indices=torch.full((4, 8), -1, dtype=torch.int32),
+        compress_ratio=2,
+    )
+    with (
+        patch.object(scoring, "topk_transform_ragged_v2") as topk,
+        patch.object(scoring, "finish_paged_indexer_topk") as finish,
+    ):
+        scoring.select_compact_prefill(
+            inputs, SimpleNamespace(k=8), chunk, torch.empty(3, 40)
+        )
+    if not width:
+        topk.assert_not_called()
+        finish.assert_not_called()
+        assert (inputs.out_raw_indices == -1).all()
+        return
+    topk.assert_called_once()
+    torch.testing.assert_close(
+        topk.call_args.args[1], torch.full((2,), width, dtype=torch.int32)
+    )
+    assert topk.call_args.kwargs["out_indices"].dtype == torch.int32
+    assert not topk.call_args.kwargs["out_offsets"].any()
+    finish.assert_called_once()
+    assert finish.call_args.args[2] is chunk.lens
+    assert finish.call_args.kwargs["output_rows"] is chunk.tok
+    assert finish.call_args.kwargs["candidate_blocks"] is chunk.candidate_blocks
+    if write_pages:
+        torch.testing.assert_close(finish.call_args.args[3], torch.tensor([2, 1]))
+    else:
+        assert finish.call_args.args[3] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("write_pages", [False, True])
+@pytest.mark.parametrize("topk", [1, 6, 24])
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_compact_prefill_finish(ratio, write_pages, topk, use_v2):
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_paged_indexer_topk
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    device = "cuda"
+    blocks = torch.tensor([[2, -1, 0], [-1, -1, -1]], dtype=torch.int32, device=device)
+    positions = (
+        blocks.long()[:, :, None] * 8 + torch.arange(8, device=device)
+    ).flatten(1)
+    lengths = torch.tensor([19, 0], device=device)
     scores = positions.float().masked_fill(
         (positions < 0) | (positions >= lengths[:, None]), -torch.inf
     )
-    actual = compact_topk(scores, blocks, lengths, topk, 23, 8).sort().values
-    visible = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18]
-    selected = sorted(visible[-topk:]) if topk else []
-    expected = torch.tensor(
-        [selected + [23] * (topk - len(selected)), [23] * topk], dtype=torch.int64
+    indices = scores.topk(topk, dim=-1, sorted=False).indices
+    if use_v2:
+        indices = torch.empty((2, topk), dtype=torch.int32, device=device)
+        topk_transform_ragged_v2(
+            scores,
+            torch.full((2,), 24, dtype=torch.int32, device=device),
+            out_offsets=torch.zeros(2, dtype=torch.int32, device=device),
+            out_indices=indices,
+        )
+    # Reverse/noncontiguous destinations; untouched rows and output padding matter.
+    output_rows = torch.tensor([3, 1], device=device)
+    raw = torch.full((5, topk + 3), -77, dtype=torch.int32, device=device)
+    pages = torch.full_like(raw, -77) if write_pages else None
+    req = torch.tensor([1, 0], device=device)
+    table = torch.arange(2 * 32 * ratio, device=device).reshape(2, 32 * ratio)
+    finish_paged_indexer_topk(
+        indices,
+        scores,
+        lengths,
+        req if write_pages else None,
+        table if write_pages else None,
+        pages,
+        raw,
+        ratio,
+        True,
+        candidate_blocks=blocks,
+        output_rows=output_rows,
     )
-    torch.testing.assert_close(actual, expected)
-    empty = compact_topk(scores[:, :0], blocks[:, :0], lengths, topk, 23, 8)
-    assert (empty == 23).all()
+    visible = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18]
+    selected = sorted(visible[-topk:])
+    expected = torch.full_like(raw, -77)
+    expected[1].fill_(-1)
+    expected[3].fill_(-1)
+    expected[3, : len(selected)] = torch.tensor(
+        selected, device=device, dtype=torch.int32
+    )
+    torch.testing.assert_close(raw, expected)
+    if write_pages:
+        expected[3, : len(selected)] += 32
+        torch.testing.assert_close(pages, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
