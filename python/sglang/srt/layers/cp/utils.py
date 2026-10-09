@@ -353,7 +353,7 @@ def dsa_prefill_cp_fused_symm_mem_eligible(
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.dsa.utils import (
         dsa_use_prefill_cp,
-        is_dsa_prefill_cp_round_robin_split,
+        is_dsa_prefill_cp_interleave,
     )
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -367,7 +367,7 @@ def dsa_prefill_cp_fused_symm_mem_eligible(
         return False
     if not get_moe_a2a_backend().is_none():
         return False
-    if not is_dsa_prefill_cp_round_robin_split():
+    if not is_dsa_prefill_cp_interleave():
         # AG places rank r at offset r * M_local; only equal round-robin
         # shards keep that arithmetic exact.
         return False
