@@ -198,7 +198,16 @@ def _parse_blkx(rec, field="blkx"):
     return out
 
 
-def report_blkx(rows, label, field="blkx"):
+def _is_prefill(rec):
+    """True unless the probe line is a decode step (``mode=2``).
+
+    Decode steps advance lastpos each step, so their per-block hashes are not
+    comparable across requests and must be excluded from the per-block verdict.
+    """
+    return rec.get("mode") != "2"
+
+
+def report_blkx(rows, label, field="blkx", keep=None):
     """Per-c128-block (``position // 128``) hit==miss verdict.
 
     A block's hash must be unique across all requests (deterministic), so a
@@ -206,9 +215,12 @@ def report_blkx(rows, label, field="blkx"):
     This is NOT shape-confounded (a block = the same absolute positions on both
     the full-prefill miss and the suffix hit).  Locates the FIRST divergent
     block and the layers diverging there (=> the first divergent layer).
+    ``keep`` optionally filters rows (e.g. prefill-only to drop decode noise).
     """
     groups = defaultdict(set)
     for r in rows:
+        if keep is not None and not keep(r):
+            continue
         ly = _int(r, "layer")
         for b, h in _parse_blkx(r, field).items():
             groups[(ly, b)].add(h)
@@ -279,8 +291,8 @@ def main(path):
             continue
         if tag == "IDXIN":
             print("\n== [IDXIN] c4-indexer raw inputs (per-block q/w + seq lens) ==")
-            report_blkx(rows, "IDXIN.q_quant", field="qblk")
-            report_blkx(rows, "IDXIN.weights", field="wblk")
+            report_blkx(rows, "IDXIN.q_quant", field="qblk", keep=_is_prefill)
+            report_blkx(rows, "IDXIN.weights", field="wblk", keep=_is_prefill)
             report_uniq(rows, "IDXIN", ("slq", "slk", "qshape", "wshape"))
             continue
         if tag == "LIMETA":
@@ -306,8 +318,8 @@ def main(path):
             report_group(rows, "logical", "C128KV", extra=("nblk", "ptab"))
             continue
         if tag == "CMPIDX":
-            print("\n== [CMPIDX] c4-indexer top-k (per-c128-block, S167.3) ==")
-            report_blkx(rows, "CMPIDX")
+            print("\n== [CMPIDX] c4-indexer top-k (per-c128-block, prefill) ==")
+            report_blkx(rows, "CMPIDX", keep=_is_prefill)
             # fall through to the whole-tensor segment compare below as well
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")
