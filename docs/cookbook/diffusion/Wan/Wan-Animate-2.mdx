@@ -1,11 +1,14 @@
 ---
 title: Wan-Animate-2
+tag: NEW
 description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion.
 metatags:
     description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Wan/wan-animate-2.jsx';
 
 <DiffusionModelTags tags={["video", "character animation", "image + reference video", "single-expert", "640×800 / 720×1280"]} />
 
@@ -141,13 +144,17 @@ for installation instructions.
 
 ### 3.1 Basic Configuration
 
-On a single high-VRAM GPU, launch the native pipeline with:
+Use Linux with NVIDIA CUDA and follow the installation guide above.
+The presets below use the [multi-GPU and memory configurations](#3-3-multi-gpu-and-memory-presets).
+For 80 GB GPUs, choose DiT layerwise offload. Memory usage depends on the input
+video, pixel-area budget, and `clip_len`; see the [benchmark](#5-benchmark) for
+the measured workload.
 
-```bash Command
-sglang serve \
-  --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
-  --port 30010
-```
+<Deployment config={config} />
+
+The request command submits both reference inputs and returns a video job ID.
+See [HTTP invocation](#4-2-serve-and-request-over-http) for polling and downloading
+the finished video. The reference video path must be readable by the server.
 
 Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
 `model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
