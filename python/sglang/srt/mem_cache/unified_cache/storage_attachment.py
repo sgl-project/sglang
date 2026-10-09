@@ -346,8 +346,8 @@ class StorageAttachment:
 
     # ---- Internals ----
 
-    @staticmethod
     def _validate_policies(
+        self,
         hicache_storage_prefetch_policy: Optional[str],
         hicache_write_policy: Optional[str],
     ) -> Optional[str]:
@@ -368,6 +368,15 @@ class StorageAttachment:
             return (
                 f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                 f"Expected one of {list(_WRITE_POLICIES)}."
+            )
+        if (
+            self._cache.host_memory_mode == "buffer_only"
+            and hicache_write_policy == "write_back"
+        ):
+            return (
+                "HiCache host memory mode 'buffer_only' does not support "
+                "write policy 'write_back'; use 'write_through' or "
+                "'write_through_selective'."
             )
         return None
 
