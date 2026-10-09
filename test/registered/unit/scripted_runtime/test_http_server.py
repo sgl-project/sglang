@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 import unittest
 import uuid
+from pathlib import Path
 
 import zmq
 
@@ -71,6 +73,9 @@ class _FakeProcess:
 
     def is_alive(self) -> bool:
         return self._alive
+
+    def join(self, timeout=None) -> None:
+        pass
 
 
 def _make_server(socket: zmq.Socket, process: _FakeProcess) -> ScriptedHttpServer:
@@ -145,6 +150,26 @@ class TestExecuteScriptDirtyGuard(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "dirty"):
                 server.execute_script(_sample_script)
             pair.assert_no_sent_message(self)
+
+
+class TestShutdownDeadServer(CustomTestCase):
+    def test_returns_when_the_server_is_gone(self):
+        # No peer is connected, as after the server process died.
+        ctx = zmq.Context()
+        socket = ctx.socket(zmq.PAIR)
+        socket.bind(f"inproc://scripted-http-server-{uuid.uuid4().hex}")
+        server = _make_server(socket, _FakeProcess(alive=False))
+        server._ctx = ctx
+        with tempfile.NamedTemporaryFile(delete=False) as oob_file:
+            server._out_of_band_error_path = Path(oob_file.name)
+        server._shutdown_done = False
+
+        thread = threading.Thread(target=server.shutdown, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+
+        self.assertFalse(thread.is_alive(), "shutdown blocked on a dead server")
+        self.assertFalse(server._out_of_band_error_path.exists())
 
 
 class TestCanaryLaunchKwargs(CustomTestCase):
