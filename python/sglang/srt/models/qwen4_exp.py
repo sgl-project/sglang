@@ -1721,7 +1721,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             return _breakable_qsa_indexer(
@@ -1731,7 +1730,6 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
-            cp_global_positions=cp_global_positions,
         )
 
     def _compute_qsa_topk_indices_eager(
@@ -1741,7 +1739,6 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         *,
         use_host_prefill_lengths: bool = False,
-        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1768,10 +1765,15 @@ class Qwen4ExpAttentionDecoderLayer(
                 ),
             )
         indexer_kwargs = {}
-        if cp_global_positions is not None:
+        if _shards_rows_over_cp(forward_batch):
             # Prefill CP: this rank's rows select against the index keys of the
-            # whole sequence, gathered in global token order.
-            indexer_kwargs["cp_global_rope_positions"] = cp_global_positions
+            # whole sequence, gathered in token order with the RoPE positions
+            # the model split (the batch keeps them whole).
+            indexer_kwargs["cp_global_rope_positions"] = (
+                forward_batch.mrope_positions
+                if positions.ndim == 2
+                else forward_batch.positions
+            )
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -1793,7 +1795,6 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        cp_global_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         overlap_indexer = (
             self.is_qsa
@@ -1828,7 +1829,7 @@ class Qwen4ExpAttentionDecoderLayer(
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
-                hidden_states, positions, forward_batch, cp_global_positions
+                hidden_states, positions, forward_batch
             )
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
@@ -1859,7 +1860,6 @@ class Qwen4ExpAttentionDecoderLayer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                cp_global_positions=kwargs.get("cp_global_positions"),
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1947,9 +1947,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 pp_proxy_tensors, forward_batch
             )
 
-        cp_global_positions = None
-        if _shards_rows_over_cp(forward_batch):
-            cp_global_positions = positions
+        shards_rows = _shards_rows_over_cp(forward_batch)
+        if shards_rows:
             hidden_states, positions = cp_split_before_forward(
                 hidden_states, positions, forward_batch
             )
@@ -1991,7 +1990,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
-                    cp_global_positions=cp_global_positions,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -2016,7 +2014,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self._mix_streams
         )
-        if cp_global_positions is not None:
+        if shards_rows:
             hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
             # Only hidden-state capture reads the streams; gather them for it.
             capture = forward_batch.capture_hidden_mode
