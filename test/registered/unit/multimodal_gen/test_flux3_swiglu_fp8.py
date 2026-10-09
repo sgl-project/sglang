@@ -2,11 +2,11 @@
 """FLUX3 packed MLP inputs must preserve SwiGLU rounding through FP8 GEMM."""
 
 import unittest
+from itertools import product
 from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-
 from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Fp8RowwiseLinear
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -35,6 +35,35 @@ class TestFlux3SwiGLUFp8(CustomTestCase):
             return output
         return result
 
+    def _reference(self, layer, packed, tuple_output):
+        gate, value = packed.chunk(2, dim=-1)
+        return self._output(layer(F.silu(gate) * value), tuple_output)
+
+    def _assert_matches(self, layer, packed, tuple_output):
+        actual = self._output(layer.forward_swiglu(packed), tuple_output)
+        self.assertTrue(
+            torch.equal(actual, self._reference(layer, packed, tuple_output))
+        )
+        return actual
+
+    def _cuda_inputs(self, hidden, batch=2, length=17):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest("requires NVIDIA SM89+")
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        weight = torch.randn(64, hidden, device="cuda", generator=generator).to(
+            torch.float8_e4m3fn
+        )
+        scales = torch.rand(64, device="cuda", generator=generator)
+        storage = torch.randn(
+            batch,
+            length,
+            3 * hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        return weight, scales, storage[..., hidden:]
+
     def test_cpu_fallback(self):
         """Unsupported devices must retain the original quantized linear result."""
         generator = torch.Generator().manual_seed(42)
@@ -52,86 +81,47 @@ class TestFlux3SwiGLUFp8(CustomTestCase):
             for tuple_output in (False, True):
                 with self.subTest(tuple_output=tuple_output):
                     layer = Flux3Fp8RowwiseLinear(weight, scales, tuple_output)
-                    gate, value = packed.chunk(2, dim=-1)
-                    expected = self._output(layer(F.silu(gate) * value), tuple_output)
-                    actual = self._output(layer.forward_swiglu(packed), tuple_output)
+                    actual = self._assert_matches(layer, packed, tuple_output)
                     self.assertEqual(actual.shape, (2, 17, 16))
-                    self.assertTrue(torch.equal(actual, expected))
 
-    def test_strided_inputs_and_graph_replay(self):
-        """Row strides, padded rows and new graph inputs must not change actions."""
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
-            self.skipTest("requires NVIDIA SM89+")
-        generator = torch.Generator(device="cuda").manual_seed(42)
-        with torch.inference_mode():
-            for hidden in (3072, 9216):
-                weight = torch.randn(64, hidden, device="cuda", generator=generator).to(
-                    torch.float8_e4m3fn
-                )
-                scales = torch.rand(64, device="cuda", generator=generator)
-                for batch, length in ((1, 1), (2, 17), (1, 340)):
-                    storage = torch.randn(
-                        batch,
-                        length,
-                        3 * hidden,
-                        device="cuda",
-                        dtype=torch.bfloat16,
-                        generator=generator,
-                    )
-                    packed = storage[..., hidden:]
-                    for tuple_output in (False, True):
-                        with self.subTest(
-                            hidden=hidden,
-                            batch=batch,
-                            length=length,
-                            tuple_output=tuple_output,
-                        ):
-                            layer = Flux3Fp8RowwiseLinear(weight, scales, tuple_output)
-                            gate, value = packed.chunk(2, dim=-1)
-                            expected = self._output(
-                                layer(F.silu(gate) * value), tuple_output
-                            )
-                            actual = self._output(
-                                layer.forward_swiglu(packed), tuple_output
-                            )
-                            self.assertTrue(torch.equal(actual, expected))
-                            graph = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(graph):
-                                captured = self._output(
-                                    layer.forward_swiglu(packed), tuple_output
-                                )
-                            packed.copy_(
-                                torch.randn(
-                                    packed.shape,
-                                    device="cuda",
-                                    dtype=packed.dtype,
-                                    generator=generator,
-                                )
-                            )
-                            graph.replay()
-                            gate, value = packed.chunk(2, dim=-1)
-                            expected = self._output(
-                                layer(F.silu(gate) * value), tuple_output
-                            )
-                            self.assertTrue(torch.equal(captured, expected))
+    @torch.inference_mode()
+    def test_strided_inputs(self):
+        """Strided rows and row padding preserve the unfused result."""
+        for hidden, (batch, length), tuple_output in product(
+            (3072, 9216), ((1, 1), (2, 17), (1, 340)), (False, True)
+        ):
+            with self.subTest(
+                hidden=hidden, batch=batch, length=length, tuple_output=tuple_output
+            ):
+                weight, scales, packed = self._cuda_inputs(hidden, batch, length)
+                layer = Flux3Fp8RowwiseLinear(weight, scales, tuple_output)
+                self._assert_matches(layer, packed, tuple_output)
 
-                # B/T cannot flatten without a copy; the fallback must preserve
-                # the transposed batch/sequence ordering through the GEMM.
-                packed = torch.randn(
-                    17,
-                    2,
-                    2 * hidden,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                    generator=generator,
-                ).transpose(0, 1)
-                layer = Flux3Fp8RowwiseLinear(weight, scales, False)
-                gate, value = packed.chunk(2, dim=-1)
+    @torch.inference_mode()
+    def test_graph_replay(self):
+        """Graph replay reads updated strided inputs for both output formats."""
+        weight, scales, packed = self._cuda_inputs(3072)
+        for tuple_output in (False, True):
+            with self.subTest(tuple_output=tuple_output):
+                layer = Flux3Fp8RowwiseLinear(weight, scales, tuple_output)
+                self._assert_matches(layer, packed, tuple_output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._output(layer.forward_swiglu(packed), tuple_output)
+                packed.neg_()
+                graph.replay()
                 self.assertTrue(
-                    torch.equal(
-                        layer.forward_swiglu(packed), layer(F.silu(gate) * value)
-                    )
+                    torch.equal(captured, self._reference(layer, packed, tuple_output))
                 )
+
+    @torch.inference_mode()
+    def test_transposed_fallback(self):
+        """Non-flattenable batch/sequence strides preserve output ordering."""
+        for hidden in (3072, 9216):
+            with self.subTest(hidden=hidden):
+                weight, scales, packed = self._cuda_inputs(hidden, batch=17, length=2)
+                layer = Flux3Fp8RowwiseLinear(weight, scales, False)
+                self._assert_matches(layer, packed.transpose(0, 1), False)
 
 
 if __name__ == "__main__":
