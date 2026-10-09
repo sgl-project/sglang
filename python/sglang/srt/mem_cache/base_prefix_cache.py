@@ -440,6 +440,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def touch_prefix(self, key: RadixKey) -> None:
+        """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
+        never allocates, loads, or queries external tiers."""
+
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
         return _dfs_weight_order(self.root_node, node_handles, self.resolve_node_handle)
