@@ -10,7 +10,10 @@
 
 #include <bit>
 #include <cstdint>
-#ifndef USE_ROCM
+#if defined(USE_MUSA)
+#include <musa_fp4.h>
+#include <musa_fp8.h>
+#elif !defined(USE_ROCM)
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 #endif

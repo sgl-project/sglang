@@ -61,6 +61,7 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #elif defined(USE_MUSA)
 #include <musa_bf16.h>
 #include <musa_fp16.h>
+#include <musa_fp4.h>
 #include <musa_fp8.h>
 #include <musa_runtime.h>
 #ifndef __grid_constant__
@@ -93,6 +94,12 @@ inline constexpr auto cudaSuccess = musaSuccess;
 #define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
 #define cudaFuncSetAttribute musaFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+using __nv_fp8_e4m3 = __mt_fp8_e4m3;
+using __nv_fp8x2_e4m3 = __mt_fp8x2_e4m3;
+#define __NV_E2M1 __MT_E2M1
+#define cudaRoundNearest musaRoundNearest
+#define __nv_cvt_float2_to_fp4x2 __musa_cvt_float2_to_fp4x2
+#define __nv_cvt_fp4x2_to_halfraw2 __musa_cvt_fp4x2_to_halfraw2
 #else
 #include <tvm/ffi/extra/cuda/device_guard.h>
 

@@ -164,16 +164,53 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
 namespace stdr = std::ranges;
 namespace stdv = stdr::views;
 
+#if defined(USE_MUSA)
+template <std::integral T>
+struct IntegerRange {
+  struct Iterator {
+    T value;
+    inline auto operator*() const -> T {
+      return value;
+    }
+    inline auto operator++() -> Iterator& {
+      ++value;
+      return *this;
+    }
+    inline auto operator!=(const Iterator& other) const -> bool {
+      return value != other.value;
+    }
+  };
+
+  T first;
+  T last;
+
+  inline auto begin() const -> Iterator {
+    return {first};
+  }
+  inline auto end() const -> Iterator {
+    return {last};
+  }
+};
+#endif
+
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>
 inline auto irange(T end) {
+#if defined(USE_MUSA)
+  return IntegerRange<T>{static_cast<T>(0), end};
+#else
   return stdv::iota(static_cast<T>(0), end);
+#endif
 }
 
 /// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
 template <std::integral T>
 inline auto irange(T start, T end) {
+#if defined(USE_MUSA)
+  return IntegerRange<T>{start, end};
+#else
   return stdv::iota(start, end);
+#endif
 }
 
 /** \brief Error class for stream-style error logging. */
