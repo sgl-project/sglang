@@ -542,6 +542,14 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
+        # Decode metadata format. unified_attention and pa_decode_gluon (the
+        # SHUFFLE 5D decode kernel) both read kv_indices as a 2-D
+        # (bs, max_num_blocks_per_seq) page table; the remaining decode kernels
+        # read flat per-token kv_indices addressed through kv_indptr.
+        self.decode_uses_page_table = (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        )
+
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
@@ -2054,7 +2062,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
@@ -2119,7 +2127,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
-                if self.use_triton_unified_attention and not self.use_mla:
+                if self.decode_uses_page_table and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
                     kv_indices, swa_page_table = (
                         self._build_unified_page_table_from_spec(spec_info, bs)
@@ -2819,8 +2827,8 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
-            # Keep a distinct page-table buffer for unified attention.  Sharing
+        if self.decode_uses_page_table:
+            # Keep a distinct page-table buffer for page-table decode.  Sharing
             # cuda_graph_kv_indices with non-unified token indices makes
             # page-table width ambiguous after the token buffer is expanded.
             max_num_blocks_per_seq = (
@@ -2966,14 +2974,12 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = None
             max_q_len = None
 
-            if spec_info is None or (
-                self.use_triton_unified_attention and not self.use_mla
-            ):
+            if spec_info is None or (self.decode_uses_page_table and not self.use_mla):
                 max_num_blocks_per_seq = (
                     self.max_context_len + self.page_size - 1
                 ) // self.page_size
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
