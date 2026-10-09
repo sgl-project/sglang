@@ -400,13 +400,17 @@ class EagerReplayGraphs:
                 # Prefill-graph steps and eager steps never overlap, so these graphs
                 # can reuse the prefill graphs' pool instead of pinning their own.
                 from sglang.srt.model_executor.runner_utils.pool import (
+                    get_or_create_global_graph_capture_stream,
                     get_or_create_global_graph_memory_pool,
                 )
 
                 _pool = get_or_create_global_graph_memory_pool(torch.cuda)
+                # The allocator reuses a pool's free blocks only on the stream that
+                # freed them, so capture on the prefill graphs' stream too.
+                _stream = get_or_create_global_graph_capture_stream()
             else:
                 _pool = torch.cuda.graph_pool_handle()
-            _stream = torch.cuda.Stream()
+                _stream = torch.cuda.Stream()
         tp_group = get_parallel().tp_group
         graph = BreakableCUDAGraph()
         with graph_capture(stream=_stream) as context:
