@@ -1,9 +1,16 @@
 """The `/generate` schema gate (`entrypoints/api_contract.py`): the typed media
-contract that replaced the raw_json passthrough, checked without a server."""
+contract that replaced the raw_json passthrough, checked without a server, and
+where the route applies it."""
 
 import unittest
+from types import SimpleNamespace
 
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.api_contract import generate_contract_error
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,6 +74,47 @@ class TestGenerateContract(CustomTestCase):
         error = generate_contract_error({"text": "hi", "sampling_params": bad})
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
+
+
+class TestGenerateRouteGate(CustomTestCase):
+    def test_route_checks_the_contract_and_serve_does_not(self):
+        """`/generate` refuses a contract violation before serving it;
+        `serve_generate_request`, which routes with their own parser call,
+        serves it without decoding and checking the body again."""
+        served = []
+
+        class FakeTokenizerManager:
+            async def generate_request(self, obj, request):
+                served.append(obj)
+                yield {"text": "ok"}
+
+        bad = {"temperatur": 1}  # codespell:ignore temperatur
+        body = {"text": "hi", "sampling_params": bad}
+
+        async def admitted(request: Request):
+            obj = GenerateReqInput(**(await request.json()))
+            return await http_server.serve_generate_request(obj, request)
+
+        app = FastAPI()
+        app.add_api_route("/generate", http_server.generate_request, methods=["POST"])
+        app.add_api_route("/admitted", admitted, methods=["POST"])
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=FakeTokenizerManager())
+        )
+        try:
+            client = TestClient(app)
+            response = client.post("/generate", json=body)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("unknown field", response.json()["error"])
+            self.assertEqual(served, [])
+
+            response = client.post("/admitted", json=body)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"text": "ok"})
+            self.assertEqual(len(served), 1)
+        finally:
+            http_server._global_state = prior_state
 
 
 if __name__ == "__main__":
