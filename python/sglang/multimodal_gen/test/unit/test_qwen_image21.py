@@ -141,7 +141,14 @@ def test_checkpoint_sigma_grid_reaches_request_scheduler(
     expected_sigmas = explicit_sigmas
     if expected_sigmas is None:
         expected_sigmas = sample_sigmas if preset else np.linspace(1, 1 / steps, steps)
-    reference = ReferenceFlowMatchScheduler(**scheduler_kwargs)
+    # preserve the native scheduler's existing dynamic-shift rounding; Turbo's
+    # unshifted grid must also match the Diffusers scheduler bit for bit
+    scheduler_cls = (
+        FlowMatchEulerDiscreteScheduler
+        if dynamic_shifting
+        else ReferenceFlowMatchScheduler
+    )
+    reference = scheduler_cls(**scheduler_kwargs)
     reference.set_timesteps(sigmas=expected_sigmas, mu=0.7, device="cpu")
     torch.testing.assert_close(batch.timesteps, reference.timesteps, atol=0, rtol=0)
     torch.testing.assert_close(batch.scheduler.sigmas, reference.sigmas, atol=0, rtol=0)
