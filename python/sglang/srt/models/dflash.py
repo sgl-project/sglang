@@ -233,15 +233,7 @@ class DFlashAttention(nn.Module):
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
-        )
+        self.qkv_proj = self._build_qkv_proj(attention_bias, quant_config, prefix)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
@@ -300,7 +292,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0)},
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         elif draft_cfg.attention_sink_bias:
             # Per-head sink bias; each TP rank owns its slice of the
@@ -311,7 +303,7 @@ class DFlashAttention(nn.Module):
             )
             set_weight_attrs(
                 self.attention_sink_bias,
-                {"weight_loader": sharded_weight_loader(0)},
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -322,6 +314,17 @@ class DFlashAttention(nn.Module):
             sliding_window_size=self.sliding_window_size,
             attn_type=self.attn_type,
             quant_config=quant_config,
+        )
+
+    def _build_qkv_proj(self, bias: bool, quant_config, prefix: str) -> nn.Module:
+        return QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
         )
 
     def forward_prepare_npu(self, positions, hidden_states):
