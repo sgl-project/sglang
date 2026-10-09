@@ -1649,8 +1649,14 @@ class KVCacheConfigurator:
                 is_fp4_indexer_cache_enabled,
             )
 
+            # [patch #7 38ca55bb0f - MTP KPool INT8 index cache guard] 旧代码：
+            # pool_kwargs["use_fp4_indexer"] = (
+            #     current_platform.is_ppu() and is_fp4_indexer_cache_enabled()
+            # )
             pool_kwargs["use_fp4_indexer"] = (
-                current_platform.is_ppu() and is_fp4_indexer_cache_enabled()
+                current_platform.is_ppu()
+                and get_dsa_index_kpool(self.model_config.hf_config) == 1
+                and is_fp4_indexer_cache_enabled()
             )
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
