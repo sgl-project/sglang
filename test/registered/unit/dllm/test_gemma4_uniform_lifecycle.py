@@ -11,7 +11,8 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -166,8 +167,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.dllm_block_id = 1
         req.extend_end = 8
         req.kv = ReqKvInfo(req_pool_idx=1, kv_allocated_len=8, kv_committed_len=8)
-        scheduler.tree_cache = ChunkCache(
-            SimpleNamespace(
+        scheduler.tree_cache = RadixCache(
+            CacheInitParams(
+                disable=True,
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=None,
                 page_size=4,

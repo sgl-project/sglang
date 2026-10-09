@@ -14,8 +14,9 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -173,8 +174,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         scheduler.spec_algorithm = None
         scheduler.req_to_token_pool = self.pool
         scheduler.token_to_kv_pool_allocator = allocator
-        scheduler.tree_cache = ChunkCache(
-            SimpleNamespace(
+        scheduler.tree_cache = RadixCache(
+            CacheInitParams(
+                disable=True,
                 req_to_token_pool=self.pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,

@@ -12,7 +12,8 @@ from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -161,8 +162,9 @@ class TestFdfoAbort(unittest.TestCase):
         scheduler, req = self.make_scheduler()
         req.sampling_params.normalize(None)
         scheduler.model_config = SimpleNamespace(context_len=64)
-        scheduler.tree_cache = ChunkCache(
-            SimpleNamespace(
+        scheduler.tree_cache = RadixCache(
+            CacheInitParams(
+                disable=True,
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=None,
                 page_size=4,

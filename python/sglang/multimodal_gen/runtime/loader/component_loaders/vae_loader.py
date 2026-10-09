@@ -9,6 +9,7 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -117,8 +118,6 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
     Returns the number of Conv3d modules converted.
     """
-    if not hasattr(torch, "channels_last_3d"):
-        return 0
     num_converted = 0
     for m in module.modules():
         if isinstance(m, nn.Conv3d):
@@ -155,7 +154,10 @@ def _should_use_channels_last_3d(
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
     if (
-        isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
+        isinstance(
+            pipeline_config,
+            (WanT2V480PConfig, LTX2PipelineConfig, Cosmos3Config),
+        )
         and server_args.num_gpus == 1
     ):
         return True

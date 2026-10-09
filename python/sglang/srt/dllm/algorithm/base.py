@@ -97,6 +97,11 @@ class DllmAlgorithm:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
 
+    def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
+        batch_size = forward_batch.batch_size
+        input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
+        return (input_ids != self.mask_id).sum(dim=1).tolist()
+
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
     ) -> DllmRunOutput:

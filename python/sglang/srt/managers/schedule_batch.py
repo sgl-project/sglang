@@ -1050,6 +1050,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         token_indices_to_pool: Optional[List[int]] = None,
+        decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
@@ -1083,6 +1084,7 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
+        self.decision_layout = decision_layout
 
         # For req-level memory management
         self.kv = ReqKvInfo()
@@ -1110,8 +1112,10 @@ class Req(ReqDllmMixin):
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
 
-        # Sampling info
-        if isinstance(sampling_params.custom_params, dict):
+        # Only custom logit processors need the "__req__" reference cycle.
+        if custom_logit_processor is not None and isinstance(
+            sampling_params.custom_params, dict
+        ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": self
@@ -1220,7 +1224,8 @@ class Req(ReqDllmMixin):
         # stamp new tree nodes. Allocation itself must NOT read it back when
         # a tree node is available (the checkpoint dedup rebind
         # would make it stale); the only allocation-time reader is the
-        # ChunkCache fallback, which has no tree nodes and no rebind.
+        # radix-disabled fallback, which keeps no nodes past the root and has
+        # no rebind.
         self.kv_rotation_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
@@ -1562,6 +1567,10 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    def next_output_finishes_by_length(self) -> bool:
+        # Whether committing one more output token reaches max_new_tokens
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
 
     @property
     def extend_len(self) -> int:
@@ -3639,20 +3648,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         strip_beam_tail(self)
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+            if isinstance(reqs_to_exclude, Req):
+                reqs_to_exclude = [reqs_to_exclude]
+            elif reqs_to_exclude is None:
+                reqs_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
