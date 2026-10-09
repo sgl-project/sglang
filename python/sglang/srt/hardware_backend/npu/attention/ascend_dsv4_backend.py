@@ -600,6 +600,63 @@ class CompressorAscendBackendMixin:
                 flush=True,
             )
 
+        # PER-POSITION mode ([C4STP]): the [C4ST] block aggregate hides
+        # per-decode-step content diffs, so also dump ONE md5 per state row
+        # keyed by ABSOLUTE position, so a miss and a hit compare the exact
+        # same decode step. state_loc is the entry of state_block_table the
+        # kernel reads for (req b, absolute pos p), i.e.
+        #   index = history + (p - start_pos[b])   (column index in row b)
+        #   state_loc = state_block_table[b, index]
+        # with history = coff * ratio (same as _hist above). Triggers:
+        # (a) BOUNDARY-CARRY: start_pos contains 16384 -> rows for
+        #     positions [16380,16384) at pre AND post.
+        # (b) COMMIT-ROW: start_pos in {17532,17533,17534,17535} -> POST-op
+        #     rows for c128 block 136 (positions 17408..17535).
+        def _c4stp_probe(_tag):
+            import hashlib as _hlsp
+
+            # .cpu() BEFORE any slicing/indexing (NPU aclnn device-mismatch,
+            # lesson from 4d9cf4a).
+            _hist = coff * ratio
+            _width = int(state_block_table.shape[1])
+            _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+            _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
+            _flat = (
+                state_cache.reshape(-1, state_cache.shape[-1])
+                .detach()
+                .to("cpu")
+            )
+            _rows_n = _flat.shape[0]
+            _sp_list = _sp.tolist()
+
+            _positions = []
+            if 16384 in _sp_list:
+                _positions.extend(range(16380, 16384))
+            if _tag == "post" and any(
+                _p in (17532, 17533, 17534, 17535) for _p in _sp_list
+            ):
+                _positions.extend(range(17408, 17536))
+            if not _positions:
+                return
+            for _p in _positions:
+                for _b in range(_tbl_cpu.shape[0]):
+                    _idx = _hist + (_p - int(_sp[_b]))
+                    if _idx < 0 or _idx >= _width:
+                        continue
+                    _sl = int(_tbl_cpu[_b, _idx])
+                    if _sl < 0 or _sl >= _rows_n:
+                        continue
+                    _row = _flat[_sl].to(torch.float32)
+                    _h = _hlsp.md5(
+                        _row.numpy().tobytes()
+                    ).hexdigest()[:16]
+                    print(
+                        f"[C4STP] layer={compressor.layer_id} "
+                        f"idx={int(compressor.is_in_indexer)} start={_sp_list} "
+                        f"pos={_p} sloc={_sl} md5={_h} tag={_tag}",
+                        flush=True,
+                    )
+
         _c4st_on = bool(_want_st) and (
             _want_st in ("all", "") or _want_st == str(compressor.layer_id)
         )
@@ -615,6 +672,10 @@ class CompressorAscendBackendMixin:
                 _c4st_probe("pre")
             except Exception as _exc:
                 print(f"[C4ST] pre skipped: {_exc}", flush=True)
+            try:
+                _c4stp_probe("pre")
+            except Exception as _exc:
+                print(f"[C4STP] pre skipped: {_exc}", flush=True)
 
         import os
 
@@ -732,6 +793,10 @@ class CompressorAscendBackendMixin:
                 _c4st_probe("post")
             except Exception as _exc:
                 print(f"[C4ST] post skipped: {_exc}", flush=True)
+            try:
+                _c4stp_probe("post")
+            except Exception as _exc:
+                print(f"[C4STP] post skipped: {_exc}", flush=True)
 
         # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
