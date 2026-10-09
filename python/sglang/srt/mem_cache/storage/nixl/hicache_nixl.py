@@ -171,6 +171,7 @@ class HiCacheNixl(HiCacheStorage):
                 tp_rank,
                 high_watermark=cleaner_config["high_watermark"],
                 low_watermark=cleaner_config["low_watermark"],
+                capacity_gb=cleaner_config["capacity_gb"],
             )
             if (
                 cleanup_dirs
