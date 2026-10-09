@@ -2157,7 +2157,9 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
+    if image_file.startswith("file://") or (
+        image_file.startswith("/") and os.path.isfile(image_file)
+    ):
         with open(image_file, "rb") as f:
             return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
