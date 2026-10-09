@@ -7,7 +7,11 @@ from typing import Any
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    merge_source_transfers,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
@@ -232,28 +236,13 @@ class HostPoolGroup:
                     transfer.device_indices = primary_device_indices
                 continue
 
-            sources = [
-                candidate
-                for candidate in transfers
-                if candidate.indices_from_pool is None
-                and candidate.name == transfer.indices_from_pool
-            ]
-            if not sources:
+            source = merge_source_transfers(transfers, transfer.indices_from_pool)
+            if source is None:
                 rollback()
                 return None
-            # Storage merges a source pool's segments in transfer order. Its
-            # sidecars must copy that same span before the storage write.
-            transfer.host_indices = (
-                sources[0].host_indices
-                if len(sources) == 1
-                else torch.cat([source.host_indices for source in sources])
-            )
+            transfer.host_indices = source.host_indices
             if transfer.device_indices is None:
-                transfer.device_indices = (
-                    sources[0].device_indices
-                    if len(sources) == 1
-                    else torch.cat([source.device_indices for source in sources])
-                )
+                transfer.device_indices = source.device_indices
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:

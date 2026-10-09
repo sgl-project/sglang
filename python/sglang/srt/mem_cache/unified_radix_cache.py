@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+    merge_source_transfers,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -1858,24 +1859,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if spec.indices_from_pool == PoolName.KV:
                 indices_source = kv_xfer
             else:
-                source_component = {
-                    PoolName.SWA: ComponentType.SWA,
-                    PoolName.MAMBA: ComponentType.MAMBA,
-                }.get(spec.indices_from_pool)
-                if source_component is None:
-                    raise AssertionError(
-                        f"Unsupported sidecar indices source pool "
-                        f"{spec.indices_from_pool}."
-                    )
-                matching_sources = comp_xfers.get(source_component, ())
-                if not matching_sources:
+                indices_source = merge_source_transfers(
+                    (x for xfers in comp_xfers.values() for x in xfers),
+                    spec.indices_from_pool,
+                )
+                if indices_source is None:
                     continue
-                indices_source = matching_sources[0]
-                if indices_source.name != spec.indices_from_pool:
-                    raise AssertionError(
-                        f"Sidecar indices source pool {spec.indices_from_pool} "
-                        f"resolved to {indices_source.name} during {phase}."
-                    )
 
             indices = (
                 indices_source.device_indices

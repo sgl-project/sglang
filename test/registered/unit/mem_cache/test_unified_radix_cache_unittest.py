@@ -87,7 +87,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
@@ -282,31 +281,6 @@ class _ExtraPoolFullComponent(FullComponent):
                 if part
             ]
         return super().build_hicache_transfers(node, phase, **kwargs)
-
-
-class _SplitBackupSWAComponent(SWAComponent):
-    def build_hicache_transfers(self, node, phase, **kwargs):
-        transfers = super().build_hicache_transfers(node, phase, **kwargs)
-        if phase != CacheTransferPhase.BACKUP_HOST or not transfers:
-            return transfers
-        source = transfers[0]
-        keys = list(node.hash_value)
-        split = len(keys) // 2
-        if split == 0:
-            return transfers
-        boundary = split * self.tree_core.page_size
-        return [
-            replace(
-                source,
-                device_indices=source.device_indices[:boundary],
-                keys=keys[:split],
-            ),
-            replace(
-                source,
-                device_indices=source.device_indices[boundary:],
-                keys=keys[split:],
-            ),
-        ]
 
 
 def _drop_hicache_atexit_pin(cache):
@@ -4441,26 +4415,21 @@ class UnifiedRadixCacheSuite:
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
-    def test_buffer_only_split_source_sidecar_storage_roundtrip(self):
+    def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
+        """A sidecar of a pool staged in several transfers copies and
+        persists every transfer's pages, not only the first one's."""
         self._skip_unsupported_hicache_test()
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires FULL/SWA buffer storage")
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        cfg = replace(
-            self.cfg,
-            sliding_window_size=max(
-                self.cfg.sliding_window_size, 2 * self.cfg.page_size
-            ),
-        )
+        # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_pool = build_fixture(
-            cfg,
-            component_registry_override={ComponentType.SWA: _SplitBackupSWAComponent},
+            self.cfg,
+            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
         controller = cache.cache_controller
-        source = controller.mem_pool_host.entry_map[PoolName.SWA]
+        source = controller.mem_pool_host.entry_map[_ExtraPoolFullComponent.EXTRA_POOL]
         sidecar_host = MHATokenToKVPoolHost(
             source.device_pool,
             host_to_device_ratio=source.host_pool.size / source.device_pool.size,
@@ -4477,16 +4446,23 @@ class UnifiedRadixCacheSuite:
             )
         )
         cache.sidecar_pool_specs.append(
-            SidecarPoolSpec(PoolName.DRAFT_SWA, PoolName.SWA)
+            SidecarPoolSpec(PoolName.DRAFT_SWA, _ExtraPoolFullComponent.EXTRA_POOL)
         )
         sidecar_host.kv_buffer.fill_(-1000)
-        tokens = self._make_seq(1, 2)
+        tokens = self._make_seq(1, 8)
         self._insert(cache, allocator, req_pool, tokens)
         leaf = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         ).last_device_node
+        # SWA may split the leaf at the window boundary; check a node whose
+        # pool is staged in two transfers.
+        node = next(
+            n
+            for n in self._path_chain(cache, leaf)
+            if len(cache.tree_core.get_hash_values(n)) >= 2
+        )
         transfers = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
+            ComponentType.FULL, node, CacheTransferPhase.BACKUP_HOST
         )
         self.assertEqual(len(transfers), 2)
         for segment, transfer in enumerate(transfers):
@@ -4500,7 +4476,7 @@ class UnifiedRadixCacheSuite:
         torch.cuda.synchronize()
         self._buffer_backup_and_wait(cache, leaf)
 
-        keys = list(cache.tree_core.get_hash_values(leaf))
+        keys = list(cache.tree_core.get_hash_values(node))
         indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
         self.assertIsNotNone(indices)
         try:
@@ -4508,10 +4484,10 @@ class UnifiedRadixCacheSuite:
             sidecar_host.kv_buffer.zero_()
             reads = [
                 PoolTransfer(name=name, keys=keys, host_indices=indices)
-                for name in (PoolName.SWA, PoolName.DRAFT_SWA)
+                for name in (_ExtraPoolFullComponent.EXTRA_POOL, PoolName.DRAFT_SWA)
             ]
             results = controller.storage_backend.batch_get_v2(reads)
-            self.assertTrue(all(results[PoolName.SWA]))
+            self.assertTrue(all(results[_ExtraPoolFullComponent.EXTRA_POOL]))
             self.assertTrue(all(results[PoolName.DRAFT_SWA]))
             for index in indices[:: self.cfg.page_size].tolist():
                 self.assertTrue(
