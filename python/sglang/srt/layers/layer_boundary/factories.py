@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
     resolve_exit_rows,
@@ -20,9 +21,6 @@ from sglang.srt.layers.layer_boundary.boundary import _cp_moves
 from sglang.srt.layers.layer_boundary.construction import (
     BatchVariant,
     _bind_stage,
-    _reject_unsupported_cp_moe,
-    _unpadded_possible,
-    _use_ag_after_qlora,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
     EdgeContract,
@@ -39,6 +37,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     TokenAxis,
     _cp_gathers_over_attn_cp,
     _prefill_cp_shards_tokens,
+    batches_are_unpadded,
     input_scattered_configured,
     is_dense_ffn_fully_dp,
     moe_gathers_over_moe_cp,
@@ -57,6 +56,43 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
+
+_use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _reject_unsupported_cp_moe(moe_on_local_rows: bool, cp_shards: bool) -> None:
+    """A MoE layer under attention CP whose tokens the steps cannot bring
+    to it: under a prefill CP, one dispatched per DP shard under attention DP
+    and GQA CP, and one on the TP group whose data-parallel groups are the CP
+    ranks under DSA or MLA CP; and under attention DP, one on the TP group
+    whose data-parallel groups are the CP ranks."""
+    parallel = get_parallel()
+    gqa = not _cp_gathers_over_attn_cp()
+    if moe_on_local_rows:
+        if cp_shards and gqa and parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE dispatched per DP shard under attention DP and GQA prefill CP"
+            )
+    elif parallel.moe_dp_size == parallel.attn_cp_size:
+        if cp_shards and not gqa:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "DSA or MLA prefill CP"
+            )
+        if parallel.attn_dp_size > 1:
+            raise NotImplementedError(
+                "a MoE on the TP group with moe_dp_size == attn_cp_size under "
+                "attention DP and attention CP"
+            )
+
+
+def _unpadded_possible() -> bool:
+    """Whether a batch whose rows do not divide over attention TP may reach an
+    FFN that would run on this rank's attention-TP slice, so that FFN needs a
+    variant that stays on the attention's rows."""
+    return batches_are_unpadded() and (
+        is_moe_input_scattered_across_dp_ranks() or is_dense_ffn_fully_dp()
+    )
 
 
 def _active_variants():
