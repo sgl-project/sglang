@@ -85,12 +85,13 @@ fn radix_config() -> Config {
 }
 
 /// Workers registered as introspection would, with `openai` as their OpenAI-layer settings.
+/// `openai[i]` is what worker `i` reports; missing entries report nothing.
 fn registry_of(
     workers: &[(&MockWorker, WorkerMode)],
-    openai: Option<Arc<OpenAiSettings>>,
+    openai: &[Option<Arc<OpenAiSettings>>],
 ) -> WorkerRegistry {
     let registry = WorkerRegistry::default();
-    for &(worker, mode) in workers {
+    for (i, &(worker, mode)) in workers.iter().enumerate() {
         let spec = WorkerSpec {
             id: WorkerId(worker.url.clone()),
             url: worker.url.clone(),
@@ -100,7 +101,7 @@ fn registry_of(
             ..Default::default()
         };
         let profile = EngineProfile {
-            openai: openai.clone(),
+            openai: openai.get(i).cloned().flatten(),
             ..WireProtocol::default().into()
         };
         registry.add_with_cb(spec, None, profile).unwrap();
@@ -111,29 +112,31 @@ fn registry_of(
 /// A cache-aware router over `workers` whose KV prefixes come from the local `tree`.
 #[allow(dead_code)] // Only some test files route by a local radix tree.
 pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> axum::Router {
-    radix_router_with(workers, tree, None)
+    radix_router_with(workers, tree, &[])
 }
 
 /// [`radix_router`] whose workers reported default OpenAI settings, so
 /// OpenAI completions go through `/generate`.
 #[allow(dead_code)] // Only some test files serve OpenAI through `/generate`.
 pub fn openai_router(workers: &[(&MockWorker, WorkerMode)]) -> axum::Router {
-    radix_router_with(workers, HashTree::new(), Some(Arc::default()))
+    let settings: Vec<_> = workers.iter().map(|_| OpenAiSettings::default()).collect();
+    openai_router_each(workers, settings)
 }
 
-/// [`openai_router`] whose workers report `settings`.
+/// [`openai_router`] whose worker `i` reports `settings[i]`.
 #[allow(dead_code)] // Only some test files set engine OpenAI settings.
-pub fn openai_router_with(
+pub fn openai_router_each(
     workers: &[(&MockWorker, WorkerMode)],
-    settings: OpenAiSettings,
+    settings: Vec<OpenAiSettings>,
 ) -> axum::Router {
-    radix_router_with(workers, HashTree::new(), Some(Arc::new(settings)))
+    let settings: Vec<_> = settings.into_iter().map(|s| Some(Arc::new(s))).collect();
+    radix_router_with(workers, HashTree::new(), &settings)
 }
 
 fn radix_router_with(
     workers: &[(&MockWorker, WorkerMode)],
     tree: HashTree,
-    openai: Option<Arc<OpenAiSettings>>,
+    openai: &[Option<Arc<OpenAiSettings>>],
 ) -> axum::Router {
     let cfg = radix_config();
     let (tree, oracle) = (Arc::new(tree), BlockSizeOracle::new());
@@ -165,7 +168,7 @@ pub fn reorg_radix_router(
         cfg.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap()),
         Arc::new(Proxy::new(Duration::from_secs(5)).unwrap()),
-        Arc::new(registry_of(workers, None)),
+        Arc::new(registry_of(workers, &[])),
         Arc::new(PolicyRegistry::default()),
     );
     ctx.chat_routing = ChatRouting::Reorg([(ModelId(MODEL.into()), resolver)].into());

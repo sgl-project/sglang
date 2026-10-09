@@ -45,6 +45,7 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_openai_route_total` | Counter | `model_id`, `outcome` |
+//! | `sgl_router_chat_defaults_mismatch` | Gauge | `model_id`, `field` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
 //!
@@ -482,6 +483,8 @@ pub struct MetricsRegistry {
     retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+    /// 1 per chat default the router's configuration sets differently from the workers'.
+    chat_defaults_mismatch: Mutex<HashMap<String, Vec<&'static str>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -914,6 +917,14 @@ impl MetricsRegistry {
             .or_default()
             .clone();
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set `sgl_router_chat_defaults_mismatch{model_id,field}` to 1 for `fields`
+    /// and drop the model's other fields.
+    pub fn set_chat_defaults_mismatch(&self, model_id: &str, fields: &[&'static str]) {
+        self.chat_defaults_mismatch
+            .lock()
+            .insert(model_id.to_owned(), fields.to_vec());
     }
 
     /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
@@ -1426,6 +1437,25 @@ impl MetricsRegistry {
             &self.openai_route_total,
         );
 
+        out.push_str(
+            "# HELP sgl_router_chat_defaults_mismatch 1 when the router's --default-chat-template-kwargs or SGLANG_* env sets a chat default differently from the workers'; chats render with the workers' value.\n",
+        );
+        out.push_str("# TYPE sgl_router_chat_defaults_mismatch gauge\n");
+        let guard = self.chat_defaults_mismatch.lock();
+        let mut entries: Vec<_> = guard
+            .iter()
+            .flat_map(|(model, fields)| fields.iter().map(move |field| (model, *field)))
+            .collect();
+        entries.sort();
+        for (model, field) in entries {
+            out.push_str(&format!(
+                "sgl_router_chat_defaults_mismatch{{model_id=\"{}\",field=\"{}\"}} 1\n",
+                escape_label(model),
+                field,
+            ));
+        }
+        drop(guard);
+
         // sampling_contract_rejections_total
         out.push_str(
             "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
@@ -1520,6 +1550,22 @@ mod tests {
             output.lines().any(|line| line == expected),
             "missing metric line `{expected}`; got:\n{output}"
         );
+    }
+
+    #[test]
+    fn chat_defaults_mismatch_holds_only_the_latest_fields() {
+        let reg = MetricsRegistry::new();
+        reg.set_chat_defaults_mismatch(
+            "m",
+            &["SGLANG_DEFAULT_THINKING", "default_chat_template_kwargs"],
+        );
+        reg.set_chat_defaults_mismatch("m", &["SGLANG_DEFAULT_THINKING"]);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_chat_defaults_mismatch gauge"));
+        assert!(out.contains(
+            r#"sgl_router_chat_defaults_mismatch{model_id="m",field="SGLANG_DEFAULT_THINKING"} 1"#
+        ));
+        assert!(!out.contains(r#"field="default_chat_template_kwargs""#));
     }
 
     #[test]

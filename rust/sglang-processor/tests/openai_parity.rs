@@ -15,7 +15,8 @@ use sglang_processor::openai::{
     lower_completion,
 };
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, RenderEnv, load_tokenizer, resolve_model_file,
+    select_chat_formatter,
 };
 
 struct FixtureTokenizer {
@@ -69,7 +70,11 @@ impl Checkpoint {
             .unwrap_or_default();
         let (prompt, prefix) = self
             .formatter
-            .render_request(request.clone(), &defaults.into_iter().collect())
+            .render_request(
+                request.clone(),
+                &defaults.into_iter().collect(),
+                &RenderEnv::default(),
+            )
             .ok()?;
         let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
         let bos = ids("").first().copied();

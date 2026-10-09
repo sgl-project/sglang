@@ -7,6 +7,7 @@ use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
 use crate::model_files::resolve_model_file;
+use crate::render::RenderEnv;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub(crate) fn render(
     profile: DeepSeekV4Profile,
     mut request: Value,
     defaults: &HashMap<String, Value>,
+    env: &RenderEnv,
 ) -> Result<(String, String), String> {
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
@@ -56,12 +58,12 @@ pub(crate) fn render(
     {
         messages[0]["tools"] = normalize_tools(tools)?.into();
     }
-    let mode = if thinking(request, defaults) {
+    let mode = if thinking(request, defaults, env) {
         ThinkingMode::Thinking
     } else {
         ThinkingMode::Chat
     };
-    let fallback = std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok();
+    let fallback = env.dsv4_reasoning_effort.clone();
     let effort = effort(profile, request, defaults, fallback);
     let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
         .map_err(|error| error.to_string())?;
@@ -107,7 +109,11 @@ pub(super) fn drop_merged_tasks(messages: &mut [Value]) {
 
 /// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the
 /// effort imply, then the server's default kwargs and `SGLANG_DEFAULT_THINKING`.
-pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bool {
+pub(crate) fn thinking(
+    request: &Value,
+    defaults: &HashMap<String, Value>,
+    env: &RenderEnv,
+) -> bool {
     if let Some(thinking) = request["chat_template_kwargs"].get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
@@ -117,8 +123,7 @@ pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bo
     if let Some(thinking) = defaults.get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
-    std::env::var("SGLANG_DEFAULT_THINKING")
-        .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
+    env.default_thinking
 }
 
 /// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
@@ -449,7 +454,21 @@ mod tests {
     use serde_json::json;
 
     use super::DeepSeekV4Profile::{Official, Preview};
-    use super::{DeepSeekV4Profile, effort, resolve_dsv4_profile};
+    use super::{DeepSeekV4Profile, RenderEnv, effort, resolve_dsv4_profile, thinking};
+    use std::collections::HashMap;
+
+    #[test]
+    fn thinking_falls_back_to_the_engine_default_last() {
+        let on = RenderEnv {
+            default_thinking: true,
+            ..Default::default()
+        };
+        let request = json!({});
+        assert!(thinking(&request, &HashMap::new(), &on));
+        assert!(!thinking(&request, &HashMap::new(), &RenderEnv::default()));
+        let off = HashMap::from([("thinking".into(), json!(false))]);
+        assert!(!thinking(&request, &off, &on));
+    }
 
     #[test]
     fn effort_maps_profile_tiers_and_env_fills_only_a_missing_effort() {

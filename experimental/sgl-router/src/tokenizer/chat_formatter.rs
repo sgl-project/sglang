@@ -17,10 +17,29 @@ use dynamo_renderer::{
 };
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
+use parking_lot::RwLock;
 use serde_json::Value as JsonValue;
-use sglang_processor::{ChatFormatter as ProcessorFormatter, DeepSeekV4Profile};
+use sglang_processor::{ChatFormatter as ProcessorFormatter, DeepSeekV4Profile, RenderEnv};
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
+
+/// The engine defaults chat rendering follows: `--default-chat-template-kwargs`
+/// and the env vars SGLang's rendering reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngineDefaults {
+    pub kwargs: ChatTemplateKwargs,
+    pub env: RenderEnv,
+}
+
+impl EngineDefaults {
+    /// No kwargs, and this process's env.
+    fn router() -> Self {
+        Self {
+            kwargs: ChatTemplateKwargs::new(),
+            env: RenderEnv::from_process(),
+        }
+    }
+}
 
 // HF special_tokens_map names. dynamo-render supplies bos/eos/unk; the rest
 // are passed as template context defaults.
@@ -44,8 +63,12 @@ pub struct ChatFormatter {
     /// DeepSeek-V4 and V4.1 render through `sglang_processor`.
     deepseek: Option<ProcessorFormatter>,
     is_kimi_k3: bool,
-    /// Worker defaults, merged before model-specific effort conversion.
-    worker_defaults: ChatTemplateKwargs,
+    /// The template's `thinking` default is `SGLANG_DEFAULT_THINKING`.
+    thinking_from_env: bool,
+    /// The router's own `--default-chat-template-kwargs` and env.
+    configured: EngineDefaults,
+    /// The defaults rendering uses: `configured` until the workers report theirs.
+    engine: RwLock<Arc<EngineDefaults>>,
 }
 
 impl ChatFormatter {
@@ -181,7 +204,9 @@ impl ChatFormatter {
             bos_token,
             deepseek: None,
             is_kimi_k3: false,
-            worker_defaults: ChatTemplateKwargs::new(),
+            thinking_from_env: false,
+            configured: EngineDefaults::router(),
+            engine: RwLock::new(Arc::new(EngineDefaults::router())),
         }))
     }
 
@@ -197,7 +222,9 @@ impl ChatFormatter {
             bos_token: Some("[BOS]".into()),
             deepseek: None,
             is_kimi_k3: true,
-            worker_defaults: ChatTemplateKwargs::new(),
+            thinking_from_env: false,
+            configured: EngineDefaults::router(),
+            engine: RwLock::new(Arc::new(EngineDefaults::router())),
         })
     }
 
@@ -227,12 +254,7 @@ impl ChatFormatter {
             });
         // Engine defaults: `SGLANG_DEFAULT_THINKING` and no reasoning-effort
         // preamble; dynamo-render defaults to thinking at high effort.
-        let thinking = std::env::var("SGLANG_DEFAULT_THINKING")
-            .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()));
-        let defaults = HashMap::from([
-            ("thinking".into(), thinking.into()),
-            ("reasoning_effort".into(), "low".into()),
-        ]);
+        let defaults = HashMap::from([("reasoning_effort".into(), "low".into())]);
         Some(Self {
             formatter,
             defaults,
@@ -243,7 +265,9 @@ impl ChatFormatter {
                 is_deepseek_v4.then_some(ProcessorFormatter::DeepSeekV4(DeepSeekV4Profile::Preview))
             },
             is_kimi_k3: false,
-            worker_defaults: ChatTemplateKwargs::new(),
+            thinking_from_env: true,
+            configured: EngineDefaults::router(),
+            engine: RwLock::new(Arc::new(EngineDefaults::router())),
         })
     }
 
@@ -255,16 +279,40 @@ impl ChatFormatter {
         }
     }
 
-    /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
-    /// request leaves unset, and a default `reasoning_effort` acts as the request's.
+    /// Apply the router's `--default-chat-template-kwargs` and env until the
+    /// workers report theirs; kwargs fill keys the request leaves unset, and a
+    /// default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
-        self.worker_defaults = defaults.clone();
+        self.configured = EngineDefaults {
+            kwargs: defaults.clone(),
+            env: RenderEnv::from_process(),
+        };
+        self.engine = RwLock::new(Arc::new(self.configured.clone()));
         self
     }
 
-    fn effective_effort(&self, request: &JsonValue) -> Option<JsonValue> {
+    pub fn configured_defaults(&self) -> &EngineDefaults {
+        &self.configured
+    }
+
+    pub fn engine_defaults(&self) -> Arc<EngineDefaults> {
+        Arc::clone(&self.engine.read())
+    }
+
+    /// Render with `defaults` from now on; `false` if they are already in use.
+    pub fn adopt(&self, defaults: EngineDefaults) -> bool {
+        let mut engine = self.engine.write();
+        if **engine == defaults {
+            return false;
+        }
+        *engine = Arc::new(defaults);
+        true
+    }
+
+    fn effective_effort(&self, request: &JsonValue, engine: &EngineDefaults) -> Option<JsonValue> {
         request_effort(request).or_else(|| {
-            self.worker_defaults
+            engine
+                .kwargs
                 .get("reasoning_effort")
                 .filter(|v| !v.is_null())
                 .cloned()
@@ -274,6 +322,7 @@ impl ChatFormatter {
     /// Request kwargs plus the thinking/effort defaults SGLang derives from
     /// `reasoning` / `reasoning_effort` (`protocol.py::normalize_reasoning_inputs`).
     fn template_kwargs(&self, request: &JsonValue) -> Result<ChatTemplateKwargs> {
+        let engine = self.engine_defaults();
         let mut kwargs: ChatTemplateKwargs = match request.get("chat_template_kwargs") {
             None | Some(JsonValue::Null) => ChatTemplateKwargs::new(),
             Some(v) => serde_json::from_value(v.clone()).context("chat_template_kwargs")?,
@@ -321,10 +370,10 @@ impl ChatFormatter {
         // then merges worker defaults. Jinja receives those merged kwargs over
         // the effective effort; Kimi derives thinking_effort only if still absent.
         kwargs.remove("reasoning_effort");
-        for (key, value) in &self.worker_defaults {
+        for (key, value) in &engine.kwargs {
             kwargs.entry(key.clone()).or_insert_with(|| value.clone());
         }
-        if let Some(effort) = self.effective_effort(request) {
+        if let Some(effort) = self.effective_effort(request, &engine) {
             if self.is_kimi_k3 {
                 if matches!(effort.as_str(), Some("low" | "high" | "max")) {
                     kwargs.entry("thinking_effort".into()).or_insert(effort);
@@ -336,6 +385,11 @@ impl ChatFormatter {
         for (key, value) in &self.defaults {
             kwargs.entry(key.clone()).or_insert_with(|| value.clone());
         }
+        if self.thinking_from_env {
+            kwargs
+                .entry("thinking".into())
+                .or_insert(engine.env.default_thinking.into());
+        }
         Ok(kwargs)
     }
 
@@ -343,8 +397,9 @@ impl ChatFormatter {
     /// separately (`_handle_last_assistant_message`).
     fn render_parts(&self, request: &JsonValue) -> Result<(RenderedPrompt, String)> {
         if let Some(formatter) = &self.deepseek {
+            let engine = self.engine_defaults();
             let (prompt, prefix) = formatter
-                .render_request(request.clone(), &self.worker_defaults)
+                .render_request(request.clone(), &engine.kwargs, &engine.env)
                 .context("render DeepSeek chat")?;
             return Ok((RenderedPrompt::text(prompt), prefix));
         }
