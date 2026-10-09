@@ -9,6 +9,7 @@ Covers:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import torch
@@ -17,10 +18,16 @@ from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -640,6 +647,80 @@ class TestScoreRequestValidation(CustomTestCase):
                 embed_override_token_id=50,
                 item_embed_overrides=[[_vec(1)]],  # 1 override for 2 items
             )
+
+
+class TestEmbedOverridesRejectMultimodal(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.context_len = 128
+        self.manager.num_reserved_tokens = 0
+        self.manager.allow_auto_truncate = False
+        self.manager.validate_total_tokens = False
+
+    def test_requests_with_overrides_and_images_are_rejected(self):
+        """EmbeddingReqInput resolves embed_overrides only after validation, so
+        the unresolved form must be caught at admission too."""
+        overrides = PositionalEmbeds(embeds=[_vec()], positions=[1])
+        for build in (
+            lambda **mm: GenerateReqInput(
+                input_ids=[10, 50, 20],
+                sampling_params={},
+                positional_embed_overrides=overrides,
+                **mm,
+            ),
+            lambda **mm: EmbeddingReqInput(
+                input_ids=[10, 50, 20],
+                sampling_params={},
+                embed_override_token_id=50,
+                embed_overrides=[_vec()],
+                **mm,
+            ),
+        ):
+            req = build(image_data=["image.png"])
+            self.manager.is_generation = isinstance(req, GenerateReqInput)
+            with self.assertRaisesRegex(ValueError, "overrides cannot be combined"):
+                self.manager._validate_one_request(req, req.input_ids)
+            text_only = build()
+            self.manager._validate_one_request(text_only, text_only.input_ids)
+
+    def test_mixed_extend_batch_is_rejected_before_embedding_lookup(self):
+        embed_layer = MagicMock(
+            side_effect=AssertionError("embedding lookup must not run")
+        )
+        runner = SimpleNamespace(
+            _pp_kwargs=lambda pp_proxy_tensors: {},
+            model=SimpleNamespace(get_input_embeddings=lambda: embed_layer),
+            is_generation=True,
+        )
+        image = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.zeros(1), offsets=[(0, 1)]
+        )
+        image.set_hash(1234)
+        forward_batch = SimpleNamespace(
+            input_embeds=None,
+            input_ids=torch.tensor([1, 2, image.pad_value, image.pad_value]),
+            replace_embeds=torch.full((1, HIDDEN_DIM), 5.0),
+            replace_positions=torch.tensor([0]),
+            mm_inputs=[None, MultimodalInputs(mm_items=[image])],
+            extend_prefix_lens_cpu=[0, 0],
+            extend_seq_lens_cpu=[2, 2],
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot share an extend batch"):
+            ModelRunner._extend_forward_kwargs(runner, forward_batch, None)
+        embed_layer.assert_not_called()
+
+        # A decoding image request in a mixed chunk has no placeholder rows here.
+        forward_batch.input_ids = torch.tensor([1, 2, 3])
+        forward_batch.extend_prefix_lens_cpu = [0, 5]
+        forward_batch.extend_seq_lens_cpu = [2, 1]
+        embed_layer.side_effect = None
+        embed_layer.return_value = torch.zeros(3, HIDDEN_DIM)
+        kwargs = ModelRunner._extend_forward_kwargs(runner, forward_batch, None)
+        self.assertTrue(torch.equal(kwargs["input_embeds"][0], _vec(5.0)))
 
 
 if __name__ == "__main__":

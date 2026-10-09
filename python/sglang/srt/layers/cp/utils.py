@@ -236,6 +236,24 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
 
 
+def cp_relayout_tail_input_ids(input_ids, full_metadata, tail_metadata, token_indices):
+    """Select canonical routing IDs without changing their original CP owner.
+
+    A request tail need not start at a multiple of CP size. Re-interleaving the
+    compact tails would move IDs to different ranks than their hidden states.
+    Both input and output use the rank-major layout consumed by the MoE gather.
+    """
+    cp_size = len(full_metadata.per_rank_actual_token)
+    full_rank_len = max(full_metadata.per_rank_actual_token)
+    full_slots = (
+        token_indices.remainder(cp_size) * full_rank_len + token_indices // cp_size
+    )
+    tail_ids = input_ids.index_select(0, full_slots)
+    result = input_ids.new_zeros(sum(tail_metadata.per_rank_actual_token))
+    result.index_copy_(0, tail_metadata.gather_index, tail_ids)
+    return result
+
+
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
     """Gather CP hidden states at the model boundary when this batch is active."""
     assert is_cp_active(forward_batch)
