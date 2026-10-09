@@ -1596,8 +1596,8 @@ class Envs:
     # per-step token-to-request map across the low-ratio layers.
     SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS = EnvBool(True)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
-    # their own (they never run concurrently). Unvalidated; off by default.
-    SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(False)
+    # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
+    SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
     # Debug only: replay decoder replay graphs one segment at a time with a sync,
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
