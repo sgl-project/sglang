@@ -926,7 +926,7 @@ def compute_swa_request_cap(
         )
 
 
-class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
+class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA with the SWA pool sized from the explicit max_running_requests
     worst case instead of swa_full_tokens_ratio; the rest goes to the full pool."""
 
@@ -1614,8 +1614,8 @@ def create_memory_pool_configurator(
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
-        if SWAChunkCapPoolConfigurator.is_applicable(kvc):
-            return SWAChunkCapPoolConfigurator(kvc)
+        if SWARequestCapPoolConfigurator.is_applicable(kvc):
+            return SWARequestCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)
