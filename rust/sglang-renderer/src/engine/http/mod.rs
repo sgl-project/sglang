@@ -92,6 +92,7 @@ impl GenerateTransport for HttpGenerateClient {
         Box::pin(async move {
             // Always consume token deltas, including for unary frontend requests.
             request.stream = true;
+            let no_stop_trim = request.sampling_params.no_stop_trim;
 
             let response = self
                 .client
@@ -139,7 +140,7 @@ impl GenerateTransport for HttpGenerateClient {
                                 return;
                             }
                         };
-                        if let Err(error) = normalize_engine_output(&mut output, &mut emitted_tokens) {
+                        if let Err(error) = normalize_engine_output(&mut output, &mut emitted_tokens, no_stop_trim) {
                             yield Err(error);
                             return;
                         }
@@ -487,6 +488,101 @@ mod tests {
             assert!(events.next().await.is_none());
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn engine_token_stops_respect_no_stop_trim_in_both_streaming_modes() {
+        async fn stopped_generate(
+            Json(body): Json<serde_json::Value>,
+        ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+            assert_eq!(body["stream"], true);
+            let cumulative = body["rid"].as_str().unwrap() == "cumulative";
+            let retain = body["sampling_params"]["no_stop_trim"].as_bool().unwrap();
+            let mut final_ids = if cumulative { vec![104] } else { vec![] };
+            if retain {
+                final_ids.push(33);
+            }
+            let frames = [
+                serde_json::json!({
+                    "output_ids": [104],
+                    "meta_info": {
+                        "prompt_tokens": 1, "completion_tokens": 1, "finish_reason": null,
+                    },
+                }),
+                serde_json::json!({
+                    "output_ids": final_ids,
+                    "meta_info": {
+                        "prompt_tokens": 1, "completion_tokens": 2,
+                        "finish_reason": {"type": "stop", "matched": 33},
+                    },
+                }),
+            ];
+            Sse::new(futures::stream::iter(
+                frames
+                    .into_iter()
+                    .map(|frame| Ok(Event::default().data(frame.to_string())))
+                    .chain([Ok(Event::default().data("[DONE]"))]),
+            ))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route("/generate", post(stopped_generate)),
+            )
+            .into_future(),
+        );
+        let client = HttpGenerateClient::new(format!("http://{address}")).unwrap();
+        let service = crate::engine::GenerationService::new(
+            Arc::new(client),
+            crate::engine::TokenDecoder::new(tiny_tokenizer()),
+        );
+
+        for cumulative in [false, true] {
+            for no_stop_trim in [false, true] {
+                let request = TokenIdsRequest {
+                    rid: if cumulative {
+                        "cumulative"
+                    } else {
+                        "incremental"
+                    }
+                    .into(),
+                    input_ids: vec![65],
+                    options: GenerationOptions {
+                        sampling_params: crate::SamplingParams {
+                            stop_token_ids: Some(vec![33]),
+                            no_stop_trim,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    metadata: Default::default(),
+                };
+                let outputs = service
+                    .generate(request.into())
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(outputs.len(), 2);
+                let text: String = outputs.iter().map(|output| output.text.as_str()).collect();
+                assert_eq!(text, if no_stop_trim { "h!" } else { "h" });
+                assert_eq!(outputs[0].completion_tokens, 1);
+                assert_eq!(outputs[1].completion_tokens, 1);
+                assert_eq!(
+                    outputs[1].finish_reason,
+                    Some(crate::GenerationFinishReason::Stop(Some(
+                        crate::MatchedStop::Token(33)
+                    )))
+                );
+            }
+        }
+        server.abort();
     }
 
     struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
