@@ -62,7 +62,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
 
     with (
         envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
-        patch.object(mm_utils, "_get_precomputed_embedding", return_value=embedding),
+        patch.object(mm_utils, "_get_precomputed_embedding", return_value=[embedding]),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
         result, result_mask, result_input_ids = mm_utils.get_embedding_and_mask(
@@ -77,7 +77,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
         )
 
     mask.sum.assert_not_called()
-    assert result is embedding
+    assert len(result) == 1 and result[0] is embedding
     assert result_mask is mask
     assert result_input_ids is input_ids
 
@@ -89,7 +89,7 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
 
     with (
         envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True),
-        patch.object(mm_utils, "_get_precomputed_embedding", return_value=embedding),
+        patch.object(mm_utils, "_get_precomputed_embedding", return_value=[embedding]),
         patch.object(mm_utils.torch, "_assert_async") as assert_async,
     ):
         mm_utils.get_embedding_and_mask(
@@ -109,21 +109,24 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
     assert "derived from offsets" in message
 
 
-def test_adjust_embedding_length_crops_overlong_embedding():
+@pytest.mark.parametrize("split_sizes", [[5], [1, 4], [2, 1, 2]])
+def test_adjust_embedding_length_crops_overlong_embedding(split_sizes):
     embedding = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     server_args = Mock(chunked_prefill_size=-1)
 
     with patch.object(mm_utils, "get_schedule", return_value=server_args):
-        result = mm_utils._adjust_embedding_length(embedding, 3, Mock())
+        result = mm_utils._adjust_embedding_length(
+            list(torch.split(embedding, split_sizes)), 3, Mock()
+        )
 
-    torch.testing.assert_close(result, embedding[-3:], rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(result), embedding[-3:], rtol=0, atol=0)
 
 
 def test_adjust_embedding_length_rejects_short_embedding():
-    embedding = torch.zeros(2, 4)
+    segments = [torch.zeros(1, 4), torch.zeros(1, 4)]
 
     with pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"):
-        mm_utils._adjust_embedding_length(embedding, 3, Mock())
+        mm_utils._adjust_embedding_length(segments, 3, Mock())
 
 
 def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
@@ -140,7 +143,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
         patch.object(
             mm_utils,
             "_get_chunked_prefill_embedding",
-            return_value=(embedding, rewritten_input_ids),
+            return_value=([embedding], rewritten_input_ids),
         ),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
@@ -157,7 +160,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
 
     mask.sum.assert_called_once_with()
     mask_sum.item.assert_called_once_with()
-    assert result is embedding
+    assert len(result) == 1 and result[0] is embedding
     assert result_mask is mask
     assert result_input_ids is rewritten_input_ids
 

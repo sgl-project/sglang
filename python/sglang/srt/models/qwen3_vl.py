@@ -1412,6 +1412,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
+        # Must stay row-wise: embed_mm_inputs splits each embedding segment alone.
         assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
             f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
         )
