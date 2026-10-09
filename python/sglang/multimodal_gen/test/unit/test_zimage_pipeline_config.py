@@ -73,7 +73,7 @@ class TestZImagePipelineConfig(unittest.TestCase):
                 self.assertEqual(actual.dtype, torch.float32)
         torch.testing.assert_close(
             config.cfg_policy.combine([-pos], batch, 0.0, config),
-            -pos.float(),
+            -pos,
             rtol=0,
             atol=0,
         )

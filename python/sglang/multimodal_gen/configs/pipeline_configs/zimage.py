@@ -41,10 +41,10 @@ class ZImageCFGPolicy(CFGPolicy):
     def combine(
         self, predictions, batch, cfg_scale, pipeline_config, *, cfg_parallel=False
     ):
+        if len(predictions) == 1:
+            return predictions[0]
         # the DiT already negates its output; match diffusers' fp32 CFG arithmetic
         pos = predictions[0].float()
-        if len(predictions) == 1:
-            return pos
         neg = predictions[1].float()
         noise_pred = pos + cfg_scale * (pos - neg)
         return _apply_cfg_postprocess(noise_pred, pos, batch, pipeline_config)
