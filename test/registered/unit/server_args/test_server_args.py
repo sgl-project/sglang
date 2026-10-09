@@ -4158,5 +4158,135 @@ class TestLazyReexports(CustomTestCase):
             server_args_module.NotAThing
 
 
+class TestAttentionBackendCudaGraph(CustomTestCase):
+    """
+    Regression tests for sglang-project/sglang#43142.
+
+    Bug: CUDA graphs stay enabled for torch_native attention when the platform
+    fallback selects it. The handle_attention_backend_compatibility function
+    checks for torch_native BEFORE _attention_backend_platform_fallbacks rewrites
+    intel_amx -> torch_native, so auto-selected torch_native keeps CUDA graphs enabled
+    while explicitly-set torch_native correctly disables them.
+    """
+
+    def _create_model_dir(self):
+        """Create a minimal model directory with config.json.
+
+        Must NOT use model_path='dummy' because run_resolution_pipeline
+        early-returns when model_path is 'dummy', skipping
+        handle_attention_backend_compatibility entirely.
+        """
+        model_config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "num_hidden_layers": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 2048,
+        }
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+            json.dump(model_config, f)
+        return tmpdir
+
+    @override_platform(is_cuda=False, has_amx=False)
+    def test_auto_fallback_and_explicit_torch_native_disable_cudagraph(self):
+        """
+        When attention backend falls back to torch_native (or user explicitly
+        sets torch_native), both prefill & decode CUDA graph must be disabled.
+        """
+        model_dir = self._create_model_dir()
+
+        # Case 1: auto platform fallback -> torch_native
+        # CPU without AMX: _attention_backend_default picks intel_amx,
+        # _attention_backend_platform_fallbacks rewrites to torch_native,
+        # then the CUDA-graph disable logic must see torch_native and disable.
+        args = ServerArgs(
+            model_path=model_dir,
+            device="cpu",
+        )
+        args.resolve_once()
+        cg_cfg = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(resolution_result(args, "attention_backend"), "torch_native")
+        self.assertEqual(cg_cfg.prefill.backend, Backend.DISABLED)
+        self.assertEqual(cg_cfg.decode.backend, Backend.DISABLED)
+
+        # Case 2: user explicitly set attention_backend=torch_native
+        args2 = ServerArgs(
+            model_path=model_dir,
+            device="cpu",
+            attention_backend="torch_native",
+        )
+        args2.resolve_once()
+        cg_cfg2 = resolution_result(args2, "cuda_graph_config")
+        self.assertEqual(resolution_result(args2, "attention_backend"), "torch_native")
+        self.assertEqual(cg_cfg2.prefill.backend, Backend.DISABLED)
+        self.assertEqual(cg_cfg2.decode.backend, Backend.DISABLED)
+
+    @override_platform(is_cuda=False, has_amx=False)
+    def test_auto_and_explicit_yield_same_cudagraph_config(self):
+        """
+        Two launches that resolve to the same attention_backend should resolve
+        to the same cuda_graph_config.
+
+        Expected behavior from issue #43142:
+        'Two launches that resolve to the same attention_backend resolve to the same cuda_graph_config.'
+        """
+        model_dir = self._create_model_dir()
+
+        auto_args = ServerArgs(model_path=model_dir, device="cpu")
+        auto_args.resolve_once()
+        auto_cg = resolution_result(auto_args, "cuda_graph_config")
+
+        explicit_args = ServerArgs(
+            model_path=model_dir,
+            device="cpu",
+            attention_backend="torch_native",
+        )
+        explicit_args.resolve_once()
+        explicit_cg = resolution_result(explicit_args, "cuda_graph_config")
+
+        # Both should have the same attention_backend
+        self.assertEqual(
+            resolution_result(auto_args, "attention_backend"),
+            resolution_result(explicit_args, "attention_backend"),
+        )
+        # And the same cuda_graph_config
+        self.assertEqual(auto_cg.prefill.backend, explicit_cg.prefill.backend)
+        self.assertEqual(auto_cg.decode.backend, explicit_cg.decode.backend)
+
+    @override_platform(is_cuda=False, has_amx=False)
+    def test_round_trip_stability(self):
+        """
+        Verify ServerArgs round-trip via msgspec.structs.asdict preserves
+        cuda_graph_config. Regression for benchmark/offline_throughput.py
+        and entrypoints/http_server.py which reconstruct ServerArgs from dict.
+        """
+        model_dir = self._create_model_dir()
+
+        orig_args = ServerArgs(
+            model_path=model_dir,
+            device="cpu",
+        )
+        orig_args.resolve_once()
+        orig_cg = resolution_result(orig_args, "cuda_graph_config")
+
+        # serialize & reconstruct, matches real benchmark/http_server path
+        reconstructed = ServerArgs(**msgspec.structs.asdict(orig_args))
+        reconstructed.resolve_once()
+        recon_cg = resolution_result(reconstructed, "cuda_graph_config")
+
+        self.assertEqual(orig_cg.prefill.backend, recon_cg.prefill.backend)
+        self.assertEqual(orig_cg.decode.backend, recon_cg.decode.backend)
+        self.assertEqual(
+            resolution_result(orig_args, "attention_backend"),
+            resolution_result(reconstructed, "attention_backend"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
