@@ -20,7 +20,7 @@ import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|OSHAPE|XIN|LHID)\]")
+TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
@@ -174,9 +174,69 @@ def report_lhid(rows):
     report_group(rows, "md5", "LHID")
 
 
+def _parse_blkx(rec):
+    """Parse a ``blkx=[<block>:<hash>, ...]`` field into {block: hash}."""
+    v = rec.get("blkx")
+    if not v:
+        return {}
+    s = v.strip().replace('"', "'")
+    if s.startswith("["):
+        s = s[1:]
+    if s.endswith("]"):
+        s = s[:-1]
+    out = {}
+    for item in s.split("'"):
+        item = item.strip().strip(",").strip()
+        if ":" not in item:
+            continue
+        b, h = item.split(":", 1)
+        try:
+            out[int(b)] = h
+        except ValueError:
+            continue
+    return out
+
+
+def report_blkx(rows, label):
+    """Per-c128-block (``position // 128``) hit==miss verdict.
+
+    A block's hash must be unique across all requests (deterministic), so a
+    ``(layer, block)`` group with >1 distinct hash is a REAL divergence there.
+    This is NOT shape-confounded (a block = the same absolute positions on both
+    the full-prefill miss and the suffix hit).  Locates the FIRST divergent
+    block and the layers diverging there (=> the first divergent layer).
+    """
+    groups = defaultdict(set)
+    for r in rows:
+        ly = _int(r, "layer")
+        for b, h in _parse_blkx(r).items():
+            groups[(ly, b)].add(h)
+    if not groups:
+        print(f"  [{label}] no blkx= field (probe without per-block hashing)")
+        return
+    div = [(ly, b, sorted(s)) for (ly, b), s in groups.items() if len(s) > 1]
+    if not div:
+        print(f"  [{label}] no per-block divergence: every (layer,block) "
+              f"group has one hash")
+        return
+    div.sort(key=lambda t: (t[1], t[0]))  # first by block, then by layer
+    b0 = div[0][1]
+    layers0 = sorted(ly for ly, b, _ in div if b == b0)
+    print(f"  [{label}] groups={len(groups)} divergent={len(div)} "
+          f"first_block={b0}")
+    print(f"  FIRST divergent block={b0}; layers there = {layers0}")
+    blocks = sorted(set(b for _, b, _ in div))
+    print(f"  divergent blocks ({len(blocks)}): {blocks[:40]}"
+          + (" ..." if len(blocks) > 40 else ""))
+    for ly, b, s in div[:MAX_DIFF_SHOWN]:
+        print(f"     block={b} layer={ly}  hashes={s}")
+    if len(div) > MAX_DIFF_SHOWN:
+        print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -195,13 +255,19 @@ def main(path):
         miss_i = 0
         print("\nno [CMPIDX] lines; per-tag request split used (req0 = MISS).")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "OSHAPE", "XIN", "LHID"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID"):
         rows = recs.get(tag, [])
         if not rows:
             continue
         if tag == "LHID":
             print("\n== [LHID] per-layer hidden (order-independent) ==")
             report_lhid(rows)
+            print("  ---- [LHID] per-c128-block ----")
+            report_blkx(rows, "LHID")
+            continue
+        if tag == "C128X":
+            print("\n== [C128X] c128 compressor input x (per-block) ==")
+            report_blkx(rows, "C128X")
             continue
         if tag == "C128KV":
             print("\n== [C128KV] c128 compressed-KV (order-independent) ==")
