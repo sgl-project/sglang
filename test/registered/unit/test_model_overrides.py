@@ -184,6 +184,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "attn_cp_size",
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
+                    "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
@@ -1168,6 +1169,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 speculative_algorithm=None,
                 moe_runner_backend="auto",
+                moe_a2a_backend="none",
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
@@ -1180,6 +1182,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _mimo_v2_overrides(_args(), _hf("fp8")),
                 {"attention_backend": "fa4", "moe_runner_backend": "flashinfer_trtllm"},
+            )
+            # An all-to-all backend chooses its own runner (deepep_v2 accepts
+            # only deep_gemm), so the FP8 pin must not fire.
+            self.assertEqual(
+                _mimo_v2_overrides(_args(moe_a2a_backend="deepep_v2"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # An explicit user choice is never overwritten.
             self.assertEqual(
@@ -3236,7 +3244,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                _model_config=SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(
+                    attention_arch=None, hf_config=SimpleNamespace(architectures=[])
+                ),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))

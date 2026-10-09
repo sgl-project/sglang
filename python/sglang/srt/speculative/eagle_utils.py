@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -606,6 +607,7 @@ def eagle_prepare_for_verify(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
+        kv_loc_plan=verify_input.kv_loc_plan,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -898,6 +900,8 @@ def eagle_sample(
         # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
             if _is_cuda:
                 from sglang.kernels.ops.speculative.sampling import (

@@ -193,6 +193,43 @@ def test_real_components_restore_weights_and_exact_policy(
             torch.testing.assert_close(model(inputs), reference(inputs), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("has_type_embedding", [False, True])
+def test_diffusion_decoder_restores_optional_keyframe_tag(tmp_path, has_type_embedding):
+    role, class_name, config_cls, raw_config = CASES[3]
+    config = config_cls()
+    config.update_model_arch(raw_config)
+    model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+    reference = model_cls(config)
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.fill_(0.25)
+    weights = reference.state_dict()
+    if not has_type_embedding:
+        weights.pop("decoder.type_emb")
+    component = tmp_path / role
+    _write_checkpoint(component, {"_class_name": class_name, **raw_config}, weights)
+    args = ServerArgs(
+        model_path="x",
+        component_precisions={role: "fp32"},
+        component_residency={role: "component-offload"},
+    )
+    model, _ = PipelineComponentLoader.load_component(
+        role, str(component), "diffusers", args
+    )
+    expected = torch.full(
+        (raw_config["latent_channels"],), 0.25 if has_type_embedding else 0.0
+    )
+    torch.testing.assert_close(model.decoder.type_emb.cpu(), expected, rtol=0, atol=0)
+    for key, tensor in weights.items():
+        torch.testing.assert_close(
+            model.state_dict()[key].cpu(), tensor, rtol=0, atol=0
+        )
+    with pytest.raises(RuntimeError, match="size mismatch for decoder.type_emb"):
+        model.load_state_dict({**weights, "decoder.type_emb": torch.zeros(5)})
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        model.load_state_dict({**weights, "decoder.unknown": torch.zeros(1)})
+
+
 class _DecoderOnly(nn.Module):
     def __init__(self, config):
         super().__init__()

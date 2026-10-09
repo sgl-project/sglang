@@ -10,8 +10,7 @@ Triton kernel.
 
 ## Coverage Matrix
 
-Columns are runner modes; rows are the linear-attention kernel backend
-(`triton` is the only one wired today). Cells use:
+Columns are runner modes; rows are the linear-attention kernel backend. Cells use:
 - **✓ \<variants\>** — exercised, with the config variants listed in the cell
 - **—** — not applicable / not exercised
 - **blocked: \<reason\>** — production-unsupported, not a follow-up
@@ -20,6 +19,7 @@ Columns are runner modes; rows are the linear-attention kernel backend
 | Linear-attn kernel | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `triton` | ✓ 10 input layouts (page 1/16/32, prefix/decode edges) | ✓ decode page-boundary (uses `KDA_GRAPH_ATOL=1e-1` to absorb Triton recurrent-kernel CG-replay drift; eager `KDA_ATOL=3e-2` kept for non-graph cases) | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) (`atol=1e-1` because the verify reference's pure-Python per-token recurrence drifts ~0.07 vs the Triton kernel even before CG capture/replay) | ✓ EAGLE chain CG + EAGLE tree CG (same `1e-1` tolerance) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | deferred | blocked: same `_replay_metadata` reject | — |
+| `flashinfer` prefill (SM100/SM103, FlashInfer 0.7.0) | ✓ KDA backend extend with beta logits, 128-D heads, and aligned/unaligned radix-cache snapshots; kernel tests cover BF16/FP32 and indexed state pools | — | — | — | — | — | — | — | — | — | — | — |
 
 ## Input And Config Coverage
 
@@ -28,6 +28,33 @@ Columns are runner modes; rows are the linear-attention kernel backend
   page-boundary, batch-size-1 decode.
 - `num_k_heads=2, num_v_heads=2` with head dims defaulted by
   `DEFAULT_HEAD_K_DIM = DEFAULT_HEAD_V_DIM = 32`.
+- `test_kda_prefill_flashinfer.py` exercises the 128-D FlashInfer path against
+  Triton on B200/GB300, including the 130-token to 128-token cache boundary.
+
+## FlashInfer Prefill Contract
+
+FlashInfer prefill execution requires SM100/SM103,
+BF16 model activations, BF16 or FP32 SSM state, equal Q/K/V head counts with
+128-D heads, and a finite negative safe-gate lower bound.
+FlashInfer validates this tensor contract when the kernel runs, including
+during server warmup. Radix-cache checkpoints require a positive mamba chunk
+size divisible by 32. Incompatible intervals are rejected at backend
+initialization; FlashInfer rejects unbounded gates during warmup, so original
+Kimi Linear should use Triton prefill.
+
+The backend maps radix-cache checkpoint destinations once per tracked batch,
+before layer execution. The adapter consumes raw gate/beta projections and
+normalizes projection strides before calling `recurrent_kda(backend="cute-dsl")`
+directly. FlashInfer owns execution scheduling and workspace allocation; its
+direct API may read packed sequence offsets on the host to size that workspace.
+Packed batches may include single-token sequences and zero-length padding rows;
+only the total packed token count must exceed one.
+
+KDA models pass raw beta logits in every phase; activation belongs to the
+kernel adapters. A packed batch with only one token uses Triton with the same
+raw beta format. Invalid checkpoint metadata raises an assertion instead of changing
+kernels. TBO and full prefill CUDA graphs are rejected at initialization; BCG
+keeps linear attention eager. Verify uses its separately resolved backend.
 
 ## Production-Unsupported
 
@@ -40,6 +67,4 @@ Columns are runner modes; rows are the linear-attention kernel backend
 
 ## Next Work
 
-- Consider additional KDA kernel backend variants when available. CG
-  decode, PCG/BCG split-op extend, and EAGLE chain/tree verify
-  (eager + CG) are all wired (see matrix above).
+- Add model-level Kimi K3 coverage when weights are available in the runner.
