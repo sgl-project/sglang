@@ -208,6 +208,24 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(os.environ["DG_USE_FP4_ACTS"], "0")
             self.assertEqual(os.environ["DG_USE_MXF4_KIND"], "0")
 
+    def test_speculative_w4a4_mxfp4_megamoe_is_tri_state(self):
+        # Unset must stay None, not False: None is what lets the draft inherit
+        # --enable-w4a4-mxfp4-megamoe.
+        for flag, expected in (
+            ([], None),
+            (["--speculative-enable-w4a4-mxfp4-megamoe"], True),
+            (["--no-speculative-enable-w4a4-mxfp4-megamoe"], False),
+        ):
+            with self.subTest(flag=flag):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--enable-w4a4-mxfp4-megamoe", *flag]
+                )
+                args.resolve_once()
+                self.assertIs(
+                    resolution_result(args, "speculative_enable_w4a4_mxfp4_megamoe"),
+                    expected,
+                )
+
     def test_megamoe_rejects_two_batch_overlap(self):
         # The fused kernel has no dispatch/combine split for the TBO ops to call.
         with override_platform(is_cuda=True, is_sm90=False, is_sm100=True):
@@ -1119,7 +1137,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             handle_pd_disaggregation(server_args)
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
-    def test_pd_decode_dcp_forces_chunk_cache(self):
+    def test_pd_decode_dcp_disables_radix_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
             disaggregation_transfer_backend="mooncake",
@@ -2087,6 +2105,32 @@ class TestHiCacheArgs(CustomTestCase):
             )
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
+
+    def test_buffer_only_resolves_write_back_to_write_through(self):
+        """buffer_only has no retained host tier for write_back to defer
+        writes into, so the mode resolves that policy to write_through
+        instead of rejecting the launch. The rewrite is that narrow: an
+        explicit write_through_selective stays as given, and the cache
+        mode keeps write_back.
+        """
+        cases = [
+            ("buffer_only", "write_back", "write_through"),
+            ("buffer_only", "write_through", "write_through"),
+            ("buffer_only", "write_through_selective", "write_through_selective"),
+            ("cache", "write_back", "write_back"),
+        ]
+        for mode, policy, expected in cases:
+            with self.subTest(mode=mode, policy=policy):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_host_memory_mode=mode,
+                    hicache_storage_backend="file",
+                    hicache_write_policy=policy,
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_write_policy"), expected
+                )
 
     def test_optimistic_prefill_allows_only_exercised_hicache_modes(self):
         common = {
