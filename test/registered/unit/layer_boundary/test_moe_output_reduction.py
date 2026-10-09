@@ -191,7 +191,11 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
 
                 group = types.SimpleNamespace(reduce_scatterv=rsv)
                 parallel = types.SimpleNamespace(
-                    attn_dp_size=2, attn_tp_size=1, tp_size=2, tp_group=group
+                    attn_dp_size=2,
+                    attn_tp_size=1,
+                    tp_size=2,
+                    tp_group=group,
+                    dwdp_size=1,
                 )
                 namespace = dict(
                     torch=torch,
