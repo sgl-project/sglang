@@ -899,7 +899,13 @@ mod tests {
         let (ps, _) = requests(r#"{"text": "a", "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
         assert_eq!(
             images_of(&ps[0]),
-            vec![src("u1"), MmItem::Ref { url: "u2".into() }]
+            vec![
+                src("u1"),
+                MmItem::Ref {
+                    url: "u2".into(),
+                    hints: Default::default(),
+                },
+            ]
         );
 
         // Batch + scalar image: broadcast, one image per item.

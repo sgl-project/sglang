@@ -287,8 +287,11 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
 
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events and not self.disable,
+            page_size=self.page_size,
         )
 
         if params.enable_metrics:
@@ -304,7 +307,8 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.eviction_strategy = get_eviction_strategy(
-            self.eviction_policy, params.eviction_policy_config
+            "lru" if self.disable else self.eviction_policy,
+            None if self.disable else params.eviction_policy_config,
         )
 
         self.evictable_leaves = set()
@@ -604,6 +608,9 @@ class RadixCache(BasePrefixCache):
                 )
             node = node.parent
         return DecLockRefResult(delta=delta)
+
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
 
     def evictable_size(self):
         return self.evictable_size_

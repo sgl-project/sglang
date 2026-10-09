@@ -12,7 +12,6 @@ mod chat;
 mod completions;
 mod models;
 mod pd_routing;
-mod reasoning;
 mod template;
 mod template_builtins;
 mod template_legacy;
