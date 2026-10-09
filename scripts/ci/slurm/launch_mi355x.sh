@@ -403,6 +403,17 @@ DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
 [[ "$HAS_MODEL" == "1" ]] && DSV4_ENV_STR=""
+# On spur every node picks its own RDMA devices when its server starts, from the
+# list drive.sh writes for it (ib_nodes/<hostname>): an RDMA device name is only a
+# local handle, and a port that was down at boot keeps a rocepNNsM name on that one
+# node. The generated scripts therefore carry a reference to the per-node list
+# instead of the recipe's literal one; everywhere else IB_REF is the recipe list.
+IB_REF="$IB"
+IB_NODE_SNIPPET=""
+if [[ "$CLUSTER" == "spur" && -n "$IB" ]]; then
+    IB_REF='${IB_NODE}'
+    IB_NODE_SNIPPET=$'\n''IB_NODE="$(cat "'"$WORKDIR"'/ib_nodes/$(hostname)" 2>/dev/null)"; export IB_NODE="${IB_NODE:-'"$IB"'}"'
+fi
 # NCCL_IB_HCA must name real devices. "ionic" is the mi355x cluster's spelling;
 # on pit2 the HCAs are rdma0..7 (the recipe's $IB) and "ionic" matches nothing,
 # which fails TP group init outright with
@@ -410,8 +421,10 @@ DSV4_ENV_STR="${DSV4_ENV[*]}"
 # from ncclCommInitRank. The wide-EP block below already overrides this for
 # EP>8; EP<=8 recipes need it too.
 MORI_NCCL_HCA=ionic
-[[ "$CLUSTER" == "spur" ]] && MORI_NCCL_HCA="$IB"
+[[ "$CLUSTER" == "spur" ]] && MORI_NCCL_HCA="$IB_REF"
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=$MORI_NCCL_HCA -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+# The entry scripts run inside the container, so the node's list has to go in too.
+[[ -n "$IB_NODE_SNIPPET" ]] && MORI_ENV="$MORI_ENV -e IB_NODE=\${IB_NODE}"
 # Whether NCCL may use IB depends on the role, not on the recipe. A single-node
 # engine does all its NCCL traffic intra-node (cross-node KV goes over mori),
 # and on pit2 letting it reach for IB hangs ncclCommInitRank. Gating on the
@@ -445,7 +458,7 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
     # cross-node TP/attention collectives ride NCCL, so point NCCL at the real
     # HCAs. Docker last-wins => this overrides the base value for wide recipes.
     MORI_ENV="$MORI_ENV \
--e NCCL_IB_HCA=$IB \
+-e NCCL_IB_HCA=$IB_REF \
 -e MORI_IB_GID_INDEX=1 \
 -e SGLANG_MORI_DISPATCH_DTYPE=bf16 -e SGLANG_MORI_COMBINE_DTYPE=bf16 \
 -e SGLANG_MORI_QP_PER_TRANSFER=4 -e SGLANG_MORI_NUM_WORKERS=4 \
@@ -468,11 +481,11 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
         MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK -e MORI_SOCKET_IFNAME=$DIST_SOCK"
     fi
     # sglang hands --disaggregation-ib-device to mori only for the KV transfer
-    # engine; the MoE all-to-all picks its own NICs. On spur drive.sh may drop
-    # dead ports from $IB, so name the list here too or the a2a can still land
-    # on a port that never linked.
+    # engine; the MoE all-to-all picks its own NICs. On spur drive.sh swaps dead
+    # ports out of the list per node, so name that list here too or the a2a can
+    # still land on a port that never linked.
     if [[ "$CLUSTER" == "spur" ]]; then
-        MORI_ENV="$MORI_ENV -e MORI_RDMA_DEVICES=$IB"
+        MORI_ENV="$MORI_ENV -e MORI_RDMA_DEVICES=$IB_REF"
     fi
 fi
 
@@ -549,6 +562,89 @@ if [[ -n "$IB" && ! "$IB" =~ ^[A-Za-z0-9_,]+$ ]]; then
 fi
 printf 'IB_RECIPE=%q\n' "$IB" > "$WORKDIR/ib_check.sh"
 
+# Per-node RDMA device selection for drive.sh (spur only; see IB_REF above). Input
+# is one probe file per node holding lines "<device> <N>: <STATE> <netdev>". A
+# device is identified by its rail, the number at the end of its netdev
+# (tw-eth3 -> 3), not by its name, because a port that was down at boot is
+# rocepNNsM on that node and rdmaN on the others. Output is one file per node
+# with the devices that node should use.
+#
+# Rails come in this order: the recipe's rails that are ACTIVE on every node, then
+# other rails ACTIVE on every node, then whatever else that node has up. The
+# count is the recipe's, cut down only to what every node can supply, since KV
+# throughput scales with the number of HCAs.
+cat > "$WORKDIR/ib_select.py" <<'IBSEL_EOF'
+import os
+import re
+import sys
+
+
+def tail_int(s):
+    m = re.search(r"(\d+)$", s or "")
+    return int(m.group(1)) if m else None
+
+
+def parse_probe(path):
+    rails = {}
+    for line in open(path):
+        m = re.match(r"^(\S+) \d+: (\w+)(?: (\S+))?\s*$", line)
+        if not m or m.group(2) != "ACTIVE":
+            continue
+        dev, netdev = m.group(1), m.group(3)
+        rail = tail_int(netdev)
+        if rail is None and re.fullmatch(r"rdma\d+", dev):
+            rail = tail_int(dev)
+        if rail is not None:
+            rails[rail] = dev
+    return rails
+
+
+def select(recipe, active):
+    """recipe: device names; active: {node: {rail: device}} -> {node: [devices]}."""
+    want = [tail_int(d) for d in recipe]
+    if None in want or len(set(want)) != len(want):
+        return None
+    common = set.intersection(*(set(a) for a in active.values())) if active else set()
+    common_ranked = [r for r in want if r in common] + sorted(r for r in common if r not in want)
+    ranked = {}
+    for node, a in active.items():
+        r = list(common_ranked)
+        r += [x for x in want if x in a and x not in r]
+        r += sorted(x for x in a if x not in r)
+        ranked[node] = r
+    k = min([len(want)] + [len(r) for r in ranked.values()])
+    return {n: [active[n][x] for x in r[:k]] for n, r in ranked.items()}, want
+
+
+def main():
+    recipe = sys.argv[1].split(",")
+    probe_dir, out_dir, nodes = sys.argv[2], sys.argv[3], sys.argv[4:]
+    active = {n: parse_probe(os.path.join(probe_dir, n)) for n in nodes}
+    res = select(recipe, active)
+    if res is None:
+        print("[drive] WARN: cannot map recipe RDMA devices %s to rails; keeping the recipe list" % ",".join(recipe))
+        return 0
+    chosen, want = res
+    dead = [n for n, a in active.items() if not a]
+    if dead:
+        print("ERROR: no RDMA port is PORT_ACTIVE on: %s" % " ".join(dead))
+        return 1
+    os.makedirs(out_dir, exist_ok=True)
+    for n, devs in chosen.items():
+        with open(os.path.join(out_dir, n), "w") as f:
+            f.write(",".join(devs) + "\n")
+        print("[drive] RDMA devices on %s: %s" % (n, ",".join(devs)))
+    got = len(next(iter(chosen.values())))
+    if got < len(want):
+        print("WARN: running on %d of %d requested RDMA devices (%s) -- throughput is not comparable to a full-rail run"
+              % (got, len(want), "; ".join("%s: %s" % (n, ",".join(d)) for n, d in chosen.items())), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+IBSEL_EOF
+
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
 #
@@ -609,12 +705,12 @@ if [[ "$HAS_MODEL" == "1" ]]; then
 $ATTN_FLAGS --max-running-requests $PMAXREQ --page-size $PAGE \
 --mem-fraction-static $PMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $PCHUNK \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB_REF$KV_FLAG$PREFILL_TAIL"
     DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
 $ATTN_FLAGS --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB_REF$KV_FLAG$DECODE_TAIL"
 else
     # DSV4 path: for EP<=8 recipes (PTP==DTP, no wide_ep) both role strings equal
     # the pre-Kimi launcher's COMMON_FLAGS exactly.
@@ -623,13 +719,13 @@ else
 --mem-fraction-static $PMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $PCHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$PREFILL_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB_REF$KV_FLAG$PREFILL_TAIL"
     DECODE_COMMON_FLAGS="--trust-remote-code --tp $DTP --disable-radix-cache \
 --attention-backend $ATTN --max-running-requests $DMAXREQ --page-size $PAGE \
 --mem-fraction-static $DMEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB_REF$KV_FLAG$DECODE_TAIL"
 fi
 
 # /it-share is the mi355x cluster's model NFS. Mount it only where it exists --
@@ -1032,7 +1128,7 @@ EOF
   cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
-source "$WORKDIR/ionic_mounts.sh"
+source "$WORKDIR/ionic_mounts.sh"$IB_NODE_SNIPPET
 NODE_RANK="\${1:-0}"; NNODES="\${2:-1}"; DIST_ADDR="\${3:-}"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
@@ -1046,7 +1142,7 @@ EOF
   cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
-source "$WORKDIR/ionic_mounts.sh"
+source "$WORKDIR/ionic_mounts.sh"$IB_NODE_SNIPPET
 NODE_RANK="\${1:-0}"; NNODES="\${2:-1}"; DIST_ADDR="\${3:-}"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
@@ -1095,7 +1191,7 @@ EOF
   cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
-source "$WORKDIR/ionic_mounts.sh"
+source "$WORKDIR/ionic_mounts.sh"$IB_NODE_SNIPPET
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$PENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
@@ -1105,7 +1201,7 @@ EOF
   cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
-source "$WORKDIR/ionic_mounts.sh"
+source "$WORKDIR/ionic_mounts.sh"$IB_NODE_SNIPPET
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV$DENV_ARG $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
@@ -1503,36 +1599,26 @@ fi
 # The recipe's ib_devices is a fixed list, but a pit2 port can stay down for
 # days (some never link after a reboot). Handing a dead port to NCCL or mori
 # fails init with a network error that names neither the node nor the port.
-# Keep only the devices whose port is ACTIVE on EVERY allocated node -- the
-# same set on both ends, so no transfer has to cross rails -- and patch that
-# list into the generated server scripts before anything is launched.
+# So each node gets its own list: ib_select.py (see launch_mi355x.sh) keeps the
+# recipe's rails that are up everywhere, tops up with other live rails, and names
+# every rail by the device that carries it on that node. Whether a port is called
+# rdmaN or rocepNNsM depends on whether it was up at boot, so one rail can have a
+# different name on each node; the name is only a local handle and both ends do
+# not have to agree. The servers read their list from ib_nodes/<hostname> when
+# they start.
 #
-# If that leaves fewer devices than the recipe asked for, top the list back up
-# with other ports that are ACTIVE on every node. The 1p1d recipes name
-# rdma0..3, and a node can lose exactly those: on 2026-10-02 g02 had only
-# rdma4..7 up (its rdma0..3 had come back as unrenamed rocep* devices, DOWN),
-# so every pair that included it had no usable recipe port at all. A port off
-# the recipe's list may sit further from the GPU, but it works; a dead one
-# does not. Candidates are picked by state, not name: rdmaN vs rocep* reflects
-# whether the port was up at boot, so a rocep* port that links later is just
-# as usable. It still has to carry the same name on every node, though, and
-# the same slot is usually rdmaN elsewhere; pairing ports by PCI slot across
-# nodes would need a different list per node, which this does not do.
-#
-# A list that is still short changes the numbers (KV throughput scales with
-# HCA count), so that case is written to ib_warn for the launcher to put in
-# the job summary -- this log is only read when the leg fails.
+# A list shorter than the recipe's changes the numbers (KV throughput scales with
+# HCA count), so that case is written to ib_warn for the launcher to put in the
+# job summary -- this log is only read when the leg fails.
 source "$WORKDIR/ib_check.sh"
 if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
-  IFS=',' read -ra _ib_want <<< "$IB_RECIPE"
-  _ib_live=("${_ib_want[@]}")
-  _ib_spare=()       # non-recipe ports ACTIVE on every node checked so far
-  _ib_spare_init=0
-  # Every port on the node, not just the recipe's, so there is something to
-  # fall back to. __ok__ separates "the step ran" from a flaky srun dispatch,
-  # as in container_state(); sysfs reads e.g. "4: ACTIVE" or "1: DOWN".
-  _ib_probe='for p in /sys/class/infiniband/*/ports/1/state; do [ -e "$p" ] || continue; d=${p#/sys/class/infiniband/}; echo "${d%%/*} $(cat "$p" 2>/dev/null)"; done; echo __ok__'
-  _ib_unchecked=()
+  rm -rf "$WORKDIR/ib_probe" "$WORKDIR/ib_nodes"
+  mkdir -p "$WORKDIR/ib_probe"
+  # Every port on the node with its netdev. __ok__ separates "the step ran" from
+  # a flaky srun dispatch, as in container_state(); a line reads e.g.
+  # "rdma0 4: ACTIVE tw-eth0" or "rocep249s0 1: DOWN tw-eth7".
+  _ib_probe='for d in /sys/class/infiniband/*; do [ -e "$d/ports/1/state" ] || continue; echo "$(basename $d) $(cat $d/ports/1/state 2>/dev/null) $(ls $d/device/net 2>/dev/null | head -1)"; done; echo __ok__'
+  _ib_checked=()
   for n in "${NODES[@]}"; do
     _ib_out=""
     for _try in 1 2 3; do
@@ -1542,63 +1628,22 @@ if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
       sleep 2
     done
     if [[ -z "$_ib_out" ]]; then
-      echo "[drive] WARN: could not read RDMA port state on $n; not filtering on it" >&2
-      _ib_unchecked+=("$n")
+      echo "[drive] WARN: could not read RDMA port state on $n; it keeps the recipe list $IB_RECIPE" >&2
       continue
     fi
-    _ib_keep=()
-    for d in "${_ib_live[@]}"; do
-      if grep -qxE "$d [0-9]+: ACTIVE" <<< "$_ib_out"; then
-        _ib_keep+=("$d")
-      else
-        _st="$(grep -m1 "^$d " <<< "$_ib_out" | cut -d' ' -f2-)"
-        echo "[drive] $n: dropping $d (${_st:-missing})" >&2
-      fi
-    done
-    _ib_live=("${_ib_keep[@]}")
-    mapfile -t _ib_active < <(sed -nE 's/^([^ ]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
-    if (( ! _ib_spare_init )); then
-      _ib_spare=()
-      for d in "${_ib_active[@]}"; do
-        [[ ",$IB_RECIPE," == *",$d,"* ]] || _ib_spare+=("$d")
-      done
-      _ib_spare_init=1
-    else
-      _ib_keep=()
-      for d in "${_ib_spare[@]}"; do
-        printf '%s\n' "${_ib_active[@]}" | grep -qx "$d" && _ib_keep+=("$d")
-      done
-      _ib_spare=("${_ib_keep[@]}")
-    fi
+    grep -v '^__ok__$' <<< "$_ib_out" > "$WORKDIR/ib_probe/$n"
+    _ib_checked+=("$n")
   done
-  _ib_added=()
-  if (( ${#_ib_live[@]} < ${#_ib_want[@]} && ${#_ib_spare[@]} )); then
-    mapfile -t _ib_spare < <(printf '%s\n' "${_ib_spare[@]}" | sort -V)
-    for d in "${_ib_spare[@]}"; do
-      (( ${#_ib_live[@]} < ${#_ib_want[@]} )) || break
-      _ib_live+=("$d"); _ib_added+=("$d")
-    done
-  fi
-  IB_LIVE="$(IFS=,; echo "${_ib_live[*]}")"
-  if [[ -z "$IB_LIVE" ]]; then
-    echo "ERROR: no RDMA port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
-    exit 1
-  fi
-  _ib_note=""
-  (( ${#_ib_added[@]} )) && _ib_note=" (off-recipe fallback: ${_ib_added[*]})"
-  (( ${#_ib_unchecked[@]} )) && _ib_note="$_ib_note (unchecked: ${_ib_unchecked[*]})"
-  if (( ${#_ib_live[@]} < ${#_ib_want[@]} )); then
-    echo "WARN: running on ${#_ib_live[@]} of ${#_ib_want[@]} requested RDMA devices ($IB_LIVE; recipe $IB_RECIPE)$_ib_note -- throughput is not comparable to a full-rail run" \
-      | tee "$WORKDIR/ib_warn" >&2
-  fi
-  if [[ "$IB_LIVE" != "$IB_RECIPE" ]]; then
-    echo "[drive] RDMA devices changed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
-    # The list appears only as a whole flag/env value, after a space or "=".
-    for f in prefill.sh decode.sh prefill_entry.sh decode_entry.sh; do
-      sed -i -E "s/(^|[ =])$IB_RECIPE( |$)/\1$IB_LIVE\2/g" "$WORKDIR/$f"
-    done
-  else
-    echo "[drive] RDMA devices $IB_RECIPE are PORT_ACTIVE on all nodes$_ib_note"
+  if (( ${#_ib_checked[@]} )); then
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "[drive] WARN: python3 not found; RDMA devices stay as the recipe list $IB_RECIPE" >&2
+    else
+      _ib_rc=0
+      python3 "$WORKDIR/ib_select.py" "$IB_RECIPE" "$WORKDIR/ib_probe" "$WORKDIR/ib_nodes" \
+        "${_ib_checked[@]}" 2> "$WORKDIR/ib_warn" || _ib_rc=$?
+      if [[ -s "$WORKDIR/ib_warn" ]]; then cat "$WORKDIR/ib_warn" >&2; else rm -f "$WORKDIR/ib_warn"; fi
+      (( _ib_rc == 0 )) || exit 1
+    fi
   fi
 fi
 if (( DW > 1 )); then
