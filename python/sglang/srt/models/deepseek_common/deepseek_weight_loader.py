@@ -629,7 +629,8 @@ class DeepseekV2WeightLoaderMixin:
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
                     is_ue8m0_uint8 = (
-                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
+                        getattr(weight_scale, "format_ue8m0", False)
+                        and weight_scale.dtype == torch.uint8
                     )
                     if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
