@@ -1110,8 +1110,10 @@ class Req(ReqDllmMixin):
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
 
-        # Sampling info
-        if isinstance(sampling_params.custom_params, dict):
+        # Only custom logit processors need the "__req__" reference cycle.
+        if custom_logit_processor is not None and isinstance(
+            sampling_params.custom_params, dict
+        ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": self
