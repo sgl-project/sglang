@@ -48,7 +48,12 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.kvcache import (
+    can_use_store_cache,
+    can_use_store_k_cache,
+    store_cache,
+    store_k_cache,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -5598,6 +5603,29 @@ class MHATokenToKOnlyPool(KVCache):
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
+        buf = self.k_buffer[layer_id]
+        row_dim = self.head_num * self.head_dim
+        row_bytes = row_dim * buf.element_size()
+        if (_is_cuda or _is_hip) and can_use_store_k_cache(row_bytes):
+            # The index_put_ below costs 287.1 us/step on MiniMax-M3 TP2 against
+            # 225.6 for the JIT kernel on a STRICTLY LARGER write (the main pool
+            # moves two heads of K and of V; this pool moves one head of K).
+            #
+            # `view` on the destination, `reshape` on the source, deliberately:
+            # a `reshape` that cannot alias silently returns a copy, and a copy
+            # of the destination would swallow the write. The source may be
+            # copied harmlessly, so it takes the form that always succeeds.
+            #
+            # Slot 0 is the reserved graph-padding index and is skipped, which
+            # is the same default the main pool's store_cache path takes.
+            return store_k_cache(
+                cache_k.reshape(-1, row_dim),
+                buf.view(-1, row_dim),
+                loc,
+                row_bytes=row_bytes,
+            )
+        # Any row width the JIT kernel will not serve degrades to stock rather
+        # than failing the request.
         self.k_buffer[layer_id][loc] = cache_k
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:

@@ -5,13 +5,18 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.kvcache import (
+    can_use_store_cache,
+    can_use_store_k_cache,
+    store_cache,
+    store_k_cache,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=34, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=55, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=48, stage="nightly", runner_config="1-gpu-large")
+register_amd_ci(est_time=66, stage="jit-kernel-unit", runner_config="amd")
 
 BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
@@ -164,6 +169,108 @@ def test_store_cache_asymmetric(k_dim: int, v_dim: int, dtype: torch.dtype) -> N
     untouched[indices] = False
     assert torch.all(k_cache[untouched] == k_before[untouched])
     assert torch.all(v_cache[untouched] == v_before[untouched])
+
+
+# --- K-only form -------------------------------------------------------------
+#
+# A pool with no V half at all (MiniMax's sparse index cache). Expressing it as
+# store_cache(k, k, k_cache, k_cache, ...) would produce the same bytes but
+# aliases two pointers the kernel declares __restrict__ and issues the store
+# twice to one address, so it gets its own template instantiation and entry
+# point rather than a calling convention.
+
+
+@pytest.mark.parametrize(
+    "batch_size,element_dim",
+    list(itertools.product(BS_LIST, HIDDEN_DIMS)),
+)
+def test_store_k_cache(batch_size: int, element_dim: int) -> None:
+    k = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn((CACHE_SIZE, element_dim), dtype=DTYPE, device=DEVICE)
+    indices = torch.randperm(CACHE_SIZE - 1, device=DEVICE)[:batch_size] + 1
+
+    store_k_cache(k, k_cache, indices)
+
+    assert torch.all(k_cache[indices] == k)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("element_dim", REPR_DIMS)
+def test_store_k_cache_dtypes_and_indices(
+    element_dim: int, index_dtype: torch.dtype, dtype: torch.dtype
+) -> None:
+    batch_size = 128
+    k = torch.randn((batch_size, element_dim), dtype=dtype, device=DEVICE)
+    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=dtype, device=DEVICE)
+    before = k_cache.clone()
+    indices = (torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1).to(
+        index_dtype
+    )
+
+    store_k_cache(k, k_cache, indices)
+
+    assert torch.all(k_cache[indices.long()] == k)
+    # The K-only form still carries the V-form's params struct, with the V
+    # stride zeroed. A V store that survived the if-constexpr would land at some
+    # multiple of a stride nobody set, i.e. on a row nobody named -- which the
+    # target-slot assertion above cannot see.
+    untouched = torch.ones(SMALL_CACHE, dtype=torch.bool, device=DEVICE)
+    untouched[indices.long()] = False
+    assert torch.all(k_cache[untouched] == before[untouched])
+
+
+@pytest.mark.parametrize("element_dim", REPR_DIMS)
+def test_store_k_cache_matches_store_cache(element_dim: int) -> None:
+    """The specialisation must not change what gets written, only how."""
+    batch_size = 128
+    k = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE)
+    # A distinct V source and V cache, so neither call aliases a __restrict__
+    # pointer -- the very thing this entry point exists to avoid.
+    v = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE)
+    ref_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    v_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    k_cache = ref_cache.clone()
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
+
+    # Reference: the ordinary two-tensor form writing the same K rows.
+    store_cache(k, v, ref_cache, v_cache, indices)
+    store_k_cache(k, k_cache, indices)
+
+    torch.testing.assert_close(k_cache, ref_cache, rtol=0.0, atol=0.0)
+
+
+def test_store_k_cache_reserved_skip_index() -> None:
+    element_dim = 1024
+    k = torch.randn((4, element_dim), dtype=DTYPE, device=DEVICE)
+    # CUDA-graph padding rows may be left undefined by the producing kernel.
+    k[[0, 2]] = torch.nan
+    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    reserved_before = k_cache[0].clone()
+    indices = torch.tensor([0, 7, 0, 9], dtype=torch.int64, device=DEVICE)
+
+    store_k_cache(k, k_cache, indices)
+
+    torch.testing.assert_close(k_cache[0], reserved_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_cache[7], k[1], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_cache[9], k[3], rtol=0.0, atol=0.0)
+
+
+def test_store_k_cache_zero_index_can_be_written_when_skip_disabled() -> None:
+    element_dim = 64
+    k = torch.randn((1, element_dim), dtype=DTYPE, device=DEVICE)
+    k_cache = torch.randn((SMALL_CACHE, element_dim), dtype=DTYPE, device=DEVICE)
+    indices = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+
+    store_k_cache(k, k_cache, indices, reserved_skip_index=-1)
+
+    torch.testing.assert_close(k_cache[0], k[0], rtol=0.0, atol=0.0)
+
+
+def test_can_use_store_k_cache() -> None:
+    assert can_use_store_k_cache(128)
+    assert can_use_store_k_cache(256)
+    assert can_use_store_k_cache(2048)
 
 
 def test_can_use_store_cache() -> None:
