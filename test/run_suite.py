@@ -87,7 +87,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-1-gpu-5090",
         "base-b-test-diffusion-1-gpu-b200",
         "base-b-test-diffusion-2-gpu-h100",
-        "base-b-test-diffusion-bcg-1-gpu-h100",
+        "base-b-test-diffusion-bcg-1-gpu-5090",
         "base-b-test-diffusion-component-2-gpu-h100",
         "base-b-test-diffusion-unit-1-gpu-h100",
         "base-c-test-4-gpu-h100",

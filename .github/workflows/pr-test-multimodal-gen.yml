@@ -215,7 +215,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-h100
+    runs-on: 1-gpu-5090
     timeout-minutes: 90
     steps:
       - name: Checkout code
@@ -249,7 +249,7 @@ jobs:
         run: |
           python3 test/run_suite.py \
             --hw cuda \
-            --suite base-b-test-diffusion-bcg-1-gpu-h100 \
+            --suite base-b-test-diffusion-bcg-1-gpu-5090 \
             --timeout-per-file 3600
 
       - name: Upload BCG diffusion artifacts
