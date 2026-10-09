@@ -582,17 +582,23 @@ class CompressorAscendBackendMixin:
                             continue
                         _by_blk.setdefault(_p // 128, []).append(_sl)
                 _out = []
+                _locx = []
                 for _bk in sorted(_by_blk):
-                    _idxs = torch.tensor(sorted(set(_by_blk[_bk])), dtype=torch.int64)
+                    _locs = sorted(set(_by_blk[_bk]))
+                    _idxs = torch.tensor(_locs, dtype=torch.int64)
                     _r = _flat.index_select(0, _idxs)
                     _h = _hlst.md5(
                         _r.detach().to(torch.float32).cpu().numpy().tobytes()
                     ).hexdigest()[:16]
                     _out.append(f"{_bk}:{_h}")
+                    # S195: raw state SLOT ids per block -> tells LOC (slots
+                    # identical across suffix blocks) vs CONTENT (distinct slots,
+                    # identical content) apart.
+                    _locx.append(f"{_bk}:n{len(_locs)}:{_locs[:6]}")
                 print(
                     f"[C4ST] layer={compressor.layer_id} "
                     f"idx={int(compressor.is_in_indexer)} start={_sp.tolist()} "
-                    f"blkx={_out[-10:]}",
+                    f"rows={_rows_n} blkx={_out[-10:]} locx={_locx[-10:]}",
                     flush=True,
                 )
             except Exception as _exc:
