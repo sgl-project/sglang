@@ -493,6 +493,12 @@ if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
+    from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
+        maybe_cache_mxfp8_dispatch,
+    )
+
+    _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
+
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
         if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
@@ -587,7 +593,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
-        return _raw_flashinfer_mm_mxfp8(
+        return _flashinfer_mm_mxfp8_impl(
             q_input,
             weight_t,
             x_scale_u8,
