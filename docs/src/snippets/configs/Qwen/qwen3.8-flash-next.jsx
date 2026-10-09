@@ -812,7 +812,7 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
       verified: true,
       verificationStatus: (sel) => sel.pleOffload === "off" ? "unverified" : "verified",
-      warn: "Long-context recipe: reserve 224 GiB of host RAM for HiCache, approximately 48 GiB for pinned PLE offload, and loading headroom. See [GB300 configuration notes](#23-gb300-long-context-serving-with-hicache-and-mtp). The Docker wrapper is adapted from the qualified Slurm/Enroot launch.",
+      warn: "Long-context recipe: reserve 224 GiB of host RAM for HiCache, approximately 48 GiB for pinned PLE offload, and loading headroom. See the [Agentic Long-Context Deployment](#agentic-long-context-deployment) section for the qualified launch. The Docker wrapper is adapted from the qualified Slurm/Enroot launch.",
       env: [
         "PYTHONNOUSERSITE=1",
         "PYTHONUNBUFFERED=1",
