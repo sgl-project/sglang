@@ -548,7 +548,9 @@ class GraniteForCausalLM(nn.Module):
 
 
 class GraniteSWAForCausalLM(GraniteForCausalLM):
-    pass
+    def get_attention_sliding_window_size(self) -> int:
+        # Same exclusive bound as the layers (granite_layer_attn_params).
+        return self.config.sliding_window - 1
 
 
 EntryClass = [GraniteForCausalLM, GraniteSWAForCausalLM]

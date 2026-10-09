@@ -769,6 +769,12 @@ class IQuestQ1ForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        # Same exclusive bound as the layers.
+        if self.config.sliding_window is None:
+            return None
+        return self.config.sliding_window - 1
+
     @torch.no_grad()
     def forward(
         self,

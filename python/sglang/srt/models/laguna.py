@@ -655,6 +655,10 @@ class LagunaForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        # Same exclusive bound as the layers; a falsy window means no sliding layers.
+        return self.config.sliding_window - 1 if self.config.sliding_window else None
+
     @torch.no_grad()
     def forward(
         self,
