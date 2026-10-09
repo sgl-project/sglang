@@ -394,6 +394,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
+        batch.sp_video_has_padding = pad_frames > 0
         if pad_frames:
             pad_tokens = int(pad_frames) * int(tokens_per_frame)
             pad = torch.zeros(
@@ -443,6 +444,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_orig_num_frames = int(seq_len)
 
         pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        batch.sp_audio_has_padding = pad_frames > 0
         if pad_frames:
             pad = torch.zeros(
                 (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),

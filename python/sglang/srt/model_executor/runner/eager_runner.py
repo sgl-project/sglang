@@ -370,8 +370,12 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         **kwargs,
                     )
-            # Under CP-TP group sharing the model owns the CP row layout.
-            elif cp_active and not get_parallel().enable_cp_tp_group_sharing:
+            elif cp_active and (
+                not get_parallel().enable_cp_tp_group_sharing
+                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
+            ):
+                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
+                # Other group-sharing models keep owning the layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -390,18 +394,25 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        input_embeds = kwargs.get("input_embeds")
-        if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
+            input_embeds, positions, model_kwargs = prepare_inputs(
+                forward_batch, **kwargs
+            )
+        else:
+            input_embeds = kwargs.get("input_embeds")
+            if input_embeds is None:
+                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            positions = forward_batch.positions
+            model_kwargs = {}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         with cp_shard_model_inputs(
             input_embeds,
-            forward_batch.positions,
+            positions,
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-            model_kwargs = {"input_embeds": sharded_input_embeds}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
-                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
                 model_input_ids,
                 sharded_positions,
