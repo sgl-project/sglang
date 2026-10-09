@@ -512,6 +512,30 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
+    def step_logits_dtype(
+        self, base_dtype: torch.dtype, bias_dtype: torch.dtype
+    ) -> torch.dtype:
+        # The bias is FP32 or upcast into an FP32 add, sharded or not.
+        del base_dtype, bias_dtype
+        return torch.float32
+
+    def _vocab_shard_args(self) -> dict:
+        shard = self._tp_shard
+        if shard is None:
+            return {}
+        return dict(
+            vocab_start=shard.org_vocab_start,
+            group=self._shard_group,
+            gather=self._vocab_gather.gather_stacked,
+        )
+
+    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
+        if self._tp_shard is None:
+            return local_logits
+        rows = local_logits.reshape(-1, local_logits.shape[-1])
+        full = self._vocab_gather(rows)[:, : self.vocab_size]
+        return full.reshape(*local_logits.shape[:-1], self.vocab_size)
+
     @property
     def supports_sharded_greedy(self) -> bool:
         return (

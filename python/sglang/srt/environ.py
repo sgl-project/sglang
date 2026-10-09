@@ -545,7 +545,6 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
-    SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
@@ -1988,6 +1987,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
+        note="DSpark draft sampling always uses Gumbel-max."
+    ),
     "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
         note="Buffer-mode anchor pinning is always on; set "

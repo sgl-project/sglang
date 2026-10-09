@@ -11,6 +11,7 @@ from torch import nn
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -109,6 +110,43 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         return base_logits + bias
+
+    def step_logits_dtype(
+        self, base_dtype: torch.dtype, bias_dtype: torch.dtype
+    ) -> torch.dtype:
+        return torch.promote_types(base_dtype, bias_dtype)
+
+    def sample_step(
+        self,
+        base_logits: torch.Tensor,
+        bias: torch.Tensor,
+        *,
+        temperatures: torch.Tensor,
+        noise_key: int,
+        noise_offset: torch.Tensor,
+        step: int,
+        logits_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """One token per row from ``step_logits(base_logits, bias)``: the argmax
+        at temperature 0, a Gumbel-max sample otherwise. ``logits_out`` receives
+        this rank's step logits, in the layout ``gather_vocab`` takes."""
+        return MarkovSampleStep.execute(
+            base_logits=base_logits,
+            bias=bias,
+            temperatures=temperatures,
+            key=noise_key,
+            offset=noise_offset,
+            step=step,
+            step_dtype=self.step_logits_dtype(base_logits.dtype, bias.dtype),
+            logits_out=logits_out,
+            **self._vocab_shard_args(),
+        )
+
+    def _vocab_shard_args(self) -> dict:
+        return {}
+
+    def gather_vocab(self, local_logits: torch.Tensor) -> torch.Tensor:
+        return local_logits
 
     @property
     def supports_sharded_greedy(self) -> bool:

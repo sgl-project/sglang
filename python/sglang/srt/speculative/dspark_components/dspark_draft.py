@@ -6,9 +6,7 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
-    SampleStepTokens,
-)
+from sglang.kernels.ops.speculative.dspark.markov_sample import draft_noise_key
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -33,21 +31,8 @@ from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 logger = logging.getLogger(__name__)
 
 
-def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
-    degenerate = torch.isnan(probs[:, :1])
-    one_hot = torch.zeros_like(probs)
-    one_hot[:, 0] = 1.0
-    return torch.where(degenerate, one_hot, probs)
-
-
-# Draft step logits: NaN is a bug, but -inf is legitimate (masking). The data
-# layer lives downstream (probs one-hot below, or the fast kernel's clamp).
+# Draft step logits: NaN is a bug, but -inf is legitimate (masking).
 _DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN())
-# Draft sampling probs: SOFTEN (tolerate + count), matching the original
-# unconditional clamp; an all-NaN row would otherwise make multinomial raise.
-_DRAFT_PROBS = Invariant(
-    "dspark.draft.probs", Bucket.SOFTEN, NotNaN(), recover=_one_hot_token0
-)
 
 
 def _make_num_token_non_padded(
@@ -125,74 +110,75 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
+class DraftNoise(msgspec.Struct, frozen=True):
+    """Philox key of the draft sampling noise, and its counter: one GPU int64
+    that every draft block advances by one."""
+
+    key: int
+    offset: torch.Tensor
+
+
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
     anchor_tokens: torch.Tensor,
-    draft_hidden: torch.Tensor,
+    draft_hidden: Optional[torch.Tensor],
     sampling_info,
     markov_head,
+    noise: DraftNoise,
     device: torch.device,
     tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
-    bs = base_logits.shape[0]
+    bs, gamma = base_logits.shape[:2]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
-    fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
-
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
     else:
         temperatures = (
             sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
         )
-
-    if not any_sampling:
-
-        def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            return tp_sync.sync(
-                SpecTpSyncSite.DSPARK_DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
-            )
-
-    else:
-
-        def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            if fast_sampling:
-                exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
-                ).exponential_(1)
-                return tp_sync.sync(
-                    SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
-                    SampleStepTokens.execute(
-                        step_logits=step_logits,
-                        temperatures=temperatures,
-                        greedy_mask=greedy_mask,
-                        exp_noise=exp_noise,
-                    ),
-                )
-            else:
-                probs = torch.softmax(
-                    step_logits.float() / temperatures[:, None], dim=-1
-                )
-                probs = expect(_DRAFT_PROBS, probs)
-                argmax_tokens = torch.argmax(step_logits, dim=-1)
-                sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-                return tp_sync.sync(
-                    SpecTpSyncSite.DSPARK_DRAFT_MULTINOMIAL,
-                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
-                )
-
-    draft_tokens, corrected_logits = markov_head.sample_block(
-        base_logits,
-        first_prev_tokens=anchor_tokens,
-        hidden_states=draft_hidden,
-        sampler=sampler,
+    # A step at temperature 0 takes the argmax.
+    step_temperatures = temperatures.masked_fill(greedy_mask, 0.0)
+    site = (
+        SpecTpSyncSite.DSPARK_DRAFT_SAMPLE
+        if any_sampling
+        else SpecTpSyncSite.DSPARK_DRAFT_GREEDY
     )
+
+    local_logits = None
+    state = markov_head.init_state(draft_hidden)
+    prev_tokens = anchor_tokens.long()
+    draft_tokens = []
+    for step in range(gamma):
+        step_hidden = None if draft_hidden is None else draft_hidden[:, step]
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=step_hidden, state=state
+        )
+        step_base = base_logits[:, step]
+        if local_logits is None:
+            local_logits = torch.empty(
+                (bs, gamma, step_base.shape[-1]),
+                dtype=markov_head.step_logits_dtype(step_base.dtype, bias.dtype),
+                device=device,
+            )
+        prev_tokens = markov_head.sample_step(
+            step_base,
+            bias,
+            temperatures=step_temperatures,
+            noise_key=noise.key,
+            noise_offset=noise.offset,
+            step=step,
+            logits_out=local_logits[:, step],
+        )
+        prev_tokens = tp_sync.sync(site, prev_tokens)
+        draft_tokens.append(prev_tokens)
+    noise.offset.add_(1)
+
+    corrected_logits = markov_head.gather_vocab(local_logits)
     return DraftBlockResult(
-        draft_tokens=draft_tokens,
-        corrected_logits=corrected_logits,
+        draft_tokens=torch.stack(draft_tokens, dim=1),
+        corrected_logits=expect(_DRAFT_STEP_LOGITS, corrected_logits),
         greedy_mask=greedy_mask,
         temperatures=temperatures,
     )
@@ -208,6 +194,7 @@ class DraftBlockProposer:
         mask_token_id: int,
         draft_block_spec_info,
         tp_sync: SpecTpSync,
+        random_seed: int,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -218,6 +205,12 @@ class DraftBlockProposer:
         self._mask_token_id = mask_token_id
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
+        self._noise = DraftNoise(
+            key=draft_noise_key(random_seed),
+            offset=torch.zeros(
+                1, dtype=torch.int64, device=self.draft_model_runner.device
+            ),
+        )
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
@@ -322,6 +315,7 @@ class DraftBlockProposer:
                 draft_hidden=fwd.draft_hidden_3d,
                 sampling_info=sampling_info,
                 markov_head=self.draft_model.markov_head,
+                noise=self._noise,
                 device=device,
                 tp_sync=self._tp_sync,
             )
