@@ -237,6 +237,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "zai-org/glm-image",
         "z-image",
         "z-image-turbo",
+        "black-forest-labs/flux.2-klein-4b",
+        "black-forest-labs/flux.2-klein-9b",
+        "flux.2-klein-4b",
+        "flux.2-klein-9b",
     }
 )
 
@@ -259,6 +263,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
+        "Flux2KleinPipelineConfig",
     }
 )
 
@@ -640,13 +645,6 @@ class ServerArgs(DisaggServerArgsMixin):
     def broker_port(self) -> int:
         return self.port + 1
 
-    @property
-    def is_local_mode(self) -> bool:
-        """
-        If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched
-        """
-        return self.host is None or self.port is None
-
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
@@ -808,9 +806,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, Ideogram-4, "
-            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
-            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "[Diffusion BCG] disabled for %s: only Anima Base v1.0, FLUX.1-dev, "
+            "FLUX.2-Klein, Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
+            "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
             "Qwen/Qwen-Image-2.1, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
             "zai-org/GLM-Image are currently supported.",

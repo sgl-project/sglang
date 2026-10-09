@@ -173,10 +173,13 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "sana-video_2.0": "SanaVideo2Pipeline",
+    "sana-video2": "SanaVideo2Pipeline",
+    "sana_video2": "SanaVideo2Pipeline",
     "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
-    "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
+    "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
@@ -291,7 +294,7 @@ _configs_discovered: bool = False
 
 # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
 # SANA-Video (register before generic SANA to avoid detector overlap).
-_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video")
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video2", "sana_video")
 
 
 def _discover_and_register_configs() -> None:
@@ -462,8 +465,11 @@ def _get_config_info(
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
-    config = maybe_download_model_index(model_path)
-    pipeline_name = config.get("_class_name", "").lower()
+    pipeline_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_name is None:
+        config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "")
+    pipeline_name = pipeline_name.lower()
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:

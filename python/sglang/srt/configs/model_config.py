@@ -122,13 +122,13 @@ def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
-    if layout is None:
+    if layout in (None, "split"):
         return None
     if layout != "fused_qkv":
         raise ValueError(
             "MiMoV2 hf_config has unsupported "
-            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
-            "or unset."
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv', "
+            "'split' or unset."
         )
 
     num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
@@ -289,6 +289,23 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
             f"decision_config.json pooling {pooling!r} is not supported, only 'last' is"
         )
     return config
+
+
+@lru_cache
+def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """joint_head_config.json of a Clef checkpoint, whose joint schema head
+    answers /v1/systemone decisions from the backbone's hidden states."""
+    path = cached_file(
+        model_path,
+        "joint_head_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 def is_qwen3_5(config) -> bool:
@@ -544,6 +561,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        self.joint_head_config = None
+        if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            self.joint_head_config = load_joint_head_config(self.model_path, revision)
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
@@ -1119,6 +1139,7 @@ class ModelConfig:
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
+            "EmbeddingGemma2Model",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
@@ -1187,7 +1208,13 @@ class ModelConfig:
             else:
                 self.context_len = context_length
         else:
-            self.context_len = derived_context_len
+            if (
+                self.hf_config.architectures
+                and self.hf_config.architectures[0] == "EmbeddingGemma2Model"
+            ):
+                self.context_len = min(derived_context_len, 8192)
+            else:
+                self.context_len = derived_context_len
 
         # Transfer context_len to HuggingFace config so models can access it
         self.hf_config.context_len = self.context_len
@@ -2241,6 +2268,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "EmbeddingGemma2Model" in model_architectures
         or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
@@ -2258,6 +2286,7 @@ multimodal_model_archs = [
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
+    "EmbeddingGemma2Model",
     "Gemma4UnifiedForConditionalGeneration",
     "DiffusionGemmaForBlockDiffusion",
     "Glm4vForConditionalGeneration",
@@ -2519,6 +2548,7 @@ def is_hybrid_swa_model(
         "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "EmbeddingGemma2Model",
         "Gemma4UnifiedForConditionalGeneration",
         "DiffusionGemmaForBlockDiffusion",
         "LagunaForCausalLM",
@@ -2600,6 +2630,7 @@ def get_hybrid_layer_ids(
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
+        or "EmbeddingGemma2Model" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "DiffusionGemmaForBlockDiffusion" in model_architectures
         or "LagunaForCausalLM" in model_architectures
