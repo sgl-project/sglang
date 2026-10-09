@@ -33,7 +33,9 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
@@ -213,6 +215,10 @@ def _update_and_read_residual_aiter_fp8_group(
     unquantized bf16 output rides along as a third element, so the DSA indexer
     can skip dequantizing. post_residual_addition is not applied on this path."""
     needs_bf16 = get_attn_tp_context().is_dsa
+    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+        hidden_states.shape[0],
+        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+    )
     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
         hidden_states,
         norm.weight,
@@ -224,9 +230,11 @@ def _update_and_read_residual_aiter_fp8_group(
         dtype_quant=torch.float8_e4m3fn,
         res1=residual,
         output_unquantized_inp1=needs_bf16,
-        transpose_scale=False,
+        transpose_scale=emit_transposed_scale,
     )
-    if _use_aiter_bpreshuffle_gfx95:
+    if emit_transposed_scale:
+        output = view_aiter_fused_rms_transposed_fp8_scale_tuple(output)
+    elif _use_aiter_bpreshuffle_gfx95:
         output = materialize_bpreshuffle_fp8_scale_tuple(output)
     if needs_bf16:
         output = (output[0], output[1], unquantized)
@@ -271,6 +279,26 @@ class PlainAdd:
 
     def update(self, hidden_states, residual):
         hidden_states += residual
+        return hidden_states
+
+    def slice_residual_attn_tp(self, residual):
+        return attn_tp_slice(residual)
+
+    def gather_residual_attn_tp(self, residual):
+        return attn_tp_gather(residual)
+
+
+class ReplaceAtExit:
+    """The producer computes the next stream itself (its own add, norms and
+    scaling, in whatever kernels it uses) and writes it at its exit; the
+    previous residual is dropped. The stream is complete: the producer has its
+    boundary complete each part's sum first (StageBoundary.sum_part)."""
+
+    is_plain_add = False
+    applied_at_exit = True
+    outlives_layer = True
+
+    def update(self, hidden_states, residual):
         return hidden_states
 
     def slice_residual_attn_tp(self, residual):
@@ -367,9 +395,33 @@ class NormReadout:
         return norm(hidden_states, residual)
 
 
+@dataclass(frozen=True)
+class UnfusedNormReadout(NormReadout):
+    """The input is the norm of the residual after the producer's update, in
+    two steps: the update rounds to the activation dtype before the norm, as
+    in models that add their residual themselves. No fused kernel takes it."""
+
+    is_plain_norm = False
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if residual is not None:
+            hidden_states = update.update(hidden_states, residual)
+        return self.read(hidden_states, norm, quant_format, post_residual_addition)
+
+
 PLAIN_ADD = PlainAdd()
+REPLACE_AT_EXIT = ReplaceAtExit()
 NORM_QUANT_READOUT = NormQuantReadout()
 NORM_READOUT = NormReadout()
+UNFUSED_NORM_READOUT = UnfusedNormReadout()
 # A plain residual: the attention reads with its input norm and the quantization
 # it wants, the FFN with its norm, and each stage's output is added.
 PLAIN_RESIDUAL_OPS = LayerResidualOps(

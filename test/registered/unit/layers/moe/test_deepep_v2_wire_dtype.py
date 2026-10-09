@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import deepep_v2
 from sglang.srt.layers.moe.utils import (
     DeepEPv2Fp8ScaleFormat,
@@ -136,14 +137,36 @@ class TestDeepEPv2WireDtype(_DeepEPv2WireDtypeBase):
                 )
                 self.assertEqual(out.activation_scale_block_size, 32)
                 self.assertEqual(out.hidden_states_scale.shape[-1], HIDDEN // 32)
-                self.assertEqual(out.is_expanded, not is_extend)
+                # Prefill expands but stays non-masked; only decode is masked.
+                self.assertTrue(out.is_expanded)
+                self.assertEqual(out.use_masked_gemm, not is_extend)
+
+    def test_prefill_expand_default_follows_scale_format(self):
+        # Unset, prefill expands only without UE8M0 scales; an explicit value wins.
+        cases = [
+            (False, None, True),
+            (True, None, False),
+            (True, True, True),
+            (False, False, False),
+        ]
+        for ue8m0, setting, want_expanded in cases:
+            scale_format = DeepEPv2Fp8ScaleFormat(tma_aligned=ue8m0, ue8m0=ue8m0)
+            with (
+                self.subTest(ue8m0=ue8m0, setting=setting),
+                envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.override(setting),
+                patch.object(
+                    deepep_v2, "get_deepep_v2_fp8_scale_format", lambda: scale_format
+                ),
+            ):
+                _, out = self._dispatch(use_fp8_dispatch=False)
+                self.assertEqual(out.is_expanded, want_expanded)
+                self.assertFalse(out.use_masked_gemm)
 
     def test_bf16_dispatch_sends_unquantized_activations(self):
         hidden_states, out = self._dispatch(use_fp8_dispatch=False)
         self.assertIs(_FakeBuffer.last.dispatch_x, hidden_states)
         self.assertIsNone(out.hidden_states_scale)
         self.assertEqual(out.hidden_states.dtype, torch.bfloat16)
-        self.assertFalse(out.hidden_states_scale_tma_aligned)
 
     def test_fp8_dispatch_still_sends_activations_and_scales(self):
         _, out = self._dispatch(use_fp8_dispatch=True)

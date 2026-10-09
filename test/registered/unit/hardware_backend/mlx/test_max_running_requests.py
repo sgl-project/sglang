@@ -32,6 +32,9 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
+    from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+        MlxAuxiliaryStateComponent,
+    )
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO as RATIO,
     )
@@ -265,15 +268,8 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
     def test_radix_disabled_sequential_requests_release_their_aux_slot(self):
-        # THE LEAK: with radix disabled, release_kv_cache's free_mamba_cache
-        # fallback never fires (the MLX pool is not a HybridReqToTokenPool)
-        # and ChunkCache frees token KV only, so pool.free(req) was the only
-        # release hook left -- and it freed just the request row. Every
-        # finished request permanently consumed one auxiliary slot and the
-        # (cap + 1)-th SEQUENTIAL request crashed with "Not enough MLX
-        # auxiliary state slots" even at concurrency 1. The pool now owns
-        # auxiliary release in this configuration: allocate/free/reallocate
-        # far past the pool size must succeed, with every slot returned.
+        # With radix disabled the component cleanup still frees the slot on finish;
+        # sequential requests far past the pool size must get every slot back.
         stub = _hybrid_stub_for_initialize(
             max_running_requests=2,
             max_mamba_cache_size=2,
@@ -282,11 +278,16 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):
             req = _fake_req()
             self.assertIsNotNone(pool.alloc([req]))
-            pool.free(req)  # as release_kv_cache does after ChunkCache
+            component.cleanup_after_caching_req(req=req, is_finished=True)
+            pool.free(req)
             self.assertIsNone(req.kv.mamba_pool_idx)
             self.assertEqual(pool.auxiliary_state_pool.available_size(), aux_capacity)
 

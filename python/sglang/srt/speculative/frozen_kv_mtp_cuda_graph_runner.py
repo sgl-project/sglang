@@ -320,6 +320,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         def run_once():
             # Record the metadata rebuild against the committed target-prefix

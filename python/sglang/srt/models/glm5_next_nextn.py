@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        # The worker has rotated the target's multimodal embeddings per request.
+        # Fill each appended token while indices still address full sequences,
+        # then let the runner shard embeddings and target states together.
+        input_embeds = self.model.embed_input_ids(
+            forward_batch.input_ids, forward_batch
+        )
+        return input_embeds, forward_batch.positions, {}
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
