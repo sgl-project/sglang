@@ -778,12 +778,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     model_config.head_dim,
                     1,
                     kv_size,
+                    include_dequant_workspace=False,
                 )
                 self._swa_per_token = quant_method.compute_cell_size(
                     model_config.get_swa_num_kv_heads(tp_size),
                     model_config.swa_head_dim,
                     1,
                     kv_size,
+                    include_dequant_workspace=False,
                 )
         elif self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
