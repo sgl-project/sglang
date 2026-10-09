@@ -1,5 +1,3 @@
-"""Occupancy probes a host-side dispatch needs before it can size a grid."""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -21,7 +19,7 @@ class NoSchedulableClustersError(ValueError):
 def _jit_probe_module() -> Module:
     return load_jit(
         "occupancy_cluster_probe",
-        cuda_files=["occupancy/cluster_probe.cuh"],
+        cuda_files=["arch/cluster_probe.cuh"],
         cuda_wrappers=[("get_max_active_clusters", "get_max_active_clusters")],
     )
 
