@@ -496,14 +496,28 @@ class CompressorAscendBackendMixin:
                     if _lox <= _lpx <= _hix:
                         import hashlib as _hlx
 
-                        # Hash the trailing 128 rows so the full-prefill miss and
-                        # the suffix hit compare the SAME absolute positions.
-                        _tail = x[-128:] if x.shape[0] >= 128 else x
-                        _xt = _tail.detach().contiguous().to(torch.float32).cpu()
+                        # Per-BLOCK (position // 128) hash of the compressor input
+                        # x, so the full-prefill miss and the suffix hit compare
+                        # the SAME absolute c128 blocks (miss blocks 0..N vs hit
+                        # suffix blocks) and we can see WHICH block's input differs.
+                        _pos = (
+                            forward_batch.positions.reshape(-1).to(torch.int64).cpu()
+                        )
+                        _blk = _pos // 128
+                        _x = x.detach().to(torch.float32).cpu()
+                        _parts = []
+                        for _b in torch.unique(_blk).tolist():
+                            _m = _blk == _b
+                            _parts.append(
+                                f"{_b}:"
+                                + _hlx.md5(
+                                    _x[_m].contiguous().numpy().tobytes()
+                                ).hexdigest()[:8]
+                            )
                         print(
                             f"[C128X] layer={compressor.layer_id} lastpos={_lpx} "
-                            f"ntok={int(x.shape[0])} ntail={int(_tail.shape[0])} "
-                            f"md5={_hlx.md5(_xt.numpy().tobytes()).hexdigest()[:16]}",
+                            f"ntok={int(x.shape[0])} nblk={len(_parts)} "
+                            f"blkx={_parts[-10:]}",
                             flush=True,
                         )
                 except Exception as _exc:
