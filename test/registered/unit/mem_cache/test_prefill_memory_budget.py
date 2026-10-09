@@ -294,17 +294,31 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         )
 
     def test_tri_pool_eviction_does_not_reenter_common(self):
-        allocator = self._allocator(UnifiedMambaSWATokenToKVPoolAllocator)
-        allocator.available_size = lambda: 0
-        allocator.full_available_size = lambda: 0
-        allocator.swa_available_size = lambda: 0
-        cache = _cache()
-        cache.token_to_kv_pool_allocator = allocator
-        cache.evict_for_alloc = MagicMock()
-        evict_from_tree_cache(cache, 8)
-        cache.evict_for_alloc.assert_called_once()
-        params = cache.evict_for_alloc.call_args.args[0]
-        self.assertEqual((params.num_tokens, params.swa_num_tokens), (8, 8))
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.runtime_context import reset_context
+        from sglang.test.unified_allocator_fixtures import (
+            build_tri_cache,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+        bundle, allocator, cache = build_tri_cache(state_cache=False)
+        states = bundle.req_to_token_pool.mamba_allocator.alloc(8)
+        slots = allocator.alloc(96)
+        self.assertIsNotNone(states)
+        self.assertIsNotNone(slots)
+        for i in range(96):
+            cache.insert(
+                InsertParams(key=RadixKey(array("q", [i])), value=slots[i : i + 1])
+            )
+        self.assertLess(allocator.available_size(), 8)
+        self.assertTrue(evict_from_tree_cache(cache, 8))
+        self.assertIsNotNone(allocator.alloc(8))
+        self.assertFalse(allocator.verify_byte_accounting())
 
 
 if __name__ == "__main__":

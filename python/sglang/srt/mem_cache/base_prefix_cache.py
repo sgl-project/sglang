@@ -506,14 +506,25 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
         """Evict cache entries to cover allocator shortfalls.
 
         The default implementation preserves the component-count semantics of
         :meth:`evict`. Multi-component caches backed by shared memory can
         override this entry point to stop once collateral frees make the
         requested allocation feasible.
+
+        With ``allocation_reclaim_satisfied``, params are cumulative reclaim
+        quotas. The pure predicate can stop the walk when no more eviction is
+        needed; the allocator still owns preparation before actual allocation.
         """
+        if allocation_reclaim_satisfied is not None:
+            raise NotImplementedError("This cache does not support joint reclaim")
         return self.evict(params)
 
     @abstractmethod
