@@ -332,10 +332,12 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
             raise NotImplementedError("MHC with a gather over attention CP")
         attn_input_adapter = None
         if declaration.kind is StageKind.ATTENTION:
+            # On an input-scattered batch the step gathers the rows itself for
+            # an attention whose QKV hook does not gather them after the
+            # projection.
             attn_input_adapter = (
                 _attn_input_scattered
                 if variant is BatchVariant.INPUT_SCATTERED
-                and not declaration.update.is_plain_add
                 else _attn_input_default
             )
         moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None

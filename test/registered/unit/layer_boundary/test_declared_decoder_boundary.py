@@ -1014,12 +1014,15 @@ class TestInputScatteredAttention(CustomTestCase):
             patch_communicator("get_parallel", lambda: parallel),
             patch_communicator(
                 "get_attn_tp_context",
-                lambda: SimpleNamespace(input_scattered=True),
+                lambda: SimpleNamespace(input_scattered=True, is_dsa=False),
             ),
             patch_communicator(
                 "get_forward",
                 lambda: SimpleNamespace(sp_active=False, attn_input_scattered=False),
             ),
+            # This attention has no QKV hook, so it takes every row of its
+            # input: the slice is gathered after the read.
+            patch_communicator("tp_gather", lambda h, fb: torch.cat([h, h])),
         ):
             hidden, residual = prepare_input(
                 communicator.attn,
@@ -1030,7 +1033,7 @@ class TestInputScatteredAttention(CustomTestCase):
         self.assertEqual(scattered, [4])
         # Norm: (2 * (h + r), h + r) on the slice, with h the completed sum.
         torch.testing.assert_close(residual.residual, torch.full((2, HIDDEN), 5.0))
-        torch.testing.assert_close(hidden, torch.full((2, HIDDEN), 10.0))
+        torch.testing.assert_close(hidden, torch.full((4, HIDDEN), 10.0))
 
     def test_the_last_layer_completes_its_own_sum(self):
         parallel = parallel_of(

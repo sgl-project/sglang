@@ -837,6 +837,33 @@ class TestValuesAcrossAPipelineCut(CustomTestCase):
         self.assert_sums_completed_once(run)
 
 
+class TestInputScatteredAttentionInput(CustomTestCase):
+    """On an input-scattered batch an attention without a QKV hook, which
+    projects the rows it is given, gets every row of its input."""
+
+    def test_an_attention_without_a_qkv_hook_gets_every_row(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+        )
+        with fixture.planning(parallel):
+            with layer_stack():
+                attention, _ = layer()
+        entry = attention.plan.paths[BatchVariant.INPUT_SCATTERED].entry
+        rows = torch.ones(2, 4)
+        with (
+            patch.object(
+                boundary_prepare,
+                "get_attn_tp_context",
+                return_value=SimpleNamespace(is_dsa=False),
+            ),
+            patch.object(
+                boundary_prepare, "tp_gather", lambda h, fb: torch.cat([h, h])
+            ),
+        ):
+            hidden = entry.attn_input_adapter(rows, SimpleNamespace(), None)
+        self.assertEqual(hidden.shape[0], 4)
+
+
 class TestUnpaddedBatches(CustomTestCase):
     """Without attention DP, --disable-attn-tp-gather lets a batch reach the
     stages with rows that do not divide over attention TP. Such a batch keeps
