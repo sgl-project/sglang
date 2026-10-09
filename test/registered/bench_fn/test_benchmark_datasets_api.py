@@ -217,6 +217,7 @@ class TestBenchmarkCacheFlush(CustomTestCase):
                     request_received.set()
                     status = 200 if server_idle.wait(timeout) else 400
                 self.send_response(status)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
             def log_message(self, format, *args):
