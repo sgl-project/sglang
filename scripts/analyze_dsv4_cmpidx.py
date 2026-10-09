@@ -352,71 +352,155 @@ def _c4st_slots(recs, block, field="locx"):
 
 
 def verdict_c4st(rows):
-    """Deterministic device A/B verdict for the [C4ST] post-op state.
+    """Deterministic device A/B verdict for the [C4ST] pre/post compress state.
 
-    MISS = largest prefill (its C4ST ``start`` is 0); HIT = suffix prefill
-    (largest ``start``, e.g. 16384).  Block 127 post-op: differs => A (the
-    reused, prefix-written boundary state is stale); equal => B (the divergence
-    is inside the closed compressor op).  Suffix blocks 128..136 must be equal.
+    Rows are split by ``tag`` (pre = before the op, post = after); only
+    ``idx="1"`` (c4-indexer state) rows are considered, and rows without a tag
+    are skipped as unknown.  For each tag the cache-MISS request is the record
+    with the SMALLEST ``start`` (the full prefill, start=0) and the cache-HIT
+    request the LARGEST ``start`` (the suffix prefill, e.g. 16384).  For every
+    block seen on either side we compare BOTH the content md5 AND the
+    compress-state slot ids (the ``locx`` addresses): identical content at a
+    different address means the state was SHIFTED.  Block 127 is reported like
+    any other block -- it is NOT required to be present or divergent.
     """
-    post = [r for r in rows if r.get("idx") == "1" and r.get("tag") == "post"]
-    parsed = []
-    for r in post:
-        st = _c4st_start(r)
-        if st is None:
+
+    def _blk_map(value):
+        """Parse ``<block>:<hash>`` entries (quoted or bare) into {block: hash}."""
+        out = {}
+        if not value:
+            return out
+        for m in re.finditer(r"(\d+)\s*:\s*([^,\[\]\s'\"]+)", value):
+            try:
+                out.setdefault(int(m.group(1)), m.group(2))
+            except ValueError:
+                continue
+        return out
+
+    def _slot_map(value, block):
+        """Parse ``<block>:n<count>:[a, b, ...]`` slot ids for block, or None."""
+        if not value:
+            return None
+        found = False
+        slots = set()
+        for m in re.finditer(r"(\d+)\s*:\s*n\d*\s*:\s*\[([^\]]*)\]", value):
+            if int(m.group(1)) != block:
+                continue
+            found = True
+            for tok in m.group(2).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    slots.add(int(tok))
+                except ValueError:
+                    continue
+        return sorted(slots) if found else None
+
+    def _side_slots(recs, block):
+        found = False
+        slots = set()
+        for r in recs:
+            got = _slot_map(r.get("locx"), block)
+            if got is not None:
+                found = True
+                slots.update(got)
+        return sorted(slots) if found else None
+
+    def _content(mmiss, mhit):
+        if mmiss is None or mhit is None:
+            return "N/A"
+        return "DIFF" if mmiss != mhit else "SAME"
+
+    def _slots_cmp(smiss, shit):
+        if smiss is None or shit is None:
+            return "N/A"
+        return "SHIFTED" if smiss != shit else "SAME"
+
+    def _fmt(slots):
+        return str(slots) if slots is not None else "NONE"
+
+    # 1. split by tag, keep only idx="1" (rows without a tag are skipped).
+    by_tag = {"pre": [], "post": []}
+    for r in rows:
+        if r.get("idx") != "1":
             continue
-        parsed.append((_int(r, "layer"), st, _parse_blkx(r), r))
-    if not parsed:
-        print("[C4ST-VERDICT] no C4ST post data")
+        t = r.get("tag")
+        if t in by_tag:
+            by_tag[t].append(r)
+
+    # 2. per tag: MISS = smallest start, HIT = largest start.
+    sides = {}
+    for name in ("pre", "post"):
+        parsed = []
+        for r in by_tag[name]:
+            st = _c4st_start(r)
+            if st is not None:
+                parsed.append((st, r))
+        if not parsed:
+            print(f"[C4ST-VERDICT] no C4ST {name} pairing")
+            continue
+        starts = [st for st, _ in parsed]
+        miss_st, hit_st = min(starts), max(starts)
+        miss_recs = [r for st, r in parsed if st == miss_st]
+        hit_recs = [r for st, r in parsed if st == hit_st]
+        sides[name] = {
+            "miss_recs": miss_recs,
+            "hit_recs": hit_recs,
+            "miss_blks": [_blk_map(r.get("blkx")) for r in miss_recs],
+            "hit_blks": [_blk_map(r.get("blkx")) for r in hit_recs],
+        }
+
+    if not sides:
         return
 
-    # the runbook dumps a single layer (DSV4_DUMP_C4ST=2); keep the densest one
-    counts = {}
-    for ly, _, _, _ in parsed:
-        counts[ly] = counts.get(ly, 0) + 1
-    layer = max(counts, key=lambda k: counts[k])
-    parsed = [p for p in parsed if p[0] == layer]
+    # 3. per (tag, block) compact verdict; block set = union of every blkx seen.
+    present = set()
+    for s in sides.values():
+        for bm in s["miss_blks"] + s["hit_blks"]:
+            present.update(bm)
+    blocks = sorted(present)
 
-    starts = sorted({st for _, st, _, _ in parsed})
-    if len(starts) < 2:
-        print("[C4ST-VERDICT] no C4ST post data")
-        return
-    miss_st, hit_st = starts[0], starts[-1]
-    miss_blks = [b for _, st, b, _ in parsed if st == miss_st]
-    hit_blks = [b for _, st, b, _ in parsed if st == hit_st]
-    miss_recs = [r for _, st, _, r in parsed if st == miss_st]
-    hit_recs = [r for _, st, _, r in parsed if st == hit_st]
+    out = []  # (tag, block, miss_md5, hit_md5, content, slots, miss_slots, hit_slots)
+    for name in ("pre", "post"):
+        s = sides.get(name)
+        if s is None:
+            continue
+        for b in blocks:
+            mmiss = _c4st_md5(s["miss_blks"], b)
+            mhit = _c4st_md5(s["hit_blks"], b)
+            smiss = _side_slots(s["miss_recs"], b)
+            shit = _side_slots(s["hit_recs"], b)
+            out.append((name, b, mmiss, mhit, _content(mmiss, mhit),
+                        _slots_cmp(smiss, shit), smiss, shit))
 
-    miss127 = _c4st_md5(miss_blks, 127)
-    hit127 = _c4st_md5(hit_blks, 127)
-    if miss127 is None or hit127 is None:
-        print("[C4ST-VERDICT] no C4ST post data")
-        return
-    verdict = "A" if miss127 != hit127 else "B"
-    print(f"[C4ST-VERDICT] block127 post miss={miss127} hit={hit127} -> {verdict}")
-    print(f"[C4ST-VERDICT] suffix128_136 post "
-          f"miss={_c4st_suffix(miss_blks)} hit={_c4st_suffix(hit_blks)} "
-          f"(must be equal)")
+    # keep it compact: with many blocks only print the interesting ones.
+    show_all = len(blocks) <= 20
+    for (name, b, mmiss, mhit, content, slots, smiss, shit) in out:
+        if not show_all and content != "DIFF" and slots != "SHIFTED":
+            continue
+        print(f"[C4ST-VERDICT] {name} block={b} "
+              f"miss={mmiss if mmiss else 'NONE'} "
+              f"hit={mhit if mhit else 'NONE'} "
+              f"content={content} slots={slots} "
+              f"miss_slots={_fmt(smiss)} hit_slots={_fmt(shit)}")
 
-    # S197b: compare the raw compress-state SLOT ids (addresses) for block 127.
-    # Content (md5) can be equal while the state lives at a different address on
-    # the reuse (hit) side -> distinguishes stale CONTENT from shifted ADDRESS.
-    miss_slots = _c4st_slots(miss_recs, 127)
-    hit_slots = _c4st_slots(hit_recs, 127)
-    slots_differ = miss_slots != hit_slots
-    content_differs = miss127 != hit127
-    print(f"[C4ST-VERDICT] block127 slots "
-          f"miss={miss_slots if miss_slots is not None else 'NONE'} "
-          f"hit={hit_slots if hit_slots is not None else 'NONE'} "
-          f"addr={'SHIFTED' if slots_differ else 'SAME'}")
-    if content_differs:
-        branch = "A"  # stale content: reused boundary state differs
-    elif slots_differ:
-        branch = "B"  # content equal but address shifted
-    else:
-        branch = "NONE"  # no divergence reproduced
-    print(f"[C4ST-VERDICT] DECISION branch={branch} "
-          f"content_differs={content_differs} slots_differ={slots_differ}")
+    # 4. one decision line for the post-op (suffix) state.
+    post_diff = [b for (n, b, _, _, c, _, _, _) in out
+                 if n == "post" and c == "DIFF"]
+    post_shift = [b for (n, b, _, _, _, sl, _, _) in out
+                  if n == "post" and sl == "SHIFTED"]
+    boundary127 = "N/A"
+    for (n, b, _, _, c, _, _, _) in out:
+        if n == "post" and b == 127:
+            boundary127 = c
+    print("[C4ST-VERDICT] DECISION "
+          f"post_content_diff_blocks={','.join(str(x) for x in post_diff)} "
+          f"post_slot_shift_blocks={','.join(str(x) for x in post_shift)} "
+          f"boundary127={boundary127}")
+    if boundary127 == "SAME" and post_diff:
+        print("=> boundary history OK; divergence is in the SUFFIX state "
+              "produced by the op")
 
 
 def main(path):
