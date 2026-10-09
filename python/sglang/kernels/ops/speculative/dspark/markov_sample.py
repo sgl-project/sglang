@@ -5,24 +5,21 @@ The vocab may be TP-sharded: each rank reduces its shard to one (value,
 global-index-bits) pair per block, and only those pairs are all-gathered.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+
 _BLOCK = 4096
-_NO_INDEX = 2147483647
-# XORed into the seed so this stream never reuses another consumer's Philox key.
-_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
+_NO_INDEX = tl.constexpr(2147483647)
+# 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
+_UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _PHILOX_ROUNDS = 10
 _ROUND_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
-
-
-def draft_noise_key(seed: int) -> int:
-    """The Philox key of the draft noise for a server's random seed."""
-    return (int(seed) ^ _NOISE_DOMAIN) & 0x7FFFFFFFFFFFFFFF
 
 
 @triton.jit
@@ -68,7 +65,7 @@ def _markov_sample_partial_kernel(
     key = value
     temperature = tl.load(T + row)
     if temperature != 0.0:
-        # One Philox call yields four words; word k goes to token 4 * g + k.
+        # One Philox call yields four words; word k goes to token 4 * q + k.
         quad = (part * BLOCK + VOCAB_START) // 4 + tl.arange(0, BLOCK // 4)
         lane = tl.zeros([BLOCK // 4], tl.int64)
         w0, w1, w2, w3 = tl.philox(
@@ -80,17 +77,17 @@ def _markov_sample_partial_kernel(
             PHILOX_ROUNDS,
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-        # Uniform in (0, 1), dense near 0 so the winning tail of the noise keeps
-        # its resolution; exp_noise ~ Exp(1), and value/T - log(exp_noise) is
-        # value/T plus Gumbel noise.
-        uniform = (bits.to(tl.float32) + 0.5) * 2.3283064365386963e-10
+        # Small words convert to FP32 exactly, so the small exp_noise that wins
+        # keeps its resolution; value/T - log(exp_noise) is value/T plus Gumbel
+        # noise.
+        uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
-        key = libdevice.div_rn(value, temperature) - libdevice.log(exp_noise)
+        key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
     maximum = tl.max(tl.where(valid & ~nan, key, -float("inf")), 0)
     wins = tl.where(has_nan, nan, valid & (key == maximum))
-    idx = tl.min(tl.where(wins, i + VOCAB_START, 2147483647), 0)
+    idx = tl.min(tl.where(wins, i + VOCAB_START, _NO_INDEX), 0)
     maximum = tl.where(has_nan, float("nan"), maximum)
     tl.store(P + (row * PARTS + part) * 2, maximum)
     tl.store(P + (row * PARTS + part) * 2 + 1, idx.to(tl.float32, bitcast=True))
@@ -100,7 +97,7 @@ def _markov_sample_partial_kernel(
 def _markov_sample_finish_kernel(
     P,
     OUT,
-    BS: tl.constexpr,
+    BS,
     PARTS: tl.constexpr,
     WORLD: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -114,13 +111,13 @@ def _markov_sample_finish_kernel(
     idx = tl.load(P + offset + 1, valid, 0).to(tl.int32, bitcast=True)
     # The NVLink push transport changes +0 to -0 as its Lamport sentinel.
     # Indices are nonnegative int32 bits, so strip that sign bit to recover ID 0.
-    idx &= 2147483647
-    valid &= idx != 2147483647
+    idx &= _NO_INDEX
+    valid &= idx != _NO_INDEX
     nan = valid & (value != value)
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
     maximum = tl.max(tl.where(valid & ~nan, value, -float("inf")), 0)
     wins = tl.where(has_nan, nan, valid & (value == maximum))
-    result = tl.min(tl.where(wins, idx, 2147483647), 0)
+    result = tl.min(tl.where(wins, idx, _NO_INDEX), 0)
     tl.store(OUT + row, result.to(tl.int64))
 
 
@@ -146,28 +143,18 @@ def _philox(key: int, c0, c1, c2, c3) -> tuple[torch.Tensor, ...]:
     return c0, c1, c2, c3
 
 
-def _reduce_partials(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    # Lowest index among the NaNs if any, else among the maxima; _NO_INDEX
-    # marks an empty candidate.
-    valid = indices != _NO_INDEX
-    nan = valid & values.isnan()
-    has_nan = nan.any(dim=-1, keepdim=True)
-    finite = torch.where(valid & ~nan, values, -torch.inf)
-    maximum = finite.amax(dim=-1, keepdim=True)
-    wins = torch.where(has_nan, nan, valid & (finite == maximum))
-    return torch.where(wins, indices, _NO_INDEX).amin(dim=-1)
-
-
 class MarkovSampleStep:
     """``base_logits`` is the rank's padded vocab shard, ``bias`` its first
     ``width`` columns (the rest is padding and never wins). The step logits are
     their sum rounded to ``step_dtype``, the dtype the head's own add produces.
     A temperature of 0 takes the argmax. ``logits_out``, when given, receives
-    the step logits of the whole padded shard. Returns global token ids."""
+    the step logits of the whole padded shard. ``gather`` stacks every rank's
+    ``[rows, k]`` candidates as ``[world * rows, k]``; None for an unsharded
+    vocab. Returns global token ids."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
-        if kwargs["base_logits"].is_cuda:
+        if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
 
@@ -180,11 +167,11 @@ class MarkovSampleStep:
         assert bias.shape[1] <= base_logits.shape[1]
         assert bias.stride(1) == base_logits.stride(1) == 1
         assert temperatures.shape == (base_logits.shape[0],)
-        assert temperatures.dtype == torch.float32
+        assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
         assert offset.dtype == torch.int64 and offset.numel() == 1
         assert step_dtype in _ROUND_CODE, step_dtype
-        # Philox words are dealt to tokens in groups of four from a global id.
-        assert vocab_start % 4 == 0
+        # Philox words go to tokens in quads of global ids.
+        assert vocab_start % 4 == 0, vocab_start
         if logits_out is not None:
             assert logits_out.shape == base_logits.shape
             assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
@@ -201,10 +188,12 @@ class MarkovSampleStep:
         step: int,
         step_dtype: torch.dtype,
         vocab_start: int = 0,
-        group=None,
-        gather=None,
+        gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
+        # Each row branches on its own temperature here; the hint is for torch.
+        del has_sampled_rows
         cls._check(
             base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
         )
@@ -237,15 +226,11 @@ class MarkovSampleStep:
             _PHILOX_ROUNDS,
             num_warps=4,
         )
-        world = 1 if group is None else group.world_size
         # The padded shard width fixes the transport shape on all ranks;
         # WIDTH masks real entries, including a completely empty final shard.
-        if gather is not None:
-            gathered = gather(partial.view(rows, parts * 2))
-        elif world > 1:
-            gathered = group.all_gather(partial, dim=0)
-        else:
-            gathered = partial
+        partial = partial.view(rows, parts * 2)
+        gathered = partial if gather is None else gather(partial)
+        world = gathered.shape[0] // rows
         result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
         _markov_sample_finish_kernel[(rows,)](
             gathered,
@@ -270,11 +255,12 @@ class MarkovSampleStep:
         step: int,
         step_dtype: torch.dtype,
         vocab_start: int = 0,
-        group=None,
-        gather=None,
+        gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
-        del gather
+        """``has_sampled_rows=False`` skips the noise; None draws it for every
+        row without reading the temperatures on the host, so it can be captured."""
         cls._check(
             base_logits, bias, temperatures, offset, step_dtype, vocab_start, logits_out
         )
@@ -287,39 +273,52 @@ class MarkovSampleStep:
         if logits_out is not None:
             logits_out.copy_(value)
 
-        cols = torch.arange(padded, device=device, dtype=torch.int64)
         keys = value
-        sampled = temperatures != 0
-        if bool(sampled.any()):
-            tokens = (cols + vocab_start)[None, :]
+        if has_sampled_rows is not False:
+            quads = vocab_start // 4 + torch.arange(
+                triton.cdiv(padded, 4), device=device, dtype=torch.int64
+            )
             words = _philox(
                 key,
-                tokens // 4,
+                quads[None, :],
                 torch.arange(rows, device=device, dtype=torch.int64)[:, None],
                 torch.full((1, 1), step, device=device, dtype=torch.int64),
                 offset.reshape(1, 1) & 0xFFFFFFFF,
             )
-            bits = torch.stack(torch.broadcast_tensors(*words), dim=-1)
-            bits = bits.gather(-1, (tokens % 4).expand(rows, -1)[..., None])[..., 0]
-            uniform = (bits.float() + 0.5) * 2.3283064365386963e-10
+            words = torch.broadcast_tensors(*words)
+            bits = torch.stack(words, dim=-1).reshape(rows, -1)[:, :padded]
+            uniform = (bits.float() + 0.5) * _UNIFORM_SCALE.value
             exp_noise = -torch.log1p(-uniform)
+            sampled = temperatures != 0
             safe_temperatures = torch.where(sampled, temperatures, 1.0)[:, None]
             noised = value / safe_temperatures - torch.log(exp_noise)
             keys = torch.where(sampled[:, None], noised, value)
+        cols = torch.arange(padded, device=device)
         keys = torch.where(cols[None, :] < width, keys, -torch.inf)
 
         if width == 0:
             local_values = torch.full((rows,), -torch.inf, device=device)
-            local_indices = torch.full((rows,), _NO_INDEX, device=device)
+            local_indices = torch.full(
+                (rows,), _NO_INDEX.value, dtype=torch.int32, device=device
+            )
         else:
             local = keys.argmax(dim=1)
             local_values = keys.gather(1, local[:, None]).squeeze(1)
-            local_indices = local + vocab_start
-        pairs = torch.stack([local_values.double(), local_indices.double()], dim=1)
-        if group is not None and group.world_size > 1:
-            pairs = group.all_gather(pairs[None], dim=0)
-        else:
-            pairs = pairs[None]
-        values = pairs[..., 0].transpose(0, 1)
-        indices = pairs[..., 1].transpose(0, 1).long()
-        return _reduce_partials(values, indices)
+            local_indices = (local + vocab_start).to(torch.int32)
+        # The same (value, index bits) transport as the triton path, one part.
+        partial = torch.stack(
+            [local_values.float(), local_indices.view(torch.float32)], dim=1
+        )
+        gathered = partial if gather is None else gather(partial)
+        gathered = gathered.view(-1, rows, 2)
+        values = gathered[..., 0].transpose(0, 1)
+        indices = gathered[..., 1].contiguous().view(torch.int32) & _NO_INDEX.value
+        indices = indices.transpose(0, 1).long()
+        # Lowest index among the NaNs if any, else among the maxima.
+        valid = indices != _NO_INDEX.value
+        nan = valid & values.isnan()
+        has_nan = nan.any(dim=-1, keepdim=True)
+        finite = torch.where(valid & ~nan, values, -torch.inf)
+        maximum = finite.amax(dim=-1, keepdim=True)
+        wins = torch.where(has_nan, nan, valid & (finite == maximum))
+        return torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
