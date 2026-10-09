@@ -1,6 +1,6 @@
 // Instantiated from cookbook-add-model/templates/config.jsx.tmpl.
 // BF16, TP=1 recipes validated on one H200, B200, or B300.
-// See clef-benchmarks.jsx for accuracy results and serving revisions.
+// See clef-benchmarks.jsx for accuracy results.
 export const config = {
   modelName: "Clef",
   showPlaygroundLink: false,
