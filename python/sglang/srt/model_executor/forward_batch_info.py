@@ -615,6 +615,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Setwise pooling readout positions (CPU tensors, one per request)
     token_indices_to_pool: Optional[List[torch.Tensor]] = None
 
+    # Joint schema head decision layouts (one per request, None if absent)
+    decision_layouts: Optional[List[Optional[List[int]]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -1264,6 +1267,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
                     for r in batch.reqs
                 ]
+
+            if any(r.decision_layout is not None for r in batch.reqs):
+                self.decision_layouts = [r.decision_layout for r in batch.reqs]
 
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None

@@ -1339,6 +1339,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1487,6 +1488,12 @@
                     "pages": [
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+                    ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
                     ]
                   }
                 ]
