@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "2f279a867d1d99dd6e8908af6cc24bc206e2da2c"
+SGL_TEST_FILES_CI_DATA_REVISION = "60e8e8908055d06855bc9239a6ecda18d2ce0d1d"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
