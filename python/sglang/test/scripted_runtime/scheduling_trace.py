@@ -6,7 +6,9 @@ ran under, then a ``schedule`` record each time the scheduler picks the next
 batch and a ``result`` record each time a batch result is processed.
 A schedule record also carries what the scheduler's readers (the idle checks
 behind health check, pause and flush, and the load report) saw at the top of
-that scheduler iteration, where they run.
+that scheduler iteration, where they run. Iterations while the engine is
+paused plan nothing, so each writes those reader values as a ``paused``
+record instead; the script's yields fix how many there are.
 Records hold only what two runs of one commit reproduce: rids are relabeled
 r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
 
@@ -95,7 +97,8 @@ class SchedulingTraceWriter:
 
         Called at the top of each scheduler iteration. Not asked from
         record_schedule: during planning, scheduler.running_batch is not yet
-        the plan's running batch, a state no reader sees.
+        the plan's running batch, a state no reader sees. A paused iteration
+        skips planning, so its values are written as a ``paused`` record.
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {
@@ -106,6 +109,8 @@ class SchedulingTraceWriter:
                 "waiting": load.num_waiting_reqs,
             },
         }
+        if scheduler._engine_paused:
+            self._write({"kind": "paused", "step": self._step, **self._readers})
 
     def record_schedule(self, scheduler: Scheduler, plan: NextBatchPlan) -> None:
         self._step += 1
