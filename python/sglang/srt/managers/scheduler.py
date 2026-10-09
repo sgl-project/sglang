@@ -4258,7 +4258,8 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
-            self.tp_worker.on_reqs_retracted(retracted_reqs)
+            # Aborted requests also had their KV freed without a tree insert.
+            self.tp_worker.on_reqs_retracted(retracted_reqs + reqs_to_abort)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
