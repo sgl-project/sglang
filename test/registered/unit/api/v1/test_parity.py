@@ -70,6 +70,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "num_items_assigned",
         "positional_embed_overrides",
         "priority",
+        "readout_anchor",
         "received_time",
         "require_reasoning",
         "return_bytes",
