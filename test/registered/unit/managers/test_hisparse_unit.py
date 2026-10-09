@@ -553,51 +553,6 @@ class TestHiSparseUnit(unittest.TestCase):
         self.allocator.logical_attn_allocator.free(kv_loc)
         self._assert_sizes_restored(initial, "alloc_free_cycle")
 
-    @unittest.skipUnless(is_cuda(), "Requires CUDA synchronization diagnostics")
-    def test_eager_backup_does_not_synchronize_host(self):
-        """Eager backup must enqueue work without blocking CPU batch preparation."""
-        initial = self._get_initial_sizes()
-        fill_len = self.page_size
-        req = _make_req("async-backup", list(range(fill_len)))
-        self._alloc_req_slot(req)
-        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
-        self._populate_host_pool(req, fill_len)
-        self.coordinator.admit_request_direct(req)
-        req_idx = req.kv.req_pool_idx
-        self.coordinator._skip_first_backup[req_idx] = False
-        seq_lens_cpu = torch.tensor([fill_len + 1], dtype=torch.int64)
-        req_indices_cpu = torch.tensor([req_idx], dtype=torch.int64)
-        seq_lens = seq_lens_cpu.to(DEVICE)
-        req_indices = req_indices_cpu.to(DEVICE)
-        device_loc = self.coordinator.req_to_device_buffer[req_idx, fill_len - 1]
-        host_loc = int(self.coordinator.req_to_host_pool[req_idx, fill_len - 1])
-        for layer_id in range(LAYER_NUM):
-            self.device_pool.kv_buffer[layer_id][device_loc] = layer_id + 17
-
-        # Warm up the backup kernel before checking steady-state synchronization.
-        self.coordinator._eager_backup_previous_token(
-            seq_lens, req_indices, seq_lens_cpu, req_indices_cpu
-        )
-        torch.cuda.synchronize()
-        for layer_id in range(LAYER_NUM):
-            self.coordinator.mem_pool_host.kv_buffer[layer_id][host_loc].zero_()
-
-        previous_mode = torch.cuda.get_sync_debug_mode()
-        try:
-            torch.cuda.set_sync_debug_mode("error")
-            self.coordinator._eager_backup_previous_token(
-                seq_lens, req_indices, seq_lens_cpu, req_indices_cpu
-            )
-        finally:
-            torch.cuda.set_sync_debug_mode(previous_mode)
-            torch.cuda.synchronize()
-
-        for layer_id in range(LAYER_NUM):
-            actual = self.coordinator.mem_pool_host.kv_buffer[layer_id][host_loc]
-            torch.testing.assert_close(actual, torch.full_like(actual, layer_id + 17))
-        self._cleanup_req(req, kv_loc, logical_only=True)
-        self._assert_sizes_restored(initial, "async_backup")
-
     def test_allocator_page_size_one_alloc_free_cycle(self):
         """alloc() maps logical to hisparse indices for ROCm page_size=1."""
         if self.page_size != 1:

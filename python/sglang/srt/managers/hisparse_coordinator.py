@@ -755,8 +755,8 @@ class HiSparseCoordinator:
         if not backup_indices:
             return
 
-        # A blocking H2D copy waits for pending schedule-stream dependencies,
-        # preventing CPU batch preparation from overlapping the previous forward.
+        # Use a pinned, non-blocking H2D copy to avoid synchronizing the host
+        # with pending work on the schedule stream.
         backup_indices_gpu = torch.tensor(
             backup_indices, dtype=torch.int64, device="cpu", pin_memory=True
         ).to(self.device, non_blocking=True)
