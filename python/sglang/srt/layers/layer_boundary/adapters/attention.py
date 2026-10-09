@@ -26,6 +26,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary.layout import (
+    _prefill_cp_shards_tokens,
     batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
@@ -88,6 +89,8 @@ class AttnTpContext:
             and (is_mhc or not is_dsa)
             and get_parallel().tp_size > 1
             and not is_dp_attention_enabled()
+            # The stages bind no input-scattered path under a prefill CP.
+            and not _prefill_cp_shards_tokens()
             and get_moe_a2a_backend().is_none()
             and not is_dense_ffn_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
