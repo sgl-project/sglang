@@ -1103,12 +1103,21 @@ class C4IndexerAscendBackendMixin:
                     return hashlib.md5(raw).hexdigest()[:16]
 
                 def _blk_in(tt):
+                    # NOTE: do the masking on CPU. Boolean-mask indexing an NPU
+                    # tensor (tt[blk == b]) hits aclnnIndex and fails with
+                    # 161002; moving tt to CPU first avoids the device op.
                     parts = []
                     if tt is not None and tt.numel():
+                        t_cpu = tt.detach().to("cpu")
                         pos = forward_batch.positions.reshape(-1).to(torch.int64).cpu()
-                        blk = pos // 128
-                        for b in torch.unique(blk).tolist():
-                            parts.append(f"{int(b)}:{_md5_in(tt[blk == b])}")
+                        if pos.numel() == t_cpu.shape[0]:
+                            blk = pos // 128
+                            for b in torch.unique(blk).tolist():
+                                parts.append(f"{int(b)}:{_md5_in(t_cpu[blk == b])}")
+                        else:
+                            parts.append(
+                                f"lenMismatch(pos={pos.numel()},t={t_cpu.shape[0]})"
+                            )
                     return parts[-8:]
 
                 def _seq(tt):
