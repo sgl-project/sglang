@@ -1,28 +1,10 @@
 """FP32 sigmoid gate, preserving the shared-expert fused-add reduction."""
 
 import torch
-import triton
-import triton.language as tl
 
-
-@triton.jit
-def _shared_expert_gate_kernel(
-    hidden_ptr,
-    weight_ptr,
-    gate_ptr,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    w = tl.load(weight_ptr + offsets, offsets < HIDDEN_SIZE, 0).to(tl.float32)
-    tl.extra.cuda.gdc_wait()
-    x = tl.load(hidden_ptr + row * HIDDEN_SIZE + offsets, offsets < HIDDEN_SIZE, 0).to(
-        tl.float32
-    )
-    gate = tl.sigmoid(tl.sum(x * w, 0))
-    tl.extra.cuda.gdc_launch_dependents()
-    tl.store(gate_ptr + row, gate)
+from sglang.kernels.ops.elementwise.elementwise import (
+    _fused_gate_sigmoid_mul_add_kernel,
+)
 
 
 def shared_expert_gate(
@@ -37,7 +19,17 @@ def shared_expert_gate(
         gate = torch.empty(hidden.shape[0], device=hidden.device, dtype=torch.float32)
     assert gate.shape == (hidden.shape[0],) and gate.dtype == torch.float32
     assert gate.device == hidden.device and gate.is_contiguous()
-    _shared_expert_gate_kernel[(hidden.shape[0],)](
-        hidden, weight, gate, 2560, 4096, num_warps=16, launch_pdl=True
+    _fused_gate_sigmoid_mul_add_kernel[(hidden.shape[0],)](
+        hidden,
+        weight,
+        None,
+        gate,
+        hidden_dim=2560,
+        BLOCK_SIZE=4096,
+        DO_ADD=False,
+        USE_PDL=True,
+        GATE_ONLY=True,
+        num_warps=16,
+        launch_pdl=True,
     )
     return gate

@@ -237,13 +237,13 @@ class GatedResidual(HyperConnectionBase):
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
-            return mixed_input, (hyper_input, hyper_input)
+            return mixed_input, (hyper_input, hyper_input, None)
 
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
@@ -297,7 +297,7 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        residuals = (hyper_input, hyper_input_normed)
+        partials = None
         stream = self._gate_stream
         if (
             stream is not None
@@ -313,22 +313,22 @@ class GatedResidual(HyperConnectionBase):
                     hyper_input_normed, self.block_inject_weight.weight
                 )
             hyper_input_normed.record_stream(stream)
-            residuals = (*residuals, partials)
-        return mixed_input, residuals
+        return mixed_input, (hyper_input, hyper_input_normed, partials)
 
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
-        residuals,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         next_norm: Optional[GroupedGemmaRMSNorm],
-    ):
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Return the residual and its next HC normalization explicitly.
 
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
+        hyper_input, _, partials = residuals
         if (
-            len(residuals) == 3
+            partials is not None
             and next_norm is not None
             and next_norm.group_size == self.hidden_size
             and next_norm.weight.dtype == torch.bfloat16
@@ -338,7 +338,6 @@ class GatedResidual(HyperConnectionBase):
                 hc_combine_apply_norm,
             )
 
-            hyper_input, _, partials = residuals
             current = torch.cuda.current_stream()
             current.wait_stream(self._gate_stream)
             partials.record_stream(current)
@@ -351,18 +350,21 @@ class GatedResidual(HyperConnectionBase):
             )
         return self.combine(block_output, residuals), None
 
-    def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        if len(residuals) == 3:
+    def combine(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        hyper_input, hyper_input_normed, partials = residuals
+        if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,
             )
 
-            hyper_input, _, partials = residuals
             current = torch.cuda.current_stream()
             current.wait_stream(self._gate_stream)
             partials.record_stream(current)
             return hc_combine_apply(block_output, hyper_input, partials)
-        hyper_input, hyper_input_normed = residuals
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:

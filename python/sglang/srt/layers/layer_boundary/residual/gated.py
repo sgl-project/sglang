@@ -29,11 +29,10 @@ class GatedResidualState:
     per-stream gates, and writes its output back scaled by an injection
     coefficient computed from that same normalized residual.
 
-    Unlike the hyper-connection streams in mhc.py and ihc.py, whose read
-    produces the coefficient its write-back consumes, the coefficient here is
-    computed at write time. What has to survive from a stage's read to its
-    write-back is therefore the normalized residual itself, which this state
-    holds along with optional gate partials computed during the read.
+    The read carries its normalized residual to write-back. Decode may also
+    prepare gate partials during the read; otherwise write-back computes the
+    coefficient from that normalized residual. Both follow the residual rows
+    through any slicing and are cleared after the FFN write-back.
     Parameters belong to the owning layer's modules.
 
     Args:
@@ -63,8 +62,7 @@ class GatedResidualState:
                 "normalizes the streams itself"
             )
         hidden_states, residuals = mix(residual)
-        residual, self.normed = residuals[:2]
-        self.gate_partials = residuals[2] if len(residuals) == 3 else None
+        residual, self.normed, self.gate_partials = residuals
         return hidden_states, residual
 
     def read_attn_input(self, residual, out_norm=None):
@@ -74,16 +72,15 @@ class GatedResidualState:
         residual = self.apply_attn_combine(hidden_states, residual)
         return self._read(self.ffn_mix, residual, out_norm)
 
-    def _combine_inputs(self, residual):
-        if self.gate_partials is None:
-            return residual, self.normed
-        return residual, self.normed, self.gate_partials
-
     def apply_attn_combine(self, hidden_states, residual):
-        return self.attn_combine(hidden_states, self._combine_inputs(residual))
+        return self.attn_combine(
+            hidden_states, (residual, self.normed, self.gate_partials)
+        )
 
     def apply_ffn_combine(self, hidden_states, residual):
-        return self.ffn_combine(hidden_states, self._combine_inputs(residual))
+        return self.ffn_combine(
+            hidden_states, (residual, self.normed, self.gate_partials)
+        )
 
     def clear_coefficients(self):
         self.normed = None

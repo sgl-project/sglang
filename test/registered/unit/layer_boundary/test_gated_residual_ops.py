@@ -34,17 +34,17 @@ def _normalize(residual, seed):
 
 
 def _mix(seed):
-    """Stands in for GatedResidual.mix: returns the mixed input and the pair
-    the write-back consumes, the streams and their normalization."""
+    """Stands in for GatedResidual.mix: returns the mixed input and the streams,
+    their normalization, and optional gate partials consumed at write-back."""
 
     def mix(hyper_input):
         if hyper_input.shape[0] == 0:
             empty = hyper_input.new_empty((0, HIDDEN))
             # An empty batch puts the un-normalized streams in the second slot.
-            return empty, (hyper_input, hyper_input)
+            return empty, (hyper_input, hyper_input, None)
         normed = _normalize(hyper_input, seed)
         mixed = normed.unflatten(-1, (HC_COUNT, HIDDEN)).mean(dim=-2)
-        return mixed, (hyper_input, normed)
+        return mixed, (hyper_input, normed, None)
 
     return mix
 
@@ -52,7 +52,7 @@ def _mix(seed):
 def _combine(block_output, residuals):
     """Stands in for GatedResidual.combine: the injection coefficient is
     computed at write time from the normalized residual the read produced."""
-    hyper_input, normed = residuals
+    hyper_input, normed, _ = residuals
     if block_output.shape[0] == 0:
         return hyper_input
     coefficient = 2 * torch.sigmoid(
@@ -105,7 +105,7 @@ class TestGatedResidualOps(CustomTestCase):
 
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (residual, normed)),
+            _combine(self.output, (residual, normed, None)),
         )
 
     def test_the_write_back_reads_the_carried_value_not_a_fresh_one(self):
@@ -120,7 +120,7 @@ class TestGatedResidualOps(CustomTestCase):
         state.normed = torch.full_like(state.normed, -3.0)
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (residual, state.normed)),
+            _combine(self.output, (residual, state.normed, None)),
         )
 
     def test_ffn_write_back_clears_the_carried_value(self):
@@ -140,14 +140,14 @@ class TestGatedResidualOps(CustomTestCase):
     def test_gate_partials_follow_their_read_and_are_cleared_after_write_back(self):
         def mix(seed):
             def read(residual):
-                hidden, pair = _mix(seed)(residual)
-                return hidden, (*pair, pair[1].mean(dim=-1, keepdim=True))
+                hidden, (residual, normed, _) = _mix(seed)(residual)
+                return hidden, (residual, normed, normed.mean(dim=-1, keepdim=True))
 
             return read
 
         def combine(hidden, residuals):
             residual, normed, partials = residuals
-            return _combine(hidden * partials, (residual, normed))
+            return _combine(hidden * partials, (residual, normed, None))
 
         state = GatedResidualState(_expand, mix(1), mix(2), combine, combine)
         ops = state.residual_ops()
@@ -171,7 +171,7 @@ class TestGatedResidualOps(CustomTestCase):
                 state = _state()
                 residual = _expand(self.hidden)
                 state.normed = _normalize(residual, 2)
-                expected = _combine(self.output * 4, (residual, state.normed))
+                expected = _combine(self.output * 4, (residual, state.normed, None))
                 batch = SimpleNamespace(
                     residual_stream=ResidualStream(residual),
                     forward_mode=ForwardMode.DECODE,
@@ -211,8 +211,8 @@ class TestGatedResidualOps(CustomTestCase):
         got_input, got_residual = ops.ffn_readout.update_and_read(
             ops.attn_update, self.output, residual, None
         )
-        want_residual = _combine(self.output, (residual, attn_normed))
-        want_input, (_, want_normed) = _mix(2)(want_residual)
+        want_residual = _combine(self.output, (residual, attn_normed, None))
+        want_input, (_, want_normed, _) = _mix(2)(want_residual)
         torch.testing.assert_close(got_residual, want_residual)
         torch.testing.assert_close(got_input, want_input)
         torch.testing.assert_close(state.normed, want_normed)
@@ -231,7 +231,7 @@ class TestGatedResidualOps(CustomTestCase):
         # The write-back lands on the contributed streams, once.
         torch.testing.assert_close(
             ops.attn_update.update(self.output, residual),
-            _combine(self.output, (entered + contribution, state.normed)),
+            _combine(self.output, (entered + contribution, state.normed, None)),
         )
 
     def test_an_empty_batch_keeps_the_streams_and_their_width(self):

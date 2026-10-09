@@ -1,6 +1,6 @@
 """Fused deferred-MoE finalize + 1shot push all-reduce [+ RMSNorm] (bf16).
 
-One entry point, :func:`moe_finalize_all_reduce`, over
+The base entry point, :func:`moe_finalize_all_reduce`, wraps
 ``csrc/distributed/all_reduce_fusion.cuh``::
 
     out[t] = allreduce( sum_k expert_weights[t, k] * gemm2_out[idx[t*top_k + k]]
@@ -14,8 +14,10 @@ materializes; ``idx == -1`` slots (EP: non-local expert) contribute nothing.
 Small-batch only: the whole ``[T, hidden]`` bf16 row view must fit one push
 slot (checked C++-side; :func:`fits_push_slot` lets callers pre-check).
 
-Needs :func:`register_comm` once per process (the CustomAllReduceV2
-``Communicator``); the ops key on ``world_size`` alone.
+The base entry point needs :func:`register_comm` once per process and keys on
+``world_size`` alone. :func:`moe_finalize_shared_gate_all_reduce` takes the
+caller's communicator directly and applies an FP32 shared gate after rounding
+the routed values to BF16, before the collective.
 """
 
 from __future__ import annotations
@@ -248,10 +250,10 @@ def _jit_shared_gate_module(
         cluster_size,
         is_arch_support_pdl(),
         weight_dtype,
-        False,
-        False,
-        False,
-        True,
+        False,  # kMhc
+        False,  # kQuant
+        False,  # kCollapse
+        True,  # kGatedShared
     )
     return load_jit(
         "moe_finalize_shared_gate_all_reduce",
