@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import random
+import time
 
 import numpy as np
 import requests
@@ -14,7 +15,14 @@ LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
 DEFAULT_PROMPT_TOKENS = 3000  # Maximum number of tokens to use
-CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
+# Outside the repo, where CI's checkout clean would wipe it before every job.
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "sglang",
+    "longbench",
+)
+# Fail the test instead of letting a slow stream run out the CI job.
+DOWNLOAD_TIMEOUT_S = 300
 
 # In-memory cache for the current session
 _cached_input_ids = {}
@@ -78,18 +86,26 @@ def get_input_ids(
     )
 
     input_ids = []
-    for i, example in enumerate(dataset):
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT_S
+    for example in dataset:
         if len(input_ids) >= num_samples:
             break
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"LongBench V2 download exceeded {DOWNLOAD_TIMEOUT_S}s after "
+                f"{len(input_ids)}/{num_samples} samples"
+            )
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
         # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
         truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
         input_ids.append(tokens[:truncate_len])
 
-    # Save to local cache
-    with open(cache_file, "w") as f:
+    # Save to local cache; concurrent jobs may share the directory.
+    tmp_file = f"{cache_file}.{os.getpid()}.tmp"
+    with open(tmp_file, "w") as f:
         json.dump(input_ids, f)
+    os.replace(tmp_file, cache_file)
     print(f"Saved {len(input_ids)} prompts to cache: {cache_file}")
 
     # Also cache in memory
@@ -285,9 +301,9 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        assert len(new_input_ids) > 0.5 * len(
-            input_ids
-        ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+        assert len(new_input_ids) > 0.5 * len(input_ids), (
+            f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
+        )
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
@@ -308,6 +324,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     max_samples=None,
     max_new_tokens=8192,
     trust_remote_code=False,
+    min_cache_hit_ratio=0.5,
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -363,9 +380,12 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         output_logprobs.append(_extract_output_logprobs(result))
 
     if not os.environ.get("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"):
-        assert len(new_input_ids) > 0.5 * len(
-            second_turn_input_ids
-        ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+        # Page-aligned SWA retention decides which prompts hit at all, so the default
+        # only screens out a vacuous run. A caller whose checkpoint interval makes
+        # every prompt hit raises this to pin that down.
+        assert len(new_input_ids) > min_cache_hit_ratio * len(second_turn_input_ids), (
+            f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
+        )
 
     print("Flush Cache and run prefill to get input logprobs ...")
     input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)

@@ -5,9 +5,11 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
@@ -15,7 +17,6 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -115,9 +116,9 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
         # update with group router
         self.router_n_groups = getattr(config, "router_n_groups", -1)
         if self.router_n_groups > 0:
-            assert (
-                config.num_experts_per_tok % self.router_n_groups == 0
-            ), f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
+            assert config.num_experts_per_tok % self.router_n_groups == 0, (
+                f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
+            )
             self.mlp.topk = TopK(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
@@ -131,9 +132,7 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
     def get_group_offsets(router_n_groups: int, group_size: int, device: str):
         group_offsets = (
             torch.arange(router_n_groups, device=device) * group_size
-        ).view(
-            1, -1, 1
-        )  # [1, n_groups, 1]
+        ).view(1, -1, 1)  # [1, n_groups, 1]
         return group_offsets
 
     def _custom_routing_function(
@@ -146,9 +145,9 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
         """Group router"""
         routing_weights = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         if self.router_n_groups > 0:
-            assert (
-                routing_weights.shape[-1] % self.router_n_groups == 0
-            ), f"{routing_weights.shape[-1]} cannot be divided by {self.router_n_groups}"
+            assert routing_weights.shape[-1] % self.router_n_groups == 0, (
+                f"{routing_weights.shape[-1]} cannot be divided by {self.router_n_groups}"
+            )
             per_group_top_k = topk // self.router_n_groups
             group_size = routing_weights.shape[-1] // self.router_n_groups
             group_offsets = self.get_group_offsets(
@@ -189,7 +188,6 @@ class InternS1ProTextModel(Qwen3MoeLLMModel):
 
 
 class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -214,8 +212,8 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
     def _load_fope_weights(self, name: str, loaded_weight: torch.Tensor, params_dict):
         """load fope weights"""
-        attn_tp_size = get_parallel().attn_tp_size
-        attn_tp_rank = get_parallel().attn_tp_rank
+        qkv_proj = unwrap_lora_layer(self.model.layers[0].self_attn.qkv_proj)
+        attn_tp_rank, attn_tp_size = get_group_rank_size(qkv_proj.tp_group)
 
         num_key_value_heads = loaded_weight.size(0)
         # replicate head if necessary

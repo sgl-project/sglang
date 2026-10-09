@@ -13,6 +13,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -70,9 +71,6 @@ class Conv1dLocalIsland(nn.Conv1d):
       placements can be customized).
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     def forward(self, input):
         if isinstance(input, DTensor):
             x_local = input.to_local()  # type: ignore[attr-defined]
@@ -87,9 +85,8 @@ class Conv1dLocalIsland(nn.Conv1d):
 
 
 class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = MOVAAudioConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAAudioConfig()._compile_conditions
-    _supported_attention_backends = MOVAAudioConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAAudioConfig().param_names_mapping
     reverse_param_names_mapping = MOVAAudioConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAAudioConfig().lora_param_names_mapping
@@ -166,21 +163,6 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = num_heads
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients = []
-        self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = None
-        self.previous_resiual = None
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = False
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
     def _init_freqs(self):

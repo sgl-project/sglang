@@ -35,6 +35,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -100,6 +101,7 @@ class RequestFuncOutput:
     success: bool = False
     latency: float = 0.0
     ttft: float = 0.0  # Time to first token
+    tpot: Optional[float] = None  # Time per output token
     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
     text_chunks: List[str] = field(default_factory=list)
     prompt_len: int = 0
@@ -253,15 +255,40 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
+def _record_server_prompt_len(data, output):
+    """Take the prompt length from the server, the only side that knows it.
+
+    ``RequestFuncOutput.prompt_len`` is seeded from the dataset row by
+    ``RequestFuncOutput.init_new``. That is correct for a single-turn row, where
+    one row is one request. A multi-turn row is instead replayed as one request
+    per round, and every round's output inherits the row's single value -- so
+    summing ``prompt_len`` across outputs counts one number once per round
+    rather than adding up each request's own prompt.
+
+    Two consumers divide by that sum: the ``--cache-report`` hit rate, and
+    ``input_lens`` in the JSON output.
+
+    The server reports the real figure as ``usage.prompt_tokens`` on the
+    OpenAI-compatible routes and ``meta_info.prompt_tokens`` on the native one.
+    It is the same quantity for a single-turn row, so preferring it needs no
+    per-dataset branch, and leaving the seeded value in place when the server
+    reports nothing keeps behaviour unchanged for any backend that does not.
+    """
+    reported = data.get("usage") or data.get("meta_info") or {}
+    prompt_tokens = reported.get("prompt_tokens")
+    if prompt_tokens:
+        output.prompt_len = prompt_tokens
+
+
 # set ignore_eos True by default
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     prompt = request_func_input.prompt
 
@@ -325,6 +352,7 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+                            _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -390,9 +418,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -482,6 +510,7 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        _record_server_prompt_len(response_json, output)
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
@@ -515,6 +544,7 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
+                                _record_server_prompt_len(data, output)
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -710,12 +740,18 @@ async def async_request_sglang_generate(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        # Cumulative chunks make parsing O(n^2) per request on this
+                        # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
+                        sse_data = (
+                            chunk_bytes[6:]
+                            if chunk_bytes.startswith(b"data: ")
+                            else chunk_bytes
+                        )
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
+                        if sse_data == b"[DONE]":
                             pass
                         else:
-                            data = json.loads(chunk)
+                            data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
@@ -726,6 +762,8 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            _record_server_prompt_len(data, output)
+
                             if getattr(args, "cache_report", False):
                                 _meta = data.get("meta_info") or {}
                                 output.cached_tokens = _meta.get("cached_tokens", 0)
@@ -964,13 +1002,27 @@ _BACKEND_API_PATHS = {
 
 _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
+_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT = 60.0
 
-def flush_server_cache(base_url: str, backend: str) -> None:
+
+def flush_server_cache(
+    base_url: str,
+    backend: str,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
-    cache_endpoint = (
-        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
-    )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    if backend.startswith("vllm"):
+        response = requests.post(
+            base_url + "/reset_prefix_cache", headers=get_auth_headers()
+        )
+    elif backend.startswith("sglang"):
+        response = requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            params={"timeout": flush_cache_timeout},
+        )
+    else:
+        response = requests.post(base_url + "/flush_cache", headers=get_auth_headers())
     response.raise_for_status()
 
 
@@ -1274,9 +1326,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert (
-        backend in MULTI_TURN_BACKENDS
-    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    assert backend in MULTI_TURN_BACKENDS, (
+        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    )
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1299,6 +1351,15 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
+            # Each round's prompt length comes from the server's usage block,
+            # which a streamed response only carries when asked for. Default the
+            # key rather than the object, so a user's stream_options still gets
+            # it, while an explicit include_usage=false is kept.
+            if not args.disable_stream:
+                body = inner_input.extra_request_body
+                options = body.get("stream_options") or {}
+                options.setdefault("include_usage", True)
+                body["stream_options"] = options
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
@@ -1319,7 +1380,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[DatasetRow],
+    input_requests: List[Union[DatasetRow, Dict[str, Any]]],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -1330,6 +1391,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -1342,14 +1404,20 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    is_mooncake = args.dataset_name == "mooncake"
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = input_requests[0].prompt
-    is_multi_turn = (
-        isinstance(first_prompt, list)
-        and bool(first_prompt)
-        and _normalize_round_messages(first_prompt[0]) is not None
-    )
+    if is_mooncake:
+        # Mooncake dataset rows are raw trace dictionaries. They are converted
+        # into DatasetRow objects by get_mooncake_request_over_time below.
+        is_multi_turn = False
+    else:
+        first_prompt = input_requests[0].prompt
+        is_multi_turn = (
+            isinstance(first_prompt, list)
+            and bool(first_prompt)
+            and _normalize_round_messages(first_prompt[0]) is not None
+        )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
@@ -1367,7 +1435,7 @@ async def benchmark(
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Handle the data structure difference for the warmup request
-    if args.dataset_name == "mooncake":
+    if is_mooncake:
         # For mooncake, input_requests is a list of dicts.
         # We need to build a temporary DatasetRow for the warmup phase.
         warmup_record = input_requests[0]
@@ -1412,9 +1480,16 @@ async def benchmark(
 
     # Run warmup requests
     warmup_tasks = []
+    # Keep warmup at the same concurrency as the measured run. Otherwise,
+    # --warmup-requests also becomes an unbounded warmup burst.
     for _ in range(warmup_requests):
         warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+            asyncio.create_task(
+                limited_request_func(
+                    request_func_input=test_input,
+                    pbar=None,
+                )
+            )
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
@@ -1439,9 +1514,9 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend)
+        flush_server_cache(base_url, backend, flush_cache_timeout)
 
-    time.sleep(1.0)
+    await asyncio.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
@@ -1471,7 +1546,7 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
-        backend == "sglang" and args.dataset_name == "mooncake"
+        backend == "sglang" and is_mooncake
     ):  # Assuming mooncake is mainly for sglang or similar backends
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
@@ -1495,7 +1570,9 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    benchmark_requests: List[DatasetRow] = []
     async for request in request_generator:
+        benchmark_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1503,9 +1580,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                assert lora_request_distribution == "skewed", (
+                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                )
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -1581,7 +1658,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -1969,9 +2046,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert (
-            args.backend == "sglang"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert args.backend == "sglang", (
+            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        )
 
     # Set url
     if args.port is None:
@@ -2048,18 +2125,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert (
-            not args.tokenize_prompt
-        ), "`--tokenize-prompt` not compatible with image dataset"
+        assert not args.tokenize_prompt, (
+            "`--tokenize-prompt` not compatible with image dataset"
+        )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        assert args.lora_name is not None and len(args.lora_name) > 1, (
+            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        )
 
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert args.lora_zipf_alpha > 1, (
+        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    )
 
     print(f"{args}\n")
 
@@ -2086,6 +2163,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_timeout"):
+        args.flush_cache_timeout = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -2116,6 +2195,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -2330,13 +2410,13 @@ def cli_main():
         "--image-format",
         type=str,
         default="jpeg",
-        help=("Format of images for image dataset. " "Supports jpeg and png."),
+        help=("Format of images for image dataset. Supports jpeg and png."),
     )
     parser.add_argument(
         "--image-content",
         type=str,
         default="random",
-        help=("Content for images for image dataset. " "Supports random and blank."),
+        help=("Content for images for image dataset. Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",
@@ -2563,6 +2643,12 @@ def cli_main():
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=_finite_positive_float,
+        default=_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+        help="Maximum seconds to wait for an SGLang server to become idle before flushing the cache",
     )
     parser.add_argument(
         "--warmup-requests",

@@ -9,9 +9,10 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3, LingBot World, SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image / Qwen-Image 2.1, LongCat-Image, Z-Image, Anima, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, FastH3, VDN-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
-  - Ease of use: OpenAI-compatible api, CLI, and python sdk support
+  - Ease of use: OpenAI-compatible api, CLI, python sdk, and a [ComfyUI plugin](apps/ComfyUI_SGLDiffusion/README.md)
+  - [Conditioning reuse](https://docs.sglang.io/docs/sglang-diffusion/caching-acceleration#conditioning-cache): bounded CPU caching for repeated text/image inputs and VAE posteriors, with `--disable-conditioning-cache` to opt out
   - Multi-platform support:
     - NVIDIA GPUs (H100, H200, A100, B200, 4090, 5090)
     - AMD GPUs (MI300X, MI325X, MI355X)
@@ -30,15 +31,14 @@ SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software s
 
 ### Apple MPS Support
 
-SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, all Triton kernels are replaced with PyTorch-native fallbacks on MPS. Norm operations can be optionally accelerated with MLX fused Metal kernels (`SGLANG_USE_MLX=1`). See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, Triton kernels are replaced with PyTorch-native fallbacks on MPS. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ## Getting Started
 
-```bash
-uv pip install 'sglang[diffusion]' --prerelease=allow
-```
+Docker is recommended for Linux GPU deployments. Follow the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to start a container with diffusion dependencies included, or choose pip/uv, source installation, or another platform's setup. Run the examples below inside that environment.
 
-For more installation methods (e.g. pypi, uv, docker, ROCm/AMD, MUSA/Moore Threads), check the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation).
+Video output requires a system `ffmpeg` with the `libx264` encoder on `PATH`. For Ubuntu source or pip installations, install it with `sudo apt-get install ffmpeg`; on macOS, use `brew install ffmpeg`.
+
 
 ## Inference
 
@@ -72,10 +72,29 @@ Or, more simply, with the CLI:
 
 ```bash
 sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --text-encoder-cpu-offload --pin-cpu-memory \
+    --component-residency text_encoder=component-offload --pin-cpu-memory \
     --prompt "A curious raccoon" \
     --save-output
 ```
+
+### Component residency
+
+Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
+loaded component:
+
+- `resident` keeps the complete component on the accelerator.
+- `component-offload` stores the complete component on CPU between uses.
+- `snapshot-offload` keeps a CPU weight snapshot while the complete component
+  runs on the accelerator, avoiding a weight copy back to CPU after each use.
+- `layerwise-offload` streams the component's declared layers from CPU.
+
+`COMPONENT` can be an exact `model_index.json` key or one of `all`, `dit`,
+`text_encoder`, `image_encoder`, and `vae`. Exact keys override groups, and
+groups override `all`. Existing options such as `--dit-cpu-offload`,
+`--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`,
+`--vae-cpu-offload`, and `--cpu-offload-components` remain supported. See the
+[CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli#component-residency)
+for precedence and compatibility details.
 
 ### LoRA support
 

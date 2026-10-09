@@ -9,12 +9,20 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import (
+    is_npu,
+)
+
+_is_npu = is_npu()
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     positions: torch.Tensor
     verify_cache_loc: torch.Tensor
     verify_ids: torch.Tensor
+    # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
+    # verify window, -1 on a padded lane.
+    window_index: torch.Tensor
 
 
 class BuildRaggedVerifyWindow:
@@ -124,6 +132,9 @@ def build_ragged_verify_window(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=torch.where(
+            valid, safe_req.to(torch.int64) * verify_num_draft_tokens + within, -1
+        ),
     )
 
 
@@ -171,7 +182,7 @@ def build_ragged_verify_window_triton(
     verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
     padded_total = layout.graph_num_tokens
 
-    req_id, within, _valid = compact_row_index_triton(
+    req_id, within, valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
     real_cache_loc = assign_extend_cache_locs_func(
@@ -213,6 +224,11 @@ def build_ragged_verify_window_triton(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=torch.where(
+            valid,
+            req_id.clamp(max=bs - 1).to(torch.int64) * verify_num_draft_tokens + within,
+            -1,
+        ),
     )
 
 
@@ -385,9 +401,9 @@ def compact_row_index_triton(
     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
     bs = verify_lens.shape[0]
     # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
-    assert bs <= 1 << (
-        _SEARCH_NBITS - 1
-    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    assert bs <= 1 << (_SEARCH_NBITS - 1), (
+        f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+    )
     incl = torch.cumsum(verify_lens, dim=0).contiguous()
     req = torch.empty(padded_total, dtype=torch.int64, device=device)
     within = torch.empty(padded_total, dtype=torch.int64, device=device)
@@ -604,6 +620,37 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
+def build_unified_commit_inject_layout(
+    *,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_pos_offsets: torch.Tensor,
+    commit_lens: torch.Tensor,
+    stride: int,
+    ring_stride: int,
+) -> CommitInjectLayoutResult:
+    """unified_kv counterpart of build_commit_inject_layout.
+
+    Non-unified injection translates the verify tokens' full cache locs through
+    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
+    directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
+    ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
+    are skipped by the scatter. All ops are static-shape (CUDA-graph safe).
+    """
+    bs = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
+    positions = positions_2d.reshape(-1).to(torch.int64)
+    state_slot = (
+        req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
+    )
+    loc = state_slot * ring_stride + positions % ring_stride
+    col = torch.arange(stride, device=device).view(1, -1)
+    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+    swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
+    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+
+
 class BuildCommitInjectLayout:
     @classmethod
     def execute(cls, *args, **kwargs) -> CommitInjectLayoutResult:
@@ -666,32 +713,20 @@ def build_commit_inject_layout(
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
-
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
-
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
-
-    cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + stride,
-        batch_size=bs,
-        draft_token_num=stride,
-        device=device,
-    ).to(dtype=torch.int64)
-    swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
-
     col = torch.arange(stride, device=device).view(1, -1)
-    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-    swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
-
-    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+    committed = col < commit_lens.to(torch.long).view(-1, 1)
+    req_rows = req_pool_indices.to(torch.long).view(-1, 1).expand(bs, stride)
+    rows = torch.where(committed, req_rows, 0)
+    cols = torch.where(committed, positions_2d.long(), 0)
+    cache_loc = torch.where(committed, req_to_token[rows, cols].long(), 0)
+    swa_loc = torch.where(committed, full_to_swa_mapping[cache_loc], -1)
+    return CommitInjectLayoutResult(
+        swa_loc=swa_loc.to(torch.int32).reshape(-1), positions=positions
+    )
 
 
 @triton.jit
@@ -717,13 +752,14 @@ def _commit_inject_layout_kernel(
     prefix = tl.load(prefix_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     pos_off = tl.load(block_pos_offsets_ptr + c, mask=mask, other=0).to(tl.int64)
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0).to(tl.int64)
-    full_loc = tl.load(
-        req_to_token_ptr + rp * rt_stride + prefix + pos_off, mask=mask, other=0
-    ).to(tl.int64)
-    swa = tl.load(full_to_swa_ptr + full_loc, mask=mask, other=-1).to(tl.int32)
-
     commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
-    swa = tl.where(c.to(tl.int64) < commit_len, swa, -1)
+    committed = mask & (c.to(tl.int64) < commit_len)
+    full_loc = tl.load(
+        req_to_token_ptr + rp * rt_stride + prefix + pos_off,
+        mask=committed,
+        other=0,
+    ).to(tl.int64)
+    swa = tl.load(full_to_swa_ptr + full_loc, mask=committed, other=-1).to(tl.int32)
 
     tl.store(swa_loc_ptr + offs, swa, mask=mask)
     tl.store(positions_ptr + offs, prefix + pos_off, mask=mask)
@@ -766,7 +802,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

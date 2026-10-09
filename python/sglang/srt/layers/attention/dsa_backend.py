@@ -15,7 +15,14 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -25,36 +32,49 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    mla_quantize_for_fp8_no_rope,
     q8kv8_topk_length_from_indices,
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
+    DeepseekSparseAttnBackendKPoolMixin,
+    _KPoolForwardInputs,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
+    DSAMetadataManagementMixin,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.kpool_plan import (
+    KPoolExtendPlan,
+    KPoolWritePlan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_prefill_cp_round_robin_split,
+    can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
-    dsa_cp_round_robin_split_data,
-    dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
@@ -63,27 +83,17 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_position,
-)
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_sm100_supported,
+    is_xpu,
     print_warning_once,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
-# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
-# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
-# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
-# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
-_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
@@ -95,42 +105,34 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-def _all_gather_dsa_trtllm_fp8_kv(
-    forward_batch: ForwardBatch,
-    k: torch.Tensor,
-    k_rope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_lora_rank = k.shape[-1]
-    qk_rope_head_dim = k_rope.shape[-1]
-    kv_dtype = k.dtype
-    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
-    kv = cp_all_gather_rerange_output(
-        kv,
-        get_parallel().attn_cp_size,
-        forward_batch,
-        torch.cuda.current_stream(),
-    ).view(kv_dtype)
-    return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
-
-
-def materialize_full_kv_cp(
+def prepare_kv_for_attention(
     attn_mla,
     forward_batch: ForwardBatch,
-    latent_cache: torch.Tensor,
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
+    *,
+    defer_materialization: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if is_cp_v2_active(forward_batch):
-        return get_cp_strategy().materialize_full_mla_kv(
-            forward_batch,
-            attn_mla.attn_mqa,
-            k_nope,
-            k_pe,
-        )
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
+    """Materialize KV needed before attention for the active layout."""
+    if (
+        defer_materialization
+        or not dsa_use_prefill_cp(forward_batch)
+        or not is_cp_active(forward_batch)
+    ):
+        return k_nope, k_pe
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    return strategy.materialize_full_mla_kv(
+        forward_batch,
+        attn_mla.attn_mqa,
+        k_nope,
+        k_pe,
+    )
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -149,6 +151,11 @@ if _is_hip:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
+elif _is_xpu:
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
 else:
     from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
@@ -165,6 +172,46 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
+
+
+def _trim_trtllm_decode_dp_padding(
+    q_all: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    real_batch_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    """Align eager decode inputs with metadata planned before DP padding."""
+    physical_batch_size = q_all.shape[0]
+    assert real_batch_size <= physical_batch_size, (
+        f"DSA metadata batch size ({real_batch_size}) exceeds q batch size "
+        f"({physical_batch_size})"
+    )
+    if topk_indices is not None:
+        assert real_batch_size <= topk_indices.shape[0], (
+            f"DSA metadata batch size ({real_batch_size}) exceeds topk batch size "
+            f"({topk_indices.shape[0]})"
+        )
+
+    num_padding_rows = physical_batch_size - real_batch_size
+    if num_padding_rows == 0:
+        return q_all, topk_indices, 0
+
+    return (
+        q_all[:real_batch_size],
+        topk_indices[:real_batch_size] if topk_indices is not None else None,
+        num_padding_rows,
+    )
+
+
+def _restore_trtllm_decode_dp_padding(
+    output: torch.Tensor, num_padding_rows: int
+) -> torch.Tensor:
+    """Restore the physical DP shape required by downstream MLP collectives."""
+    if num_padding_rows == 0:
+        return output
+    return torch.cat(
+        [output, output.new_zeros((num_padding_rows, *output.shape[1:]))],
+        dim=0,
+    )
 
 
 @dataclass(frozen=True)
@@ -229,7 +276,7 @@ class DSAMetadata:
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
-    # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
+    # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
@@ -248,6 +295,13 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+
+    pooled_index_kpool: int = 1
+    pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
+    pooled_real_page_table: Optional[torch.Tensor] = None
+    pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    kpool_extend_plan: Optional[KPoolExtendPlan] = None
+    kpool_write_plan: Optional[KPoolWritePlan] = None
 
 
 @torch.compile
@@ -271,104 +325,102 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
-@dataclass(frozen=True)
-class DSAIndexerMetadata(BaseIndexerMetadata):
-    attn_metadata: DSAMetadata
-    topk_transform_method: TopkTransformMethod
-    topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
-    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
-    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
-    force_unfused_topk: bool = False
-
-    def get_seqlens_int32(self) -> torch.Tensor:
-        return self.attn_metadata.cache_seqlens_int32
-
-    def get_page_table_64(self) -> torch.Tensor:
-        return self.attn_metadata.real_page_table
-
-    def get_page_table_1(self) -> torch.Tensor:
-        return self.attn_metadata.page_table_1
-
-    def get_seqlens_expanded(self) -> torch.Tensor:
-        return self.attn_metadata.dsa_seqlens_expanded
-
-    def get_cu_seqlens_k(self) -> torch.Tensor:
-        return self.attn_metadata.cu_seqlens_k
-
-    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.attn_metadata.indexer_k_start_end
-
-    def get_indexer_seq_len(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens
-
-    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens_cpu
-
-    def get_dsa_extend_len_cpu(self) -> List[int]:
-        return self.attn_metadata.dsa_extend_seq_lens_list
-
-    def get_token_to_batch_idx(self) -> torch.Tensor:
-        return self.attn_metadata.token_to_batch_idx
-
-    def topk_transform(
-        self,
-        logits: torch.Tensor,
-        topk: int,
-        ks: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        ke_offset: Optional[torch.Tensor] = None,
-        batch_idx_list: Optional[List[int]] = None,
-        topk_indices_offset_override: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if topk_indices_offset_override is not None:
-            cu_topk_indices_offset = topk_indices_offset_override
-            cu_seqlens_q_topk = None
-        elif cu_seqlens_q is not None:
-            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
-            cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-            )
-        else:
-            cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
-            cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
-        if ke_offset is not None:
-            seq_lens_topk = ke_offset
-        else:
-            seq_lens_topk = self.get_seqlens_expanded()
-        return self.topk_backend.topk_transform(
-            logits=logits,
-            lengths=seq_lens_topk,
-            topk=topk,
-            topk_transform_method=self.topk_transform_method,
-            attn_metadata=self.attn_metadata,
-            cu_seqlens_q_topk=cu_seqlens_q_topk,
-            topk_indices_offset=cu_topk_indices_offset,
-            row_starts=ks,
-            batch_idx_list=batch_idx_list,
-            force_unfused_topk=self.force_unfused_topk,
-        )
-
-
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashinfer_sparse_mla",
+    "triton_sparse_mla",
     "fa3",
     "tilelang",
+    "triton",
     "trtllm",
+    "intel_xpu",
 ]
 
 
+# Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
+# makes the [BLOCK_H, 512] fp32 accumulator spill or miss SM120's smem budget.
+_TRITON_SPARSE_MLA_MAX_HEADS = 32
+
+
+def _validate_triton_sparse_mla_backend(
+    *,
+    device_sm_major: int,
+    num_q_heads: int,
+    union: int,
+    index_kpool: int,
+) -> None:
+    if _is_hip:
+        raise ValueError(
+            "triton_sparse_mla is a CUDA prefill backend; on ROCm use the "
+            "existing tilelang / aiter DSA paths."
+        )
+    if device_sm_major < 9:
+        raise ValueError(
+            "triton_sparse_mla requires SM90 (Hopper) or newer; "
+            f"got sm_major={device_sm_major}."
+        )
+    if num_q_heads > _TRITON_SPARSE_MLA_MAX_HEADS:
+        raise ValueError(
+            "triton_sparse_mla is validated up to "
+            f"{_TRITON_SPARSE_MLA_MAX_HEADS} query heads per rank; got "
+            f"num_q_heads={num_q_heads}. Raise the attention TP degree or use "
+            "another DSA prefill backend."
+        )
+    if index_kpool > 1:
+        raise ValueError(
+            "triton_sparse_mla does not support index_kpool > 1 (the pooled "
+            f"indexer appends tail tokens to topk_indices); got {index_kpool}. "
+            "Use flashmla_sparse, which reroutes the tail."
+        )
+    if union not in (0, 2, 4):
+        raise ValueError(f"--dsa-triton-union must be 0, 2 or 4; got {union}.")
+    if union:
+        # tl.arange needs a power of two and tl.dot needs M >= 16; the tuned
+        # union tiles stop at 32 rows.
+        rows = num_q_heads * union
+        if rows < 16 or rows > 32 or rows & (rows - 1):
+            raise ValueError(
+                f"--dsa-triton-union {union} needs num_q_heads * union to be a "
+                f"power of two in [16, 32] (the union mma tile); got "
+                f"num_q_heads={num_q_heads}, i.e. {rows} rows. Use a different "
+                "group size or disable union."
+            )
+
+
+def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
+    # Union makes a token's output depend on which tokens share its group and
+    # on the T % G tail, which breaks the batch invariance deterministic
+    # inference promises.
+    if union and deterministic:
+        logger.warning(
+            "--dsa-triton-union %d is disabled under "
+            "--enable-deterministic-inference: the union path makes a token's "
+            "output depend on its batch neighbours.",
+            union,
+        )
+        return 0
+    return union
+
+
 class DeepseekSparseAttnBackend(
-    DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
+    DSAMetadataManagementMixin,
+    DeepseekSparseAttnBackendKPoolMixin,
+    DeepseekSparseAttnBackendMTPPrecomputeMixin,
+    AttentionBackend,
 ):
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
-    # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
+    # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
+    # KPool indexer reads the host mirror only for extend, which always has it.
     needs_cpu_seq_lens: bool = False
+    # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
+    # branch of __init__ allocates one.
+    _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -383,17 +435,24 @@ class DeepseekSparseAttnBackend(
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
-        self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
-        self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+        hf_config = model_runner.model_config.hf_config
+        self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
-        self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        self.dsa_index_topk = get_dsa_index_topk(hf_config)
+        self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
+        self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
+        self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
+        self._memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=get_exec().features.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -401,6 +460,8 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
+        self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -409,13 +470,15 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        self.dsa_prefill_impl: _DSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
+        self.supports_mha_one_shot: bool = True
+        self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
+        self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        # Opt-in exact fast path for the Triton sparse-MLA prefill kernel.
+        self.dsa_triton_union: int = _resolve_dsa_triton_union(
+            union=get_exec().kernel.dsa_triton_union,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
-        self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
-        )
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -424,6 +487,28 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Keep graph-captured buffers alive per stream.
+        self._triton_sparse_mla_workspaces: dict[
+            int, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
+
+        # Hoisted per-call imports of set_dsa_prefill_impl. Module-scope
+        # imports would cycle through model_executor (which imports the
+        # attention backends); backend init runs after those modules are
+        # fully imported, so binding the function refs here is cycle-safe.
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+        from sglang.srt.utils import get_device_sm, is_blackwell
+
+        self._is_in_breakable_cuda_graph = is_in_breakable_cuda_graph
+        self._is_in_tc_piecewise_cuda_graph = is_in_tc_piecewise_cuda_graph
+        self._get_device_sm = get_device_sm
+        self._is_blackwell = is_blackwell
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -465,21 +550,20 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
-            model_runner.server_args, seed_dsa_topk_from_draft_extend
-        )
+        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
 
-        self.device_capability = torch.cuda.get_device_capability()
+        if _is_xpu:
+            self.device_capability = (0, 0)
+        else:
+            self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -501,9 +585,17 @@ class DeepseekSparseAttnBackend(
                     f"capability sm_{self.device_sm_major}x."
                 )
 
+        if self.dsa_prefill_impl == "triton_sparse_mla":
+            _validate_triton_sparse_mla_backend(
+                device_sm_major=self.device_sm_major,
+                num_q_heads=self.num_q_heads,
+                union=self.dsa_triton_union,
+                index_kpool=self.dsa_index_kpool,
+            )
+
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
-        # via the shared DSA_CHOICES list.
+        # via the shared CLI choices.
         if self.dsa_decode_impl == "flashmla_sparse_q8":
             raise ValueError(
                 "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
@@ -550,7 +642,7 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_buf: Optional[torch.Tensor] = None
         self._q8kv8_born_q_stash: Optional[Tuple[int, int]] = None
         self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
-        self._q8kv8_born_q_tbo = model_runner.server_args.enable_two_batch_overlap
+        self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
@@ -573,8 +665,12 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
-        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode).
+        # These come from flashinfer, which is CUDA-only, so the SM major alone
+        # cannot gate them: ROCm gfx1250 also reports compute capability (12, 5).
+        elif _is_cuda and (
+            self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
+        ):
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
@@ -592,7 +688,6 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
-            self._multi_ctas_kv_counter_buffer = None
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -733,6 +828,21 @@ class DeepseekSparseAttnBackend(
             "num_kv_splits": self.aiter_dsa_max_split_per_batch,
         }
 
+    def _pad_trtllm_sparse_page_table(
+        self, page_table_1: torch.Tensor
+    ) -> Tuple[torch.Tensor, int]:
+        sparse_mla_top_k = page_table_1.shape[1]
+        padded_top_k = ((sparse_mla_top_k + 3) // 4) * 4
+        if padded_top_k == sparse_mla_top_k:
+            return page_table_1, sparse_mla_top_k
+        padding = torch.full(
+            (page_table_1.shape[0], padded_top_k - sparse_mla_top_k),
+            -1,
+            dtype=page_table_1.dtype,
+            device=page_table_1.device,
+        )
+        return torch.cat([page_table_1, padding], dim=1), padded_top_k
+
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
         forward_mode: ForwardMode,
@@ -749,7 +859,7 @@ class DeepseekSparseAttnBackend(
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
-            and is_sm100_supported()
+            and get_platform().is_sm100
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -775,11 +885,11 @@ class DeepseekSparseAttnBackend(
         # Preprocess the folded top-k v2 plan once per forward (shared across
         # layers), at metadata-build time, from the same seqlens the transform
         # receives as `lengths` (dsa_seqlens_expanded). This must cover EVERY shape
-        # that dispatches to `_topk_transform_v2_paged` -- decode AND MTP
-        # target-verify / draft-extend, whose expanded row count is exactly what v2
-        # sees -- otherwise the helper's plan-present assertion fires. None only
-        # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        # that dispatches to `_topk_transform_v2_paged` -- decode, MTP target-verify
+        # / draft-extend, and packed PAGED extend, whose expanded row count is what
+        # v2 sees -- otherwise the helper's plan-present assertion fires. None only
+        # when the SGL v2 path is disabled; such metadata is never dispatched to v2.
+        if not self.dsa_topk_backend.should_use_topk_v2():
             return None
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
@@ -816,6 +926,9 @@ class DeepseekSparseAttnBackend(
             )
         return self._arange_buf[:length]
 
+    def update_verify_buffers_to_fill_after_draft(self, *args, **kwargs):
+        return None
+
     def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
         page_table_1 width when present, else req_to_token's width (the wide table
@@ -825,7 +938,7 @@ class DeepseekSparseAttnBackend(
         return self.req_to_token.shape[1]
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
-        page_size = self.real_page_size
+        page_size = self.physical_page_size
         if page_size == 1:
             return page_table
         max_seqlen_k = page_table.shape[1]
@@ -905,6 +1018,16 @@ class DeepseekSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+        use_kpool = self.dsa_index_kpool > 1
+        if use_kpool:
+            assert (
+                self.physical_page_size == 64
+                and self.physical_page_size % self.dsa_index_kpool == 0
+            ), (
+                f"kpool path requires page_size == 64 and page_size % pool_size == 0; "
+                f"got page_size={self.physical_page_size}, pool_size={self.dsa_index_kpool}."
+            )
+        kpool_inputs = _KPoolForwardInputs()
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -1004,21 +1127,18 @@ class DeepseekSparseAttnBackend(
                     )
                 ]
             )
+            if use_kpool:
+                kpool_inputs.full_real_page_table = self._transform_table_1_to_real(
+                    page_table
+                )
+                kpool_inputs.full_seqlens_expanded = seqlens_expanded
 
-            if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                if is_cp_v2_active(forward_batch):
-                    strategy = get_cp_strategy()
-                    seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
-                    )
-                else:
-                    seqlens_expanded = dsa_cp_round_robin_split_data(seqlens_expanded)
-                    extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
-                        dsa_cp_round_robin_split_q_seqs(
-                            extend_seq_lens_cpu, extend_seq_lens
-                        )
-                    )
+            if can_dsa_prefill_cp_interleave(forward_batch):
+                strategy = get_cp_strategy()
+                seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
+                extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
+                    strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
+                )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
@@ -1059,9 +1179,9 @@ class DeepseekSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(
-                    indexer_seq_lens_cpu
-                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
+                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                )
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -1090,6 +1210,7 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = compute_dsa_seqlens(
             original_seq_lens=seqlens_expanded,
             dsa_index_topk=self.dsa_index_topk,
+            index_kpool=self.dsa_index_kpool,
         )
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
@@ -1118,7 +1239,7 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
             max_seq_len_k=max_seqlen_k,
@@ -1132,7 +1253,7 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv
+                if use_flashmla_kv and not _is_xpu
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -1150,6 +1271,12 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+        )
+        metadata = self._init_kpool_metadata(
+            metadata,
+            forward_batch,
+            topk_transform_method=topk_transform_method,
+            kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
 
@@ -1223,12 +1350,8 @@ class DeepseekSparseAttnBackend(
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
-            assert can_dsa_prefill_cp_round_robin_split(forward_batch)
-            split_per_token = (
-                get_cp_strategy().shard_local_tokens
-                if is_cp_v2_active(forward_batch)
-                else dsa_cp_round_robin_split_data
-            )
+            assert can_dsa_prefill_cp_interleave(forward_batch)
+            split_per_token = get_cp_strategy().shard_local_tokens
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
@@ -1250,25 +1373,49 @@ class DeepseekSparseAttnBackend(
         # page_size=1 table. This MUST match the exact condition under which
         # `DSATopKBackend.topk_transform` dispatches decode PAGED to
         # `_topk_transform_v2_paged` -- otherwise the legacy transform would read a
-        # dropped (None) table. Hence: fused top-k AND v2 enabled AND index_topk in
-        # the kernel's supported range, on CUDA with page_size>1. Excludes HIP (its
-        # indexer reads page_table_1), hisparse (needs page_size=1 loc translation),
-        # and spec decoding (MTP precompute fast-path + target-verify/draft-extend
-        # still consume the wide table). Computed once from stable config; the graph
-        # is captured once per process.
+        # dropped (None) table. Hence: SGL top-k backend AND fused top-k AND v2
+        # enabled AND index_topk in the kernel's supported range, on CUDA with
+        # page_size>1. Excludes HIP (its indexer reads page_table_1), hisparse
+        # (needs page_size=1 loc translation), and spec decoding (MTP precompute
+        # fast-path + target-verify/draft-extend still consume the wide table).
+        # Computed once from stable config; the graph is captured once per process.
         self.dsa_drop_wide_page_table = (
             is_cuda()
             and not _is_hip
-            and self.real_page_size > 1
+            and self.physical_page_size > 1
             and self.hisparse_coordinator is None
             and not self.speculative_num_draft_tokens
+            # kpool's PAGED fused-topk mapping still reads page_table_1.
+            and self.dsa_index_kpool <= 1
             and self.use_fused_topk
-            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and self.dsa_topk_backend.should_use_topk_v2()
             and self.dsa_index_topk is not None
-            and self.dsa_index_topk <= 2048
+            and 0 < self.dsa_index_topk <= 2048
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        # rewritten in full before every replay; the init-once metadata below would resume zeroed
+        with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
+            page_table = (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1288,34 +1435,50 @@ class DeepseekSparseAttnBackend(
             "real_page_table": (
                 torch.zeros(
                     max_num_tokens,
-                    (max_ctx_len + self.real_page_size - 1) // self.real_page_size,
+                    (max_ctx_len + self.physical_page_size - 1)
+                    // self.physical_page_size,
                     dtype=torch.int32,
                     device=self.device,
                 )
                 if self.dsa_drop_wide_page_table
                 else None
             ),
-            "page_table": (
-                None
-                if self.dsa_drop_wide_page_table
-                else torch.zeros(
-                    max_num_tokens,
-                    max_ctx_len,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
+
+        # Sized by query rows, not requests: target verify captures
+        # speculative_num_draft_tokens rows per request.
+        self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
+
+    def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
+        # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
+        # rebinding would free the allocation the decode graphs captured.
+        counter = grow_multi_ctas_kv_counter_buffer_if_needed(
+            buffer=self._multi_ctas_kv_counter_buffer,
+            device=torch.device(self.device),
+            num_q_heads=self.num_q_heads,
+            batch_size=num_query_rows,
+        )
+        # Capacity is set before capture, so a grow here is a broken invariant.
+        assert (
+            counter is self._multi_ctas_kv_counter_buffer
+            or not torch.cuda.is_current_stream_capturing()
+        ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
+        return counter
+
+    def _ensure_multi_ctas_kv_counter_capacity(self, num_query_rows: int) -> None:
+        if self._multi_ctas_kv_counter_buffer is None:
+            return
+        # Must run before any capture: a later rebind frees what a graph replays.
+        self._multi_ctas_kv_counter_buffer = (
+            grow_multi_ctas_kv_counter_buffer_if_needed(
+                buffer=self._multi_ctas_kv_counter_buffer,
+                device=torch.device(self.device),
+                num_q_heads=self.num_q_heads,
+                batch_size=num_query_rows,
+            )
+        )
 
     def _build_forward_metadata_cuda_graph(
         self,
@@ -1354,7 +1517,9 @@ class DeepseekSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
             dsa_cache_seqlens_int32 = compute_dsa_seqlens(
-                cache_seqlens_int32, dsa_index_topk=self.dsa_index_topk
+                cache_seqlens_int32,
+                dsa_index_topk=self.dsa_index_topk,
+                index_kpool=self.dsa_index_kpool,
             )
 
             seqlens_expanded = cache_seqlens_int32
@@ -1417,7 +1582,9 @@ class DeepseekSparseAttnBackend(
                 ]
             )
             dsa_cache_seqlens_int32 = compute_dsa_seqlens(
-                seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+                seqlens_expanded,
+                dsa_index_topk=self.dsa_index_topk,
+                index_kpool=self.dsa_index_kpool,
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
@@ -1461,7 +1628,7 @@ class DeepseekSparseAttnBackend(
             )
 
         metadata = DSAMetadata(
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seqlen_q,
             max_seq_len_k=max_seqlen_k,
@@ -1479,6 +1646,7 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
+        metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -1513,25 +1681,25 @@ class DeepseekSparseAttnBackend(
             )
             return
 
+        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+
         self.set_dsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
+
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
-                from sglang.kernels.ops.attention.dsa_metadata import (
-                    fused_dsa_decode_metadata,
-                )
-
-                fused_dsa_decode_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_decode_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1544,7 +1712,7 @@ class DeepseekSparseAttnBackend(
                     bs=bs,
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -1561,22 +1729,22 @@ class DeepseekSparseAttnBackend(
                 page_indices = self.req_to_token[req_pool_indices, :max_len]
                 metadata.page_table_1[:, :max_len].copy_(page_indices)
                 dsa_cache_seqlens = compute_dsa_seqlens(
-                    cache_seqlens, dsa_index_topk=self.dsa_index_topk
+                    cache_seqlens,
+                    dsa_index_topk=self.dsa_index_topk,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
                 seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
-                from sglang.kernels.ops.attention.dsa_metadata import (
-                    fused_dsa_target_verify_metadata,
-                )
-
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
-                    and is_sm100_supported()
+                    and get_platform().is_sm100
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -1585,7 +1753,7 @@ class DeepseekSparseAttnBackend(
                 ):
                     paged_mqa_ctx_lens_2d = metadata.paged_mqa_ctx_lens_2d
 
-                fused_dsa_target_verify_metadata(
+                self._fused_verify_metadata(
                     seq_lens=seq_lens,
                     req_pool_indices=req_pool_indices,
                     req_to_token=self.req_to_token,
@@ -1599,7 +1767,7 @@ class DeepseekSparseAttnBackend(
                     bs=bs,
                     max_seqlen_k=max_seqlen_k,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
                 )
@@ -1644,7 +1812,9 @@ class DeepseekSparseAttnBackend(
                 )
                 metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
                 dsa_cache_seqlens = compute_dsa_seqlens(
-                    seqlens_expanded, self.dsa_index_topk
+                    seqlens_expanded,
+                    self.dsa_index_topk,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
         elif forward_mode.is_draft_extend_v2():
@@ -1666,12 +1836,10 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if is_cuda() and not _is_hip:
-                from sglang.kernels.ops.attention.dsa_metadata import (
-                    fused_dsa_draft_extend_metadata,
-                )
-
-                fused_dsa_draft_extend_metadata(
+            if (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion:
+                self._fused_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
                     req_pool_indices=req_pool_indices,
@@ -1687,7 +1855,7 @@ class DeepseekSparseAttnBackend(
                     total_len=total_extend_len,
                     max_seqlen_k=max_seqlen_k,
                     dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
+                    physical_page_size=self.physical_page_size,
                     max_extend_len=self.speculative_num_draft_tokens,
                     max_total_len=bs * self.speculative_num_draft_tokens,
                     static_extend_len=True,
@@ -1721,7 +1889,9 @@ class DeepseekSparseAttnBackend(
                     seqlens_expanded
                 )
                 dsa_cache_seqlens = compute_dsa_seqlens(
-                    seqlens_expanded, self.dsa_index_topk
+                    seqlens_expanded,
+                    self.dsa_index_topk,
+                    index_kpool=self.dsa_index_kpool,
                 )
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
@@ -1765,8 +1935,8 @@ class DeepseekSparseAttnBackend(
             )
         # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
-        assert self.real_page_size == metadata.page_size
-        if self.real_page_size > 1:
+        assert self.physical_page_size == metadata.page_size
+        if self.physical_page_size > 1:
             if not used_fused_metadata_generation:
                 real_table = self._transform_table_1_to_real(page_indices)
                 new_rows = real_table.shape[0]
@@ -1774,6 +1944,19 @@ class DeepseekSparseAttnBackend(
                 metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
+
+        effective_n_per_batch = None
+        if forward_mode.is_draft_extend_v2() and spec_info is not None:
+            effective_n_per_batch = getattr(spec_info, "num_accept_tokens", None)
+            if effective_n_per_batch is not None:
+                effective_n_per_batch = effective_n_per_batch[:bs]
+        self._update_kpool_metadata_replay(
+            metadata,
+            seq_lens,
+            req_pool_indices,
+            forward_mode,
+            effective_n_per_batch=effective_n_per_batch,
+        )
 
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
@@ -1807,130 +1990,10 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        # Track whether fused kernel succeeded
-        fused_kernel_succeeded = False
+        self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
 
-        # Use fused CUDA kernel for all copy operations
-        if not _is_hip:
-            try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
-                    fused_metadata_copy_cuda,
-                )
-
-                # Map forward_mode to integer enum
-                if forward_mode.is_decode_or_idle():
-                    mode_int = 0  # DECODE
-                elif forward_mode.is_target_verify():
-                    mode_int = 1  # TARGET_VERIFY
-                else:
-                    raise ValueError(f"Unsupported forward_mode: {forward_mode}")
-
-                # Prepare FlashMLA tensors if needed
-                flashmla_num_splits_src = None
-                flashmla_num_splits_dst = None
-                flashmla_metadata_src = None
-                flashmla_metadata_dst = None
-                if precomputed.flashmla_metadata is not None:
-                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
-                    flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
-                    flashmla_metadata_src = (
-                        precomputed.flashmla_metadata.flashmla_metadata
-                    )
-                    flashmla_metadata_dst = metadata.flashmla_metadata.flashmla_metadata
-
-                # Call fused kernel
-                fused_metadata_copy_cuda(
-                    # Source tensors
-                    precomputed.cache_seqlens,
-                    precomputed.cu_seqlens_k,
-                    precomputed.page_indices,
-                    precomputed.dsa_cache_seqlens,
-                    precomputed.seqlens_expanded,
-                    precomputed.dsa_cu_seqlens_k,
-                    precomputed.real_page_table,
-                    flashmla_num_splits_src,
-                    flashmla_metadata_src,
-                    # Destination tensors
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table_1,
-                    metadata.dsa_cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded,
-                    metadata.dsa_cu_seqlens_k,
-                    (
-                        metadata.real_page_table
-                        if precomputed.real_page_table is not None
-                        else None
-                    ),
-                    flashmla_num_splits_dst,
-                    flashmla_metadata_dst,
-                    # Parameters
-                    mode_int,
-                    bs,
-                    precomputed.max_len,
-                    precomputed.max_seqlen_k,
-                    precomputed.seqlens_expanded_size,
-                )
-
-                # Successfully used fused kernel
-                fused_kernel_succeeded = True
-
-            except ImportError:
-                print(
-                    "Warning: Fused metadata copy kernel not available, falling back to individual copies."
-                )
-            except Exception as e:
-                print(
-                    f"Warning: Fused metadata copy kernel failed with error: {e}, falling back to individual copies."
-                )
-
-        # Fallback to individual copy operations if the fused kernel is unavailable
-        # or fails at runtime.
-        if not fused_kernel_succeeded:
-            # Copy basic seqlens
-            metadata.cache_seqlens_int32.copy_(precomputed.cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(precomputed.cu_seqlens_k[1:])
-
-            # Mode-specific copy logic
-            if forward_mode.is_decode_or_idle():
-                # Decode mode
-                metadata.page_table_1[:, : precomputed.max_len].copy_(
-                    precomputed.page_indices
-                )
-                metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-                # seqlens_expanded is same as cache_seqlens (already copied)
-
-            elif forward_mode.is_target_verify():
-                # Target verify mode
-                metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
-                    precomputed.page_indices
-                )
-                metadata.dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
-                metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-
-            # Copy DSA cu_seqlens
-            size = precomputed.seqlens_expanded_size
-            metadata.dsa_cu_seqlens_k[1 : 1 + size].copy_(
-                precomputed.dsa_cu_seqlens_k[1 : 1 + size]
-            )
-
-            # Copy real page table
-            if precomputed.real_page_table is not None:
-                rows, cols = precomputed.real_page_table.shape
-                metadata.real_page_table[:rows, :cols].copy_(
-                    precomputed.real_page_table
-                )
-
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
-
-        # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
-        # this replay (the captured graph holds stale data otherwise, which can
-        # deadlock the kernel when the runtime work decomposition diverges from
-        # the captured one).
+        # Refresh the schedule because stale shape decomposition can deadlock
+        # DeepGEMM paged MQA.
         if is_cuda():
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
@@ -1947,6 +2010,10 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+
+        self._update_kpool_metadata_from_precomputed(
+            metadata, precomputed, forward_mode
+        )
 
         self.forward_metadata = metadata
 
@@ -1965,6 +2032,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1979,6 +2047,21 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+            raise RuntimeError(
+                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+            )
+
+        phase = (
+            "decode"
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            else "prefill"
+        )
+        dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -2017,9 +2100,9 @@ class DeepseekSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert (
-                layer.tp_k_head_num == layer.tp_q_head_num > 1
-            ), "MHA_ONE_SHOT requires dense multi-head config"
+            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
+                "MHA_ONE_SHOT requires dense multi-head config"
+            )
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -2030,14 +2113,16 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        assert q_rope is not None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
             )
+            q_all = None
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
@@ -2092,33 +2177,11 @@ class DeepseekSparseAttnBackend(
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
-                # Triton prefill kernel reads q_nope/q_rope directly, skipping
-                # the concat (it splits q into main/tail internally anyway).
-                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
-                # tail=64, topk=2048); everything else uses TileLang.
-                if (
-                    _DSA_TRITON_PREFILL
-                    and _IS_GFX95
-                    and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-                    and layer.tp_q_head_num == 16
-                    and layer.v_head_dim == 512
-                    and (layer.head_dim - layer.v_head_dim) == 64
-                    and page_table_1.shape[-1] == 2048
-                    and q_nope.shape[0] >= 512
-                ):
-                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-                        triton_sparse_mla_fwd,
-                    )
-
-                    return triton_sparse_mla_fwd(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        kv=kv_cache,
-                        indices=page_table_1.unsqueeze(1),
-                        sm_scale=layer.scaling,
-                        d_v=layer.v_head_dim,
-                    )
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                # Cat-skip, as in forward_decode: q_rope=None means the caller
+                # already handed us the concatenated form and q_all is a
+                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
+                if q_all is None or not _is_hip:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2126,7 +2189,30 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
+        elif dsa_impl == "triton":
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            return triton_sparse_mla_fwd(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
+                topk_length=None,
+                max_topk_length=(
+                    min(metadata.max_seq_len_k, page_table_1.shape[-1])
+                    if self.dsa_index_kpool <= 1
+                    else None
+                ),
+            )
+        elif dsa_impl in (
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            "triton_sparse_mla",
+        ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
                 page_table_1 = topk_indices
@@ -2183,7 +2269,9 @@ class DeepseekSparseAttnBackend(
                         layer_id=layer.layer_id,
                     )
 
-                # bf16 path (dsa_impl == "flashmla_sparse").
+                # bf16 path: `flashmla_sparse` and `triton_sparse_mla` take the
+                # same inputs (concatenated q, dequantized bf16 KV, top-k list
+                # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
@@ -2197,12 +2285,23 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if dsa_impl == "triton_sparse_mla":
+                return self._forward_triton_sparse_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2254,6 +2353,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 layer=layer,
             )
+        elif dsa_impl == "intel_xpu":
+            return self._forward_intel_xpu_dense_prefill(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                sm_scale=layer.scaling,
+                metadata=metadata,
+            )
         else:
             raise ValueError(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
@@ -2274,13 +2382,22 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        if self.dsa_decode_impl == "trtllm":
+        dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
+        self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
+
+        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+            raise RuntimeError(
+                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+            )
+
+        if dsa_impl == "trtllm":
             return self._forward_trtllm(
                 q,
                 k,
@@ -2317,7 +2434,9 @@ class DeepseekSparseAttnBackend(
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
             )
             # Caller passed split q_nope / q_rope; we'll need to concat below if
             # the chosen impl wants q_all.
@@ -2350,7 +2469,7 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if self.dsa_decode_impl == "flashmla_sparse":
+        if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -2359,8 +2478,10 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
-        elif self.dsa_decode_impl == "flashinfer_sparse_mla":
+        elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashinfer_sparse_mla(
@@ -2371,7 +2492,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
-        elif self.dsa_decode_impl == "flashmla_kv":
+        elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -2384,7 +2505,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif self.dsa_decode_impl == "tilelang":
+        elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
             # has already been set to a zero-copy view of q in the else branch
             # above and we can reuse it directly. The `not _is_hip` clause keeps
@@ -2398,7 +2519,16 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif self.dsa_decode_impl == "fa3":
+        elif dsa_impl == "triton":
+            return self._forward_triton_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+            )
+        elif dsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -2413,7 +2543,7 @@ class DeepseekSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
-        elif self.dsa_decode_impl == "aiter":
+        elif dsa_impl == "aiter":
             if q_all is None or not _is_hip:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter(
@@ -2424,9 +2554,18 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 bs=forward_batch.batch_size,
             )
+        elif self.dsa_decode_impl == "intel_xpu":
+            return self._forward_intel_xpu_sparse_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
 
         else:
-            assert False, f"Unsupported {self.dsa_decode_impl = }"
+            assert False, f"Unsupported {dsa_impl = }"
 
     def _forward_fa3(
         self,
@@ -2443,16 +2582,46 @@ class DeepseekSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        # Sparse DSA represents each query token as a one-token FA3 sequence.
+        # MoE synchronization can pad length metadata, while the prefill graph
+        # attention bridge narrows Q and the page table to real query tokens.
+        # Remove only trailing metadata padding to match that narrowed layout.
+        if max_seqlen_q == 1 and q_nope.ndim == 3:
+            num_queries = q_nope.shape[0]
+            if cache_seqlens.shape[0] > num_queries:
+                if (
+                    page_table.shape[0] != num_queries
+                    or cu_seqlens_q.shape[0] != cache_seqlens.shape[0] + 1
+                    or cu_seqlens_k.shape[0] != cache_seqlens.shape[0] + 1
+                ):
+                    raise ValueError(
+                        "Inconsistent padded DSA FA3 metadata: "
+                        f"q={tuple(q_nope.shape)}, page_table={tuple(page_table.shape)}, "
+                        f"cache_seqlens={tuple(cache_seqlens.shape)}, "
+                        f"cu_q={tuple(cu_seqlens_q.shape)}, "
+                        f"cu_k={tuple(cu_seqlens_k.shape)}"
+                    )
+                cache_seqlens = cache_seqlens[:num_queries]
+                cu_seqlens_q = cu_seqlens_q[: num_queries + 1]
+                cu_seqlens_k = cu_seqlens_k[: num_queries + 1]
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
-        k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
-        c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        num_blocks = kv_cache.shape[0] // page_size
+        only_qv = qk_rope_dim == 0
+        if only_qv:
+            k_rope_cache = None
+        else:
+            k_rope_cache = k_rope_cache.view(num_blocks, page_size, 1, qk_rope_dim)
+        c_kv_cache = c_kv_cache.view(num_blocks, page_size, 1, v_head_dim)
+        if self.dsa_index_kpool > 1:
+            page_table = page_table.clamp(min=0)
         o = flash_attn_with_kvcache(
-            q=q_rope,
+            q=None if only_qv else q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
             qv=q_nope,
+            only_qv=only_qv,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
@@ -2473,6 +2642,8 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2498,8 +2669,29 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        sink_input = attn_sink
+        if need_padding and attn_sink is not None:
+            key = (attn_sink.data_ptr(), required_padding)
+            sink_input = self._sink_pad_cache.get(key)
+            if sink_input is None:
+                sink_input = attn_sink.new_zeros(required_padding)
+                self._sink_pad_cache[key] = sink_input
+            sink_input[:num_heads].copy_(attn_sink)
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
+
+        # topk_length is the per-row count of valid indices
+        # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
+        # whose context is shorter than `index_topk` have their indices
+        # tail-padded with -1; passing the valid length lets the kernel skip
+        # the padded tail instead of scanning the full topk width. The output
+        # is unchanged: the kernel masks -1 indices either way.
+        if topk_length is not None and topk_length.shape[0] != num_tokens:
+            # Metadata rows are expected to match q rows (the DP/CP padding
+            # helpers keep them aligned); fall back to full-width compute if
+            # they ever diverge.
+            topk_length = None
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
@@ -2507,6 +2699,8 @@ class DeepseekSparseAttnBackend(
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            attn_sink=sink_input,
+            topk_length=topk_length,
         )
 
         # Trim output back to original num_heads if we padded
@@ -2826,6 +3020,41 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
         return o
 
+    def _forward_triton_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        topk_length: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill import (
+            sparse_mla_prefill,
+        )
+
+        # Only the stream's own capture state gates union: the breakable prefill
+        # graph runs attention eagerly between its segments while
+        # get_is_capture_mode() stays set for the whole replay. Under real capture
+        # the per-token path runs instead (same result); union is untested there.
+        capturing = torch.cuda.is_current_stream_capturing()
+        union = 0 if capturing else self.dsa_triton_union
+
+        # Same contract as `_forward_flashmla_sparse`: metadata rows are expected
+        # to match q rows; fall back to full-width compute if they ever diverge.
+        if topk_length is not None and topk_length.shape[0] != q_all.shape[0]:
+            topk_length = None
+
+        return sparse_mla_prefill(
+            q_all,
+            kv_cache,
+            page_table_1,
+            sm_scale,
+            v_head_dim,
+            topk_length=topk_length,
+            union=union,
+        )
+
     def _forward_flashinfer_sparse_mla(
         self,
         q_all: torch.Tensor,
@@ -2846,7 +3075,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1,
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
-            page_size=self.real_page_size,
+            page_size=self.physical_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -2883,8 +3112,8 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
-        assert self.real_page_size == 64, "only page size 64 is supported"
+        kv_cache = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
+        assert self.physical_page_size == 64, "only page size 64 is supported"
 
         if not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
@@ -2909,6 +3138,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
+            kv_format=self.flashmla_kv_format,
         )
 
         if target_q_heads != num_q_heads:
@@ -2938,12 +3168,14 @@ class DeepseekSparseAttnBackend(
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
         assert len(cu_seqlens_q) == len(cu_seqlens_k), (
-            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
-            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q) - 1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        if self.device_sm_major >= 10:
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # ROCm devices fall through to the aiter flash_attn_varlen_func path below:
+        # flashinfer is CUDA-only and gfx1250 also reports a major of 12 here.
+        if _is_cuda and self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
@@ -2991,12 +3223,167 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+        # KPool appends up to index_kpool - 1 live tail tokens to the fixed
+        # index_topk columns. TileLang processes indices in 64-column blocks,
+        # so mask-pad the tail-extended table to the next complete block.
+        padding = (-page_table_1.shape[-1]) % 64
+        if padding:
+            page_table_1 = torch.cat(
+                (
+                    page_table_1,
+                    page_table_1.new_full((*page_table_1.shape[:-1], padding), -1),
+                ),
+                dim=-1,
+            )
+
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+        )
+
+    def _forward_triton_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        return triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            workspace=workspace,
+        )
+
+    def _forward_intel_xpu_sparse_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Sparse decode for XPU using flash_mla_decode with gathered KV.
+
+        Gathers the sparse KV tokens selected by the indexer into a contiguous
+        buffer organized as virtual pages, then runs flash_mla_decode on it.
+        """
+        from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+
+        B = q_nope.shape[0]
+        TOPK = page_table_1.shape[1]
+        D_ckv = kv_cache.shape[-1]
+        GATHER_PAGE_SIZE = 16
+        assert TOPK % GATHER_PAGE_SIZE == 0, (
+            f"TOPK {TOPK} must be a multiple of GATHER_PAGE_SIZE {GATHER_PAGE_SIZE}"
+        )
+        NUM_PAGES = TOPK // GATHER_PAGE_SIZE
+
+        # Count valid tokens per batch (non -1 entries)
+        valid_counts = (page_table_1 >= 0).sum(dim=1).to(torch.int32)
+
+        # Gather KV tokens: replace -1 with 0 for safe indexing, zero-fill after
+        safe_indices = page_table_1.clamp(min=0)
+        # kv_cache is [total_tokens, D_ckv], index with flat indices
+        gathered_kv = kv_cache[safe_indices.view(-1)].view(B, TOPK, D_ckv)
+        # Zero out invalid entries
+        invalid_mask = page_table_1 < 0  # [B, TOPK]
+        gathered_kv[invalid_mask] = 0
+
+        # Reshape to pages: [B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv]
+        gathered_kv_paged = gathered_kv.view(B * NUM_PAGES, GATHER_PAGE_SIZE, D_ckv)
+
+        # Identity page table: batch i → pages [i*NUM_PAGES, ..., (i+1)*NUM_PAGES-1]
+        identity_page_table = torch.arange(
+            B * NUM_PAGES, device=q_nope.device, dtype=torch.int32
+        ).view(B, NUM_PAGES)
+
+        # Workspace
+        ws_size = flash_mla_get_workspace_size(
+            TOPK, B, q_nope.shape[1], GATHER_PAGE_SIZE
+        )
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
+
+        o = flash_mla_decode(
+            q_nope,
+            q_rope,
+            gathered_kv_paged,
+            valid_counts,
+            identity_page_table,
+            self.workspace_buffer,
+            sm_scale,
+        )
+        return o
+
+    def _forward_intel_xpu_dense_prefill(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        metadata: DSAMetadata,
+    ) -> torch.Tensor:
+        """Dense prefill for XPU using flash_mla_prefill.
+
+        Runs full causal MLA attention over all KV positions (no sparse top-K
+        selection).  This is the XPU equivalent of the CUDA flashmla_kv /
+        flashmla_sparse prefill paths.
+        """
+        from sgl_kernel import flash_mla_prefill, flash_mla_prefill_get_workspace_size
+
+        D_ckv = kv_cache.shape[-1]
+        # kv_cache: (N_tokens, 1, D_ckv) from MLATokenToKVPool → (N_pages, page_size, D_ckv)
+        kv_paged = kv_cache.view(-1, self.physical_page_size, D_ckv)
+
+        block_table = metadata.real_page_table  # (B, max_pages), page-indexed int32
+        seq_lens_k = metadata.cache_seqlens_int32  # (B,) total KV lengths
+        cu_seqlens_q = metadata.cu_seqlens_q  # (B+1,) cumulative Q lengths
+        max_seqlen_q = metadata.max_seq_len_q
+
+        max_seq_len_k = int(seq_lens_k.max().item())
+        ws_size = flash_mla_prefill_get_workspace_size(
+            max_seq_len_k, seq_lens_k.shape[0]
+        )
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
+
+        return flash_mla_prefill(
+            q_nope,
+            q_rope,
+            kv_paged,
+            cu_seqlens_q,
+            seq_lens_k,
+            max_seqlen_q,
+            block_table,
+            self.workspace_buffer,
+            sm_scale,
+            causal=True,
+            num_kv_splits=1,
         )
 
     def _forward_aiter(
@@ -3190,47 +3577,51 @@ class DeepseekSparseAttnBackend(
 
         metadata = self.forward_metadata
 
-        merge_query = q_rope is not None
+        # The BF16 no-RoPE path passes a zero-width q_rope tensor.
+        merge_query = q_rope is not None and self.qk_rope_head_dim > 0
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert (
-                cos_sin_cache is not None
-            ), "For FP8 path cos_sin_cache should not be None."
-
-            rope_positions = forward_batch.positions
-            if dsa_use_prefill_cp(forward_batch):
-                rope_positions = cp_split_and_rebuild_position(
-                    forward_batch, rope_positions
+            if cos_sin_cache is None:
+                q, k, k_rope = mla_quantize_for_fp8_no_rope(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
                 )
+            else:
+                rope_positions = forward_batch.positions
+                if dsa_use_prefill_cp(forward_batch):
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                rope_positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
-            if save_kv_cache and dsa_use_prefill_cp(forward_batch):
-                if is_cp_v2_active(forward_batch):
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    rope_positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
+                if save_kv_cache and dsa_use_prefill_cp(forward_batch):
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
                     )
-                else:
-                    k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
             merge_query = False
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention
@@ -3239,7 +3630,9 @@ class DeepseekSparseAttnBackend(
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = k_cache.view(
+            -1, self.physical_page_size, self.kv_cache_dim
+        ).unsqueeze(1)
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -3250,9 +3643,24 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        # Eager DP attention can pad q beyond metadata that was deliberately
+        # planned on the real draft batch. Pad top-k to the physical q shape,
+        # then run decode attention only on metadata-backed rows. The output is
+        # restored below before downstream MLP/EP collectives.
+        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        num_decode_padding_rows = 0
+        if not is_prefill:
+            q_all, topk_indices, num_decode_padding_rows = (
+                _trim_trtllm_decode_dp_padding(
+                    q_all,
+                    topk_indices,
+                    metadata.cache_seqlens_int32.shape[0],
+                )
+            )
+
         if self.use_fused_topk:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3268,13 +3676,17 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
             )
+        page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
+            page_table_1
+        )
+        sparse_mla_top_k_lens = None
+        if self.qk_rope_head_dim == 0:
+            sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
 
         q_scale = 1.0
         k_scale = (
@@ -3287,28 +3699,12 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
-        )
+        multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
-
-        if (
-            dsa_use_prefill_cp(forward_batch)
-            and is_dsa_prefill_cp_in_seq_split()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            cp_meta = forward_batch.attn_cp_metadata
-            seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
-            seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
@@ -3320,14 +3716,15 @@ class DeepseekSparseAttnBackend(
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
-            sparse_mla_top_k=self.dsa_index_topk,
+            sparse_mla_top_k=sparse_mla_top_k,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
-        return out
+        return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -3358,13 +3755,11 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-            is_in_breakable_cuda_graph,
-        )
-        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-            is_in_tc_piecewise_cuda_graph,
-        )
-        from sglang.srt.utils import get_device_sm, is_blackwell
+        # Hoisted in __init__ (import cost is per-call otherwise).
+        is_in_breakable_cuda_graph = self._is_in_breakable_cuda_graph
+        is_in_tc_piecewise_cuda_graph = self._is_in_tc_piecewise_cuda_graph
+        get_device_sm = self._get_device_sm
+        is_blackwell = self._is_blackwell
 
         # Decide MHA vs MLA
         if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
@@ -3380,11 +3775,14 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                self.supports_mha_one_shot
+                and (
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or _IS_GFX95
+                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
@@ -3428,8 +3826,11 @@ class DeepseekSparseAttnBackend(
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
-            # fp8 KV ("kv must have dtype kBFloat16").
-            and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
+            # fp8 KV ("kv must have dtype kBFloat16"). triton_sparse_mla is listed for
+            # the same reason: its dispatch also dequantizes inside the RAGGED branch
+            # and its kernel is bf16-only.
+            and self.dsa_prefill_impl
+            in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
@@ -3478,7 +3879,6 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
-
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
@@ -3492,6 +3892,7 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -3540,6 +3941,20 @@ class DeepseekSparseAttnMultiStepBackend:
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             forward_mode=ForwardMode.DECODE,
         )
+
+        if self.attn_backends[0].experimental_kpool_metadata_fusion:
+            first = self.attn_backends[0]
+            first.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                bs=bs, precomputed=precomputed, forward_mode=ForwardMode.DECODE
+            )
+            for backend in self.attn_backends[1 : self.speculative_num_steps - 1]:
+                backend._copy_replay_metadata_from_sibling(
+                    src_backend=first,
+                    bs=bs,
+                    precomputed=precomputed,
+                    forward_mode=ForwardMode.DECODE,
+                )
+            return
 
         # Use multi-backend fused copy when we have 3 or more backends
         # This is 3x faster than calling the single-backend copy 3 times
@@ -3641,6 +4056,16 @@ class DeepseekSparseAttnMultiStepBackend:
                     precomputed.seqlens_expanded_size,
                 )
 
+                for backend, metadata in zip(
+                    self.attn_backends[:3],
+                    (metadata0, metadata1, metadata2),
+                    strict=True,
+                ):
+                    backend._update_kpool_metadata_from_precomputed(
+                        metadata, precomputed, ForwardMode.DECODE
+                    )
+                    backend.forward_metadata = metadata
+
                 # Copy remaining backends one by one (if > 3 backends)
                 for i in range(3, self.speculative_num_steps - 1):
                     self.attn_backends[
@@ -3669,7 +4094,7 @@ class DeepseekSparseAttnMultiStepBackend:
                         forward_mode=ForwardMode.DECODE,
                     )
         else:
-            # Less than 3 backends: copy to each backend individually
+            # Copy to each backend and refresh its derived metadata independently.
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[
                     i
@@ -3682,11 +4107,3 @@ class DeepseekSparseAttnMultiStepBackend:
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
-
-
-# Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata

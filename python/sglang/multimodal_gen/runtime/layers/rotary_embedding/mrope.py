@@ -5,6 +5,7 @@ import functools
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _to_tuple(x: int | tuple[int, ...], dim: int = 2) -> tuple[int, ...]:
@@ -298,9 +299,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.theta_rescale_factor = [theta_rescale_factor[0]] * self.ndim
         else:
             self.theta_rescale_factor = theta_rescale_factor
-        assert (
-            len(self.theta_rescale_factor) == self.ndim
-        ), "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        assert len(self.theta_rescale_factor) == self.ndim, (
+            "len(theta_rescale_factor) should equal to len(rope_dim_list)"
+        )
 
         if isinstance(interpolation_factor, (int, float)):
             self.interpolation_factor = [interpolation_factor] * self.ndim
@@ -308,9 +309,9 @@ class NDRotaryEmbedding(torch.nn.Module):
             self.interpolation_factor = [interpolation_factor[0]] * self.ndim
         else:
             self.interpolation_factor = interpolation_factor
-        assert (
-            len(self.interpolation_factor) == self.ndim
-        ), "len(interpolation_factor) should equal to len(rope_dim_list)"
+        assert len(self.interpolation_factor) == self.ndim, (
+            "len(interpolation_factor) should equal to len(rope_dim_list)"
+        )
 
         self.rope_generators: list[OneDRotaryEmbedding] = torch.nn.ModuleList()
         _config_to_gen_idx: dict[tuple, int] = {}
@@ -500,3 +501,27 @@ class NDRotaryEmbedding(torch.nn.Module):
             col_offset += dim_i_half
 
         return cos.float(), sin.float()
+
+
+class FluxPosEmbed(torch.nn.Module):
+    """uncached FLUX-family RoPE with contiguous float32 outputs"""
+
+    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
+    def __init__(self, theta: int, axes_dim: list[int]):
+        super().__init__()
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=axes_dim,
+            rope_theta=theta,
+            use_real=False,
+            repeat_interleave_real=False,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
+
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = ids.float()
+        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
+        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()

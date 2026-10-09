@@ -4,6 +4,8 @@
 
 #include "marlin.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 template <typename scalar_t>
@@ -73,5 +75,7 @@ class ScalarType<bf16_t> {
 };
 
 }  // namespace device::marlin
+
+}  // namespace sglang
 
 #endif

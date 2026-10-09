@@ -16,15 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-# TODO(will): move PRECISION_TO_TYPE to better place
-
-logger = init_logger(__name__)
 
 
 class HunyuanVideoPipeline(ComposedPipelineBase):
-
     pipeline_name = "HunyuanVideoPipeline"
 
     _required_config_modules = [

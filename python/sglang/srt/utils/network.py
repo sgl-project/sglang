@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import random
 import socket
 import time
 from dataclasses import dataclass
@@ -88,7 +89,7 @@ def wait_port_available(
                 logger.info(
                     f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
                 )
-        time.sleep(0.1)
+        time.sleep(1)
 
     if raise_exception:
         raise ValueError(
@@ -192,6 +193,28 @@ def get_free_port():
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
+    """Free port under the kernel ephemeral range (32768+ by default), for a
+    port that a child process binds only later."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            ephemeral_low = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        ephemeral_low = 32768
+    # bind(0) and connect() only hand out ports from ephemeral_low up.
+    high = min(high, ephemeral_low - 1)
+    if high - low + 1 < attempts:
+        return get_free_port()
+    for port in random.sample(range(low, high + 1), attempts):
+        try:
+            # IPv4 explicitly: the TCPStore binds the IPv4 side of this port.
+            try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+            return port
+        except OSError:
+            continue
+    return get_free_port()
 
 
 def bind_port(port):

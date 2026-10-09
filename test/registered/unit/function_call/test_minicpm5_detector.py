@@ -118,7 +118,7 @@ def test_detect_and_parse_cdata_multiline_v3():
 def test_unknown_tool_block_preserved_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = '<function name="unknown">' '<param name="x">1</param>' "</function>\n"
+    text = '<function name="unknown"><param name="x">1</param></function>\n'
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == 0
     assert "unknown" in res.normal_text
@@ -168,7 +168,7 @@ def test_multiple_calls_interleaved_text_v3():
 def test_incomplete_missing_function_end_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = '<function name="get_weather">' '<param name="city">北京</param>'
+    text = '<function name="get_weather"><param name="city">北京</param>'
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == 0
     assert "get_weather" in res.normal_text
@@ -204,11 +204,7 @@ def test_duplicate_param_names_invalid_v3():
 def test_case_sensitive_param_name_invalid_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = (
-        '<function name="get_weather">'
-        '<param name="City">北京</param>'
-        "</function>\n"
-    )
+    text = '<function name="get_weather"><param name="City">北京</param></function>\n'
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == 0
 
@@ -243,9 +239,7 @@ def test_streaming_increment_v3():
 def test_streaming_split_bot_token():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = (
-        '<function name="get_weather">' '<param name="city">北京</param>' "</function>"
-    )
+    text = '<function name="get_weather"><param name="city">北京</param></function>'
 
     r1 = detector.parse_streaming_increment("<", tools)
     assert r1.normal_text == ""
@@ -274,9 +268,7 @@ def test_streaming_multiple_complete_blocks_in_one_delta():
 def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = (
-        '<function name="get_weather">' '<param name="city">A & B</param>' "</function>"
-    )
+    text = '<function name="get_weather"><param name="city">A & B</param></function>'
 
     result = detector.detect_and_parse(text, tools)
     assert len(result.calls) == 1

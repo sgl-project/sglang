@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 from sglang.multimodal_gen.runtime.models.encoders import base as _base_mod
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     FOLD_MIN_HIDDEN_SIZE,
@@ -33,7 +34,7 @@ def _run(
     dp=1,
     disagg=False,
     num_gpus=None,
-    image=(),
+    image=None,
     policy="auto",
     batching_max_size=1,
     explicit=(),
@@ -48,9 +49,9 @@ def _run(
         batching_max_size=batching_max_size,
         is_arg_explicitly_set=lambda name: name in explicit,
         num_gpus=num_gpus if num_gpus is not None else tp * sp * cfg * dp,
-        pipeline_config=SimpleNamespace(
+        pipeline_config=PipelineConfig(
             text_encoder_configs=tuple(encoders),
-            image_encoder_configs=tuple(image),
+            image_encoder_config=(image if image is not None else ImageEncoderConfig()),
         ),
     )
     ServerArgs.adjust_pipeline_config(self)
@@ -68,8 +69,23 @@ def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"
 
 
 def test_pure_tp_not_folded():
-    # replica == tp: encoder already uses every replica GPU; nothing to fold.
+    # replica == tp under auto: each rank keeps a full encoder replica; auto
+    # never proposes folding here (the trade-off stays opt-in, see below).
     assert _proposed_mode(tp=2, sp=1, cfg=1) is None
+
+
+def test_explicit_fold_proposes_replica_for_any_shape():
+    # Encoder layout is independent of the DiT's parallelism: an operator's
+    # explicit fold is honored on every multi-rank replica instead of being
+    # silently ignored (pure TP) or narrowed to the SP group (dp > 1).
+    assert _proposed_mode(tp=2, sp=1, cfg=1, policy="fold") == "replica"
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
+    assert (
+        _proposed_mode(tp=2, sp=2, cfg=1, dp=2, num_gpus=8, policy="fold") == "replica"
+    )
+    # single-GPU replica: nothing to shard over
+    assert _proposed_mode(tp=1, sp=1, cfg=1, policy="fold") is None
+    assert _proposed_mode(tp=1, sp=1, cfg=1, dp=2, num_gpus=2, policy="fold") is None
 
 
 def test_single_gpu_not_folded():
@@ -115,16 +131,28 @@ def test_all_encoders_get_the_same_proposed_mode():
     img = ImageEncoderConfig()
     for e in (t5, clip, img):
         e.parallel_folding_mode = None
-    _run([t5, clip], tp=1, sp=2, cfg=1, image=[img])
+    _run([t5, clip], tp=1, sp=2, cfg=1, image=img)
     assert t5.parallel_folding_mode == "world"
     assert clip.parallel_folding_mode == "world"
     assert img.parallel_folding_mode == "world"
 
 
-def test_adjust_proposes_regardless_of_policy():
-    # adjust reads the parallelism only; finalize owns the policy decision.
-    for policy in ("auto", "fold", "dp", "replicate"):
+def test_image_encoder_gets_each_policy_proposal():
+    expected_modes = {"auto": "world", "fold": "replica", "replicate": "world"}
+    for policy, expected_mode in expected_modes.items():
+        image = ImageEncoderConfig()
+        _run([], tp=1, sp=2, cfg=1, image=image, policy=policy)
+        assert image.parallel_folding_mode == expected_mode
+
+
+def test_adjust_proposal_policy_dependence():
+    # adjust reads the parallelism only for auto/dp/replicate; finalize owns
+    # those policy decisions. An explicit fold is the one exception: it widens
+    # the proposal to the whole replica, because finalize cannot conjure a
+    # group that was never proposed (pure-TP replicas had none at all).
+    for policy in ("auto", "dp", "replicate"):
         assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
 
 
 def test_no_policy_touches_batching_max_size():
@@ -174,6 +202,22 @@ def test_indivisible_dims_not_folded():
     assert encoder_folding_worthwhile(_enc(4096, 64, 10250), group_size=4) is False
 
 
+def test_image_encoder_fold_requires_divisible_dims(monkeypatch):
+    monkeypatch.setattr(
+        _base_mod,
+        "get_folding_tp_group",
+        lambda config: SimpleNamespace(world_size=4),
+    )
+    for heads, expected_mode in ((64, "world"), (6, None)):
+        image = ImageEncoderConfig()
+        image.hidden_size = 4096
+        image.num_attention_heads = heads
+        image.intermediate_size = 10240
+        image.parallel_folding_mode = "world"
+        finalize_encoder_folding(image, "fold")
+        assert image.parallel_folding_mode == expected_mode
+
+
 def test_group_size_one_not_folded():
     assert encoder_folding_worthwhile(_enc(4096, 64, 10240), group_size=1) is False
 
@@ -221,7 +265,7 @@ def _finalize(
     policy,
     mode="world",
     group_size=2,
-    batched=False,
+    prefer_dp=False,
     measured=True,
 ):
     monkeypatch.setattr(
@@ -234,7 +278,7 @@ def _finalize(
     )
     enc = _enc(hidden, heads, inter)
     enc.parallel_folding_mode = mode
-    finalize_encoder_folding(enc, policy, batched=batched)
+    finalize_encoder_folding(enc, policy, prefer_dp=prefer_dp)
     return enc.parallel_folding_mode
 
 
@@ -249,11 +293,13 @@ def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
     assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
 
 
-def test_finalize_auto_leaves_dp_capable_unsharded_when_batched(monkeypatch):
+def test_finalize_auto_leaves_dp_capable_unsharded_when_dp_preferred(monkeypatch):
     # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
-    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", prefer_dp=True) is None
+    # TP or DiT-DP makes encoder DP ineligible, so keep the useful fold
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
     # CLIP-L cannot dp either, so folding remains the only question
-    assert _finalize(monkeypatch, 768, 12, 3072, "auto", batched=True) is None
+    assert _finalize(monkeypatch, 768, 12, 3072, "auto", prefer_dp=True) is None
 
 
 def test_finalize_auto_needs_a_measured_topology(monkeypatch):

@@ -40,7 +40,7 @@ class LatentPreparationFingerprint:
 
 @dataclass(frozen=True)
 class LatentPreparationSpec:
-    """ "dataclass for controlling the LatentPreparationStage runtime semantics"""
+    """Runtime configuration for LatentPreparationStage."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -141,18 +141,24 @@ class LatentPreparationStage(PipelineStage):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        # Generate or use provided latents
+        # Apply the same preparation to generated and unpacked provided latents.
+        spec = self.get_latent_preparation_spec(
+            batch, server_args, batch_size, latent_num_frames, device
+        )
         if latents is None:
-            spec = self.get_latent_preparation_spec(
-                batch, server_args, batch_size, latent_num_frames, device
-            )
             latents = randn_tensor(
                 spec.shape,
                 generator=generator,
                 device=spec.device,
                 dtype=spec.dtype,
             )
+            needs_preparation = True
+        else:
+            latents = latents.to(device)
+            # ComfyUI may provide already-packed [B, S, D] latents.
+            needs_preparation = tuple(latents.shape) == tuple(spec.shape)
 
+        if needs_preparation:
             latent_ids = (
                 server_args.pipeline_config.maybe_prepare_latent_ids(latents)
                 if spec.prepare_latent_ids
@@ -166,8 +172,6 @@ class LatentPreparationStage(PipelineStage):
                 latents = server_args.pipeline_config.maybe_pack_latents(
                     latents, batch_size, batch
                 )
-        else:
-            latents = latents.to(device)
 
         # Scale the initial noise if needed
         if self.should_scale_initial_noise(batch, server_args) and hasattr(
@@ -342,9 +346,7 @@ class LatentPreparationStage(PipelineStage):
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )
         if use_temporal_scaling_frames:
-            temporal_scale_factor = (
-                server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
+            temporal_scale_factor = server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
             latent_num_frames = (video_length - 1) // temporal_scale_factor + 1
         return int(latent_num_frames)
 
@@ -354,8 +356,10 @@ class LatentPreparationStage(PipelineStage):
         result.add_check(
             "prompt_or_embeds",
             None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
+            lambda _: (
+                V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds)
+            ),
         )
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
         result.add_check(

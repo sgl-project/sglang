@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.srt.layers.linear import LinearParallelGroup, resolve_linear_parallel_group
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -18,7 +19,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
 )
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,10 @@ class InklingDenseMLP(LlamaMLP):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         fused: bool = False,
-        tp_rank: int = 0,
-        tp_size: int = 1,
+        parallel_group: LinearParallelGroup = "replicated",
         tp_group: torch.distributed.ProcessGroup | None = None,
         use_dp_attention_reduce: bool = False,
     ) -> None:
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
         self.tp_group = tp_group
 
         super().__init__(
@@ -107,8 +105,7 @@ class InklingDenseMLP(LlamaMLP):
             quant_config=quant_config,
             prefix=prefix,
             reduce_results=False,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group=parallel_group,
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
 
@@ -123,7 +120,7 @@ class InklingDenseMLP(LlamaMLP):
         fused = fused and not lora_compatible_layout_enabled()
         self.layer_id = layer_id
         self.act_fn = InklingSwiglu(interleaved=fused)
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
     def forward(
         self,
@@ -160,8 +157,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         prefix: str,
         quant_config: QuantizationConfig | None = None,
         inference_moe_w13_interleaved: bool = True,
-        tp_rank: int = 0,
-        tp_size: int = 1,
+        parallel_group: LinearParallelGroup = "replicated",
         tp_group: torch.distributed.ProcessGroup | None = None,
         linearized_bf16: bool = False,
     ):
@@ -186,8 +182,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         self.hidden_size = d_model
         self.layer_id = layer_id
 
-        self.moe_tp_rank = tp_rank
-        self.moe_tp_size = tp_size
+        self.moe_tp_rank, self.moe_tp_size = resolve_linear_parallel_group(
+            parallel_group
+        )
         self.tp_group = tp_group
 
         local_intermediate_size = shared_d_mlp // self.moe_tp_size
@@ -209,6 +206,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             gemm1_alpha=None,
             gemm1_clamp_limit=None,
             is_gated=True,
+            layer=self,
         )
 
         FusedMoELoadingMixin.__init__(
@@ -217,6 +215,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             self.quant_method,
             self.moe_runner_config,
             self.moe_tp_rank,
+            self.moe_tp_size,
         )
         self.quant_method.create_weights(
             layer=self,
@@ -328,9 +327,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         """
         assert x.ndim in (2, 3), f"{x.shape=}"
         assert gammas.ndim in (2, 3), f"{gammas.shape=}"
-        assert (
-            gammas.size(-1) == self.n_shared_experts
-        ), f"{gammas.shape=} {self.n_shared_experts=}"
+        assert gammas.size(-1) == self.n_shared_experts, (
+            f"{gammas.shape=} {self.n_shared_experts=}"
+        )
         if self._fp4_strategy.serves_fp4:
             return self._forward_fp4(x, gammas, use_reduce_scatter)
 
@@ -386,9 +385,9 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
             silu_and_mul_triton,
         )
 
-        assert (
-            self.inference_moe_w13_interleaved
-        ), "silu_and_mul_triton requires interleaved w13"
+        assert self.inference_moe_w13_interleaved, (
+            "silu_and_mul_triton requires interleaved w13"
+        )
         y_st_2f = y_st2f.view(-1, y_st2f.size(-1))
         y_st_f = silu_and_mul_triton(y_st_2f, gammas_st.reshape(-1))
         return y_st_f.view(*y_st2f.shape[:-1], y_st2f.size(-1) // 2)
@@ -484,7 +483,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         # All shared experts must share one global weight scale (reshard with
         # single_global_scale=True). ModelOpt's input_scale = amax / (6 * 448).
         flat2 = scale2.reshape(-1).float()
-        if get_server_args().load_format == "dummy" and not bool(
+        if get_model().load_format == "dummy" and not bool(
             torch.all(flat2 == flat2[0])
         ):
             # Dummy loading uses per-element noise; replace it with a valid scale.

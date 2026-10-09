@@ -1,8 +1,9 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -11,15 +12,28 @@ from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
     create_tree_cache,
+    create_unified_radix_cache,
     default_radix_cache_factory,
     get_radix_cache_factory,
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.test_utils import CustomTestCase, enter_override
+
+
+def _publish(testcase, **fields):
+    """Install a published config for one case and restore on its cleanup."""
+    from sglang.srt.runtime_context import get_context, get_server_args
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    testcase.addCleanup(override.restore)
+    return get_server_args()
 
 
 def _make_ctx(
+    testcase,
     *,
     backend=None,
     enable_streaming=False,
@@ -29,14 +43,19 @@ def _make_ctx(
     is_dsa=False,
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
-    effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
 ):
-    server_args = MagicMock()
-    server_args.radix_cache_backend = backend
-    server_args.enable_streaming_session = enable_streaming
-    server_args.enable_lmcache = enable_lmcache
-    server_args.enable_flexkv = False
+    # The factory reads the published bags for the cache-backend leaves, so the
+    # fixture publishes them; the instance stays for the whole-object contract
+    # `TreeCacheBuildContext` carries.
+    server_args = _publish(
+        testcase,
+        radix_cache_backend=backend,
+        enable_streaming_session=enable_streaming,
+        enable_lmcache=enable_lmcache,
+        enable_flexkv=False,
+        enable_unified_cache_external_linker=False,
+    )
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),
@@ -45,7 +64,6 @@ def _make_ctx(
         is_dsa=is_dsa,
         enable_hierarchical_cache=enable_hierarchical_cache,
         disable_radix_cache=disable_radix_cache,
-        effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=MagicMock(),
         model_config=MagicMock(),
         tp_size=1,
@@ -96,134 +114,179 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
     def test_dispatches_to_registered_factory(self):
-        cache = MagicMock()
-        cache.supports_streaming_session.return_value = True
+        cache = MagicMock(spec=UnifiedRadixCache)
         factory = MagicMock(return_value=cache)
         register_radix_cache_backend("custom", factory)
 
-        result = create_tree_cache(_make_ctx(backend="custom"))
+        result = create_tree_cache(_make_ctx(self, backend="custom"))
 
         factory.assert_called_once()
         self.assertIs(result, cache)
 
     def test_unknown_backend_raises(self):
         with self.assertRaises(ValueError):
-            create_tree_cache(_make_ctx(backend="not_a_real_backend"))
+            create_tree_cache(_make_ctx(self, backend="not_a_real_backend"))
 
     @patch("sglang.srt.mem_cache.registry.default_radix_cache_factory")
     def test_unset_backend_falls_back_to_default(self, default_factory):
-        cache = MagicMock()
-        cache.supports_streaming_session.return_value = True
+        cache = MagicMock(spec=UnifiedRadixCache)
         default_factory.return_value = cache
 
-        result = create_tree_cache(_make_ctx(backend=None))
+        result = create_tree_cache(_make_ctx(self, backend=None))
 
         default_factory.assert_called_once()
         self.assertIs(result, cache)
 
-    def test_streaming_wrap_when_cache_does_not_support_it(self):
+    def test_streaming_rejected_on_non_unified_cache(self):
         inner = MagicMock()
-        inner.supports_streaming_session.return_value = False
         register_radix_cache_backend("nonstreaming", MagicMock(return_value=inner))
 
-        with patch(
-            "sglang.srt.session.streaming_session.StreamingSession"
-        ) as session_cls:
-            session_cls.return_value = MagicMock(name="wrapped")
-            result = create_tree_cache(
-                _make_ctx(backend="nonstreaming", enable_streaming=True)
+        with self.assertRaisesRegex(NotImplementedError, "not verified"):
+            create_tree_cache(
+                _make_ctx(self, backend="nonstreaming", enable_streaming=True)
             )
 
-        session_cls.assert_called_once_with(inner)
-        self.assertIs(result, session_cls.return_value)
+    def test_full_attention_with_disable_radix_routes_to_unified(self):
+        ctx = _make_ctx(self, disable_radix_cache=True)
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            result = default_radix_cache_factory(ctx)
+        create_unified.assert_called_once_with(ctx)
+        self.assertIs(result, create_unified.return_value)
 
-    def test_no_streaming_wrap_when_cache_supports_it(self):
+    def test_hybrid_swa_with_disable_radix_routes_to_unified(self):
+        ctx = _make_ctx(
+            self,
+            disable_radix_cache=True,
+            is_hybrid_swa=True,
+            full_tokens_per_layer=128,
+        )
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            result = default_radix_cache_factory(ctx)
+        create_unified.assert_called_once_with(ctx)
+        self.assertIs(result, create_unified.return_value)
+
+    def test_swa_component_accepts_hisparse_allocator(self):
+        # Disabled DeepSeek V4 HiSparse routes to UnifiedRadixCache, whose SWA
+        # component must accept the HiSparse allocator.
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+        params = MagicMock(sliding_window_size=128, page_size=64)
+        params.token_to_kv_pool_allocator = MagicMock(
+            spec=DeepSeekV4HiSparseTokenToKVPoolAllocator
+        )
+        component = SWAComponent(MagicMock(), params)
+        self.assertEqual(component.full_window_pages, 2)
+
+    def test_pure_swa_with_disable_radix_skips_storage_backends(self):
+        ctx = _make_ctx(
+            self, disable_radix_cache=True, is_hybrid_swa=True, full_tokens_per_layer=0
+        )
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_unified_cache_external_linker=True
+            ),
+        )
+        with patch(
+            "sglang.srt.mem_cache.pure_swa_radix_cache.PureSWARadixCache"
+        ) as PureSWARadixCache:
+            PureSWARadixCache.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+            PureSWARadixCache.assert_called_once_with(params=ctx.params)
+            self.assertIs(result, PureSWARadixCache.return_value)
+
+    def test_pure_swa_with_disable_radix_and_host_pool_goes_to_unified(self):
+        ctx = _make_ctx(
+            self, disable_radix_cache=True, is_hybrid_swa=True, full_tokens_per_layer=0
+        )
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_retraction_backup="host_pool"
+            ),
+        )
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            result = default_radix_cache_factory(ctx)
+            create_unified.assert_called_once_with(ctx)
+            self.assertIs(result, create_unified.return_value)
+
+    def test_mamba_rejected_on_cache_without_mamba(self):
         inner = MagicMock()
-        inner.supports_streaming_session.return_value = True
-        register_radix_cache_backend("streaming", MagicMock(return_value=inner))
+        inner.supports_mamba.return_value = False
+        register_radix_cache_backend("nomamba", MagicMock(return_value=inner))
 
-        result = create_tree_cache(
-            _make_ctx(backend="streaming", enable_streaming=True)
-        )
+        with self.assertRaisesRegex(NotImplementedError, "not verified"):
+            create_tree_cache(_make_ctx(self, backend="nomamba", is_hybrid_ssm=True))
 
-        self.assertIs(result, inner)
-
-
-class TestDefaultRadixCacheFactory(CustomTestCase):
-    """Branch coverage for the built-in radix cache selection chain.
-
-    Each cache class is imported lazily inside the factory, so we patch
-    the class at its definition site to verify routing without depending
-    on each cache's real constructor or runtime state.
-    """
-
-    def test_chunk_cache_when_chunked_prefill_and_disable_radix(self):
-        ctx = _make_ctx(effective_chunked_prefill_size=512, disable_radix_cache=True)
-        with patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache:
-            ChunkCache.return_value = MagicMock()
-            result = default_radix_cache_factory(ctx)
-            ChunkCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, ChunkCache.return_value)
-
-    def test_swa_chunk_cache_when_chunked_prefill_disable_and_hybrid_swa(self):
+    def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
-            effective_chunked_prefill_size=512,
-            disable_radix_cache=True,
-            is_hybrid_swa=True,
+            self,
         )
-        with patch("sglang.srt.mem_cache.chunk_cache.SWAChunkCache") as SWAChunkCache:
-            SWAChunkCache.return_value = MagicMock()
-            result = default_radix_cache_factory(ctx)
-            SWAChunkCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, SWAChunkCache.return_value)
-
-    def test_pure_swa_chunk_cache_when_chunked_prefill_disable_and_all_swa(self):
-        ctx = _make_ctx(
-            effective_chunked_prefill_size=512,
-            disable_radix_cache=True,
-            is_hybrid_swa=True,
-            full_tokens_per_layer=0,
-        )
-        with patch(
-            "sglang.srt.mem_cache.chunk_cache.PureSWAChunkCache"
-        ) as PureSWAChunkCache:
-            PureSWAChunkCache.return_value = MagicMock()
-            result = default_radix_cache_factory(ctx)
-            PureSWAChunkCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, PureSWAChunkCache.return_value)
-
-    def test_cpp_radix_cache_when_env_flag_set(self):
-        ctx = _make_ctx()
-        # `radix_cache_cpp` requires ninja + C++ extension to import, so
-        # we inject a stand-in module rather than letting patch() trigger
-        # the real import.
-        fake_module = MagicMock()
-        with (
-            patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
-                return_value=True,
-            ),
-            patch.dict(
-                "sys.modules",
-                {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
-            ),
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_module.RadixCacheCpp.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
-            )
-            self.assertIs(result, fake_module.RadixCacheCpp.return_value)
-
-    def test_unified_radix_cache_when_env_flag_set(self):
-        ctx = _make_ctx()
         # Shim both factory imports — each transitively loads sgl_kernel.
         fake_components = MagicMock()
         fake_radix = MagicMock()
-        with (
-            patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get",
-                return_value=True,
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_unified_radix_cache_when_hierarchical(self):
+        ctx = _make_ctx(self, enable_hierarchical_cache=True)
+        # Full attention with hierarchical cache also uses UnifiedRadixCache.
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
+                ctx.server_args, ctx.params
+            )
+            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
+            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_unified_radix_cache_with_mori_external_linker(self):
+        from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
+
+        ctx = _make_ctx(self)
+        # The factory reads the linker settings from the bags.
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend="mori",
             ),
+        )
+        fake_components = MagicMock()
+        fake_components.ComponentType.FULL = "full"
+        fake_radix = MagicMock()
+        cache = fake_radix.UnifiedRadixCache.return_value
+        cache.components = ("full",)
+        counter = MagicMock(name="layer_done_counter")
+        cache.linker.layer_done_counter = counter
+        linker = MagicMock(name="linker")
+
+        with (
             patch.dict(
                 "sys.modules",
                 {
@@ -231,107 +294,47 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                     "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
                 },
             ),
+            patch.object(
+                umbp_direct_linker,
+                "UMBPDirectLinker",
+                return_value=linker,
+            ) as linker_cls,
         ):
             result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
-    def test_hi_radix_cache_when_hierarchical(self):
-        ctx = _make_ctx(enable_hierarchical_cache=True)
-        # `hiradix_cache` imports `hicache_storage` and
-        # `memory_pool_host`, both of which transitively load
-        # `sgl_kernel`; inject a stand-in module.
-        fake_module = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {"sglang.srt.mem_cache.hiradix_cache": fake_module},
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_module.HiRadixCache.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
-            )
-            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_module.HiRadixCache.return_value)
+        linker_cls.assert_called_once_with(
+            ctx.server_args,
+            ctx.params,
+            components={"full"},
+        )
+        cache.init_cache_linker.assert_called_once_with(linker)
+        ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+        self.assertIs(result, cache)
 
-    def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
-        ctx = _make_ctx(enable_hierarchical_cache=True, is_hybrid_ssm=True)
-        # Hybrid SSM with hierarchical cache now uses UnifiedRadixCache.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
-                ctx.server_args, ctx.params
-            )
-            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
-    def test_unified_radix_cache_when_hierarchical_and_hybrid_swa(self):
-        ctx = _make_ctx(enable_hierarchical_cache=True, is_hybrid_swa=True)
-        # Hybrid SWA with hierarchical cache also uses UnifiedRadixCache.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
-                ctx.server_args, ctx.params
-            )
-            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
-    def test_unified_radix_cache_when_hierarchical_and_dsa(self):
-        ctx = _make_ctx(enable_hierarchical_cache=True, is_dsa=True)
-        # DSA models (e.g. DeepSeek V3.2 / GLM-5.1) with hierarchical cache
-        # use UnifiedRadixCache.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
-                ctx.server_args, ctx.params
-            )
-            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
-    def test_swa_radix_cache_when_hybrid_swa(self):
-        ctx = _make_ctx(is_hybrid_swa=True)
-        # SWA hybrid models now default to the unified radix tree.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+    def test_custom_unified_cache_keeps_host_pool_setup(self):
+        ctx = _make_ctx(self)
+        enter_override(
+            self,
+            get_context().override_server_args(
+                disaggregation_decode_retraction_backup="host_pool"
+            ),
+        )
+        cache_class = MagicMock()
+        result = create_unified_radix_cache(ctx, cache_class=cache_class)
+        cache_class.assert_called_once_with(ctx.params)
+        result.init_hicache.assert_called_once_with(ctx.server_args, ctx.params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            result.cache_controller.layer_done_counter
+        )
+        self.assertIs(result, cache_class.return_value)
 
     def test_pure_swa_radix_cache_when_all_swa(self):
-        ctx = _make_ctx(is_hybrid_swa=True, full_tokens_per_layer=0)
+        ctx = _make_ctx(self, is_hybrid_swa=True, full_tokens_per_layer=0)
         with patch(
             "sglang.srt.mem_cache.pure_swa_radix_cache.PureSWARadixCache"
         ) as PureSWA:
@@ -340,49 +343,91 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, PureSWA.return_value)
 
-    def test_mamba_radix_cache_when_hybrid_ssm(self):
-        ctx = _make_ctx(is_hybrid_ssm=True)
-        # Mamba hybrid models now default to the unified radix tree.
+    def test_lmcache_unified_radix_cache_when_enable_lmcache(self):
+        ctx = _make_ctx(self, enable_lmcache=True)
+        fake_module = MagicMock()
         fake_components = MagicMock()
-        fake_radix = MagicMock()
         with patch.dict(
             "sys.modules",
             {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
                 "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
             },
         ):
             result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
-    def test_lmc_radix_cache_when_enable_lmcache(self):
-        ctx = _make_ctx(enable_lmcache=True)
-        # The lmcache backend raises at import time when the `lmcache`
-        # package isn't installed, so inject a stand-in module instead
-        # of letting patch() trigger the real import.
-        fake_module = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {"sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache": fake_module},
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_module.LMCRadixCache.assert_called_once_with(
-                params=ctx.params,
+            fake_module.LMCacheUnifiedRadixCache.assert_called_once_with(
+                ctx.params,
                 model_config=ctx.model_config,
                 tp_size=ctx.tp_size,
-                rank=ctx.tp_rank,
-                tp_group=ctx.tp_group,
+                tp_rank=ctx.tp_rank,
+                lmcache_config_file=None,
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
-            self.assertIs(result, fake_module.LMCRadixCache.return_value)
+            self.assertEqual(
+                ctx.params.tree_components,
+                (fake_components.ComponentType.FULL,),
+            )
+            self.assertIs(result, fake_module.LMCacheUnifiedRadixCache.return_value)
 
-    def test_fallback_to_radix_cache(self):
-        ctx = _make_ctx()
-        with patch("sglang.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
-            RadixCache.return_value = MagicMock()
-            result = default_radix_cache_factory(ctx)
-            RadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, RadixCache.return_value)
+    def test_lmcache_supports_hybrid_swa_components(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_swa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.SWA,
+            ),
+        )
+
+    def test_lmcache_supports_hybrid_ssm_components(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_hybrid_ssm=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.MAMBA,
+            ),
+        )
+
+    def test_lmcache_supports_dsa_as_full_sidecar(self):
+        ctx = _make_ctx(self, enable_lmcache=True, is_dsa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.FULL,),
+        )
 
 
 if __name__ == "__main__":

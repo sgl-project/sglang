@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.runtime.vla.observation import VLAObservationBatch
 
 
-def _tensor_from_image(value: Any) -> torch.Tensor:
+def _tensor_from_image(value: Any) -> tuple[torch.Tensor, bool, bool]:
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
         if tensor.ndim == 4:
@@ -33,14 +33,16 @@ def _tensor_from_image(value: Any) -> torch.Tensor:
             )
         is_integer = not tensor.is_floating_point()
         tensor = tensor.to(dtype=torch.float32)
-        if is_integer or tensor.max() > 2.0:
+        is_byte_scaled = is_integer or tensor.max() > 2.0
+        is_normalized = not is_byte_scaled and tensor.min() < 0.0
+        if is_byte_scaled:
             tensor = tensor / 255.0
-        return tensor
+        return tensor, is_byte_scaled, is_normalized
 
     if isinstance(value, Image.Image):
         image = value.convert("RGB")
         arr = np.asarray(image, dtype=np.float32) / 255.0
-        return torch.from_numpy(arr).permute(2, 0, 1)
+        return torch.from_numpy(arr).permute(2, 0, 1), True, False
 
     if isinstance(value, (np.ndarray, list)):
         arr = np.asarray(value)
@@ -57,15 +59,21 @@ def _tensor_from_image(value: Any) -> torch.Tensor:
             )
         is_integer = not tensor.is_floating_point()
         tensor = tensor.to(dtype=torch.float32)
-        if is_integer or tensor.max() > 2.0:
+        is_byte_scaled = is_integer or tensor.max() > 2.0
+        is_normalized = not is_byte_scaled and tensor.min() < 0.0
+        if is_byte_scaled:
             tensor = tensor / 255.0
-        return tensor
+        return tensor, is_byte_scaled, is_normalized
 
     raise TypeError(f"Unsupported Pi05 image type: {type(value)}")
 
 
 def _resize_with_pad_image_tensor(
-    tensor: torch.Tensor, size: tuple[int, int]
+    tensor: torch.Tensor,
+    size: tuple[int, int],
+    *,
+    round_to_uint8: bool = False,
+    pad_value: float = 0.0,
 ) -> torch.Tensor:
     height, width = size
     if tensor.shape[-2:] == (height, width):
@@ -80,14 +88,30 @@ def _resize_with_pad_image_tensor(
         mode="bilinear",
         align_corners=False,
     )[0]
+    if round_to_uint8:
+        # openpi rounds resized byte images before mapping them to [-1, 1]
+        tensor = torch.round(tensor * 255.0).clamp_(0.0, 255.0) / 255.0
     pad_h0, rem_h = divmod(height - resized_height, 2)
     pad_w0, rem_w = divmod(width - resized_width, 2)
     return F.pad(
         tensor,
         (pad_w0, pad_w0 + rem_w, pad_h0, pad_h0 + rem_h),
         mode="constant",
-        value=0.0,
+        value=pad_value,
     )
+
+
+def _preprocess_image(value: Any, size: tuple[int, int]) -> torch.Tensor:
+    tensor, is_byte_scaled, is_normalized = _tensor_from_image(value)
+    tensor = _resize_with_pad_image_tensor(
+        tensor,
+        size,
+        round_to_uint8=is_byte_scaled,
+        pad_value=-1.0 if is_normalized else 0.0,
+    )
+    if is_normalized:
+        return tensor.clamp_(-1.0, 1.0)
+    return tensor * 2.0 - 1.0
 
 
 class Pi05Preprocessor:
@@ -142,9 +166,7 @@ class Pi05Preprocessor:
             value = raw_images.get(key)
             is_present = value is not None and bool(image_masks_in.get(key, True))
             if is_present:
-                tensor = _tensor_from_image(value)
-                tensor = _resize_with_pad_image_tensor(tensor, self.config.image_size)
-                tensor = tensor * 2.0 - 1.0
+                tensor = _preprocess_image(value, self.config.image_size)
             else:
                 channels = 3
                 height, width = self.config.image_size

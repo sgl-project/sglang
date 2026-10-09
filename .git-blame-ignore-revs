@@ -1,0 +1,5 @@
+# Skipped by `git blame`. Enable locally:
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# [CI][RFC] Replace black-jupyter with ruff-format (#37210)
+28262c20df6f2945c1b1cd7b27b0faef59cb0438

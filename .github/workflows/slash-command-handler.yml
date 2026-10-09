@@ -14,14 +14,24 @@ jobs:
   slash_command:
     # Only run if it is a PR and the comment contains a recognized command
     # Use contains() since startsWith() can't handle leading whitespace/newlines
+    #
+    # The trailing startsWith() namespace clauses admit *unrecognized* commands
+    # so the script can answer them; they are startsWith() because
+    # contains('/run-') would fire on any comment quoting `scripts/run-tests.sh`.
     if: >
       github.event.issue.pull_request &&
       (contains(github.event.comment.body, '/tag-run-ci-label') ||
        contains(github.event.comment.body, '/rerun-failed-ci') ||
        contains(github.event.comment.body, '/tag-and-rerun-ci') ||
-       contains(github.event.comment.body, '/rerun-stage') ||
+       contains(github.event.comment.body, '/run-full-ci') ||
+       contains(github.event.comment.body, '/run-extra-ci') ||
+       contains(github.event.comment.body, '/rerun-full-ci') ||
+       contains(github.event.comment.body, '/rerun-extra-ci') ||
        contains(github.event.comment.body, '/rerun-group') ||
-       contains(github.event.comment.body, '/rerun-test'))
+       contains(github.event.comment.body, '/rerun-test') ||
+       startsWith(github.event.comment.body, '/tag-') ||
+       startsWith(github.event.comment.body, '/rerun-') ||
+       startsWith(github.event.comment.body, '/run-'))
     runs-on: ubuntu-latest
 
     steps:

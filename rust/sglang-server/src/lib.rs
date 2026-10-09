@@ -1,169 +1,244 @@
-//! sglang-server: a multi-threaded Rust frontend (API server → TokenizerManager
+//! sglang-server: a multi-threaded Rust frontend (HTTP server → TokenizerManager
 //! → Tokenizer/Detokenizer) embedded in the Python scheduler process.
 //!
-//! Pipeline stages 1–5 are pure Rust and never touch a `PyObject`, so they run
-//! concurrently with the Python scheduler without contending for the GIL. The
-//! only GIL crossings are the boundary methods on [`Server`]:
-//!   * `recv_requests` — Python scheduler thread drains the ingress ring.
-//!   * `push_batch`    — Python scheduler thread pushes one output batch.
-//!   * `push_result`   — Python scheduler thread pushes one control result.
-//!
-//! All are non-blocking, so the GIL is never held across a wait.
+//! This file is the Python↔Rust boundary: it registers the pyo3 module
+//! (`_server`) and the classes exposed to the scheduler — the boot config
+//! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
+//! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
+//! (boot, `recv_requests`/`wait_request`, `push_*`, shutdown),
+//! [`IngressRequest`] and [`ShmBuffer`]. Everything behind that boundary --
+//! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
+//! SSE streaming, and so on — is implemented purely in Rust and never touches
+//! a `PyObject`.
 
 mod api_server;
-mod detokenizer;
-mod environ;
-mod error;
-mod fsm;
-mod ids;
 mod message;
-mod ring;
-mod runtime;
-mod tokenizer;
+mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
-use std::net::SocketAddr;
+pub use message::config::{
+    DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
+    RustServerServerArgs, ServerArgs,
+};
+pub use message::multimodal::{MediaHints, MmItem};
+pub use message::request::MmData;
+pub use message::types::TokenIds;
+pub use multi_modality::encoded::{
+    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
+};
+pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
+pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
+pub use sglang_mm::pipeline::{Tensor, TensorData};
+
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
-use crate::runtime::{Runtime, RuntimeConfig};
+use crate::message::config::RuntimeConfig;
+use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
+use crate::utils::{logging, runtime, shm::ShmSegment};
 
-/// Columnar ingress batch handed to Python by [`Server::recv_requests`].
-/// `frozen`: immutable snapshot, so field access never contends on a borrow.
+/// One drained request handed to Python by [`Server::recv_requests`]: the
+/// msgpack scalar header plus every non-scalar payload as a named buffer --
+/// `input_ids`, `token_ids_logprob`, and for a multimodal request the
+/// `mm.*` set (`mm.feature.{i}` per item, `mm.mrope`, and the `mm.meta`
+/// msgpack sidecar) that `RustMmProcessor.wrap_encoded` or an external
+/// package's wrapper consumes. An inline buffer is a numpy array, shaped, that
+/// **owns** the Rust vector (no copy); a shm buffer is a [`ShmBuffer`] naming
+/// the segment to map. `frozen`: immutable snapshot, so field access never
+/// contends on a borrow.
 #[pyclass(frozen, get_all)]
-struct IngressBatch {
-    /// One msgpack scalar header per request (`input_ids` omitted).
-    headers: Vec<Py<PyBytes>>,
-    /// The raw-data plane today just all requests' raw little-endian int64
-    /// ids, concatenated; sliced per request via `lengths`.
-    data: Py<PyBytes>,
-    /// Per-request token count (0 for control requests).
-    lengths: Vec<u32>,
+pub struct IngressRequest {
+    header: Py<PyBytes>,
+    /// `(name, numpy array | ShmBuffer)` in producer order; empty for control
+    /// requests.
+    buffers: Vec<(String, Py<PyAny>)>,
+}
+
+/// A buffer parked in a POSIX shared-memory segment: `name` is what Python's
+/// `SharedMemory(name=...)` opens, `dtype` the numpy dtype to view it with,
+/// `shape` its logical shape.
+///
+/// The unlink duty stays on this side until Python has admitted the request.
+/// `release()` hands it to `ShmPointerMMData` (whose `materialize()` unlinks
+/// after the post-broadcast open) once every item of the request wrapped;
+/// `discard()` unlinks at once when the request is rejected; and a `ShmBuffer`
+/// dropped with neither call (a header that never decoded, so the buffers were
+/// never looked at) unlinks on drop. So no rejection path can leak a segment.
+#[pyclass]
+pub struct ShmBuffer {
+    /// `Some` while this side still owns the unlink.
+    segment: Option<ShmSegment>,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    dtype: &'static str,
+    #[pyo3(get)]
+    shape: Vec<usize>,
+}
+
+impl ShmBuffer {
+    fn new(segment: ShmSegment, dtype: &'static str, shape: Vec<usize>) -> Self {
+        Self {
+            name: segment.name().to_owned(),
+            segment: Some(segment),
+            dtype,
+            shape,
+        }
+    }
+
+    /// Whether this side still owns the unlink.
+    #[cfg(test)]
+    fn owns_segment(&self) -> bool {
+        self.segment.is_some()
+    }
+}
+
+#[pymethods]
+impl ShmBuffer {
+    /// Hand the unlink duty to Python: the request was admitted and its
+    /// `ShmPointerMMData` stubs now own the segment. Idempotent.
+    fn release(&mut self) {
+        if let Some(segment) = self.segment.take() {
+            let _ = segment.into_name();
+        }
+    }
+
+    /// Unlink now: the request was rejected before Python took the segment.
+    /// Idempotent, and a no-op after `release`.
+    fn discard(&mut self) {
+        self.segment.take();
+    }
+}
+
+/// Hand one buffer across: the inline vector becomes a numpy array owning it,
+/// viewed with the buffer's shape; the shm segment becomes its name.
+fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(String, Py<PyAny>)> {
+    use message::buffers::{BufferData, BufferStore};
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    fn shaped<T: numpy::Element>(
+        py: Python<'_>,
+        v: Vec<T>,
+        shape: &[usize],
+    ) -> PyResult<Py<PyAny>> {
+        let array = v.into_pyarray(py);
+        Ok(if shape.len() == 1 {
+            array.into_any().unbind()
+        } else {
+            array.reshape(shape.to_vec())?.into_any().unbind()
+        })
+    }
+
+    let shape = buffer.shape;
+    let value = match buffer.store {
+        BufferStore::Inline(data) => match data {
+            BufferData::I64(v) => shaped(py, v, &shape)?,
+            BufferData::F32(v) => shaped(py, v, &shape)?,
+            BufferData::U32(v) => shaped(py, v, &shape)?,
+            BufferData::U64(v) => shaped(py, v, &shape)?,
+            BufferData::U16(v) => shaped(py, v, &shape)?,
+            BufferData::U8(v) => shaped(py, v, &shape)?,
+        },
+        BufferStore::Shm { segment, dtype } => {
+            Py::new(py, ShmBuffer::new(segment, dtype.numpy(), shape))?.into_any()
+        }
+    };
+    Ok((buffer.name, value))
 }
 
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
 #[pyclass]
-struct Server {
-    rt: Runtime,
+pub struct Server {
+    rt: runtime::Runtime,
 }
 
 #[pymethods]
 impl Server {
     /// Boot the frontend (spawns all threads) and return immediately.
+    /// `server_args` is the scheduler's [`ServerArgs`]; the rest are
+    /// rust-server-only overrides.
     #[new]
     #[pyo3(signature = (
-        http_addr = None,
-        ingress_ring_cap = 8192,
-        egress_ring_cap = 8192,
-        channel_cap = 8192,
+        server_args,
+        port_offset = None,
+        to_scheduler_cap = 8192,
+        from_scheduler_cap = 8192,
+        stage_channel_cap = 8192,
         cores = None,
-
-        server_args_json = "{}",
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
     // surface (all optional overrides), not a call-site ergonomics problem.
     #[allow(clippy::too_many_arguments)]
-    fn start(
-        http_addr: Option<String>,
-        ingress_ring_cap: usize,
-        egress_ring_cap: usize,
-        channel_cap: usize,
+    pub fn start(
+        server_args: ServerArgs,
+        port_offset: Option<u16>, // DP rank; listen on server_args.port + offset
+        to_scheduler_cap: usize,
+        from_scheduler_cap: usize,
+        stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
-        server_args_json: &str,
     ) -> PyResult<Self> {
-        // Static server metadata (server_args + model_config) dumped by the
-        // scheduler; parse and validate mandatory fields now so a bad/missing
-        // field is a boot error, not a request-time 500.
-        let server_args: runtime::ServerArgs = runtime::ServerArgs::from_json(server_args_json)
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "bad server_args_json: {e}"
-                ))
-            })?;
-        server_args.validate_mandatory().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
-        })?;
-        // The HTTP listen address, tokenizer source/threads/shards all live in the
-        // `server_args` blob; resolve them from there so the scheduler doesn't
-        // re-pass them. The explicit params stay as optional overrides for
-        // standalone callers (tests) that construct a `Server` without a full
-        // `server_args`.
-        let http_addr: SocketAddr = http_addr
-            .unwrap_or_else(|| server_args.bind())
-            .parse()
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad http_addr: {e}"))
-            })?;
+        // `server_args` already arrived typed (pyo3 rejected any missing/extra/
+        // mistyped field when Python constructed it); only value checks remain.
+        server_args
+            .validate()
+            .map_err(|e| value_error("server_args", e))?;
+        // The host and base port come from `server_args`; DP ranks only supply
+        // their offset so this boundary has one source of truth for the address.
+        let http_addr = listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad listen address", e))?;
+        let grpc_addr = grpc_listen_addr(&server_args, port_offset)
+            .map_err(|e| value_error("bad gRPC listen address", e))?;
 
         let cfg = RuntimeConfig {
-            rust_server_args: runtime::RustServerServerArgs {
+            rust_server_args: RustServerServerArgs {
                 http_addr,
-                api_worker_num: server_args.api_worker_num(),
-                ingress_ring_cap,
-                egress_ring_cap,
-                channel_cap,
+                grpc_addr,
+                http_api_worker_num: server_args.http_api_worker_num(),
+                to_scheduler_cap,
+                from_scheduler_cap,
+                stage_channel_cap,
                 cores,
             },
             server_args: std::sync::Arc::new(server_args),
         };
-        let rt = runtime::start(cfg).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("runtime start failed: {e}"))
-        })?;
-        Ok(Server { rt })
+        let rt = runtime::start(cfg).map_err(|e| value_error("runtime start failed", e))?;
+        Ok(Self { rt })
     }
 
-    /// Non-blocking drain of the ingress ring, returned **columnar** as an
-    /// [`IngressBatch`] so the large `input_ids` tensor never goes through
-    /// msgpack (see the field docs for the layout). The `ids` cells are copied
-    /// **directly into the result `bytes`** (one copy, no intermediate buffer).
-    ///
-    /// Runs entirely GIL-held, deliberately. `drain` is a `try_recv` loop plus an
-    /// uncontended stash lock (the Python thread is the only consumer), so it
-    /// cannot block — there is nothing for a detach to overlap with. And detaching
-    /// is far from free: reacquiring the GIL waits out the interpreter's switch
-    /// interval, so a `py.detach` here cost up to 5 ms whenever another Python
-    /// thread was runnable, to cover ~0.2 µs of work. Held, the whole call is a
-    /// fraction of a microsecond on an empty ring.
+    /// Non-blocking drain of the to_scheduler channel: one [`IngressRequest`]
+    /// per request, its buffers moved out of Rust rather than copied (see the
+    /// type docs for the layout).
     #[pyo3(signature = (max = 256))]
-    fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<IngressBatch> {
-        let cols = self.rt.ingress.drain(max);
-        let headers = cols
-            .headers
-            .iter()
-            .map(|h| PyBytes::new(py, h).unbind())
-            .collect();
-        // Single pass: copy each raw ids cell straight into the output `bytes`.
-        let data = PyBytes::new_with(py, cols.ids_total, |buf| {
-            let mut pos = 0;
-            for cell in &cols.ids {
-                let end = pos + cell.len();
-                buf[pos..end].copy_from_slice(cell);
-                pos = end;
-            }
-            Ok(())
-        })?
-        .unbind();
-        Ok(IngressBatch {
-            headers,
-            data,
-            lengths: cols.lengths,
-        })
+    pub fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<Vec<IngressRequest>> {
+        self.rt
+            .to_scheduler_rx
+            .drain(max)
+            .into_iter()
+            .map(|req| {
+                Ok(IngressRequest {
+                    header: PyBytes::new(py, &req.header).unbind(),
+                    buffers: req
+                        .buffers
+                        .into_iter()
+                        .map(|b| buffer_to_py(py, b))
+                        .collect::<PyResult<_>>()?,
+                })
+            })
+            .collect()
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
-    /// sleeps instead of spinning at 100% CPU. Returns `True` when a request is
-    /// ready (the next `recv_requests` includes it). The GIL is released while
-    /// parked, and `flume` wakes the moment a request is pushed, so this adds no
-    /// latency to real requests — only the idle wait is bounded by `timeout_ms`.
+    /// sleeps instead of spinning at 100% CPU.
     #[pyo3(signature = (timeout_ms = 1000))]
-    fn wait_ingress(&self, py: Python<'_>, timeout_ms: u64) -> bool {
+    pub fn wait_request(&self, py: Python<'_>, timeout_ms: u64) -> bool {
         py.detach(|| {
             self.rt
-                .ingress
+                .to_scheduler_rx
                 .wait(std::time::Duration::from_millis(timeout_ms))
         })
     }
@@ -171,80 +246,146 @@ impl Server {
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
     /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
     /// backpressure; `False` only on shutdown.
-    ///
-    /// Framed and pushed with the GIL HELD, detaching only if the ring is full.
-    /// This runs on the scheduler's CUDA-launch thread every decode step, where the
-    /// unconditional detach was the single worst boundary cost: framing is
-    /// ~0.1–0.2 µs, but reacquiring the GIL waits out the interpreter's switch
-    /// interval (5 ms by default) whenever another Python thread is runnable —
-    /// 17–50% of a 10–30 ms decode step, landing nondeterministically. Held, the
-    /// whole boundary is ~1.3 µs per step.
-    ///
-    /// The slow path keeps its detach because a full ring genuinely parks: the
-    /// scheduler must feel backpressure rather than drop output it has already
-    /// committed to. It essentially never fires — measured headroom is ~100×.
-    fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
+    pub fn push_decode_result_batch(
+        &self,
+        py: Python<'_>,
+        header: &[u8],
+        data_cols: Vec<PyBackedBytes>,
+    ) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
-        self.push_frame(py, crate::message::frame_egress_batch_cols(header, &cols))
+        self.push_frame(
+            py,
+            crate::message::response::frame_decode_batch_cols(header, &cols),
+        )
     }
 
     /// Push a control-request result. Blocks for backpressure; `False` only on
     /// shutdown.
-    fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
-        self.push_frame(py, crate::message::frame_egress_result(rid, payload))
+    pub fn push_control_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
+        self.push_frame(
+            py,
+            crate::message::response::frame_control_result(rid, payload),
+        )
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
-    fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        self.push_frame(py, crate::message::frame_egress_error(rid, message))
+    pub fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
+        self.push_frame(py, crate::message::response::frame_error(rid, message))
+    }
+
+    /// Spawn the MM worker pool for the pipeline in `spec` (built from the
+    /// resolved processor config; see `RustMmProcessor.resolve_spec` and
+    /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
+    /// in Rust; their buffers ride the ring with the request (the `mm.*` set of
+    /// [`IngressRequest::buffers`]). Anything the pipeline cannot serve is
+    /// rejected back to the client -- there is no Python fallback.
+    pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
+        self.rt
+            .start_mm_workers(spec, workers)
+            .map_err(|e| value_error("mm spec", e))
     }
 
     /// Signal all threads to stop (best effort).
-    fn shutdown(&self) {
+    pub fn shutdown(&self) {
         self.rt.request_shutdown();
     }
 }
 
 impl Server {
-    /// Hand one already-framed egress message to the ring: GIL-held when it fits,
-    /// detaching only to park on a full ring. Shared by every push path — they
-    /// differ solely in how the frame is built. `false` only on shutdown.
+    /// Start the shared worker pool with a processor supplied by an external
+    /// model package. The default Python API retains the built-in Qwen path.
+    /// `feature_shm` is the package's own `_use_feature_shm` answer: place
+    /// feature tensors in POSIX shm for the TP broadcast.
+    pub fn start_mm_workers_with_processor(
+        &self,
+        processor: Arc<dyn MmProcessor>,
+        workers: usize,
+        feature_shm: bool,
+    ) {
+        self.rt
+            .start_mm_workers_with_processor(processor, workers, feature_shm);
+    }
+
+    /// Hand one already-framed message to the ring. Shared by every push path —
+    /// they differ solely in how the frame is built. `false` only on shutdown.
     #[inline]
     fn push_frame(&self, py: Python<'_>, frame: bytes::Bytes) -> bool {
-        match self.rt.egress.try_push(frame) {
+        match self.rt.from_scheduler_tx.try_push(frame) {
             Ok(()) => true,
             // Consumer gone (shutdown): the frame is unavoidably lost.
             Err(None) => false,
-            // Full: the scheduler must block here so backpressure reaches it, and
-            // blocking is exactly when releasing the GIL pays for itself.
-            Err(Some(frame)) => py.detach(|| self.rt.egress.push(frame)),
+            // Full: the scheduler must block here so backpressure reaches it.
+            Err(Some(frame)) => py.detach(|| self.rt.from_scheduler_tx.push(frame)),
         }
     }
 }
 
-/// Keeps the non-blocking log writer's background thread alive for the process
-/// lifetime (dropping the guard would stop log delivery).
-static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    std::sync::OnceLock::new();
+/// Register all Python boundary types used by [`Server`]. External
+/// model-package modules call this before exposing their wrapper server.
+pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    logging::init_tracing();
+    m.add_class::<DisaggregationMode>()?;
+    m.add_class::<DefaultSamplingParams>()?;
+    m.add_class::<ModelConfig>()?;
+    m.add_class::<ServerArgs>()?;
+    m.add_class::<MmFamily>()?;
+    m.add_class::<MmResample>()?;
+    m.add_class::<MmSpec>()?;
+    m.add_class::<IngressRequest>()?;
+    m.add_class::<ShmBuffer>()?;
+    Ok(())
+}
 
 #[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Initialize tracing once; ignore if already set by the host process.
-    // Non-blocking writer: emitting threads (axum workers, egress, detok) only
-    // enqueue; a dedicated thread does the stdout formatting-flush + syscall.
-    // The queue is bounded and lossy — under extreme pressure log lines are
-    // dropped instead of stalling request threads.
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-    let _ = LOG_GUARD.set(guard);
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(writer)
-        .try_init();
+fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Server>()?;
-    m.add_class::<IngressBatch>()?;
+    register_boundary_types(m)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod shm_buffer_tests {
+    use super::ShmBuffer;
+    use crate::utils::shm::{ShmSegment, shm_path, unique_name};
+
+    fn buffer() -> (ShmBuffer, String) {
+        let name = unique_name("test");
+        let segment = ShmSegment::create(name.clone(), &[1, 2, 3, 4]).unwrap();
+        (ShmBuffer::new(segment, "float32", vec![1]), name)
+    }
+
+    /// Neither `release` nor `discard` (the header never decoded): dropping
+    /// the handle unlinks, so a rejected request cannot leak its segment.
+    #[test]
+    fn drop_without_admission_unlinks() {
+        let (buffer, name) = buffer();
+        assert_eq!(buffer.name, name);
+        assert!(buffer.owns_segment());
+        drop(buffer);
+        assert!(!shm_path(&name).exists());
+    }
+
+    /// `release` moves the unlink duty to Python: the segment must outlive the
+    /// handle so the TP receivers can still open it.
+    #[test]
+    fn release_keeps_the_segment_for_python() {
+        let (mut buffer, name) = buffer();
+        buffer.release();
+        assert!(!buffer.owns_segment());
+        buffer.discard(); // no-op after release
+        drop(buffer);
+        assert!(shm_path(&name).exists(), "released: Python unlinks later");
+        let _ = rustix::shm::unlink(format!("/{name}"));
+    }
+
+    /// `discard` unlinks at once (a rejected request), and is idempotent.
+    #[test]
+    fn discard_unlinks_immediately() {
+        let (mut buffer, name) = buffer();
+        buffer.discard();
+        assert!(!shm_path(&name).exists());
+        buffer.discard();
+        drop(buffer);
+    }
 }

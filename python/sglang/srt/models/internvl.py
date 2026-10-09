@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -46,7 +47,7 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
 from sglang.utils import logger
 
@@ -199,8 +200,7 @@ class InternMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        parallel_group = "replicated" if use_data_parallel else "tp"
         self.config = config
         self.act = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
@@ -208,16 +208,14 @@ class InternMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -234,7 +232,6 @@ NORM2FN = {
 
 
 class InternVisionEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -520,7 +517,7 @@ class InternVLChatModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.quant_config = quant_config
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size
@@ -675,7 +672,7 @@ class InternVLChatModel(nn.Module):
 
         return hidden_states
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
@@ -716,7 +713,9 @@ class InternVLChatModel(nn.Module):
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
+                # InternVLChatConfig has no top-level num_experts; the MoE config lives on
+                # the nested llm_config (the Qwen3MoE text backbone).
+                num_experts=self.config.llm_config.num_experts,
             )
         elif "Qwen3ForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [

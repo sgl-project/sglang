@@ -25,7 +25,7 @@ jobs:
       - name: Sync blog cards
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python docs_new/scripts/update_lmsys_sglang_blogs.py
+        run: python docs/scripts/update_lmsys_sglang_blogs.py
 
       - name: Open or update pull request
         env:
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git diff --quiet -- docs_new/index.mdx; then
+          if git diff --quiet -- docs/index.mdx; then
             echo "No blog card changes; nothing to do."
             exit 0
           fi
@@ -45,7 +45,7 @@ jobs:
           # Recreate the bot branch as "current main + card diff" and overwrite
           # any previous state, so the PR always shows a clean single-commit diff.
           git checkout -B "$BRANCH"
-          git add docs_new/index.mdx
+          git add docs/index.mdx
           git commit -m "docs: sync LMSYS SGLang blog cards"
           git push --force origin "$BRANCH"
 
@@ -56,5 +56,5 @@ jobs:
               --base main \
               --head "$BRANCH" \
               --title "docs: sync LMSYS SGLang blog cards" \
-              --body $'Automated sync of the LMSYS SGLang blog cards in `docs_new/index.mdx`.\n\n🤖 Generated with GitHub Actions'
+              --body $'Automated sync of the LMSYS SGLang blog cards in `docs/index.mdx`.\n\n🤖 Generated with GitHub Actions'
           fi
