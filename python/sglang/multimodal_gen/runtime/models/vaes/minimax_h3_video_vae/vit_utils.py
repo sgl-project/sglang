@@ -115,8 +115,10 @@ def prepare_rotary_pos_emb(
     rotary_pos_emb: Tuple[torch.Tensor, torch.Tensor],
     *,
     dtype: torch.dtype,
+    batch: int = 1,
 ) -> tuple[torch.Tensor, ...]:
-    """Prebuild the native Q/K rotary cache once per ViT decoder forward."""
+    """Prebuild the native Q/K rotary cache once per ViT decoder forward; its
+    positions cover ``batch`` samples sharing one token grid."""
     cos, sin = rotary_pos_emb
     if (
         not cos.is_cuda
@@ -143,7 +145,7 @@ def prepare_rotary_pos_emb(
         cos.shape[1],
         dtype=torch.long,
         device=cos.device,
-    )
+    ).repeat(batch)
     return cos, sin, cache, positions
 
 
@@ -209,13 +211,15 @@ def apply_rotary_pos_emb(
         raise
 
 
-def apply_rotary_pos_emb_qk(
+def native_rope_cache(
     query: torch.Tensor,
     key: torch.Tensor,
     rotary_pos_emb: Sequence[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
-    if (
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(cache, positions)`` from ``prepare_rotary_pos_emb`` when the native
+    kernels can consume it for this Q/K, else None. ``positions`` covers the
+    batch-major rows of ``query.flatten(0, 1)``."""
+    if not (
         len(rotary_pos_emb) == 4
         and query.is_cuda
         and query.shape == key.shape
@@ -224,33 +228,47 @@ def apply_rotary_pos_emb_qk(
         and query.dim() == 4
         and not torch.compiler.is_compiling()
     ):
-        _, _, cache, positions = rotary_pos_emb
-        batch, seq_len = query.shape[:2]
-        if (
-            cache.is_cuda
-            and cache.dtype == query.dtype
-            and cache.dim() == 2
-            and cache.shape[0] == seq_len
-            and cache.shape[1] <= query.shape[-1]
-            and positions.is_cuda
-            and positions.shape == (seq_len,)
-        ):
-            from sgl_kernel import rotary_embedding
+        return None
+    _, _, cache, positions = rotary_pos_emb
+    if not (
+        cache.is_cuda
+        and cache.dtype == query.dtype
+        and cache.dim() == 2
+        and cache.shape[0] == query.shape[1]
+        and cache.shape[1] <= query.shape[-1]
+        and positions.is_cuda
+        and positions.shape in ((query.shape[1],), (query.shape[0] * query.shape[1],))
+    ):
+        return None
+    # Accept both main's shared sequence positions and the pre-expanded
+    # batch-major positions used by the decoder cache and fused fast path.
+    if positions.shape == (query.shape[1],) and query.shape[0] > 1:
+        positions = positions.repeat(query.shape[0])
+    return cache, positions
 
-            # Stacked spatial tiles share one rotary table. Flatten the
-            # batch and replay that table once per tile.
-            query = query.contiguous()
-            key = key.contiguous()
-            token_positions = positions if batch == 1 else positions.repeat(batch)
-            rotary_embedding(
-                token_positions,
-                query.view(batch * seq_len, -1),
-                key.view(batch * seq_len, -1),
-                query.shape[-1],
-                cache,
-                True,
-            )
-            return query, key
+
+def apply_rotary_pos_emb_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_pos_emb: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
+    native = native_rope_cache(query, key, rotary_pos_emb)
+    if native is not None:
+        from sgl_kernel import rotary_embedding
+
+        cache, positions = native
+        query = query.contiguous()
+        key = key.contiguous()
+        rotary_embedding(
+            positions,
+            query.view(positions.shape[0], -1),
+            key.view(positions.shape[0], -1),
+            query.shape[-1],
+            cache,
+            True,
+        )
+        return query, key
 
     return (
         apply_rotary_pos_emb(query, rotary_pos_emb),
