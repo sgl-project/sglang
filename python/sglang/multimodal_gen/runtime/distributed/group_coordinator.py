@@ -131,13 +131,34 @@ class GraphCaptureContext:
     stream: torch.cuda.Stream | None
 
 
-def new_device_group(ranks, backend=None):
+def _resolved_device_backend(backend) -> str:
+    backend_str = str(backend)
+    if backend is None or backend_str.rsplit(":", 1)[-1] == "nccl":
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+        try:
+            return default_pg._get_backend(torch.device("cuda")).name()
+        except RuntimeError:
+            return str(torch.distributed.get_backend(default_pg))
+    return backend_str
+
+
+def new_device_group(ranks, backend=None, lazy_init=False):
     """Create a process group for device collectives.
 
     A single-rank group never runs one: every collective short-circuits on
     world_size == 1. NCCL would still allocate its per-channel device buffers
     for it, which costs ~390 MiB a group.
     """
+    if backend == "nccl-lazy":
+        return torch.distributed.new_group(ranks, backend=backend)
+
+    if (len(ranks) == 1 or lazy_init) and _resolved_device_backend(backend) == "nccl2":
+        pg_options = torch.distributed.ProcessGroupNCCL.Options()
+        pg_options.lazy_init = True
+        return torch.distributed.new_group(
+            ranks, backend=backend, pg_options=pg_options
+        )
+
     return torch.distributed.new_group(
         ranks, backend="gloo" if len(ranks) == 1 else backend
     )
@@ -188,7 +209,11 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = new_device_group(ranks, torch_distributed_backend)
+            device_group = new_device_group(
+                ranks,
+                torch_distributed_backend,
+                lazy_init=use_device_communicator or use_srt_custom_allreduce,
+            )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
