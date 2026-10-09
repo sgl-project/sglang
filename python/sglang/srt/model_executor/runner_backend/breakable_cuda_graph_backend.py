@@ -118,7 +118,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         warmup_out = None
-        for _ in range(2):
+        for _ in range(1):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
