@@ -829,8 +829,8 @@ class ModelRunner:
         layer are attn-TP-scattered (num_tokens // attn_tp_size rows per rank).
 
         The layer_boundary refactor replaced the old ScatterMode machinery:
-        when the first local stage declares its incoming residual rows
-        ATTN_TP_SCATTER, it gathers them itself on read, so the tensor crossing
+        when the first local stage declares its incoming rows sharded over
+        TokenAxis.ATTN_TP, it gathers them itself on read, so the tensor crossing
         the PP boundary is rank-local — the scheduler transport must not
         all-gather it, and pp_proxy buffers used for graph capture and warmup
         must be sliced to the scattered row count (full-length slicing trips
@@ -842,7 +842,7 @@ class ModelRunner:
             return False
         first_attn_stage = self._pp_boundary_stages()[0]
         return first_attn_stage is not None and (
-            first_attn_stage.input_on_attention_tp_slices
+            first_attn_stage.input_on_attn_tp_slices
         )
 
     def is_pp_proxy_output_scattered(self) -> bool:
@@ -859,14 +859,14 @@ class ModelRunner:
 
         last_ffn_stage = self._pp_boundary_stages()[1]
         edges = (
-            last_ffn_stage.plan.variants.get(BatchVariant.ORDINARY)
+            last_ffn_stage.plan.edges.get(BatchVariant.ORDINARY)
             if last_ffn_stage is not None
             else None
         )
         produced = getattr(edges, "outgoing", None)
         produced = getattr(produced, "produced", None) if produced else None
         layout = getattr(produced, "layout", None)
-        return layout is not None and (TokenAxis.ATTN_TP_SCATTER in layout.sharded)
+        return layout is not None and (TokenAxis.ATTN_TP in layout.sharded)
 
     def _pp_boundary_stages(self):
         """(first local attn stage, last local ffn stage) for PP boundary queries.

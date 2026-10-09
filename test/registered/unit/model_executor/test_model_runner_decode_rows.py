@@ -3,8 +3,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -49,6 +52,50 @@ class TestModelRunnerDecodeRows(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(runner.max_decode_logits_rows(), 72)
+
+
+class _FakePPRunner:
+    is_pp_proxy_input_scattered = ModelRunner.is_pp_proxy_input_scattered
+    is_pp_proxy_output_scattered = ModelRunner.is_pp_proxy_output_scattered
+
+    def __init__(self, first_attn, last_ffn):
+        self.first_attn = first_attn
+        self.last_ffn = last_ffn
+
+    def _pp_boundary_stages(self):
+        return self.first_attn, self.last_ffn
+
+
+class TestModelRunnerPPProxyRows(CustomTestCase):
+    def test_prefill_pp_input_uses_stage_boundary_row_layout(self):
+        """A PP receiver must recognize attention-TP-sharded input rows."""
+        runner = _FakePPRunner(
+            first_attn=SimpleNamespace(input_on_attn_tp_slices=True),
+            last_ffn=None,
+        )
+        with patch(
+            "sglang.srt.model_executor.model_runner.get_parallel",
+            return_value=SimpleNamespace(pp_size=4, pp_rank=1),
+        ):
+            self.assertTrue(runner.is_pp_proxy_input_scattered())
+
+    def test_prefill_pp_output_uses_ordinary_ffn_exit_layout(self):
+        """A PP sender must preserve attention-TP-sharded output rows."""
+        produced = SimpleNamespace(layout=SimpleNamespace(sharded={TokenAxis.ATTN_TP}))
+        edges = {
+            BatchVariant.ORDINARY: SimpleNamespace(
+                outgoing=SimpleNamespace(produced=produced)
+            )
+        }
+        runner = _FakePPRunner(
+            first_attn=None,
+            last_ffn=SimpleNamespace(plan=SimpleNamespace(edges=edges)),
+        )
+        with patch(
+            "sglang.srt.model_executor.model_runner.get_parallel",
+            return_value=SimpleNamespace(pp_size=4, pp_rank=0),
+        ):
+            self.assertTrue(runner.is_pp_proxy_output_scattered())
 
 
 if __name__ == "__main__":

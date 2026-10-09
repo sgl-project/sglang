@@ -1088,8 +1088,10 @@ def update_kpool_write_plan_npu(
         # The generic kernel retains the GPU b * N row indexing, while NPU
         # metadata now uses one row per request. Expand the input only in this
         # compatibility branch; plan outputs and other NPU paths keep the new contract.
+        # The generic kernel divides table entries by kpool, while the NPU
+        # table already contains physical page IDs. Convert at this boundary.
         reuse_page_table = torch.repeat_interleave(
-            real_page_table, num_draft_tokens, dim=0
+            real_page_table * pool_size, num_draft_tokens, dim=0
         ).contiguous()
         update_kpool_write_plan_cuda_graph(
             write_start,
@@ -1101,9 +1103,9 @@ def update_kpool_write_plan_npu(
             write_loc_out=plan.write_loc,
             pool_seqlens_per_q_out=per_q_out,
             seqlens_per_q_out=seq_per_q_out,
-            pool_size=pool_size,
+            kpool=pool_size,
             num_draft_tokens=num_draft_tokens,
-            slots_per_page=slots_per_page,
+            index_page_size=slots_per_page,
         )
         return
 

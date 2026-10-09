@@ -4,9 +4,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.mem_cache import kv_cache_configurator as kvc
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestHybridNPUDSAPoolSelection(unittest.TestCase):
+class TestHybridNPUDSAPoolSelection(CustomTestCase):
     def test_npu_hybrid_dsa_uses_npu_pool(self):
         class NPUPool:
             pass

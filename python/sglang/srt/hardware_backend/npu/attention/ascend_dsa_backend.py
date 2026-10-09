@@ -478,7 +478,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         plan = _alloc_kpool_write_plan_buffers(
             max_bs=forward_batch.batch_size,
             num_draft_tokens=num_draft_tokens,
-            pool_size=pool_size,
+            kpool=pool_size,
             device=forward_batch.seq_lens.device,
             is_verify=True,
             is_v2=is_v2,
