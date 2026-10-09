@@ -1082,6 +1082,51 @@ class C4IndexerAscendBackendMixin:
             sparse_count=self._dsv4_index_topk,
             metadata=li_quant_metadata,
         )
+        # S169: L2 c4-indexer RAW-INPUT direct read. Decisive op-vs-mapping split:
+        # if q / index-K(buffer) / weights / c4_page_table / seq-lens / k-scale are
+        # byte-identical at prefill hit vs miss, the block-135 topk split is the
+        # (closed-source) OP; if ANY input differs, it is framework read/mapping/state.
+        # Env DSV4_DUMP_IDXIN = layer id (or "all"). Per-c128-block hashes appended.
+        _want_idxin = os.environ.get("DSV4_DUMP_IDXIN")
+        if _want_idxin and (
+            _want_idxin == "all" or str(getattr(c4_indexer, "layer_id", -1)) == _want_idxin
+        ):
+            try:
+
+                def _md5_in(t: torch.Tensor) -> str:
+                    x = t.detach().to("cpu").contiguous()
+                    try:
+                        raw = x.view(torch.uint8).numpy().tobytes()
+                    except Exception:
+                        raw = x.to(torch.float32).numpy().tobytes()
+                    return hashlib.md5(raw).hexdigest()[:16]
+
+                def _blk_in(tt):
+                    parts = []
+                    if tt is not None and tt.numel():
+                        pos = forward_batch.positions.reshape(-1).to(torch.int64).cpu()
+                        blk = pos // 128
+                        for b in torch.unique(blk).tolist():
+                            parts.append(f"{int(b)}:{_md5_in(tt[blk == b])}")
+                    return parts[-8:]
+
+                _slq = fm.actual_seq_lengths_q
+                _slk = fm.actual_seq_lengths_kv
+                _ptab = fm.c4_page_table
+                print(
+                    f"[IDXIN] layer={getattr(c4_indexer, 'layer_id', -1)} "
+                    f"mode={forward_batch.forward_mode} "
+                    f"q={_md5_in(q)} qq={_md5_in(q_quant)} qblk={_blk_in(q_quant)} "
+                    f"w={_md5_in(kwargs['weights'])} kbuf={_md5_in(k)} "
+                    f"kshape={tuple(k.shape)} kscale={_md5_in(k_scale)} "
+                    f"ptab={_md5_in(_ptab)} "
+                    f"ptab_head={_ptab.reshape(-1)[:8].tolist() if _ptab is not None and _ptab.numel() else []} "
+                    f"slq=({int(_slq.min())},{int(_slq.max())},{_slq.numel()}) "
+                    f"slk=({int(_slk.min())},{int(_slk.max())},{_slk.numel()})",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[IDXIN] skipped: {exc}", flush=True)
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**kwargs)
         return topk_idxs.view(-1, self._dsv4_index_topk)
 
