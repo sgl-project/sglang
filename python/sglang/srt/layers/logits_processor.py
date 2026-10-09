@@ -977,7 +977,11 @@ class LogitsProcessor(nn.Module):
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
-        elif should_apply_lm_head_quant_method(lm_head, quant_method):
+        elif hasattr(lm_head, "weight") and should_apply_lm_head_quant_method(
+            lm_head, quant_method
+        ):
+            # Heads without `weight` (GGUF, packed codes) keep the fp32-aware
+            # apply path below.
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
@@ -1410,20 +1414,23 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
+    if quant_method is None or not callable(getattr(quant_method, "apply", None)):
         return False
 
     method_name = type(quant_method).__name__
     if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
         return False
 
+    if not method_name.startswith("ModelOpt"):
+        # The method owns its parameter layout (`weight`, `weight_packed`,
+        # `qweight`, ...); nothing here to check.
+        return True
+
     # Some draft models share an unquantized target lm_head tensor while still
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    if not hasattr(lm_head, "weight"):
+        return False
     if method_name == "ModelOptFp4LinearMethod":
         if quant_method.quant_mode == "w4a16":
             return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
