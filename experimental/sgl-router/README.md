@@ -500,11 +500,15 @@ reported them, `--completion-template`, `return_hidden_states` and other
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
 `AllText` scope, DeepSeek-V4 today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
-(`deepseek-v4`) or none, and no tools or media yet.
+(`deepseek-v4`) or none, and no media yet. Tools are served with `tool_choice`
+`auto` or `none`, non-strict, with standard JSON-schema types, and a tool
+parser the processor reproduces (`deepseekv4`); `required`, named and strict
+tools take a constraint from the engine's xgrammar, so they go to the engine.
 The router reads the model's `config.json` and `generation_config.json` beside
 `--tokenizer-path` (or from the HF repo), as the engine reads them, so a local
-path should point into the model's directory. `sgl_router_openai_route_total`
-counts each outcome.
+path should point into the model's directory. Engine env vars that change the
+layer (`SGLANG_TOOL_STRICT_LEVEL`, `SGLANG_FORWARD_UNKNOWN_TOOLS`) are taken as
+unset. `sgl_router_openai_route_total` counts each outcome.
 
 ## Embeddings
 
