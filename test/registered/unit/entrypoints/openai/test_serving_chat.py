@@ -4717,6 +4717,72 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(r, reasoning)
         self.assertEqual(t, tool_calls)
 
+    # ------------- include_reasoning -------------
+    def _build_reasoning_response(
+        self,
+        include_reasoning,
+        reasoning_parser="mock-reasoning-parser",
+        reasoning="想了一下",
+    ):
+        """Build a non-stream response whose reasoning parser splits think text."""
+        self.template_manager.force_reasoning = False
+        self.chat.reasoning_parser = reasoning_parser
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+            include_reasoning=include_reasoning,
+        )
+        ret = [
+            {
+                "text": "想了一下正式回答",
+                "meta_info": {
+                    "id": "test-id",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 9,
+                },
+            }
+        ]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.ReasoningParser"
+        ) as parser_mock:
+            parser_mock.return_value.parse_non_stream.return_value = (
+                reasoning,
+                "正式回答",
+            )
+            return self.chat._build_chat_response(req, ret, created=0)
+
+    def test_include_reasoning_false_drops_reasoning_content(self):
+        # #39103: the request field existed nowhere, so reasoning always came
+        # back even when the caller asked to suppress it.
+        resp = self._build_reasoning_response(False)
+        self.assertIsNone(resp.choices[0].message.reasoning_content)
+        # The reasoning split still runs, so the visible content stays clean.
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_default_keeps_reasoning_content(self):
+        resp = self._build_reasoning_response(None)
+        self.assertEqual(resp.choices[0].message.reasoning_content, "想了一下")
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_false_drops_k2_empty_reasoning_replay(self):
+        # K2 templates replay reasoning_content even when the parser split is
+        # empty; include_reasoning=False must win over that replay too.
+        resp = self._build_reasoning_response(
+            False, reasoning_parser="k2_horizon", reasoning=""
+        )
+        self.assertIsNone(resp.choices[0].message.reasoning_content)
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
+    def test_include_reasoning_default_keeps_k2_empty_reasoning_replay(self):
+        resp = self._build_reasoning_response(
+            None, reasoning_parser="k2_horizon", reasoning=""
+        )
+        self.assertEqual(resp.choices[0].message.reasoning_content, "")
+        self.assertEqual(resp.choices[0].message.content, "正式回答")
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
