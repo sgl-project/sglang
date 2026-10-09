@@ -15,9 +15,9 @@ from pathlib import Path
 # Record this checkout's SGLang, not whichever one is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
 
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-
 from fixture_json import dump
+
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/reasoning_parity"
 

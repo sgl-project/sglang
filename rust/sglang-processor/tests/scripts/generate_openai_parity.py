@@ -31,6 +31,8 @@ from starlette.responses import Response
 # Record this checkout's SGLang, not whichever one is installed.
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python"))
 
+from fixture_json import dump
+
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -42,8 +44,6 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers.common import get_context_length
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-from fixture_json import dump
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/openai_parity"
 HANDLERS = {
