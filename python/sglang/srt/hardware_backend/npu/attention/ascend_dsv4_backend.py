@@ -1196,9 +1196,20 @@ class C4IndexerAscendBackendMixin:
             try:
                 t = topk_idxs.detach().to(torch.int32).cpu()
                 row = t.reshape(t.shape[0], -1)[-1].tolist()[:16] if t.numel() else []
+                # S167.3: per-c128-block topk verdict. If the same input (L1 out)
+                # and same index-K still yield a different topk at block 134-135,
+                # the divergence is inside L2's c4-indexer select (not the SWA).
+                blkx = []
+                if t.numel():
+                    _pos = forward_batch.positions.reshape(-1).to(torch.int64).cpu()
+                    _blk = _pos // 128
+                    for _b in torch.unique(_blk).tolist():
+                        _m = _blk == _b
+                        blkx.append(f"{int(_b)}:{_md5(t[_m])}")
                 print(
                     f"[CMPIDX] layer={layer_id} mode={forward_batch.forward_mode} "
-                    f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} tail={row}",
+                    f"ntok={int(t.shape[0])} lastpos={lastpos} md5={_md5(t)} "
+                    f"tail={row} blkx={blkx[-8:]}",
                     flush=True,
                 )
             except Exception as exc:

@@ -273,6 +273,10 @@ def main(path):
             print("\n== [C128KV] c128 compressed-KV (order-independent) ==")
             report_group(rows, "logical", "C128KV", extra=("nblk", "ptab"))
             continue
+        if tag == "CMPIDX":
+            print("\n== [CMPIDX] c4-indexer top-k (per-c128-block, S167.3) ==")
+            report_blkx(rows, "CMPIDX")
+            # fall through to the whole-tensor segment compare below as well
         reqs = cmp_reqs if (tag == "CMPIDX" and cmp_reqs is not None) else segment(rows)
         print(f"\n== [{tag}] ==")
         if cmp_reqs is not None and tag != "CMPIDX" and len(reqs) != len(cmp_reqs):
