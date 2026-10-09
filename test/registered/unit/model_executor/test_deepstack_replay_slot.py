@@ -8,6 +8,9 @@ CPU-only; the logic under test is GPU-agnostic.
 """
 
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -15,6 +18,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
     _refresh_deepstack_replay_slot,
 )
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
@@ -169,28 +173,133 @@ class TestDeepStackReplaySlotRefresh(CustomTestCase):
         _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=None)
         self.assertTrue(torch.all(slot == 0.0))
 
+    def _malformed_inputs(self):
+        return [
+            self._embeds(4, 1.0, dtype=torch.float32),
+            torch.full((4, 1), 1.0, dtype=self.DTYPE, device=_DEVICE),
+            self._embeds(self.NUM_TOKENS + 1, 1.0),
+            torch.tensor(1.0, dtype=self.DTYPE, device=_DEVICE),
+        ]
+
     def test_malformed_deepstack_fails_closed(self):
-        # Row/width mismatches are rejected by copy_ itself; dtype drift is
-        # silently cast, so the guard is the only failing-closed check.
-        with self.assertRaises(RuntimeError):
-            _refresh_deepstack_replay_slot(
-                slot=self._slot(),
-                deepstack_embeds=self._embeds(4, 1.0, dtype=torch.float32),
-            )
+        # copy_ silently casts dtype drift and broadcasts an (n, 1) source
+        # across the full width, so the explicit guard is the only check.
+        for bad in self._malformed_inputs():
+            with self.subTest(shape=tuple(bad.shape), dtype=bad.dtype):
+                with self.assertRaises(RuntimeError):
+                    _refresh_deepstack_replay_slot(
+                        slot=self._slot(), deepstack_embeds=bad
+                    )
 
     def test_fail_closed_leaves_slot_unmodified(self):
-        # A dtype-mismatched tensor is the only rejected input copy_ would
-        # have modified the slot with, so it is what proves validate-before-write.
+        # copy_ would have written every rejected input above (cast or
+        # broadcast), so they are what prove validate-before-write.
+        for bad in self._malformed_inputs():
+            with self.subTest(shape=tuple(bad.shape), dtype=bad.dtype):
+                slot = self._slot()
+                _refresh_deepstack_replay_slot(
+                    slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
+                )
+                with self.assertRaises(RuntimeError):
+                    _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=bad)
+                self.assertTrue(torch.all(slot == 3.0))
+
+    def test_empty_tensor_clears_like_none(self):
         slot = self._slot()
         _refresh_deepstack_replay_slot(
             slot=slot, deepstack_embeds=self._embeds(self.NUM_TOKENS, 3.0)
         )
-        with self.assertRaises(RuntimeError):
-            _refresh_deepstack_replay_slot(
-                slot=slot,
-                deepstack_embeds=self._embeds(4, 9.0, dtype=torch.float32),
+        _refresh_deepstack_replay_slot(slot=slot, deepstack_embeds=self._embeds(0, 1.0))
+        self.assertTrue(torch.all(slot == 0.0))
+
+
+class TestDeepStackReplaySlotWiring(CustomTestCase):
+    """Drives ``_execute_body_capture`` so the slot is exercised through the
+    replay closure as wired; the helper tests above cannot catch the refresh
+    call or the capture binding being dropped."""
+
+    NUM_TOKENS = 8
+    WIDTH = 6
+    DTYPE = torch.bfloat16
+
+    def _runner(self, replay):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._use_draft_input_embeds = False
+        runner._input_embeds_arg_idx = None
+        runner.buffer_registry = build_prefill_registry(
+            device=_DEVICE,
+            max_bs=1,
+            max_num_token=self.NUM_TOKENS,
+            cache_loc_dtype=torch.int32,
+            is_multimodal=True,
+            hidden_size=4,
+            embed_dtype=self.DTYPE,
+            deepstack_replay_width=self.WIDTH,
+        )
+        runner._fill_input_embeds_slot = Mock()
+        runner.backend = SimpleNamespace(replay=replay)
+        runner.layer_model = SimpleNamespace(forward=None)
+        runner._prefill_forward_context = lambda *_args, **_kwargs: nullcontext()
+        return runner
+
+    def _drive(self, runner, deepstack_embeds):
+        def model_forward(ids, positions, batch, **_kwargs):
+            return runner.layer_model.forward(
+                ids, positions, batch, input_deepstack_embeds=deepstack_embeds
             )
-        self.assertTrue(torch.all(slot == 3.0))
+
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True),
+            model=SimpleNamespace(forward=model_forward),
+        )
+        batch = SimpleNamespace(input_ids=None, positions=None, mm_input_embeds=None)
+        return runner._execute_body_capture(
+            batch,
+            batch,
+            static_num_tokens=self.NUM_TOKENS,
+            raw_num_tokens=3,
+            shape_key=object(),
+        )
+
+    def _slot_contents(self, runner):
+        return runner.buffer_registry.get_slot("input_deepstack_embeds").buffer.clone()
+
+    def test_replay_refreshes_the_captured_slot(self):
+        seen = {}
+
+        def replay(*_args, **_kwargs):
+            seen["slot"] = self._slot_contents(runner)
+            return "replayed"
+
+        runner = self._runner(replay)
+        full = torch.full((3, self.WIDTH), 3.0, dtype=self.DTYPE, device=_DEVICE)
+        self.assertEqual(self._drive(runner, full), "replayed")
+        self.assertTrue(torch.all(seen["slot"][:3] == 3.0))
+        self.assertTrue(torch.all(seen["slot"][3:] == 0.0))
+
+        short = torch.full((2, self.WIDTH), 5.0, dtype=self.DTYPE, device=_DEVICE)
+        self._drive(runner, short)
+        self.assertTrue(torch.all(seen["slot"][:2] == 5.0))
+        self.assertTrue(torch.all(seen["slot"][2:] == 0.0))
+
+        self._drive(runner, None)
+        self.assertTrue(torch.all(seen["slot"] == 0.0))
+
+    def test_malformed_input_prevents_replay(self):
+        replayed = []
+
+        def replay(*_args, **_kwargs):
+            replayed.append(True)
+            return "replayed"
+
+        runner = self._runner(replay)
+        bad = torch.full((3, self.WIDTH), 1.0, dtype=torch.float32, device=_DEVICE)
+        with self.assertRaises(RuntimeError):
+            self._drive(runner, bad)
+        self.assertFalse(replayed)
+        self.assertIsNone(runner.layer_model.forward)
 
 
 if __name__ == "__main__":

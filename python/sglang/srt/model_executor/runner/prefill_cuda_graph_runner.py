@@ -243,7 +243,8 @@ def _refresh_deepstack_replay_slot(
 
     num_tokens = slot.shape[0]
     if (
-        deepstack_embeds.shape[0] > num_tokens
+        deepstack_embeds.ndim != slot.ndim
+        or deepstack_embeds.shape[0] > num_tokens
         or deepstack_embeds.shape[1:] != slot.shape[1:]
         or deepstack_embeds.dtype != slot.dtype
         or deepstack_embeds.device != slot.device
@@ -413,10 +414,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        # Only the eager-tail backends (BREAKABLE/FULL) bind and refresh this
+        # slot; tc_piecewise captures the outer forward and never reads it.
         deepstack_replay_width = (
             self.model_runner.model_config.hidden_size
             * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
-            if getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
+            if self._uses_eager_prefill_tail()
+            and getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
             else 0
         )
 
