@@ -408,18 +408,7 @@ def _try_enable_offline_mode_if_cache_complete(
 ) -> Optional[str]:
     """Set HF_HUB_OFFLINE=1 in `env` if the model cache validates; return the
     per-run marker path, or None if offline mode was not enabled.
-
-    Markers are per-run and not shared across runners. A marker is only a hint;
-    the current launch's requirements (e.g. hf_quant_config.json) are revalidated.
     """
-    from sglang.srt.model_loader.ci_weight_validation import (
-        _get_per_run_marker_path,
-        _read_per_run_marker,
-        _write_per_run_marker,
-        validate_cache_lightweight,
-    )
-    from sglang.srt.utils import find_local_repo_dir
-
     other_args = other_args or []
 
     # Skip offline mode for LoRA scenarios (dynamic adapter loading may need online access)
@@ -435,6 +424,40 @@ def _try_enable_offline_mode_if_cache_complete(
         )
         return None
 
+    # Detect before the marker check so the current launch's requirements are known.
+    requires_hf_quant_config = False
+    for i, arg in enumerate(other_args):
+        if arg == "--quantization" and i + 1 < len(other_args):
+            quant_value = other_args[i + 1].lower()
+            if quant_value in ["modelopt_fp4", "modelopt_fp8", "modelopt"]:
+                requires_hf_quant_config = True
+                break
+
+    marker_path = _validate_cache_for_offline(
+        model_name_or_path, requires_hf_quant_config
+    )
+    if marker_path is not None:
+        env["HF_HUB_OFFLINE"] = "1"
+    return marker_path
+
+
+def _validate_cache_for_offline(
+    model_name_or_path: str, requires_hf_quant_config: bool
+) -> Optional[str]:
+    """Return the per-run marker path if the model's local cache is complete
+    enough to load offline, else None.
+
+    Markers are per-run and not shared across runners. A marker is only a hint;
+    the current launch's requirements (e.g. hf_quant_config.json) are revalidated.
+    """
+    from sglang.srt.model_loader.ci_weight_validation import (
+        _get_per_run_marker_path,
+        _read_per_run_marker,
+        _write_per_run_marker,
+        validate_cache_lightweight,
+    )
+    from sglang.srt.utils import find_local_repo_dir
+
     # Skip if already a local path
     if os.path.isdir(model_name_or_path):
         return None
@@ -446,15 +469,6 @@ def _try_enable_offline_mode_if_cache_complete(
             return None
     except Exception:
         return None
-
-    # Detect before the marker check so the current launch's requirements are known.
-    requires_hf_quant_config = False
-    for i, arg in enumerate(other_args):
-        if arg == "--quantization" and i + 1 < len(other_args):
-            quant_value = other_args[i + 1].lower()
-            if quant_value in ["modelopt_fp4", "modelopt_fp8", "modelopt"]:
-                requires_hf_quant_config = True
-                break
 
     # Check per-run marker (fast hint - snapshot validated earlier in this run)
     per_run_marker = _read_per_run_marker(snapshot_dir)
@@ -473,7 +487,6 @@ def _try_enable_offline_mode_if_cache_complete(
             return None
 
         # Marker exists and current validation passed
-        env["HF_HUB_OFFLINE"] = "1"
         marker_path = _get_per_run_marker_path(snapshot_dir)
         print(
             f"CI_OFFLINE: Per-run marker found and current validation passed "
@@ -494,9 +507,6 @@ def _try_enable_offline_mode_if_cache_complete(
         )
         return None
 
-    # Validation passed - enable offline mode and write per-run marker
-    env["HF_HUB_OFFLINE"] = "1"
-
     # Write per-run marker for subsequent tests in this run
     _write_per_run_marker(snapshot_dir, model_name_or_path)
 
@@ -511,6 +521,94 @@ def _try_enable_offline_mode_if_cache_complete(
     )
 
     return marker_path
+
+
+@contextlib.contextmanager
+def _hf_offline_if_cache_complete(engine_kwargs: dict):
+    """Run an in-process Engine startup with HF_HUB_OFFLINE=1 when every Hub
+    repo it loads validates in the local cache.
+
+    A scheduler that fails at startup kills the test process, so there is no
+    online retry as in popen_launch_server; any doubt keeps the startup online.
+    """
+    import huggingface_hub.constants
+
+    if "server_args" in engine_kwargs:
+        server_args = engine_kwargs["server_args"]
+        model_path = server_args.model_path
+        tokenizer_path = server_args.tokenizer_path
+        draft_path = server_args.speculative_draft_model_path
+        quantization = server_args.quantization
+        uses_lora = server_args.enable_lora or bool(server_args.lora_paths)
+    else:
+        model_path = engine_kwargs.get("model_path")
+        tokenizer_path = engine_kwargs.get("tokenizer_path")
+        draft_path = engine_kwargs.get("speculative_draft_model_path")
+        quantization = engine_kwargs.get("quantization")
+        uses_lora = bool(
+            engine_kwargs.get("enable_lora") or engine_kwargs.get("lora_paths")
+        )
+
+    # Adapters can be loaded by repo id after startup, from an offline scheduler.
+    if uses_lora or os.environ.get("HF_HUB_OFFLINE") == "1":
+        yield
+        return
+
+    requires_hf_quant_config = quantization in [
+        "modelopt_fp4",
+        "modelopt_fp8",
+        "modelopt",
+    ]
+    repo_ids = {
+        path
+        for path in (model_path, tokenizer_path, draft_path)
+        if path is not None and not os.path.isdir(path)
+    }
+    if not repo_ids or not all(
+        _validate_cache_for_offline(
+            repo_id, requires_hf_quant_config and repo_id == model_path
+        )
+        for repo_id in repo_ids
+    ):
+        yield
+        return
+
+    # Spawned children read the env at import; this process already imported
+    # huggingface_hub, which reads it once into a module constant.
+    prev_env = os.environ.get("HF_HUB_OFFLINE")
+    prev_constant = huggingface_hub.constants.HF_HUB_OFFLINE
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    huggingface_hub.constants.HF_HUB_OFFLINE = True
+    try:
+        yield
+    finally:
+        if prev_env is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = prev_env
+        huggingface_hub.constants.HF_HUB_OFFLINE = prev_constant
+
+
+def _install_ci_engine_offline_hook():
+    """In CI, wrap Engine.__init__ once per process with _hf_offline_if_cache_complete."""
+    try:
+        from sglang.srt.entrypoints.engine import Engine
+    except ImportError as e:
+        # A test that never builds an Engine must not fail on this.
+        print(f"CI_OFFLINE: Engine import failed, skip the offline hook: {e}")
+        return
+
+    orig_init = Engine.__init__
+    if getattr(orig_init, "_ci_offline_wrapped", False):
+        return
+
+    @wraps(orig_init)
+    def init(self, **kwargs):
+        with _hf_offline_if_cache_complete(kwargs):
+            orig_init(self, **kwargs)
+
+    init._ci_offline_wrapped = True
+    Engine.__init__ = init
 
 
 def _create_clean_subprocess_env(env: dict) -> dict:
@@ -2306,6 +2404,8 @@ class CustomTestCase(unittest.TestCase):
         def safe_setUpClass(klass):
             try:
                 _wait_for_gpu_idle_in_ci()
+                if is_in_ci():
+                    _install_ci_engine_offline_hook()
                 orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the

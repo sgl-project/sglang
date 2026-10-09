@@ -6,13 +6,7 @@ DEFAULT_CHUNK_SIZE: int = 256
 
 DEFAULT_MAX_STEPS: int = 400
 
-VERY_LONG_PROMPT_LEN: int = 8 * DEFAULT_CHUNK_SIZE
-
 SMALL_MODEL: str = "Qwen/Qwen3-0.6B"
-
-RID_RELEASE_SETTLE_STEPS: int = 40
-
-DRAIN_RELEASE_STEPS: int = 12
 
 
 def base_engine_kwargs(
@@ -44,24 +38,6 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
 
 
-def run_until_finished_then_settle(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
-    yield from run_until_finished(handle, max_steps=max_steps)
-    for _ in range(RID_RELEASE_SETTLE_STEPS):
-        yield
-
-
-def drain_until_released(t, *handles, max_steps: int = DRAIN_RELEASE_STEPS):
-    for _ in range(max_steps):
-        if all(
-            h.kv_pages == 0
-            and h.lock_refs == 0
-            and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
-
-
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
     done = [False] * len(handles)
     for _ in range(max_steps):
@@ -73,35 +49,6 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
     raise AssertionError(
         f"run_until_all_finished: not all reqs finished after {max_steps} "
         f"steps (finished={done})"
-    )
-
-
-DEFAULT_DRAIN_STEPS: int = 16
-
-
-def drain_until_kv_released(*reqs, max_steps: int = DEFAULT_DRAIN_STEPS):
-    # Takes Reqs, not handles: a handle's req goes None once an aborted req leaves
-    # the live queues, so the check would pass vacuously without ever seeing KV.
-    def released(r):
-        return r.kv.req_pool_idx is None and r.kv.is_kv_released
-
-    for _ in range(max_steps):
-        if all(released(r) for r in reqs):
-            return
-        yield
-    # The loop tests before each yield, so the last yield's state is still unseen.
-    pending = [r for r in reqs if not released(r)]
-    if not pending:
-        return
-    raise AssertionError(
-        f"drain_until_kv_released: reqs still holding KV after {max_steps} steps ("
-        + "; ".join(
-            f"rid={r.rid} row_idx={r.kv.req_pool_idx!r} "
-            f"kv_allocated_len={r.kv.kv_allocated_len} "
-            f"swa_evicted_seqlen={r.kv.swa_evicted_seqlen}"
-            for r in pending
-        )
-        + ")"
     )
 
 

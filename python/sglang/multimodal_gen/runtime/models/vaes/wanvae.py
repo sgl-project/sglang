@@ -56,6 +56,8 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
+from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_cuda() or current_platform.is_xpu():
@@ -77,7 +79,7 @@ first_chunk = contextvars.ContextVar("first_chunk", default=None)
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
-    return hasattr(torch, "channels_last_3d") and (
+    return (
         current_platform.is_cuda()
         or current_platform.is_rocm()
         or current_platform.is_xpu()
@@ -164,103 +166,10 @@ def _run_cached_causal_conv(
     return out
 
 
-class AvgDown3D(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        factor_t,
-        factor_s=1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-
-        assert in_channels * self.factor % out_channels == 0
-        self.group_size = in_channels * self.factor // out_channels
-
+class DupUp3D(DupUp3DBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
-        pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
-        B, C, T, H, W = x.shape
-        x = x.view(
-            B,
-            C,
-            T // self.factor_t,
-            self.factor_t,
-            H // self.factor_s,
-            self.factor_s,
-            W // self.factor_s,
-            self.factor_s,
-        )
-        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        x = x.view(
-            B,
-            C * self.factor,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.view(
-            B,
-            self.out_channels,
-            self.group_size,
-            T // self.factor_t,
-            H // self.factor_s,
-            W // self.factor_s,
-        )
-        x = x.mean(dim=2)
-        return x
-
-
-class DupUp3D(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        factor_t,
-        factor_s=1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        self.factor_t = factor_t
-        self.factor_s = factor_s
-        self.factor = self.factor_t * self.factor_s * self.factor_s
-
-        assert out_channels * self.factor % in_channels == 0
-        self.repeats = out_channels * self.factor // in_channels
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            self.factor_t,
-            self.factor_s,
-            self.factor_s,
-            x.size(2),
-            x.size(3),
-            x.size(4),
-        )
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-        x = x.view(
-            x.size(0),
-            self.out_channels,
-            x.size(2) * self.factor_t,
-            x.size(4) * self.factor_s,
-            x.size(6) * self.factor_s,
-        )
-
         _first_chunk = first_chunk.get() if first_chunk is not None else None
-        if _first_chunk:
-            x = x[:, :, self.factor_t - 1 :, :, :]
-        return x
+        return super().forward(x, first_chunk=_first_chunk)
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -1514,6 +1423,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
     """
 
     _supports_gradient_checkpointing = False
+    supports_decode_on_frames = True
 
     def __init__(
         self,
@@ -1692,7 +1602,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
         enc = torch.cat([first_frame, enc], dim=2)
         return enc
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, on_frames=None) -> torch.Tensor:
+        """``on_frames`` receives every returned frame once, in order, as soon as it is final."""
         if self.use_feature_cache:
             self.clear_cache()
             iter_ = z.shape[2]
@@ -1711,6 +1622,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                        # with the causal cache these frames are final, and full
+                        # height even under spatial-parallel decode
+                        if on_frames is not None:
+                            on_frames(self._output_frames(out_chunks[-1]))
                     out = (
                         torch.cat(out_chunks, 2)
                         if len(out_chunks) > 1
@@ -1725,8 +1640,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)
+            # tiled and whole-clip decodes only finish frames at the end
+            if on_frames is not None:
+                on_frames(out)
 
         return out
+
+    def _output_frames(self, out: torch.Tensor) -> torch.Tensor:
+        """What ``decode`` returns for decoder output ``out``, leaving ``out`` intact."""
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return out.float().clamp(min=-1.0, max=1.0)
 
     def _decode(self, z: torch.Tensor, first_frame=False) -> torch.Tensor:
         x = self.post_quant_conv(z)

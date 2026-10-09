@@ -17,6 +17,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class _SwaCache(RadixCache):
     def __init__(self, *, auxiliary=False):
+        self.disable = False
         self.sliding_window_size = 128
         self.page_size = 16
         self.req_to_token_pool = SimpleNamespace(

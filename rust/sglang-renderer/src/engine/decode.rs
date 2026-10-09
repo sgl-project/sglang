@@ -196,10 +196,22 @@ pub(super) fn decode_output(
             text.push_str(&delta);
         }
     }
-    if output.finish_reason.is_some()
-        && let Some(matcher) = stop_matcher
-    {
-        text.push_str(&matcher.flush());
+    if output.finish_reason.is_some() {
+        let tail = decoder
+            .finish()
+            .map_err(|error| internal(format!("detokenizing engine output failed: {error}")))?
+            .unwrap_or_default();
+        if let Some(matcher) = stop_matcher {
+            let matched = matcher.push(&tail);
+            text.push_str(&matched.text);
+            if let Some(stop) = matched.matched {
+                output.text = text;
+                return Ok(Some(stop));
+            }
+            text.push_str(&matcher.flush());
+        } else {
+            text.push_str(&tail);
+        }
     }
     output.text = text;
     Ok(None)
