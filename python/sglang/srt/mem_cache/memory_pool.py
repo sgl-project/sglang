@@ -43,12 +43,12 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
+from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -2862,16 +2862,8 @@ class MHATokenToKVPool(KVCache):
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
-            # Lazy kernel resolution is not traceable by torch.compile.
-            if (
-                _is_cuda
-                and cache_k.is_cuda
-                and not torch.compiler.is_compiling()
-                and self.head_dim == self.v_head_dim
-                and self.store_dtype == self.dtype
-                and cache_k.dtype == cache_v.dtype == self.dtype == torch.bfloat16
-            ):
-                reshape_and_cache_flash(
+            if _is_cuda and self.head_dim == self.v_head_dim:
+                launch_reshape_and_cache_flash(
                     cache_k,
                     cache_v,
                     k_buf.permute(0, 2, 1, 3),
