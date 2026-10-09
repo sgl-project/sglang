@@ -673,6 +673,8 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Override NVML Confidential Computing autodetection. None = autodetect.
+    SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
     # ===================================================================
     # Radix and sparse KV caches
