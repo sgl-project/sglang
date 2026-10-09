@@ -1,0 +1,17 @@
+# StepFun Step-5 acceptance contract. Values follow the acceptance manual; confirm against StepFun's API docs.
+name: stepfun-step5
+limits:
+  max_body_bytes: 128MiB
+  max_images: 60
+output:
+  max_tokens: { cap: 64000, on_exceed: clamp }
+params:
+  temperature:       { default: 1.0, min: 0, max: 2 }
+  top_p:             { default: 0.95, min: 0, max: 1, exclusive_min: true }
+  top_k:             { min: 0, type: int, normalize: [[0, -1]] }   # 0 means "no limit"; the engine spells it -1
+  frequency_penalty: { min: -2, max: 2 }
+  presence_penalty:  { min: -2, max: 2 }
+  n:                 { min: 1, max: 8, type: int }
+  reasoning_format:  { values: [general, deepseek-style] }
+errors:
+  bad_request_type: request_params_invalid

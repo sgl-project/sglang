@@ -11,7 +11,7 @@ use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -22,19 +22,45 @@ use tower_http::compression::{CompressionLayer, CompressionLevel};
 /// and URI so an operator investigating "client X gets 413s" has a
 /// server-side breadcrumb. The 413 is produced by axum's `DefaultBodyLimit`
 /// layer BEFORE the handler runs, so without this we would have no record
-/// of which request was rejected.
-async fn log_413(req: Request, next: Next) -> Response {
+/// of which request was rejected. axum's body is plain text, so it is also
+/// replaced with the protocol's JSON error envelope.
+async fn log_413(State(limit): State<usize>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let resp = next.run(req).await;
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        tracing::warn!(
-            %method,
-            %uri,
-            "request rejected with 413 PAYLOAD_TOO_LARGE (body exceeded route limit)",
-        );
+    if resp.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return resp;
     }
-    resp
+    tracing::warn!(
+        %method,
+        %uri,
+        "request rejected with 413 PAYLOAD_TOO_LARGE (body exceeded route limit)",
+    );
+    let mut json = route_error(
+        uri.path(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
+        format!(
+            "request body exceeds the {} limit for this endpoint",
+            size_text(limit)
+        ),
+    );
+    // Keep the router's own headers (e.g. Server-Timing) from the original.
+    let (parts, _) = resp.into_parts();
+    for (k, v) in parts.headers.iter().filter(|(k, _)| {
+        *k != axum::http::header::CONTENT_TYPE && *k != axum::http::header::CONTENT_LENGTH
+    }) {
+        json.headers_mut().insert(k.clone(), v.clone());
+    }
+    json
+}
+
+fn size_text(bytes: usize) -> String {
+    match bytes {
+        b if b >= 1 << 20 && b % (1 << 20) == 0 => format!("{} MiB", b >> 20),
+        b if b >= 1 << 10 && b % (1 << 10) == 0 => format!("{} KiB", b >> 10),
+        b => format!("{b} byte"),
+    }
 }
 
 /// Infra endpoints excluded from the access log (logged at DEBUG instead) and
@@ -358,6 +384,130 @@ async fn access_log_and_record(
     resp
 }
 
+/// Anthropic envelope under `/v1/messages`, OpenAI elsewhere.
+fn route_error(path: &str, status: StatusCode, code: &'static str, message: String) -> Response {
+    use axum::response::IntoResponse;
+    let body = if path.starts_with("/v1/messages") {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": crate::protocol::anthropic::error_type(status.as_u16()),
+                "message": message,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "error": {"type": "invalid_request_error", "code": code, "message": message}
+        })
+    };
+    (status, axum::Json(body)).into_response()
+}
+
+async fn unmatched_route(uri: axum::http::Uri) -> Response {
+    route_error(
+        uri.path(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!(
+            "no route for path `{}`; supported endpoints are /v1/chat/completions, \
+             /v1/responses, /v1/messages, /v1/messages/count_tokens, /v1/models, \
+             /v1/tokenize and /v1/detokenize",
+            uri.path()
+        ),
+    )
+}
+
+async fn method_not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    route_error(
+        uri.path(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        format!("method {method} is not allowed on `{}`", uri.path()),
+    )
+}
+
+/// `/generate` plus the inference routes the API profile enables, with its body limit and
+/// `errors.bad_request_type` rewrite.
+fn inference_routes(
+    mut router: Router<Arc<AppContext>>,
+    ctx: &Arc<AppContext>,
+) -> Router<Arc<AppContext>> {
+    use crate::server::routes::{chat, generate, messages, responses};
+    let profile = &ctx.config.model.profile;
+    let limit = profile
+        .limits
+        .max_body_bytes
+        .unwrap_or(MAX_REQUEST_BODY_BYTES);
+    let retype = profile.errors.bad_request_type.is_some();
+    let layered = |h: MethodRouter<Arc<AppContext>>| {
+        let h = h
+            .layer(DefaultBodyLimit::max(limit))
+            .layer(middleware::from_fn_with_state(limit, log_413));
+        if retype {
+            h.layer(middleware::from_fn_with_state(
+                Arc::clone(ctx),
+                retype_bad_request,
+            ))
+        } else {
+            h
+        }
+    };
+    // sglang-native; not a client protocol a profile toggles.
+    router = router.route("/generate", layered(post(generate::generate)));
+    let p = &profile.protocols;
+    if p.chat {
+        router = router.route(
+            "/v1/chat/completions",
+            layered(post(chat::chat_completions)),
+        );
+    }
+    if p.messages {
+        router = router
+            .route("/v1/messages", layered(post(messages::messages)))
+            .route(
+                "/v1/messages/count_tokens",
+                layered(post(messages::count_tokens)),
+            );
+    }
+    if p.responses {
+        router = router.route("/v1/responses", layered(post(responses::responses)));
+    }
+    router
+}
+
+/// Set the profile's `errors.bad_request_type` on every 400 body, in either
+/// envelope (`error.type`, or sglang's flat top-level `type`).
+async fn retype_bad_request(
+    State(ctx): State<Arc<AppContext>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let resp = next.run(req).await;
+    let typ = ctx.config.model.profile.errors.bad_request_type.as_deref();
+    let (Some(typ), StatusCode::BAD_REQUEST) = (typ, resp.status()) else {
+        return resp;
+    };
+    let (mut parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    let target = match v.get_mut("error") {
+        Some(e @ serde_json::Value::Object(_)) => e,
+        _ => &mut v,
+    };
+    if let serde_json::Value::Object(m) = target {
+        m.insert("type".into(), typ.into());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(
+        parts,
+        axum::body::Body::from(serde_json::to_vec(&v).expect("serialize")),
+    )
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
@@ -374,18 +524,6 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/detokenize",
             post(crate::server::routes::tokenize::detokenize),
-        )
-        .route(
-            "/v1/chat/completions",
-            post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
-        )
-        .route(
-            "/generate",
-            post(crate::server::routes::generate::generate)
-                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-                .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/flush_cache",
@@ -423,6 +561,8 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             ),
         );
 
+    let router = inference_routes(router, &ctx);
+
     // Debug-only CPU flamegraph endpoint — compiled in only with `--features
     // profiling` (see Cargo.toml and `routes::pprof`'s module doc), never
     // present in the normal production image.
@@ -433,6 +573,9 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
     );
 
     router
+        // Structured error bodies instead of axum's empty 404 / 405.
+        .fallback(unmatched_route)
+        .method_not_allowed_fallback(method_not_allowed)
         // Convert a handler panic into a 500 response. hyper otherwise catches
         // the panic and drops the connection WITHOUT a Response, so the failure
         // never reaches the `access_log_and_record` middleware below and is

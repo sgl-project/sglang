@@ -54,8 +54,7 @@ fn build_ctx() -> Arc<AppContext> {
             cache_aware: None,
             decode_policy: None,
             sticky: None,
-            max_output_tokens: None,
-            sampling_overrides: Default::default(),
+            profile: Default::default(),
             forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

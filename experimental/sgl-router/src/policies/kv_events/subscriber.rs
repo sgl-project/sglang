@@ -70,8 +70,9 @@ use tracing::{debug, error, info, trace, warn};
 use zeromq::{Socket, SocketRecv, SubSocket, ZmqMessage};
 
 use super::discovery::EventConfig;
+use super::tally::EventTally;
 use super::tree::KvWorkerId;
-use super::wire::{decode_event_batch, KvEventBatch};
+use super::wire::{decode_event_batch, DecodeError, KvEventBatch};
 use crate::policies::engine_load::{decode_load_stat, LoadStat};
 
 /// Maximum number of consecutive `recv()` errors before the subscriber
@@ -181,6 +182,7 @@ struct Inner {
 pub struct KvEventSubscriberRegistry {
     inner: Arc<Inner>,
     kind: SubKind,
+    tally: Arc<EventTally>,
 }
 
 impl KvEventSubscriberRegistry {
@@ -192,7 +194,17 @@ impl KvEventSubscriberRegistry {
 
     /// Build an empty registry of the given kind.
     pub fn with_kind(tx: mpsc::Sender<WorkerEvent>, kind: SubKind) -> Self {
+        Self::with_tally(tx, kind, Arc::new(EventTally::new()))
+    }
+
+    /// Share decoder telemetry with the index that consumes these events.
+    pub fn with_tally(
+        tx: mpsc::Sender<WorkerEvent>,
+        kind: SubKind,
+        tally: Arc<EventTally>,
+    ) -> Self {
         Self {
+            tally,
             inner: Arc::new(Inner {
                 tx,
                 handles: Mutex::new(HashMap::new()),
@@ -271,6 +283,7 @@ impl KvEventSubscriberRegistry {
                 self.kind,
                 self.inner.tx.clone(),
                 cancel.clone(),
+                self.tally.clone(),
             );
             handles.insert(id, SubscriberHandle { cancel, join });
         }
@@ -352,9 +365,10 @@ fn spawn_subscriber_task(
     kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
+    tally: Arc<EventTally>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_subscriber(id, endpoint, topic, kind, tx, cancel).await;
+        run_subscriber(id, endpoint, topic, kind, tx, cancel, tally).await;
     })
 }
 
@@ -372,6 +386,7 @@ async fn run_subscriber(
     kind: SubKind,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
+    tally: Arc<EventTally>,
 ) {
     debug!(
         worker_url = %id.url,
@@ -403,7 +418,7 @@ async fn run_subscriber(
                 match res {
                     Ok(msg) => {
                         errors_in_a_row = 0;
-                        if let Some(event) = decode_message(&id, msg, kind) {
+                        if let Some(event) = decode_message(&id, msg, kind, &tally) {
                             if tx.send(event).await.is_err() {
                                 // The pump (or the entire index) is gone.
                                 // This is unexpected mid-stream; warn so
@@ -530,8 +545,16 @@ async fn connect_with_backoff(
 /// Returns `None` (with logging) for any non-event input (bad frame
 /// count, sentinel sequence, or msgpack decode error). `kind` selects
 /// whether to emit a KV [`WorkerEvent::Batch`] or a [`WorkerEvent::Load`].
-fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<WorkerEvent> {
+fn decode_message(
+    id: &KvWorkerId,
+    msg: ZmqMessage,
+    kind: SubKind,
+    tally: &EventTally,
+) -> Option<WorkerEvent> {
     if msg.len() != 3 {
+        if matches!(kind, SubKind::Kv) {
+            tally.record_decode_failure(id, "frame_count");
+        }
         warn!(
             worker_url = %id.url,
             dp_rank = id.dp_rank,
@@ -553,6 +576,9 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<Wor
     let seq_bytes: [u8; 8] = match seq_frame.as_ref().try_into() {
         Ok(b) => b,
         Err(_) => {
+            if matches!(kind, SubKind::Kv) {
+                tally.record_decode_failure(id, "sequence_frame");
+            }
             warn!(
                 worker_url = %id.url,
                 dp_rank = id.dp_rank,
@@ -587,6 +613,13 @@ fn decode_message(id: &KvWorkerId, msg: ZmqMessage, kind: SubKind) -> Option<Wor
             let batch = match decode_event_batch(payload.as_ref()) {
                 Ok(b) => b,
                 Err(e) => {
+                    tally.record_decode_failure(
+                        id,
+                        match &e {
+                            DecodeError::PayloadTooLarge { .. } => "block_hashes_limit",
+                            DecodeError::Msgpack(_) => "msgpack",
+                        },
+                    );
                     warn!(
                         worker_url = %id.url,
                         dp_rank = id.dp_rank,
@@ -1218,6 +1251,10 @@ mod tests {
         // We must NOT have received the bad message.
         assert!(matches!(batch.events[0], KvCacheEvent::AllBlocksCleared));
 
+        assert_eq!(
+            registry.tally.stream_snapshot()[0].1.decode_failures,
+            [1, 0, 0, 0]
+        );
         registry.shutdown().await;
     }
 
@@ -1427,6 +1464,42 @@ mod tests {
         assert!(extract_host("not a url").is_none());
     }
 
+    #[test]
+    fn kv_decode_failures_are_counted_by_reason() {
+        use super::super::wire::{tests::long_store_batch, MAX_HASHES_PER_EVENT};
+        let id = KvWorkerId::new("http://w".into(), 0);
+        let tally = EventTally::new();
+        for map in [false, true] {
+            let payload = long_store_batch(map, false, 0, MAX_HASHES_PER_EVENT + 1);
+            assert!(decode_message(
+                &id,
+                helpers::build_multipart(0, payload),
+                SubKind::Kv,
+                &tally
+            )
+            .is_none());
+        }
+        assert!(decode_message(
+            &id,
+            helpers::build_multipart(1, vec![0xc1]),
+            SubKind::Kv,
+            &tally
+        )
+        .is_none());
+        let state = &tally.stream_snapshot()[0].1;
+        assert_eq!(state.decode_failures, [1, 2, 0, 0]);
+        assert!(state.untrusted);
+        let payload = long_store_batch(true, true, 600_000, 9375);
+        assert!(decode_message(
+            &id,
+            helpers::build_multipart(2, payload),
+            SubKind::Kv,
+            &tally
+        )
+        .is_some());
+        assert_eq!(tally.stream_snapshot()[0].1.decode_failures, [1, 2, 0, 0]);
+    }
+
     /// Direct unit test of [`decode_message`] — exercises sentinel and
     /// bad-frame paths without involving sockets.
     #[test]
@@ -1438,29 +1511,31 @@ mod tests {
 
         // Wrong frame count.
         let one_frame = ZmqMessage::from(Bytes::from_static(b"only"));
-        assert!(decode_message(&id, one_frame, SubKind::Kv).is_none());
+        assert!(decode_message(&id, one_frame, SubKind::Kv, &EventTally::new()).is_none());
 
         // Sentinel seq = -1 now surfaces as PublisherReset (not None) so
         // the downstream pump can clear its cursor before a reconnecting
         // publisher restarts from seq=1.
         let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
-        let reset = decode_message(&id, sentinel, SubKind::Kv).expect("END_SEQ forwards");
+        let reset = decode_message(&id, sentinel, SubKind::Kv, &EventTally::new())
+            .expect("END_SEQ forwards");
         assert!(matches!(reset, WorkerEvent::PublisherReset { .. }));
 
         // Bad seq frame length.
         let mut bad_seq = ZmqMessage::from(Bytes::new());
         bad_seq.push_back(Bytes::from_static(b"abc")); // 3 bytes, not 8
         bad_seq.push_back(Bytes::from_static(b""));
-        assert!(decode_message(&id, bad_seq, SubKind::Kv).is_none());
+        assert!(decode_message(&id, bad_seq, SubKind::Kv, &EventTally::new()).is_none());
 
         // Bad payload.
         let bad_payload = helpers::build_multipart(1, vec![0xff, 0xfe]);
-        assert!(decode_message(&id, bad_payload, SubKind::Kv).is_none());
+        assert!(decode_message(&id, bad_payload, SubKind::Kv, &EventTally::new()).is_none());
 
         // Happy path.
         let payload = helpers::encode_all_blocks_cleared_batch(0.0, None);
         let good = helpers::build_multipart(7, payload);
-        let event = decode_message(&id, good, SubKind::Kv).expect("should decode");
+        let event =
+            decode_message(&id, good, SubKind::Kv, &EventTally::new()).expect("should decode");
         let (worker, seq, _batch) = helpers::expect_batch(event);
         assert_eq!(seq, 7);
         assert_eq!(worker, id);
@@ -1477,12 +1552,13 @@ mod tests {
 
         // END_SEQ is dropped for the load topic.
         let sentinel = helpers::build_multipart(-1, b"ignored".to_vec());
-        assert!(decode_message(&id, sentinel, SubKind::Load).is_none());
+        assert!(decode_message(&id, sentinel, SubKind::Load, &EventTally::new()).is_none());
 
         // A bare LoadStat frame becomes WorkerEvent::Load.
         let payload = helpers::encode_load_stat(5, 2, 100, 1000, 1);
         let msg = helpers::build_multipart(3, payload);
-        let event = decode_message(&id, msg, SubKind::Load).expect("should decode load");
+        let event = decode_message(&id, msg, SubKind::Load, &EventTally::new())
+            .expect("should decode load");
         match event {
             WorkerEvent::Load { worker, load } => {
                 assert_eq!(worker, id);

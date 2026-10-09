@@ -802,7 +802,12 @@ impl KvEventIndex {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<PumpControl>(16);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let tally = Arc::new(EventTally::new());
+        let subscribers = Arc::new(KvEventSubscriberRegistry::with_tally(
+            tx.clone(),
+            SubKind::Kv,
+            tally.clone(),
+        ));
         let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
         let engine_load = EngineLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -810,7 +815,6 @@ impl KvEventIndex {
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
-        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tally: Arc::clone(&tally),
@@ -1487,6 +1491,7 @@ impl KvEventIndex {
             let mut cursors = self.cursors.lock();
             for id in &ids {
                 self.tree.clear_worker(id);
+                self.tally.forget_worker(id);
                 cursors.remove(id);
             }
         }
@@ -2310,12 +2315,12 @@ fn spawn_mode_recheck(
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
 /// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
 /// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
-/// with no seq. `PublisherReset` events clear the cursor so a publisher
-/// restarting from seq=0 (after sending END_SEQ) is not filtered. Without
+/// with no seq. `PublisherReset` sets the cursor to -1, accepting seq=0
+/// and detecting missing batches at the start of the new stream. Without
 /// that event, a regression is still read as a restart where it is
 /// unambiguous: any backwards step in a Pending rank's received sequence, and
-/// a batch 0 behind any cursor — both replace the rank's state with the new
-/// stream rather than being skipped.
+/// a batch 0 behind any applied cursor — both replace the rank's state with
+/// the new stream rather than being skipped.
 ///
 /// Also the sole writer of tree state, including snapshot grafts arriving as
 /// [`PumpControl`]; see the single-writer property in [`super::tree`].
@@ -2407,6 +2412,7 @@ async fn pump_loop(
                             // this is applied and then undone here; one queued
                             // after is filtered by the epoch/live/state gates.
                             tree.clear_worker(&rank);
+                            tally.forget_worker(&rank);
                             cursors.lock().remove(&rank);
                         }
                     }
@@ -2598,21 +2604,28 @@ async fn pump_loop(
                         true,
                         RankOutcome::PublisherReset,
                     );
+                } else {
+                    // The old publisher's cache no longer exists on any tier.
+                    // Clear only this URL/rank, preserving other worker owners.
+                    tree.clear_worker(&worker);
                 }
-                if cursors.lock().remove(&worker).is_some() {
-                    info!(
-                        worker = ?worker,
-                        "kv-events pump: publisher reset; cursor cleared",
-                    );
-                }
+                held.remove(&worker);
+                tally.record_publisher_reset(&worker);
+                let had_cursor = cursors.lock().insert(worker.clone(), -1).is_some();
+                info!(
+                    worker = ?worker, had_cursor,
+                    "kv-events pump: publisher reset; tree cleared, cursor reset to -1",
+                );
                 // A reset also means the engine process restarted — possibly
                 // with different speculative-decoding config. Discovery only
                 // notices restarts that change its entry (pod replacement, a
                 // readiness toggle, Removed→Added); a silent in-place restart
                 // (same pod UID/IP, or static worker-urls) emits nothing, so
                 // the pump re-introspects the vote itself. Note resets only
-                // follow a graceful publisher shutdown; a crash restart
-                // surfaces as a stream gap handled by the gap path instead.
+                // follow a graceful publisher shutdown. Without the sentinel,
+                // a regression to batch 0 is read as a restart (see the `Batch`
+                // arm); any other rollback is reported as untrusted and stays
+                // filtered.
                 spawn_mode_recheck(&http, &oracle, &live_workers, &bootstrap, &worker);
             }
             WorkerEvent::Batch { worker, seq, batch } => {
@@ -2653,6 +2666,7 @@ async fn pump_loop(
                             "kv-bootstrap: sequence regressed while holding; the publisher \
                              restarted without END_SEQ, discarding the dead stream's batches",
                         );
+                        tally.record_publisher_reset(&worker);
                         if seq == STREAM_ORIGIN_SEQ {
                             resolve_from_origin(&pump_state, &mut held, &worker);
                         } else {
@@ -2686,7 +2700,10 @@ async fn pump_loop(
                     }
                     // Falls through: the rank is no longer Pending, so this
                     // batch is applied directly below.
-                } else if seq == STREAM_ORIGIN_SEQ && cursors.lock().contains_key(&worker) {
+                } else if seq == STREAM_ORIGIN_SEQ
+                    // -1 is the post-`PublisherReset` sentinel: batch 0 is expected.
+                    && cursors.lock().get(&worker).is_some_and(|&c| c >= STREAM_ORIGIN_SEQ)
+                {
                     // The resolved-rank counterpart of the regression above,
                     // narrowed to batch 0. Here the comparison is against the
                     // CURSOR, which a graft may have seeded ahead of anything
@@ -2705,6 +2722,7 @@ async fn pump_loop(
                         "kv-events pump: batch 0 behind a later cursor; the publisher \
                          restarted without END_SEQ, replacing this rank's state with the new stream",
                     );
+                    tally.record_publisher_reset(&worker);
                     if awaiting_splice_proof.remove(&worker).is_some() {
                         // The graft's verdict is final now: its state is gone,
                         // and what replaces it is the new stream from its origin.
@@ -2716,6 +2734,13 @@ async fn pump_loop(
                 }
                 // First batch after a graft proves — or disproves — that the
                 // snapshot joins up with this rank's live stream.
+                if let Some(proof) = awaiting_splice_proof.get(&worker) {
+                    if seq <= proof.watermark {
+                        // Expected snapshot overlap, not a live rollback. Keep
+                        // waiting for evidence beyond the snapshot watermark.
+                        continue;
+                    }
+                }
                 if let Some(proof) = awaiting_splice_proof.remove(&worker) {
                     if seq > proof.watermark + 1 {
                         warn!(
@@ -2771,6 +2796,10 @@ fn apply_batch(
 ) {
     if let Some(p) = cursors.lock().get(worker).copied() {
         if seq <= p {
+            if tally.record_skipped_batch(worker, seq < p) {
+                warn!(worker = ?worker, last_applied = p, seq,
+                    "kv-events pump: sequence rollback without reset; cache index untrusted; batch skipped");
+            }
             debug!(
                 worker = ?worker,
                 seq,
@@ -2778,6 +2807,14 @@ fn apply_batch(
                 "kv-events pump: out-of-order batch; skipping",
             );
             return;
+        }
+        let distance = seq.abs_diff(p);
+        if distance > 1 && tally.record_gap(worker, distance - 1) {
+            warn!(
+                worker = ?worker, last_applied = p, seq,
+                missing_sequences = distance - 1,
+                "kv-events pump: sequence gap; cache index may be stale; no automatic replay",
+            );
         }
     }
     for event in &batch.events {
@@ -2814,6 +2851,7 @@ fn apply_batch(
             KvCacheEvent::AllBlocksCleared => {
                 tally.record(EventKind::AllBlocksCleared, None, 0);
                 tree.clear_worker(worker);
+                tally.record_clear(worker);
             }
         }
     }
@@ -3183,6 +3221,10 @@ fn apply_snapshot(
         bootstrap.set(&rank, BootstrapState::Recovered);
         // The seeded cursor filters whatever the snapshot already reflects.
         for (seq, batch) in queue {
+            if seq <= peer_cursor {
+                // Already represented by the snapshot, not a skipped live batch.
+                continue;
+            }
             apply_batch(tree, cursors, st.tally, &rank, seq, &batch);
         }
         // Tallied only once the splice is proven. When it is not yet, the
@@ -3213,6 +3255,183 @@ mod tests {
             ts: 0.0,
             events,
             attn_dp_rank: None,
+        }
+    }
+
+    #[test]
+    fn forward_gap_is_reported_without_silently_clearing_cache() {
+        let tree = HashTree::new();
+        let cursors = Mutex::new(HashMap::new());
+        let tally = EventTally::default();
+        let id = worker_id("http://w1", 0);
+        apply_batch(
+            &tree,
+            &cursors,
+            &tally,
+            &id,
+            1,
+            &batch(vec![stored(None, vec![11])]),
+        );
+        // seq=2 (a removal) is absent from the received stream.
+        apply_batch(
+            &tree,
+            &cursors,
+            &tally,
+            &id,
+            3,
+            &batch(vec![stored(None, vec![22])]),
+        );
+        assert!(tree.match_prefix(None, &[11]).workers.contains(&id));
+        assert!(tree.match_prefix(None, &[22]).workers.contains(&id));
+        assert_eq!(cursors.lock().get(&id).copied(), Some(3));
+        let state = &tally.stream_snapshot()[0].1;
+        assert_eq!((state.gaps, state.missing_sequences), (1, 1));
+        assert!(state.untrusted);
+        for seq in [3, 2, 4] {
+            apply_batch(&tree, &cursors, &tally, &id, seq, &batch(vec![]));
+        }
+        let state = &tally.stream_snapshot()[0].1;
+        assert_eq!((state.gaps, state.skipped_batches), (1, 2));
+        assert!(state.untrusted);
+        apply_batch(
+            &tree,
+            &cursors,
+            &tally,
+            &id,
+            5,
+            &batch(vec![KvCacheEvent::AllBlocksCleared]),
+        );
+        assert!(!tally.stream_snapshot()[0].1.untrusted);
+        assert!(tree.match_prefix(None, &[11]).workers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_without_sentinel_marks_stream_untrusted() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        // Not batch 0: a regression to 0 is read as a restart (below).
+        for seq in [100, 100, 50] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert!(state.untrusted);
+        assert_eq!(state.skipped_batches, 2);
+        assert_eq!(state.gaps, 0);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn rollback_to_batch_zero_without_sentinel_counts_as_a_reset() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        for seq in [100, 0] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert!(!state.untrusted);
+        assert_eq!(state.publisher_resets, 1);
+        assert_eq!(state.skipped_batches, 0);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn batch_zero_after_publisher_reset_is_not_a_second_restart() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let events = [
+            WorkerEvent::Batch {
+                worker: id.clone(),
+                seq: 100,
+                batch: batch(vec![]),
+            },
+            WorkerEvent::PublisherReset { worker: id.clone() },
+            WorkerEvent::Batch {
+                worker: id.clone(),
+                seq: 0,
+                batch: batch(vec![]),
+            },
+            // The -1 sentinel survives batch 0, so a later hole is still seen.
+            WorkerEvent::Batch {
+                worker: id.clone(),
+                seq: 3,
+                batch: batch(vec![]),
+            },
+        ];
+        for event in events {
+            h.tx.send(event).await.unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert_eq!(state.publisher_resets, 1);
+        assert_eq!(state.gaps, 1);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn deferred_snapshot_overlap_does_not_report_rollback_or_gap() {
+        let id = worker_id("http://w1", 0);
+        let (tracker, h) = graft_with_deferred_proof(&id, 5).await;
+        for seq in [3, 5, 6, 7] {
+            h.tx.send(WorkerEvent::Batch {
+                worker: id.clone(),
+                seq,
+                batch: batch(vec![]),
+            })
+            .await
+            .unwrap();
+        }
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        assert!(h.tally.stream_snapshot().is_empty());
+        assert_eq!(rank_count(&tracker, "warm"), 1);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(7));
+    }
+
+    #[test]
+    fn long_token_batch_applies_sibling_deletions() {
+        use super::super::wire::{decode_event_batch, tests::long_store_batch};
+        for map in [false, true] {
+            for (bigram, positions) in [(true, 600_000usize), (false, 1_048_577usize)] {
+                let tree = HashTree::new();
+                let id = worker_id("http://w1", 0);
+                tree.insert_tiered(&id, None, &[42, 43], Tiers::ALL);
+                let decoded = decode_event_batch(&long_store_batch(
+                    map,
+                    bigram,
+                    positions,
+                    positions.div_ceil(64),
+                ))
+                .unwrap();
+                let cursors = Mutex::new(HashMap::new());
+                let tally = EventTally::new();
+                apply_batch(&tree, &cursors, &tally, &id, 0, &decoded);
+                let counts = tree.tier_occupancy();
+                let (_, counts) = counts.iter().find(|(w, _)| w == &id).unwrap();
+                assert_eq!(counts[0], positions.div_ceil(64) as u64);
+                assert_eq!(counts[1], 2); // device removal preserves host copies
+                assert_eq!(cursors.lock().get(&id).copied(), Some(0));
+            }
         }
     }
 
@@ -5705,6 +5924,7 @@ mod tests {
             "a batch the snapshot already reflects must be filtered",
         );
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(5));
+        assert!(h.tally.stream_snapshot().is_empty());
         assert_eq!(tracker.state_of(&id), Some(BootstrapState::Recovered));
     }
 
@@ -6625,7 +6845,7 @@ mod tests {
         );
     }
 
-    /// S1: a restarted publisher renumbers from 1, so its cursor MUST be cleared.
+    /// A reset starts a new stream at zero; missing its first batch is visible.
     ///
     /// Without this, every post-restart batch has `seq < last_applied` and is
     /// dropped as out-of-order: the rank's tree freezes at pre-restart state
@@ -6664,6 +6884,44 @@ mod tests {
             "a restarted publisher's stream must apply, not be filtered as stale",
         );
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
+        assert!(!h.tree.match_prefix(None, &[11]).workers.contains(&id));
+        let state = &h.tally.stream_snapshot()[0].1;
+        assert_eq!(state.publisher_resets, 1);
+        // The first post-reset batch is 1: seq 0 was lost.
+        assert_eq!((state.gaps, state.missing_sequences), (1, 1));
+        assert!(state.untrusted);
+    }
+
+    #[tokio::test]
+    async fn publisher_reset_clears_all_tiers_only_for_its_rank_without_cursor() {
+        let id = worker_id("http://w1", 0);
+        let peer = worker_id("http://w1", 1);
+        let h = spawn_pump(&[id.clone(), peer.clone()]);
+        h.tree.insert_tiered(&id, None, &[11], Tiers::ALL);
+        h.tree.insert_tiered(&peer, None, &[11], Tiers::ALL);
+        h.tally.record_gap(&id, 2);
+        h.tally.record_gap(&peer, 3);
+        h.tx.send(WorkerEvent::PublisherReset { worker: id.clone() })
+            .await
+            .unwrap();
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 0,
+            batch: batch(vec![stored(None, vec![22])]),
+        })
+        .await
+        .unwrap();
+        drop(h.tx);
+        drop(h.ctrl_tx);
+        h.pump.await.unwrap();
+        let old = h.tree.match_prefix(None, &[11]);
+        assert!(!old.workers.contains(&id));
+        assert!(old.workers.contains(&peer));
+        assert!(h.tree.match_prefix(None, &[22]).workers.contains(&id));
+        let states = h.tally.stream_snapshot();
+        assert!(!states.iter().find(|(w, _)| w == &id).unwrap().1.untrusted);
+        assert!(states.iter().find(|(w, _)| w == &peer).unwrap().1.untrusted);
+        assert_eq!(h.cursors.lock().get(&id).copied(), Some(0));
     }
 
     /// A reset means the engine restarted, and its speculative-decoding

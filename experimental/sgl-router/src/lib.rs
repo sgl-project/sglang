@@ -14,6 +14,8 @@ pub mod discovery;
 pub mod health;
 pub mod load_monitor;
 pub mod policies;
+pub mod profile;
+pub mod protocol;
 pub mod proxy;
 pub mod server;
 pub mod tokenizer;

@@ -113,6 +113,9 @@ pub struct ChatRenderOpts {
     /// mirrored by the built-in dsv4 encoder, ignored by Jinja and by K3.
     pub dsv4_parts: ChatRenderOptsDsv4Parts,
     pub kimi_k3: kimi_k3::RenderOpts,
+    /// Tools and template kwargs for the Jinja encoder, resolved as SGLang's
+    /// generic Jinja path resolves them.
+    pub jinja: chat_template::JinjaRenderOpts,
 }
 
 // Deliberately NO `Default` impl: the only sensible body would be `chat()`, and
@@ -137,6 +140,7 @@ impl ChatRenderOpts {
             dsv4: dsv4::RenderOpts::chat(),
             dsv4_parts: ChatRenderOptsDsv4Parts::default(),
             kimi_k3: kimi_k3::RenderOpts::default(),
+            jinja: chat_template::JinjaRenderOpts::default(),
         }
     }
 
@@ -149,8 +153,18 @@ impl ChatRenderOpts {
         }
     }
 
-    /// Resolve both encoders' options from one request body.
+    /// Resolve every encoder's options from one request body, with no engine
+    /// default template kwargs.
     pub fn resolve(request: &serde_json::Value) -> Self {
+        Self::resolve_with_engine_defaults(request, None)
+    }
+
+    /// [`ChatRenderOpts::resolve`] for an engine running with
+    /// `--default-chat-template-kwargs` (Jinja encoder only).
+    pub fn resolve_with_engine_defaults(
+        request: &serde_json::Value,
+        engine_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
         ChatRenderOpts {
             dsv4: dsv4::resolve_render_opts(request),
             // The bool is coerced the way pydantic would (`openai_bool`), not
@@ -165,6 +179,7 @@ impl ChatRenderOpts {
                     == Some(true),
             },
             kimi_k3: kimi_k3::resolve_render_opts(request),
+            jinja: chat_template::JinjaRenderOpts::resolve(request, engine_defaults),
         }
     }
 }
@@ -202,9 +217,10 @@ impl ChatEncoder {
     /// The DeepSeek-V4 encoder renders `tools` (see [`dsv4::render_messages`]) so
     /// cache-aware routing matches the engine's cached blocks for tool traffic,
     /// and it threads the request-level `parts` (`task`, `continue_final_message`;
-    /// see [`dsv4::render_request`]). The Jinja path does not yet thread
-    /// `tools`/`parts` (a tools-carrying request there still routes on the
-    /// no-tools rendering); adding per-model Jinja tool rendering is future work.
+    /// see [`dsv4::render_request`]). The Jinja path renders the request's tools
+    /// and template kwargs as SGLang's generic Jinja path does
+    /// ([`ChatRenderOpts::jinja`]); it does not do the trailing-assistant
+    /// surgery, so such requests are never forwarded.
     fn render(
         &self,
         messages: &serde_json::Value,
@@ -212,10 +228,9 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<(String, Option<String>)> {
         match self {
-            // The Jinja path does not thread thinking-mode/tools/parts yet
-            // (future work); it ignores `opts` and renders the model's default
-            // template.
-            ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
+            // `opts.jinja.tools` (tool_choice-selected, pydantic-dumped), not
+            // the raw `tools`.
+            ChatEncoder::Jinja(t) => t.render_with(messages, &opts.jinja).map(|s| (s, None)),
             ChatEncoder::DeepSeekV4 => {
                 dsv4::render_request(messages, tools, opts.dsv4, opts.dsv4_parts())
                     .map_err(anyhow::Error::from)
@@ -242,7 +257,7 @@ impl ChatEncoder {
         opts: &ChatRenderOpts,
     ) -> Result<String> {
         match self {
-            ChatEncoder::Jinja(t) => t.render(messages),
+            ChatEncoder::Jinja(t) => t.render_with(messages, &opts.jinja),
             ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts.dsv4)),
             // As in `render`: K3 has no single-string form, so the segment path
             // in `encode_chat_plain` handles it before reaching here.
@@ -259,8 +274,11 @@ impl ChatEncoder {
     /// downstream from another registry lookup.
     fn forward_parity(&self) -> ForwardParity {
         match self {
-            // The Jinja encoder needs the conservative predicate (no tool /
-            // thinking / task rendering — see `input_ids_safe_to_forward`).
+            // A Jinja model verified token-identical to the engine (see
+            // `FULL_FORWARDING_MODEL_TYPES`) forwards every shape
+            // `JinjaRenderOpts` mirrors; any other Jinja model stays on the
+            // conservative predicate.
+            ChatEncoder::Jinja(t) if t.full_forwarding() => ForwardParity::JinjaFull,
             ChatEncoder::Jinja(_) => ForwardParity::Conservative,
             // The dsv4 encoder mirrors the engine's full dsv4 request
             // handling (`input_ids_safe_to_forward_dsv4`).
@@ -287,6 +305,11 @@ pub enum ForwardParity {
     /// `input_ids_safe_to_forward_dsv4` (only genuinely unmirrored engine
     /// internals withheld).
     Dsv4Full,
+    /// `input_ids_safe_to_forward_jinja_full`: a Jinja model whose rendering
+    /// with tools / reasoning effort / template kwargs is verified identical to
+    /// SGLang's generic Jinja path (multimodal, trailing assistant and
+    /// malformed shapes withheld).
+    JinjaFull,
 }
 
 /// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI
@@ -719,26 +742,16 @@ impl TokenizerRegistry {
             adapter::note_k3_encoder(adapter::K3EncoderState::Active);
             return Some(ChatEncoder::KimiK3(tk));
         }
-        match adapter::load_tokenizer_config(tokenizer_path) {
-            Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
-                Ok(Some(tmpl)) => {
-                    tracing::info!(model = %model_id,
-                        "chat-template routing enabled; chat requests route by templated tokens");
-                    return Some(ChatEncoder::Jinja(Box::new(tmpl)));
-                }
-                Ok(None) => {} // no template — fall through to built-in detection
-                Err(e) => tracing::warn!(model = %model_id, error = %e,
-                    "failed to compile chat template; falling back to built-in detection"),
-            },
-            Ok(None) => {}
-            Err(e) => tracing::warn!(model = %model_id, error = %e,
-                "failed to load tokenizer_config.json; falling back to built-in detection"),
-        }
+        // Also before the template: the engine encodes DeepSeek-V4 in code and
+        // ignores any shipped template (a checkpoint may carry a
+        // `chat_template.jinja`, which the template branch would pick up).
         if is_deepseek_v4(model_id) {
             tracing::info!(model = %model_id,
                 "DeepSeek-V4 routing enabled; chat requests route via the built-in V4 encoder");
             return Some(ChatEncoder::DeepSeekV4);
         }
+        // Other DeepSeek-V4.x versions use a different engine-side encoder (e.g.
+        // V4.1's `encoding_dsv41`); keep them worker-encoded until one exists.
         let id = model_id.to_ascii_lowercase();
         if id.contains("deepseek") && id.contains("v4") {
             tracing::warn!(model = %model_id,
@@ -746,6 +759,49 @@ impl TokenizerRegistry {
                  chat traffic routes via raw prompt text and stays worker-encoded \
                  (no router input_ids offload)");
             return None;
+        }
+        // A sibling `chat_template.jinja` overrides the config's `chat_template`
+        // (transformers' precedence); it may also be the only template source.
+        let cfg = adapter::load_tokenizer_config(tokenizer_path);
+        let jinja = adapter::load_chat_template_jinja(tokenizer_path).unwrap_or_else(|e| {
+            tracing::warn!(model = %model_id, error = %e,
+                "failed to read chat_template.jinja; using tokenizer_config.json only");
+            None
+        });
+        let cfg = match (cfg, jinja) {
+            (Ok(cfg_json), Some(tmpl)) => {
+                let mut cfg_json = cfg_json.unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = cfg_json.as_object_mut() {
+                    obj.insert("chat_template".into(), serde_json::Value::String(tmpl));
+                }
+                tracing::info!(model = %model_id, "chat template taken from chat_template.jinja");
+                Ok(Some(cfg_json))
+            }
+            (cfg, _) => cfg,
+        };
+        match cfg {
+            Ok(Some(cfg_json)) => match ChatTemplate::from_tokenizer_config(&cfg_json) {
+                Ok(Some(tmpl)) => {
+                    tracing::info!(model = %model_id,
+                        "chat-template routing enabled; chat requests route by templated tokens");
+                    let tmpl = match full_forwarding_model_type(tokenizer_path) {
+                        Some(model_type) => {
+                            tracing::info!(model = %model_id, model_type = %model_type,
+                                "verified Jinja parity: input_ids forwarding covers tools, \
+                                 reasoning_effort and chat_template_kwargs");
+                            tmpl.with_full_forwarding()
+                        }
+                        None => tmpl,
+                    };
+                    return Some(ChatEncoder::Jinja(Box::new(tmpl)));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(model = %model_id, error = %e,
+                    "failed to compile chat template; chat traffic routes via raw prompt text"),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(model = %model_id, error = %e,
+                "failed to load tokenizer_config.json; chat traffic routes via raw prompt text"),
         }
         tracing::info!(model = %model_id,
             "no chat template or built-in encoder; chat traffic routes via raw prompt text");
@@ -765,6 +821,14 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_encoder(&self, model_id: &str) -> bool {
         self.encoders.contains_key(model_id)
+    }
+
+    /// Whether this model's chat encoder renders its Jinja template (the only
+    /// encoder an engine-side template override can invalidate).
+    pub fn has_jinja_encoder(&self, model_id: &str) -> bool {
+        self.encoders
+            .get(model_id)
+            .is_some_and(|e| matches!(e.encoder, ChatEncoder::Jinja(_)))
     }
 
     /// This model's chat encoder's forwarding parity ([`ForwardParity`]),
@@ -1053,9 +1117,10 @@ impl TokenizerRegistry {
 /// prepends `reasoning_content + </think>` (a trailing turn is always at/after
 /// the last user index, so `drop_thinking` never strips it — same as in the
 /// full conversation). Tools are irrelevant here: they render into the
-/// system-turn prefix, which the strip removes. An encoder for which the
-/// derivation is wrong (e.g. a Jinja template that appends a generation
-/// prompt, or errors on an empty conversation) fails
+/// system-turn prefix, which the strip removes. A template that cannot render
+/// an empty conversation (e.g. one reading `messages[0]` unconditionally) is
+/// diffed against a one-user-turn anchor instead, the position a reply always
+/// follows. An encoder for which the derivation is wrong still fails
 /// [`extension_concat_safe`] and never takes the incremental path in
 /// production.
 fn assistant_turn_suffix(
@@ -1067,13 +1132,19 @@ fn assistant_turn_suffix(
     // NEXT round's history — request-level surgery must not run here (it
     // would rewrite the trailing turn's role, producing a suffix no next
     // round ever contains).
-    let empty = encoder
-        .render_plain(&serde_json::Value::Array(Vec::new()), None, opts)
-        .ok()?;
-    let solo = encoder
-        .render_plain(&serde_json::Value::Array(vec![reply.clone()]), None, opts)
-        .ok()?;
-    solo.strip_prefix(&empty).map(str::to_owned)
+    let render = |messages: Vec<serde_json::Value>| {
+        encoder
+            .render_plain(&serde_json::Value::Array(messages), None, opts)
+            .ok()
+    };
+    if let Some(empty) = render(Vec::new()) {
+        let solo = render(vec![reply.clone()])?;
+        return solo.strip_prefix(&empty).map(str::to_owned);
+    }
+    let anchor = serde_json::json!({"role": "user", "content": "x"});
+    let base = render(vec![anchor.clone()])?;
+    let with_reply = render(vec![anchor, reply.clone()])?;
+    with_reply.strip_prefix(&base).map(str::to_owned)
 }
 
 /// One-time per-model probe backing [`TokenizerRegistry::encode_chat_extension`]:
@@ -1220,6 +1291,25 @@ fn is_deepseek_v4(model_id: &str) -> bool {
     })
 }
 
+/// `config.json` `model_type`s whose Jinja rendering (tools, reasoning effort,
+/// template kwargs via [`chat_template::JinjaRenderOpts`]) is verified
+/// token-identical to SGLang's generic Jinja path against engine
+/// `return_prompt_token_ids` (`testdata/step5_parity.json`). Adding a model
+/// type here requires the same verification.
+///
+/// Keyed on the checkpoint's architecture: served model ids are arbitrary.
+const FULL_FORWARDING_MODEL_TYPES: [&str; 1] = ["step5_vl"];
+
+/// The verified `model_type` of the checkpoint next to `tokenizer_path`, if
+/// any. An unreadable or absent `config.json` keeps the conservative predicate.
+fn full_forwarding_model_type(tokenizer_path: &str) -> Option<String> {
+    let cfg = adapter::load_model_config(tokenizer_path).ok().flatten()?;
+    let model_type = cfg.get("model_type")?.as_str()?;
+    FULL_FORWARDING_MODEL_TYPES
+        .contains(&model_type)
+        .then(|| model_type.to_owned())
+}
+
 /// Whether `model_id` denotes a Kimi-K3 model, which ships no Jinja template and
 /// is encoded by [`kimi_k3`].
 ///
@@ -1274,8 +1364,7 @@ mod tests {
                 cache_aware: None,
                 decode_policy: None,
                 sticky: None,
-                max_output_tokens: None,
-                sampling_overrides: Default::default(),
+                profile: Default::default(),
                 forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -1741,6 +1830,170 @@ mod tests {
         assert_eq!(cfg["chat_template"], "REAL");
     }
 
+    /// Step-5-style checkpoint: `tokenizer_config.json` has no `chat_template`,
+    /// the template ships only as `chat_template.jinja` (and uses
+    /// `{% generation %}`). The router must still pick it up.
+    #[test]
+    fn chat_template_jinja_file_enables_chat_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ bos_token }}{% for m in messages %}{% generation %}{{ m['content'] }}{% endgeneration %}{% endfor %}",
+        )
+        .unwrap();
+        assert_eq!(
+            adapter::load_chat_template_jinja(dir.path().to_str().unwrap()).unwrap().as_deref(),
+            Some("{{ bos_token }}{% for m in messages %}{% generation %}{{ m['content'] }}{% endgeneration %}{% endfor %}"),
+        );
+        let mut c = cfg();
+        c.model.tokenizer_path = dir
+            .path()
+            .join("tokenizer.json")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(reg.has_chat_encoder(&c.model.id));
+    }
+
+    /// transformers' precedence: a sibling `chat_template.jinja` wins over the
+    /// config field (here the config's template would not even compile).
+    #[test]
+    fn deepseek_v4_ignores_a_shipped_template() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{{ bos_token }}C","bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "{{ bos_token }}J").unwrap();
+        let mut c = cfg();
+        c.model.id = "deepseek-ai/DeepSeek-V4".into();
+        c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert_eq!(reg.forward_parity(&c.model.id), ForwardParity::Dsv4Full);
+        assert!(!reg.has_jinja_encoder(&c.model.id));
+    }
+
+    #[test]
+    fn chat_template_jinja_overrides_tokenizer_config_template() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{% invalid %}","bos_token":"<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), "{{ bos_token }}X").unwrap();
+        let mut c = cfg();
+        c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(reg.has_chat_encoder(&c.model.id));
+    }
+
+    /// Full forwarding is keyed on the checkpoint's `config.json` `model_type`:
+    /// only verified types get `JinjaFull`; everything else stays conservative.
+    #[test]
+    fn full_forwarding_follows_verified_model_type() {
+        let parity_for = |config: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(
+                "tests/fixtures/tiny_tokenizer.json",
+                dir.path().join("tokenizer.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                r#"{"chat_template":"{{ bos_token }}X","bos_token":"<s>"}"#,
+            )
+            .unwrap();
+            if let Some(config) = config {
+                std::fs::write(dir.path().join("config.json"), config).unwrap();
+            }
+            let mut c = cfg();
+            c.model.tokenizer_path = dir.path().to_str().unwrap().to_owned();
+            TokenizerRegistry::load_from_config(&c)
+                .unwrap()
+                .forward_parity(&c.model.id)
+        };
+        assert_eq!(
+            parity_for(Some(r#"{"model_type":"step5_vl"}"#)),
+            ForwardParity::JinjaFull
+        );
+        assert_eq!(
+            parity_for(Some(r#"{"model_type":"llama"}"#)),
+            ForwardParity::Conservative
+        );
+        assert_eq!(parity_for(Some("not json")), ForwardParity::Conservative);
+        assert_eq!(parity_for(None), ForwardParity::Conservative);
+    }
+
+    /// Token parity against the engine for real Step-5 traffic shapes
+    /// (`testdata/step5_parity.json`, regenerated by `gen_step5_parity.py`).
+    /// Needs the checkpoint's tokenizer files (tokenizer.json,
+    /// tokenizer_config.json, chat_template.jinja, config.json), which are not
+    /// vendored: `STEP5_TOK_DIR=<dir> cargo test step5_parity -- --ignored`.
+    #[test]
+    #[ignore = "needs STEP5_TOK_DIR with the Step-5 tokenizer files"]
+    fn step5_parity_with_engine_prompt_ids() {
+        let dir = std::env::var("STEP5_TOK_DIR").expect("STEP5_TOK_DIR");
+        let mut c = cfg();
+        c.model.id = "step5".into();
+        c.model.tokenizer_path = dir;
+        let reg = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert_eq!(reg.forward_parity(&c.model.id), ForwardParity::JinjaFull);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/step5_parity.json")).unwrap();
+        let mut compared = 0;
+        for case in fixture["cases"].as_array().unwrap() {
+            if !case["forward"].as_bool().unwrap() {
+                continue;
+            }
+            let req = &case["request"];
+            let ids = reg
+                .encode_chat(
+                    &c.model.id,
+                    &req["messages"],
+                    req.get("tools"),
+                    &ChatRenderOpts::resolve(req),
+                )
+                .unwrap_or_else(|| panic!("{}: render failed", case["name"]));
+            let expected: Vec<u32> = serde_json::from_value(case["expected_ids"].clone()).unwrap();
+            assert_eq!(ids, expected, "{}", case["name"]);
+            compared += 1;
+        }
+        assert!(compared > 0);
+    }
+
+    #[test]
+    fn load_chat_template_jinja_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, "{}").unwrap();
+        assert!(adapter::load_chat_template_jinja(tok.to_str().unwrap())
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn load_tokenizer_config_absent_returns_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1996,6 +2249,68 @@ mod tests {
                 .is_none(),
             "a failing self-check must force the full-re-encode fallback"
         );
+    }
+
+    /// A Jinja template that reads `messages[0]` unconditionally (as Step5's
+    /// does) cannot render an empty conversation. Its reply suffix must still
+    /// be derivable, so cache-sim extensions stay incremental instead of
+    /// re-encoding the whole conversation on every response.
+    #[test]
+    fn encode_chat_extension_matches_full_reencode_when_empty_render_fails() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            TokenizerShards::shared(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": concat!(
+                    "{{ bos_token }}{% if messages[0].role == 'system' %}",
+                    "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n{% endif %}",
+                    "{% for m in messages %}{% if m.role == 'assistant' %}",
+                    "<|im_start|>assistant\n<think>{{ m.reasoning_content or '' }}</think>",
+                    "{{ m.content }}<|im_end|>\n",
+                    "{% elif not (m.role == 'system' and loop.first) %}",
+                    "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}",
+                    "{% if add_generation_prompt %}<|im_start|>assistant\n<think>{% endif %}",
+                ),
+                "bos_token": "<s>",
+            }),
+        );
+        let opts = ChatRenderOpts::chat();
+        assert!(
+            reg.encode_chat_plain("tiny", &serde_json::json!([]), None, &opts)
+                .is_none(),
+            "precondition: the template must fail on an empty conversation"
+        );
+
+        let messages = serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "what is 2+2?"},
+            {"role": "assistant", "content": "4", "reasoning_content": "2+2 is 4"},
+            {"role": "user", "content": "and 3+3?"},
+        ]);
+        let prompt_ids = reg
+            .encode_chat("tiny", &messages, None, &opts)
+            .expect("encode_chat");
+        let replies = [
+            serde_json::json!({"role": "assistant", "content": "6"}),
+            serde_json::json!({"role": "assistant", "content": "6", "reasoning_content": "3+3 is 6"}),
+            serde_json::json!({"role": "assistant", "content": " six"}),
+            serde_json::json!({"role": "assistant", "content": "\nsix"}),
+        ];
+        for reply in &replies {
+            let inc = reg
+                .encode_chat_extension("tiny", &prompt_ids, reply, &opts)
+                .expect("an empty-render failure must not force the full re-encode");
+            let mut msgs = messages.as_array().unwrap().clone();
+            msgs.push(reply.clone());
+            let full = reg
+                .encode_chat_plain("tiny", &serde_json::Value::Array(msgs), None, &opts)
+                .expect("full re-encode");
+            assert_eq!(inc, full, "incremental extension diverged for {reply}");
+        }
     }
 
     #[test]

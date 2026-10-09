@@ -55,8 +55,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
-            max_output_tokens: None,
-            sampling_overrides: Default::default(),
+            profile: Default::default(),
             forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

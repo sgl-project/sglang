@@ -25,8 +25,8 @@
 
 use anyhow::{Context, Result};
 use minijinja::{
-    value::Value as JinjaValue, Environment, Error as JinjaError, ErrorKind as JinjaErrorKind,
-    UndefinedBehavior,
+    value::{Kwargs, Value as JinjaValue},
+    Environment, Error as JinjaError, ErrorKind as JinjaErrorKind, UndefinedBehavior,
 };
 use std::collections::BTreeMap;
 
@@ -57,12 +57,16 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     /// `(name, token)` pairs for [`SPECIAL_TOKEN_KEYS`]; absent tokens are `""`.
     special_tokens: Vec<(&'static str, String)>,
+    /// Rendering with [`JinjaRenderOpts`] is verified token-identical to the
+    /// engine for this model (see [`super::ForwardParity::JinjaFull`]).
+    full_forwarding: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatTemplate")
             .field("special_tokens", &self.special_tokens)
+            .field("full_forwarding", &self.full_forwarding)
             .finish()
     }
 }
@@ -85,26 +89,56 @@ impl ChatTemplate {
         // mirror that or rendered whitespace (and thus tokens) diverge.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
-        // Printing a variable the router didn't supply (a custom
-        // `chat_template_kwargs` entry, a date var, ...) must be a render
-        // error so the caller falls back to raw-text hashing — under the
-        // default lenient behavior it would render as `""` and produce a
-        // plausible-but-divergent prompt whose hashes silently never match
-        // the engine's. If-tests and iteration over undefined stay permitted
-        // (`{% if enable_thinking is defined %}`-style guards are common).
-        env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
+        // Undefined behaves as in jinja2 (`msg.name == 'x'` is false, if-tests
+        // pass), except that printing it is an error: a variable the router
+        // didn't supply would render as `""` and silently diverge from the
+        // engine's prompt, so the caller falls back to raw-text hashing.
+        env.set_undefined_behavior(UndefinedBehavior::Lenient);
+        env.set_formatter(|out, state, value| {
+            if value.is_undefined() {
+                return Err(JinjaError::new(
+                    JinjaErrorKind::UndefinedError,
+                    "printed a variable the router does not supply",
+                ));
+            }
+            minijinja::escape_formatter(out, state, value)
+        });
         // Python str/dict methods used by real templates (.startswith, .items,
         // .strip, ...) that minijinja doesn't implement natively.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
-        env.add_template_owned(TEMPLATE_NAME, template_src)
+        // transformers' template filters. minijinja's own `tojson` takes no
+        // `ensure_ascii` (a compile-time-valid, render-time error) and
+        // HTML-escapes `<>&'`; `fromjson` does not exist.
+        env.add_filter("tojson", hf_tojson);
+        env.add_filter("fromjson", hf_fromjson);
+        env.add_template_owned(TEMPLATE_NAME, strip_generation_tags(&template_src))
             .context("compile chat template from tokenizer_config.json")?;
 
         Ok(Some(Self {
             env,
             special_tokens,
+            full_forwarding: false,
         }))
+    }
+
+    /// Mark this model's rendering as verified token-identical to the engine
+    /// for every request shape [`JinjaRenderOpts`] mirrors, so its ids may be
+    /// forwarded beyond the conservative subset.
+    pub(crate) fn with_full_forwarding(mut self) -> Self {
+        self.full_forwarding = true;
+        self
+    }
+
+    pub(crate) fn full_forwarding(&self) -> bool {
+        self.full_forwarding
+    }
+
+    /// Render `messages` with no tools and no template kwargs (see
+    /// [`ChatTemplate::render_with`]).
+    pub fn render(&self, messages: &serde_json::Value) -> Result<String> {
+        self.render_with(messages, &JinjaRenderOpts::default())
     }
 
     /// Render `messages` (the request's `messages` array) into the prompt text
@@ -115,28 +149,376 @@ impl ChatTemplate {
     /// template may stringify the array (divergent hashes → min-load) or error
     /// (raw prompt-text fallback); neither fails the request.
     ///
-    /// `tools` and `documents` are supplied as `none` — the context HuggingFace
-    /// renders with when a request carries neither, so tools-branching
-    /// templates take the no-tools path. A request that does carry them renders
-    /// the no-tools form, so its hashes won't match the engine and it routes by
-    /// min-load — no worse than before this path existed. Any other variable
-    /// the template prints is a render error (semi-strict undefined), falling
-    /// back to raw rather than hashing a silently divergent prompt.
-    pub fn render(&self, messages: &serde_json::Value) -> Result<String> {
+    /// `opts` carries what SGLang's generic Jinja path threads into
+    /// `apply_chat_template`: `tools` (`none` when absent — the no-tools path)
+    /// and the merged template kwargs. `documents` is always `none`. Any other
+    /// variable the template prints is a render error,
+    /// falling back to raw rather than hashing a silently divergent prompt.
+    pub fn render_with(
+        &self,
+        messages: &serde_json::Value,
+        opts: &JinjaRenderOpts,
+    ) -> Result<String> {
         let tmpl = self
             .env
             .get_template(TEMPLATE_NAME)
             .context("chat template not registered")?;
         let mut ctx: BTreeMap<&str, JinjaValue> = BTreeMap::new();
-        ctx.insert("messages", JinjaValue::from_serialize(messages));
-        ctx.insert("add_generation_prompt", JinjaValue::from(true));
-        ctx.insert("tools", JinjaValue::from(()));
-        ctx.insert("documents", JinjaValue::from(()));
         for (name, token) in &self.special_tokens {
             ctx.insert(name, JinjaValue::from(token.clone()));
         }
+        // transformers renders with `**special_tokens_map, **kwargs`, so a
+        // kwarg may override a special token but not the names it passes
+        // explicitly (those are a TypeError engine-side; the forwarding
+        // predicate withholds such requests).
+        for (key, value) in &opts.kwargs {
+            if !RESERVED_RENDER_KEYS.contains(&key.as_str()) {
+                ctx.insert(key, JinjaValue::from_serialize(value));
+            }
+        }
+        ctx.insert("messages", JinjaValue::from_serialize(messages));
+        ctx.insert("add_generation_prompt", JinjaValue::from(true));
+        ctx.insert(
+            "tools",
+            opts.tools
+                .as_ref()
+                .map_or_else(|| JinjaValue::from(()), JinjaValue::from_serialize),
+        );
+        ctx.insert("documents", JinjaValue::from(()));
         tmpl.render(ctx).context("render chat template")
     }
+}
+
+/// Names `apply_chat_template` passes to the template explicitly; a template
+/// kwarg cannot replace them.
+pub(crate) const RESERVED_RENDER_KEYS: [&str; 4] =
+    ["messages", "tools", "documents", "add_generation_prompt"];
+
+/// The request-level inputs SGLang's generic Jinja path (`serving_chat.py`
+/// `_apply_jinja_template`) threads into `apply_chat_template`, resolved from
+/// the raw request body the way the engine resolves them from its pydantic
+/// model. Without these a tools / `reasoning_effort` / `chat_template_kwargs`
+/// request renders the default prompt and its hashes never match the engine's.
+#[derive(Clone, Debug, Default)]
+pub struct JinjaRenderOpts {
+    /// `request.tools` as `Tool.model_dump()` emits them, after `tool_choice`
+    /// selection; `None` renders the no-tools path.
+    pub tools: Option<serde_json::Value>,
+    /// The merged `extra_template_kwargs`.
+    pub kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+impl JinjaRenderOpts {
+    /// `engine_defaults` is the engine's `--default-chat-template-kwargs`
+    /// (see [`crate::workers::introspect::EngineChatTemplate`]).
+    pub fn resolve(
+        request: &serde_json::Value,
+        engine_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
+        JinjaRenderOpts {
+            tools: sglang_template_tools(request),
+            kwargs: sglang_template_kwargs(request, engine_defaults),
+        }
+    }
+}
+
+/// Mirror SGLang's tool selection for the template: nothing for
+/// `tool_choice: "none"`, only the named tool for a function `tool_choice`,
+/// else every request-level tool, each dumped like pydantic's `Tool`.
+///
+/// Engine: `serving_chat.py` `_process_messages` (`tools = [item.model_dump()
+/// ...]`). Message-level tools gate that branch but are never rendered from it;
+/// the forwarding predicate withholds requests that carry them.
+fn sglang_template_tools(request: &serde_json::Value) -> Option<serde_json::Value> {
+    let tools = request.get("tools")?.as_array().filter(|t| !t.is_empty())?;
+    let selected: Vec<serde_json::Value> = match request.get("tool_choice") {
+        Some(serde_json::Value::String(s)) if s == "none" => return None,
+        Some(serde_json::Value::Object(choice)) => {
+            let name = choice.get("function").and_then(|f| f.get("name"))?;
+            tools
+                .iter()
+                .filter(|t| t.get("function").and_then(|f| f.get("name")) == Some(name))
+                .map(dump_tool)
+                .collect()
+        }
+        _ => tools.iter().map(dump_tool).collect(),
+    };
+    (!selected.is_empty()).then_some(serde_json::Value::Array(selected))
+}
+
+/// `Tool.model_dump()`: declared fields only, in declaration order, defaults
+/// filled — `{type, function: {description, name, parameters, strict
+/// [, defer_loading]}, defer_loading}`. `Function` drops a `None`
+/// `defer_loading`; `Tool` keeps its own, and propagates it into `function`
+/// when the function has none (`_propagate_defer_loading`).
+fn dump_tool(tool: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let field = |obj: &Value, key: &str| obj.get(key).filter(|v| !v.is_null()).cloned();
+    let func = tool.get("function").cloned().unwrap_or(Value::Null);
+    let tool_defer = field(tool, "defer_loading");
+    let mut f = serde_json::Map::new();
+    f.insert(
+        "description".into(),
+        field(&func, "description").unwrap_or(Value::Null),
+    );
+    f.insert(
+        "name".into(),
+        func.get("name").cloned().unwrap_or(Value::Null),
+    );
+    f.insert(
+        "parameters".into(),
+        field(&func, "parameters").unwrap_or(Value::Null),
+    );
+    f.insert(
+        "strict".into(),
+        field(&func, "strict").unwrap_or(Value::Bool(false)),
+    );
+    if let Some(d) = field(&func, "defer_loading").or_else(|| tool_defer.clone()) {
+        f.insert("defer_loading".into(), d);
+    }
+    let mut t = serde_json::Map::new();
+    t.insert(
+        "type".into(),
+        field(tool, "type").unwrap_or_else(|| Value::String("function".into())),
+    );
+    t.insert("function".into(), Value::Object(f));
+    t.insert("defer_loading".into(), tool_defer.unwrap_or(Value::Null));
+    Value::Object(t)
+}
+
+/// The engine's `extra_template_kwargs`: a top-level `reasoning_effort` sets
+/// `thinking` / `enable_thinking` (`effort != "none"`) unless the request does
+/// (`ChatCompletionRequest` validator); engine defaults fill the keys the
+/// request's `chat_template_kwargs` omits; and the request's effort
+/// (`chat_template_kwargs.reasoning_effort`, else top-level `reasoning_effort`)
+/// wins over a default one.
+///
+/// SGLang's `serving_chat.py` intends this (`_process_messages` only adopts a
+/// default effort when the request has none) but its final
+/// `extra_template_kwargs.update(chat_template_kwargs)` lets a default
+/// `reasoning_effort` override the request's; the router follows the intended
+/// behavior, so forwarded ids honor the client's effort.
+fn sglang_template_kwargs(
+    request: &serde_json::Value,
+    engine_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let set = |v: &&serde_json::Value| !v.is_null();
+    let mut ctk = request
+        .get("chat_template_kwargs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(top) = request.get("reasoning_effort").filter(set) {
+        let thinking = serde_json::Value::Bool(top.as_str() != Some("none"));
+        for key in ["thinking", "enable_thinking"] {
+            ctk.entry(key).or_insert_with(|| thinking.clone());
+        }
+    }
+    let effort = ctk
+        .remove("reasoning_effort")
+        .filter(|v| !v.is_null())
+        .or_else(|| request.get("reasoning_effort").filter(set).cloned());
+    for (k, v) in engine_defaults.into_iter().flatten() {
+        ctk.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    if let Some(effort) = effort {
+        ctk.insert("reasoning_effort".into(), effort);
+    }
+    ctk
+}
+
+/// transformers' `tojson` filter: `json.dumps(x, ensure_ascii=False,
+/// indent=None, separators=None, sort_keys=False)`. Unlike minijinja's builtin
+/// it accepts these kwargs, uses Python's default separators (`", "`, `": "`,
+/// or `","` with an indent) and does not HTML-escape — a byte difference in a
+/// rendered tool schema shifts every block hash after it.
+fn hf_tojson(value: JinjaValue, kwargs: Kwargs) -> std::result::Result<JinjaValue, JinjaError> {
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let indent: Option<usize> = kwargs.get("indent")?;
+    let separators: Option<Vec<String>> = kwargs.get("separators")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    kwargs.assert_all_used()?;
+    let (item_sep, key_sep) = match separators.as_deref() {
+        Some([item, key]) => (item.clone(), key.clone()),
+        Some(_) => {
+            return Err(JinjaError::new(
+                JinjaErrorKind::InvalidOperation,
+                "tojson separators must be a pair",
+            ))
+        }
+        None if indent.is_some() => (",".to_owned(), ": ".to_owned()),
+        None => (", ".to_owned(), ": ".to_owned()),
+    };
+    let json = serde_json::to_value(&value)
+        .map_err(|e| JinjaError::new(JinjaErrorKind::InvalidOperation, e.to_string()))?;
+    let style = PyJsonStyle {
+        ensure_ascii: ensure_ascii.unwrap_or(false),
+        indent,
+        item_sep,
+        key_sep,
+        sort_keys: sort_keys.unwrap_or(false),
+    };
+    let mut out = String::new();
+    style.write(&json, 0, &mut out);
+    Ok(JinjaValue::from_safe_string(out))
+}
+
+/// transformers' `fromjson` filter: `json.loads`.
+fn hf_fromjson(text: String) -> std::result::Result<JinjaValue, JinjaError> {
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| JinjaError::new(JinjaErrorKind::InvalidOperation, format!("fromjson: {e}")))?;
+    Ok(JinjaValue::from_serialize(&json))
+}
+
+/// Python `json.dumps` output formatting.
+struct PyJsonStyle {
+    ensure_ascii: bool,
+    indent: Option<usize>,
+    item_sep: String,
+    key_sep: String,
+    sort_keys: bool,
+}
+
+impl PyJsonStyle {
+    fn write(&self, v: &serde_json::Value, depth: usize, out: &mut String) {
+        use serde_json::Value;
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+                (Some(i), _, _) => out.push_str(&i.to_string()),
+                (_, Some(u), _) => out.push_str(&u.to_string()),
+                (_, _, Some(f)) => out.push_str(&py_float_repr(f)),
+                _ => out.push_str(&n.to_string()),
+            },
+            Value::String(s) => self.write_str(s, out),
+            Value::Array(items) => {
+                if items.is_empty() {
+                    out.push_str("[]");
+                    return;
+                }
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&self.item_sep);
+                    }
+                    self.newline(depth + 1, out);
+                    self.write(item, depth + 1, out);
+                }
+                self.newline(depth, out);
+                out.push(']');
+            }
+            Value::Object(map) => {
+                if map.is_empty() {
+                    out.push_str("{}");
+                    return;
+                }
+                let mut entries: Vec<_> = map.iter().collect();
+                if self.sort_keys {
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                }
+                out.push('{');
+                for (i, (k, item)) in entries.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&self.item_sep);
+                    }
+                    self.newline(depth + 1, out);
+                    self.write_str(k, out);
+                    out.push_str(&self.key_sep);
+                    self.write(item, depth + 1, out);
+                }
+                self.newline(depth, out);
+                out.push('}');
+            }
+        }
+    }
+
+    fn newline(&self, depth: usize, out: &mut String) {
+        if let Some(width) = self.indent {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', width * depth));
+        }
+    }
+
+    fn write_str(&self, s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 || (self.ensure_ascii && (c as u32) > 0x7e) => {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// Python `repr(float)`: shortest round-trip digits, positional for exponents
+/// in `[-4, 16)`, else `d.ddde±XX`.
+fn py_float_repr(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
+    }
+    let sci = format!("{f:e}");
+    let (mantissa, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+    let exp: i32 = exp.parse().expect("{:e} exponent is an integer");
+    if (-4..16).contains(&exp) {
+        let s = format!("{f}");
+        if s.contains('.') {
+            s
+        } else {
+            format!("{s}.0")
+        }
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
+    }
+}
+
+/// Remove `{% generation %}` / `{% endgeneration %}` (with optional `-`
+/// whitespace control) and keep the body.
+///
+/// transformers registers these as an extension that only marks assistant spans
+/// for `return_assistant_tokens_mask`; they render nothing. minijinja has no
+/// such statement, so the whole template would fail to compile (Step-5 ships
+/// one) and routing would fall back to raw text.
+fn strip_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{%") {
+        let Some(len) = rest[start..].find("%}").map(|e| e + 2) else {
+            break;
+        };
+        let inner = rest[start + 2..start + len - 2]
+            .trim_start_matches('-')
+            .trim_end_matches('-')
+            .trim();
+        out.push_str(&rest[..start]);
+        if inner != "generation" && inner != "endgeneration" {
+            out.push_str(&rest[start..start + len]);
+        }
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Pull the chat-template source out of `tokenizer_config.json`.
@@ -200,6 +582,184 @@ mod tests {
             {"role": "system", "content": "be brief"},
             {"role": "user", "content": "hi"}
         ])
+    }
+
+    #[test]
+    fn strip_generation_tags_keeps_body_and_other_tags() {
+        assert_eq!(
+            strip_generation_tags("A{% generation %}B{% endgeneration %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%- generation -%}B{%-endgeneration%}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("{% if x %}{% generation %}y{% endgeneration %}{% endif %}{% set generation_x = 1 %}"),
+            "{% if x %}y{% endif %}{% set generation_x = 1 %}"
+        );
+        assert_eq!(
+            strip_generation_tags("no tags {{ a }} %}"),
+            "no tags {{ a }} %}"
+        );
+        assert_eq!(
+            strip_generation_tags("dangling {% generation"),
+            "dangling {% generation"
+        );
+    }
+
+    /// Step-5 wraps assistant content in `{% generation %}`; minijinja has no
+    /// such statement, so without stripping the template fails to compile.
+    fn render_tojson(expr: &str, value: serde_json::Value) -> String {
+        let cfg = json!({ "chat_template": format!("{{{{ messages | {expr} }}}}") });
+        ChatTemplate::from_tokenizer_config(&cfg)
+            .unwrap()
+            .unwrap()
+            .render(&value)
+            .unwrap()
+    }
+
+    /// Expected strings are Python's `json.dumps` output for the same value
+    /// (transformers' `tojson` is a thin wrapper over it).
+    #[test]
+    fn tojson_matches_python_json_dumps() {
+        let v = json!({"b":1,"a":[1.5,1e20,1.5e-5,0.0001,null,true],
+                       "s":"<x>&'中😀\n\"\\","e":{},"l":[]});
+        assert_eq!(
+            render_tojson("tojson", v.clone()),
+            r#"{"b": 1, "a": [1.5, 1e+20, 1.5e-05, 0.0001, null, true], "s": "<x>&'中😀\n\"\\", "e": {}, "l": []}"#
+        );
+        assert_eq!(
+            render_tojson("tojson(ensure_ascii=False)", v.clone()),
+            render_tojson("tojson", v.clone())
+        );
+        assert_eq!(
+            render_tojson("tojson(ensure_ascii=True)", v),
+            r#"{"b": 1, "a": [1.5, 1e+20, 1.5e-05, 0.0001, null, true], "s": "<x>&'\u4e2d\ud83d\ude00\n\"\\", "e": {}, "l": []}"#
+        );
+        assert_eq!(
+            render_tojson("tojson(indent=2)", json!({"k":[1,{"z":2}]})),
+            "{\n  \"k\": [\n    1,\n    {\n      \"z\": 2\n    }\n  ]\n}"
+        );
+        assert_eq!(
+            render_tojson(
+                "tojson(sort_keys=True, separators=[',', ':'])",
+                json!({"b":1,"a":2})
+            ),
+            r#"{"a":2,"b":1}"#
+        );
+    }
+
+    #[test]
+    fn fromjson_parses_and_rejects_bad_json() {
+        let cfg =
+            json!({"chat_template": "{% set a = messages | fromjson %}{{ a.x }}-{{ a.y[1] }}"});
+        let t = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        assert_eq!(t.render(&json!(r#"{"x":"v","y":[0,7]}"#)).unwrap(), "v-7");
+        assert!(t.render(&json!("not json")).is_err());
+    }
+
+    #[test]
+    fn render_with_threads_tools_and_kwargs_but_not_reserved_names() {
+        let cfg = json!({
+            "chat_template": "{{ bos_token }}{% if tools %}T={{ tools | length }};{% endif %}{% if reasoning_effort is defined %}R={{ reasoning_effort }};{% endif %}{{ messages | length }}",
+            "bos_token": "<s>"
+        });
+        let t = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        let msgs = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(t.render(&msgs).unwrap(), "<s>1");
+        let mut opts = JinjaRenderOpts {
+            tools: Some(json!([{"type": "function"}, {"type": "function"}])),
+            ..Default::default()
+        };
+        opts.kwargs.insert("reasoning_effort".into(), json!("low"));
+        opts.kwargs.insert("bos_token".into(), json!("[B]"));
+        opts.kwargs.insert("messages".into(), json!([1, 2, 3]));
+        assert_eq!(t.render_with(&msgs, &opts).unwrap(), "[B]T=2;R=low;1");
+    }
+
+    #[test]
+    fn template_tools_follow_tool_choice_and_pydantic_dump() {
+        let tools = json!([
+            {"type": "function", "function": {"name": "a", "parameters": {"type": "object"}}, "extra": 1},
+            {"function": {"name": "b", "description": "B", "strict": true}, "defer_loading": true}
+        ]);
+        let dumped_a = json!({"type": "function", "function": {"description": null, "name": "a",
+            "parameters": {"type": "object"}, "strict": false}, "defer_loading": null});
+        let dumped_b = json!({"type": "function", "function": {"description": "B", "name": "b",
+            "parameters": null, "strict": true, "defer_loading": true}, "defer_loading": true});
+        let resolve = |extra: serde_json::Value| {
+            let mut req = json!({ "tools": tools });
+            req.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            JinjaRenderOpts::resolve(&req, None).tools
+        };
+        assert_eq!(resolve(json!({})), Some(json!([dumped_a, dumped_b])));
+        assert_eq!(
+            resolve(json!({"tool_choice": "required"})),
+            Some(json!([dumped_a, dumped_b]))
+        );
+        assert_eq!(resolve(json!({"tool_choice": "none"})), None);
+        assert_eq!(
+            resolve(json!({"tool_choice": {"type": "function", "function": {"name": "b"}}})),
+            Some(json!([dumped_b]))
+        );
+        assert_eq!(
+            resolve(json!({"tool_choice": {"type": "function", "function": {"name": "zz"}}})),
+            None
+        );
+        // Key order is part of the contract: `tojson` emits it verbatim.
+        let a = serde_json::to_string(&resolve(json!({})).unwrap()[0]).unwrap();
+        assert!(a.starts_with(r#"{"type":"function","function":{"description":null,"name":"a""#));
+        assert_eq!(
+            JinjaRenderOpts::resolve(&json!({"tools": []}), None).tools,
+            None
+        );
+    }
+
+    /// `testdata/jinja_template_kwargs_cases.json`: expectations produced by
+    /// SGLang's own request validation and kwargs merge (see its `_doc`).
+    #[test]
+    fn template_kwargs_follow_engine_precedence() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/jinja_template_kwargs_cases.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let got =
+                JinjaRenderOpts::resolve(&case["request"], case["defaults"].as_object()).kwargs;
+            assert_eq!(
+                serde_json::Value::Object(got),
+                case["expected"],
+                "request {} defaults {}",
+                case["request"],
+                case["defaults"]
+            );
+        }
+    }
+
+    #[test]
+    fn template_with_generation_tags_compiles_and_renders_like_without() {
+        let with = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{% if m['role'] == 'assistant' %}{% generation %}{{ m['content'] }}{% endgeneration %}{% else %}{{ m['content'] }}{% endif %}{% endfor %}";
+        let without = "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{% if m['role'] == 'assistant' %}{{ m['content'] }}{% else %}{{ m['content'] }}{% endif %}{% endfor %}";
+        let msgs =
+            json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]);
+        let a = ChatTemplate::from_tokenizer_config(
+            &json!({"chat_template": with, "bos_token": "<s>"}),
+        )
+        .unwrap()
+        .unwrap()
+        .render(&msgs)
+        .unwrap();
+        let b = ChatTemplate::from_tokenizer_config(
+            &json!({"chat_template": without, "bos_token": "<s>"}),
+        )
+        .unwrap()
+        .unwrap()
+        .render(&msgs)
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, "<s><|user|>hi<|assistant|>yo");
     }
 
     #[test]
@@ -312,9 +872,9 @@ mod tests {
         assert_eq!(tmpl.render(&json!([])).unwrap(), "<pad>|<unk>");
     }
 
-    /// Printing a variable the router doesn't supply is a render error
-    /// (semi-strict undefined) so the caller falls back to raw-text hashing,
-    /// instead of rendering a plausible-but-divergent prompt.
+    /// Printing a variable the router doesn't supply is a render error so the
+    /// caller falls back to raw-text hashing, instead of rendering a
+    /// plausible-but-divergent prompt.
     #[test]
     fn printing_unsupplied_variable_fails_render() {
         let cfg = json!({
@@ -325,9 +885,8 @@ mod tests {
         tmpl.render(&messages()).unwrap_err();
     }
 
-    /// Undefined names stay usable in if-tests (semi-strict only rejects
-    /// printing them); common `{% if enable_thinking is defined %}`-style
-    /// guards must keep rendering.
+    /// Undefined names stay usable in if-tests; common
+    /// `{% if enable_thinking is defined %}`-style guards must keep rendering.
     #[test]
     fn undefined_in_if_test_is_permitted() {
         let cfg = json!({
@@ -335,6 +894,20 @@ mod tests {
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
         assert_eq!(tmpl.render(&messages()).unwrap(), "X");
+    }
+
+    /// Comparing a missing field is false, as in jinja2. Step-5's template
+    /// reads `message.name` on every non-first system message.
+    #[test]
+    fn comparing_a_missing_field_is_false() {
+        let cfg = json!({
+            "chat_template": "{% for m in messages %}{{ 'obs' if (m.role == 'system' \
+                and m.name == 'observation') else m.role }};{% endfor %}",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        let msgs = json!([{"role": "user", "content": "a"}, {"role": "system", "content": "b"},
+                          {"role": "system", "content": "c", "name": "observation"}]);
+        assert_eq!(tmpl.render(&msgs).unwrap(), "user;system;obs;");
     }
 
     /// `tools` is `none` in the render context — the same context HuggingFace

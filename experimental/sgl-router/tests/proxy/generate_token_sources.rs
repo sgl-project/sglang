@@ -121,7 +121,13 @@ fn chat_input_ids_does_not_bypass_the_chat_encoder() {
         "messages": [{"role": "user", "content": "hi"}],
         "input_ids": [1, 2, 3],
     });
-    let tokens = request_tokens_for(&reg, &model, &body).expect("chat body must tokenize");
+    let tokens = request_tokens_for(
+        &reg,
+        &model,
+        &body,
+        &sgl_router::workers::introspect::EngineChatTemplate::Unverified,
+    )
+    .expect("chat body must tokenize");
     assert!(
         tokens.engine_equivalent,
         "a chat body must route through the chat encoder even when input_ids is present"

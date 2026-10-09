@@ -666,6 +666,7 @@ async fn register_one(
     // protocol on the post-insert entry.
     if let Some(w) = registry.get(&worker_id) {
         w.set_protocol(protocol);
+        w.set_chat_template_serving(info.chat_template);
     }
     if let Some(lm) = &load_monitor {
         // Start polling `/v1/loads` right away so the worker becomes
@@ -715,8 +716,7 @@ mod tests {
                 cache_aware: None,
                 decode_policy: None,
                 sticky: None,
-                max_output_tokens: None,
-                sampling_overrides: Default::default(),
+                profile: Default::default(),
                 forward_input_ids: true,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -867,6 +867,66 @@ mod tests {
         })
         .await;
         assert!(registered.is_ok(), "manager did not resolve model id");
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// The engine's chat-template serving setup from `/server_info` lands on
+    /// the registered worker, where router-side chat rendering reads it.
+    #[tokio::test]
+    async fn manager_records_chat_template_serving_from_server_info() {
+        let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+            "served_model_name": "m",
+            "default_chat_template_kwargs": {"reasoning_effort": "low"},
+            "chat_template": null,
+        }))
+        .await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            None,
+            fast_introspector(),
+        ));
+        let id = WorkerId("w-1".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+            transfer_group: None,
+        }))
+        .await
+        .unwrap();
+
+        let want = crate::workers::introspect::ChatTemplateServing::Checkpoint(
+            json!({"reasoning_effort": "low"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let recorded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|w| w.chat_template_serving() == want)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recorded.is_ok(),
+            "manager did not record chat-template serving"
+        );
 
         drop(tx);
         let _ = manager_handle.await;

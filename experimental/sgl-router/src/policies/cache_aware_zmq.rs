@@ -159,6 +159,7 @@ pub struct CacheAwareZmqPolicy {
     /// (tests) or the `Policy::attach_metrics` hook (production, called by
     /// `PolicyRegistry::attach_metrics` after the registry is built).
     metrics: OnceLock<Arc<MetricsRegistry>>,
+    diagnostic_sequence: AtomicU64,
     /// Worker pins for image-carrying conversations.
     ///
     /// Prefix matching cannot route these: the engine encodes an image as token
@@ -205,6 +206,14 @@ struct MatchOutcome {
     /// tier metric to label the selection, both in [`Tiers::SLOTS`]
     /// vocabulary so they agree with `sgl_router_kv_tree_blocks`.
     owner_tiers: HashMap<String, Tiers>,
+    /// Owner depth for each eligible URL, captured during the lookup.
+    owner_depths: HashMap<String, usize>,
+    /// Structural suffix skipped for each owner's best eligible mode.
+    owner_depth_gaps: HashMap<String, usize>,
+    /// Deepest owned match across modes, including below-threshold matches.
+    owned_matched_blocks: usize,
+    has_owner_path_gap: bool,
+    diagnostic_sampled: bool,
     /// Best (max-rate) mode's matched-block count — logging / metrics only.
     matched_blocks: usize,
     /// Best mode's query-block count — the match_rate denominator and the
@@ -253,6 +262,7 @@ impl CacheAwareZmqPolicy {
             block_size_oracle,
             engine_load,
             metrics: OnceLock::new(),
+            diagnostic_sequence: AtomicU64::new(0),
             mm_affinity: MultimodalAffinity::new(mm_affinity_idle, mm_affinity_sweep),
         }
     }
@@ -439,6 +449,14 @@ impl CacheAwareZmqPolicy {
 
         let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut owner_tiers: HashMap<String, Tiers> = HashMap::new();
+        let mut owner_depths: HashMap<String, usize> = HashMap::new();
+        let mut owner_depth_gaps: HashMap<String, usize> = HashMap::new();
+        let mut owned_matched_blocks = 0;
+        let mut has_owner_path_gap = false;
+        // One in 128 metered selections, independent of routing mode.
+        // Short-circuit before touching the counter when metrics are absent.
+        let diagnostic_sampled = self.metrics.get().is_some()
+            && self.diagnostic_sequence.fetch_add(1, Ordering::Relaxed) % 128 == 0;
         let mut mode_hashes: Vec<Vec<i64>> = Vec::with_capacity(modes.len());
         let mut had_blocks = false;
         let mut any_above_threshold = false;
@@ -469,18 +487,42 @@ impl CacheAwareZmqPolicy {
                 continue;
             }
             had_blocks = true;
-            let matched = self.tree.match_prefix(None, &hashes);
+            let matched = self.tree.match_prefix_with_options(
+                None,
+                &hashes,
+                self.config.ancestor_fallback,
+                diagnostic_sampled,
+            );
+            has_owner_path_gap |= matched.has_owner_path_gap;
             debug_assert!(matched.matched_blocks <= hashes.len());
             let rate = matched.matched_blocks as f32 / hashes.len() as f32;
             if best.is_none_or(|(r, m, _)| (rate, matched.matched_blocks) > (r, m)) {
                 best = Some((rate, matched.matched_blocks, hashes.len()));
             }
-            // Per-mode threshold BEFORE unioning: a mode contributes owners only
+            owned_matched_blocks = owned_matched_blocks.max(matched.owned_matched_blocks);
+            let owned_rate = matched.owned_matched_blocks as f32 / hashes.len() as f32;
+            any_above_threshold |= rate > self.config.cache_threshold;
+            // Per-mode OWNED threshold BEFORE unioning: a mode contributes owners only
             // if its own overlap cleared the bar, so a strong match in one family
             // never drags in a weak match's owners from the other.
-            if rate > self.config.cache_threshold {
-                any_above_threshold = true;
+            if owned_rate > self.config.cache_threshold {
                 for (w, tiers) in matched.tiers {
+                    let depth = matched.owned_matched_blocks;
+                    // A nonempty owner set always comes from a positive depth.
+                    // Its first URL occurrence must therefore insert both maps.
+                    debug_assert!(depth > 0);
+                    let gap = matched.matched_blocks - depth;
+                    let old_depth = owner_depths.get(&w.url).copied().unwrap_or(0);
+                    if depth > old_depth {
+                        owner_depths.insert(w.url.clone(), depth);
+                        owner_depth_gaps.insert(w.url.clone(), gap);
+                    } else if depth == old_depth {
+                        // If either equally deep mode has a direct owner, do
+                        // not classify this destination as ancestor fallback.
+                        owner_depth_gaps
+                            .entry(w.url.clone())
+                            .and_modify(|g| *g = (*g).min(gap));
+                    }
                     owner_urls.insert(w.url.clone());
                     owner_tiers.entry(w.url).or_default().insert(tiers);
                 }
@@ -497,6 +539,11 @@ impl CacheAwareZmqPolicy {
         MatchOutcome {
             owner_urls,
             owner_tiers,
+            owner_depths,
+            owner_depth_gaps,
+            owned_matched_blocks,
+            has_owner_path_gap,
+            diagnostic_sampled,
             matched_blocks,
             query_blocks,
             match_rate,
@@ -567,15 +614,13 @@ impl CacheAwareZmqPolicy {
 
     /// How many blocks of this request the worker at `url` holds itself.
     ///
-    /// Short-circuits when only one mode produced blocks and `url` is one of
-    /// its owners: `owner_urls` is then exactly the worker set of the node at
-    /// depth `matched_blocks` on that single chain, so the answer is
-    /// `matched_blocks` without walking the tree again. That covers every
-    /// `cache_hit` selection on a uniform fleet — the dominant path — for no
-    /// added cost. With two chains in play the membership no longer says
-    /// *which* chain the worker owns, so the shortcut would be guessing.
+    /// For a single hash mode, use the owner depth captured during matching.
+    /// This can be shorter than the structural path after ancestor fallback.
+    /// With two modes, re-query because a selected URL may also hold a deeper
+    /// prefix in a mode that did not contribute it to the owner set.
     ///
-    /// Otherwise re-descends per mode and takes the deepest: the request goes
+    /// For other destinations or multiple modes, walk each chain and take
+    /// the deepest prefix held by that URL: the request goes
     /// to one worker, whose engine hashes with its own family, so a worker warm
     /// under either family can serve it from cache. This stays within
     /// `matched_blocks` only because [`Self::match_request`] breaks rate ties by
@@ -583,8 +628,10 @@ impl CacheAwareZmqPolicy {
     /// there before changing either side.
     fn selected_overlap(&self, outcome: &MatchOutcome, url: &str) -> usize {
         let single_chain = outcome.mode_hashes.len() < 2;
-        if single_chain && outcome.owner_urls.contains(url) {
-            return outcome.matched_blocks;
+        if single_chain {
+            if let Some(depth) = outcome.owner_depths.get(url) {
+                return *depth;
+            }
         }
         outcome
             .mode_hashes
@@ -622,8 +669,29 @@ impl CacheAwareZmqPolicy {
             return;
         };
         let selected = self.selected_overlap(outcome, chosen.url.as_str()) as u64;
+        // Classify the affinity that admitted this URL, not a later metric
+        // re-read of a different hash mode (or a concurrently changed tree).
+        let ancestor_gap = outcome
+            .owner_depth_gaps
+            .get(chosen.url.as_str())
+            .copied()
+            .unwrap_or(0);
+        // Split ordinary affinity hits without hiding queue/admission outcomes.
+        // Every counter below uses the same effective decision.
+        let decision = if matches!(decision, CacheAwareDecision::CacheHit) && ancestor_gap > 0 {
+            CacheAwareDecision::AncestorHit
+        } else {
+            decision
+        };
+        if outcome.diagnostic_sampled {
+            m.record_owner_path_gap(model_id, outcome.has_owner_path_gap);
+        }
         m.record_cache_aware_decision(model_id, decision);
         m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
+        m.observe_owned_overlap_blocks(model_id, outcome.owned_matched_blocks as u64);
+        if ancestor_gap > 0 {
+            m.observe_ancestor_fallback_blocks(model_id, ancestor_gap as u64);
+        }
         m.add_cache_aware_blocks(
             model_id,
             decision,
@@ -920,7 +988,9 @@ impl CacheAwareZmqPolicy {
                         );
                     }
                 };
-                let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
+                let engine = crate::workers::introspect::EngineChatTemplate::from_workers(workers);
+                let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value, &engine)
+                else {
                     self.record_decision(model_id, CacheAwareDecision::TokenizationUnavailable);
                     if should_log(&TOKENIZATION_LOG_COUNTER) {
                         tracing::warn!(
@@ -1160,7 +1230,10 @@ impl CacheAwareZmqPolicy {
             // matched/selected counters under `decision="cache_worker_queued"`.
             if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
                 if let Some(m) = self.metrics.get() {
-                    m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
+                    m.observe_diverted_overlap_blocks(
+                        model_id,
+                        outcome.owned_matched_blocks as u64,
+                    );
                 }
             }
             if should_log(&MATCHED_FALLBACK_LOG_COUNTER) {
@@ -1313,8 +1386,7 @@ mod tests {
                 cache_aware: None,
                 decode_policy: None,
                 sticky: None,
-                max_output_tokens: None,
-                sampling_overrides: Default::default(),
+                profile: Default::default(),
                 forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -3788,12 +3860,66 @@ mod tests {
 
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "model": "tiny", "messages": messages });
-        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        let rt = request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
+        )
+        .expect("tokens");
         assert!(
             rt.engine_equivalent,
             "chat-encoder ids must be engine-equivalent"
         );
         assert_eq!(rt.ids, expected);
+    }
+
+    /// The engine's chat-template setup, agreed across workers, shapes both the
+    /// tokens (default kwargs are rendered in) and how far they may be
+    /// forwarded (full only when agreed; never past a template override).
+    #[test]
+    fn request_tokens_for_applies_engine_chat_template() {
+        use crate::tokenizer::{chat_template::ChatTemplate, ChatEncoder, ForwardParity};
+        use crate::workers::introspect::EngineChatTemplate;
+        let registry = tokenizer_registry_with_tiny();
+        let tmpl = ChatTemplate::from_tokenizer_config(&serde_json::json!({
+            "chat_template": "{% if reasoning_effort is defined %}{{ reasoning_effort }} {% endif %}{{ messages[0]['content'] }}"
+        }))
+        .unwrap()
+        .unwrap()
+        .with_full_forwarding();
+        registry.attach_chat_encoder_for_test("tiny", ChatEncoder::Jinja(Box::new(tmpl)));
+        let model = ModelId("tiny".into());
+        let value = serde_json::json!({"messages": [{"role": "user", "content": "hello world"}]});
+        let tokens = |engine: EngineChatTemplate| {
+            request_tokens_for(&registry, &model, &value, &engine).expect("tokens")
+        };
+        let low = serde_json::json!({"reasoning_effort": "low"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let plain = tokens(EngineChatTemplate::Checkpoint(serde_json::Map::new()));
+        assert!(plain.engine_equivalent);
+        assert_eq!(plain.parity, ForwardParity::JinjaFull);
+
+        let defaulted = tokens(EngineChatTemplate::Checkpoint(low));
+        assert_ne!(
+            defaulted.ids, plain.ids,
+            "engine default kwargs must be rendered in"
+        );
+        assert_eq!(defaulted.parity, ForwardParity::JinjaFull);
+
+        let unverified = tokens(EngineChatTemplate::Unverified);
+        assert_eq!(unverified.ids, plain.ids);
+        assert!(unverified.engine_equivalent);
+        assert_eq!(unverified.parity, ForwardParity::Conservative);
+
+        let overridden = tokens(EngineChatTemplate::Overridden);
+        assert!(
+            !overridden.engine_equivalent,
+            "a template override is never engine-equivalent"
+        );
     }
 
     /// End-to-end: `request_tokens_for` threads the request's thinking mode through
@@ -3814,6 +3940,7 @@ mod tests {
             &registry,
             &model,
             &serde_json::json!({ "messages": messages.clone() }),
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
         )
         .expect("tokens")
         .ids;
@@ -3824,6 +3951,7 @@ mod tests {
                 "messages": messages.clone(),
                 "chat_template_kwargs": {"thinking": true}
             }),
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
         )
         .expect("tokens")
         .ids;
@@ -3874,7 +4002,13 @@ mod tests {
         assert!(!registry.has_chat_encoder("tiny"));
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "prompt": "hello world" });
-        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        let rt = request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified,
+        )
+        .expect("tokens");
         assert!(!rt.engine_equivalent);
         assert!(!rt.ids.is_empty());
     }
@@ -3887,7 +4021,13 @@ mod tests {
         let registry = tokenizer_registry_with_tiny();
         let model = ModelId("tiny".into());
         let value = serde_json::json!({ "frobnicate": 42 });
-        assert!(request_tokens_for(&registry, &model, &value).is_none());
+        assert!(request_tokens_for(
+            &registry,
+            &model,
+            &value,
+            &crate::workers::introspect::EngineChatTemplate::Unverified
+        )
+        .is_none());
     }
 
     /// `select` consumes the ingress-precomputed tokens and does NOT
@@ -3932,6 +4072,304 @@ mod tests {
             chosen.url, "http://w0:30000",
             "select must use ctx tokens (w0's prefix), not re-tokenize the body"
         );
+    }
+
+    // A query stops at an unowned interior node kept alive by a longer chain.
+    // Its first three blocks still have an owner. Cold fallback prefers w1.
+    fn ancestor_fixture(bigram: bool) -> (Arc<HashTree>, Vec<u32>) {
+        let tokens: Vec<u32> = (0..24).collect();
+        let hashes = if bigram {
+            compute_block_hashes_bigram(&tokens, 4)
+        } else {
+            compute_block_hashes(&tokens, 4)
+        };
+        let tree = Arc::new(HashTree::new());
+        let id = KvWorkerId::new("http://w0:30000".into(), 0);
+        tree.insert_tiered(&id, None, &hashes, Tiers::HOST);
+        tree.remove_tiered(&id, &hashes[3..5], Tiers::HOST);
+        (tree, tokens[..if bigram { 21 } else { 20 }].to_vec())
+    }
+
+    fn ancestor_cfg() -> CacheAwareConfig {
+        CacheAwareConfig {
+            ancestor_fallback: true,
+            ..queue_cfg(4)
+        }
+    }
+
+    #[test]
+    fn ancestor_fallback_disabled_preserves_unowned_fallback() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let policy = new_policy(
+            queue_cfg(4),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let outcome = policy.match_request(&tokens, 4, false, false);
+        assert!(outcome.owner_urls.is_empty());
+        assert_eq!(outcome.owned_matched_blocks, 3);
+        assert!(!outcome.diagnostic_sampled);
+    }
+
+    #[test]
+    fn ancestor_owner_routes_without_overstating_selected_overlap() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.5,
+                ..ancestor_cfg()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _load = w0.load_guard();
+        let model = ModelId("tiny".into());
+        let body = br#"{"prompt":"irrelevant"}"#;
+        let ctx = SelectionContext::new(&model, Some(body)).with_request_tokens(Some(&tokens));
+        let chosen = policy.select(&[w0, w1], &ctx).unwrap();
+        assert_eq!(chosen.url, "http://w0:30000");
+        let rendered = metrics.render();
+        assert_eq!(
+            block_counter(&rendered, "cache_aware_query_blocks_total", "ancestor_hit"),
+            5
+        );
+        assert!(!rendered.contains("decision=\"cache_hit\""));
+        assert!(rendered.contains(
+            "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"ancestor_hit\"} 1"
+        ));
+        assert_eq!(
+            block_counter(&rendered, "matched_overlap_blocks_total", "ancestor_hit"),
+            5
+        );
+        assert_eq!(
+            block_counter(&rendered, "selected_overlap_blocks_total", "ancestor_hit"),
+            3
+        );
+        assert!(rendered.contains("sgl_router_owned_overlap_blocks_sum{model_id=\"tiny\"} 3"));
+        assert!(rendered.contains("sgl_router_ancestor_fallback_blocks_count{model_id=\"tiny\"} 1"));
+        assert!(rendered.contains("sgl_router_ancestor_fallback_blocks_sum{model_id=\"tiny\"} 2"));
+    }
+
+    #[test]
+    fn ancestor_threshold_uses_owned_depth_in_each_hash_mode() {
+        for bigram in [false, true] {
+            for threshold in [0.5, 0.6, 0.9] {
+                let (tree, tokens) = ancestor_fixture(bigram);
+                let policy = new_policy(
+                    CacheAwareConfig {
+                        cache_threshold: threshold,
+                        ..ancestor_cfg()
+                    },
+                    tree,
+                    tokenizer_registry_with_tiny(),
+                    oracle_for_tests(4),
+                );
+                for bimodal in [false, true] {
+                    let m = policy.match_request(&tokens, 4, bigram, bimodal);
+                    assert_eq!(m.matched_blocks, 5);
+                    assert_eq!(m.owned_matched_blocks, 3);
+                    assert_eq!(m.owner_urls.contains("http://w0:30000"), threshold < 0.6);
+                    if threshold < 0.6 {
+                        assert_eq!(policy.selected_overlap(&m, "http://w0:30000"), 3);
+                        assert_eq!(m.owner_tiers["http://w0:30000"], Tiers::HOST);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_owner_must_be_in_eligible_worker_slice() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let policy = new_policy(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        // Admission has removed the ancestor owner; never resurrect it.
+        let chosen = policy
+            .select(&[worker("http://w1:30000", "tiny")], &ctx)
+            .unwrap();
+        assert_eq!(chosen.url, "http://w1:30000");
+    }
+
+    #[test]
+    fn direct_mode_does_not_admit_below_threshold_ancestor_from_other_mode() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let direct = KvWorkerId::new("http://w1:30000".into(), 0);
+        tree.insert(&direct, None, &compute_block_hashes_bigram(&tokens, 4));
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.8,
+                ..ancestor_cfg()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        for primary_bigram in [false, true] {
+            let m = policy.match_request(&tokens, 4, primary_bigram, true);
+            assert!(!m.owner_urls.contains("http://w0:30000"));
+            assert!(m.owner_urls.contains("http://w1:30000"));
+            assert_eq!(m.owner_depth_gaps["http://w1:30000"], 0);
+            assert_eq!(policy.selected_overlap(&m, "http://w1:30000"), 5);
+        }
+    }
+
+    #[test]
+    fn ancestor_accounting_preserves_gate_decisions() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let outcome = policy.match_request(&tokens, 4, false, false);
+        let chosen = worker("http://w0:30000", "tiny");
+        for decision in [
+            CacheAwareDecision::CacheHitAllQueued,
+            CacheAwareDecision::CacheWorkerQueued,
+        ] {
+            policy.record_match_outcome("tiny", decision, &outcome, &chosen);
+        }
+        let rendered = metrics.render();
+        for decision in ["cache_hit_all_queued", "cache_worker_queued"] {
+            assert_eq!(
+                block_counter(&rendered, "cache_aware_query_blocks_total", decision),
+                5
+            );
+            assert_eq!(
+                block_counter(&rendered, "matched_overlap_blocks_total", decision),
+                5
+            );
+            assert_eq!(
+                block_counter(&rendered, "selected_overlap_blocks_total", decision),
+                3
+            );
+        }
+        assert!(!rendered.contains("decision=\"ancestor_hit\""));
+    }
+
+    #[test]
+    fn owner_gap_is_counted_once_per_selection() {
+        let (tree, _) = ancestor_fixture(false);
+        // The fixture retains a deeper owner beyond its deleted interior.
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let tokens: Vec<u32> = (0..24).collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        policy
+            .select(&[worker("http://w0:30000", "tiny")], &ctx)
+            .unwrap();
+        assert!(metrics
+            .render()
+            .contains("sgl_router_owner_path_gap_total{model_id=\"tiny\"} 1"));
+    }
+
+    #[test]
+    fn diagnostics_require_metrics_and_sample_every_128_lookups() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let policy = new_policy(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        for _ in 0..256 {
+            assert!(
+                !policy
+                    .match_request(&tokens, 4, false, false)
+                    .diagnostic_sampled
+            );
+        }
+        assert_eq!(policy.diagnostic_sequence.load(Ordering::Relaxed), 0);
+        let policy = policy.with_metrics(MetricsRegistry::new());
+        for i in 0..257 {
+            assert_eq!(
+                policy
+                    .match_request(&tokens, 4, false, false)
+                    .diagnostic_sampled,
+                i % 128 == 0
+            );
+        }
+    }
+
+    #[test]
+    fn dual_mode_ancestor_label_uses_selection_snapshot() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            ancestor_cfg(),
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let outcome = policy.match_request(&tokens, 4, false, true);
+        let chosen = worker("http://w0:30000", "tiny");
+        // A different mode changes between selection and metric collection.
+        let owner = KvWorkerId::new(chosen.url.clone(), 0);
+        tree.insert(&owner, None, &compute_block_hashes_bigram(&tokens, 4));
+        assert_ne!(
+            policy.selected_overlap(&outcome, &chosen.url),
+            outcome.owner_depths[&chosen.url]
+        );
+        policy.record_match_outcome("tiny", CacheAwareDecision::CacheHit, &outcome, &chosen);
+        assert!(metrics.render().contains("decision=\"ancestor_hit\""));
+        assert!(!metrics.render().contains("decision=\"cache_hit\""));
+    }
+
+    #[test]
+    fn ancestor_owner_still_respects_queue_gate() {
+        let (tree, tokens) = ancestor_fixture(false);
+        let metrics = MetricsRegistry::new();
+        let load = EngineLoadTable::new();
+        load.set("http://w0:30000", 0, load_stat(10, 9), Instant::now());
+        load.set("http://w1:30000", 0, load_stat(1, 0), Instant::now());
+        let policy = new_policy_with_load(
+            ancestor_cfg(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let model = ModelId("tiny".into());
+        let body = br#"{"prompt":"irrelevant"}"#;
+        let ctx = SelectionContext::new(&model, Some(body)).with_request_tokens(Some(&tokens));
+        let chosen = policy
+            .select(
+                &[
+                    worker("http://w0:30000", "tiny"),
+                    worker("http://w1:30000", "tiny"),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(chosen.url, "http://w1:30000");
+        let rendered = metrics.render();
+        assert!(rendered.contains("sgl_router_diverted_overlap_blocks_sum{model_id=\"tiny\"} 3"));
+        assert!(rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"} 1"));
+        assert!(rendered.contains("sgl_router_owner_path_gap_total{model_id=\"tiny\"} 0"));
     }
 
     // ---- per-worker queue gate ----

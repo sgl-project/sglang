@@ -1,0 +1,9 @@
+# Moonshot-style immutable sampling, as Kimi K3 is served.
+name: moonshot-kimi
+params:
+  temperature:       { min: 0, max: 1 }
+  top_p:             { pin: 0.95 }
+  top_k:             { pin: 1000, type: int }
+  frequency_penalty: { pin: 0 }
+  presence_penalty:  { pin: 0 }
+  n:                 { pin: 1, type: int }

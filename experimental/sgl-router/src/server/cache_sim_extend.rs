@@ -315,13 +315,17 @@ fn full_reencode_extension(
     // assistant turn — not this request's trailing continuation. The raw
     // fallback (`request_tokens_for`) stays for models without a chat encoder.
     let messages = request.get("messages").unwrap().clone();
-    let opts = ChatRenderOpts::resolve(request);
+    // Render under the same engine defaults as the ingress tokenization.
+    let engine = crate::workers::introspect::EngineChatTemplate::from_workers(
+        &ctx.registry.workers_for(model_id),
+    );
+    let opts = ChatRenderOpts::resolve_with_engine_defaults(request, engine.default_kwargs());
     let ids = ctx
         .tokenizers
         .encode_chat_plain(&model_id.0, &messages, request.get("tools"), &opts);
     let tokens = match ids {
         Some(ids) => Some(ids),
-        None => request_tokens_for(&ctx.tokenizers, model_id, request).map(|t| t.ids),
+        None => request_tokens_for(&ctx.tokenizers, model_id, request, &engine).map(|t| t.ids),
     };
     if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
         messages.pop();
@@ -855,8 +859,7 @@ mod spawn_tests {
                 cache_aware: None,
                 decode_policy: None,
                 sticky: None,
-                max_output_tokens: None,
-                sampling_overrides: Default::default(),
+                profile: Default::default(),
                 forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(

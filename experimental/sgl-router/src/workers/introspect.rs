@@ -59,6 +59,91 @@ pub struct ServerInfo {
     /// field) ⇒ stay on HTTP/1.1. Consumed by `manager::register_one` to set
     /// [`crate::workers::WireProtocol`].
     pub enable_http2: Option<bool>,
+    /// How the engine renders chat prompts; consumed by router-side chat
+    /// rendering through [`EngineChatTemplate::from_workers`].
+    pub chat_template: ChatTemplateServing,
+}
+
+/// A worker's chat-template serving setup, from `/server_info`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ChatTemplateServing {
+    /// `/server_info` predates `default_chat_template_kwargs`, or the fetch
+    /// failed.
+    #[default]
+    Unknown,
+    /// The checkpoint's own template, with `--default-chat-template-kwargs`
+    /// (empty when unset).
+    Checkpoint(serde_json::Map<String, serde_json::Value>),
+    /// `--chat-template` or `--hf-chat-template-name`: not the template the
+    /// router loads from the checkpoint.
+    Overridden,
+}
+
+/// What the router may assume about a model's engine-side chat rendering,
+/// agreed across all its workers. A request may be dispatched (or retried)
+/// to any of them, so ids are only engine-equivalent when every worker
+/// renders the same way.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineChatTemplate {
+    /// Every worker reports the checkpoint template with these default kwargs.
+    Checkpoint(serde_json::Map<String, serde_json::Value>),
+    /// No workers yet, a worker that did not report, or workers that disagree
+    /// on default kwargs: render without defaults, forward conservatively.
+    Unverified,
+    /// Some worker renders a different template: router ids never match it.
+    Overridden,
+}
+
+impl EngineChatTemplate {
+    pub fn from_workers(workers: &[std::sync::Arc<crate::workers::Worker>]) -> Self {
+        let mut agreed: Option<serde_json::Map<String, serde_json::Value>> = None;
+        let mut unverified = workers.is_empty();
+        for w in workers {
+            match w.chat_template_serving() {
+                ChatTemplateServing::Overridden => return Self::Overridden,
+                ChatTemplateServing::Unknown => unverified = true,
+                ChatTemplateServing::Checkpoint(kwargs) => match &agreed {
+                    Some(a) if *a != kwargs => unverified = true,
+                    Some(_) => {}
+                    None => agreed = Some(kwargs),
+                },
+            }
+        }
+        match agreed {
+            Some(kwargs) if !unverified => Self::Checkpoint(kwargs),
+            _ => Self::Unverified,
+        }
+    }
+
+    /// The engine's `--default-chat-template-kwargs`, when agreed.
+    pub fn default_kwargs(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        match self {
+            Self::Checkpoint(kwargs) => Some(kwargs),
+            _ => None,
+        }
+    }
+}
+
+/// `default_chat_template_kwargs` absent ⇒ `Unknown` (older SGLang);
+/// a non-null `chat_template` / `hf_chat_template_name` ⇒ `Overridden`.
+fn resolve_chat_template_serving(body: &ServerInfoBody) -> ChatTemplateServing {
+    use serde_json::Value;
+    let set = |v: &Option<Value>| v.as_ref().is_some_and(|v| !v.is_null());
+    if set(&body.chat_template) || set(&body.hf_chat_template_name) {
+        return ChatTemplateServing::Overridden;
+    }
+    match &body.default_chat_template_kwargs {
+        Some(Value::Null) => ChatTemplateServing::Checkpoint(serde_json::Map::new()),
+        Some(Value::Object(kwargs)) => ChatTemplateServing::Checkpoint(kwargs.clone()),
+        _ => ChatTemplateServing::Unknown,
+    }
+}
+
+/// Deserialize a present field as `Some` even when it is JSON `null`, so
+/// "reported as unset" stays distinct from "not reported" (`#[serde(default)]`
+/// keeps an absent field `None`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -121,6 +206,7 @@ impl WorkerIntrospector {
             Some(p) => p,
             None => return ServerInfo::default(),
         };
+        let chat_template = resolve_chat_template_serving(&parsed);
 
         let served_model_name = match parsed.served_model_name {
             Some(name) if !name.is_empty() => Some(name),
@@ -155,6 +241,7 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
             enable_http2: parsed.enable_http2,
+            chat_template,
         }
     }
 
@@ -367,6 +454,16 @@ struct ServerInfoBody {
     /// versions that predate the flag.
     #[serde(default)]
     enable_http2: Option<bool>,
+    /// `ServerArgs.default_chat_template_kwargs` (`null` when unset; absent on
+    /// older SGLang).
+    #[serde(default, deserialize_with = "present")]
+    default_chat_template_kwargs: Option<serde_json::Value>,
+    /// `ServerArgs.chat_template` (`--chat-template`).
+    #[serde(default, deserialize_with = "present")]
+    chat_template: Option<serde_json::Value>,
+    /// `ServerArgs.hf_chat_template_name` (`--hf-chat-template-name`).
+    #[serde(default, deserialize_with = "present")]
+    hf_chat_template_name: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +661,106 @@ mod tests {
             .event_config
             .expect("kv_events present");
         assert!(!cfg.is_bigram, "non-speculative worker must not be bigram");
+    }
+
+    /// "Reported as unset" (`null`) and "not reported" (older SGLang) must stay
+    /// distinct: only the former is a verified checkpoint template.
+    #[tokio::test]
+    async fn fetch_resolves_chat_template_serving() {
+        let cases = [
+            (
+                json!({"served_model_name": "m"}),
+                ChatTemplateServing::Unknown,
+            ),
+            (
+                json!({"default_chat_template_kwargs": null, "chat_template": null}),
+                ChatTemplateServing::Checkpoint(serde_json::Map::new()),
+            ),
+            (
+                json!({"default_chat_template_kwargs": {"reasoning_effort": "low"}}),
+                ChatTemplateServing::Checkpoint(
+                    json!({"reasoning_effort": "low"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            ),
+            (
+                json!({"default_chat_template_kwargs": null, "chat_template": "/t.jinja"}),
+                ChatTemplateServing::Overridden,
+            ),
+            (
+                json!({"default_chat_template_kwargs": null, "hf_chat_template_name": "tool_use"}),
+                ChatTemplateServing::Overridden,
+            ),
+            (
+                json!({"default_chat_template_kwargs": "x"}),
+                ChatTemplateServing::Unknown,
+            ),
+        ];
+        for (body, want) in cases {
+            let (url, _shutdown) = spawn_fake_worker(body.clone()).await;
+            assert_eq!(
+                fast_introspector().fetch(&url).await.chat_template,
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_chat_template_requires_every_worker_to_agree() {
+        use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+        let worker = |id: &str, s: ChatTemplateServing| {
+            let w = crate::workers::Worker::new(WorkerSpec {
+                id: WorkerId(id.into()),
+                url: format!("http://{id}:30000"),
+                mode: WorkerMode::Plain,
+                model_ids: vec![],
+                bootstrap_port: None,
+                transfer_group: None,
+            });
+            w.set_chat_template_serving(s);
+            Arc::new(w)
+        };
+        let low = json!({"reasoning_effort": "low"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let ckpt = |m: &serde_json::Map<String, Value>| ChatTemplateServing::Checkpoint(m.clone());
+        let none = serde_json::Map::new();
+
+        assert_eq!(
+            EngineChatTemplate::from_workers(&[]),
+            EngineChatTemplate::Unverified
+        );
+        assert_eq!(
+            EngineChatTemplate::from_workers(&[worker("a", ckpt(&low)), worker("b", ckpt(&low))]),
+            EngineChatTemplate::Checkpoint(low.clone())
+        );
+        assert_eq!(
+            EngineChatTemplate::from_workers(&[worker("a", ckpt(&low)), worker("b", ckpt(&none))]),
+            EngineChatTemplate::Unverified
+        );
+        assert_eq!(
+            EngineChatTemplate::from_workers(&[
+                worker("a", ckpt(&none)),
+                worker("b", ChatTemplateServing::Unknown)
+            ]),
+            EngineChatTemplate::Unverified
+        );
+        assert_eq!(
+            EngineChatTemplate::from_workers(&[
+                worker("a", ChatTemplateServing::Unknown),
+                worker("b", ChatTemplateServing::Overridden)
+            ]),
+            EngineChatTemplate::Overridden
+        );
+        assert_eq!(
+            EngineChatTemplate::Checkpoint(low.clone()).default_kwargs(),
+            Some(&low)
+        );
+        assert_eq!(EngineChatTemplate::Unverified.default_kwargs(), None);
     }
 
     #[tokio::test]

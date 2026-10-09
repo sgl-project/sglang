@@ -1,0 +1,260 @@
+{
+ "_doc": "Expected Jinja template kwargs (JinjaRenderOpts::resolve) per request and engine --default-chat-template-kwargs, derived by running SGLang's own code on the engine: ChatCompletionRequest validation (top-level reasoning_effort sets thinking/enable_thinking), handle_request's chat_template_kwargs.reasoning_effort pop, _process_messages' defaults merge and _apply_jinja_template's extra_template_kwargs. One deliberate deviation: a default reasoning_effort never overrides the request's own effort (the engine's final update() lets it; the router follows the intended precedence).",
+ "cases": [
+  {
+   "request": {},
+   "defaults": null,
+   "expected": {}
+  },
+  {
+   "request": {
+    "reasoning_effort": "low"
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "low",
+    "thinking": true,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "none"
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "none",
+    "thinking": false,
+    "enable_thinking": false
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": 0.5
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": 0.5,
+    "thinking": true,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {
+    "chat_template_kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "high"
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "low",
+    "chat_template_kwargs": {
+     "reasoning_effort": "high",
+     "preserve_thinking": false,
+     "thinking": true,
+     "enable_thinking": true
+    }
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "high",
+    "preserve_thinking": false,
+    "thinking": true,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "high",
+    "chat_template_kwargs": {
+     "thinking": false,
+     "enable_thinking": true
+    }
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "high",
+    "thinking": false,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {
+    "chat_template_kwargs": {
+     "preserve_thinking": true
+    }
+   },
+   "defaults": null,
+   "expected": {
+    "preserve_thinking": true
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "low",
+    "chat_template_kwargs": {
+     "reasoning_effort": null,
+     "thinking": true,
+     "enable_thinking": true
+    }
+   },
+   "defaults": null,
+   "expected": {
+    "reasoning_effort": "low",
+    "thinking": true,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {},
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "low"
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "low",
+    "thinking": true,
+    "enable_thinking": true,
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "none"
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "none",
+    "thinking": false,
+    "enable_thinking": false,
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": 0.5
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": 0.5,
+    "thinking": true,
+    "enable_thinking": true,
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "chat_template_kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "high",
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "low",
+    "chat_template_kwargs": {
+     "reasoning_effort": "high",
+     "preserve_thinking": false,
+     "thinking": true,
+     "enable_thinking": true
+    }
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "high",
+    "preserve_thinking": false,
+    "thinking": true,
+    "enable_thinking": true
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "high",
+    "chat_template_kwargs": {
+     "thinking": false,
+     "enable_thinking": true
+    }
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "high",
+    "thinking": false,
+    "enable_thinking": true,
+    "preserve_thinking": false
+   }
+  },
+  {
+   "request": {
+    "chat_template_kwargs": {
+     "preserve_thinking": true
+    }
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "low",
+    "preserve_thinking": true
+   }
+  },
+  {
+   "request": {
+    "reasoning_effort": "low",
+    "chat_template_kwargs": {
+     "reasoning_effort": null,
+     "thinking": true,
+     "enable_thinking": true
+    }
+   },
+   "defaults": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": {
+    "reasoning_effort": "low",
+    "thinking": true,
+    "enable_thinking": true,
+    "preserve_thinking": false
+   }
+  }
+ ]
+}

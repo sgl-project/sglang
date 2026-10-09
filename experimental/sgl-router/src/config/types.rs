@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -410,21 +410,9 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
-    /// Per-request output-token contract for this model. A request whose
-    /// `max_completion_tokens` / `max_tokens` exceeds this is rejected with
-    /// 400 before admission; a request that sets neither gets
-    /// `max_tokens = <cap>` injected into the forwarded body, so no request
-    /// can generate unbounded output. `None` (default) leaves today's
-    /// behavior: the engine's context length is the only output bound.
-    /// `NonZeroU64` rules out a `0` cap, which would reject or zero out
-    /// every request.
-    pub max_output_tokens: Option<NonZeroU64>,
-    /// Sampling parameters fixed fleet-wide for this model, and what happens
-    /// to a request that sends a different value: a 400 before admission, or
-    /// the client value forwarded untouched. Either way the configured value
-    /// is injected when the request omits the field — see
-    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
-    pub sampling_overrides: SamplingOverrides,
+    /// Client-facing request contract (`--api-profile*`, `--max-output-tokens`,
+    /// `--override-sampling-params`), see [`crate::profile`].
+    pub profile: crate::profile::ApiProfile,
     /// Whether the chat handler may forward ingress-computed `input_ids` to
     /// the engine so it skips re-tokenizing (the ingress tokenize offload).
     /// `false` gates ONLY the engine-facing forward — ingress tokenization
@@ -681,6 +669,8 @@ pub struct CacheAwareConfig {
     /// signal but not so weak that random hash collisions could trigger
     /// affinity to an arbitrary worker.
     pub cache_threshold: f32,
+    /// Opt in to deepest-owned-ancestor affinity for unowned matches.
+    pub ancestor_fallback: bool,
     /// Which load signal is allowed to override cache affinity.
     pub load_gate: LoadGate,
     /// How long a freshly started replica may hold `/readyz` at 503 while it
@@ -758,6 +748,7 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: default_cache_threshold(),
+            ancestor_fallback: false,
             load_gate: LoadGate::default(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
             bootstrap_fetch_timeout_cap_ms: default_bootstrap_fetch_timeout_cap_ms(),

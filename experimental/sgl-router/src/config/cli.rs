@@ -86,6 +86,16 @@ pub struct Cli {
     /// the only output bound.
     #[arg(long)]
     pub max_output_tokens: Option<NonZeroU64>,
+    /// Built-in API profile preset (`openai-compatible`, `moonshot-kimi`,
+    /// `stepfun-step5`). See docs/api-profiles.md for the lookup order.
+    #[arg(long, value_name = "NAME", conflicts_with = "api_profile_file")]
+    pub api_profile: Option<String>,
+    /// API profile YAML file; may `extends` a preset or another file.
+    #[arg(long, value_name = "PATH")]
+    pub api_profile_file: Option<std::path::PathBuf>,
+    /// Print the resolved API profile as YAML and exit.
+    #[arg(long)]
+    pub print_profile: bool,
     /// Sampling parameters fixed fleet-wide for this model, as one JSON
     /// object keyed by the request-body field names — e.g.
     /// `{"temperature": 1, "top_p": 0.95, "frequency_penalty": 0,
@@ -203,6 +213,9 @@ pub struct Cli {
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
+    /// Allow affinity to an owned ancestor of an unowned match (default off).
+    #[arg(long)]
+    pub cache_aware_ancestor_fallback: bool,
     /// How long `/readyz` may stay 503 while this replica bootstraps its
     /// cache-aware tree from a warm sibling. Defaults to 5000.
     #[arg(long)]
@@ -498,7 +511,8 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_cache_aware = self.cache_threshold.is_some()
+        let tuned_cache_aware = self.cache_aware_ancestor_fallback
+            || self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
@@ -511,7 +525,7 @@ impl Cli {
             || self.mm_affinity_eviction_interval_secs.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
+                "cache-aware tuning (--cache-aware-ancestor-fallback / --cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
                  --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
                  --worker-queue-limit / --min-load-choices / --saturation-queue-floor / \
@@ -688,6 +702,12 @@ impl Cli {
                 parse_sampling_overrides(raw, self.sampling_param_conflict.unwrap_or_default())?
             }
         };
+        let profile = crate::profile::resolve(
+            self.api_profile_file.as_deref(),
+            self.api_profile.as_deref(),
+            self.max_output_tokens,
+            &sampling_overrides,
+        )?;
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -713,6 +733,7 @@ impl Cli {
             };
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
+                ancestor_fallback: self.cache_aware_ancestor_fallback,
                 load_gate,
                 bootstrap_timeout_ms: self
                     .kv_bootstrap_timeout_ms
@@ -761,8 +782,7 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
-                max_output_tokens: self.max_output_tokens,
-                sampling_overrides,
+                profile,
                 forward_input_ids: !self.disable_input_ids_offload,
                 decode_policy: self.decode_policy,
             },
@@ -1009,7 +1029,10 @@ impl<'de> serde::Deserialize<'de> for ParamValue {
 /// flag is read once at startup on a router that crash-loops if it is wrong,
 /// so the message an operator gets from `kubectl logs` is the whole debugging
 /// session.
-fn parse_sampling_overrides(raw: &str, conflict: ConflictPolicy) -> Result<SamplingOverrides> {
+pub(crate) fn parse_sampling_overrides(
+    raw: &str,
+    conflict: ConflictPolicy,
+) -> Result<SamplingOverrides> {
     let ObjectEntries(entries) = serde_json::from_str(raw).map_err(|e| {
         anyhow!(
             "--override-sampling-params must be a JSON object like \
@@ -1283,12 +1306,15 @@ mod tests {
             .collect()
     }
 
+    /// The profile rule the flags produced for one parameter.
+    fn rule_of(c: &Config, field: SamplingField) -> Option<&crate::profile::ParamRule> {
+        c.model.profile.params.get(field.wire_name())
+    }
+
     /// Helper: the exact value configured for one parameter, as an f64.
     fn exact_of(c: &Config, field: SamplingField) -> Option<f64> {
-        match c.model.sampling_overrides.params.get(&field) {
-            Some(ParamSpec::Exact(n)) => n.as_f64(),
-            _ => None,
-        }
+        let r = rule_of(c, field)?;
+        r.pin.as_ref().or(r.default.as_ref())?.as_f64()
     }
 
     #[test]
@@ -1307,14 +1333,12 @@ mod tests {
         assert_eq!(exact_of(&c, SamplingField::FrequencyPenalty), Some(0.0));
         assert_eq!(exact_of(&c, SamplingField::PresencePenalty), Some(-0.5));
         assert_eq!(exact_of(&c, SamplingField::N), Some(1.0));
-        assert!(!c.model.sampling_overrides.params.is_empty());
-        // Reject is the default mode: declaring a contract is the usual
-        // reason to declare one.
-        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Reject);
+        // Reject is the default mode: an exact value becomes an immutable pin.
+        assert!(rule_of(&c, SamplingField::TopP).unwrap().pin.is_some());
 
         // Unset -> empty: no request is ever validated or injected.
         let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
-        assert!(c.model.sampling_overrides.params.is_empty());
+        assert!(c.model.profile.params.is_empty());
     }
 
     #[test]
@@ -1328,7 +1352,9 @@ mod tests {
             "allow",
         ]))
         .unwrap();
-        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Allow);
+        // Allow: the value is only a default.
+        let r = rule_of(&c, SamplingField::Temperature).unwrap();
+        assert!(r.pin.is_none() && r.default.is_some());
 
         // The mode alone governs nothing, so clap rejects it (`requires`).
         let err = into_config_owned(with_model(&[
@@ -1351,13 +1377,8 @@ mod tests {
             r#"{"temperature": {"min": 0, "max": 1}}"#,
         ]))
         .unwrap();
-        assert_eq!(
-            c.model
-                .sampling_overrides
-                .params
-                .get(&SamplingField::Temperature),
-            Some(&ParamSpec::Range { lo: 0.0, hi: 1.0 })
-        );
+        let r = rule_of(&c, SamplingField::Temperature).unwrap();
+        assert_eq!((r.min, r.max), (Some(0.0), Some(1.0)));
 
         for (json, needle) in [
             (r#"{"temperature": {"min": 1, "max": 0}}"#, "min <= max"),
@@ -1493,10 +1514,11 @@ mod tests {
         ]))
         .unwrap();
         for field in [SamplingField::N, SamplingField::TopK] {
-            let Some(ParamSpec::Exact(n)) = c.model.sampling_overrides.params.get(&field) else {
-                panic!("{field:?} must be an exact value");
-            };
-            assert!(n.is_i64(), "{field:?} kept a float literal: {n}");
+            let pin = rule_of(&c, field).and_then(|r| r.pin.as_ref());
+            assert!(
+                pin.is_some_and(|n| n.is_i64()),
+                "{field:?} must pin an integer: {pin:?}"
+            );
         }
     }
 
@@ -2551,6 +2573,31 @@ mod tests {
     }
 
     /// The defaults an operator gets without touching anything.
+    #[test]
+    fn ancestor_fallback_flag_is_opt_in() {
+        for enabled in [false, true] {
+            let mut args = vec![
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+            ];
+            if enabled {
+                args.push("--cache-aware-ancestor-fallback");
+            }
+            let config = into_config_owned(with_model(&args)).unwrap();
+            assert_eq!(
+                config
+                    .model
+                    .cache_aware
+                    .unwrap_or_default()
+                    .ancestor_fallback,
+                enabled
+            );
+        }
+        assert!(!CacheAwareConfig::default().ancestor_fallback);
+    }
+
     #[test]
     fn mm_affinity_defaults() {
         let d = CacheAwareConfig::default();

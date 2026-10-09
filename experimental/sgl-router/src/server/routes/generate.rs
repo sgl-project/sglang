@@ -7,8 +7,7 @@
 //! `sampling_params`, `rid`, …) PLUS a top-level `model` key naming the
 //! endpoint: the shared gateway exposes exactly this surface and rewrites
 //! `body.model` to the canonical HF id before forwarding. Everything the
-//! handler does — routing, admission, the per-model sampling controls,
-//! PD bootstrap injection, abort-by-rid — is shared with the chat handler
+//! handler does — routing, admission, PD bootstrap injection, abort-by-rid — is shared with the chat handler
 //! via [`chat::chat_completions_inner`]; only the surface-varying reads and
 //! writes differ (see [`crate::server::routes::surface`]).
 
@@ -32,6 +31,13 @@ pub(crate) async fn generate(
     phase: Option<Extension<Arc<RequestPhaseCell>>>,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    // The API profile's rules, read under `sampling_params` (see
+    // [`crate::profile::ApiProfile::apply_generate`]).
+    let body = ctx
+        .config
+        .model
+        .profile
+        .apply_generate(body, &ctx.config.model.id)?;
     chat::chat_completions_inner(
         ctx,
         headers,

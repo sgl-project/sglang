@@ -501,6 +501,8 @@ impl CacheAwareBlocks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAwareDecision {
     CacheHit,
+    /// Affinity to an owned ancestor below an unowned structural suffix.
+    AncestorHit,
     LoadImbalance,
     NoWorkers,
     RequestBodyUnavailable,
@@ -556,6 +558,7 @@ impl CacheAwareDecision {
     fn as_str(self) -> &'static str {
         match self {
             Self::CacheHit => "cache_hit",
+            Self::AncestorHit => "ancestor_hit",
             Self::LoadImbalance => "load_imbalance",
             Self::NoWorkers => "no_workers",
             Self::RequestBodyUnavailable => "request_body_unavailable",
@@ -606,6 +609,10 @@ pub struct MetricsRegistry {
     // CatchPanicLayer-synthesized 500).
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    owned_overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    owner_path_gap: Mutex<HashMap<String, u64>>,
+    owner_path_gap_samples: Mutex<HashMap<String, u64>>,
+    ancestor_fallback_blocks: Mutex<HashMap<String, Histogram>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     /// The three block counters that decompose cache-aware locality, kept in
     /// one map value so a selection books all of them against one key and they
@@ -707,6 +714,10 @@ impl Default for MetricsRegistry {
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
+            owned_overlap_blocks: Default::default(),
+            owner_path_gap: Default::default(),
+            owner_path_gap_samples: Default::default(),
+            ancestor_fallback_blocks: Default::default(),
             diverted_overlap_blocks: Default::default(),
             cache_aware_blocks: Default::default(),
             cache_aware_decisions_total: Default::default(),
@@ -924,6 +935,39 @@ impl MetricsRegistry {
     /// Observe an overlap-blocks count for `sgl_router_overlap_blocks`.
     pub fn observe_overlap_blocks(&self, model_id: &str, blocks: u64) {
         let mut guard = self.overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
+    /// Count once per sampled selection if any hash mode returned an owner
+    /// missing an ancestor. Includes below-threshold and unselected owners.
+    pub fn record_owner_path_gap(&self, model_id: &str, has_gap: bool) {
+        *self
+            .owner_path_gap_samples
+            .lock()
+            .entry(model_id.to_owned())
+            .or_default() += 1;
+        *self
+            .owner_path_gap
+            .lock()
+            .entry(model_id.to_owned())
+            .or_default() += u64::from(has_gap);
+    }
+
+    /// Deepest owned prefix, before threshold and load filtering.
+    pub fn observe_owned_overlap_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.owned_overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
+    /// Structural suffix skipped when selecting an eligible ancestor owner.
+    pub fn observe_ancestor_fallback_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.ancestor_fallback_blocks.lock();
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
@@ -1682,6 +1726,66 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_owner_path_gap_samples_total Selections sampled for ownership continuity checks; denominator for owner_path_gap_total.\n");
+        out.push_str("# TYPE sgl_router_owner_path_gap_samples_total counter\n");
+        let guard = self.owner_path_gap_samples.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, count) in entries {
+            out.push_str(&format!(
+                "sgl_router_owner_path_gap_samples_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model),
+                count
+            ));
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_owner_path_gap_total Sampled selections with at least one deepest-node owner missing an ancestor across all tiers in any hash mode; not necessarily the chosen worker.\n");
+        out.push_str("# TYPE sgl_router_owner_path_gap_total counter\n");
+        let guard = self.owner_path_gap.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, count) in entries {
+            out.push_str(&format!(
+                "sgl_router_owner_path_gap_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model),
+                count
+            ));
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_owned_overlap_blocks Deepest owned prefix across hash modes before threshold and load filtering; excludes unowned structural suffixes.\n");
+        out.push_str("# TYPE sgl_router_owned_overlap_blocks histogram\n");
+        let guard = self.owned_overlap_blocks.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, histogram) in entries {
+            let labels = format!("model_id=\"{}\"", escape_label(model));
+            render_histogram(
+                &mut out,
+                "sgl_router_owned_overlap_blocks",
+                &labels,
+                histogram,
+            );
+        }
+        drop(guard);
+
+        out.push_str("# HELP sgl_router_ancestor_fallback_blocks Structural suffix skipped for selected ancestor owners; count is ancestor selections, sum is skipped blocks, not recovered engine cache hits.\n");
+        out.push_str("# TYPE sgl_router_ancestor_fallback_blocks histogram\n");
+        let guard = self.ancestor_fallback_blocks.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(model, _)| *model);
+        for (model, histogram) in entries {
+            let labels = format!("model_id=\"{}\"", escape_label(model));
+            render_histogram(
+                &mut out,
+                "sgl_router_ancestor_fallback_blocks",
+                &labels,
+                histogram,
+            );
         }
         drop(guard);
 

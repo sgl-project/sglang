@@ -22,9 +22,14 @@
 //! this build does not recognise), so a misbehaving publisher cannot mint
 //! series.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use super::tree::Tiers;
+use parking_lot::Mutex;
+
+use super::tree::{KvWorkerId, Tiers};
 
 /// Event kinds, in the order [`EventTally`] stores them.
 pub const EVENT_KINDS: [&str; 3] = ["block_stored", "block_removed", "all_blocks_cleared"];
@@ -66,9 +71,30 @@ pub struct TallyRow {
     pub blocks: u64,
 }
 
-/// Lock-free counters, written by the single pump task and read on scrape.
+/// Fixed decoder failure labels; never include raw error strings.
+pub const DECODE_FAILURE_REASONS: [&str; 4] = [
+    "msgpack",
+    "block_hashes_limit",
+    "frame_count",
+    "sequence_frame",
+];
+
+/// Local observations, not proof of complete engine state.
+/// Counters persist across resets and disappear on worker removal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamHealth {
+    pub decode_failures: [u64; 4],
+    pub gaps: u64,
+    pub missing_sequences: u64,
+    pub skipped_batches: u64,
+    pub publisher_resets: u64,
+    pub untrusted: bool,
+}
+
+/// Event counters and exceptional per-worker stream observations.
 #[derive(Debug, Default)]
 pub struct EventTally {
+    streams: Mutex<HashMap<KvWorkerId, StreamHealth>>,
     events: [[AtomicU64; MEDIUM_LABELS.len()]; EVENT_KINDS.len()],
     blocks: [[AtomicU64; MEDIUM_LABELS.len()]; EVENT_KINDS.len()],
 }
@@ -76,6 +102,64 @@ pub struct EventTally {
 impl EventTally {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn record_decode_failure(&self, worker: &KvWorkerId, reason: &'static str) {
+        let slot = DECODE_FAILURE_REASONS
+            .iter()
+            .position(|r| *r == reason)
+            .expect("fixed reason");
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.decode_failures[slot] += 1;
+        state.untrusted = true;
+    }
+
+    pub fn record_gap(&self, worker: &KvWorkerId, missing: u64) -> bool {
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.gaps += 1;
+        state.missing_sequences += missing;
+        state.untrusted = true;
+        state.gaps == 1 || state.gaps.is_multiple_of(64)
+    }
+
+    // Sample WARNs per worker; counters still include every observation.
+    pub fn record_skipped_batch(&self, worker: &KvWorkerId, rollback: bool) -> bool {
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.skipped_batches += 1;
+        let first_rollback = rollback && !state.untrusted;
+        state.untrusted |= rollback;
+        rollback && (first_rollback || state.skipped_batches.is_multiple_of(64))
+    }
+
+    pub fn record_publisher_reset(&self, worker: &KvWorkerId) {
+        let mut streams = self.streams.lock();
+        let state = streams.entry(worker.clone()).or_default();
+        state.publisher_resets += 1;
+        state.untrusted = false;
+    }
+
+    pub fn record_clear(&self, worker: &KvWorkerId) {
+        if let Some(state) = self.streams.lock().get_mut(worker) {
+            state.untrusted = false;
+        }
+    }
+
+    pub fn forget_worker(&self, worker: &KvWorkerId) {
+        self.streams.lock().remove(worker);
+    }
+
+    pub fn stream_snapshot(&self) -> Vec<(KvWorkerId, StreamHealth)> {
+        let mut rows: Vec<_> = self
+            .streams
+            .lock()
+            .iter()
+            .map(|(w, s)| (w.clone(), s.clone()))
+            .collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
     }
 
     fn medium_slot(medium: Option<&str>) -> usize {
@@ -120,6 +204,25 @@ mod tests {
         rows.iter()
             .find(|r| r.event == event && r.medium == medium)
             .expect("every (event, medium) cell is rendered")
+    }
+
+    #[test]
+    fn anomaly_warnings_are_sampled_without_losing_counts() {
+        let t = EventTally::new();
+        let worker = KvWorkerId {
+            url: "http://w1".into(),
+            dp_rank: 0,
+        };
+        let warnings = (0..128).filter(|_| t.record_gap(&worker, 2)).count();
+        assert_eq!(warnings, 3);
+        let state = &t.stream_snapshot()[0].1;
+        assert_eq!((state.gaps, state.missing_sequences), (128, 256));
+        t.record_clear(&worker);
+        assert!(!t.record_skipped_batch(&worker, false));
+        assert!(!t.stream_snapshot()[0].1.untrusted);
+        assert!(t.record_skipped_batch(&worker, true));
+        assert!(t.stream_snapshot()[0].1.untrusted);
+        assert!(!t.record_skipped_batch(&worker, true));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 mod common;
 
+mod api_profile;
 mod cache_aware_input_ids;
 mod cache_sim_extend_tee;
 mod chat_routing;
@@ -21,10 +22,12 @@ mod graceful_shutdown;
 mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
+mod messages_api;
 mod pd_bootstrap_injection;
 mod pd_load_monitor;
 mod pd_pool_isolation;
 mod pd_transfer_group;
+mod responses_api;
 mod roundrobin_input_ids;
 mod sampling_overrides;
 mod sticky_input_ids;

@@ -63,10 +63,16 @@ pub struct RequestTokens {
 /// those ids only match the engine after it applies its own template, so they
 /// are NOT engine-equivalent. A failed encoder render/encode falls through to
 /// the raw path rather than failing the request.
+///
+/// `engine` is the model's engine-side chat rendering agreed across its
+/// workers: agreed default template kwargs are rendered in; a Jinja model only
+/// keeps full forwarding when they are agreed, and its ids are not
+/// engine-equivalent at all when some worker overrides the template.
 pub fn request_tokens_for(
     tokenizers: &TokenizerRegistry,
     model_id: &ModelId,
     value: &serde_json::Value,
+    engine: &crate::workers::introspect::EngineChatTemplate,
 ) -> Option<RequestTokens> {
     if tokenizers.has_chat_encoder(&model_id.0) {
         if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
@@ -79,14 +85,27 @@ pub fn request_tokens_for(
             // tokens still match when the engine runs a non-default thinking mode.
             // `resolve` also reads the request-level dsv4 steering (`task`,
             // `continue_final_message`) into `dsv4_parts`.
-            let opts = crate::tokenizer::ChatRenderOpts::resolve(value);
+            let opts = crate::tokenizer::ChatRenderOpts::resolve_with_engine_defaults(
+                value,
+                engine.default_kwargs(),
+            );
             if let Some(ids) =
                 tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), &opts)
             {
+                use crate::tokenizer::ForwardParity;
+                use crate::workers::introspect::EngineChatTemplate;
+                let jinja = tokenizers.has_jinja_encoder(&model_id.0);
+                let parity = match (tokenizers.forward_parity(&model_id.0), engine) {
+                    (ForwardParity::JinjaFull, EngineChatTemplate::Checkpoint(_)) => {
+                        ForwardParity::JinjaFull
+                    }
+                    (ForwardParity::JinjaFull, _) => ForwardParity::Conservative,
+                    (p, _) => p,
+                };
                 return Some(RequestTokens {
                     ids,
-                    engine_equivalent: true,
-                    parity: tokenizers.forward_parity(&model_id.0),
+                    engine_equivalent: !(jinja && *engine == EngineChatTemplate::Overridden),
+                    parity,
                 });
             }
         }

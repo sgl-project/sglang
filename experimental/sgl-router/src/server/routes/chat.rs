@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{
-    ConflictPolicy, ParamSpec, RetryConfig, SamplingField, SamplingOverrides,
-    DEFAULT_RETRY_ITL_REL_FACTOR,
-};
+use crate::config::{RetryConfig, DEFAULT_RETRY_ITL_REL_FACTOR};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{
     prefill_with_compatible_group, same_transfer_group, select_decode_with_affinity_outcome,
@@ -146,42 +143,10 @@ pub(crate) struct RequestProbe {
     pub(crate) model: Option<String>,
     #[serde(default)]
     pub(crate) rid: Option<String>,
-    /// Probed as raw `Value`s, not `u64`: a mistyped value (float, string,
-    /// negative) must not fail the probe's deserialize — the engine is
-    /// authoritative for schema errors and returns the better message.
-    /// `null` deserializes to `None` (same as absent), matching the
-    /// engine's treatment of an explicit `"max_tokens": null`.
-    #[serde(default)]
-    pub(crate) max_tokens: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(crate) max_completion_tokens: Option<serde_json::Value>,
-    /// Raw `Value` (like `max_tokens`) so a mistyped sampling value doesn't
-    /// fail the probe — the engine validates the schema. `null` deserializes
-    /// to `None` (same as absent).
-    #[serde(default)]
-    top_k: Option<serde_json::Value>,
-    #[serde(default)]
-    top_p: Option<serde_json::Value>,
-    /// Probed only for `--override-sampling-params`
-    /// ([`apply_sampling_overrides`]): present means the client set the field,
-    /// which decides both whether the configured value is injected and —
-    /// under `--sampling-param-conflict reject` — whether a differing value
-    /// is 400'd. Raw `Value`s for the same lax-schema reason as `top_k`.
-    /// `null` deserializes to `None` (same as absent).
-    #[serde(default)]
-    temperature: Option<serde_json::Value>,
-    #[serde(default)]
-    frequency_penalty: Option<serde_json::Value>,
-    #[serde(default)]
-    presence_penalty: Option<serde_json::Value>,
-    #[serde(default)]
-    n: Option<serde_json::Value>,
-    /// The `/generate` sampling object, probed for the same controls on the
-    /// sglang-native surface (`sampling_params.max_new_tokens`,
-    /// `sampling_params.temperature`, …). A small object; safe to
-    /// materialize. `null` deserializes to `None` (same as absent); a
-    /// present NON-object stays `Some(...)` so the handler can 400 it
-    /// rather than forwarding a body whose output budget was never checked.
+    /// The `/generate` sampling object. A small object; safe to materialize.
+    /// `null` deserializes to `None` (same as absent); a present NON-object
+    /// stays `Some(...)` so the handler can 400 it rather than forwarding a
+    /// body the API profile could not check.
     #[serde(default)]
     pub(crate) sampling_params: Option<serde_json::Value>,
     /// Shape-only markers for the `/generate` prompt fields — NOT
@@ -195,31 +160,6 @@ pub(crate) struct RequestProbe {
     pub(crate) text: PromptShape,
     #[serde(default, deserialize_with = "de_input_ids_shape")]
     pub(crate) input_ids: PromptShape,
-}
-
-impl RequestProbe {
-    /// The raw probed value for one sampling parameter, so
-    /// [`apply_sampling_overrides`] can loop over whatever the operator
-    /// configured instead of repeating a per-field ladder.
-    pub(crate) fn sampling_field(&self, field: SamplingField) -> Option<&serde_json::Value> {
-        match field {
-            SamplingField::Temperature => self.temperature.as_ref(),
-            SamplingField::TopP => self.top_p.as_ref(),
-            SamplingField::TopK => self.top_k.as_ref(),
-            SamplingField::FrequencyPenalty => self.frequency_penalty.as_ref(),
-            SamplingField::PresencePenalty => self.presence_penalty.as_ref(),
-            SamplingField::N => self.n.as_ref(),
-        }
-    }
-
-    /// The probed `sampling_params` as a JSON object, or `None` when absent,
-    /// explicit `null`, or a non-object (the handler 400s the last case
-    /// before dispatch on the `/generate` surface).
-    pub(crate) fn sampling_params_obj(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
-        self.sampling_params.as_ref().and_then(|v| v.as_object())
-    }
 }
 
 /// Generate the scalar `Visitor` arms that all produce the same shape
@@ -416,14 +356,51 @@ pub(crate) async fn chat_completions(
     // silently receive an empty body.
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    chat_completions_inner(
+    let applied = ctx.config.model.profile.apply(body, &ctx.config.model.id)?;
+    let resp = chat_completions_inner(
         ctx,
         headers,
         phase.map(|Extension(p)| p),
-        body,
+        applied.body,
         Surface::Chat,
     )
-    .await
+    .await?;
+    Ok(if applied.reasoning_general {
+        rename_reasoning_reply(resp).await
+    } else {
+        resp
+    })
+}
+
+/// `reasoning_format: general` on a successful chat reply.
+async fn rename_reasoning_reply(resp: Response<Body>) -> Response<Body> {
+    use crate::protocol::chat::{rename_reasoning, RenameReasoning};
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let sse = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    if sse {
+        return Response::from_parts(
+            parts,
+            crate::protocol::transduce_body(body, RenameReasoning::default()),
+        );
+    }
+    let bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+    let renamed = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|mut v| {
+            rename_reasoning(&mut v).then(|| serde_json::to_vec(&v).expect("serialize"))
+        });
+    let body = renamed.map_or_else(|| Body::from(bytes), Body::from);
+    Response::from_parts(parts, body)
 }
 
 /// Parse model from body, select a healthy worker via the per-model policy, then
@@ -540,24 +517,6 @@ pub(crate) async fn chat_completions_inner(
         }
     }
 
-    // Enforce the per-model output-token contract (`--max-output-tokens`)
-    // before admission: an explicit ask above the cap is a client error
-    // (mirroring the engine's own validation), and rejecting here costs no
-    // queue slot and no engine round-trip. When the request set no output
-    // budget at all, remember the cap for injection into the forwarded body
-    // below — otherwise an unbounded request generates until EOS or the
-    // engine's full context window fills.
-    let inject_max_tokens =
-        output_budget_action(ctx.config.model.max_output_tokens, &probe, surface)?;
-
-    // Fleet-wide sampling overrides (`--override-sampling-params`): under
-    // `reject` a numeric value differing from the configured one is a 400
-    // here — before admission, like the output-budget check above — and
-    // either way the configured values for fields the request omitted come
-    // back as the inject-set for the forwarded body.
-    let inject_sampling =
-        apply_sampling_overrides(&ctx.config.model.sampling_overrides, &probe, surface)?;
-
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
     // through to the full candidate set. Partial-failure errors
@@ -644,8 +603,11 @@ pub(crate) async fn chat_completions_inner(
     // forwarded as `input_ids` so it skips re-tokenizing the same prompt. The
     // ingress owns the tokenize via the shared registry, so the choice of
     // policy never changes whether we tokenize.
+    let engine_template = crate::workers::introspect::EngineChatTemplate::from_workers(
+        &ctx.registry.workers_for(&model_id),
+    );
     let request_tokens = request_value.as_ref().and_then(|v| match surface {
-        Surface::Chat => request_tokens_for(&ctx.tokenizers, &model_id, v),
+        Surface::Chat => request_tokens_for(&ctx.tokenizers, &model_id, v, &engine_template),
         Surface::Generate => request_tokens_for_generate(&ctx.tokenizers, &model_id, v),
     });
     let at_post_tokenize = start.elapsed();
@@ -1157,18 +1119,14 @@ pub(crate) async fn chat_completions_inner(
     };
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `rid`, `input_ids`, bootstrap fields, default `max_tokens`, and/or the
-    // pinned sampling params, or forwarding the original bytes untouched when
-    // none apply.
+    // `rid`, `input_ids` and/or bootstrap fields, or forwarding the original
+    // bytes untouched when none apply.
     let outgoing_body = build_outgoing_body(
         &body,
         request_value,
         input_ids_to_forward,
         bootstrap.as_ref(),
         rid_to_inject,
-        inject_max_tokens,
-        &inject_sampling,
-        surface,
     )?;
     let at_post_build = start.elapsed();
 
@@ -1984,16 +1942,8 @@ fn build_outgoing_body(
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
     rid: Option<&str>,
-    max_tokens: Option<u64>,
-    sampling: &[(SamplingField, serde_json::Number)],
-    surface: Surface,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none()
-        && bootstrap.is_none()
-        && rid.is_none()
-        && max_tokens.is_none()
-        && sampling.is_empty()
-    {
+    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -2022,12 +1972,6 @@ fn build_outgoing_body(
             serde_json::Value::String(rid.to_string()),
         );
     }
-    // The output-budget default and the pinned sampling params: the caller
-    // passes the inject-sets decided at probe time (`output_budget_action` /
-    // `apply_sampling_overrides`), so writing them here never masks a client
-    // value, in either conflict mode. WHERE they land (top-level vs
-    // `sampling_params.*`) is the surface's business.
-    surface.write_injections(&mut obj, max_tokens, sampling);
     if let Some(ids) = input_ids {
         obj.insert(
             "input_ids".to_string(),
@@ -2105,6 +2049,11 @@ fn select_forward_input_ids<'a>(
             crate::tokenizer::ForwardParity::Dsv4Full if input_ids_safe_to_forward_dsv4(v) => {
                 Some(t.ids.as_slice())
             }
+            crate::tokenizer::ForwardParity::JinjaFull
+                if input_ids_safe_to_forward_jinja_full(v) =>
+            {
+                Some(t.ids.as_slice())
+            }
             crate::tokenizer::ForwardParity::Conservative if input_ids_safe_to_forward(v) => {
                 Some(t.ids.as_slice())
             }
@@ -2112,6 +2061,128 @@ fn select_forward_input_ids<'a>(
         },
         _ => None,
     }
+}
+
+/// The forwarding predicate for a Jinja model with verified full parity
+/// ([`crate::tokenizer::ForwardParity::JinjaFull`]). Its encoder threads what
+/// SGLang's generic Jinja path threads — request `tools` (tool_choice-selected,
+/// pydantic-dumped), `reasoning_effort`, `chat_template_kwargs` — so those are
+/// forwardable. `tool_choice` / `response_format` only steer engine-side
+/// constraints, which the engine still derives from the request alongside
+/// `input_ids`. Withheld, because the encoder does not replicate them or the
+/// engine would reject the request:
+///   * multimodal content — the engine's `input_ids` path drops `image_data`;
+///     text-only part arrays render identically and stay forwardable;
+///   * a trailing `assistant` turn or `continue_final_message` — the engine
+///     rewrites it to a user turn or strips it as a prefix;
+///   * per-request `chat_template`, legacy `functions`, message-level `tools`,
+///     and the dsv4/K3-only `task` / `reasoning` / `thinking` /
+///     `thinking_effort` fields;
+///   * roles outside `system` / `user` / `assistant` / `tool` / `developer`;
+///   * tool messages with array content (`normalize_tool_content` flattens it);
+///   * a non-string effort, a `chat_template_kwargs` that is not an object or
+///     names a reserved render argument, a malformed tool / `tool_choice`, or
+///     a history tool call whose `arguments` is not a JSON object (inline or
+///     as a JSON string) — the engine 4xxes those before a prompt exists.
+fn input_ids_safe_to_forward_jinja_full(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let present = |v: &Value, key: &str| v.get(key).is_some_and(|x| !x.is_null());
+    for key in [
+        "chat_template",
+        "functions",
+        "task",
+        "reasoning",
+        "thinking",
+        "thinking_effort",
+    ] {
+        if present(value, key) {
+            return false;
+        }
+    }
+    if let Some(v) = value.get("continue_final_message").filter(|v| !v.is_null()) {
+        if crate::tokenizer::openai_bool(v) != Some(false) {
+            return false;
+        }
+    }
+    if last_message_is_assistant(value) {
+        return false;
+    }
+    if present(value, "reasoning_effort") && !value["reasoning_effort"].is_string() {
+        return false;
+    }
+    if let Some(ctk) = value.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        let Some(ctk) = ctk.as_object() else {
+            return false;
+        };
+        if ctk
+            .keys()
+            .any(|k| crate::tokenizer::chat_template::RESERVED_RENDER_KEYS.contains(&k.as_str()))
+        {
+            return false;
+        }
+        if ctk
+            .get("reasoning_effort")
+            .is_some_and(|e| !e.is_null() && !e.is_string())
+        {
+            return false;
+        }
+    }
+    if let Some(tools) = value.get("tools").filter(|v| !v.is_null()) {
+        let Some(tools) = tools.as_array() else {
+            return false;
+        };
+        let well_formed = tools.iter().all(|t| {
+            let f = t.get("function");
+            f.and_then(|f| f.get("name")).is_some_and(Value::is_string)
+                && f.and_then(|f| f.get("strict"))
+                    .is_none_or(|s| s.is_null() || s.is_boolean())
+        });
+        if !well_formed {
+            return false;
+        }
+    }
+    match value.get("tool_choice") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if matches!(s.as_str(), "none" | "auto" | "required") => {}
+        Some(Value::Object(o))
+            if o.get("function")
+                .and_then(|f| f.get("name"))
+                .is_some_and(Value::is_string) => {}
+        Some(_) => return false,
+    }
+    let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    msgs.iter().all(|m| {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if !matches!(role, "system" | "user" | "assistant" | "tool" | "developer") {
+            return false;
+        }
+        if present(m, "tools") && m["tools"].as_array().is_none_or(|t| !t.is_empty()) {
+            return false;
+        }
+        if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+            let text_only = parts
+                .iter()
+                .all(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"));
+            if role == "tool" || !text_only {
+                return false;
+            }
+        }
+        m.get("tool_calls")
+            .and_then(|c| c.as_array())
+            .is_none_or(|calls| {
+                calls.iter().all(
+                    |c| match c.get("function").and_then(|f| f.get("arguments")) {
+                        Some(Value::Object(_)) => true,
+                        Some(Value::String(s)) => {
+                            matches!(serde_json::from_str::<Value>(s), Ok(Value::Object(_)))
+                        }
+                        _ => false,
+                    },
+                )
+            })
+    })
 }
 
 /// The dsv4-encoder forwarding predicate. The built-in encoder mirrors the
@@ -2470,151 +2541,6 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
         })
 }
 
-/// Apply the fleet-wide sampling contract (`--override-sampling-params` /
-/// `--sampling-param-conflict`) to one request, before admission.
-///
-/// Returns the inject-set: the configured value for every exact-valued
-/// parameter the request OMITTED, which [`build_outgoing_body`] writes into
-/// the forwarded body so the engine's own defaults can't drift from what the
-/// operator declared. A band ([`ParamSpec::Range`]) names no single value, so
-/// it never injects.
-///
-/// For a parameter the request DID send:
-///   * [`ConflictPolicy::Allow`] forwards the client value untouched, which
-///     is why the mode check comes before any comparison;
-///   * [`ConflictPolicy::Reject`] 400s a numeric value that differs from the
-///     configured one (or falls outside the band) — the Moonshot-style
-///     immutability contract, never a silent rewrite;
-///   * a NON-numeric value is nobody's business but the engine's, which is
-///     authoritative for the request schema and produces the better message
-///     — the same [`lax_number`] philosophy as the output-budget check.
-fn apply_sampling_overrides(
-    overrides: &SamplingOverrides,
-    probe: &RequestProbe,
-    surface: Surface,
-) -> Result<Vec<(SamplingField, serde_json::Number)>, ApiError> {
-    let mut inject = Vec::new();
-    for (&field, spec) in &overrides.params {
-        let name = field.wire_name();
-        let Some(requested) = surface.read_sampling_field(probe, field) else {
-            // Omitted: inject an exact value, leave a band to the engine's
-            // own default.
-            if let ParamSpec::Exact(v) = spec {
-                inject.push((field, v.clone()));
-            }
-            continue;
-        };
-        if overrides.conflict == ConflictPolicy::Allow {
-            continue;
-        }
-        let Some(got) = lax_number(requested) else {
-            continue;
-        };
-        match spec {
-            ParamSpec::Exact(want) => {
-                if Some(got) != want.as_f64() {
-                    return Err(ApiError::BadRequest(format!(
-                        "{name} is immutable for this model: got {got}, expected {want} \
-                         (or omit the field)"
-                    )));
-                }
-            }
-            &ParamSpec::Range { lo, hi } => {
-                if !(lo..=hi).contains(&got) {
-                    return Err(ApiError::BadRequest(format!(
-                        "{name} must be between {lo} and {hi} for this model: got {got}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(inject)
-}
-
-/// Resolve the per-model output-token contract (`--max-output-tokens`)
-/// against what the request asked for.
-///
-/// Returns the value to inject as `max_tokens` into the forwarded body
-/// (`Some(cap)` exactly when the cap is configured and the request set no
-/// effective output budget), or a 400 when the request explicitly asked
-/// for more than the cap.
-///
-/// The effective value mirrors the engine's resolution (protocol.py:
-/// `max_completion_tokens or max_tokens` — Python `or`, where an explicit
-/// numeric `0` is falsy): `max_completion_tokens` wins when present and
-/// non-zero, otherwise `max_tokens`. Diverging here would open a bypass —
-/// e.g. a legal `max_completion_tokens: 0` shadowing an over-cap
-/// `max_tokens` that the engine would then actually use.
-///
-/// Values are read through [`lax_number`] — not `as_u64` — for the same
-/// reason: the engine's pydantic lax mode coerces integral floats
-/// (`999999.0`) and numeric strings (`"999999"`) to ints, so a stricter
-/// read here could be slipped past. Everything `lax_number` can't read
-/// (non-numeric string, bool, …) neither rejects nor injects: it forwards
-/// untouched so the engine — authoritative for the request schema —
-/// produces its own 4xx with the better message.
-fn output_budget_action(
-    cap: Option<std::num::NonZeroU64>,
-    probe: &RequestProbe,
-    surface: Surface,
-) -> Result<Option<u64>, ApiError> {
-    let Some(cap) = cap else {
-        return Ok(None);
-    };
-    match surface.read_output_budget(probe) {
-        // Inject-when-absent is `Chat`-only: on `/generate` an absent
-        // `sampling_params.max_new_tokens` takes the engine's `SamplingParams`
-        // dataclass default (128), already far under any sane cap — injecting
-        // there would turn a ceiling into a floor and RAISE per-request
-        // output. `Chat`'s absent budget maps to an explicit unbounded
-        // `max_new_tokens=None`, so injecting the cap is a genuine tightening.
-        None => Ok(match surface {
-            Surface::Chat => Some(cap.get()),
-            Surface::Generate => None,
-        }),
-        Some(v) => {
-            // `/generate`-only: an explicit null `max_new_tokens` is NOT the
-            // absent case — the engine's `init_req_max_new_tokens` maps it to
-            // `1 << 30` (unbounded), so treating it as absent would let a
-            // client null its way past the cap. (`Chat` needs no such arm:
-            // its absent budget maps to unbounded too, but there the cap is
-            // INJECTED, closing the hole.)
-            if matches!(surface, Surface::Generate) && v.is_null() {
-                return Err(ApiError::BadRequest(format!(
-                    "sampling_params.max_new_tokens must be a positive integer, got null \
-                     (explicit null requests unbounded output, above this model's cap of \
-                     {cap}; omit the field for the engine default)"
-                )));
-            }
-            if let Some(f) = lax_number(v) {
-                if f > cap.get() as f64 {
-                    return Err(ApiError::BadRequest(format!(
-                        "{} is too large: {v}. This model supports at most \
-                         {cap} completion tokens.",
-                        surface.budget_error_key(),
-                    )));
-                }
-            }
-            Ok(None)
-        }
-    }
-}
-
-/// Read a JSON value the way the engine's pydantic lax mode reads an int
-/// field: numbers directly, numeric strings by parsing. Returns `None` for
-/// anything pydantic would reject outright (non-numeric string, bool,
-/// array, …). Non-integral floats parse here but fail pydantic's int
-/// coercion — harmless for the cap check: an over-cap `1e9` gets our 400
-/// instead of reaching the engine, an under-cap `1.5` forwards and gets
-/// the engine's 4xx.
-pub(crate) fn lax_number(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
 /// Derive this request's id: reuse a client-supplied `rid` (so an external
 /// abort-by-rid keeps working and we do not override intent), else mint one
 /// from the gateway/access-log `x-request-id` — read the same way as the
@@ -2949,8 +2875,7 @@ mod tests {
                 cache_aware: None,
                 decode_policy: None,
                 sticky: None,
-                max_output_tokens: None,
-                sampling_overrides: Default::default(),
+                profile: Default::default(),
                 forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -3307,17 +3232,8 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(
-            &body,
-            Some(value),
-            None,
-            Some(&bootstrap),
-            None,
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let injected =
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -3405,9 +3321,18 @@ mod tests {
                 let value = serde_json::json!({
                     "model": model, "messages": messages, "stream": stream
                 });
-                let tokens = request_tokens_for(&reg, &model_id, &value).expect("routing tokens");
+                let tokens = request_tokens_for(
+                    &reg,
+                    &model_id,
+                    &value,
+                    &crate::workers::introspect::EngineChatTemplate::Unverified,
+                )
+                .expect("routing tokens");
                 assert!(!tokens.engine_equivalent);
-                assert!(select_forward_input_ids(true, Some(&tokens), Some(&value)).is_none());
+                assert!(
+                    select_forward_input_ids(Surface::Chat, true, Some(&tokens), Some(&value))
+                        .is_none()
+                );
             }
         }
     }
@@ -3584,17 +3509,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            None,
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -3609,417 +3524,11 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            None,
-            None,
-            None,
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
         );
-    }
-
-    /// A `max_tokens` default is injected as a top-level number — including
-    /// on the path where nothing else needs injection (the early-return must
-    /// not swallow it).
-    #[test]
-    fn build_outgoing_body_injects_default_max_tokens() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out = build_outgoing_body(
-            &body,
-            None,
-            None,
-            None,
-            None,
-            Some(131072),
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("max_tokens"), Some(&serde_json::json!(131072)));
-        assert!(parsed.get("messages").is_some());
-    }
-
-    /// Build a [`SamplingOverrides`] from `(wire name, value)` pairs, the way
-    /// `--override-sampling-params` would.
-    fn overrides_of(conflict: ConflictPolicy, entries: &[(&str, f64)]) -> SamplingOverrides {
-        SamplingOverrides {
-            params: entries
-                .iter()
-                .map(|&(name, v)| {
-                    let field = SamplingField::from_wire_name(name).expect("known field");
-                    let n = if field.is_integral() {
-                        serde_json::Number::from(v as i64)
-                    } else {
-                        serde_json::Number::from_f64(v).expect("finite")
-                    };
-                    (field, ParamSpec::Exact(n))
-                })
-                .collect(),
-            conflict,
-        }
-    }
-
-    /// The inject-set from `apply_sampling_overrides` (configured values for
-    /// fields the request omitted) lands in the forwarded body, and rides the
-    /// same `build_outgoing_body` serialize as the forwarded input_ids — so
-    /// chat-encoder traffic (Kimi-K3, DSV4) gets the contract too.
-    #[test]
-    fn build_outgoing_body_injects_sampling_overrides_alongside_input_ids() {
-        let body =
-            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let ids = [1u32, 2, 3];
-        let overrides = overrides_of(
-            ConflictPolicy::Reject,
-            &[
-                ("top_p", 0.95),
-                ("top_k", 1000.0),
-                ("frequency_penalty", 0.0),
-                ("presence_penalty", 0.0),
-                ("n", 1.0),
-            ],
-        );
-        let inject = apply_sampling_overrides(
-            &overrides,
-            &probe_of(r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#),
-            Surface::Chat,
-        )
-        .unwrap();
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            None,
-            None,
-            None,
-            &inject,
-            Surface::Chat,
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
-        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
-        assert_eq!(
-            parsed.get("frequency_penalty"),
-            Some(&serde_json::json!(0.0))
-        );
-        assert_eq!(
-            parsed.get("presence_penalty"),
-            Some(&serde_json::json!(0.0))
-        );
-        // `n` is engine-typed `int`: the injected literal must not be `1.0`.
-        assert_eq!(parsed.get("n"), Some(&serde_json::json!(1)));
-        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
-        assert!(parsed.get("messages").is_some());
-    }
-
-    /// The Kimi-Vendor-Verifier `tests/params` contract, end to end at the
-    /// decision level under `reject`: omitted → inject the configured value;
-    /// equal to it (each mode's documented default) → pass untouched; any
-    /// other numeric value → 400; non-numeric garbage → forwarded for the
-    /// engine's own schema 400. Temperature is a band for K3 ([0, 1]): inside
-    /// passes, outside 400s, and nothing is ever injected for it.
-    #[test]
-    fn reject_mode_implements_the_verifier_contract() {
-        let mut overrides = overrides_of(
-            ConflictPolicy::Reject,
-            &[
-                ("top_p", 0.95),
-                ("frequency_penalty", 0.0),
-                ("presence_penalty", 0.0),
-                ("n", 1.0),
-            ],
-        );
-        overrides.params.insert(
-            SamplingField::Temperature,
-            ParamSpec::Range { lo: 0.0, hi: 1.0 },
-        );
-
-        // Omitted params: accepted, exact values injected, band injects nothing.
-        let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        let inject = apply_sampling_overrides(&overrides, &p, Surface::Chat).unwrap();
-        assert_eq!(
-            inject
-                .iter()
-                .map(|(f, v)| (f.wire_name(), v.to_string()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("top_p", "0.95".to_string()),
-                ("frequency_penalty", "0.0".to_string()),
-                ("presence_penalty", "0.0".to_string()),
-                ("n", "1".to_string()),
-            ]
-        );
-
-        // The verifier's accepted defaults (thinking and non-thinking):
-        // temperature 0.0 / 0.6 / 1.0 all inside the band, the rest equal to
-        // their configured values.
-        for accepted in [
-            r#"{"model":"x","messages":[],"temperature":0.0}"#,
-            r#"{"model":"x","messages":[],"temperature":0.6}"#,
-            r#"{"model":"x","messages":[],"temperature":1.0}"#,
-            r#"{"model":"x","messages":[],"top_p":0.95}"#,
-            r#"{"model":"x","messages":[],"presence_penalty":0}"#,
-            r#"{"model":"x","messages":[],"frequency_penalty":0}"#,
-            r#"{"model":"x","messages":[],"n":1}"#,
-        ] {
-            let p = probe_of(accepted);
-            apply_sampling_overrides(&overrides, &p, Surface::Chat)
-                .unwrap_or_else(|e| panic!("{accepted} must be accepted: {e:?}"));
-        }
-
-        // Nothing is injected for a field the client already sent.
-        let p = probe_of(r#"{"model":"x","messages":[],"top_p":0.95}"#);
-        let inject = apply_sampling_overrides(&overrides, &p, Surface::Chat).unwrap();
-        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::TopP));
-
-        // The verifier's wrong values: every one is a router 400.
-        for rejected in [
-            r#"{"model":"x","messages":[],"temperature":1.1}"#,
-            r#"{"model":"x","messages":[],"temperature":2.0}"#,
-            r#"{"model":"x","messages":[],"temperature":-0.1}"#,
-            r#"{"model":"x","messages":[],"top_p":0.8}"#,
-            r#"{"model":"x","messages":[],"presence_penalty":0.5}"#,
-            r#"{"model":"x","messages":[],"frequency_penalty":0.5}"#,
-            r#"{"model":"x","messages":[],"n":2}"#,
-        ] {
-            let p = probe_of(rejected);
-            let err = apply_sampling_overrides(&overrides, &p, Surface::Chat)
-                .expect_err(&format!("{rejected} must be rejected"));
-            assert!(
-                matches!(err, ApiError::BadRequest(_)),
-                "{rejected}: got {err:?}"
-            );
-        }
-
-        // Non-numeric garbage is not ours to judge: forwarded untouched (no
-        // injection either), the engine's schema validation owns the 400.
-        let p = probe_of(r#"{"model":"x","messages":[],"top_p":"hot","n":true}"#);
-        let inject = apply_sampling_overrides(&overrides, &p, Surface::Chat).unwrap();
-        assert!(inject
-            .iter()
-            .all(|(f, _)| !matches!(f, SamplingField::TopP | SamplingField::N)));
-
-        // Numeric strings coerce the way the engine's pydantic lax mode
-        // does: "0.95" equals the configured value, "0.8" differs and 400s here.
-        let p = probe_of(r#"{"model":"x","messages":[],"top_p":"0.95"}"#);
-        assert!(apply_sampling_overrides(&overrides, &p, Surface::Chat).is_ok());
-        let p = probe_of(r#"{"model":"x","messages":[],"top_p":"0.8"}"#);
-        assert!(apply_sampling_overrides(&overrides, &p, Surface::Chat).is_err());
-
-        // An exact temperature value (no band) rejects differing values and
-        // injects when absent, like every other parameter.
-        let exact = overrides_of(ConflictPolicy::Reject, &[("temperature", 1.0)]);
-        let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6}"#);
-        assert!(apply_sampling_overrides(&exact, &p, Surface::Chat).is_err());
-        let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        assert_eq!(
-            apply_sampling_overrides(&exact, &p, Surface::Chat).unwrap(),
-            vec![(
-                SamplingField::Temperature,
-                serde_json::Number::from_f64(1.0).unwrap()
-            )]
-        );
-    }
-
-    /// `allow` mode keeps the fill-when-absent half of the contract and drops
-    /// the rejection half: a client value — right, wrong or garbage — is
-    /// forwarded untouched, so the configured values are fleet-wide defaults.
-    #[test]
-    fn allow_mode_never_rejects_and_never_masks_a_client_value() {
-        let overrides = overrides_of(
-            ConflictPolicy::Allow,
-            &[("temperature", 1.0), ("top_p", 0.95), ("n", 1.0)],
-        );
-
-        // Omitted -> injected, exactly as under `reject`.
-        let p = probe_of(r#"{"model":"x","messages":[]}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, Surface::Chat)
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["temperature", "top_p", "n"]
-        );
-
-        // Every value that `reject` would 400 is accepted here, and nothing
-        // is injected over it — the client's value reaches the engine.
-        let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6,"top_p":0.8,"n":4}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, Surface::Chat).unwrap(),
-            vec![]
-        );
-
-        // Partial overlap: the client set temperature, so only the untouched
-        // parameters are filled in.
-        let p = probe_of(r#"{"model":"x","messages":[],"temperature":0.6}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, Surface::Chat)
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["top_p", "n"]
-        );
-    }
-
-    /// An explicit `null` is absent for the engine, so it is absent here too:
-    /// the configured value is injected rather than the field being read as a
-    /// client-supplied conflict.
-    #[test]
-    fn explicit_null_counts_as_omitted() {
-        let overrides = overrides_of(ConflictPolicy::Reject, &[("temperature", 1.0)]);
-        let p = probe_of(r#"{"model":"x","messages":[],"temperature":null}"#);
-        assert_eq!(
-            apply_sampling_overrides(&overrides, &p, Surface::Chat)
-                .unwrap()
-                .iter()
-                .map(|(f, _)| f.wire_name())
-                .collect::<Vec<_>>(),
-            vec!["temperature"]
-        );
-    }
-
-    fn probe_of(body: &str) -> RequestProbe {
-        parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
-    }
-
-    fn cap(n: u64) -> Option<std::num::NonZeroU64> {
-        Some(std::num::NonZeroU64::new(n).unwrap())
-    }
-
-    /// No cap configured → never rejects, never injects, regardless of what
-    /// the request asked for.
-    #[test]
-    fn output_budget_no_cap_is_passthrough() {
-        let p = probe_of(r#"{"model":"x","max_tokens":999999999}"#);
-        assert_eq!(output_budget_action(None, &p, Surface::Chat).unwrap(), None);
-    }
-
-    /// Neither field set → inject the cap.
-    #[test]
-    fn output_budget_injects_cap_when_unset() {
-        let p = probe_of(r#"{"model":"x"}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            Some(131072)
-        );
-        // An explicit `null` is treated the same as absent (engine parity).
-        let p = probe_of(r#"{"model":"x","max_tokens":null}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            Some(131072)
-        );
-    }
-
-    /// A legal explicit ask (≤ cap, boundary included) forwards untouched —
-    /// no rejection, no injection.
-    #[test]
-    fn output_budget_legal_explicit_value_forwards_untouched() {
-        let p = probe_of(r#"{"model":"x","max_tokens":131072}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            None
-        );
-        let p = probe_of(r#"{"model":"x","max_completion_tokens":42}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            None
-        );
-    }
-
-    /// An explicit ask above the cap is rejected with a 400 naming both the
-    /// asked-for value and the cap.
-    #[test]
-    fn output_budget_rejects_over_cap() {
-        let p = probe_of(r#"{"model":"x","max_tokens":131073}"#);
-        let err = output_budget_action(cap(131072), &p, Surface::Chat).unwrap_err();
-        assert!(matches!(&err, ApiError::BadRequest(m)
-            if m.contains("131073") && m.contains("131072")));
-    }
-
-    /// `max_completion_tokens` wins over the deprecated `max_tokens` when
-    /// both are present — same precedence as the engine.
-    #[test]
-    fn output_budget_max_completion_tokens_takes_precedence() {
-        // Over-cap max_tokens is ignored because max_completion_tokens is legal.
-        let p = probe_of(r#"{"model":"x","max_tokens":999999,"max_completion_tokens":100}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            None
-        );
-        // And the reverse: over-cap max_completion_tokens rejects even when
-        // max_tokens is legal.
-        let p = probe_of(r#"{"model":"x","max_tokens":100,"max_completion_tokens":999999}"#);
-        assert!(output_budget_action(cap(131072), &p, Surface::Chat).is_err());
-    }
-
-    /// Engine parity for Python-`or` falsiness: a numeric-zero
-    /// `max_completion_tokens` (0 or 0.0) falls through to `max_tokens`, so
-    /// it must not shadow an over-cap `max_tokens` — and standing alone it
-    /// leaves the budget unset (→ inject).
-    #[test]
-    fn output_budget_zero_mct_falls_through_to_max_tokens() {
-        for body in [
-            r#"{"model":"x","max_completion_tokens":0,"max_tokens":999999}"#,
-            r#"{"model":"x","max_completion_tokens":0.0,"max_tokens":999999}"#,
-        ] {
-            let p = probe_of(body);
-            assert!(
-                output_budget_action(cap(131072), &p, Surface::Chat).is_err(),
-                "body {body} must reject via the max_tokens fallthrough"
-            );
-        }
-        let p = probe_of(r#"{"model":"x","max_completion_tokens":0}"#);
-        assert_eq!(
-            output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-            Some(131072)
-        );
-    }
-
-    /// Values the engine's pydantic lax mode would coerce to an over-cap int
-    /// — integral floats and numeric strings — are rejected, not forwarded.
-    #[test]
-    fn output_budget_rejects_laxly_coercible_over_cap_values() {
-        for body in [
-            r#"{"model":"x","max_tokens":999999.0}"#,
-            r#"{"model":"x","max_tokens":"999999"}"#,
-        ] {
-            let p = probe_of(body);
-            assert!(
-                output_budget_action(cap(131072), &p, Surface::Chat).is_err(),
-                "body {body} must reject"
-            );
-        }
-    }
-
-    /// A mistyped value that can't reach an over-cap int at the engine
-    /// (non-numeric string, under-cap float, negative) neither rejects nor
-    /// injects — it forwards untouched for the engine's own validation.
-    #[test]
-    fn output_budget_mistyped_value_forwards_untouched() {
-        for body in [
-            r#"{"model":"x","max_tokens":"large"}"#,
-            r#"{"model":"x","max_tokens":1.5}"#,
-            r#"{"model":"x","max_tokens":-5}"#,
-        ] {
-            let p = probe_of(body);
-            assert_eq!(
-                output_budget_action(cap(131072), &p, Surface::Chat).unwrap(),
-                None,
-                "body {body} must forward untouched"
-            );
-        }
     }
 
     /// A router-minted `rid` is injected as a top-level string so the engine
@@ -4029,17 +3538,8 @@ mod tests {
     fn build_outgoing_body_injects_rid() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            None,
-            None,
-            Some("router-abc123"),
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("rid").and_then(|r| r.as_str()),
@@ -4065,17 +3565,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(
-            &body,
-            Some(value),
-            Some(&ids),
-            Some(&bootstrap),
-            None,
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -4152,6 +3643,122 @@ mod tests {
         })));
     }
 
+    /// Shapes a verified-parity Jinja encoder renders exactly like the engine
+    /// (see `step5_parity_with_engine_prompt_ids`) are forwardable.
+    #[test]
+    fn jinja_full_forwards_tools_effort_and_template_kwargs() {
+        let user = serde_json::json!([{"role":"user","content":"hi"}]);
+        let tools =
+            serde_json::json!([{"type":"function","function":{"name":"f","parameters":{}}}]);
+        let ok = [
+            serde_json::json!({ "messages": user }),
+            serde_json::json!({"messages": user, "tools": tools}),
+            serde_json::json!({"messages": user, "tools": tools, "tool_choice": "required"}),
+            serde_json::json!({"messages": user, "tools": tools,
+                               "tool_choice": {"type":"function","function":{"name":"f"}}}),
+            serde_json::json!({"messages": user, "reasoning_effort": "low"}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"preserve_thinking": false,
+                                                                          "reasoning_effort": "high"}}),
+            serde_json::json!({"messages": user, "response_format": {"type": "json_object"}}),
+            serde_json::json!({"messages": user, "continue_final_message": false}),
+            serde_json::json!({"messages": [{"role":"user","content":[{"type":"text","text":"a"},
+                                                                      {"type":"text","text":"b"}]}]}),
+            serde_json::json!({"messages": [{"role":"developer","content":"terse"},
+                                            {"role":"user","content":"hi"},
+                                            {"role":"system","tools":[]}]}),
+            serde_json::json!({"messages": [
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"1","type":"function","function":{"name":"f","arguments":"{\"city\":\"x\"}"}},
+                    {"id":"2","type":"function","function":{"name":"f","arguments":{"city":"y"}}}]},
+                {"role":"tool","tool_call_id":"1","content":"sunny"}], "tools": tools}),
+        ];
+        for b in ok {
+            assert!(
+                input_ids_safe_to_forward_jinja_full(&b),
+                "should forward {b}"
+            );
+        }
+    }
+
+    /// Everything the Jinja encoder does not replicate, or the engine would
+    /// reject before a prompt exists, stays engine-tokenized.
+    #[test]
+    fn jinja_full_withholds_unreplicated_or_rejected_shapes() {
+        let user = serde_json::json!([{"role":"user","content":"hi"}]);
+        let blockers = [
+            serde_json::json!({"messages": [{"role":"user","content":[
+                {"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"x"}}]}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                                            {"role":"assistant","content":"pre"}]}),
+            serde_json::json!({"messages": user, "continue_final_message": true}),
+            serde_json::json!({"messages": user, "continue_final_message": "maybe"}),
+            serde_json::json!({"messages": user, "chat_template": "{{ x }}"}),
+            serde_json::json!({"messages": user, "functions": [{"name":"f"}]}),
+            serde_json::json!({"messages": user, "task": "t"}),
+            serde_json::json!({"messages": user, "thinking": {"type":"disabled"}}),
+            serde_json::json!({"messages": user, "reasoning_effort": 3}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": "x"}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"messages": []}}),
+            serde_json::json!({"messages": user, "chat_template_kwargs": {"reasoning_effort": 1}}),
+            serde_json::json!({"messages": user, "tools": {"not": "a list"}}),
+            serde_json::json!({"messages": user, "tools": [{"type":"function","function":{}}]}),
+            serde_json::json!({"messages": user,
+                               "tools": [{"type":"function","function":{"name":"f","strict":"yes"}}]}),
+            serde_json::json!({"messages": user, "tool_choice": "sometimes"}),
+            serde_json::json!({"messages": user, "tool_choice": {"type":"function"}}),
+            serde_json::json!({"messages": [{"role":"latest_reminder","content":"x"},
+                                            {"role":"user","content":"hi"}]}),
+            serde_json::json!({"messages": [{"role":"system","content":"s",
+                "tools":[{"type":"function","function":{"name":"f"}}]},
+                {"role":"user","content":"hi"}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"tool","content":[{"type":"text","text":"r"}]}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"function":{"name":"f","arguments":"[1,2]"}}]},
+                {"role":"tool","content":"r"}]}),
+            serde_json::json!({"messages": [{"role":"user","content":"hi"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"function":{"name":"f","arguments":"not json"}}]},
+                {"role":"tool","content":"r"}]}),
+            serde_json::json!({"prompt": "no messages"}),
+        ];
+        for b in blockers {
+            assert!(
+                !input_ids_safe_to_forward_jinja_full(&b),
+                "must not forward {b}"
+            );
+        }
+    }
+
+    /// `JinjaFull` ids pass only their own predicate: a tools request a
+    /// conservative encoder produced is still withheld.
+    #[test]
+    fn select_forward_input_ids_gates_by_stamped_parity() {
+        let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]});
+        let tokens = |parity| RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity,
+        };
+        let full = tokens(crate::tokenizer::ForwardParity::JinjaFull);
+        let conservative = tokens(crate::tokenizer::ForwardParity::Conservative);
+        assert_eq!(
+            select_forward_input_ids(Surface::Chat, true, Some(&full), Some(&body)),
+            Some(&[1u32, 2, 3][..])
+        );
+        assert_eq!(
+            select_forward_input_ids(Surface::Chat, true, Some(&conservative), Some(&body)),
+            None
+        );
+        assert_eq!(
+            select_forward_input_ids(Surface::Chat, false, Some(&full), Some(&body)),
+            None
+        );
+    }
+
     /// Plain text chat with nothing unreplicated → input_ids may be forwarded.
     #[test]
     fn input_ids_safe_to_forward_allows_plain_text_chat() {
@@ -4207,17 +3814,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(
-            &body,
-            None,
-            None,
-            Some(&bootstrap),
-            None,
-            None,
-            &[],
-            Surface::Chat,
-        )
-        .unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
