@@ -2481,9 +2481,6 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self._dp_attention = is_dp_attention_enabled()
-        # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
-        # attn_tp multiples; attention must then run on the real rows only.
-        self._trim_padded_attn = require_mlp_sync()
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
         self._stage_boundaries = _uses_stage_boundaries(config)
         # SP-MoE (EP a2a backend): o_proj defers its attention-TP reduction;
@@ -2594,7 +2591,7 @@ class KimiK3DecoderLayer(nn.Module):
                 _sp_inner_o_proj_forward = o_proj.forward
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
-                    output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
+                    output_rows = x.shape[0]
                     if k3_sp_collective.requires_symmetric_rs(
                         output_rows, x.device, x.element_size()
                     ):
@@ -2718,47 +2715,8 @@ class KimiK3DecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        # mlp-sync pads extend batches to a multiple of attn_tp_size, but the
-        # attention metadata covers only the real tokens: flashinfer ragged
-        # prefill rejects the row mismatch, and silent paths would write the
-        # padded rows' garbage KV through zero-padded out_cache_loc (clobbering
-        # pool slot 0 -> cross-request corruption). Run attention on the real
-        # rows and zero-pad the output back.
-        num_padded = hidden_states.shape[0]
-        num_real = num_padded
-        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
-            extend_lens = forward_batch.extend_seq_lens_cpu
-            if extend_lens is not None:
-                num_real = min(int(sum(extend_lens)), num_padded)
-        if num_real != num_padded:
-            with k3_sp_collective.o_proj_output_rows(num_padded):
-                attn_out = self._run_self_attn_inner(
-                    hidden_states[:num_real],
-                    positions[:num_real],
-                    forward_batch,
-                    zero_allocator,
-                )
-            padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
-                attn_out, num_padded
-            )
-            if padded_o_proj is not None:
-                return padded_o_proj
-            out = hidden_states.new_zeros(num_padded, attn_out.shape[-1])
-            out[:num_real] = attn_out
-            return out
-        return self._run_self_attn_inner(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
-
-    def _run_self_attn_inner(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        # For MLA layers with q_lora_rank, set up attn_inputs before the
-        # forward call (normally done by the attention boundary).
+        # MLA layers with q_lora_rank read their latent inputs from the
+        # attention-TP context.
         from sglang.srt.layers.layer_boundary import (
             AttentionInputs,
             get_attn_tp_context,
@@ -2997,7 +2955,6 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._trim_padded_attn = require_mlp_sync()
         self._stage_boundaries = _uses_stage_boundaries(config)
 
         if self.pp_group.is_first_rank:
@@ -3105,21 +3062,6 @@ class KimiK3LinearModel(nn.Module):
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
-
-        # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to a
-        # multiple of attn_tp_size; attention layers run on the real rows
-        # only (_run_self_attn trims), so the KV write locations must match
-        # the trimmed length. positions and hidden_states keep the padded
-        # length for the DP gather/scatter and the MoE.
-        if (
-            self._trim_padded_attn
-            and forward_batch.forward_mode.is_extend()
-            and forward_batch.out_cache_loc is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        ):
-            num_real = int(sum(forward_batch.extend_seq_lens_cpu))
-            if forward_batch.out_cache_loc.shape[0] > num_real:
-                forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_real]
 
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
