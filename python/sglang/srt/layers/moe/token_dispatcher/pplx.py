@@ -329,9 +329,6 @@ class _PplxDispatcherImpl:
             )
 
         bound_m = torch.full((1,), num_tokens, dtype=torch.uint32, device=device)
-        n_bad = int((topk_ids < 0).sum())
-        if n_bad:
-            print(f"[pplx debug] {n_bad} of {topk_ids.numel()} topk_ids are -1", flush=True)
         indices = topk_ids.to(torch.uint32)
 
         ata.dispatch(
