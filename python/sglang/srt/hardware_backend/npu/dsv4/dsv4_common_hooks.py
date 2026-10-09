@@ -177,44 +177,51 @@ def _zero_c128_boundary(
     ratio = 128
     coff = 2
     window = (coff - 1) * ratio  # 128
+    fixed = os.environ.get("SGLANG_DSV4_DUMP_C128_WINDOW")  # "lo:hi" -> ALL reqs
     total = 0
     hit_reqs = 0
     for i in range(len(batch.reqs)):
         prefix_len = int(prefix_lens_cpu[i])
+        spans = []
+        if fixed:
+            _a, _b = fixed.split(":")
+            spans.append((int(_a), int(_b), "win"))
         lo = prefix_len - window
-        if prefix_len <= 0 or lo < 0:
-            continue
-        hit_reqs += 1
-        for pool in state_pools:
-            if pool is None or pool.ratio != ratio:
-                continue
-            state = pool.kv_score_buffer.kv_score
-            dev = state.device
-            positions = torch.arange(lo, prefix_len, device=dev, dtype=torch.int64)
-            rp = req_pool_indices_cpu.to(dev, dtype=torch.int64).reshape(-1)
-            sloc = (
-                pool.translate_from_req_position_to_state_loc(
-                    rp[i].reshape(1), positions
+        if prefix_len > 0 and lo >= 0:
+            hit_reqs += 1
+            spans.append((lo, prefix_len, "bnd"))
+        rp = req_pool_indices_cpu.to(dtype=torch.int64).reshape(-1)
+        for lo_i, hi_i, kind in spans:
+            for pool in state_pools:
+                if pool is None or pool.ratio != ratio:
+                    continue
+                state = pool.kv_score_buffer.kv_score
+                dev = state.device
+                positions = torch.arange(lo_i, hi_i, device=dev, dtype=torch.int64)
+                sloc = (
+                    pool.translate_from_req_position_to_state_loc(
+                        rp[i].to(dev).reshape(1), positions
+                    )
+                    .reshape(-1)
+                    .to(torch.int64)
                 )
-                .reshape(-1)
-                .to(torch.int64)
-            )
-            valid = (sloc >= 0) & (sloc < state.shape[0])
-            if not bool(valid.any()):
-                continue
-            if do_dump:
-                import hashlib
+                valid = (sloc >= 0) & (sloc < state.shape[0])
+                if not bool(valid.any()):
+                    continue
+                if do_dump:
+                    import hashlib
 
-                rows = state[sloc[valid]].detach().to(torch.float32).cpu().numpy()
-                print(
-                    f"[C128BNDV] pid={os.getpid()} prefix_len={prefix_len} "
-                    f"req={i} ratio={pool.ratio} n={int(valid.sum().item())} "
-                    f"md5={hashlib.md5(rows.tobytes()).hexdigest()[:16]}",
-                    flush=True,
-                )
-            if do_zero:
-                state[sloc[valid]] = 0
-                total += int(valid.sum().item())
+                    rows = state[sloc[valid]].detach().to(torch.float32).cpu().numpy()
+                    print(
+                        f"[C128BNDV] pid={os.getpid()} kind={kind} req={i} "
+                        f"prefix_len={prefix_len} lo={lo_i} hi={hi_i} "
+                        f"ratio={pool.ratio} n={int(valid.sum().item())} "
+                        f"md5={hashlib.md5(rows.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+                if do_zero and kind == "bnd":
+                    state[sloc[valid]] = 0
+                    total += int(valid.sum().item())
     print(
         f"[C128BND] pid={os.getpid()} hit_reqs={hit_reqs} zeroed_rows={total}",
         flush=True,
