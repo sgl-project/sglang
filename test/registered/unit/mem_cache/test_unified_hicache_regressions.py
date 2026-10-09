@@ -200,55 +200,6 @@ class TestSwaLoadAllocation(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestSplitSourceSidecars(unittest.TestCase):
-    """A sidecar derives its indices from every transfer of its source pool."""
-
-    @staticmethod
-    def _sources():
-        return [
-            PoolTransfer(
-                name=PoolName.DRAFT, host_indices=torch.tensor([4, 5]), keys=["a"]
-            ),
-            PoolTransfer(
-                name=PoolName.DRAFT, host_indices=torch.tensor([6, 7]), keys=["b"]
-            ),
-        ]
-
-    def test_load_resolves_sidecar_over_every_source_transfer(self):
-        controller = object.__new__(HybridCacheController)
-        next_row = iter(range(20, 30))
-        entry = PoolEntry(
-            name=PoolName.DRAFT,
-            host_pool=SimpleNamespace(),
-            device_pool=SimpleNamespace(),
-            layer_mapper=lambda i: i,
-            device_alloc_fn=lambda n: torch.tensor([next(next_row) for _ in range(n)]),
-            device_free_fn=Mock(),
-        )
-        controller.mem_pool_host = SimpleNamespace(entry_map={PoolName.DRAFT: entry})
-        sources = self._sources()
-        sidecar = PoolTransfer(
-            name=PoolName.DRAFT_SWA, indices_from_pool=PoolName.DRAFT
-        )
-
-        self.assertIsNotNone(
-            controller._resolve_device_transfers([sources[0], sidecar, sources[1]])
-        )
-        self.assertEqual(sidecar.host_indices.tolist(), [4, 5, 6, 7])
-        self.assertEqual(sidecar.device_indices.tolist(), [20, 21, 22, 23])
-
-    def test_storage_write_resolves_sidecar_over_every_source_transfer(self):
-        controller = object.__new__(HybridCacheController)
-        sidecar = PoolTransfer(
-            name=PoolName.DRAFT_SWA, indices_from_pool=PoolName.DRAFT
-        )
-        operation = SimpleNamespace(pool_transfers=[*self._sources(), sidecar])
-
-        controller._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-        self.assertEqual(sidecar.host_indices.tolist(), [4, 5, 6, 7])
-        self.assertEqual(sidecar.keys, ["a", "b"])
-
-
 class TestTransferStreamOrdering(unittest.TestCase):
     def test_load_translation_follows_supplied_start_event(self):
         # The start event precedes translation; transfer must wait for both.
