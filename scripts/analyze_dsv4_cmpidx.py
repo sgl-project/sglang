@@ -16,11 +16,12 @@ Notes on [CMPIDX]: the whole-tensor md5 is only comparable when the row count
 LAST-row ``tail`` (same absolute query token on both sides). Decode rows
 (ntok=1) are same-shape and compared by md5.
 """
+import hashlib
 import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA|C4ST)\]")
+TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|C128KV|C128X|OSHAPE|XIN|LHID|IDXIN|LIMETA|C4STP|C4ST)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
@@ -503,9 +504,199 @@ def verdict_c4st(rows):
               "produced by the op")
 
 
+C4STP_RUNBOOK = (
+    "[C4STP-RUNBOOK] DSV4_DUMP_C4ST=2 bash start_test.sh > /tmp/c4st.log 2>&1 & "
+    "bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; bash curl.sh; "
+    "python scripts/analyze_dsv4_cmpidx.py /tmp/c4st.log"
+)
+C4STP_CARRY_POS = tuple(range(16380, 16384))
+C4STP_BLOCK136_STEPS = (17532, 17533, 17534, 17535)
+
+
+def _c4stp_norm(rec):
+    """Normalize one raw [C4STP] field-dict, or None when it is unusable.
+
+    Needs ``tag`` in {pre,post}, a non-empty ``md5`` and integer ``pos``/``sloc``.
+    ``layer``/``idx``/``start`` default when the probe line omits them, so partial
+    or older dumps still parse.
+    """
+    tag = rec.get("tag")
+    if tag not in ("pre", "post"):
+        return None
+    md5 = rec.get("md5")
+    if not md5 or md5 == "empty":
+        return None
+    pos = _int(rec, "pos", None)
+    sloc = _int(rec, "sloc", None)
+    if pos is None or sloc is None:
+        return None
+    return {
+        "layer": _int(rec, "layer", -1),
+        "idx": rec.get("idx", ""),
+        "start": _c4st_start(rec),
+        "pos": pos,
+        "sloc": sloc,
+        "md5": md5,
+        "tag": tag,
+    }
+
+
+def _c4stp_low_slots(slocs):
+    """Lower half of two DISJOINT ``sloc`` regions, else None.
+
+    ``sloc`` is a state-slot address: the MISS (freshly computed) and HIT (reused
+    prefix) streams live in separate slot regions, so the boundary is the widest
+    gap.  A single stream scans a contiguous slot run whose gaps are all small, so
+    the boundary only counts when the widest gap clearly dominates the rest --
+    otherwise None and the caller falls back to ``start``.
+    """
+    uniq = sorted(set(slocs))
+    if len(uniq) < 2:
+        return None
+    gaps = [uniq[i + 1] - uniq[i] for i in range(len(uniq) - 1)]
+    top = max(gaps)
+    rest = max([g for g in gaps if g != top] or [0])
+    if top < 2 or top < 2 * rest:
+        return None
+    return set(uniq[: gaps.index(top) + 1])
+
+
+def _c4stp_sides(rows):
+    """Split one (idx,tag) pool into (miss_records, hit_records).
+
+    Rows are clustered by ``start`` and each cluster is cut at the widest ``sloc``
+    gap into a low (MISS) and high (HIT) region: this separates the two streams
+    even when they share a ``start``.  Only when NO cluster shows a gap do we fall
+    back to the smallest/largest ``start`` -- never rely on start alone.
+    """
+    buckets = defaultdict(list)
+    for r in rows:
+        buckets[r["start"]].append(r)
+    miss, hit, split = [], [], False
+    for group in buckets.values():
+        low = _c4stp_low_slots([r["sloc"] for r in group])
+        if low is None:
+            continue
+        split = True
+        for r in group:
+            (miss if r["sloc"] in low else hit).append(r)
+    if split:
+        return miss, hit
+    starts = sorted({r["start"] for r in rows if r["start"] is not None})
+    if len(starts) >= 2:
+        for r in rows:
+            if r["start"] == starts[0]:
+                miss.append(r)
+            elif r["start"] == starts[-1]:
+                hit.append(r)
+    return miss, hit
+
+
+def _c4stp_by_pos(records):
+    """{pos: md5} for one side (first md5 wins on a duplicate pos)."""
+    out = {}
+    for r in records:
+        out.setdefault(r["pos"], r["md5"])
+    return out
+
+
+def _c4stp_region(md5_map, positions):
+    """Hex16 over the per-position md5s present in ``positions`` (or None)."""
+    parts = [f"{p}:{md5_map[p]}" for p in positions if p in md5_map]
+    if not parts:
+        return None
+    return hashlib.md5("|".join(parts).encode("ascii")).hexdigest()[:16]
+
+
+def _c4stp_cmp(miss_map, hit_map, pos):
+    """SAME/DIFF for ``pos`` when both sides carry it, else None."""
+    a, b = miss_map.get(pos), hit_map.get(pos)
+    if a is None or b is None:
+        return None
+    return "SAME" if a == b else "DIFF"
+
+
+def verdict_c4stp(recs):
+    """Per-position [C4STP] MISS-vs-HIT verdict + one binary-rule line.
+
+    Splits the records into the two streams (see ``_c4stp_sides``), reports the
+    carried boundary (pos 16380..16383) and the block-136 commit steps, then
+    prints ONE rule line mapping the divergence to its root cause::
+
+        carry DIFF                             -> READ
+        first pre SAME / post DIFF commit step -> WRITE
+        pre itself already DIFF                -> UPSTREAM
+        no per-position state diff             -> NON_STATE
+
+    Additive only: it never touches the [C4ST] report above.
+    """
+    rows = [n for n in (_c4stp_norm(r) for r in recs) if n is not None]
+    if not rows:
+        print("[C4STP-BINRULE] no C4STP data")
+        print(C4STP_RUNBOOK)
+        return
+    # Focus on the indexer state (idx=1) when the probe emitted it, like [C4ST].
+    if any(r["idx"] == "1" for r in rows):
+        rows = [r for r in rows if r["idx"] == "1"]
+
+    miss_by_tag, hit_by_tag = {}, {}
+    for tag in ("pre", "post"):
+        pool = [r for r in rows if r["tag"] == tag]
+        miss, hit = _c4stp_sides(pool) if pool else ([], [])
+        miss_by_tag[tag] = _c4stp_by_pos(miss)
+        hit_by_tag[tag] = _c4stp_by_pos(hit)
+
+    # The tag that actually pairs positions (prefer post = committed state).
+    def _pairs(tag):
+        return len(set(miss_by_tag[tag]) & set(hit_by_tag[tag]))
+
+    tag = max(("post", "pre"), key=_pairs)
+    miss_map, hit_map = miss_by_tag[tag], hit_by_tag[tag]
+
+    carry = "N/A"
+    if any(p in miss_map and p in hit_map for p in C4STP_CARRY_POS):
+        m = _c4stp_region(miss_map, C4STP_CARRY_POS)
+        h = _c4stp_region(hit_map, C4STP_CARRY_POS)
+        carry = "SAME" if m == h else "DIFF"
+        print(f"[C4STP-VERDICT] carry pos=<16380..16383> miss={m} hit={h} "
+              f"content={carry}")
+
+    for step in C4STP_BLOCK136_STEPS:
+        if step in miss_map and step in hit_map:
+            m, h = miss_map[step], hit_map[step]
+            content = "SAME" if m == h else "DIFF"
+            print(f"[C4STP-VERDICT] block136 step={step} miss={m} hit={h} "
+                  f"content={content}")
+
+    pre_m, pre_h = miss_by_tag["pre"], hit_by_tag["pre"]
+    post_m, post_h = miss_by_tag["post"], hit_by_tag["post"]
+    positions = sorted(set(pre_m) | set(pre_h) | set(post_m) | set(post_h))
+    first_commit, any_pre_diff = None, False
+    for p in positions:
+        pre_cmp = _c4stp_cmp(pre_m, pre_h, p)
+        if pre_cmp == "DIFF":
+            any_pre_diff = True
+        elif (first_commit is None and pre_cmp == "SAME"
+              and _c4stp_cmp(post_m, post_h, p) == "DIFF"):
+            first_commit = p
+
+    if carry == "DIFF":
+        verdict = "READ"
+    elif first_commit is not None:
+        verdict = "WRITE"
+    elif any_pre_diff:
+        verdict = "UPSTREAM"
+    else:
+        verdict = "NON_STATE"
+    first_txt = "NONE" if first_commit is None else str(first_commit)
+    print(f"[C4STP-BINRULE] carry={carry} "
+          f"first_commit_diff_step={first_txt} verdict={verdict}")
+    print(C4STP_RUNBOOK)
+
+
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "C128KV", "C128X", "OSHAPE", "XIN", "LHID", "IDXIN", "LIMETA", "C4ST", "C4STP"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if recs.get("CMPIDX"):
         cmp_reqs = segment(recs["CMPIDX"])
@@ -614,6 +805,7 @@ def main(path):
 
     verdict_c4st(recs.get("C4ST", []))
     print(C4ST_RUNBOOK)
+    verdict_c4stp(recs.get("C4STP", []))
 
 
 if __name__ == "__main__":
