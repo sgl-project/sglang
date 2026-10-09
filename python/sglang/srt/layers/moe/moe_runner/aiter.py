@@ -272,6 +272,8 @@ class AiterRunnerCore(MoeRunnerCore):
                         self.config.activation == "silu",
                         quant_info.b13 is not None or quant_info.b2 is not None,
                         a1_scale,
+                        quant_info.w13_scale,
+                        quant_info.w2_scale,
                     )
                     and not extra.get("no_combine")
                     and runner_input.num_local_tokens is None
