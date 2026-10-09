@@ -1693,6 +1693,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             elif kv_pool_is_hnd:
                 # fmha_v2 reads HND pool buffers as-is; they are already contiguous.
+                hnd_shape = (layer.tp_k_head_num, self.page_size, layer.head_dim)
+                assert k_cache_raw.shape[1:] == v_cache_raw.shape[1:] == hnd_shape, (
+                    f"expected HND buffers [pages, *{hnd_shape}], got "
+                    f"{tuple(k_cache_raw.shape)} / {tuple(v_cache_raw.shape)}"
+                )
                 k_cache, v_cache = k_cache_raw, v_cache_raw
             else:
                 k_cache = paged_kv_view(
