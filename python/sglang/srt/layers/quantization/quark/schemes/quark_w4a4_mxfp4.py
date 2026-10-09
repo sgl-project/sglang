@@ -32,6 +32,10 @@ _is_hip = is_hip()
 
 _ASM_FP4_SCALE_ROW_MULTIPLE = 32
 _ASM_FP4_SCALE_COL_MULTIPLE = 8
+# Workaround: gemm_a4w4's untuned ASM heuristic returns wrong rows 1..M-1 for
+# N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
+# TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
+_ASM_FP4_UNSAFE_MAX_N = 128
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
 # Quark model matrix. Unlike the Triton fallback, it consumes AITER's
@@ -427,6 +431,15 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 _ASM_FP4_SCALE_ROW_MULTIPLE,
                 _ASM_FP4_SCALE_COL_MULTIPLE,
                 tuple(layer.weight_scale.shape),
+            )
+            return
+
+        if layer.weight.shape[0] <= _ASM_FP4_UNSAFE_MAX_N:
+            logger.warning_once(
+                "AITER ASM FP4 GEMM is unreliable for N <= %d; keeping the AITER "
+                "Triton FP4 GEMM for a layer with N=%d.",
+                _ASM_FP4_UNSAFE_MAX_N,
+                layer.weight.shape[0],
             )
             return
 
