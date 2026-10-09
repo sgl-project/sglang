@@ -279,7 +279,11 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        # Draft KV may be TP-sharded, so dedup keeps it rank-local.
+        if (
+            _can_pack_hicache_mtp(spec_algorithm, draft_runners)
+            and not get_memory().enable_mla_hicache_host_dedup
+        ):
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = getattr(
                 target_model_runner.req_to_token_pool, "mamba_pool", None
