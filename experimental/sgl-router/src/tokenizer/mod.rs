@@ -10,7 +10,8 @@ pub mod stats;
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
-use dynamo_tokenizers::Tokenizer;
+use dynamo_tokenizers::{EncodeSegment, Tokenizer};
+use sglang_processor::openai::{ChatModel, OpenAiTokenizer, TokenPieces};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -64,6 +65,53 @@ pub struct TokenizerRegistry {
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
     /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
     stats: Arc<stats::TokenizerStats>,
+    /// Special tokens the engine adds around a raw prompt; `None` if unknown.
+    prompt_affixes: Option<adapter::PromptAffixes>,
+    /// What SGLang's OpenAI layer asks of the tokenizer; needs `tokenizer.json`.
+    openai: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The model config SGLang's OpenAI chat layer reads.
+    chat_model: ChatModel,
+}
+
+/// `get_context_length` over the model's text config.
+fn context_length(config: &serde_json::Value) -> u64 {
+    let config = config.get("text_config").unwrap_or(config);
+    let scaling = &config["rope_scaling"];
+    let factor = match scaling.as_object() {
+        Some(s)
+            if !s.contains_key("original_max_position_embeddings")
+                && s.get("rope_type").and_then(|t| t.as_str()) != Some("llama3") =>
+        {
+            s.get("factor").and_then(|f| f.as_f64()).unwrap_or(1.0)
+        }
+        _ => 1.0,
+    };
+    [
+        "max_sequence_length",
+        "seq_length",
+        "max_seq_len",
+        "model_max_length",
+        "max_position_embeddings",
+    ]
+    .iter()
+    .find_map(|key| config[*key].as_f64())
+    .map_or(2048, |len| (factor * len) as u64)
+}
+
+/// The served model's tokenizer as SGLang's OpenAI layer uses it.
+struct OpenAiTokens {
+    tokenizer: Arc<Tokenizer>,
+    pieces: TokenPieces,
+}
+
+impl OpenAiTokenizer for OpenAiTokens {
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        adapter::decode_complete(&self.tokenizer, ids, true).ok()
+    }
+
+    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        self.pieces.byte_level_bytes(id)
+    }
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -78,13 +126,44 @@ impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let mut me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let (t, stats) = adapter::load_with(&m.tokenizer_path, m.tokenizer)?;
+        let Some(tokenizer_path) = &m.tokenizer_path else {
+            tracing::info!(model = %m.id, "tokenizer disabled; workers tokenize requests");
+            return Ok(me);
+        };
+        let (t, stats) = adapter::load_with(tokenizer_path, m.tokenizer)?;
         tracing::info!(model = %m.id, backend = stats.backend().as_str(),
             l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
             "tokenizer loaded");
+        let files = adapter::ModelFiles::open(tokenizer_path);
+        if let Ok(Some(json)) = files.json("tokenizer.json") {
+            me.openai = Some(Arc::new(OpenAiTokens {
+                tokenizer: Arc::clone(&t),
+                pieces: TokenPieces::from_tokenizer_json(&json),
+            }));
+        }
+        me.chat_model = ChatModel {
+            context_length: files
+                .json("config.json")
+                .ok()
+                .flatten()
+                .map(|config| context_length(&config)),
+            generation_config: files
+                .json("generation_config.json")
+                .ok()
+                .flatten()
+                .and_then(|config| config.as_object().cloned())
+                .unwrap_or_default(),
+        };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
-        match ChatFormatter::load(&m.id, &m.tokenizer_path) {
+        me.prompt_affixes = adapter::prompt_affixes(tokenizer_path, &files)
+            .map_err(|e| {
+                tracing::warn!(model = %m.id, error = %format!("{e:#}"),
+                    "cannot reproduce the engine's tokens; /generate, /v1/embeddings and \
+                     /v1/classify forward text")
+            })
+            .ok();
+        match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 me.formatters
@@ -124,12 +203,34 @@ impl TokenizerRegistry {
         Ok(me)
     }
 
+    pub fn openai(&self) -> Option<Arc<dyn OpenAiTokenizer>> {
+        self.openai.clone()
+    }
+
+    pub fn chat_model(&self) -> &ChatModel {
+        &self.chat_model
+    }
+
     pub fn stats(&self) -> &stats::TokenizerStats {
         &self.stats
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
         self.inner.get(model_id).map(|r| Arc::clone(&*r))
+    }
+
+    /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
+    pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        let affixes = self.prompt_affixes.as_ref()?;
+        let tokenizer = self.get(model_id)?;
+        // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
+        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+            kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
+        } else {
+            adapter::encode(&tokenizer, text)
+        }
+        .ok()?;
+        (!ids.is_empty()).then(|| affixes.apply(&ids))
     }
 
     /// Whether this model has a chat formatter (and thus the chat-aware
@@ -210,12 +311,15 @@ mod tests {
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
-                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
                 tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
+                dp_aware: false,
                 bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
@@ -356,9 +460,18 @@ mod tests {
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
-        c.model.tokenizer_path = "/nonexistent.json".into();
+        c.model.tokenizer_path = Some("/nonexistent.json".into());
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
+    }
+
+    #[test]
+    fn disabled_tokenizer_loads_an_empty_registry() {
+        let mut c = cfg();
+        c.model.tokenizer_path = None;
+        let registry = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(registry.get("tiny").is_none());
+        assert_eq!(registry.forwarding_scope("tiny"), ForwardingScope::Never);
     }
 
     #[test]
@@ -420,7 +533,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "{% invalid %}").unwrap();
         let mut cfg = cfg();
-        cfg.model.tokenizer_path = tok.to_str().unwrap().to_owned();
+        cfg.model.tokenizer_path = Some(tok.to_str().unwrap().to_owned());
 
         let reg = TokenizerRegistry::load_from_config(&cfg).unwrap();
         let tokenizer = reg.get(&cfg.model.id).unwrap();

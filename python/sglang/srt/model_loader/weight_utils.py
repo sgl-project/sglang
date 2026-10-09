@@ -19,6 +19,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -35,6 +36,7 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
@@ -520,11 +522,10 @@ def _find_local_hf_snapshot_dir_unlocked(
                 ),
             )
             rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
+            ref_path = os.path.join(repo_folder, "refs", revision or "main")
+            if os.path.isfile(ref_path):
+                with open(ref_path) as f:
+                    rev_to_use = f.read().strip()
             if rev_to_use:
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
@@ -663,7 +664,18 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            try:
+                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            except HfHubHTTPError as e:
+                # Fail open (e.g. a 429 rate limit): pick the format from the local
+                # snapshot; snapshot_download below re-raises errors it cannot recover.
+                logger.warning(
+                    "Listing %s on the Hub failed, using the local snapshot: %s",
+                    model_name_or_path,
+                    e,
+                )
+                local_dir = find_local_repo_dir(model_name_or_path, revision)
+                file_list = os.listdir(local_dir) if local_dir else []
 
             # depending on what is available we download different things
             for pattern in allow_patterns:
@@ -1474,6 +1486,18 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
+
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
+    """
+    func._supports_quantized_rl_reload = func
+    return func
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
@@ -1489,30 +1513,47 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight)
 
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
+
+
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group: Optional["LinearParallelGroup"] = None,
 ) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+    """Create a weight loader with placement frozen in its construction scope.
 
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    Without a group selection, retain the attention rank and legacy CPU padding
+    width. An explicit rank getter is evaluated once when creating the loader.
+    """
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
+    else:
         tp_rank = (
             tp_rank_getter()
             if tp_rank_getter is not None
             else get_parallel().attn_tp_rank
         )
+        tp_size = get_parallel().tp_size
 
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):
