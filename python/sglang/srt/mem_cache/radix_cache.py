@@ -406,6 +406,15 @@ class RadixCache(BasePrefixCache):
             best_match_node=last_node,
         )
 
+    def touch_prefix(self, key: RadixKey) -> None:
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if self.disable or len(key) == 0:
+            return
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return
+        self._match_prefix_helper(self.root_node, key)
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -595,6 +604,9 @@ class RadixCache(BasePrefixCache):
                 )
             node = node.parent
         return DecLockRefResult(delta=delta)
+
+    def supports_prefix_sharing(self) -> bool:
+        return not self.disable
 
     def evictable_size(self):
         return self.evictable_size_
