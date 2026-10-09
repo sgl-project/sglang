@@ -1448,6 +1448,8 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Omit a redundant processor ID list after copying canonical request IDs.
+    SGLANG_MM_STRIP_PROCESSOR_INPUT_IDS = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
