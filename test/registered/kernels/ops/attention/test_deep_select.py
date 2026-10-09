@@ -180,10 +180,7 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
 
 
 def test_full_topk_decode_runtime_integration():
-    from sglang.srt.layers.attention.dsv4.v41_indexer import (
-        DecodeInputs,
-        Selection,
-    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
     from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
     from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
 
@@ -192,7 +189,6 @@ def test_full_topk_decode_runtime_integration():
     end = torch.tensor([0, 1, k - 1, width], dtype=torch.int32, device="cuda")
     table, inverse = _random_page_table(rows, width, page_size)
     output = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
-    selection = Selection(page_indices=output, raw_indices=None)
     metadata = SimpleNamespace(
         page_table=table,
         compressed_page_size=page_size,
@@ -208,6 +204,7 @@ def test_full_topk_decode_runtime_integration():
         req_rows=torch.arange(rows, device="cuda"),
         paged_metadata=metadata,
         is_verify=False,
+        out_page_indices=output,
     )
     data = DecodeScores(
         bs=rows,
@@ -223,7 +220,7 @@ def test_full_topk_decode_runtime_integration():
     indexer.use_deep_select_decode = True
 
     with patch.object(mod, "decode_scores", return_value=data):
-        indexer.topk_decode(inputs, selection)
+        indexer.topk_decode(inputs)
 
     valid = output != -1
     wide = output.long()
