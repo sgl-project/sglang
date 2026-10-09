@@ -11,6 +11,8 @@ Two variants:
   2. Split-K: adaptive split-K with fused fast path (adapted from DSv4)
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -41,14 +43,33 @@ _SplitKWorkspace = list[tuple[torch.Tensor, torch.Tensor]]
 _splitk_bufs: dict[tuple[torch.device, int], _SplitKWorkspace] = {}
 
 
-def _gfx950_sparse_mla_decode_tile_config(
-    base_ctas: int, topk: int, block_k: int, max_kv_splits: int
-) -> tuple[int, int]:
-    if topk == 2048 and base_ctas <= 2:
-        block_k = 32
-        if base_ctas == 1:
-            max_kv_splits = 64
-    return block_k, max_kv_splits
+class _Gfx950DecodeConfig(NamedTuple):
+    block_k: int | None = None
+    max_kv_splits: int | None = None
+    kv_splits: int | None = None
+    split_num_warps: int | None = None
+    d_chunk: int | None = None
+    reduce_num_warps: int | None = None
+
+
+_GFX950_H16_DECODE_CONFIGS = {
+    1: _Gfx950DecodeConfig(64, 32, 8, 1, 64, 4),
+    16: _Gfx950DecodeConfig(32, 64, 64, 2, 128, 1),
+    24: _Gfx950DecodeConfig(64, 32, 8, 1, 64, 4),
+    32: _Gfx950DecodeConfig(64, 32, 8, 1, 256, 1),
+}
+
+
+def _gfx950_sparse_mla_decode_config(
+    base_ctas: int, heads: int, topk: int
+) -> _Gfx950DecodeConfig | None:
+    if topk != 2048:
+        return None
+    if heads == 8 and base_ctas == 1:
+        return _Gfx950DecodeConfig(block_k=32)
+    if heads == 16:
+        return _GFX950_H16_DECODE_CONFIGS.get(base_ctas)
+    return None
 
 
 def _get_splitk_bufs(
@@ -532,6 +553,7 @@ def triton_sparse_mla_decode_splitk(
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
+    gfx950_fp8_shape = _is_gfx950_sparse_mla_fp8(kv.dtype, H, d_v, d_tail, kv_dim)
     BLOCK_K = _sparse_mla_block_k(kv)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
@@ -544,13 +566,17 @@ def triton_sparse_mla_decode_splitk(
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
-    optimize_gfx950_fp8 = H == 16 and _is_gfx950_sparse_mla_fp8(
-        kv.dtype, H, d_v, d_tail, kv_dim
+    optimize_gfx950_fp8 = gfx950_fp8_shape and (H == 16 or base_ctas == 1)
+    decode_config = (
+        _gfx950_sparse_mla_decode_config(base_ctas, H, topk)
+        if optimize_gfx950_fp8
+        else None
     )
-    if optimize_gfx950_fp8:
-        BLOCK_K, max_kv_splits = _gfx950_sparse_mla_decode_tile_config(
-            base_ctas, topk, BLOCK_K, max_kv_splits
-        )
+    if decode_config is not None:
+        if decode_config.block_k is not None:
+            BLOCK_K = decode_config.block_k
+        if decode_config.max_kv_splits is not None:
+            max_kv_splits = decode_config.max_kv_splits
     if kv_splits is None:
         # Very sparse BF16 launches benefit from enough split-K work to queue
         # two workgroups per CU. Once token/head parallelism is less sparse, keep the
@@ -578,6 +604,8 @@ def triton_sparse_mla_decode_splitk(
                 kv_splits,
                 max_kv_splits,
             )
+            if decode_config is not None and decode_config.kv_splits is not None:
+                kv_splits = min(decode_config.kv_splits, max_kv_splits)
     else:
         kv_splits = min(kv_splits, max_kv_splits)
 
@@ -629,6 +657,8 @@ def triton_sparse_mla_decode_splitk(
     split_num_warps = 4
     if optimize_gfx950_fp8:
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
+    if decode_config is not None and decode_config.split_num_warps is not None:
+        split_num_warps = decode_config.split_num_warps
 
     lse_partial, acc_partial = _get_splitk_bufs(
         bs, kv_splits, h_padded, d_v, q_nope.device, workspace
@@ -665,6 +695,12 @@ def triton_sparse_mla_decode_splitk(
         )
 
     D_CHUNK = _reduce_d_chunk(active_splits, bs * H) if optimize_gfx950_fp8 else 64
+    reduce_num_warps = 4
+    if decode_config is not None:
+        if decode_config.d_chunk is not None:
+            D_CHUNK = decode_config.d_chunk
+        if decode_config.reduce_num_warps is not None:
+            reduce_num_warps = decode_config.reduce_num_warps
     grid_reduce = (bs, H, (d_v + D_CHUNK - 1) // D_CHUNK)
     _sparse_mla_reduce_kernel[grid_reduce](
         lse_partial,
@@ -677,7 +713,7 @@ def triton_sparse_mla_decode_splitk(
         ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
-        num_warps=4,
+        num_warps=reduce_num_warps,
     )
     return out.unsqueeze(0)
 
