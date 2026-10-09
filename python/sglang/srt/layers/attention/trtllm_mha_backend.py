@@ -1863,8 +1863,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         out=out[:prefix_tokens],
                         page_table_override=page_table[:prefix_reqs],
                     )
+                    # Eager DP batches can pad Q without adding requests.
+                    # Decode requires exactly one query row per tail request.
+                    tail_end = prefix_tokens + (
+                        self.forward_metadata.cache_seqlens_int32.shape[0] - prefix_reqs
+                    )
                     self._run_fixed_q_len_decode(
-                        q[prefix_tokens:],
+                        q[prefix_tokens:tail_end],
                         kv_cache,
                         page_table[prefix_reqs:],
                         self.forward_metadata.cache_seqlens_int32[prefix_reqs:],
@@ -1872,7 +1877,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         bmm2_scale=bmm2_scale,
                         window_left=layer.sliding_window_size,
                         sinks=attention_sink,
-                        out=out[prefix_tokens:],
+                        out=out[prefix_tokens:tail_end],
                     )
                     o = out
                 else:
