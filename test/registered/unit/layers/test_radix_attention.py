@@ -249,6 +249,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         runner_batch = self._new_impl_context([layer], num_tokens=2).forward_batch
         expanded_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            global_num_token_non_padded_cpu=None,
             out_cache_loc=runner_batch.out_cache_loc,
             _attn_output=None,
             mha_return_lse=False,

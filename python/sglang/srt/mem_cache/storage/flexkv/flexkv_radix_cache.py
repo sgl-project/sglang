@@ -394,6 +394,8 @@ class FlexKVRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        # Keep the stored prefix within the checkpoint boundary.
+        kv_committed_len = min(kv_committed_len, up_to)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:

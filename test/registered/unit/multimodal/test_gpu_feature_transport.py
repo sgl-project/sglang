@@ -981,6 +981,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             sampling_params=SamplingParams(),
             token_type_ids=None,
             mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=[]),
+            decision_layout=None,
         )
         self.assertIsNone(recv_req.encoding_format)
 
