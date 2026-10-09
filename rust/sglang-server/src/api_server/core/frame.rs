@@ -206,16 +206,7 @@ impl CoreOutput {
         };
         if let Some(metadata) = &self.metadata {
             meta.cached_tokens = Some(metadata.cached_tokens);
-            meta.cached_tokens_details =
-                metadata
-                    .cached_tokens_details
-                    .as_ref()
-                    .map(|details| api::CachedTokensDetails {
-                        device: details.device,
-                        host: details.host,
-                        storage: details.storage,
-                        storage_backend: details.storage_backend.clone(),
-                    });
+            meta.cached_tokens_details = metadata.cached_tokens_details.as_deref().cloned();
             meta.reasoning_tokens = Some(metadata.reasoning_tokens);
             meta.num_retractions = Some(metadata.num_retractions);
             meta.dp_rank = metadata.dp_rank;
@@ -403,10 +394,9 @@ mod tests {
 
     #[test]
     fn scheduler_statistics_replace_snapshots_and_preserve_zero_and_null() {
-        use crate::message::response::CachedTokensDetails;
         let populated = SchedulerMetadata {
             cached_tokens: 128,
-            cached_tokens_details: Some(Box::new(CachedTokensDetails {
+            cached_tokens_details: Some(Box::new(api::CachedTokensDetails {
                 device: 128,
                 host: 0,
                 ..Default::default()

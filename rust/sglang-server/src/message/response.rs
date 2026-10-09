@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use sglang_api_types::api::v1::CachedTokensDetails;
 use tokio::sync::mpsc;
 
 use super::finish_reason::FinishReason;
@@ -202,15 +203,6 @@ pub struct SchedulerMetadata {
     pub reasoning_tokens: u64,
     pub num_retractions: u64,
     pub dp_rank: Option<u32>,
-}
-
-/// The concrete map emitted by SchedulerOutputStreamer.get_cached_tokens_details.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedTokensDetails {
-    pub device: u64,
-    pub host: u64,
-    pub storage: Option<u64>,
-    pub storage_backend: Option<String>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -698,7 +690,7 @@ mod tests {
     /// short/partial blocks must fail before any request is routed.
     #[test]
     fn scheduler_statistics_decode_and_validate_as_one_block() {
-        let mut header = serde_json::json!([
+        let header = serde_json::json!([
             ["a", "b"], [null, null], [192, 192], [0, 0],
             [], [], [], [], [], [], [], [], [], [], [], [],
             [[0, 128], [null, {"device": 100, "host": 20, "storage": 8,
@@ -730,6 +722,13 @@ mod tests {
                 dp_rank: Some(1),
             })
         );
+        // Cache maps use the API schema's defaults for omitted scalar fields.
+        let mut defaults = header.clone();
+        defaults[16][1][1] = serde_json::json!({});
+        let (decoded, events) = decode(&defaults);
+        assert!(decoded.ok);
+        let details = &events[1].metadata.as_ref().unwrap().cached_tokens_details;
+        assert_eq!(details.as_deref(), Some(&CachedTokensDetails::default()));
         for index in 0..5 {
             let mut bad = header.clone();
             bad[16][index].as_array_mut().unwrap().pop();
@@ -741,10 +740,6 @@ mod tests {
         let mut partial = header.clone();
         partial[16].as_array_mut().unwrap().pop();
         assert!(!decode(&partial).0.ok);
-        header.as_array_mut().unwrap().truncate(4);
-        let (decoded, events) = decode(&header);
-        assert!(decoded.ok);
-        assert!(events.iter().all(|event| event.metadata.is_none()));
         let mut idle = vec![serde_json::json!([]); 16];
         idle.push(serde_json::json!([[], [], [], [], []]));
         let idle = serde_json::Value::Array(idle);
@@ -832,6 +827,7 @@ mod tests {
         // `has_extras` guard must skip the extras machinery entirely for every
         // request (this is the from-scheduler hot path — see `for_each_chunk`).
         assert!(events.iter().all(|e| e.extras.is_none()));
+        assert!(events.iter().all(|e| e.metadata.is_none()));
     }
 
     /// A header whose column lengths exceed the data buffer (a Python/Rust

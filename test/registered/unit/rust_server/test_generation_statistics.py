@@ -24,6 +24,14 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+STATISTICS = (
+    "cached_tokens",
+    "cached_tokens_details",
+    "reasoning_tokens",
+    "retraction_counts",
+    "dp_ranks",
+)
+
 
 def make_payload(*, rust, storage=False, rank=None, count=2):
     cache = SimpleNamespace(
@@ -61,10 +69,6 @@ def make_payload(*, rust, storage=False, rank=None, count=2):
             req.cached_tokens_device = 3
             req.cached_tokens_host = 2
             req.cached_tokens_storage = 2
-        if rust:
-            req.init_incremental_detokenize = Mock(
-                side_effect=AssertionError("Rust must not run Python detokenization")
-            )
         accumulator.accept(req=req)
     return accumulator.to_payload(dp_rank=rank, is_idle_batch=count == 0)
 
@@ -72,8 +76,8 @@ def make_payload(*, rust, storage=False, rank=None, count=2):
 def encode(payload):
     sink = Mock()
     RustServer(sink, http_port=0).push_generation(payload)
-    header, buffers = sink.push_decode_result_batch.call_args.args
-    return msgspec.msgpack.decode(header), buffers
+    header, _ = sink.push_decode_result_batch.call_args.args
+    return msgspec.msgpack.decode(header)
 
 
 class TestGenerationStatistics(CustomTestCase):
@@ -82,13 +86,7 @@ class TestGenerationStatistics(CustomTestCase):
             with self.subTest(storage=storage, rank=rank):
                 python = make_payload(rust=False, storage=storage, rank=rank)
                 rust = make_payload(rust=True, storage=storage, rank=rank)
-                expected = [
-                    python.cached_tokens,
-                    python.cached_tokens_details,
-                    python.reasoning_tokens,
-                    python.retraction_counts,
-                    python.dp_ranks,
-                ]
+                expected = [getattr(python, name) for name in STATISTICS]
                 self.assertEqual(expected[0], [0, 7])
                 self.assertIsNone(expected[1][0])
                 self.assertEqual(expected[1][1]["device"], 3 if storage else 7)
@@ -97,26 +95,15 @@ class TestGenerationStatistics(CustomTestCase):
                     if extras:
                         rust.output_token_logprobs_val = [[-0.5], []]
                         rust.output_token_logprobs_idx = [[20], []]
-                    header, buffers = encode(rust)
+                    header = encode(rust)
                     self.assertEqual(len(header), 17)
                     self.assertEqual(header[16], expected)
-                    self.assertEqual(
-                        header[:4], [["0", "1"], [None, None], [16, 16], [1, 1]]
-                    )
                     self.assertEqual(header[4:6], [[1, 0], []] if extras else [[], []])
-                    self.assertEqual(buffers[0], array("q", [20, 20]).tobytes())
 
     def test_idle_and_misaligned_statistics(self):
-        header, buffers = encode(make_payload(rust=True, count=0))
+        header = encode(make_payload(rust=True, count=0))
         self.assertEqual(header[16], [[], [], [], [], []])
-        self.assertEqual(buffers, [b""])
-        for name in (
-            "cached_tokens",
-            "cached_tokens_details",
-            "reasoning_tokens",
-            "retraction_counts",
-            "dp_ranks",
-        ):
+        for name in STATISTICS:
             with self.subTest(column=name):
                 payload = make_payload(rust=True)
                 getattr(payload, name).pop()

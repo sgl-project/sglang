@@ -464,7 +464,7 @@ fn delta_frame(
     e2e_latency: Option<f64>,
 ) -> api::GenerateResponse {
     delta.completion_tokens = accumulated.completion_tokens;
-    delta.metadata.clone_from(&accumulated.metadata);
+    delta.metadata = delta.metadata.or_else(|| accumulated.metadata.clone());
     delta.frame(rid_str, index, e2e_latency)
 }
 
