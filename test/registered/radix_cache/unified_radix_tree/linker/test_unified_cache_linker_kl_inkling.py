@@ -6,10 +6,13 @@ restored from Mooncake (KV, SWA window or Mamba checkpoint) is wrong.
 """
 
 import os
-import random
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache_kit import (
+    UnifiedCacheLinkerKLTestMixin,
+    _random_suffixes,
+)
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
     _flush_cache,
@@ -38,12 +41,12 @@ PAGE_SIZE = 128
 TRACK_INTERVAL = 128
 
 
-def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
-    rng = random.Random(seed)
-    return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
+class TestInklingUnifiedCacheLinkerKL(UnifiedCacheLinkerKLTestMixin, CustomTestCase):
+    page_size = PAGE_SIZE
+    kl_threshold = KL_DIV_THRESHOLD
+    sampling_temperature = 0
+    max_new_tokens = 64
 
-
-class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -66,6 +69,10 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
             "--enable-deterministic-inference",
             "--mem-fraction-static",
             "0.6",
+            "--max-total-tokens",
+            "8192",
+            "--swa-full-tokens-ratio",
+            "0.5",
             "--max-running-requests",
             "1",
             "--enable-cache-report",

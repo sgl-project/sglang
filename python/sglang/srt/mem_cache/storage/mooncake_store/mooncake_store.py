@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
@@ -767,10 +768,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            DevicePoolEntry,
-        )
 
         if isinstance(host_pool, DevicePoolEntry):
             # A direct-linker entry packs every buffer of a page into one object.

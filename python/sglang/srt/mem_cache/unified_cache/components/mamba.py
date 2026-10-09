@@ -504,13 +504,13 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
+    def _alloc_mamba_slot(self, required: bool = True) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            assert slot is not None or not required, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -716,14 +716,9 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         if phase == LinkerTransferPhase.LOAD:
-            allocator = self.cache.req_to_token_pool.mamba_allocator
-            slot = allocator.alloc(1)
-            if slot is None:
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-                slot = allocator.alloc(1)
-            if slot is None:
+            transfer.device_indices = self._alloc_mamba_slot(required=False)
+            if transfer.device_indices is None:
                 return None
-            transfer.device_indices = slot
         return transfer
 
     def update_external_linker_load(
@@ -745,11 +740,12 @@ class MambaComponent(TreeComponent):
 
         assert phase == ExternalLinkerLoadPhase.COMMIT
         assert insert_result is not None
+        if insert_result.mamba_exist:
+            # Free first so the COW below can reuse this slot for the request.
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            transfer = None
         # The forward's COW waits for the load before reading the source slot.
         self._cow_node_state_into_req(req, insert_result.last_device_node)
-        if insert_result.mamba_exist:
-            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
-            return None
         return transfer
 
     # ---- HiCache Hooks ----

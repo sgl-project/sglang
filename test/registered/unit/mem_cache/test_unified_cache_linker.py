@@ -18,7 +18,7 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -49,10 +48,29 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+
+_MAMBA_SWA_CFG = CacheConfig(
+    page_size=1,
+    components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+    sliding_window_size=2,
+    kv_size=64,
+    max_context_len=64,
+)
+
+
+def _unallocated_req(rid):
+    # The scheduler loads back before it allocates the request's slots.
+    return Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q"),
+        sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+    )
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -618,13 +636,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer.sanity_check()
 
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
-        cfg = CacheConfig(
-            page_size=1,
-            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
-            sliding_window_size=2,
-            kv_size=64,
-            max_context_len=64,
-        )
+        cfg = _MAMBA_SWA_CFG
         self.cfg = cfg
         stored_keys = defaultdict(set)
         tokens = list(range(1, 7))
@@ -681,7 +693,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
                 req=req,
             )
         )
-        self.assertEqual(loaded.numel(), len(tokens))
+        self.assertEqual(loaded, len(tokens))
         loads = {
             transfer.name: transfer
             for transfer in consumer_linker.queued_loads[req.rid]
@@ -706,7 +718,63 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertEqual(final_match.device_indices.numel(), len(tokens))
+        self.assertEqual(final_match.device_prefix_len, len(tokens))
+        consumer.sanity_check()
+
+    def test_mamba_load_onto_existing_state_reuses_its_slot(self):
+        cfg = _MAMBA_SWA_CFG
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 7))
+
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        for _ in producer_linker.offload_calls:
+            producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        # Both requests match before either loads, as in one scheduling round.
+        reqs = [_unallocated_req(f"linker-{i}") for i in range(2)]
+        for req in reqs:
+            match = consumer.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+            )
+            self.assertEqual(match.host_hit_length, len(tokens))
+            self._apply_match_to_req(req, match)
+
+        # Three slots: the loaded node state and one private copy per request.
+        allocator = consumer_req_pool.mamba_allocator
+        held = allocator.alloc(allocator.available_size() - 3)
+        nodes = [
+            consumer.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )[1]
+            for req in reqs
+        ]
+        self.assertEqual(nodes[0], nodes[1])
+        loaded_state = _device_value(consumer, nodes[0], ComponentType.MAMBA)
+        self.assertNotIn(reqs[1].rid, consumer_linker.queued_loads)
+        self.assertEqual(allocator.available_size(), 0)
+        for req in reqs:
+            self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, loaded_state))
+            self.assertNotEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertNotEqual(
+            int(reqs[0].kv.mamba_pool_idx), int(reqs[1].kv.mamba_pool_idx)
+        )
+
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        consumer_linker.complete_started_loads()
+        consumer.check_hicache_events()
+        allocator.free(held)
         consumer.sanity_check()
 
 
@@ -1175,47 +1243,6 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
-
-
-@pytest.mark.parametrize("mamba_exist", [False, True])
-def test_mamba_commit_copies_node_state_and_frees_an_unneeded_slot(mamba_exist):
-    node_state = torch.tensor([7])
-    component = MambaComponent.__new__(MambaComponent)
-    component.tree_core = SimpleNamespace(
-        get_component_device_value=lambda node_id, component_type: node_state
-    )
-    allocator = MagicMock()
-    component.cache = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(mamba_allocator=allocator)
-    )
-    req = SimpleNamespace(kv=ReqKvInfo(mamba_pool_idx=torch.tensor(3)))
-    transfer = PoolTransfer(
-        name=PoolName.MAMBA, keys=["d"], device_indices=torch.tensor([9])
-    )
-
-    # The Mamba slot is never page-sliced by adopted ranges.
-    loaded = UnifiedCacheLinkerWrapper(
-        _cache_for_wrapper(page_size=2), _FakeLinker()
-    )._update_load(
-        ExternalLinkerLoadPhase.COMMIT,
-        req,
-        [(component, transfer)],
-        prefix_len=8,
-        insert_result=InsertResult(
-            prefix_len=0,
-            mamba_exist=mamba_exist,
-            adopted_ranges={},
-            last_device_node=1,
-        ),
-        canonical_full=torch.arange(8),
-    )
-
-    # A node that already has a state keeps it; the loaded slot is returned.
-    assert loaded == ([] if mamba_exist else [transfer])
-    assert allocator.free.call_count == int(mamba_exist)
-    assert transfer.device_indices.tolist() == [9]
-    assert req.kv.mamba_cow_src_index is node_state
-    assert int(req.kv.mamba_pool_idx) == 3
 
 
 @pytest.mark.parametrize(

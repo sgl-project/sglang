@@ -5,7 +5,7 @@ import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kits.unified_radix_cache_kit import UnifiedCacheLinkerKLTestMixin
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
@@ -24,7 +24,7 @@ register_cuda_ci(est_time=210, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
-    UnifiedRadixTreeTestMixin, CustomTestCase
+    UnifiedCacheLinkerKLTestMixin, CustomTestCase
 ):
     page_size = 256
     kl_threshold = 0.01
@@ -91,54 +91,6 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                 terminate_and_kill_process_tree(cls.process)
         finally:
             cls.mooncake.stop()
-
-    @unittest.skip("Linker CI targets Direct load-back KL accuracy")
-    def test_gsm8k(self):
-        pass
-
-    @unittest.skip("Linker CI targets Direct load-back KL accuracy")
-    def test_mmlu(self):
-        pass
-
-    def prefill_cache_assert(self, result, prefix_len, label):
-        self._record_cache_result(result, prefix_len, label)
-
-    def decode_cache_assert(self, result, history_len, output_len, label):
-        self._record_cache_result(result, history_len + output_len, label)
-
-    def _record_cache_result(self, result, expected_cached_tokens, label):
-        meta_info = result["meta_info"]
-        cached_tokens = int(meta_info["cached_tokens"])
-        minimum = max(0, expected_cached_tokens - self.page_size)
-        self.assertGreaterEqual(
-            cached_tokens,
-            minimum,
-            f"{label}: expected cached_tokens >= {minimum}, got {cached_tokens}",
-        )
-        details = meta_info.get("cached_tokens_details") or {}
-        remote_tokens = int(details.get("host", 0))
-        self._direct_remote_tokens += remote_tokens
-        if remote_tokens:
-            print(f"{label}: Direct load-back confirmed for {remote_tokens} tokens")
-
-    def _run_linker_kl_case(self, test_case):
-        self._direct_remote_tokens = 0
-        test_case()
-        print(f"Direct load-back total: {self._direct_remote_tokens} tokens")
-        self.assertGreater(
-            self._direct_remote_tokens,
-            0,
-            "Expected this KL case to load KV through the Mooncake Direct Linker",
-        )
-
-    def test_multiturn_logprobs_match(self):
-        self._run_linker_kl_case(super().test_multiturn_logprobs_match)
-
-    def test_multiturn_prefill_cache_hit_branching(self):
-        self._run_linker_kl_case(super().test_multiturn_prefill_cache_hit_branching)
-
-    def test_multiturn_decode_cache_hit_branching(self):
-        self._run_linker_kl_case(super().test_multiturn_decode_cache_hit_branching)
 
 
 if __name__ == "__main__":
