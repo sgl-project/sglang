@@ -820,8 +820,6 @@ class BeamModel(nn.Module):
         ):
             return None
         # Attention owns a TP reduction independently of the expert layout.
-        from sglang.kernels.fused_op import get_fused_op_backend
-
         parallel = get_parallel()
         capability = torch.cuda.get_device_capability(hidden_states.device)
         architecture = capability[0]

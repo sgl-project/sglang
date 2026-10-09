@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation._triton_silu import _silu_fast_math
+
 
 @triton.jit
 def _gate_up_gemv_kernel(
@@ -20,7 +22,6 @@ def _gate_up_gemv_kernel(
     Intermediate,
     HIDDEN_SIZE: tl.constexpr,
     INTERMEDIATE_SIZE: tl.constexpr,
-    TOP_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -39,29 +40,11 @@ def _gate_up_gemv_kernel(
             (n[:, None] < 2 * INTERMEDIATE_SIZE) & (kk[None, :] < HIDDEN_SIZE),
             0,
         ).to(tl.float32)
-        x = tl.load(
-            HiddenStates + (route // TOP_K) * HIDDEN_SIZE + kk, kk < HIDDEN_SIZE, 0
-        ).to(tl.float32)
+        x = tl.load(HiddenStates + kk, kk < HIDDEN_SIZE, 0).to(tl.float32)
         accumulator = accumulator + w * x[None, :]
     y = tl.sum(accumulator, 1).to(tl.bfloat16).to(tl.float32)
     gate, up = tl.split(tl.reshape(y, (BLOCK_N // 2, 2)))
-    # Match the interleaved SwiGLU kernel's exp/div rounding, without FMA.
-    exp_neg_gate = tl.inline_asm_elementwise(
-        "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
-        "=f,f",
-        [gate],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    silu = tl.inline_asm_elementwise(
-        "div.approx.ftz.f32 $0, $1, $2;",
-        "=f,f,f",
-        [gate, 1.0 + exp_neg_gate],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    silu = _silu_fast_math(gate)
     column = tl.program_id(1) * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
     tl.store(
         Intermediate + route * INTERMEDIATE_SIZE + column,
@@ -126,33 +109,32 @@ def beam_decode_gemv(
         for t in (hidden_states, w13_weight, w2_weight, topk_weights, topk_ids)
     )
 
-    num_tokens, hidden_size = hidden_states.shape
+    hidden_size = hidden_states.shape[1]
     top_k = topk_ids.shape[1]
     intermediate_size = w2_weight.shape[2]
     intermediate = torch.empty(
-        (num_tokens * top_k, intermediate_size),
+        (top_k, intermediate_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     output = torch.empty(
-        (num_tokens, top_k, hidden_size),
+        (1, top_k, hidden_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    _gate_up_gemv_kernel[(num_tokens * top_k, triton.cdiv(2 * intermediate_size, 8))](
+    _gate_up_gemv_kernel[(top_k, triton.cdiv(2 * intermediate_size, 8))](
         hidden_states,
         w13_weight,
         topk_ids,
         intermediate,
         hidden_size,
         intermediate_size,
-        top_k,
         8,
         256,
         num_warps=4,
         enable_fp_fusion=False,
     )
-    _down_gemv_kernel[(num_tokens * top_k, triton.cdiv(hidden_size, 8))](
+    _down_gemv_kernel[(top_k, triton.cdiv(hidden_size, 8))](
         intermediate,
         w2_weight,
         topk_ids,
