@@ -9,11 +9,10 @@ from sglang.kernels.jit.utils import (
     get_activation_cuda_cflags,
     get_jit_cuda_arch,
     is_arch_support_pdl,
-    is_hip_runtime,
-    is_musa_runtime,
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -30,9 +29,10 @@ def activation_module(
     fast_math_flags = get_activation_cuda_cflags()
     if not fast_math and not fast_math_flags:
         return activation_module(dtype, vec_size=vec_size)
-    args = make_cpp_args(
-        dtype, is_arch_support_pdl(), *(() if vec_size is None else (vec_size,))
-    )
+    template_args = [dtype, is_arch_support_pdl()]
+    if vec_size is not None:
+        template_args.append(vec_size)
+    args = make_cpp_args(*template_args)
     return load_jit(
         "activation" if fast_math else "rounded_activation",
         *args,
@@ -69,9 +69,7 @@ def _resident_threads() -> int:
 def _activation_vec_size(
     num_elems: int, hidden_size: int, element_size: int
 ) -> Optional[int]:
-    if element_size != 2 or is_hip_runtime() or is_musa_runtime():
-        return None
-    if get_jit_cuda_arch().major != 10:
+    if element_size != 2 or not is_cuda() or get_jit_cuda_arch().major != 10:
         return None
     # Thresholds from a B300 sweep over hidden 360-29568 x tokens 1-2048.
     wave = _resident_threads()
