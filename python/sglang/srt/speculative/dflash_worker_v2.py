@@ -467,6 +467,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
             )
+        self._block_verification = get_spec().speculative_use_block_verification
+        if (
+            self._block_verification
+            and (
+                self._is_domino
+                or (self.selector is None and not self._lilicorr_sampling_enabled)
+            )
+            and get_parallel().tp_rank == 0
+        ):
+            # A greedy draft is a point mass, where token-wise verification
+            # already accepts every prefix with its target probability.
+            logger.warning(
+                "--speculative-use-block-verification has no effect for this DFLASH "
+                "draft: it proposes greedy tokens, and block verification only "
+                "differs from token-wise verification for sampled proposals."
+            )
         if get_spec().speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
@@ -1484,6 +1500,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma=gamma,
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
+                block_verification=self._block_verification,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a

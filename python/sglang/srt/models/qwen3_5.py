@@ -129,6 +129,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_stream,
+    linear_attn_parallel_group,
 )
 
 # Utils
@@ -335,8 +336,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        parallel_group = linear_attn_parallel_group()
+        self.attn_tp_rank, self.attn_tp_size = resolve_linear_parallel_group(
+            parallel_group
+        )
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -367,7 +370,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -379,7 +382,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         self.in_proj_ba = self.create_ba_proj(
@@ -387,7 +390,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_v_heads=self.num_v_heads,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         # Override weight loaders for packed checkpoint format.
@@ -446,11 +449,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
 
         conv_weights = self.conv1d.weight.view(
@@ -491,7 +494,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             input_is_parallel=True,
             reduce_results=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
 
