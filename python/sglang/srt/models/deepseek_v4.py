@@ -3307,7 +3307,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mega_mhc_prefill = (
             self.config.model_type == "deepseek_v41"
             and seam_open
-            and mhc.can_use_mega_mhc_prefill(self.hc_cfg, state.residual, forward_batch)
+            and mhc.can_use_mega_mhc_prefill(self.hc_cfg, forward_batch)
         )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):

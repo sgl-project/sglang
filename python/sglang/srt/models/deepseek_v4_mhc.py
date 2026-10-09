@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip, _is_npu, _is_xpu
-from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -570,22 +570,14 @@ def _compute_triplet(
     return coefficients
 
 
-def can_use_mega_mhc_prefill(
-    cfg: HcConfig, residual: torch.Tensor, forward_batch: ForwardBatch
-) -> bool:
+def can_use_mega_mhc_prefill(cfg: HcConfig, forward_batch: ForwardBatch) -> bool:
     return (
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and can_fuse_post(cfg)
         # DeepGEMM Mega mHC supports SM10x only.
         and get_platform().is_sm100
-        and residual.is_cuda
         and not _is_hip
         and forward_batch.forward_mode.is_extend_without_speculative()
-        and 4096 <= residual.shape[0] <= 65536
-        and residual.shape[1:] == (4, 5120)
-        and residual.dtype == torch.bfloat16
-        and residual.is_contiguous()
-        and not get_forward().sp_active
         and not is_batch_invariant_mode_enabled()
     )
 
