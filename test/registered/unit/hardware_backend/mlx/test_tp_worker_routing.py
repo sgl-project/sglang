@@ -71,6 +71,14 @@ class _FakeRunner:
     def has_request(self, rid):
         return rid in self._known
 
+    def remove_request(self, rid):
+        self.calls.append(("remove_request", rid))
+        self._known.discard(rid)
+        self._req_caches.pop(rid, None)
+
+    def store_auxiliary_state_for_request(self, rid):
+        pass
+
     def flush_all_decode_kv(self):
         pass
 
@@ -214,6 +222,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._mlx_finished_rids = set()
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -325,6 +334,80 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
         self.assertIsNotNone(launch.decode)  # pending mixed decode present
+
+
+def _finished_req(rid):
+    """Minimal Req stand-in for prepare_for_kv_cache_release."""
+    return SimpleNamespace(rid=rid, kv=SimpleNamespace(mamba_last_track_seqlen=None))
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMlxFinishedRequestRelease(CustomTestCase):
+    """Finished requests must release their MLX caches at the next launch,
+    whatever that launch's forward mode is.
+
+    A batch that drains completely is followed by an EXTEND batch for the
+    next wave. The old cleanup only released on DECODE launches, so every
+    dead request kept its full contiguous KV buffer allocated alongside the
+    new prefills' -- the per-request footprint doubled at exactly the
+    moment a new wave was admitted (Metal OOM at 16 concurrent requests on
+    a 24 GB machine with the pool capped).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._config = get_context().override_server_args(mlx_enable_sampling=False)
+        cls._config.install()
+        cls.addClassCleanup(cls._config.restore)
+
+    @staticmethod
+    def _worker(active_rids):
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker._mlx_runner = _FakeRunner(active_rids)
+        worker._mlx_active_rids = set(active_rids)
+        worker._mlx_finished_rids = set()
+        worker._mlx_pool_initialized = True
+        return worker
+
+    def test_finished_requests_released_on_extend_launch(self):
+        worker = self._worker({"a", "b"})
+        worker.prepare_for_kv_cache_release(_finished_req("a"))
+        worker.prepare_for_kv_cache_release(_finished_req("b"))
+
+        worker._cleanup_stale_rids(ForwardMode.EXTEND, {"c"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertFalse(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"c"})
+        self.assertEqual(worker._mlx_finished_rids, set())
+
+    def test_unfinished_requests_survive_extend_launch(self):
+        worker = self._worker({"a", "b"})
+        worker.prepare_for_kv_cache_release(_finished_req("a"))
+
+        worker._cleanup_stale_rids(ForwardMode.EXTEND, {"c"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertTrue(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"b", "c"})
+
+    def test_decode_launch_still_drops_silently_departed_requests(self):
+        # An abort leaves the batch without a finish notification; the
+        # decode-mode set difference must keep catching it.
+        worker = self._worker({"a", "b"})
+
+        worker._cleanup_stale_rids(ForwardMode.DECODE, {"b"})
+
+        self.assertFalse(worker._mlx_runner.has_request("a"))
+        self.assertTrue(worker._mlx_runner.has_request("b"))
+        self.assertEqual(worker._mlx_active_rids, {"b"})
+
+    def test_unknown_request_is_not_marked(self):
+        worker = self._worker({"a"})
+        worker.prepare_for_kv_cache_release(_finished_req("ghost"))
+        self.assertEqual(worker._mlx_finished_rids, set())
 
 
 if __name__ == "__main__":
