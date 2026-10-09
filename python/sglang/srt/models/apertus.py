@@ -266,13 +266,17 @@ class ApertusDecoderLayer(nn.Module):
         self.feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        attn, ffn = self.stage_facts(layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.attention_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.feedforward_layernorm,
-            ),
+            (attn, self.attention_layernorm),
+            (ffn, self.feedforward_layernorm),
         )
+
+    @staticmethod
+    def stage_facts(layer_id: int):
+        """The stages every Apertus layer declares, an attention and a dense
+        FFN: the model's shared declaration function (see make_layers)."""
+        return (declare_attn(), declare_ffn(sparse=False, next_layer_sparse=False))
 
     def forward(
         self,
@@ -329,6 +333,7 @@ class ApertusModel(nn.Module):
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             prefix="model.layers",
+            stage_facts=ApertusDecoderLayer.stage_facts,
         )
 
         if self.pp_group.is_last_rank:
