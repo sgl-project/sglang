@@ -1672,9 +1672,8 @@ non-default speculative acceptance thresholds or deterministic inference.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-dispatcher-output-dtype`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`,<br/> `bf16`,<br/> `int8`<br/>(When enabling DeepEP for a quantized model, set the dispatcher output dtype according to your model’s quantization.
-If the value is int8, you must also set the environment variable:DEEP_NORMAL_MODE_USE_INT8_QUANT=1)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2/A3 Series</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`,<br/> `bf16`,<br/> `int8`,<br/> `mxfp8` (FP8 E4M3 with E8M0 block scales),<br/> `mxfp4` (packed FP4 E2M1 with E8M0 block scales)<br/>(Set the dispatcher output dtype according to the model quantization.)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2/A3 Series (BF16/INT8); Ascend 950PR/DT Series (MXFP8/MXFP4)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-config`</td>

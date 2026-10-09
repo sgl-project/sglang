@@ -98,7 +98,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=4000
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -270,7 +269,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export DEEPEP_HCCL_BUFFSIZE=2000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -400,7 +399,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -602,7 +600,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -804,7 +801,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1004,7 +1000,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2
@@ -1204,7 +1199,6 @@ do
     then
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
         export TASK_QUEUE_ENABLE=2

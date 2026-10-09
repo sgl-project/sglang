@@ -16,7 +16,6 @@
 
 import logging
 import os
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -144,100 +143,79 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        exit_stack = ExitStack()
-        if (
-            _is_npu
-            and self.quant_config is None
-            and get_model().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
 
-        try:
-            zero_allocator = BumpAllocator(
-                buffer_size=2,
-                dtype=torch.float32,
-                device=(
-                    input_embeds.device
-                    if input_embeds is not None
-                    else input_ids.device
-                ),
-            )
-
+        if input_embeds is None:
+            # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+            # (far above vocab_size). Use target-produced mm_input_embeds for
+            # these positions and only call embed_tokens on the appended
+            # next-token to avoid embed OOB.
+            input_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert input_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if input_embeds is None:
-                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
-                # (far above vocab_size). Use target-produced mm_input_embeds for
-                # these positions and only call embed_tokens on the appended
-                # next-token to avoid embed OOB.
-                input_embeds = forward_batch.mm_input_embeds
-                if (
-                    forward_batch.forward_mode.is_extend()
-                    and forward_batch.contains_mm_inputs()
-                    and not forward_batch.forward_mode.is_draft_extend_v2()
-                ):
-                    assert input_embeds is not None
-                    last_indices = (
-                        forward_batch.extend_start_loc
-                        + forward_batch.extend_seq_lens
-                        - 1
-                    ).long()
-                    input_embeds[last_indices] = self.embed_tokens(
-                        input_ids[last_indices]
-                    )
-                if input_embeds is None:
-                    input_embeds = self.embed_tokens(input_ids)
-            hidden_states = input_embeds
+                input_embeds = self.embed_tokens(input_ids)
+        hidden_states = input_embeds
 
-            if hidden_states.shape[0] > 0:
-                previous_hidden_states = forward_batch.spec_info.hidden_states
-                if self.rot_weight is not None:
-                    previous_hidden_states = torch.matmul(
-                        previous_hidden_states, self.rot_weight
-                    )
-                if _is_cuda:
-                    eh_input = fused_eh_norm(
-                        hidden_states,
-                        previous_hidden_states,
-                        self.enorm.weight,
-                        self.hnorm.weight,
-                        self.enorm.variance_epsilon,
-                    )
-                else:
-                    eh_input = torch.cat(
-                        (
-                            self.enorm(hidden_states),
-                            self.hnorm(previous_hidden_states),
-                        ),
-                        dim=-1,
-                    )
-                if isinstance(self.eh_proj, ReplicatedLinear):
-                    hidden_states, _ = self.eh_proj(eh_input)
-                else:
-                    hidden_states = self.eh_proj(eh_input)
-
-            residual_batch.start(forward_batch)
-            index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
-            with get_global_expert_distribution_recorder().disable_this_region():
-                (hidden_states, topk_indices) = self.decoder(
-                    positions,
+        if hidden_states.shape[0] > 0:
+            previous_hidden_states = forward_batch.spec_info.hidden_states
+            if self.rot_weight is not None:
+                previous_hidden_states = torch.matmul(
+                    previous_hidden_states, self.rot_weight
+                )
+            if _is_cuda:
+                eh_input = fused_eh_norm(
                     hidden_states,
-                    forward_batch,
-                    zero_allocator,
-                    prev_topk_indices=index_topk_share.topk_indices,
+                    previous_hidden_states,
+                    self.enorm.weight,
+                    self.hnorm.weight,
+                    self.enorm.variance_epsilon,
                 )
-            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-            if not forward_batch.forward_mode.is_idle():
-                hidden_states = residual_batch.final_norm(
-                    hidden_states, forward_batch, self.shared_head.norm
+            else:
+                eh_input = torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(previous_hidden_states),
+                    ),
+                    dim=-1,
                 )
+            if isinstance(self.eh_proj, ReplicatedLinear):
+                hidden_states, _ = self.eh_proj(eh_input)
+            else:
+                hidden_states = self.eh_proj(eh_input)
 
-            index_topk_share.update(topk_indices)
-            index_topk_share.publish()
-        finally:
-            exit_stack.close()
+        residual_batch.start(forward_batch)
+        index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
+        with get_global_expert_distribution_recorder().disable_this_region():
+            (hidden_states, topk_indices) = self.decoder(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=index_topk_share.topk_indices,
+            )
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.shared_head.norm
+            )
+
+        index_topk_share.update(topk_indices)
+        index_topk_share.publish()
 
         return hidden_states
 
