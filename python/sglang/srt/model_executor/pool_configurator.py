@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_right
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -248,6 +249,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            if eagle_draft_num_layers is None and is_float4_e2m1fn_x2(
+                kvc.kv_cache_dtype
+            ):
+                # Path-less MTP is resolved for fused placement without changing
+                # the historical private-pool layer count. FP4 still needs to
+                # reserve the private draft's own storage and workspace.
+                eagle_draft_num_layers = kvc.spec_aux_config.draft_kv_num_layers
             fused_full_entry = kvc.fused_entry_bytes("full")
             if fused_full_entry is not None:
                 self._cell_size = int(fused_full_entry)
@@ -287,9 +295,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         draft_indexer_size *= dcp_size
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
-                    )
+                    if is_float4_e2m1fn_x2(kvc.kv_cache_dtype):
+                        # FP4 has a per-worker dequant workspace shared across
+                        # layers. The draft therefore needs its own full
+                        # workspace, not a layer-proportional fraction of the
+                        # target workspace.
+                        self._cell_size += self._compute_eagle_fp4_draft_cell_size(
+                            kvc, draft_num_layers
+                        )
+                    else:
+                        self._cell_size = int(
+                            self._cell_size * (1 + draft_num_layers / int(num_layers))
+                        )
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
@@ -314,6 +331,44 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+    def _compute_eagle_fp4_draft_cell_size(
+        self, kvc: KVCacheConfigurator, num_layers: int
+    ) -> int:
+        """Price the draft's dtype with the allocator's selected FP4 recipe.
+
+        Like the existing EAGLE sizing path, this assumes target/draft attention
+        geometry matches. The allocator selects buffers from shared server_args,
+        including when the draft executes on an overridden backend. An explicit
+        auto dtype is conservatively priced at the draft's compute dtype before
+        the draft model's quant config loads.
+        """
+        draft_dtype = get_spec().speculative_draft_kv_cache_dtype
+        draft_backend = get_spec().speculative_draft_attention_backend
+        if draft_dtype is None or draft_dtype == kvc.kv_cache_dtype_str:
+            return self._compute_cell_size(kvc, num_layers)
+
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        draft_model_config = kvc.spec_aux_config.draft_model_config
+        draft_model_dtype = (
+            draft_model_config.dtype
+            if draft_model_config is not None
+            else kvc.model_dtype
+        )
+        dtype_str, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=kvc.kv_cache_dtype_str,
+            speculative_draft_kv_cache_dtype=draft_dtype,
+            model=None,
+            model_dtype=draft_model_dtype,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend=draft_backend,
+        )
+        draft_kvc = copy(kvc)
+        draft_kvc.kv_cache_dtype = dtype
+        draft_kvc.kv_cache_dtype_str = dtype_str or draft_dtype
+        return self._compute_cell_size(draft_kvc, num_layers)
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
@@ -480,7 +535,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     effective_num_layers,
                     kv_size,
                 )
-            elif self.kv_cache_dtype_str == "mxfp8":
+            elif kvc.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
