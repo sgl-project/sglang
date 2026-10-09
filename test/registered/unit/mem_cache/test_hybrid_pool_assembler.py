@@ -597,8 +597,8 @@ class TestDeclaredStackStructure(CustomTestCase):
         )
 
     def test_plain_mla_target(self):
-        # A pool that declares KV only builds the anchor-only group the removed
-        # build_kv_only_stack built, packed draft included.
+        # A pool that declares KV only builds an anchor-only group, packed
+        # draft included.
         for drafts in (0, 1):
             with self.subTest(drafts=drafts):
                 pool = _kv_pool_stub(layer_num=3)
@@ -999,6 +999,63 @@ class TestHostPoolPreflight(CustomTestCase):
         self.assertEqual(
             [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
         )
+
+
+class TestPlainKvStrategyOnDeclarations(CustomTestCase):
+    """The plain full-attention path assembles from host_pool_decls() like the
+    sparse ones, so its result carries the declarations the presence check reads."""
+
+    def test_plain_mla_pool_builds_kv_entry_from_its_declaration(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _PlainKvStrategy,
+        )
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        pool = _kv_pool_stub(layer_num=2)
+
+        def dummy_kv_host(**kwargs):
+            return MLATokenToKVPoolHost(
+                kwargs["kv_pool"],
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=kwargs["page_size"],
+                layout="page_first",
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=kwargs["kv_pool"].kv_cache_dim,
+            )
+
+        with (
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            result = _PlainKvStrategy().build(
+                cache=None,
+                kvcache=pool,
+                params=_target_params(),
+                server_args=None,
+                load_cache_event=None,
+            )
+
+        self.assertEqual(
+            [e.name for e in result.host_pool_group.entries], [PoolName.KV]
+        )
+        self.assertTrue(result.host_pool_group.entries[0].is_primary_index_anchor)
+        self.assertEqual([d.pool_name for d in result.pool_declarations], [PoolName.KV])
+        self.assertEqual(result.pools_desc, "KV")
+        self.assertEqual(result.sidecars, [])
 
 
 class TestDeclaredPoolVerification(CustomTestCase):
