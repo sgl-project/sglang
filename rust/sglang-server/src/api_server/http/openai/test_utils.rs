@@ -157,6 +157,175 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn assert_bootstrap_requests(
+    path: &str,
+    body: serde_json::Value,
+    expected: Vec<(Option<&str>, Option<i64>, Option<i64>)>,
+) {
+    use crate::message::request::RequestKind;
+    use crate::tokenizer_manager::wiring::TmEvent;
+
+    let (intake_tx, intake_rx) = flume::unbounded();
+    let (abort_tx, _abort_rx) = flume::unbounded();
+    let core = CoreHandle::new(
+        intake_tx,
+        abort_tx,
+        crate::api_server::core::CoreConfig {
+            response_capacity: 8,
+            response_activity: Default::default(),
+            startup_ready: true,
+            is_disaggregation: true,
+            mm_limits: Default::default(),
+            metadata: crate::api_server::core::CoreMetadata::default(),
+        },
+    );
+    let formatter = super::ChatFormatter::Legacy(Box::new(super::template::LegacyFormatter {
+        spec: super::template::builtin_template("chatml").unwrap(),
+    }));
+    let state = Arc::new(super::AppState {
+        core,
+        server_args: server_args(),
+        chat_formatter: Some(formatter),
+    });
+    let response = post_json(routes().with_state(state), path, body);
+    let responder = async {
+        for (host, port, room) in expected {
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("OpenAI generation must enter through core intake");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Generate(generate) = &request.kind else {
+                panic!("OpenAI endpoint must submit a generation request");
+            };
+            assert_eq!(generate.bootstrap_host.as_deref(), host);
+            assert_eq!(generate.bootstrap_port, port);
+            assert_eq!(generate.bootstrap_room, room);
+            request
+                .sink
+                .try_send(chunk(request.rid.as_str(), "ok", true))
+                .unwrap();
+        }
+    };
+    let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(response, responder)
+    })
+    .await
+    .expect("OpenAI request must complete after its scheduler response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(intake_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn chat_forwards_pd_bootstrap_fields_to_every_choice() {
+    for stream in [false, true] {
+        assert_bootstrap_requests(
+            "/v1/chat/completions",
+            json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 2,
+                "stream": stream,
+                "bootstrap_host": "prefill",
+                "bootstrap_port": 8998,
+                "bootstrap_room": 9007199254740993_i64
+            }),
+            vec![
+                (Some("prefill"), Some(8998), Some(9007199254740993)),
+                (Some("prefill"), Some(8998), Some(9007199254740994)),
+            ],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn chat_preserves_list_bootstrap_room_for_all_choices() {
+    assert_bootstrap_requests(
+        "/v1/chat/completions",
+        json!({
+            "model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 2,
+            "bootstrap_host": ["prefill"], "bootstrap_port": [null], "bootstrap_room": [41]
+        }),
+        vec![(Some("prefill"), None, Some(41)); 2],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn completions_preserve_per_prompt_bootstrap_fields_for_all_choices() {
+    assert_bootstrap_requests(
+        "/v1/completions",
+        json!({
+            "model": "model", "prompt": ["one", "two"], "n": 2,
+            "bootstrap_host": ["prefill-a", "prefill-b"],
+            "bootstrap_port": [8998, null], "bootstrap_room": [41, 52]
+        }),
+        vec![
+            (Some("prefill-a"), Some(8998), Some(41)),
+            (Some("prefill-a"), Some(8998), Some(41)),
+            (Some("prefill-b"), None, Some(52)),
+            (Some("prefill-b"), None, Some(52)),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn token_completions_expand_scalar_bootstrap_rooms_in_sample_major_order() {
+    assert_bootstrap_requests(
+        "/v1/completions",
+        json!({
+            "model": "model", "prompt": [[1], [2]], "n": 2,
+            "bootstrap_host": "prefill", "bootstrap_room": 41
+        }),
+        vec![
+            (Some("prefill"), None, Some(41)),
+            (Some("prefill"), None, Some(43)),
+            (Some("prefill"), None, Some(42)),
+            (Some("prefill"), None, Some(44)),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mismatched_bootstrap_lists_are_rejected_before_submission() {
+    let app = routes().with_state(app_state(frontend_closed()));
+    for (field, value) in [
+        ("bootstrap_host", json!(["prefill"])),
+        ("bootstrap_port", json!([null])),
+        ("bootstrap_room", json!([41])),
+    ] {
+        let mut body = json!({"model": "model", "prompt": ["one", "two"]});
+        body[field] = value;
+        let response = post_json(app.clone(), "/v1/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        assert!(
+            body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(field)
+        );
+    }
+    let response = post_json(
+        app,
+        "/v1/chat/completions",
+        json!({
+            "model": "model", "messages": [{"role": "user", "content": "hi"}],
+            "bootstrap_room": [41, 42]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bootstrap_room")
+    );
+}
+
 #[tokio::test]
 async fn dropping_indexed_stream_aborts_its_live_call() {
     use crate::tokenizer_manager::wiring::AbortSource;
