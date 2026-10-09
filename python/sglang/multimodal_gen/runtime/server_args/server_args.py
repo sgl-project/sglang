@@ -483,6 +483,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # stay eager). Mutually exclusive with --enable-torch-compile and
     # Cache-DiT; BCG takes priority when more than one is requested.
     #
+    # PyTorch's two approximate numerics defaults, set explicitly per worker
+    # (see runtime/utils/numerics_policy.py). They are process-global, so they
+    # cannot follow a request's quality level; the defaults keep PyTorch's own
+    # values so the exact tier's speed is unchanged.
+    allow_cudnn_tf32: bool = True
+    allow_bf16_reduced_precision_reduction: bool = True
     # BCG graphs are resolution-specific, so --warmup-resolutions is required
     # when BCG is enabled: every requested resolution is captured at warmup so
     # serving never triggers a fresh capture.
@@ -2444,6 +2450,23 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--allow-cudnn-tf32",
+            action=StoreBoolean,
+            default=ServerArgs.allow_cudnn_tf32,
+            help="Let cuDNN run fp32 convolutions on TF32 tensor cores, which "
+            "truncates their inputs to 10 mantissa bits (PyTorch's own "
+            "default). Affects the fp32 VAE decoders; pass false together "
+            "with --allow-bf16-reduced-precision-reduction false for "
+            "reference-precision fp32 and bf16 math.",
+        )
+        parser.add_argument(
+            "--allow-bf16-reduced-precision-reduction",
+            action=StoreBoolean,
+            default=ServerArgs.allow_bf16_reduced_precision_reduction,
+            help="Let a bf16 GEMM accumulate its split-K partials below fp32 "
+            "(PyTorch's own default). See --allow-cudnn-tf32.",
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",

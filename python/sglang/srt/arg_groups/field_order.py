@@ -284,6 +284,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_window_size",
     "speculative_moe_runner_backend",
     "speculative_moe_a2a_backend",
+    "speculative_enable_w4a4_mxfp4_megamoe",
     "speculative_draft_model_quantization",
     "_speculative_draft_quantization_explicitly_set",
     "speculative_skip_dp_mlp_sync",

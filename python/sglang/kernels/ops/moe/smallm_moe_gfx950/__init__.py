@@ -118,7 +118,7 @@ class _Kernel:
             f"hipModuleGetFunction {name}",
         )
 
-    def launch(self, grid, args, stream):
+    def launch(self, grid, args, stream, block=256, shared=0):
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
             1,
@@ -133,10 +133,10 @@ class _Kernel:
                 grid,
                 1,
                 1,
-                256,
+                block,
                 1,
                 1,
-                0,
+                shared,
                 ctypes.c_void_p(stream),
                 None,
                 ctypes.cast(extra, ctypes.c_void_p),
