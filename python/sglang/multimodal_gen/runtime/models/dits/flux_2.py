@@ -573,7 +573,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.dropout = dropout
 
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
         # FP8 exports separate Diffusers tensors, but the loader can merge

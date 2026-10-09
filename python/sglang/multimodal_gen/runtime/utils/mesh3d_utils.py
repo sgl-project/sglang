@@ -305,12 +305,10 @@ class MeshRender:
         self.set_default_texture_resolution(texture_size)
 
         self.camera_distance = camera_distance
-        self.camera_type = camera_type
         self.bake_angle_thres = 75
         self.bake_unreliable_kernel_size = int(
             (2 / 512) * max(self.default_resolution[0], self.default_resolution[1])
         )
-        self.bake_mode = bake_mode
 
         # Set up camera projection matrix
         if camera_type == "orth":

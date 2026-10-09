@@ -118,8 +118,6 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
     Returns the number of Conv3d modules converted.
     """
-    if not hasattr(torch, "channels_last_3d"):
-        return 0
     num_converted = 0
     for m in module.modules():
         if isinstance(m, nn.Conv3d):

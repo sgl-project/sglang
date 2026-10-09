@@ -11,7 +11,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
+    LTXVideoVAEConfig,
+    get_ltx_video_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -564,36 +567,9 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-
-        scaling_factor = (
-            getattr(getattr(vae, "config", None), "scaling_factor", None)
-            or getattr(vae, "scaling_factor", None)
-            or getattr(self.vae_config.arch_config, "scaling_factor", None)
-            or 1.0
+        return get_ltx_video_decode_scale_and_shift(
+            device, dtype, vae, self.vae_config.arch_config
         )
-        if isinstance(scaling_factor, (int, float)) and float(scaling_factor) == 0.0:
-            scaling_factor = 1.0
-
-        if isinstance(latents_mean, torch.Tensor) and isinstance(
-            latents_std, torch.Tensor
-        ):
-            latents_mean = latents_mean.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            latents_std = latents_std.to(device=device, dtype=dtype).view(
-                1, -1, 1, 1, 1
-            )
-            sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-                1, 1, 1, 1, 1
-            )
-            return sf / latents_std, latents_mean
-
-        sf = torch.tensor(float(scaling_factor), device=device, dtype=dtype).view(
-            1, 1, 1, 1, 1
-        )
-        return sf, None
 
     @staticmethod
     def _unpack_latents(
@@ -625,29 +601,6 @@ class LTX2PipelineConfig(PipelineConfig):
             .flatten(2, 3)
         )
         return latents
-
-    @staticmethod
-    def _denormalize_latents(
-        latents: torch.Tensor,
-        latents_mean: torch.Tensor,
-        latents_std: torch.Tensor,
-        scaling_factor: float = 1.0,
-    ) -> torch.Tensor:
-        # Denormalize latents across the channel dimension [B, C, F, H, W]
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents * latents_std / scaling_factor + latents_mean
-        return latents
-
-    @staticmethod
-    def _denormalize_audio_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
-    ):
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents * latents_std) + latents_mean
 
     @staticmethod
     def _unpack_audio_latents(
