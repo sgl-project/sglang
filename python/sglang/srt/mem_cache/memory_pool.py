@@ -2862,7 +2862,16 @@ class MHATokenToKVPool(KVCache):
             # A slot is [page, :, off, :] (not a contiguous row), so scatter by (page, off).
             k_buf = self.k_buffer[layer_id - self.start_layer]
             v_buf = self.v_buffer[layer_id - self.start_layer]
-            if _is_cuda and self.head_dim == self.v_head_dim:
+            # The fused writer supports arbitrary token strides, but assumes
+            # contiguous heads and dimensions within each source token.
+            if (
+                _is_cuda
+                and self.head_dim == self.v_head_dim
+                and cache_k.stride(1) == self.head_dim
+                and cache_v.stride(1) == self.v_head_dim
+                and cache_k.stride(2) == 1
+                and cache_v.stride(2) == 1
+            ):
                 launch_reshape_and_cache_flash(
                     cache_k,
                     cache_v,
