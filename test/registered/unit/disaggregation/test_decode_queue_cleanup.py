@@ -251,7 +251,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock()
-        queue.token_to_kv_pool_allocator = MagicMock()
+        # SWA tail pre-allocation runs on a paged pool.
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
         queue.req_to_token_pool = MagicMock()
@@ -403,7 +404,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         mock_prepare_abort.assert_called_once()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
         receiver = FakeReceiver()
@@ -422,7 +423,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
         receiver = MagicMock()
@@ -505,7 +506,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         queue._defer_release.assert_not_called()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
+            req, queue.tree_cache, checkpoint=False
         )
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):

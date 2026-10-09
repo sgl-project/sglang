@@ -1,3 +1,5 @@
+import shutil
+
 import numpy as np
 import pytest
 import torch
@@ -73,6 +75,24 @@ def test_png_output_saving_uses_fast_pillow_path(
     assert save_calls == [("PNG", expected_compress_level)]
 
 
+def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
+    written = []
+    imwrite = output_utils.imageio.imwrite
+
+    def imwrite_spy(path, frame, **kwargs):
+        written.append((path, kwargs))
+        return imwrite(path, frame, **kwargs)
+
+    monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
+    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+
+    output_utils.warm_image_writer()
+
+    assert len(written) == 1
+    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     output_path = tmp_path / "sample.mp4"
     calls = []
@@ -82,15 +102,15 @@ def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
         def write(*_args, **_kwargs):
             pass
 
-    def mimsave_spy(path, frames, **kwargs):
+    def encode_spy(path, frames, **kwargs):
         calls.append((path, frames, kwargs))
         assert kwargs["audio_path"].endswith(".wav")
-        assert kwargs["audio_codec"] == "aac"
+        assert kwargs["quality"] == 5
 
     def fail_legacy_mux(**_kwargs):
         raise AssertionError("the two-pass mux path should not run")
 
-    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", fail_legacy_mux)
 
@@ -126,13 +146,13 @@ def test_x264_preset_reaches_every_video_save_path(tmp_path, monkeypatch):
         presets.append(("direct", kwargs["x264_preset"]))
         return False
 
-    def mimsave_spy(_path, _frames, **kwargs):
-        encoder = "single-pass" if "audio_path" in kwargs else "imageio"
-        presets.append((encoder, kwargs["output_params"][-1]))
+    def encode_spy(_path, _frames, **kwargs):
+        encoder = "single-pass" if "audio_path" in kwargs else "ffmpeg"
+        presets.append((encoder, kwargs["x264_preset"]))
 
     monkeypatch.setattr(output_utils, "_try_save_cuda_videos_direct", parallel_save)
     monkeypatch.setattr(output_utils, "_try_save_cuda_video_direct", direct_save)
-    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
 
     output_utils.save_outputs(
@@ -159,7 +179,7 @@ def test_x264_preset_reaches_every_video_save_path(tmp_path, monkeypatch):
     assert {encoder for encoder, _ in presets} == {
         "parallel",
         "direct",
-        "imageio",
+        "ffmpeg",
         "single-pass",
     }
     assert {preset for _, preset in presets} == {"ultrafast"}
@@ -175,12 +195,12 @@ def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
         def write(*_args, **_kwargs):
             pass
 
-    def mimsave_spy(path, frames, **kwargs):
+    def encode_spy(path, frames, **kwargs):
         calls.append((path, frames, kwargs))
         if "audio_path" in kwargs:
             raise RuntimeError("unsupported audio input")
 
-    monkeypatch.setattr(output_utils.imageio, "mimsave", mimsave_spy)
+    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(
         output_utils,
@@ -298,3 +318,11 @@ def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(
     assert kwargs["fps"] == 24
     assert len(serial_calls) == 1
     assert serial_calls[0]["save_file_path"] == paths[1]
+
+
+def test_video_output_preserves_pinned_encoder(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda _: "/system/ffmpeg")
+    monkeypatch.setattr(
+        output_utils.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/pinned/ffmpeg"
+    )
+    assert output_utils._resolve_ffmpeg_exe() == "/pinned/ffmpeg"

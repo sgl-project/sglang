@@ -184,7 +184,7 @@
             "estimated_full_test_time_s": 331.5,
             "stages_ms": {
                 "InputValidationStage": 0.11,
-                "TextEncodingStage": 764.42,
+                "TextEncodingStage": 1668.24,
                 "LatentPreparationStage": 1.26,
                 "TimestepPreparationStage": 0.97,
                 "DenoisingStage": 70658.77,
@@ -243,7 +243,7 @@
                 "48": 1400.3,
                 "49": 1400.39
             },
-            "expected_e2e_ms": 75427.76,
+            "expected_e2e_ms": 76292.24,
             "expected_load_ms": 48009.32,
             "expected_avg_denoise_ms": 1406.13,
             "expected_median_denoise_ms": 1400.58
