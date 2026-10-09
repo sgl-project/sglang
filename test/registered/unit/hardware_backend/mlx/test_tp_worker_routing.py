@@ -64,6 +64,7 @@ class _FakeRunner:
         # (op, rid) -> needs_logits as received; guards the worker's
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
+        self.removed_sync_kv: dict[str, bool] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -73,6 +74,11 @@ class _FakeRunner:
 
     def flush_all_decode_kv(self):
         pass
+
+    def remove_request(self, rid, sync_kv=True):
+        self.calls.append(("remove_request", rid))
+        self.removed_sync_kv[rid] = sync_kv
+        self._known.discard(rid)
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -167,6 +173,7 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
+        self.retraction_count = 0
         self.prefix_len = 0
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
@@ -214,6 +221,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._req_retraction_count = {}
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -254,6 +262,24 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
 
+    # ---------- retraction ----------
+
+    def test_retracted_request_reprefills_from_scratch(self):
+        """A request retracted after its MLX state was made drops that state
+        without a pool sync, so its re-prefill routes as a fresh prefill."""
+        worker = self._worker(known_rids=set())
+        req = _FakeReq("r1")
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        worker._mlx_runner._known.add("r1")
+
+        req.retraction_count += 1
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        self.assertEqual(worker._mlx_runner.removed_sync_kv, {"r1": False})
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"),
+            ["prefill_start", "remove_request", "prefill_start"],
+        )
+
     # ---------- sync path: _forward_batch_generation_mlx ----------
 
     def _run_sync(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
@@ -292,10 +318,7 @@ class TestMlxExtendRouting(CustomTestCase):
     # ---------- async path: _async_extend_batch ----------
 
     def _run_async(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
-
-        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker._mlx_runner = _FakeRunner(known_rids)
+        worker = self._worker(known_rids)
         batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
         launch = worker._async_extend_batch(batch)
         return worker._mlx_runner, launch
