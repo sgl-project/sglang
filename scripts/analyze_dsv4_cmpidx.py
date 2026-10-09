@@ -156,6 +156,10 @@ def report_group(rows, key, label):
           f"  first_lastpos={lp0}")
     print(f"  FIRST divergent step lastpos={lp0}; layers there = "
           f"{sorted(ly for lp, ly, _ in div if lp == lp0)}")
+    div_lps = sorted(set(lp for lp, _, _ in div))
+    _show = div_lps[:30]
+    print(f"  divergent lastpos ({len(div_lps)}): {_show}"
+          + (" ..." if len(div_lps) > 30 else ""))
     print(f"  sample (lastpos, layer, distinct_{key}):")
     for lp, ly, s in div[:MAX_DIFF_SHOWN]:
         print(f"     lastpos={lp} layer={ly}  {key}s={s}")
