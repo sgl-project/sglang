@@ -11,8 +11,9 @@ request body, the processor produces **the same prompt text and the same prompt
 token ids** as Python's `OpenAIServingChat`. Python is the reference, Dynamo is
 the implementation, and SGLang code exists only where the two differ.
 
-Scope: the request -> prompt -> token ids path. Output parsing (reasoning and
-tool calls) and multimodal preprocessing are not covered here.
+Scope: the request -> prompt -> token ids path, plus the checks that let hosts
+serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
+Multimodal preprocessing is not covered here.
 
 The worked example is DeepSeek-V4-Flash-0731: `src/render/models/deepseek_v4.rs`
 plus `tests/fixtures/parity/deepseek-v4-flash-0731.json`. Paths below are relative
@@ -177,6 +178,24 @@ snapshot is missing, the test prints `token ids not checked` (visible with
 `-- --nocapture`), so confirm that line is absent before claiming token parity.
 With the snapshot cached, the test also checks that the checkpoint resolves the
 fixture's recorded DeepSeek-V4 profile.
+
+## OpenAI layer
+
+A host serves a model's OpenAI requests through `/generate` (`src/openai/`) only
+once its render parity holds. Two more fixtures then cover the rest of Python's
+OpenAI layer:
+- `tests/fixtures/reasoning_parity/<parser>.json`, from
+  `tests/scripts/generate_reasoning_parity.py`: SGLang's `ReasoningParser` on
+  chunked outputs. A parser is served once `src/think/models/` ports it.
+- `tests/fixtures/tool_parity/<parser>.json`, from
+  `tests/scripts/generate_tool_parity.py`: SGLang's `FunctionCallParser` on
+  chunked outputs, replayed by the test in `src/tool_call/models/mod.rs`. A tool
+  parser is served once `src/tool_call/models/` ports it.
+- `tests/fixtures/openai_parity/<model-id>.json`, from
+  `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
+  the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
+  output for it, and the response Python builds from that output. Launch the
+  engine with the model's cookbook flags, including its parsers.
 
 ## Pitfalls
 
