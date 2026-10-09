@@ -1332,13 +1332,10 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                     break
                 if loaded_stacked_param:
                     continue
-            try:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-            except KeyError:
-                raise
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            param = params_dict[name]
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             loaded_weight = loaded_weight.to(param.dtype)
