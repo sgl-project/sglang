@@ -9,8 +9,6 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Callable, Mapping, Optional
 
-import msgspec
-
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
@@ -730,31 +728,6 @@ def _fork_input(prepared, consumer):
     return StageConnection(prepared.consumer, consumer, {}, entries)
 
 
-def _incoming(stage, previous_incoming=None):
-    """The boundary into ``stage``. ``previous_incoming`` is the boundary its
-    producer was bound with, when that producer ended the previous append and
-    its own history is no longer on ``stage``."""
-    if stage.prepared_from is not None:
-        return _fork_input(_incoming(stage.prepared_from), stage)
-    previous = stage.previous
-    # A normal attention may retain a finer residual than its output rows.
-    # FFN and mixer exits declare their returned residual placement directly.
-    source = None
-    if (
-        previous is not None
-        and previous.kind is StageKind.ATTENTION
-        and previous.reduction is ProducerReduction.ALWAYS_PARTIAL
-    ):
-        source = (
-            previous_incoming if previous_incoming is not None else _incoming(previous)
-        )
-    return _connect(
-        previous,
-        stage,
-        residual_from=source,
-    )
-
-
 class _Append:
     """One append_stages call: its validated stages, the boundaries it
     returned, which the stack fills in when it closes, and where it was made."""
@@ -859,58 +832,6 @@ def _note_origin(error: Exception, origin: str) -> None:
         add_note(f"while binding the stages appended at {origin}")
 
 
-class _PendingStage:
-    """The last stage of a linear append. Its consumer is the next append's
-    first stage, or the stack exit, so it binds only once that is known."""
-
-    __slots__ = (
-        "boundary",
-        "declaration",
-        "norm",
-        "options",
-        "predecessor",
-        "predecessor_incoming",
-        "predecessor_boundary",
-        "origin",
-    )
-
-    def __init__(
-        self,
-        boundary,
-        declaration,
-        norm,
-        options,
-        predecessor,
-        predecessor_incoming,
-        predecessor_boundary,
-        origin,
-    ):
-        self.boundary = boundary
-        self.declaration = declaration
-        self.norm = norm
-        self.options = options
-        # The stage before it within the same append, or None when it is the
-        # append's only stage and takes its input from the stack.
-        self.predecessor = predecessor
-        self.predecessor_incoming = predecessor_incoming
-        self.predecessor_boundary = predecessor_boundary
-        self.origin = origin
-
-
-class _Chain:
-    """The stage a following append extends, and the one stage still waiting
-    for its consumer, while the stack binds its appends in order."""
-
-    __slots__ = ("previous", "pending", "previous_incoming")
-
-    def __init__(self, previous):
-        self.previous = _detached(_handed_off(previous))
-        self.pending = None
-        # The boundary the stage ``previous`` stands for was bound with, once
-        # it is bound on this rank: ``previous`` itself drops that history.
-        self.previous_incoming = None
-
-
 def _handed_off(declaration):
     """A stage whose output crosses to another pipeline rank: an FFN leaves it
     on the attention's rows, which is what the handoff carries and the next
@@ -956,56 +877,189 @@ def _return_before_trailing_attention(line):
 
 
 def _detached(declaration):
-    """The declaration a following append extends, without its own history.
-
-    A stage's incoming edge reads its producer's own incoming edge only when
-    the producer is an attention that always leaves its sum; the copy has no
-    history, so that lookback stops at the producer.
-    """
+    """The declaration as the stage after it records it: without its own
+    history, so a bound stage holds its producer's facts and not the chain of
+    declarations before it."""
     if declaration is None:
         return None
     return replace(declaration, previous=None, prepared_from=None)
 
 
 def _bind_stack(appends, *, previous, following, final_read=None):
-    """Bind every appended stage, in order, and fill in the boundaries each
-    append returned."""
+    """Bind every appended stage and fill in the boundaries each append
+    returned.
+
+    The stages of the appends that extend the stack form one line, chained in
+    append order, and every connection between two of them is built once:
+    each stage's outgoing connection is the next one's incoming. A branch
+    then starts from the incoming connection of the stage it branches from.
+    """
     line = [a for a in appends if a.prepared_from is None]
     if following is not None:
         # The last stage hands off to the next rank.
         line[-1].declarations[-1] = _handed_off(line[-1].declarations[-1])
     _return_before_trailing_attention(line)
-    chain = _Chain(previous)
-    # A returned declaration's boundary as bound, for the branches that read it.
+    if following is None:
+        # Without a stage on a later rank, the last one ends the model's stack,
+        # read by the final read.
+        line[-1].declarations[-1] = _ended(
+            replace(line[-1].declarations[-1], terminal=True), final_read
+        )
+    stages = [
+        (append, index) for append in line for index in range(len(append.bindings))
+    ]
+    bound = {id(append): [None] * len(append.bindings) for append in appends}
+    # A returned declaration's stage as bound, for the branches that start from it.
     sources = {}
-    bound = []
-    for append in appends:
-        prepared_from = append.prepared_from
-        if prepared_from is not None:
-            source = sources.get(id(prepared_from))
-            if source is None:
-                raise ValueError(
-                    "prepared_from must be the declaration of a stage appended "
-                    f"earlier to the same layer stack (at {append.origin})"
-                )
-            prepared_from = source.declaration
-        boundaries = _extend(chain, append, prepared_from)
-        for returned, boundary in zip(append.boundaries, boundaries):
-            sources[id(returned.declaration)] = boundary
-        bound.append(boundaries)
-    # The last stage's consumer is the next rank's first stage, if any;
-    # without one it ends the model's layer stack, read by the final read.
-    _bind_pending(
-        chain,
-        consumer=following,
-        terminal=following is None,
+    producer = _detached(_handed_off(previous))
+    chained = []
+    for append, index in stages:
+        chained.append(
+            replace(append.declarations[index], previous=producer, prepared_from=None)
+        )
+        producer = _detached(chained[-1])
+    connections = []
+    for position, declaration in enumerate(chained):
+        try:
+            if not connections:
+                connections.append(_stack_entry(declaration, declaration.previous))
+            consumer = (
+                chained[position + 1] if position + 1 < len(chained) else following
+            )
+            connections.append(
+                _connect(declaration, consumer, residual_from=connections[position])
+            )
+        except Exception as error:
+            _note_origin(error, stages[position][0].origin)
+            raise
+    _bind_line(
+        stages,
+        chained,
+        connections,
+        bound,
+        sources,
         final_read=final_read if following is None else None,
     )
+    for append in appends:
+        if append.prepared_from is None:
+            continue
+        source = sources.get(id(append.prepared_from))
+        if source is None:
+            raise ValueError(
+                "prepared_from must be the declaration of a stage appended "
+                f"earlier to the same layer stack (at {append.origin})"
+            )
+        source_declaration, source_incoming = source
+        branch = [(append, index) for index in range(len(append.bindings))]
+        chained = []
+        for index, declaration in enumerate(append.declarations):
+            chained.append(
+                replace(
+                    declaration,
+                    previous=chained[-1] if chained else None,
+                    prepared_from=None if chained else source_declaration,
+                )
+            )
+        try:
+            connections = [_fork_input(source_incoming, chained[0])]
+            for position, declaration in enumerate(chained):
+                consumer = (
+                    chained[position + 1] if position + 1 < len(chained) else None
+                )
+                connections.append(
+                    _connect(declaration, consumer, residual_from=connections[position])
+                )
+        except Exception as error:
+            _note_origin(error, append.origin)
+            raise
+        _bind_line(branch, chained, connections, bound, sources)
+    bound = [tuple(bound[id(append)]) for append in appends]
     _check_declared_gathers(appends, bound, remote_producer=previous is not None)
     for append, boundaries in zip(appends, bound):
         for returned, boundary in zip(append.boundaries, boundaries):
             returned.plan = boundary.plan
             returned.declaration = boundary.declaration
+
+
+def _stack_entry(stage, producer):
+    """The connection into a stack's first stage from ``producer``: the
+    stage before it on the previous rank, or None for the stack input. An
+    attention that always leaves its sum keeps its residual on the rows it ran
+    on, which this rank takes as the stack input's."""
+    source = None
+    if (
+        producer is not None
+        and producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        source = _connect(None, producer)
+    return _connect(producer, stage, residual_from=source)
+
+
+def _bind_line(stages, chained, connections, bound, sources, *, final_read=None):
+    """Bind a chain of stages from its connections, ``connections[i]`` into
+    ``chained[i]`` and ``connections[i + 1]`` out of it. An attention that
+    always leaves its sum binds after the FFN that follows it in the same
+    append, so the attention's entry keeps the residual that FFN's capture
+    needs."""
+    last = len(chained) - 1
+    boundaries = [None] * len(chained)
+
+    def bind(position):
+        append, index = stages[position]
+        norm, options = append.bindings[index]
+        consumer = None
+        if position < last and stages[position + 1][0] is append:
+            consumer = chained[position + 1]
+            if _carries_capture(chained[position], consumer):
+                bind(position + 1)
+        try:
+            boundary = _bind_stage(
+                chained[position],
+                norm,
+                connections[position],
+                connections[position + 1],
+                final_read=final_read if position == last else None,
+                capture_preserves_residual=(
+                    _preserves_residual(boundaries[position + 1])
+                    if consumer is not None
+                    and _carries_capture(chained[position], consumer)
+                    else None
+                ),
+                **options,
+            )
+        except Exception as error:
+            _note_origin(error, append.origin)
+            raise
+        boundaries[position] = boundary
+        bound[id(append)][index] = boundary
+        sources[id(append.boundaries[index].declaration)] = (
+            boundary.declaration,
+            connections[position],
+        )
+
+    for position in range(len(chained)):
+        if boundaries[position] is None:
+            bind(position)
+
+
+def _carries_capture(producer, consumer):
+    """Whether an attention that always leaves its sum keeps the residual its
+    FFN's entry needs for capture. Only between stages of one append."""
+    return (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
+        and consumer.kind is StageKind.FFN
+    )
+
+
+def _preserves_residual(consumer):
+    """Each variant's check that the FFN's entry leaves the residual in place."""
+    return {
+        variant: path.entry.preserves_residual
+        for variant, path in consumer.plan.paths.items()
+        if path.entry.preserves_residual is not None
+    }
 
 
 def _check_declared_gathers(appends, bound, *, remote_producer):
@@ -1046,63 +1100,6 @@ def _ended(declaration, final_read):
     ):
         return replace(declaration, exit_rows=ExitRows.SLICE)
     return declaration
-
-
-def _bind_pending(chain: _Chain, *, consumer, terminal, final_read=None):
-    pending = chain.pending
-    if pending is None:
-        return
-    chain.pending = None
-    try:
-        declaration = replace(pending.declaration, terminal=terminal)
-        if terminal:
-            declaration = _ended(declaration, final_read)
-        if pending.predecessor is None:
-            incoming = _incoming(declaration, chain.previous_incoming)
-        else:
-            incoming = _connect(
-                pending.predecessor,
-                declaration,
-                residual_from=pending.predecessor_incoming,
-            )
-        outgoing = _connect(declaration, consumer, residual_from=incoming)
-        bound = _bind_stage(
-            declaration,
-            pending.norm,
-            incoming,
-            outgoing,
-            final_read=final_read,
-            **pending.options,
-        )
-    except Exception as error:
-        _note_origin(error, pending.origin)
-        raise
-    pending.boundary.plan = bound.plan
-    pending.boundary.declaration = declaration
-    chain.previous_incoming = incoming
-    if pending.predecessor_boundary is not None:
-        _carry_capture(pending.predecessor_boundary, pending.boundary)
-
-
-def _carry_capture(producer, consumer):
-    """Let an attention that always leaves its sum preserve the residual its
-    FFN's entry needs for capture. Only between stages of one append."""
-    if not (
-        producer.kind is StageKind.ATTENTION
-        and producer.declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
-        and consumer.kind is StageKind.FFN
-    ):
-        return
-    for variant, steps in producer.plan.paths.items():
-        next_steps = consumer.plan.paths[variant]
-        predicate = next_steps.entry.preserves_residual
-        if predicate is not None:
-            producer.plan.paths[variant] = msgspec.structs.replace(
-                steps,
-                entry=msgspec.structs.replace(
-                    steps.entry, capture_preserves_residual=predicate
-                ),
-            )
 
 
 _STAGE_OPTIONS = {
@@ -1172,64 +1169,3 @@ def append_stages(*stages, prepared_from=None):
         _Append(declarations, bindings, prepared_from, boundaries, _origin(stack))
     )
     return boundaries
-
-
-def _extend(chain, append, prepared_from):
-    """Chain one append onto the stack and bind what can be bound."""
-    declarations, bindings = append.declarations, append.bindings
-    branch = prepared_from is not None
-    if not branch:
-        # This append's first stage is the consumer the pending stage waited for.
-        _bind_pending(chain, consumer=declarations[0], terminal=False)
-    try:
-        chained = []
-        for index, declaration in enumerate(declarations):
-            chained.append(
-                replace(
-                    declaration,
-                    previous=(
-                        chained[-1] if index else (None if branch else chain.previous)
-                    ),
-                    prepared_from=prepared_from if index == 0 else None,
-                )
-            )
-        boundaries = []
-        last = len(chained) - 1
-        # incoming feeds the stage being bound; previous_incoming fed the one
-        # before.
-        previous_incoming, incoming = (
-            None,
-            _incoming(chained[0], None if branch else chain.previous_incoming),
-        )
-        for index, (declaration, (norm, options)) in enumerate(zip(chained, bindings)):
-            if index == last and not branch:
-                boundaries.append(StageBoundary(None, declaration=declaration))
-                chain.pending = _PendingStage(
-                    boundaries[-1],
-                    declaration,
-                    norm,
-                    options,
-                    predecessor=chained[index - 1] if index else None,
-                    predecessor_incoming=previous_incoming,
-                    predecessor_boundary=boundaries[-2] if index else None,
-                    origin=append.origin,
-                )
-                break
-            following = chained[index + 1] if index < last else None
-            outgoing = _connect(declaration, following, residual_from=incoming)
-            boundaries.append(
-                _bind_stage(declaration, norm, incoming, outgoing, **options)
-            )
-            previous_incoming, incoming = incoming, outgoing
-    except Exception as error:
-        _note_origin(error, append.origin)
-        raise
-    if branch:
-        for producer, consumer in zip(boundaries, boundaries[1:]):
-            _carry_capture(producer, consumer)
-    else:
-        # The pair that ends on the pending stage is carried when it binds.
-        for producer, consumer in zip(boundaries[:-2], boundaries[1:-1]):
-            _carry_capture(producer, consumer)
-        chain.previous = _detached(chained[-1])
-    return tuple(boundaries)
