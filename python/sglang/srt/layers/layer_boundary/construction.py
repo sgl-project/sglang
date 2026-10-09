@@ -186,6 +186,8 @@ class StagePlan:
         finishes_directly=False,
         qkv_latent_func=None,
         fusions=None,
+        attn_tp_gather=None,
+        exit_gather=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
@@ -229,11 +231,16 @@ class StagePlan:
                     cp_moves=edges.cp_moves,
                     enters_stack=enters_stack,
                     attn_input_adapter=edges.attn_input_adapter,
+                    attn_tp_gather=attn_tp_gather,
                 )
             out = (
                 ExitMove()
                 if finishes_directly
-                else bind_exit(edges.outgoing, cp_moves=edges.cp_moves)
+                else bind_exit(
+                    edges.outgoing,
+                    cp_moves=edges.cp_moves,
+                    attn_tp_gather=exit_gather,
+                )
             )
             self.paths[variant] = StagePath(
                 entry=entry,
@@ -300,7 +307,7 @@ class StagePlan:
         )
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, **options):
+def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **options):
     if incoming.consumer != declaration or outgoing.producer != declaration:
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
@@ -334,6 +341,14 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         is_branch=declaration.prepared_from is not None,
         terminal=declaration.terminal,
         writes_at_handoff=declaration.writes_at_handoff,
+        attn_tp_gather=declaration.attn_tp_gather,
+        # The exit runs its consumer's gather: the next stage's, or the
+        # final read's.
+        exit_gather=getattr(
+            outgoing.consumer if outgoing.consumer is not None else final_read,
+            "attn_tp_gather",
+            None,
+        ),
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
         **options,

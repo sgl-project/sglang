@@ -82,6 +82,7 @@ The producer owns `ResidualUpdate`; the consumer owns `ResidualReadout` and its 
 - A nonlinear update cannot generally move before reduction. The post operation of manifold-constrained hyper-connections (MHC) is one such case.
 - `applied_at_exit` requests an update at the producer exit. A deferred update must guarantee that its parameters and state outlive that producer.
 - `ResidualReadout.reads_before_dp_gather` preserves reads that must execute on the source rows before a DP gather.
+- A read that needs every row of the attention's, such as one that adds a contribution computed for every row, declares `reads_after_attn_tp_gather`. A producer that would leave its output on this rank's attention-TP slice then returns it to the attention's rows; Qwen4-exp's per-layer embedding read and Kimi K3's attention-residual bank declare it.
 
 A read returns `(compute_input, residual)`. `update_and_read()` receives the producer's update together with the read, so an implementation can fuse them: the plain add+norm read does, and keeps its FP32 accumulation instead of normalizing a separately rounded snapshot. Fusion is not guaranteed. An implementation such as MHC may run the update and the read as separate steps, provided it preserves its existing rounding order.
 
@@ -201,6 +202,8 @@ hidden_states = residual_batch.final_norm(
 ```
 
 `skip_empty=True` still completes owed work on an empty batch, which may be a collective that other ranks join, and skips only the norm kernel. `final_norm()` and `to_pp()` release the batch's stream after they hand on its output.
+
+When the final read is more than a norm, pass it to `make_layers(final_read=...)` (or `layer_stack(final_read=...)`): it is then the last stage's consumer. Its `attn_tp_gather` gathers the rows the last FFN leaves on this rank's attention-TP slice, and with `reads_attn_tp_slices` it reads that slice itself and the last FFN leaves its output there. Kimi K3's `AttnBankOutputRead` is such a read.
 
 This is a non-pipeline stack fragment. Pipeline reception uses the first boundary's `from_pp(tensors, forward_batch)` to reconstruct a stream; the sender uses `residual_batch.to_pp()`. A stream the producer already wrote travels as `hidden_states` alone and arrives written: MHC's expanded streams, and the output of an FFN on its own rows (its attention-TP slice, or an unpadded batch's rows), which writes it at its exit before a pipeline handoff. The receiver knows this from the producer's declaration, not from which tensors arrive, since a captured CUDA graph's input buffers hold every key. Dynamic completion work is resolved before transport. By default, `to_pp()` preserves a statically declared partial sum for the receiver's incoming contract to reconstruct and complete. Do not call `complete_output()` before that handoff: it would complete a sum that the receiver still expects to perform.
 
@@ -339,7 +342,7 @@ A backend fusion provider is passed per stage as the `fusions` option, `(declara
 
 `install_cutedsl_fusion()` and `prepare_cutedsl_fusion()` find providers through the decoder layer's `attn_boundary` and `ffn_boundary` attributes.
 
-Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FfnInputFusion` declares the sum group it completes with residual add and norm. The consumer only tries compatible candidates for the declared update/read capabilities.
+Consumer fusion candidates are ordered. A candidate returning `None` must do so before modifying inputs or starting a collective, so fallback remains valid. `FfnInputFusion` declares the sum group it completes with residual add and norm. A residual read may supply its own candidates as `completing_fusions`: each `ReadoutFusion` completes a sum with the residual add, ahead of the read, and is tried before the built-in collective; one with `reads=True` also does the read. Where a stage reads its input on this rank's attention-TP slice and then gathers it, a read's `gathering_reads` may do both in one kernel. A stage may declare its own implementation of the gather over attention TP that brings rows into it (`declare_attn(attn_tp_gather=...)`), tried on every batch before the built-in gather: at its own entry, or at its producer's exit, since an exit runs its consumer's gather. Across a pipeline boundary the producer's rank takes that gather from the neighbouring layer it builds on the meta device, so the gather may use only the communication state of the rank it runs on, not the declaring layer's weights or buffers. The consumer only tries compatible candidates for the declared update/read capabilities.
 
 An `OutputTransform` declares contribution processing before residual update. Its explicit `before_reduce_scatter` setting preserves a supported implementation's order; it is not permission to commute arbitrary operations across a reduction.
 

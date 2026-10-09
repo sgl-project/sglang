@@ -159,10 +159,14 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
-def attn_tp_gather(tensor: torch.Tensor) -> torch.Tensor:
+def attn_tp_gather(tensor: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
+    """Gather this rank's attention-TP slice of the rows into all of them: in
+    the local DP buffer, or in a buffer of its own for an output that
+    outlives the next use of that buffer (``owned``)."""
     parallel = get_parallel()
-    if batches_are_unpadded():
-        # MLP sync, which sizes the local DP buffer for a batch, does not run.
+    if owned or batches_are_unpadded():
+        # MLP sync, which sizes the local DP buffer for a batch, does not run
+        # for an unpadded one.
         gathered = tensor.new_empty(
             (tensor.shape[0] * parallel.attn_tp_size, tensor.shape[-1])
         )

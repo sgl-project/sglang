@@ -14,7 +14,7 @@
 """Immutable stage declarations and bound input/output paths."""
 
 from enum import Enum, auto
-from typing import Callable, FrozenSet, Optional, Tuple
+from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -45,6 +45,10 @@ class ExitRows(Enum):
 
     ATTENTION = auto()
     TBO_SPLIT = auto()
+    # The rows the FFN ran on, also at the stack's end: the layer stack's last
+    # FFN, when the model's final read reads this rank's attention-TP slice
+    # and gathers it.
+    SLICE = auto()
 
 
 class BatchVariant(Enum):
@@ -139,6 +143,8 @@ class EdgeContract(msgspec.Struct, frozen=True):
         arriving_plain_add: Allowed values of ResidualUpdate.is_plain_add for
             arriving contributions. Empty means use produced.update's capability.
             The actual update object travels with the residual stream.
+        arrives_written: Whether the producer applies its update at its exit,
+            so the stream arrives written with no residual add pending.
     """
 
     produced: OutputContract
@@ -150,6 +156,7 @@ class EdgeContract(msgspec.Struct, frozen=True):
     residual_joins_sum: bool = False
     # Capabilities allowed to arrive from another layer, not its update object.
     arriving_plain_add: Tuple[bool, ...] = ()
+    arrives_written: bool = False
 
 
 class FfnInputFusion(msgspec.Struct, frozen=True):
@@ -166,6 +173,28 @@ class FfnInputFusion(msgspec.Struct, frozen=True):
     # Callable(residual, forward_batch): True guarantees this candidate is
     # selected and does not mutate residual, including backend fallback.
     preserves_residual: Optional[Callable] = None
+
+
+class ReadoutFusion(msgspec.Struct, frozen=True):
+    """A kernel a stage's read supplies (its ``completing_fusions``) that
+    completes the sum its input owes together with the residual add, for a
+    read that is not the residual's plain norm and so takes no FfnInputFusion.
+
+    ``run(hidden_states, residual, forward_batch)`` returns the written stream,
+    the completed sum plus the residual, which the read then reads; or None
+    when it does not take the batch, before touching its inputs or starting a
+    collective."""
+
+    # The group whose sum it completes.
+    completes: SumGroup
+    run: Callable[..., Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]]
+    # Whether it completes the sum onto this rank's attention-TP slice of the
+    # rows (a reduce-scatter, given the whole residual or its slice) rather
+    # than on every row.
+    scatters: bool = False
+    # Whether it also does the read: run(hidden_states, residual,
+    # forward_batch, norm) then returns the read's (input, residual).
+    reads: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):

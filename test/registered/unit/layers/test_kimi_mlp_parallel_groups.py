@@ -20,14 +20,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 
-def build_mlp(group=None, *, width=16, quant_config=None, reduce=True):
+def build_mlp(group=None, *, width=16, quant_config=None):
     kwargs = {} if group is None else dict(parallel_group=group)
     return kimi_k3.KimiK3MLP(
         width,
         2 * width,
         "silu",
         quant_config=quant_config,
-        reduce_results=reduce,
         **kwargs,
     )
 
@@ -128,64 +127,60 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                             "replicated",
                             "shared_experts_tp",
                         ):
-                            for reduce in (False, True):
-                                module = build_mlp(group, reduce=reduce)
-                                auto_attn = group is None and dense_attn and dp > 1
-                                r, s = (
-                                    (0, 1)
-                                    if group == "replicated"
-                                    else (rank % 2, 2)
-                                    if group == "shared_experts_tp"
-                                    else (rank % (4 // dp), 4 // dp)
-                                    if group == "attn_tp" or auto_attn
-                                    else (rank, 4)
-                                )
-                                self.assertEqual(module._dense_attn_tp, auto_attn)
-                                for name in ("gate_up_proj", "down_proj"):
-                                    layer = getattr(module, name)
-                                    self.assertEqual(rank_size(layer), (r, s))
-                                    expected, _ = load_projection(layer)
-                                    torch.testing.assert_close(layer.weight, expected)
-                                    x = (
-                                        (
-                                            torch.arange(2 * expected.shape[1]).reshape(
-                                                2, -1
-                                            )
-                                            % 17
-                                            - 8
+                            module = build_mlp(group)
+                            auto_attn = group is None and dense_attn and dp > 1
+                            r, s = (
+                                (0, 1)
+                                if group == "replicated"
+                                else (rank % 2, 2)
+                                if group == "shared_experts_tp"
+                                else (rank % (4 // dp), 4 // dp)
+                                if group == "attn_tp" or auto_attn
+                                else (rank, 4)
+                            )
+                            self.assertEqual(module._dense_attn_tp, auto_attn)
+                            for name in ("gate_up_proj", "down_proj"):
+                                layer = getattr(module, name)
+                                self.assertEqual(rank_size(layer), (r, s))
+                                expected, _ = load_projection(layer)
+                                torch.testing.assert_close(layer.weight, expected)
+                                x = (
+                                    (
+                                        torch.arange(2 * expected.shape[1]).reshape(
+                                            2, -1
                                         )
-                                        / 128
-                                    ).to(layer.weight.dtype)
-                                    tp, attn = Mock(), Mock()
-                                    tp.all_reduce.side_effect = lambda v: v * 4
-                                    attn.all_reduce.side_effect = lambda v: (
-                                        v * (4 // dp)
+                                        % 17
+                                        - 8
                                     )
-                                    row = name == "down_proj"
-                                    reference = F.linear(x, expected)
-                                    if row and reduce and s > 1:
-                                        reference *= (4 // dp) if auto_attn else 4
-                                    with (
-                                        parallel_scope(tp_group=tp, attn_tp_group=attn),
-                                        patch.object(
-                                            linear,
-                                            "use_symmetric_memory",
-                                            return_value=nullcontext(),
-                                        ) as allocation,
-                                    ):
-                                        actual = layer(x)[0]
-                                    torch.testing.assert_close(actual, reference)
-                                    if row:
-                                        self.assertEqual(layer.reduce_results, reduce)
-                                        self.assertEqual(
-                                            layer.use_dp_attention_reduce, auto_attn
-                                        )
-                                        self.assertIs(
-                                            allocation.call_args.args[0],
-                                            attn if auto_attn else tp,
-                                        )
-                                    else:
-                                        allocation.assert_not_called()
+                                    / 128
+                                ).to(layer.weight.dtype)
+                                tp, attn = Mock(), Mock()
+                                tp.all_reduce.side_effect = lambda v: v * 4
+                                attn.all_reduce.side_effect = lambda v: v * (4 // dp)
+                                row = name == "down_proj"
+                                reference = F.linear(x, expected)
+                                with (
+                                    parallel_scope(tp_group=tp, attn_tp_group=attn),
+                                    patch.object(
+                                        linear,
+                                        "use_symmetric_memory",
+                                        return_value=nullcontext(),
+                                    ) as allocation,
+                                ):
+                                    actual = layer(x)[0]
+                                torch.testing.assert_close(actual, reference)
+                                if row:
+                                    # The stage boundary completes the sum.
+                                    self.assertFalse(layer.reduce_results)
+                                    self.assertEqual(
+                                        layer.use_dp_attention_reduce, auto_attn
+                                    )
+                                    self.assertIs(
+                                        allocation.call_args.args[0],
+                                        attn if auto_attn else tp,
+                                    )
+                                else:
+                                    allocation.assert_not_called()
 
     def test_moe_shared_consumer_preserves_selection_and_execution_handle(self):
         for rank in range(4):
