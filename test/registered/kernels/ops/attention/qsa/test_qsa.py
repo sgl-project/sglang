@@ -45,16 +45,15 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
-def test_fp8_chunk_pipeline_guard(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
+def test_fp8_chunk_pipeline_eligibility_is_device_agnostic():
     valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
-    assert sparse_attn_module._use_fp8_chunk_pipeline(*valid)
+    assert sparse_attn_module._is_fp8_chunk_pipeline_eligible(*valid)
 
     for group_size in (1, 3, 6, 12):
         supported = valid.copy()
         supported[4] = group_size
         supported[5] = 1024
-        assert sparse_attn_module._use_fp8_chunk_pipeline(*supported)
+        assert sparse_attn_module._is_fp8_chunk_pipeline_eligible(*supported)
 
     for index, value in [
         (0, 8191),
@@ -65,17 +64,33 @@ def test_fp8_chunk_pipeline_guard(monkeypatch):
     ]:
         invalid = valid.copy()
         invalid[index] = value
-        assert not sparse_attn_module._use_fp8_chunk_pipeline(*invalid)
+        assert not sparse_attn_module._is_fp8_chunk_pipeline_eligible(*invalid)
 
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
-    assert not sparse_attn_module._use_fp8_chunk_pipeline(*valid)
+
+def test_fp8_chunk_pipeline_config_requires_validated_device():
+    valid = [8192, 2, torch.float8_e4m3fn, 256, 6, FINAL_TOPK]
+
+    config = sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H20", *valid)
+    assert config is not None
+    assert config.block_n == 32
+
+    assert (
+        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H100", *valid) is None
+    )
+
+    invalid = valid.copy()
+    invalid[2] = torch.bfloat16
+    assert (
+        sparse_attn_module._get_fp8_chunk_pipeline_config("NVIDIA H20", *invalid)
+        is None
+    )
 
 
 @pytest.mark.parametrize(
     ("group_size", "topk"),
     [(3, 1024), (6, FINAL_TOPK), (8, 1024), (12, 1024)],
 )
-def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
+def test_fp8_operand_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")
 
@@ -98,13 +113,8 @@ def test_h20_long_chunk_fp8_pipeline_matches_bf16_dot(monkeypatch, group_size, t
     args = (q, k, v, indices, cu_q, cu_k, kv_lens, 256**-0.5)
 
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
-    monkeypatch.setattr(
-        sparse_attn_module, "_use_fp8_chunk_pipeline", lambda *args: True
-    )
     actual = sparse_gqa_fwd_interface_triton_ck(*args)
-    monkeypatch.setattr(
-        sparse_attn_module, "_use_fp8_chunk_pipeline", lambda *args: False
-    )
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
     expected = sparse_gqa_fwd_interface_triton_ck(*args)
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
