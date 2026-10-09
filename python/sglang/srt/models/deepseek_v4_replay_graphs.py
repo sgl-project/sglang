@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -149,6 +149,23 @@ def check_pointers(
 # ---------------------------------------------------------------------------
 # State flattening and debug replay
 # ---------------------------------------------------------------------------
+
+
+def _pool_capture_scope():
+    # The global pool's borrow bookkeeping must see captures into it.
+    if not envs.SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL.get():
+        return nullcontext()
+    from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
+
+    return graph_pool_capture_scope()
+
+
+def _pool_replay_scope():
+    if not envs.SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL.get():
+        return nullcontext()
+    from sglang.srt.model_executor.runner_utils.pool import graph_pool_replay_scope
+
+    return graph_pool_replay_scope()
 
 
 def _flatten_state(state: HcState):
@@ -296,10 +313,11 @@ class EagerReplayGraphs:
             ntnp = graph.owned["num_token_non_padded"]
             if ntnp is not None:
                 ntnp.fill_(num_rows)
-            if envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get():
-                _replay_checked(graph.graph, label)
-            else:
-                graph.graph.replay()
+            with _pool_replay_scope():
+                if envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get():
+                    _replay_checked(graph.graph, label)
+                else:
+                    graph.graph.replay()
         return graph.out_rebuild(num_rows)
 
     def _static_inputs(self, shape_key, live) -> list[torch.Tensor]:
@@ -378,7 +396,16 @@ class EagerReplayGraphs:
 
         global _pool, _stream
         if _pool is None:
-            _pool = torch.cuda.graph_pool_handle()
+            if envs.SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL.get():
+                # Prefill-graph steps and eager steps never overlap, so these graphs
+                # can reuse the prefill graphs' pool instead of pinning their own.
+                from sglang.srt.model_executor.runner_utils.pool import (
+                    get_or_create_global_graph_memory_pool,
+                )
+
+                _pool = get_or_create_global_graph_memory_pool(torch.cuda)
+            else:
+                _pool = torch.cuda.graph_pool_handle()
             _stream = torch.cuda.Stream()
         tp_group = get_parallel().tp_group
         graph = BreakableCUDAGraph()
@@ -388,11 +415,14 @@ class EagerReplayGraphs:
                 torch.cuda.synchronize()
                 tp_group.barrier()
                 body()
-            with BreakableCUDAGraphCapture(
-                cuda_graph=graph,
-                pool=_pool,
-                stream=context.stream,
-                barrier_fn=tp_group.barrier,
+            with (
+                _pool_capture_scope(),
+                BreakableCUDAGraphCapture(
+                    cuda_graph=graph,
+                    pool=_pool,
+                    stream=context.stream,
+                    barrier_fn=tp_group.barrier,
+                ),
             ):
                 body()
         torch.cuda.current_stream().wait_stream(_stream)
