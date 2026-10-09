@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -18,6 +18,9 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -118,9 +121,7 @@ def fused_experts_none_to_marlin(
     quant_info: MarlinMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -139,6 +140,40 @@ def fused_experts_none_to_marlin(
             router_logits=topk_output.router_logits,
         )
 
+    return StandardCombineInput(
+        hidden_states=_run_marlin(
+            hidden_states,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            quant_info,
+            runner_config,
+            # Standard EP dispatch already maps non-local routes to -1.
+            is_ep=(
+                runner_config.num_local_experts is not None
+                and runner_config.num_experts is not None
+                and runner_config.num_local_experts < runner_config.num_experts
+            ),
+        )
+    )
+
+
+def _run_marlin(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    quant_info: MarlinMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    *,
+    is_ep: bool = False,
+    expected_m: Optional[int] = None,
+    expert_num_tokens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+
+    if hidden_states.shape[0] == 0:
+        return torch.empty_like(hidden_states)
+
     if runner_config.is_gated:
         assert runner_config.activation in {
             "silu",
@@ -154,9 +189,6 @@ def fused_experts_none_to_marlin(
     workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
     marlin_hidden_states = hidden_states
-    # Avoid aliasing the MoE input buffer until Marlin output semantics are
-    # fully validated across shared-expert and overlap paths.
-    marlin_inplace = False
     if (
         quant_info.weight_bits == 4
         and quant_info.w13_qzeros is None
@@ -169,7 +201,6 @@ def fused_experts_none_to_marlin(
         # activation path. The fp16 + E8M0 path is intentionally not generated
         # in sgl-kernel, so upcast activations here and cast the result back.
         marlin_hidden_states = hidden_states.to(torch.bfloat16)
-        marlin_inplace = False
 
     output = fused_marlin_moe(
         hidden_states=marlin_hidden_states,
@@ -177,9 +208,9 @@ def fused_experts_none_to_marlin(
         w2=quant_info.w2_qweight,
         w1_scale=quant_info.w13_scales,
         w2_scale=quant_info.w2_scales,
-        gating_output=topk_output.router_logits,
-        topk_weights=topk_output.topk_weights,
-        topk_ids=topk_output.topk_ids,
+        gating_output=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         global_num_experts=quant_info.global_num_experts,
         expert_map=quant_info.expert_map,
         g_idx1=quant_info.w13_g_idx,
@@ -195,7 +226,7 @@ def fused_experts_none_to_marlin(
         workspace=workspace,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,
-        inplace=marlin_inplace,
+        inplace=False,
         routed_scaling_factor=runner_config.routed_scaling_factor,
         clamp_limit=(
             runner_config.gemm1_clamp_limit
@@ -205,11 +236,198 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        is_ep=is_ep,
+        expected_m=expected_m,
+        expert_num_tokens=expert_num_tokens,
     ).to(hidden_states.dtype)
 
-    return StandardCombineInput(
-        hidden_states=output,
+    return output
+
+
+def validate_deepep_marlin(
+    config: MoeRunnerConfig, *, lora_enabled: bool = False
+) -> None:
+    """Validate the resolved runner, including quantization's automatic choice."""
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.utils import is_cuda
+
+    if not is_cuda():
+        raise ValueError("Marlin + DeepEP requires NVIDIA CUDA.")
+    if config.runner_backend != MoeRunnerBackend.MARLIN:
+        raise ValueError("DeepEP supports marlin, not experimental_sgl_marlin.")
+    if config.params_dtype != torch.bfloat16:
+        raise ValueError("Marlin + DeepEP requires --dtype bfloat16.")
+    if lora_enabled:
+        raise ValueError("Marlin + DeepEP does not support --enable-lora.")
+    if config.num_fused_shared_experts:
+        raise ValueError("Marlin + DeepEP requires separate shared-expert computation.")
+    if (config.is_gated and config.activation not in {"silu", "situ"}) or (
+        not config.is_gated and config.activation not in {"silu", "relu2"}
+    ):
+        raise ValueError(f"Unsupported Marlin activation: {config.activation}.")
+    if config.apply_router_weight_on_input or config.no_combine:
+        raise ValueError("Marlin + DeepEP requires output routing weights and combine.")
+
+    view = resolved_view(get_server_args())
+    for option in (
+        "enable_lora",
+        "enable_eplb",
+        "elastic_ep_backend",
+        "enable_single_batch_overlap",
+        "enable_two_batch_overlap",
+        "enable_waterfill",
+        "ep_num_redundant_experts",
+    ):
+        if getattr(view, option):
+            raise ValueError(
+                f"Marlin + DeepEP does not support --{option.replace('_', '-')}."
+            )
+    if view.init_expert_location != "trivial":
+        raise ValueError("Marlin + DeepEP requires --init-expert-location trivial.")
+    if view.deepep_dispatcher_output_dtype not in {"auto", "bf16"}:
+        raise ValueError(
+            "Marlin + DeepEP requires --deepep-dispatcher-output-dtype bf16 or auto."
+        )
+
+
+@triton.jit
+def _deepep_ll_copy_kernel(
+    expert_rows,
+    compact_rows,
+    counts,
+    ids,
+    CAPACITY: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    PACK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    row = tl.program_id(1) * 8 + tl.arange(0, 8)
+    experts = tl.arange(0, BLOCK_E)
+    sizes = tl.load(counts + experts, experts < EXPERTS, 0)
+    start = tl.sum(tl.where(experts < expert, sizes, 0))
+    valid = (row < CAPACITY) & (row < tl.load(counts + expert))
+    col = tl.arange(0, BLOCK_H)
+    expert_offset = (expert * CAPACITY + row[:, None]) * HIDDEN + col[None, :]
+    compact_offset = (start + row[:, None]) * HIDDEN + col[None, :]
+    mask = valid[:, None] & (col[None, :] < HIDDEN)
+    if PACK:
+        value = tl.load(expert_rows + expert_offset, mask, 0)
+        tl.store(compact_rows + compact_offset, value, mask)
+        tl.store(ids + start + row, expert, valid)
+    else:
+        value = tl.load(compact_rows + compact_offset, mask, 0)
+        # DeepEP combine reads only dispatched rows through its handle.
+        tl.store(expert_rows + expert_offset, value, mask)
+
+
+def _deepep_ll_pack(hidden_states: torch.Tensor, masked_m: torch.Tensor, topk: int):
+    """Compact valid expert rows into a graph-safe worst-case routing capacity."""
+    experts, capacity, hidden = hidden_states.shape
+    # Capacity already includes all source ranks. A source token visits at
+    # most topk experts, so allocating capacity for every expert wastes space.
+    rows = capacity * min(experts, topk)
+    compact = hidden_states.new_empty((rows, hidden))
+    ids = torch.full((rows, 1), -1, device=hidden_states.device, dtype=torch.int32)
+    weights = torch.ones((rows, 1), device=hidden_states.device, dtype=torch.float32)
+    if capacity:
+        _deepep_ll_copy_kernel[(experts, triton.cdiv(capacity, 8))](
+            hidden_states,
+            compact,
+            masked_m,
+            ids,
+            capacity,
+            hidden,
+            experts,
+            True,
+            triton.next_power_of_2(hidden),
+            triton.next_power_of_2(experts),
+        )
+    return compact, ids, weights
+
+
+def _deepep_ll_unpack(
+    compact: torch.Tensor, hidden_states: torch.Tensor, counts: torch.Tensor
+):
+    output = torch.empty_like(hidden_states)
+    experts, capacity, hidden = hidden_states.shape
+    if capacity:
+        _deepep_ll_copy_kernel[(experts, triton.cdiv(capacity, 8))](
+            output,
+            compact,
+            counts,
+            counts,
+            capacity,
+            hidden,
+            experts,
+            False,
+            triton.next_power_of_2(hidden),
+            triton.next_power_of_2(experts),
+        )
+    return output
+
+
+@register_fused_func("deepep", "marlin")
+def fused_experts_deepep_to_marlin(
+    dispatch_output: DeepEPNormalDispatchOutput | DeepEPLLDispatchOutput,
+    quant_info: MarlinMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> CombineInput:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLCombineInput,
+        DeepEPNormalCombineInput,
+        DispatchOutputFormat,
     )
+
+    hidden_states = dispatch_output.hidden_states
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or dispatch_output.hidden_states_scale is not None
+    ):
+        raise ValueError("Marlin + DeepEP expects BF16 activations without scales.")
+
+    # Dispatch has already assigned local experts. A second global-to-local
+    # mapping would silently select another rank's weights.
+    quant_info = replace(quant_info, expert_map=None, global_num_experts=-1)
+    if dispatch_output.format == DispatchOutputFormat.DEEPEP_NORMAL:
+        output = _run_marlin(
+            hidden_states,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+            quant_info,
+            runner_config,
+            is_ep=True,
+        )
+        return DeepEPNormalCombineInput(
+            output,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+        )
+    if dispatch_output.format == DispatchOutputFormat.DEEPEP_LL:
+        compact, topk_ids, topk_weights = _deepep_ll_pack(
+            hidden_states, dispatch_output.masked_m, dispatch_output.topk_ids.shape[1]
+        )
+        output = _run_marlin(
+            compact,
+            topk_ids,
+            topk_weights,
+            quant_info,
+            runner_config,
+            is_ep=True,
+            expected_m=dispatch_output.expected_m,
+            expert_num_tokens=dispatch_output.masked_m,
+        )
+        # DeepEP applies the original routing weights while combining. These
+        # expert outputs were computed with unit weights, not the source top-k.
+        return DeepEPLLCombineInput(
+            _deepep_ll_unpack(output, hidden_states, dispatch_output.masked_m),
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+        )
+    raise ValueError(f"Unsupported Marlin dispatch format: {dispatch_output.format}")
 
 
 # ===== TO BE REFACTORED ====

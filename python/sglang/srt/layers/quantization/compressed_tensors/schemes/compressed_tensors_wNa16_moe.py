@@ -449,7 +449,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            StandardCombineInput,
+        )
+
+        if DispatchOutputChecker.format_is_deepep(dispatch_output):
+            return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
 
         assert self.moe_runner_config.activation == "silu", (
             "Only SiLU activation is supported."
