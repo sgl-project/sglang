@@ -113,6 +113,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import qwen3_5_gdn_in_proj_merge as gdn_in_proj_merge
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
@@ -380,6 +381,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
+        self.in_proj_qkvzba = None
+        if gdn_in_proj_merge.ENABLED:
+            self.in_proj_qkvzba = gdn_in_proj_merge.build(self, quant_config, prefix)
+
         self.in_proj_qkvz = self.create_qkvz_proj(
             hidden_size=self.hidden_size,
             key_dim=self.key_dim,
@@ -402,6 +407,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
+        if self.in_proj_qkvzba is not None:
+            gdn_in_proj_merge.claim_input_proj(self)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
         self._fused_in_proj_ba_width = 0
@@ -676,6 +683,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         if not (_is_cuda or _use_aiter) or self._fused_in_proj_weight is not None:
             return
+        if gdn_in_proj_merge.owns_input_proj(self):
+            return
         if (
             _use_aiter
             and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
@@ -786,6 +795,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if gdn_in_proj_merge.owns_input_proj(self):
+            return gdn_in_proj_merge.project(self, hidden_states)
+
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -1148,7 +1160,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
         # it. Otherwise, stay on the plain AR+RMSNorm path.
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        accepts_fp8_input = _linear_accepts_fp8_tuple(
+            gdn_in_proj_merge.qkvz_proj(self.linear_attn)
+        )
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
@@ -1653,6 +1667,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        **gdn_in_proj_merge.PACKED_MODULES_MAPPING,
     }
 
     supported_lora_modules = [
@@ -1929,10 +1944,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -2035,10 +2047,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         num_experts = self.config.num_experts
@@ -2392,10 +2401,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         loaded_params: Set[str] = set()
@@ -2603,10 +2609,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
             # GDN fused projections
-            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-            ("in_proj_qkvz.", "in_proj_z.", 3),
-            ("in_proj_ba.", "in_proj_b.", 0),
-            ("in_proj_ba.", "in_proj_a.", 1),
+            *gdn_in_proj_merge.stacked_params_mapping(self),
         ]
 
         num_experts = self.config.num_experts
