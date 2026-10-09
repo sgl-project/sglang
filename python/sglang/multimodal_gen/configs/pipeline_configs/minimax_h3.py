@@ -70,15 +70,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
