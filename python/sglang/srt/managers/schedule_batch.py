@@ -2399,6 +2399,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
+    # Scratch hand-off: the paged decode allocator already has to materialise
+    # `seq_lens + token_per_req` to size its allocation, so the caller adopts
+    # that tensor instead of recomputing the identical [b] add.
+    #
+    # It cannot go stale. The only writer is mem_cache/allocation.py
+    # alloc_for_decode, whose only caller is prepare_for_decode below -- so the
+    # publish and the read that clears it sit in one straight-line stretch of a
+    # single function, with no filter_batch/merge_batch/mix_with_running able to
+    # change the batch size in between. It is a field only because
+    # alloc_for_decode already returns out_cache_loc.
+    #
+    # None unless the allocator built one and it means what the consumer
+    # assumes: the page_size == 1 branch never materialises it, and any
+    # token_per_req != 1 publishes None rather than a tensor advanced by more
+    # than the one token prepare_for_decode is about to account for.
+    seq_lens_next: Optional[torch.Tensor] = None  # shape: [b], int64
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
@@ -3576,7 +3592,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
-        self.seq_lens = self.seq_lens + 1
+        #
+        # alloc_for_decode's paged branch already built `seq_lens + 1` (it is
+        # called with token_per_req=1, so the value is identical to the add
+        # below) and left it in seq_lens_next. Adopting it drops one [b]
+        # elementwise launch from every decode step, which matters because
+        # decode here is bound by launch count, not by arithmetic. It satisfies
+        # the same invariant as the add: it is a freshly allocated tensor that
+        # aliases neither the previous self.seq_lens nor any allocator buffer.
+        seq_lens_next = self.seq_lens_next
+        self.seq_lens_next = None
+        self.seq_lens = (
+            seq_lens_next if seq_lens_next is not None else self.seq_lens + 1
+        )
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.

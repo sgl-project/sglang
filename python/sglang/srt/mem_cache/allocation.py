@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
+    get_last_loc_triton_safe_i32,
     write_req_to_token_pool_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -103,16 +104,30 @@ def write_cache_indices(
             pt += extend_len
 
 
+def last_loc_uses_triton_dispatch() -> bool:
+    """Whether the last_loc computation may be done with a Triton kernel.
+
+    The `ascend` and `torch_native` backends have no Triton runtime, so both
+    last_loc call sites -- `get_last_loc` (extend) and the paged branch of
+    `alloc_for_decode` -- must stay in torch for them. Shared rather than
+    duplicated so the two cannot drift apart on backend support.
+
+    Note this is deliberately *not* `support_triton()`: that helper excludes
+    `intel_amx` but not `ascend`, which is the backend that matters here.
+    """
+    prefill_backend, decode_backend = attention_backends()
+    return prefill_backend not in ("ascend", "torch_native") and decode_backend not in (
+        "ascend",
+        "torch_native",
+    )
+
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    prefill_backend, decode_backend = attention_backends()
-    uses_triton_dispatch = prefill_backend not in (
-        "ascend",
-        "torch_native",
-    ) and decode_backend not in ("ascend", "torch_native")
+    uses_triton_dispatch = last_loc_uses_triton_dispatch()
 
     if (_is_hip or _is_npu) and uses_triton_dispatch:
         # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a
@@ -624,11 +639,41 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        # No seq_lens_next is materialised on this branch; see the stash below.
+        seq_lens_next = None
     else:
-        # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
+        # Paged allocation.
+        #
+        # One fused Triton launch replaces the equivalent torch expression
+        # `req_to_token[req_pool_indices, seq_lens_gpu - 1]`, which costs two
+        # launches: an elementwise `sub` on a [bs] tensor and an advanced-index
+        # gather. Decode runs this per step on bs-sized (e.g. 16) tensors where
+        # kernel-launch overhead dominates the arithmetic entirely, so halving
+        # the launch count here is the whole point.
+        #
+        # The _i32 variant is deliberate: plain indexing returns req_to_token's
+        # own dtype (int32, memory_pool.py ReqToTokenPool.__init__), and the
+        # consumer `alloc_decode_kernel` reads last_loc through a bare
+        # `tl.load`, so staying in int32 reproduces today's numerics exactly
+        # and avoids paying a promotion kernel that would undo the saving.
+        #
+        # Guarded, because Triton is not implied by taking this branch. The
+        # generic paged allocator does launch `alloc_decode_kernel` below
+        # (allocator/paged.py), but the NPU allocator's `alloc_decode`
+        # (hardware_backend/npu/allocator_npu.py) is pure torch, so `ascend`
+        # reaches here with no Triton runtime. The predicate is the one
+        # `get_last_loc` already applies to the identical computation on the
+        # extend side.
+        if last_loc_uses_triton_dispatch():
+            last_loc = get_last_loc_triton_safe_i32(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                seq_lens_gpu,
+            )
+        else:
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, seq_lens_gpu - 1
+            ]
         seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
@@ -644,7 +689,19 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = seq_lens_gpu.clone()
+        # Deliberately NOT a clone. `write` is an `index_put_`, which only ever
+        # READS its index tensor, and every `self.seq_lens` update in
+        # managers/schedule_batch.py rebinds a fresh tensor rather than mutating
+        # (its out-of-place `self.seq_lens = self.seq_lens + 1` is itself
+        # documented there as avoiding races with overlap-queued refs). Aliasing
+        # is therefore safe and saves one [bs] copy_ launch per decode step.
+        #
+        # Scoped to that file on purpose: this is not a structural guarantee of
+        # the codebase. `speculative/spec_utils.py` does contain an in-place
+        # `seq_lens.add_(...)` inside `create_num_accept_tokens_filter`, which
+        # has no callers today -- so if that function is ever wired up, this
+        # aliasing is what it would break.
+        locs = seq_lens_gpu
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
@@ -666,6 +723,26 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     except Exception:
         batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
         raise
+
+    # Hand the already-computed `seq_lens + token_per_req` to the caller rather
+    # than making it recompute the same [bs] add. Safe to reuse as batch state:
+    # it is a freshly allocated tensor (aliasing nothing), and no alloc_decode
+    # implementation writes to the seq_lens argument it was passed. Checked
+    # against every implementation in the tree, which fall into two kinds: the
+    # Triton ones only `tl.load` from it (allocator/paged.py alloc_decode_kernel),
+    # and the torch ones only derive new tensors from it (the NPU allocator's
+    # `(seq_lens % page_size == 1)`); the remainder delegate to one of those.
+    #
+    # Published only after the aux-length allocation above has committed, so the
+    # field never describes slots that the failure path just freed.
+    #
+    # The hand-off contract is specifically "seq_lens advanced by one token",
+    # which is what the sole consumer (ScheduleBatch.prepare_for_decode) then
+    # adopts as the new batch.seq_lens. Publishing None for any other
+    # token_per_req, and for the page_size == 1 branch that never builds the
+    # tensor, makes that consumer fall back to its own add instead of silently
+    # adopting a wrong sequence length -- which would corrupt attention.
+    batch.seq_lens_next = seq_lens_next if token_per_req == 1 else None
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
