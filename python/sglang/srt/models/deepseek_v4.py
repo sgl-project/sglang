@@ -3304,11 +3304,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         pre-mix. ``seam_open`` is False when the late-layer tail narrows the rows after
         this layer, so nothing precomputed for the next one would still describe it."""
         self._init_boundaries()
-        mega_mhc_prefill = (
-            self.config.model_type == "deepseek_v41"
-            and seam_open
-            and mhc.can_use_mega_mhc_prefill(self.hc_cfg, forward_batch)
-        )
+        mega_mhc_prefill = mhc.can_use_mega_mhc_prefill(self.hc_cfg, forward_batch)
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -4129,7 +4125,7 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
+                    seam_open=tail is None or i + 1 != self.late_layer_start,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:
