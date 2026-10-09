@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
-    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -274,11 +273,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shard pad span.
     "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
-    ),
-    # Select a built-in platform or an installed platform entry point.
-    # Empty means automatic plugin activation followed by built-in detection.
-    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
-        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
     # Import an installed package that registers out-of-tree diffusion models
     # and pipelines. This is shared with the SRT model plugin mechanism.

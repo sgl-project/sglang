@@ -10,9 +10,8 @@ import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
 from pkgutil import resolve_name
-from typing import Any, TypeVar
+from typing import TypeVar
 
-import psutil
 import torch
 from typing_extensions import ParamSpec
 
@@ -20,11 +19,11 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
-    Platform,
-    PlatformEnum,
+    MMPlatform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.platforms.cuda import CudaDeviceMixin
 
 logger = init_logger(__name__)
 
@@ -575,20 +574,9 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
 }
 
 
-class CudaPlatformBase(Platform):
-    _enum = PlatformEnum.CUDA
-    device_name: str = "cuda"
-    device_type: str = "cuda"
+class CudaPlatformBase(CudaDeviceMixin, MMPlatform):
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
-
-    @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device(f"cuda:{envs.LOCAL_RANK}")
-
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -667,42 +655,6 @@ class CudaPlatformBase(Platform):
         pass
 
     @classmethod
-    def get_current_memory_usage(
-        cls, device: torch.types.Device | None = None
-    ) -> float:
-        torch.cuda.reset_peak_memory_stats(device)
-        return float(torch.cuda.max_memory_allocated(device))
-
-    @classmethod
-    def get_available_gpu_memory(
-        cls,
-        device_id: int | None = None,
-        distributed: bool = False,
-        empty_cache: bool = True,
-        cpu_group: Any = None,
-    ) -> float:
-        if empty_cache:
-            torch.cuda.empty_cache()
-
-        if device_id is None:
-            device_id = torch.cuda.current_device()
-
-        device_props = torch.cuda.get_device_properties(device_id)
-        if device_props.is_integrated:
-            free_gpu_memory = psutil.virtual_memory().available
-        else:
-            free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
-
-        if distributed:
-            import torch.distributed as dist
-
-            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="cuda")
-            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
-            free_gpu_memory = float(tensor.item())
-
-        return free_gpu_memory / (1 << 30)
-
-    @classmethod
     def device_shares_host_memory(cls) -> bool:
         if not torch.cuda.is_available():
             return False
@@ -743,11 +695,10 @@ class CudaPlatformBase(Platform):
         set_fa_ver(4)
         return True
 
-    @classmethod
     def _resolve_flash_attention_backend_cls_str(
-        cls, target_backend: AttentionBackendEnum, head_size: int, dtype: torch.dtype
+        self, target_backend: AttentionBackendEnum, head_size: int, dtype: torch.dtype
     ) -> str:
-        if not cls.has_device_capability(80):
+        if not self.has_device_capability(80):
             logger.info("Cannot use FlashAttention backend for Volta and Turing GPUs.")
             target_backend = AttentionBackendEnum.TORCH_SDPA
         elif dtype not in (torch.float16, torch.bfloat16):
@@ -759,7 +710,7 @@ class CudaPlatformBase(Platform):
 
         if (
             target_backend == AttentionBackendEnum.FA
-            and not cls._prepare_flash_attention_for_blackwell()
+            and not self._prepare_flash_attention_for_blackwell()
         ):
             target_backend = AttentionBackendEnum.TORCH_SDPA
 
@@ -790,21 +741,20 @@ class CudaPlatformBase(Platform):
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
-    @classmethod
     def get_attn_backend_cls_str(
-        cls,
+        self,
         selected_backend: AttentionBackendEnum | None,
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
         if selected_backend is None:
-            target_backend = cls._resolve_default_attn_backend()
-            if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+            target_backend = self._resolve_default_attn_backend()
+            if target_backend == AttentionBackendEnum.FA and self.is_blackwell():
                 # cuDNN SDPA is 1.25-1.5x faster than the FA4 CuTe kernels on
                 # sm_100 for dense diffusion attention; DYNAMIC_CUDNN_SDPA
                 # keeps FA as the fallback for causal/unsupported shapes and
                 # cuDNN runtime errors.
-                fa_cls_str = cls._resolve_flash_attention_backend_cls_str(
+                fa_cls_str = self._resolve_flash_attention_backend_cls_str(
                     target_backend, head_size, dtype
                 )
                 if fa_cls_str == _SDPA_BACKEND_CLS_STR:
@@ -813,9 +763,9 @@ class CudaPlatformBase(Platform):
         else:
             resolver = _CUDA_ATTENTION_BACKEND_RESOLVERS.get(selected_backend)
             if resolver is None:
-                raise ValueError(f"Invalid attention backend for {cls.device_name}")
+                raise ValueError(f"Invalid attention backend for {self.device_name}")
 
-            resolved_backend = resolver.resolve(cls)
+            resolved_backend = resolver.resolve(self)
             if isinstance(resolved_backend, str):
                 if selected_backend == AttentionBackendEnum.SAGE_ATTN:
                     backend_cls = resolve_name(resolved_backend)
@@ -828,13 +778,16 @@ class CudaPlatformBase(Platform):
                 return resolved_backend
             target_backend = resolved_backend
 
-        return cls._resolve_flash_attention_backend_cls_str(
+        return self._resolve_flash_attention_backend_cls_str(
             target_backend, head_size, dtype
         )
 
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+    def get_communicator_class(self) -> type:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        return CudaCommunicator
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
@@ -887,19 +840,6 @@ class NvmlCudaPlatform(CudaPlatformBase):
             return DeviceCapability(major=major, minor=minor)
         except RuntimeError:
             return None
-
-    @classmethod
-    @lru_cache(maxsize=8)
-    @with_nvml_context
-    def has_device_capability(
-        cls,
-        capability: tuple[int, int] | int,
-        device_id: int = 0,
-    ) -> bool:
-        try:
-            return bool(super().has_device_capability(capability, device_id))
-        except RuntimeError:
-            return False
 
     @classmethod
     @lru_cache(maxsize=8)
@@ -977,21 +917,6 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        major, minor = torch.cuda.get_device_capability(device_id)
-        return DeviceCapability(major=major, minor=minor)
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        return str(torch.cuda.get_device_name(device_id))
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        device_props = torch.cuda.get_device_properties(device_id)
-        return int(device_props.total_memory)
-
     @classmethod
     def is_full_nvlink(cls, physical_device_ids: list[int]) -> bool:
         logger.exception(

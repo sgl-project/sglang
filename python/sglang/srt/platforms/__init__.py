@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 
 _current_platform: SRTPlatform | None = None
 
+_BUILTIN_PLATFORMS: dict[str, type[SRTPlatform]] = {
+    "cpu": CpuSRTPlatform,
+    "cuda": CudaSRTPlatform,
+    "rocm": RocmSRTPlatform,
+    "xpu": XpuSRTPlatform,
+    "mps": MpsSRTPlatform,
+    "npu": NPUSRTPlatform,
+    "musa": MusaSRTPlatform,
+}
+
 
 def _is_cuda_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is None)
@@ -74,7 +84,10 @@ def _resolve_platform() -> SRTPlatform:
     Discovery flow:
     1. Branch on SGLANG_PLATFORM:
 
-       SGLANG_PLATFORM set (front-loading filter):
+       SGLANG_PLATFORM names a built-in (cpu, cuda, rocm, xpu, mps, npu, musa):
+         - Use that built-in SRTPlatform without probing hardware or plugins
+
+       SGLANG_PLATFORM set otherwise (front-loading filter):
          - Enumerate entry_points without importing any plugin modules
          - Only ep.load() + activate() the named plugin
          - Other plugins are never imported (avoids pulling their dependencies)
@@ -98,7 +111,12 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM matches against entry_point names.
     """
-    selected = envs.SGLANG_PLATFORM.get()
+    selected = envs.SGLANG_PLATFORM.get().strip()
+
+    builtin_cls = _BUILTIN_PLATFORMS.get(selected.lower())
+    if builtin_cls is not None:
+        logger.info("Built-in platform selected via SGLANG_PLATFORM: %s", selected)
+        return builtin_cls()
 
     if selected:
         # Front-loading filter: only import and activate the specified plugin.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import psutil
 import torch
 
 from sglang.srt.platforms.device_mixin import (
@@ -45,15 +46,18 @@ class MpsDeviceMixin(DeviceMixin):
         # Driver allocation includes resident cached MPS buffers.
         return float(torch.mps.driver_allocated_memory())
 
-    def get_device(self, local_rank: int = 0) -> torch.device:
-        if local_rank not in (-1, 0):
-            raise ValueError(f"MPS exposes one device; got local_rank={local_rank}")
+    def get_device(self, device_id: int = 0) -> torch.device:
+        if device_id not in (-1, 0):
+            raise ValueError(f"MPS exposes one device; got device_id={device_id}")
         return torch.device("mps")
 
     def set_device(self, device: torch.device) -> None:
         if str(device).split(":", 1)[0] != "mps":
             raise ValueError(f"MPS platform cannot select device {device}")
         # MPS has no device-selection API.
+
+    def current_device(self) -> int:
+        return 0
 
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.backends.mps.get_name())
@@ -74,6 +78,11 @@ class MpsDeviceMixin(DeviceMixin):
         synchronize = getattr(torch.mps, "synchronize", None)
         if callable(synchronize):
             synchronize()
+
+    def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
+        total = _recommended_working_set_size()
+        metal_headroom = max(0, total - torch.mps.driver_allocated_memory())
+        return min(psutil.virtual_memory().available, metal_headroom), total
 
 
 class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):

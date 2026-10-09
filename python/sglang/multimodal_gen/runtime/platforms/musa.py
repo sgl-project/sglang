@@ -6,9 +6,8 @@ adjusted to match the structure and interface of `cuda.py`.
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
-from typing import Any, TypeVar
+from typing import TypeVar
 
-import psutil
 import pymtml
 
 # isort: off
@@ -18,14 +17,13 @@ import torchada  # noqa: F401
 # isort: on
 from typing_extensions import ParamSpec
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
-    Platform,
-    PlatformEnum,
+    MMPlatform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.platforms.musa import MusaDeviceMixin
 
 logger = init_logger(__name__)
 
@@ -64,10 +62,7 @@ def with_mtml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     return wrapper
 
 
-class MusaPlatformBase(Platform):
-    _enum = PlatformEnum.MUSA
-    device_name: str = "musa"
-    device_type: str = "musa"
+class MusaPlatformBase(MusaDeviceMixin, MMPlatform):
     dispatch_key: str = "MUSA"
     device_control_env_var: str = "MUSA_VISIBLE_DEVICES"
 
@@ -75,14 +70,6 @@ class MusaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def is_float64_supported(cls) -> bool:
         return False
-
-    @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device(f"musa:{envs.LOCAL_RANK}")
-
-    @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -102,42 +89,6 @@ class MusaPlatformBase(Platform):
     @classmethod
     def log_warnings(cls) -> None:
         pass
-
-    @classmethod
-    def get_current_memory_usage(
-        cls, device: torch.types.Device | None = None
-    ) -> float:
-        torch.cuda.reset_peak_memory_stats(device)
-        return float(torch.cuda.max_memory_allocated(device))
-
-    @classmethod
-    def get_available_gpu_memory(
-        cls,
-        device_id: int | None = None,
-        distributed: bool = False,
-        empty_cache: bool = True,
-        cpu_group: Any = None,
-    ) -> float:
-        if empty_cache:
-            torch.cuda.empty_cache()
-
-        if device_id is None:
-            device_id = torch.cuda.current_device()
-
-        device_props = torch.cuda.get_device_properties(device_id)
-        if device_props.is_integrated:
-            free_gpu_memory = psutil.virtual_memory().available
-        else:
-            free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
-
-        if distributed:
-            import torch.distributed as dist
-
-            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="musa")
-            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
-            free_gpu_memory = float(tensor.item())
-
-        return free_gpu_memory / (1 << 30)
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -219,9 +170,12 @@ class MusaPlatformBase(Platform):
         logger.info("Using FlashAttention (FA3) backend")
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+    def get_communicator_class(self) -> type:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        return CudaCommunicator
 
 
 # MTML utils
@@ -240,19 +194,6 @@ class MtmlMusaPlatform(MusaPlatformBase):
             return DeviceCapability(major=major, minor=minor)
         except RuntimeError:
             return None
-
-    @classmethod
-    @lru_cache(maxsize=8)
-    @with_mtml_context
-    def has_device_capability(
-        cls,
-        capability: tuple[int, int] | int,
-        device_id: int = 0,
-    ) -> bool:
-        try:
-            return bool(super().has_device_capability(capability, device_id))
-        except RuntimeError:
-            return False
 
     @classmethod
     @lru_cache(maxsize=8)
@@ -328,21 +269,6 @@ class MtmlMusaPlatform(MusaPlatformBase):
 
 class NonMtmlMusaPlatform(MusaPlatformBase):
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        major, minor = torch.cuda.get_device_capability(device_id)
-        return DeviceCapability(major=major, minor=minor)
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        return str(torch.cuda.get_device_name(device_id))
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        device_props = torch.cuda.get_device_properties(device_id)
-        return int(device_props.total_memory)
-
-    @classmethod
     def is_full_mtlink(cls, physical_device_ids: list[int]) -> bool:
         logger.error(
             "MTLink detection not possible, as context support was"
@@ -377,8 +303,9 @@ except ModuleNotFoundError:
     MusaPlatform.log_warnings()
 
 if __name__ == "__main__":
+    platform = MusaPlatform()
     print(MusaPlatform.__name__)
-    print(MusaPlatform.get_device_name())
-    print(MusaPlatform.get_device_capability())
-    print(MusaPlatform.get_device_total_memory())
-    print(MusaPlatform.is_full_mtlink([0, 1, 2, 3, 4, 5, 6, 7]))
+    print(platform.get_device_name())
+    print(platform.get_device_capability())
+    print(platform.get_device_total_memory())
+    print(platform.is_full_mtlink([0, 1, 2, 3, 4, 5, 6, 7]))

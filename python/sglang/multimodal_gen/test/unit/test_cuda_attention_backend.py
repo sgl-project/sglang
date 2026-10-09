@@ -75,7 +75,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         selected_backend: AttentionBackendEnum | None,
         dtype: torch.dtype = torch.float16,
     ) -> str:
-        return FakeCudaPlatform.get_attn_backend_cls_str(
+        return FakeCudaPlatform().get_attn_backend_cls_str(
             selected_backend=selected_backend,
             head_size=128,
             dtype=dtype,
@@ -215,7 +215,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             for head_size in (32, 64, 72, 96, 128):
                 with self.subTest(head_size=head_size):
                     self.assertEqual(
-                        FakeCudaPlatform.get_attn_backend_cls_str(
+                        FakeCudaPlatform().get_attn_backend_cls_str(
                             AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
                         ),
                         sage_cls_str,
@@ -223,7 +223,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             for head_size in (0, 160, 256):
                 with self.subTest(head_size=head_size):
                     with self.assertRaisesRegex(ValueError, f"head size {head_size}"):
-                        FakeCudaPlatform.get_attn_backend_cls_str(
+                        FakeCudaPlatform().get_attn_backend_cls_str(
                             AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
                         )
 
@@ -242,7 +242,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform",
-                FakeCudaPlatform,
+                FakeCudaPlatform(),
             ),
             patch.object(
                 FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
@@ -331,7 +331,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with (
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform",
-                FakeCudaPlatform,
+                FakeCudaPlatform(),
             ),
             patch(
                 "sglang.multimodal_gen.runtime.layers.attention.selector.resolve_name",

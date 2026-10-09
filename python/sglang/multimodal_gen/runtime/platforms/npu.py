@@ -3,17 +3,15 @@
 
 import os
 from functools import lru_cache
-from typing import Any
 
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
-    Platform,
-    PlatformEnum,
+    MMPlatform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.platforms.npu import NPUDeviceMixin
 
 logger = init_logger(__name__)
 
@@ -33,10 +31,7 @@ def device_id_to_physical_device_id(device_id: int) -> int:
         return device_id
 
 
-class NPUPlatformBase(Platform):
-    _enum = PlatformEnum.NPU
-    device_name: str = "npu"
-    device_type: str = "npu"
+class NPUPlatformBase(NPUDeviceMixin, MMPlatform):
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
@@ -47,19 +42,6 @@ class NPUPlatformBase(Platform):
 
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         return t.is_npu
-
-    @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device(f"npu:{envs.LOCAL_RANK}")
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        return str(torch.npu.get_device_name(device_id))
-
-    @classmethod
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        device_props = torch.npu.get_device_properties(device_id)
-        return int(device_props.total_memory)
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -84,38 +66,6 @@ class NPUPlatformBase(Platform):
             " not found. Assuming no NVLink available."
         )
         return False
-
-    @classmethod
-    def get_available_gpu_memory(
-        cls,
-        device_id: int | None = None,
-        distributed: bool = False,
-        empty_cache: bool = True,
-        cpu_group: Any = None,
-    ) -> float:
-        if empty_cache:
-            torch.npu.empty_cache()
-
-        if device_id is None:
-            device_id = torch.npu.current_device()
-
-        free_gpu_memory, _ = torch.npu.mem_get_info(device_id)
-
-        if distributed:
-            import torch.distributed as dist
-
-            tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device="npu")
-            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=cpu_group)
-            free_gpu_memory = float(tensor.item())
-
-        return free_gpu_memory / (1 << 30)
-
-    @classmethod
-    def get_current_memory_usage(
-        cls, device: torch.types.Device | None = None
-    ) -> float:
-        torch.npu.reset_peak_memory_stats(device)
-        return float(torch.npu.max_memory_allocated(device))
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -184,16 +134,19 @@ class NPUPlatformBase(Platform):
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )
 
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
-
-    @classmethod
-    def get_all_to_all_communicator_cls(cls) -> str:
-        return (
-            "sglang.multimodal_gen.runtime.distributed.device_communicators."
-            "cpu_communicator.CpuCommunicator"
+    def get_communicator_class(self) -> type:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
         )
+
+        return CudaCommunicator
+
+    def get_all_to_all_communicator_class(self) -> type:
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
+            CpuCommunicator,
+        )
+
+        return CpuCommunicator
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:

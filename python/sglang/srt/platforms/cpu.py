@@ -63,6 +63,9 @@ class CpuDeviceMixin(DeviceMixin):
         # binding (see get_device), not here.
         torch.cpu.set_device(device)
 
+    def current_device(self) -> int:
+        return 0
+
     def get_device_name(self, device_id: int = 0) -> str:
         # Arch-only label. We deliberately avoid platform.processor(): it
         # spawns a subprocess (~ms) on some platforms (e.g. macOS) and on Linux

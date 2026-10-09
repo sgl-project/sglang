@@ -41,7 +41,7 @@ The framework provides two plugin types, both discovered via Python's standard `
 
 - **Non-intrusive**: Built-in platforms remain the fallback when no OOT platform activates.
 - **Install-time discovery**: Plugins are discovered from Python entry points after installation.
-- **Environment variable control**: `SGLANG_PLATFORM` selects an SRT platform, `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` selects a diffusion platform, and `SGLANG_PLUGINS` filters general plugins in either hook group.
+- **Environment variable control**: `SGLANG_PLATFORM` selects the platform for both SRT and diffusion (`SGLANG_DIFFUSION_PLATFORM_OVERRIDE` is a deprecated alias), and `SGLANG_PLUGINS` filters general plugins in either hook group.
 
 ### Current scope
 
@@ -73,7 +73,10 @@ Diffusion reserves `cpu`, `cuda`, `rocm`, `xpu`, `mps`, `npu`, and `musa`. Autom
 ```text
 entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadata only)
   │
-  ├─ SGLANG_PLATFORM set (front-loading filter):
+  ├─ SGLANG_PLATFORM names a built-in (cpu, cuda, rocm, xpu, mps, npu, musa):
+  │   └─ use that built-in platform, no plugin is loaded
+  │
+  ├─ SGLANG_PLATFORM set otherwise (front-loading filter):
   │   ├─ Name not found in discovered → RuntimeError
   │   ├─ activate() returns non-None  → load that platform
   │   └─ activate() returns None      → RuntimeError (hardware unavailable)
@@ -92,12 +95,12 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
 
 SGLang Diffusion resolves its platform in this order:
 
-1. When `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` names `cpu`, `cuda`, `rocm`, `mps`, `npu`, or `musa`, select that built-in platform without hardware probing. XPU remains automatic-only, preserving the existing selector behavior.
+1. When `SGLANG_PLATFORM` names `cpu`, `cuda`, `rocm`, `xpu`, `mps`, `npu`, or `musa`, select that built-in platform without hardware probing. SRT accepts the same built-in names.
 2. When it contains another name, load only the matching `sglang.multimodal_gen.platforms` entry point. An unknown name or a callback that returns `None` is an error.
 3. When it is unset, activate installed diffusion platform plugins. No active plugin continues to built-in detection, one selects that plugin, and multiple active plugins raise an error that asks you to set the selector. An activation callback that raises aborts startup rather than falling back, so a broken vendor runtime cannot silently run the job on a built-in platform.
 4. Try built-in platforms in order: MPS, XPU, ROCm, CUDA, NPU, MUSA, then CPU.
 
-The existing override variable is therefore the single explicit selector for supported built-in aliases and OOT entry-point names.
+`SGLANG_PLATFORM` is therefore the single explicit selector for built-in names and OOT entry-point names in both runtimes. Register the same entry-point name in `sglang.srt.platforms` and `sglang.multimodal_gen.platforms` so one value selects your platform everywhere.
 
 Selection resolves lazily, the first time anything in a process touches `current_platform`, so it needs no call site and happens in every process automatically. SGLang Diffusion also records which distribution supplied the selected platform, and skips the hooks of every other installed platform package.
 
@@ -727,15 +730,13 @@ def activate_diffusion() -> str | None:
     return "my_platform_plugin.diffusion_platform.MyDiffusionPlatform"
 ```
 
-The referenced class must be zero-argument constructible:
+The referenced class must be zero-argument constructible. `MMPlatform` extends the same `DeviceMixin` as `SRTPlatform`, so device operations written once serve both runtimes:
 
 ```python
-from sglang.multimodal_gen.runtime.platforms import Platform, PlatformEnum
+from sglang.multimodal_gen.runtime.platforms import MMPlatform
+from my_platform_plugin.device import MyDeviceMixin
 
-class MyDiffusionPlatform(Platform):
-    _enum = PlatformEnum.OOT
-    device_name = "my_device"
-    device_type = "my_device"
+class MyDiffusionPlatform(MyDeviceMixin, MMPlatform):
     dispatch_key = "PrivateUse1"
 
     def get_dispatch_key_name(self) -> str:
@@ -744,15 +745,15 @@ class MyDiffusionPlatform(Platform):
 
 Set `dispatch_key` to the PyTorch dispatcher key used by direct `torch.library` registrations. Keep it separate from `get_dispatch_key_name()`, which selects `CustomOp` implementations. Bring up the remaining contract in dependency order:
 
-1. Implement `get_device_name()`, `get_device_total_memory()`, and `get_available_gpu_memory()` before constructing `ServerArgs`.
-2. Implement `get_device()` and `get_local_torch_device()` before worker binding.
+1. Implement `get_device_name()`, `get_device_total_memory()`, `current_device()`, and `get_available_memory()` before constructing `ServerArgs`. `get_available_gpu_memory()` is derived from them.
+2. Implement `get_device()` and `set_device()` before worker binding; `get_local_torch_device()` is derived from `get_device()`.
 3. Configure distributed initialization, attention selection, and custom-op implementations for supported workloads.
 4. Run an end-to-end workload and audit model-specific kernels, compilation, and remaining device-family branches.
 
 Register custom-op implementations from `init_backend()`, which runs once in each worker before any pipeline module is constructed:
 
 ```python
-class MyDiffusionPlatform(Platform):
+class MyDiffusionPlatform(MyDeviceMixin, MMPlatform):
     ...
 
     def init_backend(self) -> None:
@@ -769,35 +770,34 @@ class MyDiffusionPlatform(Platform):
 
 The function receives the operation instance before its normal arguments. Registration matches the exact operation class and the value returned by `get_dispatch_key_name()`. Without a registration, SGLang looks for a matching `forward_<key>()` implementation on the operation, then falls back to `forward_oot()`, whose base implementation calls `forward_native()`. Returning `"cuda"`, for example, lets a CUDA-compatible OOT platform reuse operation-specific `forward_cuda()` implementations without reporting CUDA platform identity.
 
-The `sglang.multimodal_gen.plugins` entry point remains for seams the `Platform` interface does not cover. Its callbacks run in launchers and workers before scheduler or model construction, so use a `BEFORE` or `AROUND` hook on `GPUWorker.init_device_and_model()` for rank-aware initialization. Hooks from platform distributions other than the selected one are skipped. Because these ship in your platform's distribution, a failure at any stage — load, callback, or hook application — aborts startup, the same as `init_backend()`.
+The `sglang.multimodal_gen.plugins` entry point remains for seams the `MMPlatform` interface does not cover. Its callbacks run in launchers and workers before scheduler or model construction, so use a `BEFORE` or `AROUND` hook on `GPUWorker.init_device_and_model()` for rank-aware initialization. Hooks from platform distributions other than the selected one are skipped. Because these ship in your platform's distribution, a failure at any stage — load, callback, or hook application — aborts startup, the same as `init_backend()`.
 
 #### Diffusion platform contract
 
-**Active** interfaces are called through `current_platform`. **Compatibility** interfaces are retained adapters; unlisted `Platform` methods are not a stable OOT contract.
+**Active** interfaces are called through `current_platform`; unlisted `MMPlatform` methods are not a stable OOT contract. Device rows come from `DeviceMixin` and are shared with SRT.
 
 | Status | Area | Interface |
 | --- | --- | --- |
 | Active | Initialization | `init_backend()` |
 | Active | Configuration | `apply_server_args_defaults()` |
-| Active | Device and memory | `get_device()`, `set_device()`, `get_local_torch_device()`, `get_device_name()`, `get_device_uuid()`, `get_device_total_memory()`, `get_available_gpu_memory()`, `get_device_capability()` |
-| Active | Distributed | `get_torch_distributed_backend_str()`, `supports_distributed_device_id()`, `get_all_to_all_communicator_cls()`, `get_cpu_architecture()` |
+| Active | Device and memory | `get_device()`, `set_device()`, `current_device()`, `get_local_torch_device()`, `get_device_name()`, `get_device_uuid()`, `get_device_total_memory()`, `get_available_memory()`, `get_available_gpu_memory()`, `get_device_capability()`, `has_device_capability()` |
+| Active | Distributed | `get_torch_distributed_backend_str()`, `supports_distributed_device_id()`, `get_communicator_class()`, `get_all_to_all_communicator_class()`, `get_cpu_architecture()` |
 | Active | Dispatch and model | `dispatch_key` (read by `get_torch_library_dispatch_key()`), `get_dispatch_key_name()`, `get_attn_backend_cls_str()`, `verify_model_arch()`, `optimize_vae()` |
 | Active | Execution | `get_compile_backend()`, `get_compile_options()`, `inference_mode()`, `seed_everything()`, `enable_dit_layerwise_offload_by_default()` |
-| Compatibility | Communicator | `get_device_communicator_cls()` remains the fallback used by `get_all_to_all_communicator_cls()` for existing platform subclasses. New OOT platforms should override the latter. |
 
 Install the package, restart Python to refresh entry-point metadata, and verify explicit selection:
 
 ```bash
 pip install -e my_platform_plugin/
-SGLANG_DIFFUSION_PLATFORM_OVERRIDE=my_device python -c \
+SGLANG_PLATFORM=my_device python -c \
   "from sglang.multimodal_gen.runtime.platforms import current_platform; print(current_platform)"
 ```
 
 ### Diffusion platform limitations
 
-- SRT and diffusion require separate platform classes.
+- SRT and diffusion require separate platform classes; share device operations through one `DeviceMixin` subclass.
 - Only one external platform can be active per process; set the runtime selector if multiple callbacks activate.
-- `get_all_to_all_communicator_cls()` controls only `all_to_all_4D()`, not every collective, graph-capture, or synchronization path; `get_device_communicator_cls()` remains for compatibility.
+- `get_all_to_all_communicator_class()` controls only `all_to_all_4D()`, not every collective, graph-capture, or synchronization path. It defaults to `get_communicator_class()`. Both return the class itself; the former `get_device_communicator_cls()` and `get_all_to_all_communicator_cls()` qualname hooks are rejected at load time.
 - Compile settings affect only `build_torch_compile_kwargs()` callers; audit static `@torch.compile` decorators and other direct compile paths.
 - Explicit attention selectors accept only `AttentionBackendEnum` names. Returning a custom backend works when none is selected; selecting it by name requires a hook or downstream patch.
 - Device-family branches remain outside the interface. Each supported workload needs a native fallback or an actionable unsupported-feature error.
@@ -1068,7 +1068,7 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
     </tr>
     <tr>
       <td><code>sglang/multimodal_gen/runtime/platforms/interface.py</code></td>
-      <td>Diffusion <code>Platform</code> base class</td>
+      <td>Diffusion <code>MMPlatform</code> base class (extends DeviceMixin; <code>Platform</code> is an alias)</td>
     </tr>
     <tr>
       <td><code>sglang/multimodal_gen/runtime/platforms/__init__.py</code></td>

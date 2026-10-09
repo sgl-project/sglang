@@ -11,7 +11,6 @@ import pickle
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from pkgutil import resolve_name
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -51,12 +50,13 @@ def get_local_torch_device() -> torch.device:
 
 
 def _resolve_all_to_all_communicator_cls() -> type[DeviceCommunicatorBase]:
-    qualname = current_platform.get_all_to_all_communicator_cls()
-    communicator_cls = resolve_name(qualname)
+    communicator_cls = current_platform.get_all_to_all_communicator_class()
     if not isinstance(communicator_cls, type) or not issubclass(
         communicator_cls, DeviceCommunicatorBase
     ):
-        raise TypeError(f"Expected a DeviceCommunicatorBase subclass: {qualname}")
+        raise TypeError(
+            f"Expected a DeviceCommunicatorBase subclass: {communicator_cls!r}"
+        )
     return communicator_cls
 
 
