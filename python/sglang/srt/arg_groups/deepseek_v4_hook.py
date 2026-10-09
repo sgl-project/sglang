@@ -319,11 +319,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
-        # Late layers see a per-request tail slice, not the captured prefill shape.
+        # Breakable prefill keeps its captured full-row path; only eager
+        # fallback batches use the per-request late-layer tail slice.
         incompatible = (
             (
                 "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
             # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
             ("DP attention", attn_dp_enabled_of(cfg)),
@@ -334,3 +336,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            logger.info(
+                "Decoder SWA bounded replay applies to eager prefill fallback; "
+                "breakable prefill graphs retain their full-row computation."
+            )

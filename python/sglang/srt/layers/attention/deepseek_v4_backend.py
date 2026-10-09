@@ -2580,6 +2580,9 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        # BCG captures the full padded prefill, not the eager late-layer tail.
+        # Clear state left by any preceding eager warmup/capture preparation.
+        self.tail_forward_metadata = None
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
@@ -2627,6 +2630,9 @@ class DeepseekV4AttnBackend(
         *,
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
+        # An eager fallback may have populated a tail with a different batch
+        # shape. The graph and its outer logits step must both use full rows.
+        self.tail_forward_metadata = None
         # The padded static batch still carries live seq/extend lens, so the
         # online c128 prefill plan stays batch-specific.
         metadata_batch = (
