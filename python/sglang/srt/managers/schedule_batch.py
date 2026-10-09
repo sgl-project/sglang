@@ -1165,7 +1165,6 @@ class Req(ReqDllmMixin):
         # 3: last token
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
-        self.decoded_text = ""
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
@@ -1806,13 +1805,11 @@ class Req(ReqDllmMixin):
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
+                    if stop_str in tail_str:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
-                            )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=stop_str
+                        )
                         return True
 
             # Check stop regex

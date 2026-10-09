@@ -136,15 +136,17 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
 
-    # --- decoded_text-only branch ---
-    def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
-        # Documents current behavior: when the stop is only in decoded_text (not
-        # the tail), the request finishes but finished_len is left unset.
-        req = _make_req([10, 11, 12], stop=["STOP"])  # no STOP in output tokens
-        req.decoded_text = "earlier STOP text"
-        req.update_finish_state(new_accepted_len=3)
-        self.assertTrue(req.finished())
-        self.assertIsNone(req.finished_len)
+    # --- tail-window invariant (#41372) ---
+    def test_stop_str_outside_tail_window_does_not_finish(self):
+        # stop_str_max_len("STOP") == 4 -> tail window is 5 tokens for
+        # new_accepted_len=1. STOP at index 0 is outside that window, so the
+        # finish check must miss it (matching is tail-only).
+        req = _make_req(
+            [STOP_ID, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+            stop=["STOP"],
+        )
+        req.update_finish_state(new_accepted_len=1)
+        self.assertFalse(req.finished())
 
 
 if __name__ == "__main__":

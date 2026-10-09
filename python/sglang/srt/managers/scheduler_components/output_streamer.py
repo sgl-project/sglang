@@ -328,7 +328,6 @@ class _GenerationStreamAccumulator:
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
-    decoded_texts: list = field(default_factory=list)
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
@@ -480,7 +479,6 @@ class _GenerationStreamAccumulator:
             # block. The parallel lists stay empty; the payload goes straight to
             # `push_generation`, which only indexes the fields appended above.
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
             self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
             req.send_decode_id_offset = len(decode_ids)
@@ -695,7 +693,6 @@ class _GenerationStreamAccumulator:
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
-            decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,
             output_ids=self.output_ids,
