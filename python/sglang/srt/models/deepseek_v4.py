@@ -4788,14 +4788,22 @@ class DeepseekV4Model(nn.Module):
                 if __import__("os").environ.get("DSV4_DUMP_LHID"):
                     import hashlib as _hl
 
-                    _arr = (
-                        hidden_states.detach().reshape(-1).to(torch.float32).cpu().numpy()
-                    )
+                    _pos = forward_batch.positions
+                    _lastpos = int(_pos.reshape(-1)[-1].item()) if _pos.numel() else -1
+                    if hidden_states.numel():
+                        _arr = (
+                            hidden_states.detach()
+                            .reshape(-1)
+                            .to(torch.float32)
+                            .cpu()
+                            .numpy()
+                        )
+                        _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
+                    else:
+                        _h = "empty"
                     print(
-                        f"[LHID] layer={i} lastpos="
-                        f"{int(forward_batch.positions.reshape(-1)[-1].item())} "
-                        f"ntok={int(hidden_states.shape[0])} "
-                        f"md5={_hl.md5(_arr.tobytes()).hexdigest()[:16]}",
+                        f"[LHID] layer={i} lastpos={_lastpos} "
+                        f"ntok={int(hidden_states.shape[0])} md5={_h}",
                         flush=True,
                     )
                 if capture_dspark and i in self.dspark_layers_to_capture:
