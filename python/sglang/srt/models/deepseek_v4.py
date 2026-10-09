@@ -176,7 +176,9 @@ from sglang.srt.models.deepseek_v2 import (
     _is_xpu,
 )
 from sglang.srt.models.deepseek_v4_replay_graphs import (
-    DecoderReplayGraphs,
+    TAIL_ROW_STEP,
+    TOKEN_STEP,
+    EagerReplayGraphs,
     bcg_late_kv_store,
     in_decoder_replay_graph,
 )
@@ -3951,12 +3953,33 @@ class DeepseekV4Model(nn.Module):
                 0,
                 1,
             }, f"late layers must not compress on their own, got ratios {late_ratios}"
-        self.decoder_replay_graphs: Optional[DecoderReplayGraphs] = None
-        replay_graph_rows = envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS.get()
-        if self.late_layer_start is not None and replay_graph_rows > 0 and not _is_hip:
-            self.decoder_replay_graphs = DecoderReplayGraphs(
-                model=self, run_layers=self._run_late_layers, max_rows=replay_graph_rows
-            )
+        # Eager prefill steps replay graphs of the late layers (tail rows) and of
+        # the full-width layers before them (step tokens); see deepseek_v4_replay_graphs.
+        self.decoder_replay_graphs: Optional[EagerReplayGraphs] = None
+        self.full_layer_graphs: Optional[EagerReplayGraphs] = None
+        tail_rows = envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS.get()
+        full_tokens = envs.SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS.get()
+        if self.late_layer_start is not None and not _is_hip:
+            if tail_rows > 0:
+                self.decoder_replay_graphs = EagerReplayGraphs(
+                    name="decoder-replay",
+                    model=self,
+                    run_layers=self._run_late_layers,
+                    buckets=list(range(TAIL_ROW_STEP, tail_rows + 1, TAIL_ROW_STEP)),
+                    tail_rows=True,
+                )
+            if full_tokens > 0:
+                self.full_layer_graphs = EagerReplayGraphs(
+                    name="full-layer",
+                    model=self,
+                    run_layers=self._run_full_layers,
+                    buckets=list(range(TOKEN_STEP, full_tokens + 1, TOKEN_STEP)),
+                    tail_rows=False,
+                )
+
+    @property
+    def eager_replay_graphs(self) -> List[EagerReplayGraphs]:
+        return [g for g in (self.full_layer_graphs, self.decoder_replay_graphs) if g]
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3997,20 +4020,61 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _replays_late_layers(
-        self, tail: LateLayerTail, capture_dspark: bool, forward_batch: ForwardBatch
+    def _eager_graphs_apply(
+        self,
+        graphs: Optional[EagerReplayGraphs],
+        tail: Optional[LateLayerTail],
+        capture_dspark: bool,
+        forward_batch: ForwardBatch,
     ) -> bool:
-        # Prefill graph steps keep the late layers inside their own graph.
-        graphs = self.decoder_replay_graphs
+        # Prefill graph steps keep every layer inside their own graph.
         return (
             graphs is not None
-            and graphs.ready(forward_batch.input_ids.shape[0])
+            and tail is not None
             and not capture_dspark
             and tail.cp_metadata is None
             and not is_in_breakable_cuda_graph()
             and not get_is_capture_mode()
-            and graphs.bucket_rows(tail.positions.shape[0]) is not None
+            and not forward_batch.contains_mm_inputs()
         )
+
+    def _run_full_layers(
+        self,
+        state: mhc.HcState,
+        *,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+        hash_ids: Optional[torch.Tensor] = None,
+    ) -> mhc.HcState:
+        """The full-width layers before the tail: the full-layer graphs' body."""
+        for i in range(self.start_layer, self.late_layer_start):
+            engram = self.layers[i].engram
+            if engram is not None:
+                state = state.with_residual(
+                    engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=False,
+                    )
+                )
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                state = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    state=state,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                    seam_open=False,
+                )
+        return state
 
     def _run_late_layers(
         self,
@@ -4020,7 +4084,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> mhc.HcState:
         """The late layers on the tail rows: the decoder replay graphs' body."""
         for i in range(self.late_layer_start, self.end_layer):
             assert self.layers[i].engram is None
@@ -4038,8 +4102,7 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                     seam_open=False,
                 )
-        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        return state.residual, state.pre
+        return state.materialized(self.layers[self.end_layer - 1].hc_cfg)
 
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
@@ -4114,7 +4177,21 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
+        first_layer = self.start_layer
+        if self._eager_graphs_apply(
+            self.full_layer_graphs, tail, capture_dspark, forward_batch
+        ):
+            out = self.full_layer_graphs.run(
+                state=state,
+                forward_batch=forward_batch,
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                hash_ids=hash_ids,
+            )
+            if out is not None:
+                state, first_layer = out, self.late_layer_start
+        for i in range(first_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4126,16 +4203,20 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-                if self._replays_late_layers(tail, capture_dspark, forward_batch):
-                    residual, pre = self.decoder_replay_graphs.run(
+                out = None
+                if self._eager_graphs_apply(
+                    self.decoder_replay_graphs, tail, capture_dspark, forward_batch
+                ):
+                    out = self.decoder_replay_graphs.run(
                         state=state,
+                        forward_batch=forward_batch,
                         positions=positions,
                         input_ids=input_ids,
                         input_ids_global=input_ids_global,
-                        forward_batch=forward_batch,
                     )
+                if out is not None:
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-                    return residual, pre, tail
+                    return out.residual, out.pre, tail
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
