@@ -206,9 +206,7 @@ def process_content_for_template_format(
     """
     content = msg_dict.get("content")
     if not isinstance(content, list):
-        if (content_format == "openai" or use_dpsk_v32_encoding) and isinstance(
-            content, str
-        ):
+        if content_format == "openai" and isinstance(content, str):
             msg_dict = {**msg_dict, "content": [{"type": "text", "text": content}]}
         else:
             # Already a string or None, no processing needed
