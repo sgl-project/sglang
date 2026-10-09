@@ -40,7 +40,6 @@ class NgramEmbedding(torch.nn.Module):
         self.exclusive_oe_embedder_size_sums = torch.zeros(
             [over_embedding_k * (over_embedding_n - 1) + 1],
             dtype=torch.int32,
-            device="cuda",
         )
         for i in range(over_embedding_k * (over_embedding_n - 1)):
             self.exclusive_oe_embedder_size_sums[i + 1] = (
