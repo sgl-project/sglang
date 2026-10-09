@@ -58,15 +58,6 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
 /// is bumped above worker A so the matched-worker pick prefers A.
 #[tokio::test]
 async fn zmq_indexer_routes_to_publishing_worker_e2e() {
-    run_zmq_routing(false).await;
-}
-
-#[tokio::test]
-async fn zmq_removal_routes_to_owned_ancestor_e2e() {
-    run_zmq_routing(true).await;
-}
-
-async fn run_zmq_routing(ancestor: bool) {
     let model_id = ModelId("tiny".into());
 
     // 1. Tokenizer registry — use the in-tree tiny fixture.
@@ -110,11 +101,7 @@ async fn run_zmq_routing(ancestor: bool) {
     // 3. Compute the hash chain for the routing prompt.
     let text = "hello world hello world hello world";
     let tok = tokenizers.get("tiny").unwrap();
-    let token_ids = if ancestor {
-        (0..24).collect::<Vec<u32>>()
-    } else {
-        sgl_router::tokenizer::adapter::encode(&tok, text).unwrap()
-    };
+    let token_ids = sgl_router::tokenizer::adapter::encode(&tok, text).unwrap();
     let block_size = 4u32;
     let hashes = compute_block_hashes(&token_ids, block_size as usize);
     assert!(!hashes.is_empty(), "tiny tokenizer must yield ≥1 block");
@@ -132,7 +119,6 @@ async fn run_zmq_routing(ancestor: bool) {
     let policy = CacheAwareZmqPolicy::new(
         CacheAwareConfig {
             cache_threshold: 0.0,
-            ancestor_fallback: true,
             bootstrap_timeout_ms: 5_000,
             ..Default::default()
         },
@@ -157,9 +143,7 @@ async fn run_zmq_routing(ancestor: bool) {
         load_port_base: None,
     };
     kv_index.add_worker(url_a, Some(preresolved.clone())).await;
-    if !ancestor {
-        kv_index.add_worker(url_b, Some(preresolved)).await;
-    }
+    kv_index.add_worker(url_b, Some(preresolved)).await;
 
     // SUB sockets take a moment to handshake. The polling loop below
     // soaks up any extra latency; this is just a publish-before-SUB
@@ -168,21 +152,7 @@ async fn run_zmq_routing(ancestor: bool) {
 
     // 6. Publish a BlockStored event for the routing prompt's chain.
     let event_bytes = encode_block_stored_event(&hashes, None, &token_ids, block_size);
-    let mut events = vec![event_bytes];
-    if ancestor {
-        // Keep block 6 so removed blocks 4 and 5 remain as unowned interiors.
-        // Exercise the real wire decoder and event pump, not direct tree edits.
-        let mut removed = Vec::new();
-        rmp::encode::write_array_len(&mut removed, 3).unwrap();
-        rmp::encode::write_str(&mut removed, "BlockRemoved").unwrap();
-        rmp::encode::write_array_len(&mut removed, 2).unwrap();
-        for hash in &hashes[3..5] {
-            rmp::encode::write_sint(&mut removed, *hash).unwrap();
-        }
-        rmp::encode::write_str(&mut removed, "GPU").unwrap();
-        events.push(removed);
-    }
-    let payload = encode_event_batch(0.0, events, Some(0));
+    let payload = encode_event_batch(0.0, vec![event_bytes], Some(0));
     pub_a
         .send(build_multipart(1, payload))
         .await
@@ -196,16 +166,14 @@ async fn run_zmq_routing(ancestor: bool) {
     //    so the counter stays > 0 through the polling loop.
     let w_a = build_worker(url_a, "tiny");
     let w_b = build_worker(url_b, "tiny");
-    let loaded = if ancestor { &w_a } else { &w_b };
-    let _load: Vec<_> = (0..3).map(|_| loaded.load_guard()).collect();
+    let _b_load: Vec<_> = (0..3).map(|_| w_b.load_guard()).collect();
     let workers = vec![Arc::clone(&w_a), Arc::clone(&w_b)];
 
     // 8. Drive select until the event has been applied. The pipeline is
     //    asynchronous (publish → SUB recv → mpsc → pump → tree); a
     //    polling loop is less flaky than a fixed sleep.
     let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
-    let ctx = SelectionContext::new(&model_id, Some(&body))
-        .with_request_tokens(ancestor.then_some(&token_ids[..20.min(token_ids.len())]));
+    let ctx = SelectionContext::new(&model_id, Some(&body));
 
     let start = std::time::Instant::now();
     let mut chose_a = false;
@@ -222,14 +190,6 @@ async fn run_zmq_routing(ancestor: bool) {
         chose_a,
         "policy did not route to publishing worker A within timeout",
     );
-
-    if ancestor {
-        let matched = kv_index.tree().match_prefix(None, &hashes[..5]);
-        assert_eq!(
-            (matched.matched_blocks, matched.owned_matched_blocks),
-            (5, 3)
-        );
-    }
 
     // 9. Shutdown cleanly.
     let r = tokio::time::timeout(Duration::from_secs(2), kv_index.shutdown()).await;

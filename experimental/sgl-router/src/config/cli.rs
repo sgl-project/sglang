@@ -213,9 +213,6 @@ pub struct Cli {
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
-    /// Allow affinity to an owned ancestor of an unowned match (default off).
-    #[arg(long)]
-    pub cache_aware_ancestor_fallback: bool,
     /// How long `/readyz` may stay 503 while this replica bootstraps its
     /// cache-aware tree from a warm sibling. Defaults to 5000.
     #[arg(long)]
@@ -511,8 +508,7 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_cache_aware = self.cache_aware_ancestor_fallback
-            || self.cache_threshold.is_some()
+        let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
@@ -525,7 +521,7 @@ impl Cli {
             || self.mm_affinity_eviction_interval_secs.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "cache-aware tuning (--cache-aware-ancestor-fallback / --cache-threshold / --balance-abs-threshold / \
+                "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
                  --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
                  --worker-queue-limit / --min-load-choices / --saturation-queue-floor / \
@@ -733,7 +729,6 @@ impl Cli {
             };
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                ancestor_fallback: self.cache_aware_ancestor_fallback,
                 load_gate,
                 bootstrap_timeout_ms: self
                     .kv_bootstrap_timeout_ms
@@ -2573,31 +2568,6 @@ mod tests {
     }
 
     /// The defaults an operator gets without touching anything.
-    #[test]
-    fn ancestor_fallback_flag_is_opt_in() {
-        for enabled in [false, true] {
-            let mut args = vec![
-                "--worker-urls",
-                "http://x:30000",
-                "--policy",
-                "cache_aware_zmq",
-            ];
-            if enabled {
-                args.push("--cache-aware-ancestor-fallback");
-            }
-            let config = into_config_owned(with_model(&args)).unwrap();
-            assert_eq!(
-                config
-                    .model
-                    .cache_aware
-                    .unwrap_or_default()
-                    .ancestor_fallback,
-                enabled
-            );
-        }
-        assert!(!CacheAwareConfig::default().ancestor_fallback);
-    }
-
     #[test]
     fn mm_affinity_defaults() {
         let d = CacheAwareConfig::default();
