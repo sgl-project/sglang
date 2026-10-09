@@ -76,16 +76,25 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
         )
 
     explicit_decode_backend = cfg.decode_attention_backend
-    if explicit_decode_backend not in (None, "trtllm_mha"):
-        raise ValueError(
-            "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
-            f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
-            "selects the supported decode implementation automatically."
-        )
+    if get_platform().is_sm100:
+        if explicit_decode_backend not in (None, "trtllm_mha"):
+            raise ValueError(
+                "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
+                f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
+                "selects the supported decode implementation automatically."
+            )
+        target_decode_backend = "trtllm_mha"
+    else:
+        if explicit_decode_backend not in (None, "flashinfer", "trtllm_mha"):
+            raise ValueError(
+                "NVFP4 decode requires --decode-attention-backend to be 'flashinfer' or 'trtllm_mha'; got "
+                f"{explicit_decode_backend!r}."
+            )
+        target_decode_backend = explicit_decode_backend or "flashinfer"
 
     updates = {
         "prefill_attention_backend": target_prefill_backend,
-        "decode_attention_backend": "trtllm_mha",
+        "decode_attention_backend": target_decode_backend,
     }
     if cfg.prefill_kv_cache_dequant_dtype == "auto":
         updates["prefill_kv_cache_dequant_dtype"] = requested_dtype

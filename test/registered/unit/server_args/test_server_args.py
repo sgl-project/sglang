@@ -933,6 +933,9 @@ class TestKV4Compatibility(unittest.TestCase):
         self.assertEqual(
             resolution_result(args, "prefill_attention_backend"), "flashinfer"
         )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "flashinfer"
+        )
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_prefill_kv_dequant_dtype_rejects_native_prefill_off_sm100(self):
