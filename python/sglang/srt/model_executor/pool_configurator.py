@@ -948,7 +948,12 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         if not get_memory().disable_radix_cache:
             return False
-        if get_schedule().chunked_prefill_size is None:
+        # The cap holds at most one prefill chunk per batch in flight; an
+        # unchunked prefill writes the whole prompt into the SWA pool.
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if get_disagg().disaggregation_mode != "decode" and (
+            chunked_prefill_size is None or chunked_prefill_size <= 0
+        ):
             return False
         if kvc.sliding_window_size is None:
             return False
