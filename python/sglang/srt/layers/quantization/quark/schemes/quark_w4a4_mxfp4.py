@@ -6,7 +6,6 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -19,6 +18,7 @@ from sglang.srt.layers.quantization.dequantization import (
     dequantize_fp8,
     dequantize_nvfp4,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -36,11 +36,6 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
-
-# Keep this path opt-in while the AITER ASM integration is validated across the
-# Quark model matrix. Unlike the Triton fallback, it consumes AITER's
-# a4w4_blockscale_tuned_gemm CSVs.
-_use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
 
 
 def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
@@ -96,8 +91,8 @@ def _asm_fp4_prequantized_input(
     if len(x) != 2:
         raise NotImplementedError(
             "AITER ASM FP4 GEMM only supports the (x_fp4, x_scales) tuple input; "
-            f"got a {len(x)}-tuple. Disable SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM "
-            "for models that use this projection."
+            f"got a {len(x)}-tuple. Use --fp4-gemm-backend triton for models "
+            "that use this projection."
         )
     x_q, x_scales = x
     # Only B is preshuffled (bpreshuffle=True), so the packed FP4 activation is
@@ -391,6 +386,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        # --fp4-gemm-backend aiter: unlike the Triton path, AITER's gemm_a4w4
+        # consumes the a4w4_blockscale_tuned_gemm CSVs.
+        self.use_aiter_fp4_gemm = _is_hip and get_fp4_gemm_runner_backend().is_aiter()
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -420,7 +418,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
-        if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
+        if not self.use_aiter_fp4_gemm:
             return
 
         if not _asm_fp4_scale_swizzle_supported(layer.weight_scale.data):
