@@ -104,7 +104,14 @@ SGL_DEVICE int ue8m0_of_amax(float amax) {
 // Knobs swept offline into mxfp8_gemv_gfx95_configs.json: WAVES per workgroup, STEPS 128-K steps
 // in flight, ROWS / TOKENS per wave tile (16 or 32); the waves split K and reduce through LDS.
 template <int WAVES, int STEPS, int ROWS, int TOKENS, bool X_BF16>
+#ifdef SGLANG_MXFP8_GEMV_BODY_ONLY
+// The opt-in horizontal-fusion translation unit reuses this implementation.
+// Keep the native entry point's body and restrict qualifiers intact: forwarding
+// through a device wrapper changes register allocation even with forceinline.
+__device__ __forceinline__ void mxfp8_gemv_body(
+#else
 __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
+#endif
     const uint8_t* __restrict__ W,   // [N/16, KP/128, 2048] fp8 e4m3 in MFMA lane order
     const uint8_t* __restrict__ WS,  // [N/32, KP/32] ue8m0 (the checkpoint's 32x32 block scales)
     const uint8_t* __restrict__ X,   // X_BF16 ? bf16 [M, K] : fp8 e4m3 [M, K] (uint8 view)
@@ -290,6 +297,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
 
 }  // namespace mxfp8_gemv
 
+#ifndef SGLANG_MXFP8_GEMV_BODY_ONLY
 /**
  * \brief Validate the operands and launch `mxfp8_gemv_kernel`.
  *
@@ -372,5 +380,7 @@ struct Mxfp8GemvGfx950Kernel {
         static_cast<int32_t>(K));
   }
 };
+
+#endif  // SGLANG_MXFP8_GEMV_BODY_ONLY
 
 }  // namespace sglang
