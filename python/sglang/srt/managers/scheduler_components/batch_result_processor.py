@@ -1398,6 +1398,10 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # Persist the decision for both immediate and offloaded release.
+            if not self._mamba_can_cache_finished_req(req, result, i):
+                req.skip_radix_cache_insert = True
+
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
             if isinstance(self.draft_worker, BaseSpecWorker):
@@ -1434,6 +1438,32 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _mamba_can_cache_finished_req(
+        self, req: Req, result: GenerationBatchResult, i: int
+    ) -> bool:
+        if (
+            result.num_correct_drafts_per_req_cpu is None
+            or req.kv.mamba_ping_pong_track_buffer is not None
+            or not self.tree_cache.supports_mamba()
+        ):
+            return True
+
+        # no_buffer donates the live recurrent state. Verify advanced that state
+        # through the entire accepted run, before CPU grammar/finish truncation.
+        # A shorter key cannot describe it; retain existing checkpoints instead.
+        num_verified = (
+            result.num_correct_drafts_per_req_cpu[i]
+            + result.num_non_draft_tokens_per_req
+        )
+        retained = result.grammar_retained_tokens
+        num_committed = (
+            len(retained[i])
+            if retained is not None and retained[i] is not None
+            else num_verified
+        )
+        live_state_len = req.kv.kv_committed_len + num_verified - num_committed
+        return live_state_len == req.owned_kv_len()
 
     def _maybe_update_reasoning_tokens(
         self,
