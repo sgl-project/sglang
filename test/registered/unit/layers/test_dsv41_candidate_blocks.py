@@ -100,6 +100,26 @@ class TestTopkAmongBlocks(CustomTestCase):
 
 
 class TestBlockIdsTail(CustomTestCase):
+    def test_invalid_tail_lengths_fail_before_indexing(self):
+        for full, tail in (
+            ([44], [128]),
+            ([80], [128]),
+            ([24, 24], [128, 128]),
+            ([3, 5], [2]),
+            ([3], [1, 1]),
+            ([3], [-1]),
+            ([0], [1]),
+        ):
+            with self.subTest(full=full, tail=tail), self.assertRaises(ValueError):
+                get_tail_row_indices(full, tail, device="cuda")
+
+    def test_empty_tail_rows(self):
+        for full, tail in (([], []), ([0], [0]), ([3, 0, 5], [0, 0, 0])):
+            with self.subTest(full=full, tail=tail):
+                rows = get_tail_row_indices(full, tail, device="cpu")
+                self.assertEqual(rows.dtype, torch.int64)
+                self.assertEqual(rows.tolist(), [])
+
     def test_tail_keeps_each_requests_last_rows(self):
         blocks = torch.arange(16, dtype=torch.int32).view(8, 2)
         ids = BlockIds(blocks=blocks, rows_per_request=[5, 0, 3])

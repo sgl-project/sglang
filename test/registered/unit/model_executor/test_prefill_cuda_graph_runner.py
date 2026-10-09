@@ -210,22 +210,29 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(captured, [batch])
         self.assertIs(backend, attention_backend)
 
-    def test_trim_logits_output_preserves_customized_info(self):
+    def test_trim_logits_output_preserves_metadata(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = SimpleNamespace(
             spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
         )
         runner.raw_bs = 1
+        runner.raw_num_tokens = 4
         runner._is_full_backend = True
         customized_info = {"per_request": [object()]}
+        tail_rows = torch.tensor([2, 3])
+        tail_hidden = torch.arange(16).view(2, 8)
         output = runner._trim_logits_output(
             LogitsProcessorOutput(
                 next_token_logits=torch.zeros((4, 8)),
+                hidden_states=tail_hidden,
+                hidden_states_token_indices=tail_rows,
                 customized_info=customized_info,
             )
         )
 
         self.assertIs(output.customized_info, customized_info)
+        self.assertIs(output.hidden_states_token_indices, tail_rows)
+        torch.testing.assert_close(output.hidden_states, tail_hidden)
 
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()

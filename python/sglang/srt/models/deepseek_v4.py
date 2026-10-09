@@ -6,6 +6,7 @@ import logging
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
@@ -20,6 +21,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,6 +164,14 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
+)
+from sglang.srt.models.deepseek_common.tail_graph import (
+    TailGraph,
+    TailInputs,
+    capture_tail_graph,
+    make_capture_batch,
+    select_tail_graph,
+    tail_graph_sizes,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -720,7 +730,7 @@ def deepseek_v4_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = _prefill_live_rows(forward_batch, query.shape[0])
 
     if real_num_tokens == 0:
         output.zero_()
@@ -761,10 +771,19 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+def _prefill_live_rows(forward_batch: ForwardBatch, capacity: int) -> int:
+    rows = forward_batch.global_num_token_non_padded_cpu
+    if get_exec().features.enable_decoder_swa_bounded_replay:
+        tail = get_attn_backend().forward_metadata.late_layer_tail
+        if tail is not None:
+            rows = tail.token_indices.numel()
+    return min(rows, capacity)
+
+
 def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     # The compressor and prefill indexer sync with the host, like the attention.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    real_num_tokens = _prefill_live_rows(forward_batch, positions.shape[0])
     if real_num_tokens == 0:
         return
     get_attn_backend().forward_low_ratio_sources(
@@ -3799,10 +3818,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
-    # Rows outside the tail are never read (see _check_late_layer_tail_readers).
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        start = tail.contiguous_start
+        full[start : start + tail.token_indices.numel()].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
@@ -3923,6 +3942,7 @@ class DeepseekV4Model(nn.Module):
         )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        self.tail_graphs: dict[int, TailGraph] = {}
 
         # Decoder SWA bounded replay: layers past the last kv_source layer run over
         # each request's last SWA_WINDOW extend tokens only.
@@ -4001,69 +4021,57 @@ class DeepseekV4Model(nn.Module):
                 "set logprob_start_len to the prompt length"
             )
 
-    def _forward_layers_hc_pre_from_prev(
+    def _get_engram_hash_ids(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        num_rows: int,
+    ) -> Optional[torch.Tensor]:
+        if self.engram_hasher is None:
+            return None
+        if is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend():
+            total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+            hash_ids = self.engram_hasher(
+                forward_batch.input_ids[:total], forward_batch
+            )
+            parallel = get_parallel()
+            hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+            pad_rows = num_rows - hash_ids.shape[0]
+            if pad_rows > 0:
+                hash_ids = torch.cat(
+                    [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
+                )
+            return hash_ids
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            return bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids)
+        return self.engram_hasher(input_ids, forward_batch)
+
+    def is_bounded_prefill(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+
+    def _forward_hc_layers(
+        self,
+        *,
+        layer_range: range,
+        state: mhc.HcState,
+        positions: torch.Tensor,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
-        capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
+        hash_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
-        hash_ids = None
+        assert not get_forward().sp_active
+        capture_dspark = self.dspark_layers_to_capture is not None
+        aux = []
+        seam_open = not self.is_bounded_prefill(forward_batch)
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
-            if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
-                parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
-                pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
-                if pad_rows > 0:
-                    hash_ids = torch.cat(
-                        [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
-                    )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
-            ):
-                hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
-                )
-            else:
-                hash_ids = self.engram_hasher(input_ids, forward_batch)
-        tail = None
-        if (
-            self.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            self._check_late_layer_tail_readers(forward_batch)
-            attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-        saved_full = None
-        # A pending post never meets a residual reader: the HIP boundary's defer_post
-        # gate excludes Engram/DSpark-capture layers and the model end.
-        # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
-        assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
-        for i in range(self.start_layer, self.end_layer):
-            if tail is not None and i == self.late_layer_start:
-                # Decode reaches back at most SWA_WINDOW positions.
-                saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                state = state.take_rows(tail.rows)
-                input_ids, input_ids_global = (
-                    tail.rows(input_ids),
-                    tail.rows(input_ids_global),
-                )
-                positions = tail.positions
-                if hash_ids is not None:
-                    hash_ids = tail.rows(hash_ids)
+        for i in layer_range:
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4088,10 +4096,7 @@ class DeepseekV4Model(nn.Module):
                 state = state.with_residual(hidden_states)
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
-                aux = state.residual
-                if tail is not None and i < self.late_layer_start:
-                    aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                aux.append(state.residual.mean(dim=1))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4116,13 +4121,140 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
+                    seam_open=seam_open,
                 )
-        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
-        if saved_full is not None:
-            attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-            return state.residual, state.pre, tail
-        return state.residual, state.pre, None
+        return state.materialized(self.layers[layer_range.stop - 1].hc_cfg), aux
+
+    def finish_bounded_prefill(
+        self,
+        residual: torch.Tensor,
+        pre: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        hash_ids: Optional[torch.Tensor],
+        prefix_aux: List[torch.Tensor],
+        *,
+        forward_batch: ForwardBatch,
+    ):
+        backend = get_attn_backend()
+        tail = backend.tail_forward_metadata.late_layer_tail
+        inputs = TailInputs(
+            residual=tail.rows(residual),
+            pre=tail.rows(pre),
+            positions=tail.positions,
+            input_ids=tail.rows(input_ids),
+            input_ids_global=tail.rows(input_ids_global),
+            hash_ids=None if hash_ids is None else tail.rows(hash_ids),
+            swa_out_cache_loc=tail.swa_out_cache_loc,
+        )
+        saved = backend.enter_late_layer_tail(forward_batch)
+        try:
+            graph = (
+                select_tail_graph(
+                    graphs=self.tail_graphs, rows=inputs.residual.shape[0]
+                )
+                if is_in_breakable_cuda_graph()
+                and not forward_batch.contains_mm_inputs()
+                else None
+            )
+            output, aux = (
+                graph.replay(inputs)
+                if graph is not None
+                else self._forward_bounded_tail(inputs, forward_batch=forward_batch)
+            )
+        finally:
+            backend.exit_late_layer_tail(saved, forward_batch)
+        if self.dspark_layers_to_capture is not None:
+            return output, [tail.rows(t) for t in prefix_aux] + aux
+        return tuple(
+            _scatter_tail_rows(tail=tail, rows=t, num_tokens=input_ids.shape[0])
+            for t in output
+        )
+
+    def _forward_bounded_tail(self, inputs: TailInputs, *, forward_batch: ForwardBatch):
+        state, aux = self._forward_hc_layers(
+            layer_range=range(self.late_layer_start, self.end_layer),
+            state=mhc.HcState(inputs.residual, inputs.pre),
+            positions=inputs.positions,
+            input_ids=inputs.input_ids,
+            input_ids_global=inputs.input_ids_global,
+            hash_ids=inputs.hash_ids,
+            forward_batch=forward_batch,
+        )
+        return self._finish_hc(state.residual, state.pre), aux
+
+    @torch.no_grad()
+    def capture_prefill_tail(
+        self, *, forward_batch: ForwardBatch, max_num_tokens: int, max_context_len: int
+    ) -> None:
+        self.tail_graphs = {}
+        if self.late_layer_start is None or forward_batch.lora_ids is not None:
+            return
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        backend = get_attn_backend()
+        saved_metadata = backend.forward_metadata
+        context = get_tc_piecewise_forward_context()
+        saved_batch = context.forward_batch
+        window = min(SWA_WINDOW, max_context_len)
+        max_rows = min(max_num_tokens, backend.req_to_token_pool.size * window)
+        graphs = {}
+        try:
+            for rows in reversed(tail_graph_sizes(max_rows)):
+                batch = make_capture_batch(forward_batch, rows=rows, window=window)
+                context.forward_batch = batch
+                backend.init_forward_metadata(batch)
+                residual, pre, input_ids, input_ids_global, hash_ids, _ = self.forward(
+                    input_ids=batch.input_ids,
+                    positions=batch.positions,
+                    forward_batch=batch,
+                    input_embeds=None,
+                )
+                backend.enter_late_layer_tail(batch)
+                tail = backend.forward_metadata.late_layer_tail
+                inputs = TailInputs(
+                    residual=residual,
+                    pre=pre,
+                    positions=tail.positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    hash_ids=hash_ids,
+                    swa_out_cache_loc=tail.swa_out_cache_loc,
+                ).with_capacity(rows)
+                backend.forward_metadata = replace(
+                    backend.forward_metadata,
+                    late_layer_tail=msgspec.structs.replace(
+                        tail, swa_out_cache_loc=inputs.swa_out_cache_loc
+                    ),
+                )
+                graph = capture_tail_graph(
+                    inputs=inputs,
+                    barrier=get_parallel().tp_group.barrier,
+                    stream=torch.cuda.current_stream(),
+                    forward=lambda value: self._forward_bounded_tail(
+                        value, forward_batch=batch
+                    ),
+                )
+                graphs[rows] = msgspec.structs.replace(
+                    graph,
+                    capture_batch=batch,
+                    q_pad_buffer=backend.forward_metadata.q_pad_buffer,
+                )
+            self.tail_graphs = graphs
+        finally:
+            backend.forward_metadata = saved_metadata
+            context.forward_batch = saved_batch
+
+    def _finish_hc(
+        self, hidden_states: torch.Tensor, pre: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+        pre_hc_head = hidden_states.flatten(1)
+        hidden_states = hc_combine(
+            pre_hc_head.float(), pre, self.hc_mult, hidden_states.dtype
+        )
+        return self.norm(hidden_states), pre_hc_head
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
@@ -4317,18 +4449,32 @@ class DeepseekV4Model(nn.Module):
                 positions,
             )
         last_pre = None
-        tail = None
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
-                positions,
-                hidden_states,
-                forward_batch,
-                input_ids,
-                input_ids_global,
-                capture_dspark,
-                dspark_aux_hidden_states,
+            hash_ids = self._get_engram_hash_ids(
+                input_ids, forward_batch, hidden_states.shape[0]
             )
+            bounded = self.is_bounded_prefill(forward_batch)
+            stop = self.late_layer_start if bounded else self.end_layer
+            state, dspark_aux_hidden_states = self._forward_hc_layers(
+                layer_range=range(self.start_layer, stop),
+                state=mhc.HcState(hidden_states),
+                positions=positions,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                hash_ids=hash_ids,
+                forward_batch=forward_batch,
+            )
+            hidden_states, last_pre = state.residual, state.pre
+            if bounded:
+                return (
+                    state.residual,
+                    state.pre,
+                    input_ids,
+                    input_ids_global,
+                    hash_ids,
+                    dspark_aux_hidden_states,
+                )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4377,28 +4523,17 @@ class DeepseekV4Model(nn.Module):
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
-        pre_hc_head = hidden_states.flatten(1)
-
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
-
-            hidden_states = hc_combine(
-                pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
-            )
+            hidden_states, pre_hc_head = self._finish_hc(hidden_states, last_pre)
         else:
-            hidden_states = self.hc_head(
-                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-            )
-        hidden_states = self.norm(hidden_states)
-
-        if tail is not None and not capture_dspark:
-            # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
-            hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
-            )
-            pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+            pre_hc_head = hidden_states.flatten(1)
+            hidden_states = self.norm(
+                self.hc_head(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                )
             )
 
         if capture_dspark:
@@ -4674,10 +4809,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        bounded = self.model.is_bounded_prefill(forward_batch)
+        if bounded:
+            self.model._check_late_layer_tail_readers(forward_batch)
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+            if bounded:
+                hidden_states = self.model.finish_bounded_prefill(
+                    *hidden_states, forward_batch=forward_batch
+                )
         if not self.pp_group.is_last_rank:
             return hidden_states
 
@@ -4688,11 +4830,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         logits_metadata = forward_batch
         tail = None
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
+        if bounded and self.capture_aux_hidden_states:
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)

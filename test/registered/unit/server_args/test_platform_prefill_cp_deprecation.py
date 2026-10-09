@@ -4,12 +4,21 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+from sglang.srt.arg_groups.deepseek_v4_hook import (
+    validate_deepseek_v4_cp,
+    validate_deepseek_v41_features,
+)
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     validate_prefill_cp_platform,
 )
 from sglang.srt.layers.cp.base import init_cp_strategy
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -141,6 +150,41 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
                     validate_prefill_cp_platform(args)
                     self.assertTrue(args.enable_prefill_cp)
                     self.assertEqual(args.cp_strategy, strategy)
+
+
+class TestBoundedPrefillGraphPolicy(CustomTestCase):
+    def test_supported_execution_modes(self):
+        for backend, cuda, cp_size, error in (
+            (Backend.DISABLED, True, 1, None),
+            (Backend.DISABLED, False, 1, None),
+            (Backend.BREAKABLE, True, 1, None),
+            (Backend.BREAKABLE, True, 2, "context parallelism"),
+            (Backend.BREAKABLE, False, 1, "outside CUDA"),
+            (Backend.FULL, True, 1, "full or piecewise"),
+            (Backend.TC_PIECEWISE, True, 1, "full or piecewise"),
+        ):
+            with (
+                self.subTest(backend=backend, cuda=cuda, cp_size=cp_size),
+                override_platform(
+                    is_cuda=cuda, is_hip=not cuda, is_npu=False, is_musa=False
+                ),
+            ):
+                args = _cp_args(
+                    "DeepseekV41ForCausalLM",
+                    "deepseek_v41",
+                    enable_prefill_cp=False,
+                    attn_cp_size=cp_size,
+                    enable_decoder_swa_bounded_replay=True,
+                    cuda_graph_config=with_phase(
+                        default_cuda_graph_config(), Phase.PREFILL, backend=backend
+                    ),
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        validate_deepseek_v41_features(args)
+                else:
+                    validate_deepseek_v41_features(args)
+                    self.assertIsNone(args.cuda_graph_config.prefill.max_seq_len)
 
 
 if __name__ == "__main__":

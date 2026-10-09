@@ -20,8 +20,12 @@ def get_tail_row_indices(
     device: torch.device,
 ) -> torch.Tensor:
     """Row indices of each request's tail, copied without a host sync."""
+    if len(full_rows_per_request) != len(tail_rows_per_request):
+        raise ValueError("tail lengths must match the number of requests")
     rows, start = [], 0
     for n, t in zip(full_rows_per_request, tail_rows_per_request):
+        if not 0 <= t <= n:
+            raise ValueError(f"tail length {t} is outside [0, {n}]")
         rows.extend(range(start + n - t, start + n))
         start += n
     return async_h2d(rows, dtype=torch.int64, device=device)

@@ -932,7 +932,7 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        return t[contiguous_start : contiguous_start + token_indices.numel()]
     return t[token_indices]
 
 
@@ -978,6 +978,7 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
+    tail_metadata: Optional[DSV4Metadata] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -996,6 +997,7 @@ class DSV4Metadata:
         self.prefill_shared_reads_snapshotted = False
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        self.tail_metadata = static_metadata.tail_metadata
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
@@ -1174,8 +1176,6 @@ class DeepseekV4AttnBackend(
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
         )
-        # The model switches onto this metadata in enter_late_layer_tail.
-        self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1526,7 +1526,21 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        return (
+            bool(self.low_ratios)
+            and has_dense_fp4_indexer()
+            and is_sm100_or_newer()
+            and not self.enable_decoder_swa_bounded_replay
+        )
+
+    @property
+    def tail_forward_metadata(self) -> Optional[DSV4Metadata]:
+        metadata = self.forward_metadata
+        if not isinstance(metadata, DSV4Metadata):
+            return None
+        return (
+            metadata if metadata.late_layer_tail is not None else metadata.tail_metadata
+        )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -2352,12 +2366,6 @@ class DeepseekV4AttnBackend(
         self.encoder_replay = forward_batch.encoder_swa_replay
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
-        self.tail_forward_metadata = (
-            self._build_late_layer_tail_metadata(forward_batch)
-            if self.enable_decoder_swa_bounded_replay
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            else None
-        )
 
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2572,6 +2580,13 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )
+            if (
+                self.enable_decoder_swa_bounded_replay
+                and logical_forward_mode.is_extend_without_speculative()
+            ):
+                metadata.tail_metadata = self._build_late_layer_tail_metadata(
+                    forward_batch
+                )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
@@ -2759,11 +2774,12 @@ class DeepseekV4AttnBackend(
         if (
             hoisted_req is not None
             and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
+            and hoisted_pos.shape[0] >= positions.shape[0]
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
+            req, pos = (
+                hoisted_req[: positions.shape[0]],
+                hoisted_pos[: positions.shape[0]],
+            )
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
@@ -2961,14 +2977,14 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                core.raw_out_loc[: x.shape[0]],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = core.c1_out_loc[: x.shape[0]]
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
@@ -2979,7 +2995,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                core.raw_out_loc[: x.shape[0]],
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3000,7 +3016,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     layout=kv_layout,
                 )
-            out_loc = core.c2_out_loc
+            out_loc = core.c2_out_loc[: x.shape[0]]
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:
@@ -3285,13 +3301,13 @@ class DeepseekV4AttnBackend(
             positions=pos,
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
-            kv_page_table=core.page_table,
+            kv_page_table=core.page_table[: x.shape[0]],
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
-            out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
+            out_raw_indices=core.sparse_raw_indices(layer.compress_ratio)[: x.shape[0]],
             out_page_indices=(
-                core.sparse_page_indices(layer.compress_ratio)
+                core.sparse_page_indices(layer.compress_ratio)[: x.shape[0]]
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),

@@ -1632,6 +1632,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
+        if isinstance(self.backend, BreakableCudaGraphBackend):
+            capture_tail = getattr(self.layer_model, "capture_prefill_tail", None)
+            if capture_tail is not None:
+                forward_batch, _ = self.capture_prepare(self.max_num_tokens)
+                with self._prefill_forward_context(forward_batch):
+                    capture_tail(
+                        forward_batch=forward_batch,
+                        max_num_tokens=self.max_num_tokens,
+                        max_context_len=self.model_runner.model_config.context_len,
+                    )
+
     def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
@@ -2164,6 +2175,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.hidden_states is not None
                 else None
             ),
+            hidden_states_token_indices=output.hidden_states_token_indices,
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,

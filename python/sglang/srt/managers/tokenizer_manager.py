@@ -1287,14 +1287,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay currently supports token-only text requests"
                 )
-            if (
-                isinstance(obj, GenerateReqInput)
-                and obj.return_logprob
-                and obj.logprob_start_len not in (None, -1, len(input_ids))
-            ):
-                raise ValueError(
-                    "encoder SWA replay cannot return cached prompt logprobs"
-                )
+        if (
+            (
+                get_exec().features.enable_encoder_swa_bounded_replay
+                or get_exec().features.enable_decoder_swa_bounded_replay
+            )
+            and isinstance(obj, GenerateReqInput)
+            and obj.return_logprob
+            and obj.logprob_start_len not in (None, -1)
+            and obj.logprob_start_len
+            != len(input_ids if input_ids is not None else obj.input_embeds)
+        ):
+            raise ValueError("SWA bounded replay cannot return prompt logprobs")
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
