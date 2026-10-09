@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_xpu,
     set_weight_attrs,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if is_cuda():
     from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -78,6 +79,57 @@ elif is_xpu():
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
 logger = logging.getLogger(__name__)
+
+
+# The decode state updates are opaque ops with declared mutations. Traced as
+# Triton kernels under torch.compile, Inductor clones the per-layer state pool,
+# sized by max_running_requests, around every call instead of updating in place.
+@register_custom_op(mutates_args=["conv_state"], out_shape=0)
+def mamba2_decode_conv_state_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    activation: Optional[str],
+    conv_state_indices: torch.Tensor,
+) -> torch.Tensor:
+    return causal_conv1d_update_triton(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=conv_state_indices,
+    )
+
+
+@register_custom_op(mutates_args=["state", "out"])
+def mamba2_decode_ssm_state_update(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+        out=out,
+    )
 
 
 def mamba_v2_sharded_weight_loader(
@@ -682,13 +734,17 @@ class MambaMixer2(torch.nn.Module):
                 hidden_states_B_C_d = hidden_states_B_C_d_processed.transpose(
                     1, 2
                 ).view(num_decode_tokens, -1)
-            else:
-                ccu = (
-                    causal_conv1d_update
-                    if not use_triton_causal_conv
-                    else causal_conv1d_update_triton
+            elif use_triton_causal_conv:
+                hidden_states_B_C_d = mamba2_decode_conv_state_update(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    state_indices_tensor_d,
                 )
-                hidden_states_B_C_d = ccu(
+            else:
+                hidden_states_B_C_d = causal_conv1d_update(
                     hidden_states_B_C_d,
                     conv_state,
                     conv_weights,
@@ -749,7 +805,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                selective_state_update(
+                mamba2_decode_ssm_state_update(
                     ssm_state,
                     hidden_states_d,
                     dt_d,
@@ -757,11 +813,9 @@ class MambaMixer2(torch.nn.Module):
                     B_d,
                     C_d,
                     D_d,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d,
-                    out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    dt_bias,
+                    state_indices_tensor_d,
+                    preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
                 )
 
         # 4. gated MLP
