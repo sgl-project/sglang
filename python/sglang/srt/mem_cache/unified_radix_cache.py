@@ -1869,7 +1869,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     reason="mem_capacity_insufficient",
                     rid=req.rid,
                     tokens=kv_tokens,
-                    extra=f"avail={avail},num_tokens_evicted={result.num_tokens_evicted}",
+                    extra=f"avail={avail},evicted_avail={self._component_available_size(ComponentType.FULL)}",
                 )
                 self._account_transfer_outcome(
                     self._load_outcome_stats,
