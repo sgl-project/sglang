@@ -3406,6 +3406,66 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
+    def test_response_template_messages_thinking_replay(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+        from sglang.srt.parser.beam import BeamReasoningDetector
+
+        request = AnthropicMessagesRequest(
+            model="x",
+            max_tokens=32,
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Consider the question."},
+                        {"type": "text", "text": "Hello."},
+                    ],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+        reads, content_only = (
+            "{{ messages[1].reasoning_content }}",
+            "{{ messages[1].content }}",
+        )
+        cases = [
+            (reads, None, None, True),
+            ("{{ messages[1]['reasoning_content'] }}", None, None, True),
+            ("{{ messages[1].get('reasoning_content') }}", None, None, True),
+            (content_only, None, None, False),
+            ("{# reasoning_content #}" + content_only, None, None, False),
+            (content_only, reads, None, True),
+            (reads, content_only, None, False),
+            (reads, None, "chatml", False),
+        ]
+        for template, default, conversation, native in cases:
+            with self.subTest(
+                template=template, default=default, conversation=conversation
+            ):
+                self.tm.tokenizer.chat_template = template
+                self.template_manager.chat_template_name = conversation
+                defaults = None if default is None else {"chat_template": default}
+                with get_context().override_server_args(
+                    default_chat_template_kwargs=defaults
+                ):
+                    chat = OpenAIServingChat(self.tm, self.template_manager)
+                chat.chat_encoding_spec = None
+                chat._reasoning_detector = BeamReasoningDetector()
+                converted = AnthropicServing(chat)._convert_to_chat_completion_request(
+                    request
+                )
+                assistant = converted.messages[1]
+                if native:
+                    self.assertEqual(
+                        assistant.reasoning_content, "Consider the question."
+                    )
+                    self.assertEqual(assistant.content, "Hello.")
+                else:
+                    self.assertIsNone(assistant.reasoning_content)
+                    self.assertIn("Consider the question.", assistant.content[0].text)
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
