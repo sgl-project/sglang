@@ -126,7 +126,7 @@ def _init_afd_attn_dispatcher(
                 direct_deepep_lanes[0].overlap_communication_num_sms
             ),
         )
-        if scheduler.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             logger.info(
                 "AFD attn overlap SM partition: backend=%s compute=%d communication=%d",
                 handshake.local.afd_backend,
@@ -300,7 +300,7 @@ class _AFDDirectAttnCoordinator:
         self._scheduler = scheduler
         self._handshake = handshake
         self._dispatcher = dispatcher
-        self._rank = scheduler.ps.tp_rank
+        self._rank = get_parallel().tp_rank
         self._session_id = handshake.session_id
         self._client = (
             AFDDirectControlClient(
@@ -324,7 +324,7 @@ class _AFDDirectAttnCoordinator:
         if prepared is None:
             raise RuntimeError("AFD Direct has no prepared attn step")
         proposal_can_run_graph = can_run_graph and prepared.paired_graph_preflight
-        if self._scheduler.ps.tp_size > 1:
+        if get_parallel().tp_size > 1:
             self._graph_eligible.fill_(int(proposal_can_run_graph))
             self._scheduler.tp_cpu_group.allreduce(
                 self._graph_eligible,
@@ -381,7 +381,7 @@ class _AFDDirectAttnCoordinator:
             )
         else:
             plan = None
-        if self._scheduler.ps.tp_size > 1:
+        if get_parallel().tp_size > 1:
             if self._rank == 0:
                 (plan,) = broadcast_pyobj(
                     [plan],
@@ -660,7 +660,7 @@ def _prepare_afd_attn_step(
         )
 
     scattered = get_disagg().afd_ffn_moe_backend == "deepep"
-    dp_capacity = tokens_per_rank[scheduler.ps.tp_rank] if scattered else total_tokens
+    dp_capacity = tokens_per_rank[get_parallel().tp_rank] if scattered else total_tokens
     if is_afd_fixed_shape_mode(forward_mode):
         minimum_wire_capacity = (
             max(tokens_per_rank)
@@ -822,7 +822,9 @@ def init_afd_mlp_sync_metadata(
         and batch.spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
     )
     if not model_runner.is_draft_worker and not is_dspark_target_verify:
-        forward_batch.init_mlp_sync_metadata(batch, model_runner.device)
+        forward_batch.init_mlp_sync_metadata(
+            batch, model_runner.device, is_draft_worker=model_runner.is_draft_worker
+        )
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens_across_dp
         return
 
@@ -921,7 +923,7 @@ def init_afd_attn(
     (topology / negotiated ports) to build their data-plane comm backend.
     Returns (handshake, sync_sender); the sender is None off the sender rank.
     """
-    rank = scheduler.ps.tp_rank
+    rank = get_parallel().tp_rank
     is_sender_rank = rank == 0  # pp_size == 1 is enforced for AFD
     rank_node_ids, rank_nvshmem_fabric_keys = gather_nvshmem_topology(scheduler)
     if is_sender_rank:
@@ -934,7 +936,7 @@ def init_afd_attn(
                 rank_nvshmem_fabric_keys,
             ),
         )
-        if scheduler.ps.tp_size > 1:
+        if get_parallel().tp_size > 1:
             broadcast_pyobj([handshake], rank, get_parallel().tp_group.cpu_group, src=0)
     else:
         (handshake,) = broadcast_pyobj(

@@ -27,7 +27,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
+The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
@@ -44,6 +44,30 @@ Current supported optimization options are listed in the [SGLang diffusion suppo
 - `--ulysses-degree {ULYSSES_DEGREE}`: Degree of DeepSpeed-Ulysses-style SP in USP.
 - `--ring-degree {RING_DEGREE}`: Degree of ring attention-style SP in USP.
 - `--text-encoder-cpu-offload`, `--dit-cpu-offload`, `--vae-cpu-offload`: Use CPU offload to reduce peak GPU memory when needed.
+
+### 3.3 24 GB NVIDIA GPUs
+
+The 14B DiTs do not fit on a 24 GB card in BF16 (the I2V-14B one is 30.5 GiB), so their weights have to stream from host memory layer by layer. On CUDA, `--performance-mode memory` streams the DiT, text encoder, image encoder and VAE:
+
+```bash
+# 1 GPU
+sglang serve --model-path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers --performance-mode memory
+
+# 8 GPUs: CFG parallel x Ulysses 4
+sglang serve --model-path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers --num-gpus 8 \
+  --enable-cfg-parallel --ulysses-degree 4 --performance-mode memory
+```
+
+Each GPU's worker keeps its own copy of the streamed weights in host memory, about 60 GiB, so 8 GPUs need close to 500 GiB of RAM.
+
+Measured with SGLang main `c7be3e9` (2026-09-29) on RTX 4090 24 GB (PCIe, no P2P between GPUs), for Wan2.1-I2V-14B-480P image-to-video at 480x832, 81 frames, 40 steps, BF16:
+
+| GPUs | Time per video | Time per step | Peak GPU memory | Host memory |
+|---|---:|---:|---:|---:|
+| 1 | 840 s | 20.7 s | 12.5 GiB | 59 GiB |
+| 8 | 198 s | 4.8 s | 11.9 GiB | 483 GiB |
+
+Component CPU offload (`--dit-cpu-offload`) does not help here: it moves the whole DiT onto the GPU around each use.
 
 ## 4. Model Invocation
 
@@ -121,7 +145,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Di
 
 #### 4.2.2 GPU Optimization
 
-- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if you run out of memory with FSDP.
+- `--dit-cpu-offload`: Keep DiT weights on the CPU and move them onto the GPU whole around each use. This takes the DiT out of FSDP, which shards only resident components.
 - `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
 - `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference.
 - `--vae-cpu-offload`: Use CPU offload for VAE.
@@ -217,11 +241,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two A3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     sglang serve \
       --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
       --tp-size 2 \
@@ -321,11 +345,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two Atlas 3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \
@@ -381,3 +405,9 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

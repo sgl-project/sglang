@@ -20,9 +20,18 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
+    validate_minimax_h3_checkpoint_variant,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
     RESIDENT,
+)
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
@@ -206,6 +215,50 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
         metadata.canonical_task(rejected)
 
 
+@pytest.mark.parametrize("weights", [None, "owner/repo/merged_ref2va_int8.safetensors"])
+def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
+    model_index = {
+        "_minimax_h3": {
+            "schema_version": 1,
+            "partition": "ref2va",
+            "tasks": ["ref2va"],
+            "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+        }
+    }
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.server_args = SimpleNamespace(
+        model_variant="hybrid",
+        model_subfolder=None,
+        component_weights_paths={"transformer": weights} if weights else {},
+        transformer_weights_path=None,
+    )
+    with patch.object(
+        ComposedPipelineBase, "_load_config", return_value=model_index
+    ) as load:
+        if weights is None:
+            with pytest.raises(ValueError, match="requires explicit merged weights"):
+                pipeline._load_config()
+            load.assert_not_called()
+            return
+        pipeline._load_config()
+
+    assert pipeline.server_args.model_subfolder == "Ref2VA"
+    assert model_index["_minimax_h3"]["tasks"] == ["ref2va"]
+    validate_minimax_h3_checkpoint_variant([weights], "hybrid")
+    stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
+    for task in ("t2va", "fl2va", "ref2va"):
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
+            num_inference_steps=50,
+        )
+        assert (
+            stage.forward(batch, SimpleNamespace(minimax_h3_adaln_online=False))
+            is batch
+        )
+    with pytest.raises(ValueError):
+        pipeline.release_metadata.canonical_task("unknown")
+
+
 def test_synthetic_warmup_target_honors_warmup_flags():
     def target(num_frames=None, resolution=None):
         width, height = map(int, (resolution or "896x512").split("x"))
@@ -355,6 +408,7 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -386,7 +440,7 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
     server_args = _quality_server_args()
     server_args.minimax_h3_adaln_online = True
     batch = SimpleNamespace(
-        sampling_params=SimpleNamespace(task="t2va", quality="lossless"),
+        sampling_params=SimpleNamespace(task="t2va", quality="exact"),
         num_inference_steps=50,
         is_warmup=False,
     )
@@ -400,18 +454,19 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
         assert stage.forward(batch, server_args) is batch
 
 
-def test_extra_high_quality_does_not_enable_h3_cache_dit():
+def test_lossless_quality_does_not_enable_h3_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
     stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
-    stage._minimax_h3_quality = "lossless"
+    stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="extra-high",
+            quality="lossless",
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
@@ -420,7 +475,7 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_quality == "lossless"
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
 
@@ -479,7 +534,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
 
-    batch.sampling_params.quality = "extra-high"
+    batch.sampling_params.quality = "lossless"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
@@ -497,7 +552,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         resolve_component_attention_backend=lambda *_names: (None, None),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -507,7 +562,7 @@ def test_validate_server_args_requires_packed_varlen_backend():
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend",
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
@@ -528,6 +583,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     server_args = SimpleNamespace(
         component_attention_backends={"transformer": "subblock_sparse_attn"},
         attention_backend="fa",
+        attention_backend_config={},
         ring_degree=1,
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -536,7 +592,7 @@ def test_validate_server_args_accepts_transformer_backend_override():
     )
 
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
@@ -567,7 +623,7 @@ def test_resolve_transformer_attention_backend_uses_selector_precedence():
             ),
         )
         with patch(
-            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "sglang.multimodal_gen.runtime.layers.attention.selector."
             "get_global_forced_attn_backend",
             return_value=forced_backend,
         ):

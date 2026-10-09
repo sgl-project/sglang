@@ -27,7 +27,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs.
+Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware. SGLang supports serving Qwen-Image on NVIDIA B200, B300, H200, H100, AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
@@ -311,11 +311,11 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```shell Command
-    #One A3 card has 2 npu chips
+    #One A3 Series card has 2 npu chips
     sglang serve --tp-size 2 --sp-degree 1 --model-path Qwen/Qwen-Image --num-gpus 2
     ```
 
@@ -391,7 +391,7 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Benchmark Command**:
 
     ```shell Command
@@ -428,3 +428,9 @@ Test Environment:
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="qwen-image" />

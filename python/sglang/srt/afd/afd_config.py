@@ -286,16 +286,16 @@ def _check_decode_microbatch_args(
         raise ValueError(
             "--afd-decode-num-microbatches currently supports only 1, 2, or 3"
         )
-    if not cfg.enable_dp_attention or cfg.dp_size <= 1:
+    if cfg.attn_dp_size <= 1:
         raise ValueError(
             "--afd-decode-num-microbatches greater than 1 requires DP attention with "
-            "--dp-size greater than 1"
+            "--attn-dp-size greater than 1"
         )
-    if cfg.tp_size != cfg.dp_size:
+    if cfg.tp_size != cfg.attn_dp_size:
         raise ValueError(
             "--afd-decode-num-microbatches greater than 1 currently requires "
             "attention TP size 1 "
-            "(--tp must equal --dp-size)"
+            "(--tp must equal --attn-dp-size)"
         )
     if cfg.enable_lora:
         raise ValueError(
@@ -342,6 +342,13 @@ def _check_speculative_args(server_args: ServerArgs, role: AFDRole) -> None:
             "AFD speculative decoding requires an attn instance with "
             f"speculative_algorithm in {{'EAGLE', 'DSPARK'}}; got role={role.value!r}, "
             f"speculative_algorithm={algorithm!r}"
+        )
+
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        raise ValueError(
+            "AFD speculative decoding does not support "
+            "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION: target steps require "
+            "one forward mode and a fixed number of verify tokens per request"
         )
 
     topk = cfg.speculative_eagle_topk
@@ -586,10 +593,10 @@ def _check_attn_args(server_args: ServerArgs) -> None:
     # FULL gathers expert inputs and combines ffn shard outputs through the
     # attn instance's native DP/TP collectives. Additional attn ranks can
     # contribute zero remote routed output to the same collective.
-    if cfg.tp_size > 1 and not (cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size):
+    if cfg.tp_size > 1 and cfg.attn_dp_size != cfg.tp_size:
         raise ValueError(
             "AFD attn instance requires attn_tp_size == 1: with --tp > 1, pass "
-            "--enable-dp-attention --dp-size equal to --tp-size"
+            "--attn-dp-size equal to --tp-size"
         )
 
 
@@ -625,9 +632,9 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
     # Minimal parameter surface: the ffn instance has no attention, so
     # attention-only parallel knobs would silently misconfigure its
     # parallel groups and memory pools.
-    if cfg.enable_dp_attention or cfg.dp_size > 1:
+    if cfg.attn_dp_size > 1 or cfg.dp_size > 1:
         raise ValueError(
-            "AFD ffn instance must not use --enable-dp-attention/--dp-size; "
+            "AFD ffn instance requires --attn-dp-size 1 and --dp-size 1; "
             "it only accepts tp/ep parallel args"
         )
     if not cfg.skip_server_warmup:

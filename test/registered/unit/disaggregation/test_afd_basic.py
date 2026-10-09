@@ -48,7 +48,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    build_replay_fb_view,
+)
+from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -67,6 +70,9 @@ class TestAFDDPMetadata(unittest.TestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        ranks = get_parallel().override(tp_rank=0)
+        ranks.__enter__()
+        self.addCleanup(ranks.__exit__, None, None, None)
 
     def test_target_prepare_uses_physical_rows_and_logical_graph_batch(self):
         begin_calls = []
@@ -219,11 +225,21 @@ class TestAFDDPMetadata(unittest.TestCase):
             batch_size=5,
             forward_mode=ForwardMode.TARGET_VERIFY,
             input_ids=tokens,
+            positions=tokens,
             req_pool_indices=torch.arange(5),
             seq_lens=seq_lens,
+            seq_lens_sum=None,
             seq_lens_cpu=None,
             encoder_lens=None,
             out_cache_loc=tokens,
+            out_cache_loc_virtual=None,
+            out_cache_loc_is_physical=True,
+            kv_loc_plan=None,
+            kv_loc_cols=None,
+            max_seq_len_override=None,
+            mamba_track_indices=None,
+            lora_ids=None,
+            can_run_decode_cuda_graph=True,
             spec_info=spec_info,
         )
         for num_children, sizes in ((2, (3, 2)), (3, (2, 2, 1))):
@@ -238,8 +254,19 @@ class TestAFDDPMetadata(unittest.TestCase):
                     mask=needs_mask,
                 ):
                     forward_batch.seq_lens_cpu = spec_info.seq_lens_cpu = host_lengths
-                    children = _build_afd_microbatch_child_replay_views(
+                    replay_view = build_replay_fb_view(
                         forward_batch,
+                        buffers=forward_batch,
+                        bs=5,
+                        raw_bs=5,
+                        num_tokens=15,
+                        global_num_tokens_cpu=None,
+                        seq_len_fill_value=1,
+                        capture_forward_mode=ForwardMode.TARGET_VERIFY,
+                        is_encoder_decoder=False,
+                    )
+                    children = _build_afd_microbatch_child_replay_views(
+                        replay_view,
                         torch.tensor(sizes) * 3,
                         num_children,
                         3,
@@ -250,6 +277,7 @@ class TestAFDDPMetadata(unittest.TestCase):
                         end = start + size
                         child_spec = child.spec_info
                         self.assertEqual(child.batch_size, size)
+                        self.assertTrue(child.out_cache_loc_is_physical)
                         self.assertEqual(
                             child.input_ids.tolist(), list(range(start * 3, end * 3))
                         )
@@ -289,6 +317,7 @@ class TestAFDDPMetadata(unittest.TestCase):
             global_forward_mode=ForwardMode.DECODE,
             can_run_decode_cuda_graph=True,
             can_run_prefill_cuda_graph=False,
+            can_run_draft_cuda_graph=True,
             prefill_cuda_graph_max_prefix_len=None,
         )
 
@@ -319,6 +348,54 @@ class TestAFDDPMetadata(unittest.TestCase):
             ),
             ([4, 8, 6, 7], [4, 8, 6, 7], [4, 8, 6, 7]),
         )
+
+    def test_microbatch_residual_handoff_completes_each_sum_once(self):
+        from sglang.srt.afd.microbatch_overlap import (
+            merge_afd_residual_streams,
+            split_afd_residual_stream,
+        )
+        from sglang.srt.layers.layer_boundary import PLAIN_ADD
+        from sglang.srt.layers.layer_boundary.output import UnreducedOutput
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+        for ranges in (((0, 3), (3, 5)), ((0, 2), (2, 4), (4, 5))):
+            with self.subTest(ranges=ranges):
+                partial = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+                group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
+                parent = SimpleNamespace(
+                    residual_stream=ResidualStream(torch.ones_like(partial)),
+                    afd_microbatch_children=[
+                        SimpleNamespace(tbo_parent_token_range=rows) for rows in ranges
+                    ],
+                )
+                hidden = parent.residual_stream.record(
+                    UnreducedOutput(partial, group=group), PLAIN_ADD
+                )
+                children = split_afd_residual_stream(hidden, parent)
+                self.assertIsNone(parent.residual_stream)
+                for index, child in enumerate(parent.afd_microbatch_children):
+                    stream = child.residual_stream
+                    stream.write(
+                        stream.pending.update.update(children[index], stream.residual)
+                    )
+                    children[index] = stream.record(
+                        UnreducedOutput(torch.ones_like(children[index]), group=group),
+                        PLAIN_ADD,
+                    )
+                hidden = merge_afd_residual_streams(children, parent)
+                result = residual_batch.final_norm(
+                    hidden, parent, lambda value, residual: (value + residual, residual)
+                )
+                torch.testing.assert_close(result, partial * 2 + 3)
+                self.assertEqual(group.all_reduce.call_count, 1 + len(ranges))
+                self.assertIsNone(parent.residual_stream)
+                self.assertTrue(
+                    all(
+                        child.residual_stream is None
+                        for child in parent.afd_microbatch_children
+                    )
+                )
 
 
 class TestAFDDSparkVerify(unittest.TestCase):
@@ -423,6 +500,10 @@ class TestAFDDSparkVerify(unittest.TestCase):
             SimpleNamespace(
                 global_num_tokens_across_dp=[0, 3],
                 global_num_tokens_for_logprob_across_dp=[0, 3],
+                is_extend_in_batch=False,
+                draft_global_num_tokens=None,
+                draft_global_num_tokens_for_logprob=None,
+                dp_spec_prefill_coordination_applied=False,
                 spec_info=verify,
             ),
             SimpleNamespace(is_draft_worker=False, device="cpu"),
@@ -438,6 +519,7 @@ class TestAFDDSparkVerify(unittest.TestCase):
 
         proposer = DraftBlockProposer.__new__(DraftBlockProposer)
         proposer._dp_moe_sync = True
+        proposer._num_token_non_padded = None
         proposer._draft_block_spec_info = DFlashVerifyInput(
             torch.empty(0), torch.empty(0), 8
         )
@@ -447,6 +529,10 @@ class TestAFDDSparkVerify(unittest.TestCase):
             global_num_tokens_for_logprob=[0],
             global_num_tokens_across_dp=[0, 3],
             global_num_tokens_for_logprob_across_dp=[0, 3],
+            is_extend_in_batch=False,
+            draft_global_num_tokens=None,
+            draft_global_num_tokens_for_logprob=None,
+            dp_spec_prefill_coordination_applied=False,
         )
         for role, counts in (("attn", [0, 24]), (None, [0])):
             with (
@@ -556,11 +642,12 @@ class TestAFDDSparkVerify(unittest.TestCase):
         batch = SimpleNamespace(
             spec_info=DFlashDraftInputV2.create_idle_input(device="cpu"),
             forward_mode=ForwardMode.IDLE,
+            global_num_tokens=None,
         )
         with (
             get_context().override_server_args(
                 afd_role="attn",
-                enable_dp_attention=True,
+                attn_dp_size=2,
             ),
             patch.object(get_flags().moe, "runner_backend", MoeRunnerBackend.AUTO),
             patch.object(
@@ -988,7 +1075,7 @@ def _make_args(**overrides) -> ServerArgs:
         tp_size=1,
         ep_size=1,
         moe_dp_size=1,
-        enable_dp_attention=False,
+        attn_dp_size=1,
         dp_size=1,
         attn_cp_size=1,
         enable_prefill_cp=False,
@@ -1051,8 +1138,7 @@ class TestAFDServerArgsCheck(unittest.TestCase):
                         afd_backend=backend,
                         afd_decode_num_microbatches=microbatches,
                         tp_size=2,
-                        dp_size=2,
-                        enable_dp_attention=True,
+                        attn_dp_size=2,
                         enable_dp_lm_head=True,
                     )
                     check_afd_server_args(args)

@@ -47,8 +47,8 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -125,6 +125,26 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(128,),
             extend_lens=(16,),
             compress_ratio=128,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_extend",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            # Odd lengths: the ratio-2 causal count (pos + 1) // 2 rounds down.
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=2,
+        ),
+        DSV4AttentionCase(
+            name="dsv4_c2_decode",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(65,),
+            compress_ratio=2,
         ),
         DSV4AttentionCase(
             name="dsv4_c128_decode",
@@ -318,6 +338,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             swa_page_size=128,
             seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
             query_start_loc=torch.tensor([0, 1, 2], **int32),
+            query_pos=torch.tensor([max_seq_len - 1, max_seq_len - 1], **int32),
             swa_token_ids=torch.empty(0, **int32),
             swa_first_pos=torch.zeros(2, **int32),
             swa_gather_lens=torch.zeros(2, **int32),
@@ -340,7 +361,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 [[base + 11, base + 12], [base + 13, base + 14]], dtype=torch.int32
             ),
             swa_topk_lengths=torch.tensor([base + 15, base + 16], dtype=torch.int32),
-            c4_sparse_topk=128,
+            index_topk=128,
+            present_ratios=(4, 128),
         )
         metadata.c4_out_loc = torch.tensor([base + 17, base + 18], dtype=torch.int32)
         metadata.c128_out_loc = torch.tensor([base + 19, base + 20], dtype=torch.int32)
@@ -365,10 +387,111 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
-        metadata.c1_flashmla_metadata = object()
+        metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
         return metadata
+
+    def test_present_ratios_gate_per_ratio_buffers(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+
+        with mock.patch.object(be, "_create_flashmla_metadata", side_effect=object):
+            c4_only = self._make_core_metadata(0)
+            c4_only.present_ratios = (4,)
+            c4_only.index_topk = 512
+            c4_only.c128_page_indices = None
+            c4_only.c128_topk_lengths_clamp1 = None
+            c4_only.init_flashmla_related(is_prefill=True)
+            self.assertTrue(c4_only.has_c4)
+            self.assertFalse(c4_only.has_c128)
+            self.assertEqual(c4_only.sparse_page_indices(4).shape[0], 2)
+            self.assertIsNotNone(c4_only.sparse_raw_indices(4))
+            self.assertIsNone(c4_only.sparse_page_indices(128))
+            self.assertIsNotNone(c4_only.c4_flashmla_metadata)
+            self.assertIsNone(c4_only.c128_flashmla_metadata)
+
+            c128_only = self._make_core_metadata(0)
+            c128_only.present_ratios = (128,)
+            c128_only.index_topk = 512
+            c128_only.c4_topk_lengths_clamp1 = None
+            c128_only.init_flashmla_related(is_prefill=True)
+            self.assertFalse(c128_only.has_c4)
+            self.assertIsNone(c128_only.sparse_page_indices(4))
+            self.assertIsNone(c128_only.sparse_raw_indices(4))
+            self.assertIs(
+                c128_only.sparse_page_indices(128), c128_only.c128_page_indices
+            )
+            self.assertIsNone(c128_only.c4_flashmla_metadata)
+            self.assertIsNotNone(c128_only.c128_flashmla_metadata)
+
+        # Replay metadata must describe the same set of ratios as its source.
+        src = self._make_core_metadata(100)
+        src.present_ratios = (4,)
+        with self.assertRaises(AssertionError):
+            self._make_core_metadata(0).copy_(src)
+        with self.assertRaises(AssertionError):
+            self._make_core_metadata(0).refresh_for_breakable_cuda_graph_replay_(src)
+
+    def test_sparse_topk_accessors_route_by_ratio(self):
+        metadata = self._make_core_metadata(0)
+        page_indices = torch.full((2, 4), 3, dtype=torch.int32)
+        lengths = torch.tensor([1, 2], dtype=torch.int32)
+        raw = torch.full((2, 4), 5, dtype=torch.int32)
+
+        metadata.set_sparse_topk(
+            4, page_indices=page_indices, topk_lengths=lengths, raw_indices=raw
+        )
+        self.assertIs(metadata.sparse_page_indices(4), page_indices)
+        self.assertIs(metadata.sparse_topk_lengths(4), lengths)
+        self.assertIs(metadata.sparse_raw_indices(4), raw)
+
+        metadata.set_sparse_topk(128, page_indices=page_indices, topk_lengths=lengths)
+        self.assertIs(metadata.c128_page_indices, page_indices)
+        self.assertIs(metadata.sparse_topk_lengths(128), lengths)
+        with self.assertRaises(AssertionError):
+            metadata.set_sparse_topk(
+                128, page_indices=page_indices, topk_lengths=lengths, raw_indices=raw
+            )
+        with self.assertRaises(ValueError):
+            metadata.sparse_raw_indices(128)
+        for bad_ratio in (0, 7):
+            with self.assertRaises(ValueError):
+                metadata.sparse_page_indices(bad_ratio)
+            with self.assertRaises(ValueError):
+                metadata.set_sparse_topk(
+                    bad_ratio, page_indices=page_indices, topk_lengths=lengths
+                )
+
+    def test_cp_reindex_slices_present_fields_and_skips_absent_ones(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+
+        metadata = self._make_core_metadata(0)
+        metadata.present_ratios = (4,)
+        metadata.c128_page_indices = None
+        metadata.c128_topk_lengths_clamp1 = None
+        parallel = SimpleNamespace(attn_cp_rank=1, attn_cp_size=2)
+        with mock.patch.object(be, "get_parallel", return_value=parallel):
+            metadata.apply_cp_reindex()
+
+        # Rank 1 of 2 keeps row 1 of every per-token field.
+        self.assertEqual(metadata.seq_lens_casual.tolist(), [8])
+        self.assertEqual(metadata.positions_casual.tolist(), [10])
+        self.assertEqual(metadata.page_table.tolist(), [[3, 4]])
+        self.assertEqual(metadata.swa_page_indices.tolist(), [[13, 14]])
+        self.assertEqual(metadata.swa_topk_lengths.tolist(), [16])
+        self.assertEqual(metadata.c4_topk_lengths_raw.tolist(), [22])
+        self.assertEqual(metadata.c4_topk_lengths_clamp1.tolist(), [24])
+        self.assertIsNone(metadata.c128_page_indices)
+        self.assertIsNone(metadata.c128_topk_lengths_clamp1)
+        # Cache-write locations stay in global logical order.
+        self.assertEqual(metadata.raw_out_loc.tolist(), [5, 6])
+        self.assertEqual(metadata.c4_out_loc.tolist(), [17, 18])
+
+        missing = self._make_core_metadata(0)
+        missing.swa_topk_lengths = None
+        with mock.patch.object(be, "get_parallel", return_value=parallel):
+            with self.assertRaises(AssertionError):
+                missing.apply_cp_reindex()
 
     def test_bcg_is_explicit_and_dsv4_backend_opt_in_only(self):
         from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -377,10 +500,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         from sglang.srt.server_args import ServerArgs
 
-        # cg-refactor folded the legacy enable_breakable_cuda_graph flag
-        # into cuda_graph_config. Verify the per-phase backend selectors
-        # default to None (i.e. nothing opted into BREAKABLE without an
-        # explicit CLI flag).
+        # Breakable graphs require explicit opt-in for each phase.
         sa = ServerArgs(model_path="dummy")
         self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
         self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
@@ -433,6 +553,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 backend.model_runner = SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
+                backend.token_to_kv_pool = SimpleNamespace(request_window=None)
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -455,7 +576,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 metadata = backend.forward_metadata
                 if builds:
                     backend._build_sparse_prefill_chunk_cache.assert_called_once_with(
-                        batch, num_qo_tokens=num_qo_tokens
+                        batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
                     )
                     self.assertIs(metadata.sparse_prefill_cache, cache)
                 else:
@@ -477,6 +598,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.model_runner = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH
         )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -519,7 +641,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
+            "c0_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
@@ -582,8 +704,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live")
-        static_forward_batch = SimpleNamespace(name="static")
+        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
@@ -603,6 +725,30 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        model_runner = SimpleNamespace()
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+        ):
+            # Prefill chunk / max_prefill_tokens dominates.
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
+            # Decode rows = requests x draft tokens dominate.
+            schedule.max_running_requests = 8192
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+
+        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
+            trtllm._check_trtllm_query_rows(64)
+            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+                trtllm._check_trtllm_query_rows(65)
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
@@ -625,12 +771,10 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         for max_seq_len in (3, 4, 255, 256, 259, 260):
             with self.subTest(max_seq_len=max_seq_len):
                 cache = self._make_sparse_prefill_cache(max_seq_len)
-                cache.ensure_c4(page_table, c4_page_size=64)
+                gather = cache.ensure_compressed(4, page_table, c_page_size=64)
                 expected_extent = max(max_seq_len // 4, 1)
-                self.assertEqual(cache.c4_flat_token_ids.numel(), 2 * expected_extent)
-                self.assertEqual(
-                    cache.c4_compressed_base.tolist(), [0, expected_extent]
-                )
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.compressed_base.tolist(), [0, expected_extent])
 
     def test_sparse_prefill_c128_uses_live_extent(self):
         from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
@@ -649,9 +793,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     "combine_topk_swa_indices",
                     return_value=combined,
                 ) as combine:
-                    cache.ensure_c128(page_indices)
+                    gather = cache.ensure_c128(page_indices)
 
-                self.assertEqual(cache.c128_flat_token_ids.numel(), 2 * expected_extent)
+                self.assertEqual(gather.flat_token_ids.numel(), 2 * expected_extent)
                 self.assertEqual(combine.call_args.kwargs["topk"], expected_extent)
                 self.assertEqual(
                     combine.call_args.kwargs["topk_indices"].shape,
@@ -660,13 +804,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
-    """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
-
-    The KV-store consumers run in paths that never invoke
-    `init_forward_metadata_in_graph` (eager idle, runners that only run the
-    out-graph prep) or whose batch is re-padded after init (DP attention).
-    The resolver must use the per-forward cached value only when it is
-    provably current and fall back to translating `out_cache_loc` otherwise.
+    """SWA writes must translate live locations for idle or missing/mismatched caches.
+    A matching cache on an active forward must be reused.
     """
 
     def _make_backend(self, mapping: torch.Tensor):
@@ -677,7 +816,8 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = None
         backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc],
+            request_window=None,
         )
         return backend
 

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.models.fsdp import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Re-exported for back-compat: callers import these names from this module path.
@@ -77,9 +78,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (  # no
     _UpstreamMlp,
     compute_chunk_plucker,
     process_camera_conditions_ucpe,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
-    parity_probe,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -171,6 +169,17 @@ class SanaWMBlock(nn.Module):
         tokens_per_frame = N // num_frames
         return x.reshape(B, num_frames, tokens_per_frame, C), tokens_per_frame
 
+    def _prepare_modulation(self, t: torch.Tensor, batch_size: int):
+        if t.dim() == 2:
+            return None, (
+                self.scale_shift_table[None] + t.reshape(batch_size, 6, -1)
+            ).chunk(6, dim=1)
+        num_frames = t.reshape(batch_size, -1, 6, t.shape[-1] // 6).shape[1]
+        t = t.reshape(batch_size, num_frames, 6, -1)
+        return num_frames, (self.scale_shift_table[None, None, :, :] + t).chunk(
+            6, dim=2
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # (B, N, D)
@@ -186,17 +195,8 @@ class SanaWMBlock(nn.Module):
         chunk_index: Optional[List[int]] = None,
     ) -> torch.Tensor:
         B = x.shape[0]
-        if t.dim() == 2:
-            num_frames = None
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + t.reshape(B, 6, -1)
-            ).chunk(6, dim=1)
-        else:
-            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
-            t = t.reshape(B, num_frames, 6, -1)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None, None, :, :] + t
-            ).chunk(6, dim=2)
+        num_frames, modulation = self._prepare_modulation(t, B)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
 
         # Self-attention with UCPE camera branch
         if num_frames is None:
@@ -261,17 +261,8 @@ class SanaWMBlock(nn.Module):
     ) -> Tuple[torch.Tensor, list]:
         """Streaming counterpart of ``forward``: threads the per-block 10-slot ``kv_cache`` through cached attention + FFN."""
         B = x.shape[0]
-        if t.dim() == 2:
-            num_frames = None
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + t.reshape(B, 6, -1)
-            ).chunk(6, dim=1)
-        else:
-            num_frames = t.reshape(B, -1, 6, t.shape[-1] // 6).shape[1]
-            t = t.reshape(B, num_frames, 6, -1)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None, None, :, :] + t
-            ).chunk(6, dim=2)
+        num_frames, modulation = self._prepare_modulation(t, B)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
 
         if num_frames is None:
             x_in = self._modulate(self.norm1(x), shift_msa, scale_msa)
@@ -437,7 +428,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             for i in range(depth)
             if arch.softmax_every_n > 0 and (i + 1) % arch.softmax_every_n == 0
         )
-        self.softmax_block_indices = tuple(sorted(softmax_idx))
 
         self.blocks = nn.ModuleList(
             [

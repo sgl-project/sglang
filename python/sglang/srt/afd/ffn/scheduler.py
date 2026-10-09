@@ -54,6 +54,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_model,
+    get_parallel,
     get_serving,
 )
 from sglang.srt.utils.common import broadcast_pyobj
@@ -75,7 +77,7 @@ def init_ffn_model_worker_state(scheduler: Scheduler) -> None:
     """
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if scheduler.server_args.is_startup_weight_load_overlap:
+    if get_model().is_startup_weight_load_overlap:
         scheduler.tp_worker.start_startup_weight_load()
         scheduler.tp_worker.finalize_startup_weight_load()
 
@@ -107,9 +109,8 @@ def finish_ffn_scheduler_init(scheduler: Scheduler) -> None:
         SchedulerMetricsReporter,
     )
 
-    # run_event_loop creates the schedule stream from device_module (normally
-    # set in init_overlap, which the ffn role skips).
     scheduler.device_module = torch.get_device_module(scheduler.device)
+    scheduler.schedule_stream = scheduler.device_module.Stream(priority=0)
 
     # Prepare expert compute now; graph capture runs after the A/F handshake.
     from sglang.srt.afd.ffn.compute import AFDFFNCompute
@@ -119,9 +120,6 @@ def finish_ffn_scheduler_init(scheduler: Scheduler) -> None:
     # run_scheduler_process's exit path shuts down the metrics reporter.
     scheduler.metrics_reporter = SchedulerMetricsReporter(
         scheduler=scheduler,
-        tp_rank=scheduler.ps.tp_rank,
-        pp_rank=scheduler.ps.pp_rank,
-        dp_rank=scheduler.ps.dp_rank,
         metrics_collector_context=scheduler.metrics_collector_context,
         metrics_collector=scheduler.metrics_collector,
     )
@@ -387,7 +385,7 @@ def _event_loop_afd_ffn_cohort(
 ) -> None:
     from sglang.srt.afd.ffn.cohort import AFDFFNCohortExecutor
 
-    rank = scheduler.ps.tp_rank
+    rank = get_parallel().tp_rank
     is_rank0 = rank == 0
     join_timeout_us = envs.SGLANG_AFD_STAGED_COHORT_JOIN_TIMEOUT_US.get()
     cohort_executor = AFDFFNCohortExecutor([session.executor for session in sessions])
@@ -500,7 +498,7 @@ def _event_loop_afd_ffn_cohort(
     while True:
         if is_rank0:
             action = next_action()
-            if scheduler.ps.tp_size > 1:
+            if get_parallel().tp_size > 1:
                 broadcast_pyobj(action, rank, scheduler.tp_cpu_group, src=0)
         else:
             action = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
@@ -668,7 +666,7 @@ def _event_loop_afd_ffn_direct_union(
     scheduler: Scheduler,
     handshakes: list[AFDHandshakeResult],
 ) -> None:
-    rank = scheduler.ps.tp_rank
+    rank = get_parallel().tp_rank
     is_rank0 = rank == 0
     session = _build_ffn_session(
         scheduler,
@@ -730,7 +728,7 @@ def _event_loop_afd_ffn_direct_union(
                     union_step_id += 1
                     action = (plan, msg)
                     break
-                if scheduler.ps.tp_size > 1:
+                if get_parallel().tp_size > 1:
                     broadcast_pyobj(
                         [action],
                         rank,
@@ -783,7 +781,7 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     before serving (static membership), then per-session control messages
     are multiplexed over one shared ffn compute stream.
     """
-    rank = scheduler.ps.tp_rank
+    rank = get_parallel().tp_rank
     is_rank0 = rank == 0
     num_sessions = get_disagg().afd_attn_instances
     compute = scheduler.afd_ffn_compute
@@ -807,7 +805,7 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
             )
         finally:
             handshake_server.close()
-        if scheduler.ps.tp_size > 1:
+        if get_parallel().tp_size > 1:
             broadcast_pyobj([handshakes], rank, scheduler.tp_cpu_group, src=0)
     else:
         # Every ffn rank needs the handshake results (topology / negotiated
@@ -884,7 +882,7 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
             else:
                 session_id = session.session_id
                 msg = session.receiver.recv()
-            if scheduler.ps.tp_size > 1:
+            if get_parallel().tp_size > 1:
                 broadcast_pyobj(
                     [(session_id, msg)], rank, scheduler.tp_cpu_group, src=0
                 )

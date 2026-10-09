@@ -24,13 +24,7 @@ Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. SGLang loads t
 
 ## 2. SGLang-diffusion Installation
 
-Install SGLang with diffusion dependencies:
-
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Model Deployment
 
@@ -248,3 +242,9 @@ Some community LoRAs only include weights for transformer blocks. In that case, 
 - Use `--ltx2-two-stage-device-mode resident` on high-VRAM GPUs if latency matters more than memory usage.
 - Use `--ltx2-two-stage-device-mode original` when comparing against official two-stage behavior.
 - Keep `--width` and `--height` aligned with the target model resolution; for LTX models, these are output video dimensions.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

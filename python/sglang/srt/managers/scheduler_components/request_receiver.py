@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     MMInputsProcessError,
@@ -37,7 +38,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -45,7 +46,6 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -63,14 +63,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    ps: ParallelState
-    tp_group: Any
-    tp_cpu_group: Any
-    attn_tp_group: Any
-    attn_tp_cpu_group: Any
-    attn_cp_group: Any
-    attn_cp_cpu_group: Any
-    world_group: Any
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
@@ -86,9 +78,13 @@ class SchedulerRequestReceiver:
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
-        self,
+        self, local_reqs: Optional[List[AbortReq]] = None
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks.
+
+        local_reqs are aborts the caller decided on this rank; they ride the
+        same broadcast as the pulled requests.
+        """
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
@@ -102,9 +98,9 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
 
-        if self.ps.pp_rank == 0:
+        if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
@@ -114,8 +110,8 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:
-        if self.ps.pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        if get_parallel().pp_rank == 0:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
@@ -147,25 +143,35 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 dp_offset = (
-                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                    get_parallel().attn_dp_rank
+                    * get_parallel().attn_cp_size
+                    * get_parallel().attn_tp_size
                 )
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
+                    get_parallel().world_group.cpu_group,
+                    (get_parallel().pp_rank - 1) * get_parallel().tp_size + dp_offset,
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 )
             else:
                 recv_reqs = None
         return recv_reqs
 
-    def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if get_parallel().enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+    def _broadcast_reqs_across_ranks(
+        self, recv_reqs: Optional[List], local_reqs: Optional[List] = None
+    ) -> List:
+        """local_reqs ride the work channel, which is scoped to the ranks
+        sharing one waiting queue; the control channel fans out from global
+        rank 0 and would overwrite every DP group's aborts but the first.
+        """
+        local_reqs = local_reqs or []
+        if get_parallel().attn_dp_enabled:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+                work_reqs.extend(local_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
@@ -179,25 +185,30 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
+                or get_exec().moe.is_ep_scale_joiner
             )
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
-            elif self.ps.tp_size != 1:
+            elif get_parallel().tp_size != 1:
+                tp_group = get_parallel().tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    tp_group.rank,
+                    tp_group.cpu_group,
+                    src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+        else:
+            if recv_reqs is not None:
+                recv_reqs = [*recv_reqs, *local_reqs]
+            if get_parallel().tp_size != 1:
+                tp_group = get_parallel().tp_group
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
+                    tp_group.rank,
+                    tp_group.cpu_group,
+                    src=tp_group.ranks[0],
+                )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
@@ -216,7 +227,7 @@ class SchedulerRequestReceiver:
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
         if (
-            self.ps.pp_rank == 0
+            get_parallel().pp_rank == 0
             and get_disagg().language_only
             and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
@@ -252,13 +263,13 @@ class SchedulerRequestReceiver:
 
         # 1. wait until every rank has opened the shared feature segments
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
-            if self.ps.attn_tp_size > 1:
-                barrier(group=self.attn_tp_cpu_group)
-            if self.ps.attn_cp_size > 1:
-                barrier(group=self.attn_cp_cpu_group)
-        elif self.ps.tp_size > 1:
-            barrier(group=self.tp_cpu_group)
+        if parallel.attn_dp_enabled:
+            if parallel.attn_tp_size > 1:
+                barrier(group=parallel.attn_tp_group.cpu_group)
+            if parallel.attn_cp_size > 1:
+                barrier(group=parallel.attn_cp_group.cpu_group)
+        elif parallel.tp_size > 1:
+            barrier(group=parallel.tp_group.cpu_group)
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -276,13 +287,17 @@ class SchedulerRequestReceiver:
                 failed[index] = 1
 
         # 3. all ranks reject the same requests before entering model collectives
-        if parallel.enable_dp_attention:
-            if self.ps.attn_tp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
-            if self.ps.attn_cp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
-        elif self.ps.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+        if parallel.attn_dp_enabled:
+            if parallel.attn_tp_size > 1:
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_tp_group.cpu_group
+                )
+            if parallel.attn_cp_size > 1:
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_cp_group.cpu_group
+                )
+        elif parallel.tp_size > 1:
+            all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
 
         error = MMInputsProcessError(
             "Failed to materialize shared-memory multimodal features on a scheduler rank."

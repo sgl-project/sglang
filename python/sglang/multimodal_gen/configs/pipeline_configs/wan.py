@@ -48,12 +48,13 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 @dataclass
 class WanI2VCommonConfig(PipelineConfig):
     # for all wan i2v pipelines
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         if num_frames % vae_scale_factor_temporal != 1:
-            logger.warning(
-                f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
-            )
+            if log_adjustment:
+                logger.warning(
+                    f"`num_frames - 1` has to be divisible by {vae_scale_factor_temporal}. Rounding to the nearest number."
+                )
             num_frames = (
                 num_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
             )
@@ -311,3 +312,114 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.wan import (
+        FastWanT2V480PConfig,
+        Turbo_Wan2_2_I2V_A14B_SamplingParam,
+        Wan2_1_Fun_1_3B_InP_SamplingParams,
+        Wan2_2_I2V_A14B_SamplingParam,
+        Wan2_2_T2V_A14B_SamplingParam,
+        Wan2_2_TI2V_5B_SamplingParam,
+        WanI2V_14B_480P_SamplingParam,
+        WanI2V_14B_720P_SamplingParam,
+        WanT2V_1_3B_SamplingParams,
+        WanT2V_14B_SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=WanT2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V1_3B480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=WanT2V720PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
+            "IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanI2V_14B_480P_SamplingParam,
+        pipeline_config_cls=WanI2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        ],
+        model_detectors=[lambda hf_id: "wanimagetovideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=WanI2V_14B_720P_SamplingParam,
+        pipeline_config_cls=WanI2V720PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Turbo_Wan2_2_I2V_A14B_SamplingParam,
+        pipeline_config_cls=TurboWanI2V720Config,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_1_Fun_1_3B_InP_SamplingParams,
+        pipeline_config_cls=WanI2V480PConfig,
+        hf_model_paths=[
+            "weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
+        pipeline_config_cls=Wan2_2_TI2V_5B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
+        pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
+        hf_model_paths=[
+            "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+            "FastVideo/FastWan2.2-TI2V-5B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_T2V_A14B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_I2V_A14B_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=FastWanT2V480PConfig,
+        pipeline_config_cls=FastWan2_1_T2V_480P_Config,
+        hf_model_paths=[
+            "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )

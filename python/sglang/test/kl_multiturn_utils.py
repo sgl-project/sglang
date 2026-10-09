@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import time
 from typing import Callable
+
+import requests
 
 from sglang.test.kl_test_utils import (
     _extract_output_logprobs,
@@ -50,13 +53,25 @@ def default_prefill_cache_assert(result: dict, prefix_len: int, label: str):
 
 
 def default_decode_cache_assert(
-    result: dict, history_len: int, output_len: int, label: str
+    result: dict, history_len: int, output_len: int, label: str, page_size: int = 1
 ):
-    """Standard radix cache: cached_tokens == history_len + output_len."""
+    """Standard radix cache: cached_tokens == history_len + output_len.
+
+    A previous turn that finished by length never computed its last output
+    token's KV, so the cache may hold one token less, cut to a page boundary.
+    """
     expected = history_len + output_len
+    allowed = {expected, expected - 1, (expected - 1) // page_size * page_size}
     actual = result["meta_info"]["cached_tokens"]
-    assert actual == expected, (
-        f"{label}: expected cached_tokens={expected}, got {actual}"
+    assert actual in allowed, (
+        f"{label}: expected cached_tokens in {sorted(allowed)}, got {actual}"
+    )
+
+
+def _default_decode_cache_assert_for(base_url: str) -> Callable:
+    server_info = requests.get(base_url + "/server_info", timeout=30).json()
+    return functools.partial(
+        default_decode_cache_assert, page_size=server_info["page_size"]
     )
 
 
@@ -374,7 +389,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     # Additional turns: decode cache hits (interleaved if order is set)
     if turn_suffixes:
         if assert_decode_cached_tokens is None:
-            assert_decode_cached_tokens = default_decode_cache_assert
+            assert_decode_cached_tokens = _default_decode_cache_assert_for(base_url)
 
         for t, suffixes in enumerate(turn_suffixes):
             current_input = [
@@ -462,7 +477,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         "turn_suffixes must have at least 1 entry (for turn 2)"
     )
     if assert_decode_cached_tokens is None:
-        assert_decode_cached_tokens = default_decode_cache_assert
+        assert_decode_cached_tokens = _default_decode_cache_assert_for(base_url)
 
     n = len(first_turn_input_ids)
     num_turns = 1 + len(turn_suffixes)

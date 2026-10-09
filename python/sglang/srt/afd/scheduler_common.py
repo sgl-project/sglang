@@ -31,6 +31,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_model,
@@ -99,7 +100,7 @@ def gather_nvshmem_topology(
 ) -> tuple[list[str], list[tuple[bytes, int] | None]]:
     if get_disagg().afd_backend != "nvshmem":
         return [], []
-    local = (get_local_ip_auto(), _query_nvshmem_fabric_key(scheduler.ps.gpu_id))
+    local = (get_local_ip_auto(), _query_nvshmem_fabric_key(get_device().gpu_id))
     members = get_parallel().tp_group.all_gather_object(local)
     return [node_id for node_id, _ in members], [key for _, key in members]
 
@@ -122,7 +123,7 @@ def build_local_handshake_info(
         get_afd_decode_num_tokens_per_bs() if role.is_attn() else 1
     )
     wire_token_multiplier = decode_num_tokens_per_bs * (
-        1 if scattered else scheduler.ps.tp_size
+        1 if scattered else get_parallel().tp_size
     )
     if role.is_attn():
         if decode_config.backend == Backend.DISABLED:
@@ -168,7 +169,7 @@ def build_local_handshake_info(
     return AFDHandshakeInfo(
         role=role.value,
         model_identity=compute_model_identity(get_model().model_path),
-        num_ranks=scheduler.ps.tp_size,
+        num_ranks=get_parallel().tp_size,
         rank_node_ids=rank_node_ids,
         afd_backend=get_disagg().afd_backend,
         afd_ffn_moe_backend=get_disagg().afd_ffn_moe_backend,
@@ -217,7 +218,7 @@ def should_log_step(step_id: int) -> bool:
 def _afd_device(scheduler: Scheduler) -> str:
     device = str(scheduler.tp_worker.model_runner.device)
     if device == "cuda":
-        return f"cuda:{scheduler.ps.gpu_id}"
+        return f"cuda:{get_device().gpu_id}"
     return device
 
 
@@ -250,7 +251,7 @@ def init_afd_comm_backend(
         num_attn_ranks=num_attn_ranks,
         num_ffn_ranks=num_ffn_ranks,
         # Same numbering space as the handshake's num_ranks (= tp_size).
-        instance_rank=scheduler.ps.tp_rank,
+        instance_rank=get_parallel().tp_rank,
         store_host=handshake.dist_host,
         store_port=handshake.dist_port,
         device=_afd_device(scheduler),

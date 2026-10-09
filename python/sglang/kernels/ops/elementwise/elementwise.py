@@ -386,6 +386,9 @@ def _fused_sigmoid_mul_kernel(
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    q_ptr=None,
+    s_ptr=None,
+    QUANT: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -403,13 +406,21 @@ def _fused_sigmoid_mul_kernel(
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
     result = attn * tl.sigmoid(g)
-    tl.store(output_ptr + attn_off, result, mask=mask)
+    if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, result.to(output_ptr.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + attn_off, y_q, mask=mask)
+        tl.store(s_ptr + pid_row, y_s)
+    else:
+        tl.store(output_ptr + attn_off, result, mask=mask)
 
 
 def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
     inplace: bool = False,
+    quant: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -445,6 +456,12 @@ def fused_sigmoid_mul(
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
+    kwargs = {}
+    if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
+        block_h = triton.next_power_of_2(hidden_dim)
+        q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+        s = torch.empty((num_tokens, 1), dtype=torch.float32, device=q.device)
+        kwargs = {"q_ptr": q, "s_ptr": s, "QUANT": True}
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _fused_sigmoid_mul_kernel[grid](
         out,
@@ -456,8 +473,9 @@ def fused_sigmoid_mul(
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
         num_warps=4,
+        **kwargs,
     )
-    return out
+    return (q, s) if quant else out
 
 
 @triton.jit

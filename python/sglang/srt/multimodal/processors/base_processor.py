@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
+from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -35,6 +36,7 @@ from sglang.srt.multimodal.cache import (
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -43,6 +45,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_mm,
     get_serving,
 )
@@ -226,6 +229,9 @@ class BaseMultimodalProcessor(ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+    # Artifact-based processors may keep their prompt/M-RoPE fast path even
+    # when artifact retention is disabled.
+    uses_media_artifacts_without_cache = False
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
@@ -286,6 +292,7 @@ class BaseMultimodalProcessor(ABC):
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
+            or self.uses_media_artifacts_without_cache
             else None
         )
         if self.mm_preprocess_cache.enabled:
@@ -325,6 +332,7 @@ class BaseMultimodalProcessor(ABC):
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
         )
+        self.hash_executor = MultimodalHashExecutor()
         if self.mm_io_worker_num > 4:
             logger.info(
                 "Multimodal data loading enabled with %d worker threads (%s).",
@@ -488,6 +496,7 @@ class BaseMultimodalProcessor(ABC):
     def shutdown(self) -> None:
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
+        self.hash_executor.shutdown()
         self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
@@ -716,19 +725,23 @@ class BaseMultimodalProcessor(ABC):
         return processor, _tokenizer_of(processor)
 
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing submits its work to the serving GPU.
+        """Whether image preprocessing contends with the serving accelerator.
 
-        The fast image processor runs inside the tokenizer process but on
-        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
-        preprocessing worker there is one more competitor for that device rather
-        than added parallelism.
+        The fast image processor runs inside the tokenizer process but may run on
+        the same accelerator as the scheduler. A second preprocessing worker there
+        adds device contention rather than CPU preprocessing parallelism.
         """
-        if _is_cpu or self.server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
         if self.disable_fast_image_processor:
             return False
         image_processor = getattr(self._processor, "image_processor", None)
-        return isinstance(image_processor, BaseImageProcessor)
+        if not isinstance(image_processor, BaseImageProcessor):
+            return False
+        if _is_xpu or _is_npu:
+            return True
+        platform = platforms.current_platform
+        return platform.is_cuda_alike()
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """The worker count to use when the user did not ask for one.
@@ -759,14 +772,17 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or server_args.rl_on_policy_target is not None:
+        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"
         if not _is_npu:
+            platform = platforms.current_platform
+            if not platform.is_cuda_alike():
+                return None
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
-            return f"cuda:{server_args.base_gpu_id}"
+            return f"{platform.device_type}:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
@@ -1727,7 +1743,14 @@ class BaseMultimodalProcessor(ABC):
 
         """
         assert images is not None
-        image_sizes = [(image.height, image.width) for image in images]
+        image_sizes = [
+            (
+                tuple(image.shape[-2:])
+                if isinstance(image, torch.Tensor)
+                else (image.height, image.width)
+            )
+            for image in images
+        ]
         num_image_tokens = self._processor._get_num_multimodal_tokens(
             image_sizes=image_sizes
         ).num_image_tokens

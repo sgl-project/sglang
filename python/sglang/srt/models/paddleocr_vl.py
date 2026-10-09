@@ -24,6 +24,7 @@ projections run once for the batch instead of once per image.
 """
 
 import itertools
+from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -584,7 +585,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         )
         self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

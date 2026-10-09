@@ -861,6 +861,7 @@ def sparse_mla_fwd_decode_partial(
     BI = block_I
     D = dim
     D_tail = tail_dim
+    has_tail = D_tail > 0
 
     q_shape = [batch, seq_len, heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
@@ -884,13 +885,16 @@ def sparse_mla_fwd_decode_partial(
         with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
             if _q_in_shared:
                 Q_buf = T.alloc_shared([H_per_block, D], dtype)
-                Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
+                if has_tail:
+                    Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
             else:
                 Q_buf = T.alloc_fragment([H_per_block, D], dtype)
-                Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
+                if has_tail:
+                    Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
 
             KV_shared = T.alloc_shared([BI, D], dtype)
-            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            if has_tail:
+                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
             mask = T.alloc_fragment([BI], T.bool)
 
@@ -913,7 +917,8 @@ def sparse_mla_fwd_decode_partial(
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
+            if has_tail:
+                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
 
             for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
                 topk_block_i = group_i * inner_iter + k_i
@@ -925,11 +930,12 @@ def sparse_mla_fwd_decode_partial(
                     KV_shared[bi_i, d_i] = KV[
                         b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
                     ]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    K_tail_shared[bi_i, d_i] = KV[
-                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
-                    ]
+                if has_tail:
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                        K_tail_shared[bi_i, d_i] = KV[
+                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
+                        ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -943,13 +949,14 @@ def sparse_mla_fwd_decode_partial(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                T.gemm(
-                    Q_tail_buf,
-                    K_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if has_tail:
+                    T.gemm(
+                        Q_tail_buf,
+                        K_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1085,7 +1092,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     inner_iter=1,
     threads=256,
 ):
-    assert d_v == 512, f"only support d_v=512"
+    assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
         "otherwise will load some index=0 thus causing wrong kv to be loaded"
     )
@@ -1100,6 +1107,10 @@ def sparse_mla_fwd_decode_partial_fp8(
 
     BI = block_I
     group_size = 128
+    assert d_v % group_size == 0
+    assert d_tail in (0, 64), f"only support d_tail=0 or d_tail=64, got {d_tail}"
+    num_main_tiles = d_v // group_size
+    has_tail = d_tail > 0
     dim_quant_fp8 = d_v + d_tail
     rope_offset_fp8 = d_v
     n_groups = topk // (BI * inner_iter)
@@ -1149,19 +1160,21 @@ def sparse_mla_fwd_decode_partial_fp8(
             H0 = (bx % head_blocks_per_seq) * h_per_block
             H1 = H0 + h_per_block
 
-            # We intentionally split the K=512 GEMM into 4x128 tiles.
+            # Split the main-dimension GEMM into 128-wide tiles.
             # Although this adds extra intermediate memory traffic,
             # it shortens the MFMA accumulation dependency chain and improves performance.
             q_tile0 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
             q_tile1 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
-            q_tile2 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
-            q_tile3 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
             kv_tile0 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
-            kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
-            kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
-            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
-            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
+            if num_main_tiles == 4:
+                q_tile2 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
+                q_tile3 = T.alloc_shared([h_per_block, group_size], fp8_dtype)
+                kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
+                kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
+            if has_tail:
+                q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
+                k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
 
@@ -1178,21 +1191,31 @@ def sparse_mla_fwd_decode_partial_fp8(
 
             acc_o_tile0 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
             acc_o_tile1 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
-            acc_o_tile2 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
-            acc_o_tile3 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+            if num_main_tiles == 4:
+                acc_o_tile2 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
+                acc_o_tile3 = T.alloc_fragment([h_per_block, group_size], accum_dtype)
 
             T.fill(acc_o_tile0, 0)
             T.fill(acc_o_tile1, 0)
-            T.fill(acc_o_tile2, 0)
-            T.fill(acc_o_tile3, 0)
+            if num_main_tiles == 4:
+                T.fill(acc_o_tile2, 0)
+                T.fill(acc_o_tile3, 0)
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
-            T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
-            T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
-            T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
-            T.copy(q_fp8[b_i, s_i, H0:H1, 3 * group_size : 4 * group_size], q_tile3)
+            if has_tail:
+                T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            T.copy(q_fp8[b_i, s_i, H0:H1, 0:group_size], q_tile0)
+            T.copy(q_fp8[b_i, s_i, H0:H1, group_size : 2 * group_size], q_tile1)
+            if num_main_tiles == 4:
+                T.copy(
+                    q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size],
+                    q_tile2,
+                )
+                T.copy(
+                    q_fp8[b_i, s_i, H0:H1, 3 * group_size : 4 * group_size],
+                    q_tile3,
+                )
 
             for k_i in T.serial(inner_iter):
                 topk_block_i = group_i * inner_iter + k_i
@@ -1205,14 +1228,18 @@ def sparse_mla_fwd_decode_partial_fp8(
 
                 for bi_i, j in T.Parallel(BI, group_size):
                     page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, 0 * group_size + j]
-                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, 1 * group_size + j]
-                    kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
-                    kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
+                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
+                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
+                    if num_main_tiles == 4:
+                        kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
+                        kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
-                for bi_i, j in T.Parallel(BI, d_tail):
-                    page = page_idx_shared[bi_i]
-                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
+                if has_tail:
+                    for bi_i, j in T.Parallel(BI, d_tail):
+                        page = page_idx_shared[bi_i]
+                        k_tail_shared[bi_i, j] = kv_fp8[
+                            b_i, page, g_i, rope_offset_fp8 + j
+                        ]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1223,19 +1250,33 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.gemm(q_tile1, kv_tile1, acc_tile, transpose_B=True, clear_accum=True)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(q_tile2, kv_tile2, acc_tile, transpose_B=True, clear_accum=True)
-                for h_i, bi_i in T.Parallel(h_per_block, BI):
-                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
-                for h_i, bi_i in T.Parallel(h_per_block, BI):
-                    acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(
-                    q_tail_buf,
-                    k_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if num_main_tiles == 4:
+                    T.gemm(
+                        q_tile2,
+                        kv_tile2,
+                        acc_tile,
+                        transpose_B=True,
+                        clear_accum=True,
+                    )
+                    for h_i, bi_i in T.Parallel(h_per_block, BI):
+                        acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+                    T.gemm(
+                        q_tile3,
+                        kv_tile3,
+                        acc_tile,
+                        transpose_B=True,
+                        clear_accum=True,
+                    )
+                    for h_i, bi_i in T.Parallel(h_per_block, BI):
+                        acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
+                if has_tail:
+                    T.gemm(
+                        q_tail_buf,
+                        k_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1249,10 +1290,11 @@ def sparse_mla_fwd_decode_partial_fp8(
                 for h_i in T.Parallel(h_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] * alpha[h_i]
-                    acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] * alpha[h_i]
-                    acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] * alpha[h_i]
-                    acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] * alpha[h_i]
+                    acc_o_tile0[h_i, j] *= alpha[h_i]
+                    acc_o_tile1[h_i, j] *= alpha[h_i]
+                    if num_main_tiles == 4:
+                        acc_o_tile2[h_i, j] *= alpha[h_i]
+                        acc_o_tile3[h_i, j] *= alpha[h_i]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     s_fp8_shared[h_i, bi_i] = T.clamp(
@@ -1262,36 +1304,27 @@ def sparse_mla_fwd_decode_partial_fp8(
                     )
                 T.gemm(s_fp8_shared, kv_tile0, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile0[h_i, j] = (
-                        acc_o_tile0[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
-
+                    acc_o_tile0[h_i, j] += sv_tile[h_i, j] * s_scale_const
                 T.gemm(s_fp8_shared, kv_tile1, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile1[h_i, j] = (
-                        acc_o_tile1[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
-
-                T.gemm(s_fp8_shared, kv_tile2, sv_tile, clear_accum=True)
-                for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile2[h_i, j] = (
-                        acc_o_tile2[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
-
-                T.gemm(s_fp8_shared, kv_tile3, sv_tile, clear_accum=True)
-                for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile3[h_i, j] = (
-                        acc_o_tile3[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
+                    acc_o_tile1[h_i, j] += sv_tile[h_i, j] * s_scale_const
+                if num_main_tiles == 4:
+                    T.gemm(s_fp8_shared, kv_tile2, sv_tile, clear_accum=True)
+                    for h_i, j in T.Parallel(h_per_block, group_size):
+                        acc_o_tile2[h_i, j] += sv_tile[h_i, j] * s_scale_const
+                    T.gemm(s_fp8_shared, kv_tile3, sv_tile, clear_accum=True)
+                    for h_i, j in T.Parallel(h_per_block, group_size):
+                        acc_o_tile3[h_i, j] += sv_tile[h_i, j] * s_scale_const
 
             for h_i in T.Parallel(h_per_block):
                 denom = T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
                 inv_denom[h_i] = 1.0 / denom
             for h_i, j in T.Parallel(h_per_block, group_size):
-                acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] * inv_denom[h_i]
-                acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] * inv_denom[h_i]
-                acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] * inv_denom[h_i]
-                acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] * inv_denom[h_i]
+                acc_o_tile0[h_i, j] *= inv_denom[h_i]
+                acc_o_tile1[h_i, j] *= inv_denom[h_i]
+                if num_main_tiles == 4:
+                    acc_o_tile2[h_i, j] *= inv_denom[h_i]
+                    acc_o_tile3[h_i, j] *= inv_denom[h_i]
 
             for h_i in T.Parallel(h_per_block):
                 sumexp[h_i] = T.if_then_else(
@@ -1300,22 +1333,24 @@ def sparse_mla_fwd_decode_partial_fp8(
                     T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                 )
 
-            T.copy(
-                acc_o_tile0,
-                partial_o[b_i, s_i, group_i, H0:H1, 0 * group_size : 1 * group_size],
-            )
+            T.copy(acc_o_tile0, partial_o[b_i, s_i, group_i, H0:H1, 0:group_size])
             T.copy(
                 acc_o_tile1,
-                partial_o[b_i, s_i, group_i, H0:H1, 1 * group_size : 2 * group_size],
+                partial_o[b_i, s_i, group_i, H0:H1, group_size : 2 * group_size],
             )
-            T.copy(
-                acc_o_tile2,
-                partial_o[b_i, s_i, group_i, H0:H1, 2 * group_size : 3 * group_size],
-            )
-            T.copy(
-                acc_o_tile3,
-                partial_o[b_i, s_i, group_i, H0:H1, 3 * group_size : 4 * group_size],
-            )
+            if num_main_tiles == 4:
+                T.copy(
+                    acc_o_tile2,
+                    partial_o[
+                        b_i, s_i, group_i, H0:H1, 2 * group_size : 3 * group_size
+                    ],
+                )
+                T.copy(
+                    acc_o_tile3,
+                    partial_o[
+                        b_i, s_i, group_i, H0:H1, 3 * group_size : 4 * group_size
+                    ],
+                )
 
             T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
 

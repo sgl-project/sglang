@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_temb_table_slices,
     can_use_linear_gelu,
     fused_gelu_active,
     fused_linear_gelu_tanh,
@@ -204,7 +203,6 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
         tp_size = get_tp_world_size()
 
         # layers
@@ -410,7 +408,8 @@ def _wan_temb_table_slices(
     verified = _WAN_TEMB_SLICES.verified
     if (
         not _WAN_TEMB_SLICES.disabled
-        and can_use_fused_temb_table_slices(table, temb)
+        and _is_cuda
+        and temb.is_cuda
         and (verified or _WAN_TEMB_SLICES.can_attempt_once())
     ):
         try:
@@ -492,6 +491,11 @@ class WanTransformerBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("to_out", prefix),
         )
+        self.hidden_dim = dim
+        self.num_attention_heads = num_heads
+        self.dim_head = dim // num_heads
+        self.use_offline_qk_rotation = False
+
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
@@ -509,6 +513,36 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
+            # TODO Need to create mxfp8 attention scheme and port the code below
+            from sglang.multimodal_gen import envs
+
+            quant_description = getattr(quant_config, "quant_description", {})
+            self.use_offline_qk_rotation = (
+                quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
+                and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
+                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+            )
+            if self.use_offline_qk_rotation:
+                self.register_buffer(
+                    "q_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                self.register_buffer(
+                    "k_rot",
+                    torch.empty(
+                        self.dim_head,
+                        self.dim_head,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=True,
+                )
+                quant_config.use_offline_qk_rotation = True
+
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
@@ -519,9 +553,6 @@ class WanTransformerBlock(nn.Module):
                 is_cross_attention=False,
             )
 
-        self.hidden_dim = dim
-        self.num_attention_heads = num_heads
-        self.dim_head = dim // num_heads
         if qk_norm == "rms_norm":
             self.norm_q = RMSNorm(self.dim_head, eps=eps)
             self.norm_k = RMSNorm(self.dim_head, eps=eps)
@@ -683,6 +714,19 @@ class WanTransformerBlock(nn.Module):
                 _apply_rotary_emb(query, cos, sin, is_neox_style=False),
                 _apply_rotary_emb(key, cos, sin, is_neox_style=False),
             )
+
+        if (
+            self.use_offline_qk_rotation
+            and self.attn1.backend is AttentionBackendEnum.FA
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        ):
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -1092,19 +1136,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         width_local: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        token_start = rank * local_len
-        token_indices = torch.arange(
-            token_start,
-            token_start + local_len,
-            device=device,
-            dtype=torch.long,
+        return self.rotary_emb.forward_3d_sequence_shard(
+            local_len, rank, frame_stride_local, width_local, device
         )
-        t_idx = token_indices // frame_stride_local
-        rem = token_indices % frame_stride_local
-        h_idx = rem // width_local
-        w_idx = rem % width_local
-        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-        return self.rotary_emb.forward_uncached(positions)
 
     def forward(
         self,

@@ -2,7 +2,7 @@
 //! the rest from the `TreeComponent` defaults.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use tch::{Kind, Tensor};
 
@@ -49,6 +49,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         mut result: MatchResult,
+        last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
@@ -56,9 +58,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         // Compute Full KV host hit length: walk from last_host_node up to
         // last_device_node, summing host_value lengths of evicted nodes.
         let mut kv_host_hit = 0;
-        let mut node_idx = tree_core.arena.resolve(result.best_match_node_id);
-        let last_device_idx = tree_core.arena.resolve(result.last_device_node_id);
-        while node_idx != last_device_idx {
+        let mut node_idx = best_match_node_idx;
+        while node_idx != last_device_node_idx {
             let node = tree_core.arena.node(node_idx);
             let parent = node.try_parent().unwrap_or_else(|| {
                 panic!(
@@ -85,6 +86,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         let (new_parent, child) = tree_core.arena.node_pair_mut(new_parent_id, child_id);
         let split_len = new_parent.key.atom_len() as i64;
         new_parent.copy_device_lock_ref(FULL, child);
+        new_parent.set_lock_ref_(FullComponent::HOST, child.host_lock_ref(FULL));
+        // The boundary marks the older edge of the host-lock segment. A split
+        // inserts the prefix at that edge, so move the boundary with it.
+        new_parent.full_host_uuid = child.full_host_uuid.take();
         if child.has_device_value(FULL) {
             Node::redistribute_child_device_value(new_parent, child, FULL, split_len);
         }
@@ -276,34 +281,30 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         mut result: IncLockRefResult,
         lock_host: bool,
     ) -> IncLockRefResult {
-        let ct = FULL;
-
         // Only the last host node needs to be protected.
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
             // write_back mode: the anchor may be device-only (no host_value); pin it anyway.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
+            if !tree_core.arena.node(node_id).has_host_value(FULL) && !tree_core.is_write_back {
                 return result;
             }
-            node.inc_host_lock_ref(FULL);
+            let boundary_uuid = self.get_or_fill_uuid(tree_core, node_id, lock_host);
+            result.set_lock_uuid(FULL.idx() as u8, Some(boundary_uuid), lock_host);
+            tree_core.arena.node_mut(node_id).inc_host_lock_ref(FULL);
             tree_core.update_evictable_leaf_sets_(node_id);
             return result;
         }
 
-        // Skip the bottom evicted segment, recording it for the matching release.
-        let on_boundary = |node: &Node<K>| node.is_root() || node.has_device_value(FULL);
+        // The bottom device-evicted segment is locked too (no ledger move —
+        // nothing is on device); a load-back that materializes a value under
+        // lock credits protected directly.
         let mut cur = node_id;
-        let mut node = tree_core.arena.node(cur);
-        if !on_boundary(node) {
-            let skip_lock_node_ids = result.skip_lock_node_ids.entry(ct).or_default();
-            loop {
-                skip_lock_node_ids.insert(node.id);
-                cur = node.parent();
-                node = tree_core.arena.node(cur);
-                if on_boundary(node) {
-                    break;
-                }
+        loop {
+            let node = tree_core.arena.node_mut(cur);
+            if node.is_root() || node.has_device_value(FULL) {
+                break;
             }
+            node.inc_device_lock_ref(FULL);
+            cur = node.parent();
         }
 
         // Lock the device-on segment up to the root.
@@ -340,29 +341,50 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
-        let ct = FULL;
-
         if lock_host {
-            let node = tree_core.arena.node_mut(node_id);
-            if node.host_lock_ref(FULL) == 0 {
+            if !params
+                .component_host_lock_uuids
+                .contains_key(&(FULL.idx() as u8))
+            {
                 return;
             }
-            // Mirror of `acquire`. write_back uses a pure counter.
-            if !node.has_host_value(FULL) && !tree_core.is_write_back {
-                return;
+            let boundary_uuid = params
+                .get_lock_uuid(FULL.idx() as u8, lock_host)
+                .expect("Full host lock receipt has no boundary");
+            let mut cur = node_id;
+            loop {
+                let node = tree_core.arena.node(cur);
+                if !node.has_host_value(FULL) && !tree_core.is_write_back {
+                    return;
+                }
+                assert!(
+                    node.host_lock_ref(FULL) > 0,
+                    "Full host segment release hit host_lock_ref=0 on node {cur}"
+                );
+                let at_boundary = node.full_host_uuid == Some(boundary_uuid);
+                let parent = if at_boundary {
+                    None
+                } else {
+                    Some(node.try_parent().unwrap_or_else(|| {
+                        panic!(
+                            "Full host lock boundary {boundary_uuid} is not an ancestor of receipt anchor {:?}",
+                            params.node_id
+                        )
+                    }))
+                };
+                tree_core.arena.node_mut(cur).dec_host_lock_ref(FULL);
+                tree_core.update_evictable_leaf_sets_(cur);
+                if at_boundary {
+                    break;
+                }
+                cur = parent.unwrap();
             }
-            node.dec_host_lock_ref(FULL);
-            tree_core.update_evictable_leaf_sets_(node_id);
             return;
         }
 
-        let empty = HashSet::new();
-        let skip_lock_node_ids = params
-            .and_then(|p| p.skip_lock_node_ids.get(&ct))
-            .unwrap_or(&empty);
         let mut cur = node_id;
         loop {
             let node = tree_core.arena.node_mut(cur);
@@ -370,20 +392,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 break;
             }
             let parent = node.parent();
-            if skip_lock_node_ids.contains(&node.id) {
-                cur = parent;
-                continue;
-            }
-            assert!(
-                node.has_device_value(FULL),
-                "release_component_lock: node {cur} has no FULL device value"
-            );
             let old_lock_ref = node.device_lock_ref(FULL);
             assert!(
                 old_lock_ref > 0,
-                "release_component_lock: node {cur} is not locked"
+                "FULL segment release hit lock_ref=0 on node {cur}"
             );
-            let newly_unlocked_len = if old_lock_ref == 1 {
+            let newly_unlocked_len = if old_lock_ref == 1 && node.has_device_value(FULL) {
                 Some(node.device_value_len(FULL))
             } else {
                 None
@@ -392,6 +406,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if let Some(key_len) = newly_unlocked_len {
                 tree_core.dec_protected_size(FULL, key_len);
                 tree_core.inc_evictable_size(FULL, key_len);
+            }
+            if old_lock_ref == 1 {
                 tree_core.update_evictable_leaf_sets_(cur);
             }
             cur = parent;
@@ -407,6 +423,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         _host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
+        _staging_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         Ok(match phase {
@@ -443,6 +460,25 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         })
     }
 
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let keys = node
+            .hash_value
+            .as_ref()
+            .filter(|hashes| !hashes.is_empty())?;
+        let device_indices = node.try_device_value(FULL)?;
+        Some(PoolTransfer {
+            name: PoolName::Kv,
+            device_indices: Some(device_indices.to_kind(Kind::Int64)),
+            keys: Some(keys.clone()),
+            ..Default::default()
+        })
+    }
+
     fn commit_hicache_transfer(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -469,14 +505,24 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 {
                     let mut offset = 0i64;
                     for &loaded_id in transfer.nodes_to_load.iter().flatten() {
-                        let loaded_idx = tree_core.arena.resolve(loaded_id);
+                        let loaded_idx = tree_core
+                            .arena
+                            .resolve(loaded_id)
+                            .expect("load-back transfers must reference live nodes");
                         let loaded = tree_core.arena.node_mut(loaded_idx);
                         let n_len = loaded.host_value_len(FULL) as i64;
                         loaded
                             .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
+                        let locked = loaded.device_lock_ref(FULL) > 0;
                         offset += n_len;
-                        // Full uses leaf sets, not LRU.
-                        tree_core.inc_evictable_size(FULL, n_len as usize);
+                        // Full uses leaf sets, not LRU. A value materialized
+                        // under lock is protected; the last release moves it
+                        // to evictable.
+                        if locked {
+                            tree_core.inc_protected_size(FULL, n_len as usize);
+                        } else {
+                            tree_core.inc_evictable_size(FULL, n_len as usize);
+                        }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
                     }
                 }

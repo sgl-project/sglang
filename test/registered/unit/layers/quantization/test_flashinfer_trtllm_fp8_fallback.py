@@ -20,14 +20,22 @@ backend selector and the two GEMM implementations so they run on CPU CI.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import functools
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang.srt.layers.quantization.fp8 as fp8
 import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    Fp8GemmRunnerBackend,
+    dispatch_w8a8_block_fp8_linear,
+    triton_w8a8_block_fp8_linear,
+)
 from sglang.test.test_utils import CustomTestCase
 
 BLOCK_SIZE = [128, 128]
@@ -100,3 +108,45 @@ class TestFlashinferTrtllmFp8Fallback(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
+
+
+class TestBlockSizeDispatch(CustomTestCase):
+    """Non-128-wide K blocks dispatch to Triton regardless of --fp8-gemm-backend;
+    128-wide blocks keep the backend choice."""
+
+    def test_128_wide_k_blocks_keep_the_backend_choice(self):
+        for name in ("triton", "deep_gemm"):
+            with (
+                self.subTest(backend=name),
+                patch.object(
+                    fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(name)
+                ),
+            ):
+                default = dispatch_w8a8_block_fp8_linear()
+                self.assertIs(dispatch_w8a8_block_fp8_linear([128, 128]), default)
+                self.assertIs(dispatch_w8a8_block_fp8_linear([1, 128]), default)
+                fn = dispatch_w8a8_block_fp8_linear([32, 32], act_scale_ue8m0=True)
+                self.assertIsInstance(fn, functools.partial)
+                self.assertIs(fn.func, triton_w8a8_block_fp8_linear)
+                self.assertEqual(fn.keywords, {"act_scale_ue8m0": True})
+
+    def test_method_dispatches_on_the_effective_block_size(self):
+        # An MXFP8 checkpoint converted to block-fp8 at load time is a [128, 128]
+        # weight; dispatching on the pre-conversion [1, 32] would pick Triton.
+        with (
+            patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.TRITON
+            ),
+            patch.object(fp8, "_mxfp8_to_block_fp8_required", True),
+        ):
+            method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    use_mxfp8=True,
+                    weight_block_size=[1, 32],
+                    scale_fmt="ue8m0",
+                )
+            )
+            self.assertTrue(method.convert_mxfp8_to_block)
+            self.assertIs(method.w8a8_block_fp8_linear, triton_w8a8_block_fp8_linear)
+            self.assertFalse(method.block_fp8_as_mxfp8)

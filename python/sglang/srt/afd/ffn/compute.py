@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mo
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_device, get_disagg, get_exec
 from sglang.srt.utils import get_available_gpu_memory, get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class AFDFFNCompute:
         ]
         self._device = next(self._layers[0].experts.parameters()).device
         self._device_name = model_runner.device
-        self._gpu_id = scheduler.ps.gpu_id
+        self._gpu_id = get_device().gpu_id
         self._tp_group = scheduler.tp_group
         self._disable_padding = get_exec().graph.disable_cuda_graph_padding
         self._enable_cudagraph_gc = get_exec().graph.enable_cudagraph_gc
@@ -438,10 +438,10 @@ class AFDFFNCompute:
         if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
         from sglang.srt.layers.flashinfer_comm_fusion import (
             pre_initialize_workspaces,
         )
+        from sglang.srt.layers.layer_boundary import FUSE_ALLREDUCE_MAX_BATCH_SIZE
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,

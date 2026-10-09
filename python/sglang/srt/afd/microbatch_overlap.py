@@ -375,6 +375,13 @@ def _split_afd_spec_info(
             if spec_info.live_seq_lens_cpu is not None
             else None
         ),
+        kv_loc_cols=(
+            spec_info.kv_loc_plan.cols_slice(
+                spec_info.kv_loc_cols, slice(start_token_index, end_token_index)
+            )
+            if spec_info.kv_loc_plan is not None
+            else None
+        ),
     )
 
 
@@ -531,6 +538,20 @@ def _build_afd_microbatch_child_replay_views(
                 out_cache_loc=(
                     forward_batch.out_cache_loc[start_token:end_token]
                     if forward_batch.out_cache_loc is not None
+                    else None
+                ),
+                out_cache_loc_virtual=(
+                    forward_batch.out_cache_loc_virtual[start_token:end_token]
+                    if forward_batch.out_cache_loc_virtual is not None
+                    else None
+                ),
+                out_cache_loc_is_physical=forward_batch.out_cache_loc_is_physical,
+                kv_loc_plan=forward_batch.kv_loc_plan,
+                kv_loc_cols=(
+                    forward_batch.kv_loc_plan.cols_slice(
+                        forward_batch.kv_loc_cols, slice(start_token, end_token)
+                    )
+                    if forward_batch.kv_loc_plan is not None
                     else None
                 ),
                 spec_info=_split_afd_spec_info(
@@ -707,6 +728,54 @@ def run_afd_microbatch_wavefront(
     return child_states
 
 
+def split_afd_residual_stream(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> list[torch.Tensor]:
+    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+    stream = residual_batch.stream_of(forward_batch)
+    update = stream.pending.update if stream.pending is not None else None
+    hidden_states, residual = stream.export(hidden_states)
+    child_hidden_states = []
+    for child in forward_batch.afd_microbatch_children:
+        rows = slice(*child.tbo_parent_token_range)
+        hidden, child.residual_stream = ResidualStream.from_handoff(
+            hidden_states[rows],
+            residual[rows] if residual is not None else None,
+            update,
+        )
+        child_hidden_states.append(hidden)
+    forward_batch.residual_stream = None
+    return child_hidden_states
+
+
+def merge_afd_residual_streams(
+    child_hidden_states: list[torch.Tensor], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+    from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+    children = forward_batch.afd_microbatch_children
+    outputs = []
+    residuals = []
+    first_stream = residual_batch.stream_of(children[0])
+    update = first_stream.pending.update if first_stream.pending is not None else None
+    for hidden, child in zip(child_hidden_states, children, strict=True):
+        stream = residual_batch.stream_of(child)
+        assert (stream.pending.update if stream.pending is not None else None) is update
+        hidden, residual = stream.export(hidden)
+        outputs.append(hidden)
+        residuals.append(residual)
+        child.residual_stream = None
+    hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
+        torch.cat(outputs),
+        torch.cat(residuals) if residuals[0] is not None else None,
+        update,
+    )
+    return hidden_states
+
+
 def model_forward_afd_microbatch(
     *,
     layers,
@@ -714,27 +783,11 @@ def model_forward_afd_microbatch(
     end_layer: int,
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
 ):
-    children = forward_batch.afd_microbatch_children
-    child_states = [
-        (
-            hidden_states[slice(*child.tbo_parent_token_range)],
-            None
-            if residual is None
-            else residual[slice(*child.tbo_parent_token_range)],
-        )
-        for child in children
-    ]
+    child_states = split_afd_residual_stream(hidden_states, forward_batch)
 
-    def launch_child_layer(layer, child, state, _child_index):
-        hidden_states, child_residual = state
-        return layer.forward_afd_microbatch_launch(
-            child.positions,
-            hidden_states,
-            child,
-            child_residual,
-        )
+    def launch_child_layer(layer, child, hidden, _child_index):
+        return layer.forward_afd_microbatch_launch(child.positions, hidden, child)
 
     def finish_child_layer(layer, child, pending, _child_index):
         return layer.forward_afd_microbatch_finish(pending, child)
@@ -748,18 +801,7 @@ def model_forward_afd_microbatch(
         launch_child_layer=launch_child_layer,
         finish_child_layer=finish_child_layer,
     )
-
-    return (
-        torch.cat([state[0] for state in child_states]),
-        _merge_residuals(child_states),
-    )
-
-
-def _merge_residuals(child_states):
-    residuals = [state[1] for state in child_states]
-    if residuals[0] is None:
-        return None
-    return torch.cat(residuals)
+    return merge_afd_residual_streams(child_states, forward_batch)
 
 
 def _set_child_dp_buffer(child: ForwardBatch) -> None:

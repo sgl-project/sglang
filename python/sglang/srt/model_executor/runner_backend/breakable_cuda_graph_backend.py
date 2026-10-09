@@ -46,6 +46,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -69,13 +70,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -126,12 +128,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = (
-            eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
-        )
+        captured_fn = eager_on_graph(forward_fn) if self._debug_eager else forward_fn
         size = shape_key.size
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
+                warmup_out
+            )
+            if capacity_rows is None:
+                capacity_rows = size
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, capacity_rows
+            )
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
@@ -158,6 +165,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         Tensor bodies can shard or prune below ``cap``. Full-model outputs
         retain token rows because decode keys count requests instead.
         """
+        runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
+        if runner_rows is not None:
+            return runner_rows
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, LogitsProcessorOutput):
@@ -274,8 +284,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     tensor, output_buffer.tensors[key], num_tokens
                 )
             return
-        if isinstance(output, (list, tuple)) and isinstance(
-            output_buffer, type(output)
+        if (isinstance(output, list) and isinstance(output_buffer, list)) or (
+            isinstance(output, tuple) and isinstance(output_buffer, tuple)
         ):
             if len(output) != len(output_buffer):
                 raise ValueError(
