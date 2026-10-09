@@ -374,6 +374,12 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        # Prefill-only requests never reach decode's release hook.
+                        prepare_release = getattr(
+                            self.model_worker, "prepare_for_kv_cache_release", None
+                        )
+                        if callable(prepare_release):
+                            prepare_release(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,

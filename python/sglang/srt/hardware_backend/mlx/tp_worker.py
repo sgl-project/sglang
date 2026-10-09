@@ -118,6 +118,7 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        self._mlx_finished_rids: set[str] = set()
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -156,7 +157,16 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+        """Release finished requests before launching a new non-idle batch."""
+        # Fresh launches follow finalization of any pending chained decode.
+        # Reclaim here, not in the finish hook, where that decode may still
+        # hold references to this request's state.
+        finished_rids = self._mlx_finished_rids & self._mlx_active_rids
+        for rid in finished_rids:
+            self._mlx_runner.remove_request(rid)
+        self._mlx_active_rids -= finished_rids
+        self._mlx_finished_rids.clear()
+
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
@@ -166,8 +176,11 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Snapshot auxiliary state and defer removal until the next fresh launch."""
         if self._mlx_runner.has_request(req.rid):
+            # An overlap decode may still be in flight. Keep its state until
+            # finalization, then reclaim it at the next fresh launch.
+            self._mlx_finished_rids.add(req.rid)
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
