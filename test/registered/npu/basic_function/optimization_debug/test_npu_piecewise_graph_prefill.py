@@ -12,9 +12,6 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
-
 
 TOKENS_TO_CAPTURE = [i for i in range(128, 4096, 128)]
 
