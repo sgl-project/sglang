@@ -512,8 +512,9 @@ embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
 ## DeepSeek V4
 
-Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
-Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
+Native V4 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
+server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
+OpenAI defaults: all declared tools are rendered with SGLang's schema
 defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
 official/preview effort profile is detected from the checkpoint's
 `encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in

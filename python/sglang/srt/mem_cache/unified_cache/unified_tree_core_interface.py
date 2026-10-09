@@ -438,7 +438,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -463,7 +463,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
