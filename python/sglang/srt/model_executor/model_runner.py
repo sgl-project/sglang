@@ -153,6 +153,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
     init_lplb_solvers,
+    prebuild_deepep_v2_buffer,
     prepare_moe_topk,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -628,7 +629,10 @@ class ModelRunner:
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
             post_capture_kv_active=is_post_capture_kv_active(
-                server_args=self.server_args, is_draft_worker=self.is_draft_worker
+                server_args=self.server_args,
+                is_draft_worker=self.is_draft_worker,
+                spec_algorithm=self.spec_algorithm,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             ),
             spec_aux_config=self.spec_aux_config,
             is_hybrid_swa=self.is_hybrid_swa,
@@ -894,6 +898,7 @@ class ModelRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
             device=self.device,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def max_shared_logits_buffer_rows(self) -> int:
@@ -1146,6 +1151,8 @@ class ModelRunner:
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
 
+        prebuild_deepep_v2_buffer(model=self.model)
+
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
             # Capture is target-only. The draft worker runs in the same process
@@ -1245,6 +1252,7 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        current_platform.post_load_model(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
@@ -1742,7 +1750,7 @@ class ModelRunner:
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
-            rank_id = self.gpu_id if get_parallel().attn_dp_size > 1 else None
+            rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span

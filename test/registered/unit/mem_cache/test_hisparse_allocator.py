@@ -242,11 +242,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             kv=ReqKvInfo(),
         )
 
-        def set_extend_range(start, end):
-            req.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
-
-        req.set_extend_range = set_extend_range
-
         class ReqToTokenPool:
             def __init__(self):
                 self.writes = []
@@ -281,6 +276,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.tree_cache = SimpleNamespace(
             evictable_size=MagicMock(return_value=0),
             protected_size=MagicMock(return_value=0),
+            maybe_hand_to_session=lambda req: None,
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
@@ -303,7 +299,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_range.length, fill_len)
+        self.assertEqual(req.extend_end, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
         regular_host_alloc.assert_called_once_with(
