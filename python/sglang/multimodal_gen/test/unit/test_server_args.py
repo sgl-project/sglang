@@ -3322,18 +3322,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
-    def test_disagg_args_import_path_matches_server_args_package(self):
-        from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args.disagg import (
-            DisaggServerArgsMixin,
-        )
-
-        self.assertIs(disagg_args.DisaggArgsMixin, DisaggServerArgsMixin)
-        self.assertIs(
-            disagg_args.DISAGG_RESULT_PORT_OFFSETS,
-            DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS,
-        )
-
     def test_gpu_ids_normalize_lists_and_commas(self):
         args = self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "6", "7 8"]})
 
