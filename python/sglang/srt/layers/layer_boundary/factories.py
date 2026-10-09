@@ -156,8 +156,6 @@ def _resolve_ffn(
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)
-    if parallel.attn_cp_size > 1 and sparse:
-        _reject_unsupported_cp_moe(on_rank_rows, cp_shards)
     if variant is BatchVariant.UNPADDED and on_rank_rows:
         # Rows that do not divide over attention TP stay whole: the FFN runs on
         # the attention's rows (an a2a MoE dispatches them from every
@@ -499,19 +497,32 @@ def declare_ffn(
     )
 
 
-def _resolve_stage(stage, variant, following=None):
-    axes, attention, local, full = _row_layouts(variant)
+def _reject_unsupported(stage):
+    """Reject a stage whose declared capabilities this parallel configuration
+    cannot bind, naming the combination. The rejections that depend on the
+    rows of one edge are made where that edge binds (``_bind_stage``)."""
+    parallel = get_parallel()
     if stage.update.applied_at_exit:
         if stage.sparse and moe_gathers_over_moe_cp():
             raise NotImplementedError(
                 "an update applied at the stage's exit with a MoE gathered over "
                 "the MoE-CP group"
             )
-        if get_parallel().attn_cp_size > 1 and input_scattered_configured():
+        if parallel.attn_cp_size > 1 and input_scattered_configured():
             raise NotImplementedError(
                 "an update applied at the stage's exit with input-scattered "
                 "attention under attention CP"
             )
+    if stage.kind is StageKind.FFN and stage.sparse and parallel.attn_cp_size > 1:
+        _reject_unsupported_cp_moe(
+            _ffn_on_rank_rows(stage.sparse, stage.dense_tp_size),
+            _prefill_cp_shards_tokens(),
+        )
+
+
+def _resolve_stage(stage, variant, following=None):
+    axes, attention, local, full = _row_layouts(variant)
+    _reject_unsupported(stage)
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
             variant,
