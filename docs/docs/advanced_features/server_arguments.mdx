@@ -2847,7 +2847,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enforce-shared-experts-fusion`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

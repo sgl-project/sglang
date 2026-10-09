@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (  # noqa: E501
@@ -37,7 +38,12 @@ from sglang.srt.layers.quantization.quark.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_device_capability
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import (
+    get_device_capability,
+    is_gfx95_supported,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -289,6 +295,24 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "down_proj",
 )
 
+# Model types the online shared-expert MXFP4 conversion is offered on. Qwen3.5
+# and Qwen3.8 share this architecture and the mlp.shared_expert.* -> fused-slot
+# remap the loader hook depends on; text checkpoints report the "_text"
+# spelling, multimodal ones the bare one.
+#
+# The restriction is deliberate, and it carries more weight now that the opt-in
+# is --enforce-shared-experts-fusion: the DeepSeek-V4 recipes pass that flag as a
+# matter of course. can_fuse_shared_expert() is also reached from
+# quant_blocks_shared_experts_fusion() in models/deepseek_common/utils.py, so
+# without this list a DeepSeek-family Quark MXFP4 checkpoint that excludes its
+# shared-expert body would silently start quantizing it. That combination is
+# unmeasured, and DeepSeek's layer 0 is a dense MLP, so the layer-0 probe below
+# would fall back to the global spec instead of reading a real MoE layer.
+_ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES: tuple[str, ...] = (
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+)
+
 
 class QuarkConfig(QuantizationConfig):
     def __init__(
@@ -333,6 +357,9 @@ class QuarkConfig(QuantizationConfig):
         self.num_nextn_predict_layers = int(
             getattr(hf_config, "num_nextn_predict_layers", 0) or 0
         )
+        # Gates the online shared-expert MXFP4 conversion to the architectures
+        # it is supported on; see _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES.
+        self.model_type = getattr(hf_config, "model_type", None)
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         # Load-as-is FP8 config for excluded layers of a mixed-precision source
@@ -451,8 +478,25 @@ class QuarkConfig(QuantizationConfig):
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+        matched_config = self._find_matched_config(prefix, layer)
+
+        # Answered once per layer and handed to get_moe_scheme below, so the
+        # exclude scan and the per-layer lookups behind it run only once.
+        quantize_shared_online = self.shared_expert_online_mxfp4_for_layer(layer)
+        if quantize_shared_online and not self._is_mx_fp4(
+            matched_config.get("weight"), matched_config.get("input_tensors")
+        ):
+            # Checked here rather than in get_moe_scheme because block-FP8 MoE
+            # layers are dispatched to Fp8MoEMethod below and never reach it.
+            raise NotImplementedError(
+                f"{prefix} does not use the W4A4 MXFP4 MoE scheme, which is "
+                "the only one that can quantize a BF16 shared expert into the "
+                "fused slot. Drop --enforce-shared-experts-fusion to run this "
+                "checkpoint with a standalone shared expert."
+            )
+
         block_fp8_config = self._get_block_fp8_config(
-            self._find_matched_config(prefix, layer), self.packed_modules_mapping
+            matched_config, self.packed_modules_mapping
         )
         if block_fp8_config is not None:
             if isinstance(layer, LinearBase):
@@ -472,7 +516,9 @@ class QuarkConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             self._online_quantized_layers.add(prefix)
-            layer.scheme = self.get_moe_scheme(layer, prefix)
+            layer.scheme = self.get_moe_scheme(
+                layer, prefix, quantize_shared_expert_online=quantize_shared_online
+            )
             return QuarkFusedMoEMethod(self)
 
         return None
@@ -987,7 +1033,15 @@ class QuarkConfig(QuantizationConfig):
         self,
         module: torch.nn.Module,
         layer_name: str,
+        quantize_shared_expert_online: Optional[bool] = None,
     ) -> "QuarkMoEScheme":
+        # None means "work it out from the module". get_quant_method passes the
+        # answer it already computed so the scan behind it is not repeated.
+        if quantize_shared_expert_online is None:
+            quantize_shared_expert_online = self.shared_expert_online_mxfp4_for_layer(
+                module
+            )
+
         layer_quant_config = self._find_matched_config(layer_name, module)
 
         if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
@@ -1005,6 +1059,7 @@ class QuarkConfig(QuantizationConfig):
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
                 dequantization_config=self.dequantization_config,
+                quantize_shared_expert_online=quantize_shared_expert_online,
             )
         elif self._is_mx_w4a8(weight_config, input_config):
             logger.info_once("Using Quark MXFP4-W/FP8-A MoE scheme")
@@ -1039,15 +1094,164 @@ class QuarkConfig(QuantizationConfig):
             for i in range(self.num_nextn_predict_layers)
         )
 
-    def can_fuse_shared_expert(self) -> bool:
-        # Shared-expert body excluded from quant; the gate must not veto fusion.
-        if any(
+    def shared_expert_excluded_from_quant(self) -> bool:
+        """Whether the target model's shared-expert body is left unquantized.
+
+        The shared_expert_gate is a separate tiny linear that stays BF16 in
+        every checkpoint, and draft-stack entries say nothing about how the
+        target stores its shared experts, so neither counts.
+        """
+        return any(
             "shared_expert" in layer
             and "shared_expert_gate" not in layer
             and not self._is_draft_layer(layer)
             for layer in self.exclude_layers
-        ):
+        )
+
+    def shared_expert_online_mxfp4_supported(self) -> bool:
+        """Whether a BF16 shared expert can be quantized into the fused slot.
+
+        Opt-in, because the conversion costs accuracy: --enforce-shared-experts-fusion
+        is what asks for fusion in a case the gate would otherwise refuse, and an
+        excluded shared expert is exactly such a case.
+
+        Only QuarkW4A4MXFp4MoE implements it, and only for a prequantized
+        checkpoint on FP4 hardware and one of the architectures it has been
+        measured on, so every MoE layer has to resolve to that scheme. The
+        global spec is not enough to decide that: layer_quant_config can send
+        individual MoE layers to the W4A8 or FP8 scheme, and those would copy
+        the BF16 shared expert into their own buffers unconverted. Both the
+        layer-0 lookup and the per-layer overrides are therefore checked, and
+        names the checkpoint does not carry fall back to the global spec, so a
+        non-MXFP4 global spec conservatively disables fusion.
+
+        Every refusal warns and answers "unsupported" rather than raising, so an
+        unsupported checkpoint falls back to a standalone shared expert.
+        """
+        if not get_exec().moe.enforce_shared_experts_fusion:
             return False
+
+        # is_hip() first: on a CUDA build SGLANG_USE_AITER is meaningless, and
+        # naming it would point the user at the wrong fix.
+        if not is_hip():
+            return self._warn_online_mxfp4_unavailable("this is not a ROCm build")
+        if not envs.SGLANG_USE_AITER.get():
+            return self._warn_online_mxfp4_unavailable("SGLANG_USE_AITER is not set")
+        if not is_gfx95_supported():
+            return self._warn_online_mxfp4_unavailable(
+                "the device has no FP4 support (needs gfx95x, e.g. MI355X)"
+            )
+        if not self.is_prequantized:
+            return self._warn_online_mxfp4_unavailable(
+                "the checkpoint is not prequantized"
+            )
+        if self.model_type not in _ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES:
+            return self._warn_online_mxfp4_unavailable(
+                f"model_type {self.model_type!r} is not one of "
+                f"{list(_ONLINE_SHARED_EXPERT_MXFP4_MODEL_TYPES)}, the "
+                "architectures it is supported on"
+            )
+
+        lookup_stub = torch.nn.Module()
+        try:
+            moe_configs = [
+                self._find_matched_config(f"{base}.mlp.experts", lookup_stub)
+                for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
+            ]
+        except ValueError:
+            return self._warn_online_mxfp4_unavailable(
+                "the layer-0 MoE quantization config could not be resolved"
+            )
+
+        if not all(
+            self._is_mx_fp4(cfg.get("weight"), cfg.get("input_tensors"))
+            for cfg in moe_configs
+        ):
+            return self._warn_online_mxfp4_unavailable(
+                "the routed experts are not MXFP4"
+            )
+
+        # Layer 0 answers for layer 0 only, but the fused slot lives in every
+        # MoE layer. Rejecting a non-MXFP4 per-layer override here turns what
+        # would otherwise be a NotImplementedError from get_quant_method part
+        # way through startup into the same warning and fallback.
+        elsewhere = self._non_mxfp4_moe_layer_overrides()
+        if elsewhere:
+            return self._warn_online_mxfp4_unavailable(
+                f"layer_quant_config sends {len(elsewhere)} MoE layer(s) to a "
+                f"non-MXFP4 scheme, starting with {elsewhere[0]}"
+            )
+        return True
+
+    def _non_mxfp4_moe_layer_overrides(self) -> list[str]:
+        """Per-layer config entries naming routed experts that are not MXFP4.
+
+        Sorted so every rank names the same layer in its warning. The shared
+        expert is skipped: it is the tensor being converted, and it is excluded
+        from quantization rather than given a spec of its own.
+        """
+        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
+        return sorted(
+            name
+            for name, spec in layer_quant_config.items()
+            if "experts" in name
+            and "shared_expert" not in name
+            and not self._is_mx_fp4(spec.get("weight"), spec.get("input_tensors"))
+        )
+
+    @staticmethod
+    def _warn_online_mxfp4_unavailable(reason: str) -> bool:
+        """Report an opt-in that cannot be honoured, and answer "unsupported".
+
+        Only reached when the checkpoint's shared expert really is excluded
+        from quantization, so the flag was asked for and is being dropped;
+        without this the fallback to a standalone shared expert is silent.
+        """
+        logger.warning_once(
+            "--enforce-shared-experts-fusion was passed but the shared expert "
+            f"will not be quantized or fused because {reason}. The model runs "
+            "with a standalone shared expert instead."
+        )
+        return False
+
+    def shared_expert_needs_online_mxfp4(self) -> bool:
+        """Whether the fused shared slot has to be quantized while loading.
+
+        Quark MXFP4 checkpoints (Qwen3.5, Qwen3.8) ship a BF16 shared expert
+        alongside MXFP4 routed experts, and copying those BF16 weights into the
+        packed FP4 expert buffers unchanged produces garbage.
+        """
+        return (
+            self.shared_expert_excluded_from_quant()
+            and self.shared_expert_online_mxfp4_supported()
+        )
+
+    def shared_expert_online_mxfp4_for_layer(self, layer: torch.nn.Module) -> bool:
+        """Whether this MoE layer's fused shared slot needs converting.
+
+        shared_expert_needs_online_mxfp4() is a model-wide answer and says
+        nothing about whether this layer actually got a fused shared slot.
+        Fusion can still be off for it: --disable-shared-experts-fusion, a
+        DeepEP / DeepEP-v2 / MoRI a2a backend, a shared-expert intermediate
+        size that differs from the routed one, or per-rank shared slots at
+        moe_ep_size > 1 all leave _has_fused_shared False. Nothing is then
+        copied into a fused slot, so neither the guard nor the scheme's warning
+        should fire. FusedMoE.__init__ sets the attribute before it calls
+        get_quant_method(), and create_weights() already gates on it.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        return (
+            isinstance(layer, FusedMoE)
+            and getattr(layer, "_has_fused_shared", False)
+            and self.shared_expert_needs_online_mxfp4()
+        )
+
+    def can_fuse_shared_expert(self) -> bool:
+        # An excluded shared-expert body cannot match the routed spec, so
+        # fusing it is only possible by quantizing it online.
+        if self.shared_expert_excluded_from_quant():
+            return self.shared_expert_online_mxfp4_supported()
 
         # No per-layer config -> uniform spec, nothing to compare.
         layer_quant_config = self.quant_config.get("layer_quant_config") or {}
