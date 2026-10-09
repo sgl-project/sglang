@@ -820,6 +820,14 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
+        if buf.mma_type == "nvfp4xnvfp4":
+            # Explicitly out of scope: the fp8 JIT pre-dispatch below would feed
+            # fp8 activations into an nvfp4-typed buffer, and DeepGEMM's situ
+            # gate rejects NVFP4 by design. Fail loudly instead of corrupting.
+            raise NotImplementedError(
+                "MegaMoE situ pre-dispatch supports fp8xfp4 and mxf4xmxf4 only; "
+                "nvfp4xnvfp4 is not implemented (see sgl-project/sglang#43294)."
+            )
         if buf.mma_type == "mxf4xmxf4":
             # The packed-FP4 path goes through DeepGEMM's own pre-dispatch,
             # which emits E2M1-packed activations; sglang's JIT pre-dispatch
