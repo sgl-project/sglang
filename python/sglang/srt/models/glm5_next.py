@@ -1334,14 +1334,32 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    # [patch #5(a') 1c8267b9fe 蓝本 fb9024683b - MXFP4 quant-metadata 名称映射] 旧代码（v0.5.21-native）：
+    # hf_to_sglang_mapper = WeightsMapper(
+    #     orig_to_new_substr={
+    #         "model.visual": "visual",
+    #     },
+    #     orig_to_new_prefix={
+    #         "model.language_model.": "model.",
+    #     },
+    #     orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+    # )
+    # 旧 suffix 形式只按 ".attn.qkv" 结尾匹配，无法命中文本层 "…self_attn.qkv"
+    # 条目（其结尾是 "_attn.qkv"，不含前置点号），会导致 quant metadata
+    # （ignored_layers / fp8_channelwise_layers）漏映射。改用源 patch 的两阶段
+    # 语义：substring 做 qkv 映射、prefix 做层级映射，_map_name 按
+    # substr→prefix→suffix 三阶段顺序执行，组合路径两步都能命中。
+    # substr 会连带命中 "attn.qkv_conv1d" / 已映射的 "attn.qkv_proj"，但该
+    # mapper 仅作用于 quant metadata 名称列表（checkpoint 原名、单次幂等），
+    # load_weights 内的 qkv 重写带点号且独立处理（见 load_weights）。
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.visual": "visual",
+            "attn.qkv": "attn.qkv_proj",
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
+            "model.visual": "visual",
         },
-        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],

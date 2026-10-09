@@ -5,11 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-# [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] PPU flashmla_kv KPool tail support
-from sglang.srt.utils import is_ppu
-
-_is_ppu = is_ppu()
-
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
@@ -18,6 +13,12 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
     update_pooled_paged_mqa_metadata,
 )
+
+# [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] PPU flashmla_kv KPool tail support
+from sglang.srt.utils import is_ppu
+
+# [CR Finding W7 - E402 fix] _is_ppu moved after all imports
+_is_ppu = is_ppu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (

@@ -187,6 +187,7 @@ class TestDsaKpoolMultiPool(CustomTestCase):
                 1, num_draft_tokens + 1, dtype=torch.int64, device="cuda"
             ),
             num_draft_tokens=num_draft_tokens,
+            plan_bs=1,
             round_scale=False,
             effective_n_per_batch=torch.tensor(
                 [effective_n], dtype=torch.int32, device="cuda"

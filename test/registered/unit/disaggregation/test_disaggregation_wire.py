@@ -36,14 +36,18 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    get_dsa_seed_metadata_dim,
+    get_dsa_tail_state_indices,
     get_qsa_pending_state_indices,
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
     setup_state_kv_args,
     should_send_replicated_state,
+    slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -55,6 +59,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     request_scoped_state_transfer_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
@@ -709,6 +714,18 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
+    def test_pd_seed_metadata_keeps_kpool_tail_width(self):
+        """Migrated from v0.5.18_rel commit 3dcb7d5eb6 (#15) DSA-tail state transfer patch.
+        Verifies get_dsa_seed_metadata_dim returns topk + kpool - 1 for GLM-5.3 config."""
+        config = SimpleNamespace(
+            architectures=["Glm5NextForConditionalGeneration"],
+            index_share_for_mtp_iteration=True,
+            index_topk=2048,
+            index_kpool=4,
+        )
+
+        self.assertEqual(get_dsa_seed_metadata_dim(config), 2051)
+
     @staticmethod
     def _make_req(
         seed,
@@ -1139,6 +1156,75 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertTrue(future_map.need_topk)
         self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
         self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
+
+
+class TestDSAKPoolDisaggregationState(unittest.TestCase):
+    """Migrated from v0.5.18_rel commit 3dcb7d5eb6 (#15) DSA-tail state transfer patch.
+
+    Tests cover HybridLinearKVPool state registration (MAMBA + DSA + DSA_TAIL),
+    tail-ring index calculation, cross-ring-size transfer remapping, and PP-slice
+    pointer halving.  All are pure-logic tests (no GPU, no distributed).
+    """
+
+    def test_hybrid_pool_registers_mamba_dsa_and_tail_state(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.use_dsa = True
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [3]
+        pool.full_kv_pool = SimpleNamespace(
+            get_state_buf_infos=lambda: ([30, 31], [300, 310], [40, 41]),
+            kpool_use_compress=True,
+            get_compress_tail_buf_infos=lambda: (
+                [50, 51],
+                [500, 510],
+                [60, 61],
+            ),
+        )
+        kv_args = KVArgs()
+
+        setup_state_kv_args(kv_args, pool)
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.DSA, StateType.DSA_TAIL],
+        )
+        self.assertEqual(kv_args.state_data_ptrs, [[10], [30, 31], [50, 51]])
+
+    def test_tail_indices_describe_wrapped_live_tokens(self):
+        pool = SimpleNamespace(
+            kpool_use_compress=True,
+            index_kpool=4,
+            tail_extra_slots=1,
+        )
+
+        self.assertEqual(get_dsa_tail_state_indices(pool, 2, 7), [2, 4, 1, 0, 2, 5])
+        self.assertEqual(get_dsa_tail_state_indices(pool, 2, 8), [])
+
+    def test_tail_transfer_remaps_different_ring_sizes(self):
+        blocks = build_dsa_tail_transfer_blocks(
+            src_ptrs=[1000],
+            src_item_lens=[40],
+            dst_ptrs=[2000],
+            src_indices=[2, 4, 1, 0, 2, 5],
+            dst_indices=[3, 6, 1, 0, 2, 7],
+            dst_item_lens=[56],
+        )
+
+        self.assertEqual(blocks, [(1112, 2216, 8), (1080, 2168, 16)])
+
+    def test_tail_pp_slice_preserves_key_and_score_halves(self):
+        self.assertEqual(
+            slice_dsa_tail_dst_ptrs_for_pp(
+                [10, 11, 20, 21],
+                [100, 101, 102, 103, 200, 201, 202, 203],
+                start_layer=1,
+                end_layer=3,
+            ),
+            [101, 102, 201, 202],
+        )
 
 
 class TestDSV4C4StateIndices(unittest.TestCase):

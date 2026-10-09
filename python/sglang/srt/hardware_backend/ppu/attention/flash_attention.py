@@ -171,12 +171,31 @@ def flash_attn_with_kvcache(
         if softmax_scale is None:
             softmax_scale = qv.shape[-1] ** -0.5
 
-    # PPU int8: PPU FA3 only supports BF16 KV; an int8 KV cache (quantized
-    # models such as GLM-5.3-Flash INT8) must be up-cast before the kernel.
+    # [CR Finding W5 - fail-fast instead of silent copy] 旧代码：
+    # # PPU int8: PPU FA3 only supports BF16 KV; an int8 KV cache (quantized
+    # # models such as GLM-5.3-Flash INT8) must be up-cast before the kernel.
+    # if k_cache is not None and k_cache.dtype == torch.int8:
+    #     k_cache = k_cache.to(torch.bfloat16)
+    # if v_cache is not None and v_cache.dtype == torch.int8:
+    #     v_cache = v_cache.to(torch.bfloat16)
+    #
+    # 原因：.to(bfloat16) 返回新 tensor（copy），FA3 对 cache 的 in-place 更新
+    # 不会回写到原 int8 buffer → 后续 decode 从 stale cache 读取，静默产生错误结果。
+    # 改为 fail-fast：若 cache 为 int8，直接报错要求使用 bf16 cache 或 DSA backend。
     if k_cache is not None and k_cache.dtype == torch.int8:
-        k_cache = k_cache.to(torch.bfloat16)
+        raise ValueError(
+            "PPU FA3 received k_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
+        )
     if v_cache is not None and v_cache.dtype == torch.int8:
-        v_cache = v_cache.to(torch.bfloat16)
+        raise ValueError(
+            "PPU FA3 received v_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
+        )
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
