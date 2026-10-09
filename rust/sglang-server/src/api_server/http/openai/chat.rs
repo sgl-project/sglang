@@ -120,11 +120,14 @@ async fn chat_completions(
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools_enabled = request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && tool_choice != DynamoToolChoice::None;
+    let tools = match sglang_processor::chat_tool_definitions(
+        request.tools.as_deref(),
+        &request.messages,
+    ) {
+        Ok(tools) => tools,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
     let parser = tools_enabled
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
@@ -139,16 +142,7 @@ async fn chat_completions(
     // the Dynamo request type has no such field, so it is always on when the
     // server was launched with `--reasoning-parser`.
     let reasoning_parser = state.server_args.reasoning_parser.clone();
-    let tools = request.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(|tool| ToolDefinition {
-                name: tool.function.name.clone(),
-                parameters: tool.function.parameters.clone(),
-                strict: tool.function.strict,
-            })
-            .collect::<Vec<_>>()
-    });
+    let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, prompt) =
@@ -1166,5 +1160,109 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+
+    // A named dynamic tool must pass request validation and reach both wire formats.
+    #[tokio::test]
+    async fn system_message_tools_reach_http_responses() {
+        use super::super::test_utils::{body_json, post_json};
+        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::message::config::ServerArgs;
+        use crate::message::request::RequestKind;
+        use crate::tokenizer_manager::wiring::TmEvent;
+        use std::sync::Arc;
+
+        for stream in [false, true] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "model".into(),
+                tool_call_parser: Some("kimi_k3".into()),
+                ..Default::default()
+            });
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: CoreMetadata::from(args.as_ref()),
+                },
+            );
+            let formatter =
+                dynamo_renderer::kimi_k3_formatter_for(&Some("kimi_k3".into()), "kimi_k3", false)
+                    .unwrap();
+            let state = Arc::new(super::super::AppState {
+                core,
+                server_args: args,
+                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+            });
+            let responder = tokio::spawn(async move {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected generation intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("expected generation");
+                };
+                assert!(generate.text.as_ref().unwrap().contains("lookup"));
+                assert!(
+                    generate
+                        .sampling_params
+                        .structural_tag
+                        .as_ref()
+                        .unwrap()
+                        .contains("lookup")
+                );
+                request.sink.try_send(chunk(request.rid.as_str(),
+                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>", true)).unwrap();
+            });
+            let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
+                "model":"model", "stream":stream,
+                "messages":[{"role":"system","tools":[{"name":"lookup","parameters":{"type":"object","properties":{}}}]},
+                            {"role":"user","content":"Call lookup"}],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "chat_template_kwargs":{"thinking":false}
+            })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let frames: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix("data: ")
+                            .filter(|data| *data != "[DONE]")
+                            .map(|data| serde_json::from_str(data).unwrap())
+                    })
+                    .collect();
+                assert!(
+                    frames.iter().any(
+                        |frame| frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+                            == "lookup"
+                    ),
+                    "{text}"
+                );
+                assert!(
+                    frames
+                        .iter()
+                        .any(|frame| frame["choices"][0]["finish_reason"] == "tool_calls"),
+                    "{text}"
+                );
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup",
+                    "{body}"
+                );
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+            }
+            responder.await.unwrap();
+        }
     }
 }
