@@ -376,6 +376,8 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     mixer's attention partial sum, or a value that is complete or carries the
     sum an FFN before it left."""
 
+    is_attention_free = True
+
     def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
         self.boundary = make_stage_boundary(
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx

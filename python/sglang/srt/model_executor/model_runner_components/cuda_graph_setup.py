@@ -95,6 +95,16 @@ def has_standard_gqa_for_all_local_layers(
     return attention_layer_count >= end_layer - start_layer
 
 
+def count_attention_free_layers(layer_model) -> int:
+    """Count local layers that need no attention metadata, such as the MLP and
+    MoE stages of hybrid models. They keep a ``None`` attention slot, which
+    must not disable the prefill CUDA graph."""
+    layers = layer_model.layers
+    if hasattr(layers, "values"):
+        layers = layers.values()
+    return sum(getattr(layer, "is_attention_free", False) for layer in layers)
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
@@ -627,7 +637,8 @@ def capture_prefill_graph(
     if not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
-        ),
+        )
+        + count_attention_free_layers(layer_model),
         start_layer=model_runner.layer_info.start_layer,
         end_layer=model_runner.layer_info.end_layer,
     ):

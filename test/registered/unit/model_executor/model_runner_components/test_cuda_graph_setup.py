@@ -7,6 +7,7 @@ from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
     capture_decode_graph,
+    count_attention_free_layers,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
 )
@@ -29,6 +30,57 @@ def test_standard_gqa_gate_is_unchanged_without_pipeline_parallelism():
     assert has_standard_gqa_for_all_local_layers(
         attention_layer_count=92, start_layer=0, end_layer=92
     )
+
+
+def test_standard_gqa_gate_counts_attention_free_hybrid_layers():
+    # Nemotron-H style stack: attention, Mamba, MoE, MLP. The MoE and MLP
+    # stages keep a None attention slot but need no attention metadata.
+    attention = SimpleNamespace()
+    mamba = SimpleNamespace()
+    moe = SimpleNamespace(is_attention_free=True)
+    mlp = SimpleNamespace(is_attention_free=True)
+    layer_model = SimpleNamespace(layers=[attention, mamba, moe, mlp])
+    attention_layers = [attention, mamba, None, None]
+
+    attention_free = count_attention_free_layers(layer_model)
+
+    assert attention_free == 2
+    assert has_standard_gqa_for_all_local_layers(
+        attention_layer_count=sum(layer is not None for layer in attention_layers)
+        + attention_free,
+        start_layer=0,
+        end_layer=4,
+    )
+
+
+def test_standard_gqa_gate_still_rejects_unrecognized_attention():
+    # The None slot belongs to an attention layer the gate cannot see.
+    attention = SimpleNamespace()
+    unrecognized = SimpleNamespace()
+    moe = SimpleNamespace(is_attention_free=True)
+    layer_model = SimpleNamespace(layers=[attention, unrecognized, moe])
+    attention_layers = [attention, None, None]
+
+    assert not has_standard_gqa_for_all_local_layers(
+        attention_layer_count=sum(layer is not None for layer in attention_layers)
+        + count_attention_free_layers(layer_model),
+        start_layer=0,
+        end_layer=3,
+    )
+
+
+def test_nemotron_h_ffn_layers_are_attention_free():
+    from sglang.srt.models.nemotron_h import (
+        NemotronHAttentionDecoderLayer,
+        NemotronHMambaDecoderLayer,
+        NemotronHMLPDecoderLayer,
+        NemotronHMoEDecoderLayer,
+    )
+
+    assert NemotronHMLPDecoderLayer.is_attention_free
+    assert NemotronHMoEDecoderLayer.is_attention_free
+    assert not getattr(NemotronHAttentionDecoderLayer, "is_attention_free", False)
+    assert not getattr(NemotronHMambaDecoderLayer, "is_attention_free", False)
 
 
 def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
