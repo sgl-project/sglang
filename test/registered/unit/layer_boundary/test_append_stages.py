@@ -233,6 +233,34 @@ class TestAppendStages(CustomTestCase):
 NUM_LAYERS = 4
 
 
+class TestOneStagePerAppend(CustomTestCase):
+    """Appends of one stage each: an attention, then an FFN, alternately."""
+
+    def test_both_sides_of_an_attention_s_edge_agree_across_appends(self):
+        # An a2a MoE returns its output on this rank's attention-TP slice,
+        # so the next attention keeps its residual there; the following FFN
+        # must start from that slice, not from the attention's full rows.
+        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True):
+            with layer_stack():
+                stages = [
+                    append_stages(
+                        (
+                            declare_attn() if i % 2 == 0 else declare_ffn(sparse=True),
+                            fixture.Norm(),
+                        )
+                    )[0]
+                    for i in range(4)
+                ]
+        for producer, consumer in zip(stages, stages[1:]):
+            if not producer.plan.finishes_directly:
+                continue
+            for variant, edges in producer.plan.edges.items():
+                with self.subTest(variant=variant.name):
+                    incoming = consumer.plan.edges[variant].incoming
+                    self.assertEqual(edges.outgoing.residual, incoming.residual)
+                    self.assertEqual(edges.outgoing.residual_to, incoming.residual_to)
+
+
 class TestMakeLayers(CustomTestCase):
     """make_layers builds its layers in one stack, and on a pipeline stage
     reads the stages the other stages' layers declare next to it."""

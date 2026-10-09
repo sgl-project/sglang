@@ -527,7 +527,7 @@ def _connect(producer, consumer, *, residual_from=None):
             decl, during, returned = _resolve_stage(before, variant, following=after)
             if during is None:
                 if residual_from is not None:
-                    if residual_from.consumer != producer:
+                    if _detached(residual_from.consumer) != _detached(producer):
                         raise ValueError("residual source must enter the producer")
                     during = residual_from.entries[variant].residual_to
                 elif (
@@ -640,19 +640,24 @@ def _fork_input(prepared, consumer):
     return StageConnection(prepared.consumer, consumer, {}, entries)
 
 
-def _incoming(stage):
+def _incoming(stage, previous_incoming=None):
+    """The boundary into ``stage``. ``previous_incoming`` is the boundary its
+    producer was bound with, when that producer ended the previous append and
+    its own history is no longer on ``stage``."""
     if stage.prepared_from is not None:
         return _fork_input(_incoming(stage.prepared_from), stage)
     previous = stage.previous
     # A normal attention may retain a finer residual than its output rows.
     # FFN and mixer exits declare their returned residual placement directly.
-    source = (
-        _incoming(previous)
-        if previous is not None
+    source = None
+    if (
+        previous is not None
         and previous.kind is StageKind.ATTENTION
         and previous.reduction is ProducerReduction.ALWAYS_PARTIAL
-        else None
-    )
+    ):
+        source = (
+            previous_incoming if previous_incoming is not None else _incoming(previous)
+        )
     return _connect(
         previous,
         stage,
@@ -805,11 +810,14 @@ class _Chain:
     """The stage a following append extends, and the one stage still waiting
     for its consumer, while the stack binds its appends in order."""
 
-    __slots__ = ("previous", "pending")
+    __slots__ = ("previous", "pending", "previous_incoming")
 
     def __init__(self, previous):
         self.previous = _detached(_handed_off(previous))
         self.pending = None
+        # The boundary the stage ``previous`` stands for was bound with, once
+        # it is bound on this rank: ``previous`` itself drops that history.
+        self.previous_incoming = None
 
 
 def _handed_off(declaration):
@@ -932,7 +940,7 @@ def _bind_pending(chain: _Chain, *, consumer, terminal, final_read=None):
         if terminal:
             declaration = _ended(declaration, final_read)
         if pending.predecessor is None:
-            incoming = _incoming(declaration)
+            incoming = _incoming(declaration, chain.previous_incoming)
         else:
             incoming = _connect(
                 pending.predecessor,
@@ -953,6 +961,7 @@ def _bind_pending(chain: _Chain, *, consumer, terminal, final_read=None):
         raise
     pending.boundary.plan = bound.plan
     pending.boundary.declaration = declaration
+    chain.previous_incoming = incoming
     if pending.predecessor_boundary is not None:
         _carry_capture(pending.predecessor_boundary, pending.boundary)
 
@@ -1070,7 +1079,10 @@ def _extend(chain, append, prepared_from):
         last = len(chained) - 1
         # incoming feeds the stage being bound; previous_incoming fed the one
         # before.
-        previous_incoming, incoming = None, _incoming(chained[0])
+        previous_incoming, incoming = (
+            None,
+            _incoming(chained[0], None if branch else chain.previous_incoming),
+        )
         for index, (declaration, (norm, options)) in enumerate(zip(chained, bindings)):
             if index == last and not branch:
                 boundaries.append(StageBoundary(None, declaration=declaration))
