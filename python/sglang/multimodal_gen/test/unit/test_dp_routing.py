@@ -44,6 +44,15 @@ def test_session_requests_stick_to_one_replica():
     assert _select_replica([_req()], 4, counter) == 0
 
 
+def test_comfyui_session_requests_stick_to_one_replica():
+    counter = itertools.count()
+    session_req = _req(extra={"comfyui_session_id": "executor-1:run-1"})
+    picks = [_select_replica([session_req], 2, counter) for _ in range(4)]
+    assert len(set(picks)) == 1
+    # ComfyUI session traffic does not consume the round-robin counter either.
+    assert _select_replica([_req()], 2, counter) == 0
+
+
 def test_control_reqs_are_recognized():
     assert isinstance(SetLoraReq(lora_nickname="x", lora_path="y"), _CONTROL_REQ_TYPES)
     assert isinstance(ShutdownReq(), _CONTROL_REQ_TYPES)
