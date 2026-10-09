@@ -22,7 +22,6 @@ if torch_npu is not None:
 
 from sglang.test.test_utils import CustomTestCase
 
-
 POOL_SIZE = 4
 NUM_DRAFT_TOKENS = 3
 PAGE_SIZE = 128
@@ -89,12 +88,8 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
         )
 
     def test_target_verify_and_draft_extend_v2_metadata(self):
-        expected_seqlens = torch.tensor(
-            [6, 7, 8, 10, 11, 12], dtype=torch.int32
-        )
-        expected_pool_seqlens = torch.tensor(
-            [1, 1, 2, 2, 2, 3], dtype=torch.int32
-        )
+        expected_seqlens = torch.tensor([6, 7, 8, 10, 11, 12], dtype=torch.int32)
+        expected_pool_seqlens = torch.tensor([1, 1, 2, 2, 2, 3], dtype=torch.int32)
 
         cases = (
             (ForwardMode.TARGET_VERIFY, [5, 9], None),
@@ -112,9 +107,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                 torch.testing.assert_close(
                     metadata.dsa_seqlens_expanded.cpu(), expected_seqlens
                 )
-                torch.testing.assert_close(
-                    plan.seqlens_per_q.cpu(), expected_seqlens
-                )
+                torch.testing.assert_close(plan.seqlens_per_q.cpu(), expected_seqlens)
                 torch.testing.assert_close(
                     plan.pool_seqlens_per_q.cpu(), expected_pool_seqlens
                 )
@@ -197,9 +190,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
         def fake_lightning_indexer(**kwargs):
             captured.update(kwargs)
             rows = kwargs["query"].shape[0]
-            indices = torch.zeros(
-                (rows, 1, 2), dtype=torch.int32, device=self.device
-            )
+            indices = torch.zeros((rows, 1, 2), dtype=torch.int32, device=self.device)
             return (indices,)
 
         query = torch.zeros(
@@ -213,12 +204,15 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
             device=self.device,
         )
 
-        with patch(
-            "sglang.srt.layers.attention.dsa.dsa_indexer_kpool."
-            "get_token_to_kv_pool",
-            return_value=pool,
-        ), patch.object(
-            torch_npu, "npu_lightning_indexer", side_effect=fake_lightning_indexer
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.dsa_indexer_kpool."
+                "get_token_to_kv_pool",
+                return_value=pool,
+            ),
+            patch.object(
+                torch_npu, "npu_lightning_indexer", side_effect=fake_lightning_indexer
+            ),
         ):
             result = indexer._get_topk_paged_npu(
                 forward_batch, 0, query, weights, metadata
@@ -326,9 +320,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
             metadata.cache_seqlens_int32.data_ptr(), pointers["cache_seqlens"]
         )
         self.assertEqual(metadata.real_page_table.data_ptr(), pointers["page_table"])
-        self.assertEqual(
-            metadata.dsa_seqlens_expanded.data_ptr(), pointers["expanded"]
-        )
+        self.assertEqual(metadata.dsa_seqlens_expanded.data_ptr(), pointers["expanded"])
         self.assertEqual(replay_plan.req.data_ptr(), pointers["plan_req"])
         self.assertEqual(
             replay_plan.write_start.data_ptr(), pointers["plan_write_start"]
@@ -391,9 +383,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                         device=self.device,
                     )
                 )
-                expected = torch.zeros(
-                    (6, 11), dtype=torch.int32, device=self.device
-                )
+                expected = torch.zeros((6, 11), dtype=torch.int32, device=self.device)
                 indexer._get_topk_paged_npu = Mock(return_value=expected)
 
                 forward_batch = SimpleNamespace(
@@ -404,9 +394,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                     get_indexer_metadata=lambda _layer_id, _batch: SimpleNamespace()
                 )
                 x = torch.zeros((6, 4), dtype=torch.bfloat16, device=self.device)
-                q_lora = torch.zeros(
-                    (6, 4), dtype=torch.bfloat16, device=self.device
-                )
+                q_lora = torch.zeros((6, 4), dtype=torch.bfloat16, device=self.device)
                 positions = torch.arange(6, dtype=torch.int64, device=self.device)
 
                 with patch(

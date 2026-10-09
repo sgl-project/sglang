@@ -851,6 +851,7 @@ def init_kpool_write_plan(
     )
     return metadata
 
+
 # ── NPU variants ──────────────────────────────────────────────────────────
 def init_kpool_extend_metadata_npu(
     metadata,
@@ -861,7 +862,7 @@ def init_kpool_extend_metadata_npu(
     slots_per_page: int,
     full_real_page_table: torch.Tensor,
     local_seqlens_expanded: torch.Tensor,
-) -> "DSAMetadata":
+) -> DSAMetadata:
     """NPU variant of init_kpool_extend_metadata.
 
     Reuses the platform-agnostic CPU plan (_kpool_cpu_plan) and the PyTorch
@@ -1139,30 +1140,22 @@ def update_kpool_write_plan_npu(
         ).unsqueeze(0)
         flat = seqlen_per_q.reshape(-1)[: bs * num_draft_tokens]
         seq_per_q_out[: bs * num_draft_tokens] = flat
-        per_q_out[: bs * num_draft_tokens] = (
-            flat // pool_size
-        ).to(torch.int32)
+        per_q_out[: bs * num_draft_tokens] = (flat // pool_size).to(torch.int32)
 
     # ── Write location (vectorised) ──
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
-    pool_offsets = torch.arange(
-        max_closed_pools, device=ws.device, dtype=torch.int32
-    )
+    pool_offsets = torch.arange(max_closed_pools, device=ws.device, dtype=torch.int32)
     pool_ids = base_pool.unsqueeze(1) + pool_offsets.unsqueeze(0)
-    pool_page_group = torch.div(
-        pool_ids, slots_per_page, rounding_mode="floor"
-    )
+    pool_page_group = torch.div(pool_ids, slots_per_page, rounding_mode="floor")
     token_page_row = pool_page_group * pool_size
     token_page_row = token_page_row.clamp(0, real_page_table.shape[1] - 1)
 
     # NPU real_page_table has one row per request, including verify / draft-v2.
     row_idx = torch.arange(bs, device=ws.device, dtype=torch.int64).unsqueeze(1)
-    packed_page = real_page_table[
-        row_idx, token_page_row.to(torch.int64)
-    ].to(torch.int64)
-    write_loc = packed_page * slots_per_page + torch.remainder(
-        pool_ids, slots_per_page
+    packed_page = real_page_table[row_idx, token_page_row.to(torch.int64)].to(
+        torch.int64
     )
+    write_loc = packed_page * slots_per_page + torch.remainder(pool_ids, slots_per_page)
 
     plan.req[:bs] = req_pool_indices[:bs].to(torch.int64)
     plan.write_start[:bs] = ws[:bs]

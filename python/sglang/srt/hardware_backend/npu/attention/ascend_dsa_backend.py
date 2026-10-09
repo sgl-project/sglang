@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -81,9 +80,7 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
         """Select request-relative logical indices with invalid slots padded by -1."""
         rows, width = logits.shape
         if width == 0:
-            return torch.full(
-                (rows, topk), -1, dtype=torch.int32, device=logits.device
-            )
+            return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
 
         lengths = self.get_seqlens_expanded()[:rows].to(logits.device)
         valid_widths = lengths.clamp(min=0, max=width)
@@ -135,9 +132,9 @@ def _expand_causal_seqlens_kernel(
     cache_seqlen = tl.load(cache_seqlens_ptr + request_idx).to(tl.int32)
     causal_start = tl.maximum(cache_seqlen - query_len + 1, 0)
 
-    query_offsets = (
-        query_chunk_idx * BLOCK_QUERY + tl.arange(0, BLOCK_QUERY)
-    ).to(tl.int32)
+    query_offsets = (query_chunk_idx * BLOCK_QUERY + tl.arange(0, BLOCK_QUERY)).to(
+        tl.int32
+    )
     output_offsets = request_output_start + query_offsets
     mask = (query_offsets < query_len) & (output_offsets < total_q)
 
@@ -341,11 +338,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         """Return the effective maximum KV length from the existing CPU mirror."""
         assert forward_batch.seq_lens_cpu is not None
         seq_lens_cpu = forward_batch.seq_lens_cpu[: forward_batch.batch_size]
-        max_seq_len = (
-            int(seq_lens_cpu.max().item())
-            if seq_lens_cpu.numel() > 0
-            else 0
-        )
+        max_seq_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() > 0 else 0
         if forward_batch.forward_mode.is_target_verify():
             max_seq_len += self.speculative_num_draft_tokens
         elif (
@@ -375,8 +368,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             :max_seq_len_k,
         ]
         real_page_table_computed = (
-            page_table_1[:, :: self.page_size] // self.page_size
-        ).to(torch.int32).contiguous()
+            (page_table_1[:, :: self.page_size] // self.page_size)
+            .to(torch.int32)
+            .contiguous()
+        )
 
         if _graph_capture:
             max_rows = real_page_table_computed.shape[0]
@@ -469,10 +464,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # ── Verify / draft-extend-v2: build KPoolWritePlan ──
         # Plain NPU decode updates the KPool cache directly through
         # kpool_decode_update_index_cache and does not consume this plan.
-        if not (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-        ):
+        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
             return
 
         is_v2 = forward_mode.is_draft_extend_v2()
@@ -497,9 +489,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # ring-write start for this iteration.
         seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
         if is_v2:
-            write_start = (seq_lens - self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
+            write_start = (seq_lens - self.speculative_num_draft_tokens).to(torch.int32)
         else:
             write_start = seq_lens.to(torch.int32)
 
@@ -520,9 +510,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         update_kpool_write_plan_npu(
             metadata,
             write_start=write_start,
-            req_pool_indices=forward_batch.req_pool_indices[
-                : forward_batch.batch_size
-            ],
+            req_pool_indices=forward_batch.req_pool_indices[: forward_batch.batch_size],
             real_page_table=real_page_table,
             pool_size=pool_size,
             real_page_size=self.page_size,
@@ -562,8 +550,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             forward_batch.req_pool_indices[:bs], :max_seq_len_k
         ]
         new_real_page_table = (
-            page_table_1[:, :: self.page_size] // self.page_size
-        ).to(torch.int32).contiguous()
+            (page_table_1[:, :: self.page_size] // self.page_size)
+            .to(torch.int32)
+            .contiguous()
+        )
 
         n_rows, n_cols = new_real_page_table.shape
         if (
@@ -627,10 +617,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         if (
             self.dsa_index_kpool > 1
             and metadata.kpool_write_plan is not None
-            and (
-                forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend_v2()
-            )
+            and (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2())
         ):
             from sglang.srt.layers.attention.dsa.kpool_plan import (
                 update_kpool_write_plan_npu,
@@ -641,9 +628,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             if num_draft_tokens > 0:
                 seq_lens = forward_batch.seq_lens[:bs]
                 if is_v2:
-                    write_start = (
-                        seq_lens - self.speculative_num_draft_tokens
-                    ).to(torch.int32)
+                    write_start = (seq_lens - self.speculative_num_draft_tokens).to(
+                        torch.int32
+                    )
                 else:
                     write_start = seq_lens.to(torch.int32)
 

@@ -776,9 +776,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_score = None
             return
 
-        assert (
-            max_running_requests is not None
-        ), "NPUMLATokenToKVPool with kpool compress requires max_running_requests"
+        assert max_running_requests is not None, (
+            "NPUMLATokenToKVPool with kpool compress requires max_running_requests"
+        )
         req_pool_size = max_running_requests + 1
         tail_dtype = torch.bfloat16
         tail_width = index_kpool + tail_extra_slots
@@ -811,9 +811,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            self._kpool_use_compress
-        ), "get_compress_tail_buffers called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "get_compress_tail_buffers called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         return (
             self._compress_tail_k[idx],
@@ -840,9 +840,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kpool_decode_update_and_maybe_write_cache_bf16,
         )
 
-        assert (
-            self._kpool_use_compress
-        ), "kpool_decode_update_index_cache called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
         kpool_decode_update_and_maybe_write_cache_bf16(
@@ -871,9 +871,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         n_remain: int,
         dst_logical_start: int,
     ) -> None:
-        assert (
-            self._kpool_use_compress
-        ), "set_compress_tail_for_request called when kpool compress is disabled"
+        assert self._kpool_use_compress, (
+            "set_compress_tail_for_request called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         if n_remain > 0:
             slots = (

@@ -152,9 +152,7 @@ def npu_wrapper_glmga_image_preprocess(func):
                 )
             resized_images_grouped[shape] = stacked_images
 
-        resized_images = reorder_images(
-            resized_images_grouped, grouped_images_index
-        )
+        resized_images = reorder_images(resized_images_grouped, grouped_images_index)
         grouped_images, grouped_images_index = group_images_by_shape(
             resized_images, disable_grouping=disable_grouping
         )
@@ -238,20 +236,14 @@ def npu_wrapper_glmga_video_preprocess(func):
                 )
             resized_videos_grouped[shape] = stacked_videos
 
-        resized_videos = reorder_videos(
-            resized_videos_grouped, grouped_videos_index
-        )
-        grouped_videos, grouped_videos_index = group_videos_by_shape(
-            resized_videos
-        )
+        resized_videos = reorder_videos(resized_videos_grouped, grouped_videos_index)
+        grouped_videos, grouped_videos_index = group_videos_by_shape(resized_videos)
         processed_videos_grouped = {}
         processed_grids = {}
 
         for shape, stacked_videos in grouped_videos.items():
             # Preserve the upstream validation/shape access before normalization.
-            get_image_size(
-                stacked_videos[0], channel_dim=ChannelDimension.FIRST
-            )
+            get_image_size(stacked_videos[0], channel_dim=ChannelDimension.FIRST)
             patches = self.rescale_and_normalize(
                 stacked_videos,
                 do_rescale,

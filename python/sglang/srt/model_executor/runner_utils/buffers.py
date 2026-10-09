@@ -87,7 +87,9 @@ def allocate_pp_proxy_tensors(
     is_mhc = hc_hidden_size is not None
     pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
     pp_proxy_tensors = {
-        "hidden_states": torch.zeros((proxy_hidden_tokens, pp_hidden_size), dtype=dtype),
+        "hidden_states": torch.zeros(
+            (proxy_hidden_tokens, pp_hidden_size), dtype=dtype
+        ),
     }
     if pp_proxy_residual_num_blocks is not None:
         # Only Kimi K3 supplies num_blocks: its attention-residual bank is

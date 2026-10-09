@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.dsa.kpool_index_npu import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-
 HEAD_DIM = 128
 PAGE_SIZE = 128
 RTOL = 1e-2
@@ -142,9 +141,7 @@ class TestKPoolBF16IndexNPU(CustomTestCase):
         def randn(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
             return torch.randn(shape, device=self.device, dtype=torch.float32).to(dtype)
 
-        initial_cache = randn(
-            (cache_pages, PAGE_SIZE, 1, HEAD_DIM), torch.bfloat16
-        )
+        initial_cache = randn((cache_pages, PAGE_SIZE, 1, HEAD_DIM), torch.bfloat16)
         chunk_k = randn((chunk_rows, HEAD_DIM), torch.bfloat16)
         tail_k = randn((n_requests, tail_size, HEAD_DIM), torch.bfloat16)
         chunk_score = randn((chunk_rows, HEAD_DIM), score_dtype) * 4

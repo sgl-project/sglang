@@ -74,12 +74,12 @@ if use_deepep and _is_npu:
     # NPU workaround: normal mode -> HCCL alltoall strategy (Cam IPC-window
     # combine kernel deadlocks on ep rank 0 under cross-rank skew); LL stays
     # default.
+    import deep_ep.ep_strategy as _TDbEps
     import torch_npu
     from deep_ep import EventOverlap as _TDbEventOverlap
     from deep_ep.strategies.normal_strategy import (
         AlltoAllNormalCommStrategy as _TDbA2AStrategy,
     )
-    import deep_ep.ep_strategy as _TDbEps
 
     def _TDb_get_strategy(cls, deep_mode):
         return (_TDbEps.NormalStrategy.ALLTOALL, _TDbEps.LowLatencyStrategy.DEFAULT)

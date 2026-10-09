@@ -72,7 +72,11 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 import torch
-from sglang.srt.layers.attention.dsa.kpool_index_npu import kpool_decode_update_and_maybe_write_cache_bf16
+
+from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+    kpool_decode_update_and_maybe_write_cache_bf16,
+)
+
 # Auto-detect device: prefer CUDA, fallback to NPU
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -82,15 +86,14 @@ else:
     DEVICE = "cpu"
 
 
-
 def kpool_decode_update_and_maybe_write_cache_bf16_torch(
-    buf: torch.Tensor,             # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
-    tail_k: torch.Tensor,          # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
-    tail_score: torch.Tensor,      # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] float32
-    key: torch.Tensor,             # [batch, HEAD_DIM] bfloat16
-    slot_score: torch.Tensor,      # [batch, HEAD_DIM] float32
-    ape: torch.Tensor,             # [POOL_SIZE, HEAD_DIM] float32
-    block_tables: torch.Tensor,    # [batch, BLOCK_TABLE_COLS] int32
+    buf: torch.Tensor,  # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
+    tail_k: torch.Tensor,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
+    tail_score: torch.Tensor,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] float32
+    key: torch.Tensor,  # [batch, HEAD_DIM] bfloat16
+    slot_score: torch.Tensor,  # [batch, HEAD_DIM] float32
+    ape: torch.Tensor,  # [POOL_SIZE, HEAD_DIM] float32
+    block_tables: torch.Tensor,  # [batch, BLOCK_TABLE_COLS] int32
     req_pool_indices: torch.Tensor,
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -120,7 +123,7 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
         slot = pos % pool_size
         phys_slot = pos % tail_size
 
-        cur_key = key[row].float()         # [HEAD_DIM]
+        cur_key = key[row].float()  # [HEAD_DIM]
         cur_score = slot_score[row].float()  # [HEAD_DIM]
 
         # ── (B) Pool compression ──
@@ -131,7 +134,7 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
             scores_list = []
             keys_list = []
             for pool_slot in range(pool_size):
-                is_current = (pool_slot == slot)
+                is_current = pool_slot == slot
                 phys = (pool_logical_start + pool_slot) % tail_size
                 if is_current:
                     s = cur_score
@@ -144,15 +147,17 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
 
             # Stack: [POOL_SIZE, HEAD_DIM]
             all_scores = torch.stack(scores_list)  # [POOL_SIZE, HEAD_DIM]
-            all_keys = torch.stack(keys_list)       # [POOL_SIZE, HEAD_DIM]
+            all_keys = torch.stack(keys_list)  # [POOL_SIZE, HEAD_DIM]
 
             # Softmax along pool dimension
-            max_score = all_scores.max(dim=0).values               # [HEAD_DIM]
-            probs = torch.exp(all_scores - max_score.unsqueeze(0)) # [POOL_SIZE, HEAD_DIM]
-            denom = probs.sum(dim=0)                                # [HEAD_DIM]
-            acc = (all_keys * probs).sum(dim=0)                     # [HEAD_DIM]
+            max_score = all_scores.max(dim=0).values  # [HEAD_DIM]
+            probs = torch.exp(
+                all_scores - max_score.unsqueeze(0)
+            )  # [POOL_SIZE, HEAD_DIM]
+            denom = probs.sum(dim=0)  # [HEAD_DIM]
+            acc = (all_keys * probs).sum(dim=0)  # [HEAD_DIM]
 
-            compressed = (acc / denom).to(torch.bfloat16)           # [HEAD_DIM]
+            compressed = (acc / denom).to(torch.bfloat16)  # [HEAD_DIM]
 
             # Compute write location
             pool_id = pos // pool_size
@@ -164,7 +169,7 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
             loc_token_offset = pool_id % slots_per_page
 
             out_offset = loc_page_index * buf.shape[1] + loc_token_offset * head_dim
-            buf.view(-1)[out_offset:out_offset + head_dim] = compressed
+            buf.view(-1)[out_offset : out_offset + head_dim] = compressed
 
         # ── (A) Tail buffer update ──
         if pos_valid:
@@ -176,6 +181,7 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
 # 4. VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def verify_kernel():
     """Verify BF16 Triton kernel against torch native reference."""
     device = DEVICE
@@ -183,9 +189,9 @@ def verify_kernel():
 
     # ── Test parameters ──
     POOL_SIZE = 4
-    TAIL_SIZE = POOL_SIZE + 1   # kpool + tail_extra_slots = 5
+    TAIL_SIZE = POOL_SIZE + 1  # kpool + tail_extra_slots = 5
     HEAD_DIM = 128
-    SLOTS_PER_PAGE = 64         # same as BLOCK_SIZE_K
+    SLOTS_PER_PAGE = 64  # same as BLOCK_SIZE_K
     BATCH = 16
     REQ_POOL_SIZE = BATCH
     NUM_PAGES = 32
@@ -194,14 +200,28 @@ def verify_kernel():
     # ── Create test data ──
     # Buffer: BF16 keys only, no scale
     buf_numel_per_page = SLOTS_PER_PAGE * HEAD_DIM
-    buf_triton = torch.zeros(NUM_PAGES, buf_numel_per_page, dtype=torch.bfloat16, device=device)
-    buf_torch  = torch.zeros(NUM_PAGES, buf_numel_per_page, dtype=torch.bfloat16, device=device)
+    buf_triton = torch.zeros(
+        NUM_PAGES, buf_numel_per_page, dtype=torch.bfloat16, device=device
+    )
+    buf_torch = torch.zeros(
+        NUM_PAGES, buf_numel_per_page, dtype=torch.bfloat16, device=device
+    )
 
     # Tail ring buffers (pre-fill with some history)
-    tail_k_triton = torch.randn(REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.1
-    tail_k_torch  = tail_k_triton.clone()
-    tail_score_triton = torch.randn(REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype=torch.float32, device=device) * 0.1
-    tail_score_torch  = tail_score_triton.clone()
+    tail_k_triton = (
+        torch.randn(
+            REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
+    tail_k_torch = tail_k_triton.clone()
+    tail_score_triton = (
+        torch.randn(
+            REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype=torch.float32, device=device
+        )
+        * 0.1
+    )
+    tail_score_torch = tail_score_triton.clone()
 
     # Current token key & score
     key = torch.randn(BATCH, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.1
@@ -211,49 +231,77 @@ def verify_kernel():
     ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device=device) * 0.01
 
     # Page table: map each request to pages (each row has BLOCK_TABLE_COLS page indices)
-    block_tables = torch.randint(0, NUM_PAGES, (BATCH, BLOCK_TABLE_COLS), dtype=torch.int32, device=device)
+    block_tables = torch.randint(
+        0, NUM_PAGES, (BATCH, BLOCK_TABLE_COLS), dtype=torch.int32, device=device
+    )
 
     # Request metadata
     req_pool_indices = torch.arange(BATCH, dtype=torch.int32, device=device)
 
     # Positions: design so that some are at pool boundary (slot == POOL_SIZE-1)
     # Mix of positions: some trigger compression, some don't
-    positions = torch.tensor([
-        3,   # slot=3 → pool full (triggers compression)
-        7,   # slot=3 → pool full
-        10,  # slot=2 → no compression
-        15,  # slot=3 → pool full
-        20,  # slot=0 → no compression
-        23,  # slot=3 → pool full
-        25,  # slot=1 → no compression
-        27,  # slot=3 → pool full
-        30,  # slot=2 → no compression
-        31,  # slot=3 → pool full
-        35,  # slot=3 → pool full
-        38,  # slot=2 → no compression
-        43,  # slot=3 → pool full
-        44,  # slot=0 → no compression
-        47,  # slot=3 → pool full
-        50,  # slot=2 → no compression
-    ], dtype=torch.int32, device=device)
+    positions = torch.tensor(
+        [
+            3,  # slot=3 → pool full (triggers compression)
+            7,  # slot=3 → pool full
+            10,  # slot=2 → no compression
+            15,  # slot=3 → pool full
+            20,  # slot=0 → no compression
+            23,  # slot=3 → pool full
+            25,  # slot=1 → no compression
+            27,  # slot=3 → pool full
+            30,  # slot=2 → no compression
+            31,  # slot=3 → pool full
+            35,  # slot=3 → pool full
+            38,  # slot=2 → no compression
+            43,  # slot=3 → pool full
+            44,  # slot=0 → no compression
+            47,  # slot=3 → pool full
+            50,  # slot=2 → no compression
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
 
     seq_lens = positions + 10  # ensure pos < seq_len
-    out_cache_loc = torch.ones(BATCH, dtype=torch.int32, device=device)  # all valid (non-zero)
+    out_cache_loc = torch.ones(
+        BATCH, dtype=torch.int32, device=device
+    )  # all valid (non-zero)
 
     # ── Run Triton kernel ──
     kpool_decode_update_and_maybe_write_cache_bf16(
-        buf_triton, tail_k_triton, tail_score_triton,
-        key, slot_score, ape, block_tables,
-        req_pool_indices, positions, seq_lens, out_cache_loc,
-        pool_size=POOL_SIZE, slots_per_page=SLOTS_PER_PAGE, head_dim=HEAD_DIM,
+        buf_triton,
+        tail_k_triton,
+        tail_score_triton,
+        key,
+        slot_score,
+        ape,
+        block_tables,
+        req_pool_indices,
+        positions,
+        seq_lens,
+        out_cache_loc,
+        pool_size=POOL_SIZE,
+        slots_per_page=SLOTS_PER_PAGE,
+        head_dim=HEAD_DIM,
     )
 
     # ── Run torch native ──
     kpool_decode_update_and_maybe_write_cache_bf16_torch(
-        buf_torch, tail_k_torch, tail_score_torch,
-        key, slot_score, ape, block_tables,
-        req_pool_indices, positions, seq_lens, out_cache_loc,
-        pool_size=POOL_SIZE, slots_per_page=SLOTS_PER_PAGE, head_dim=HEAD_DIM,
+        buf_torch,
+        tail_k_torch,
+        tail_score_torch,
+        key,
+        slot_score,
+        ape,
+        block_tables,
+        req_pool_indices,
+        positions,
+        seq_lens,
+        out_cache_loc,
+        pool_size=POOL_SIZE,
+        slots_per_page=SLOTS_PER_PAGE,
+        head_dim=HEAD_DIM,
     )
 
     # ── Compare results ──
@@ -267,9 +315,13 @@ def verify_kernel():
     print(f"\n[Tail Buffer]")
     print(f"  tail_k     max abs diff: {tail_k_diff.max().item():.2e}")
     print(f"  tail_k     mean abs diff: {tail_k_diff.mean().item():.2e}")
-    print(f"  tail_k     allclose (atol=1e-3): {torch.allclose(tail_k_triton, tail_k_torch, atol=1e-3)}")
+    print(
+        f"  tail_k     allclose (atol=1e-3): {torch.allclose(tail_k_triton, tail_k_torch, atol=1e-3)}"
+    )
     print(f"  tail_score max abs diff: {tail_score_diff.max().item():.2e}")
-    print(f"  tail_score allclose (atol=1e-6): {torch.allclose(tail_score_triton, tail_score_torch, atol=1e-6)}")
+    print(
+        f"  tail_score allclose (atol=1e-6): {torch.allclose(tail_score_triton, tail_score_torch, atol=1e-6)}"
+    )
 
     # 2. Index cache buffer comparison
     buf_diff = (buf_triton - buf_torch).abs()
@@ -281,13 +333,19 @@ def verify_kernel():
         print(f"  Written entries: {nonzero_mask.sum().item()} / {buf_torch.numel()}")
         print(f"  buf max abs diff:  {buf_diff_nz.max().item():.2e}")
         print(f"  buf mean abs diff: {buf_diff_nz.mean().item():.2e}")
-        print(f"  buf allclose (atol=2e-2): {torch.allclose(buf_triton, buf_torch, atol=2e-2)}")
-        print(f"  buf allclose (atol=5e-3): {torch.allclose(buf_triton, buf_torch, atol=5e-3)}")
+        print(
+            f"  buf allclose (atol=2e-2): {torch.allclose(buf_triton, buf_torch, atol=2e-2)}"
+        )
+        print(
+            f"  buf allclose (atol=5e-3): {torch.allclose(buf_triton, buf_torch, atol=5e-3)}"
+        )
 
         # Relative error
         buf_torch_nz = buf_torch[nonzero_mask].float()
         buf_triton_nz = buf_triton[nonzero_mask].float()
-        rel_err = ((buf_triton_nz - buf_torch_nz).abs() / buf_torch_nz.abs().clamp(min=1e-8))
+        rel_err = (buf_triton_nz - buf_torch_nz).abs() / buf_torch_nz.abs().clamp(
+            min=1e-8
+        )
         print(f"  buf max rel err:   {rel_err.max().item():.2e}")
         print(f"  buf mean rel err:  {rel_err.mean().item():.2e}")
     else:
@@ -307,16 +365,23 @@ def verify_kernel():
     # 4. Overall verdict
     tail_ok = torch.allclose(tail_k_triton, tail_k_torch, atol=1e-3)
     score_ok = torch.allclose(tail_score_triton, tail_score_torch, atol=1e-6)
-    buf_ok = True if not nonzero_mask.any() else torch.allclose(buf_triton, buf_torch, atol=2e-2)
+    buf_ok = (
+        True
+        if not nonzero_mask.any()
+        else torch.allclose(buf_triton, buf_torch, atol=2e-2)
+    )
 
     print(f"\n{'=' * 70}")
     if tail_ok and score_ok and buf_ok:
         print("  ✅ ALL CHECKS PASSED — Triton BF16 kernel matches torch native")
     else:
         print("  ❌ MISMATCH DETECTED")
-        if not tail_ok:    print("    - tail_k mismatch")
-        if not score_ok:   print("    - tail_score mismatch")
-        if not buf_ok:     print("    - buf mismatch")
+        if not tail_ok:
+            print("    - tail_k mismatch")
+        if not score_ok:
+            print("    - tail_score mismatch")
+        if not buf_ok:
+            print("    - buf mismatch")
     print(f"{'=' * 70}")
 
 
@@ -333,12 +398,18 @@ def verify_edge_cases():
 
     buf_numel_per_page = SLOTS_PER_PAGE * HEAD_DIM
     buf_triton = torch.zeros(8, buf_numel_per_page, dtype=torch.bfloat16, device=device)
-    buf_torch  = torch.zeros(8, buf_numel_per_page, dtype=torch.bfloat16, device=device)
+    buf_torch = torch.zeros(8, buf_numel_per_page, dtype=torch.bfloat16, device=device)
 
-    tail_k_triton = torch.randn(BATCH, TAIL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.1
-    tail_k_torch  = tail_k_triton.clone()
-    tail_score_triton = torch.randn(BATCH, TAIL_SIZE, HEAD_DIM, dtype=torch.float32, device=device) * 0.1
-    tail_score_torch  = tail_score_triton.clone()
+    tail_k_triton = (
+        torch.randn(BATCH, TAIL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        * 0.1
+    )
+    tail_k_torch = tail_k_triton.clone()
+    tail_score_triton = (
+        torch.randn(BATCH, TAIL_SIZE, HEAD_DIM, dtype=torch.float32, device=device)
+        * 0.1
+    )
+    tail_score_torch = tail_score_triton.clone()
 
     key = torch.randn(BATCH, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.1
     slot_score = torch.randn(BATCH, HEAD_DIM, dtype=torch.float32, device=device) * 0.1
@@ -352,19 +423,41 @@ def verify_edge_cases():
     # Edge case: one invalid (cache_loc=0), one at pool boundary
     positions = torch.tensor([3, 5, 3, 7], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([100, 100, 100, 100], dtype=torch.int32, device=device)
-    out_cache_loc = torch.tensor([1, 0, 1, 1], dtype=torch.int32, device=device)  # row 1 invalid
+    out_cache_loc = torch.tensor(
+        [1, 0, 1, 1], dtype=torch.int32, device=device
+    )  # row 1 invalid
 
     kpool_decode_update_and_maybe_write_cache_bf16(
-        buf_triton, tail_k_triton, tail_score_triton,
-        key, slot_score, ape, block_tables,
-        req_pool_indices, positions, seq_lens, out_cache_loc,
-        pool_size=POOL_SIZE, slots_per_page=SLOTS_PER_PAGE, head_dim=HEAD_DIM,
+        buf_triton,
+        tail_k_triton,
+        tail_score_triton,
+        key,
+        slot_score,
+        ape,
+        block_tables,
+        req_pool_indices,
+        positions,
+        seq_lens,
+        out_cache_loc,
+        pool_size=POOL_SIZE,
+        slots_per_page=SLOTS_PER_PAGE,
+        head_dim=HEAD_DIM,
     )
     kpool_decode_update_and_maybe_write_cache_bf16_torch(
-        buf_torch, tail_k_torch, tail_score_torch,
-        key, slot_score, ape, block_tables,
-        req_pool_indices, positions, seq_lens, out_cache_loc,
-        pool_size=POOL_SIZE, slots_per_page=SLOTS_PER_PAGE, head_dim=HEAD_DIM,
+        buf_torch,
+        tail_k_torch,
+        tail_score_torch,
+        key,
+        slot_score,
+        ape,
+        block_tables,
+        req_pool_indices,
+        positions,
+        seq_lens,
+        out_cache_loc,
+        pool_size=POOL_SIZE,
+        slots_per_page=SLOTS_PER_PAGE,
+        head_dim=HEAD_DIM,
     )
 
     tail_ok = torch.allclose(tail_k_triton, tail_k_torch, atol=1e-3)

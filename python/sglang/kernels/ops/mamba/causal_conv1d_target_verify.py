@@ -70,9 +70,7 @@ def _causal_conv1d_target_verify_npu_kernel(
     weight2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
     weight3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
     if KERNEL_WIDTH >= 1:
-        weight0 = tl.load(
-            weight_base, mask=channel_mask, other=0.0
-        ).to(tl.float32)
+        weight0 = tl.load(weight_base, mask=channel_mask, other=0.0).to(tl.float32)
     if KERNEL_WIDTH >= 2:
         weight1 = tl.load(
             weight_base + stride_weight_width, mask=channel_mask, other=0.0
@@ -91,9 +89,7 @@ def _causal_conv1d_target_verify_npu_kernel(
         ).to(tl.float32)
 
     if HAS_BIAS:
-        bias = tl.load(bias_ptr + channels, mask=channel_mask, other=0.0).to(
-            tl.float32
-        )
+        bias = tl.load(bias_ptr + channels, mask=channel_mask, other=0.0).to(tl.float32)
     else:
         bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
@@ -126,9 +122,7 @@ def _causal_conv1d_target_verify_npu_kernel(
         history1 = tl.zeros((BLOCK_N,), dtype=conv_state_ptr.dtype.element_ty)
         history2 = tl.zeros((BLOCK_N,), dtype=conv_state_ptr.dtype.element_ty)
         if KERNEL_WIDTH >= 2:
-            history0 = tl.load(
-                state_base, mask=active & channel_mask, other=0.0
-            )
+            history0 = tl.load(state_base, mask=active & channel_mask, other=0.0)
         if KERNEL_WIDTH >= 3:
             history1 = tl.load(
                 state_base + stride_state_token,
@@ -143,9 +137,7 @@ def _causal_conv1d_target_verify_npu_kernel(
             )
 
         x_base = x_ptr + batch_idx * stride_x_batch + channels * stride_x_dim
-        out_base = (
-            out_ptr + batch_idx * stride_out_batch + channels * stride_out_dim
-        )
+        out_base = out_ptr + batch_idx * stride_out_batch + channels * stride_out_dim
         intermediate_base = (
             intermediate_conv_window_ptr
             + intermediate_idx * stride_inter_batch
@@ -172,9 +164,7 @@ def _causal_conv1d_target_verify_npu_kernel(
             # Keep tree traversal as a loop to avoid excessive code growth for
             # larger EAGLE trees. The common linear chain below is fully unrolled.
             for token_idx in tl.range(0, seqlen):
-                child_idx = tl.sum(
-                    tl.where(token_offsets == token_idx, next_tokens, 0)
-                )
+                child_idx = tl.sum(tl.where(token_offsets == token_idx, next_tokens, 0))
                 if child_idx != -1:
                     parent_tokens = tl.where(
                         token_offsets == child_idx, token_idx, parent_tokens
@@ -433,14 +423,11 @@ def causal_conv1d_target_verify_npu(
             retrieve_parent_token,
         )
         if any(
-            tensor.dim() != 2
-            or tensor.shape[0] < batch
-            or tensor.shape[1] < seqlen
+            tensor.dim() != 2 or tensor.shape[0] < batch or tensor.shape[1] < seqlen
             for tensor in tree_tensors
         ):
             raise ValueError(
-                "tree mapping tensors must have shape "
-                "[rows >= batch, steps >= seqlen]"
+                "tree mapping tensors must have shape [rows >= batch, steps >= seqlen]"
             )
     elif retrieve_next_sibling is not None or retrieve_parent_token is not None:
         raise ValueError(
@@ -457,8 +444,7 @@ def causal_conv1d_target_verify_npu(
         if weight_channel_last:
             if stride_weight_dim != 1:
                 raise ValueError(
-                    "[width, dim] weight must be contiguous along the channel "
-                    "dimension"
+                    "[width, dim] weight must be contiguous along the channel dimension"
                 )
         elif stride_weight_width != 1:
             raise ValueError(

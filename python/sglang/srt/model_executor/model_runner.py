@@ -849,7 +849,10 @@ class ModelRunner:
         """Whether the hidden states sent across the next PP boundary (this
         rank's last local layer output) are attn-TP-scattered; gates the PP
         transport, whose send-slice + recv-all-gather assumes replicated tensors."""
-        if get_parallel().pp_size <= 1 or get_parallel().pp_rank == get_parallel().pp_size - 1:
+        if (
+            get_parallel().pp_size <= 1
+            or get_parallel().pp_rank == get_parallel().pp_size - 1
+        ):
             return False
         from sglang.srt.layers.layer_boundary.contracts import BatchVariant
         from sglang.srt.layers.layer_boundary.layout import TokenAxis
@@ -863,9 +866,7 @@ class ModelRunner:
         produced = getattr(edges, "outgoing", None)
         produced = getattr(produced, "produced", None) if produced else None
         layout = getattr(produced, "layout", None)
-        return layout is not None and (
-            TokenAxis.ATTN_TP_SCATTER in layout.sharded
-        )
+        return layout is not None and (TokenAxis.ATTN_TP_SCATTER in layout.sharded)
 
     def _pp_boundary_stages(self):
         """(first local attn stage, last local ffn stage) for PP boundary queries.

@@ -4,7 +4,6 @@ The NPU cache stores pooled index keys directly as BF16. It does not apply a
 Hadamard transform, FP8 quantization, or per-slot scale storage.
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -15,19 +14,20 @@ import triton.language as tl
 # 2. BF16 TRITON KERNEL
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @triton.jit
 def _kpool_decode_update_and_maybe_write_cache_bf16_kernel(
-    buf_bf16_ptr,           # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
-    tail_k_ptr,             # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
-    tail_score_ptr,         # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] same as score dtype
-    key_ptr,                # [batch, HEAD_DIM] bfloat16
-    slot_score_ptr,         # [batch, HEAD_DIM] same as score dtype
-    ape_ptr,                # [POOL_SIZE, HEAD_DIM] float32
-    block_tables_ptr,       # [batch, BLOCK_TABLE_COLS] int32
-    req_pool_indices_ptr,   # [>=batch] int
-    positions_ptr,          # [>=batch] int
-    seq_lens_ptr,           # [>=batch] int
-    out_cache_loc_ptr,      # [>=batch] int
+    buf_bf16_ptr,  # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
+    tail_k_ptr,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
+    tail_score_ptr,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] same as score dtype
+    key_ptr,  # [batch, HEAD_DIM] bfloat16
+    slot_score_ptr,  # [batch, HEAD_DIM] same as score dtype
+    ape_ptr,  # [POOL_SIZE, HEAD_DIM] float32
+    block_tables_ptr,  # [batch, BLOCK_TABLE_COLS] int32
+    req_pool_indices_ptr,  # [>=batch] int
+    positions_ptr,  # [>=batch] int
+    seq_lens_ptr,  # [>=batch] int
+    out_cache_loc_ptr,  # [>=batch] int
     tail_k_stride_0,
     tail_k_stride_1,
     tail_score_stride_0,
@@ -165,13 +165,13 @@ def _kpool_decode_update_and_maybe_write_cache_bf16_kernel(
 
 
 def kpool_decode_update_and_maybe_write_cache_bf16(
-    buf: torch.Tensor,             # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
-    tail_k: torch.Tensor,          # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
-    tail_score: torch.Tensor,      # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] float32
-    key: torch.Tensor,             # [batch, HEAD_DIM] bfloat16
-    slot_score: torch.Tensor,      # [batch, HEAD_DIM] float32
-    ape: torch.Tensor,             # [POOL_SIZE, HEAD_DIM] float32
-    block_tables: torch.Tensor,    # [batch, BLOCK_TABLE_COLS] int32
+    buf: torch.Tensor,  # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
+    tail_k: torch.Tensor,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
+    tail_score: torch.Tensor,  # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] float32
+    key: torch.Tensor,  # [batch, HEAD_DIM] bfloat16
+    slot_score: torch.Tensor,  # [batch, HEAD_DIM] float32
+    ape: torch.Tensor,  # [POOL_SIZE, HEAD_DIM] float32
+    block_tables: torch.Tensor,  # [batch, BLOCK_TABLE_COLS] int32
     req_pool_indices: torch.Tensor,
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -353,9 +353,9 @@ def _kpool_assemble_softmax_write_cache_npu_kernel(
                         + tail_slot * tail_score_stride_1
                         + offs
                     )
-                    key = tl.load(
-                        tail_k_ptr + k_offset, mask=head_mask, other=0.0
-                    ).to(tl.float32)
+                    key = tl.load(tail_k_ptr + k_offset, mask=head_mask, other=0.0).to(
+                        tl.float32
+                    )
                     score = tl.load(
                         tail_score_ptr + score_offset,
                         mask=head_mask,
@@ -365,9 +365,9 @@ def _kpool_assemble_softmax_write_cache_npu_kernel(
                     chunk_row = chunk_src + slot - n_tail
                     k_offset = chunk_row * chunk_k_stride_0 + offs
                     score_offset = chunk_row * chunk_score_stride_0 + offs
-                    key = tl.load(
-                        chunk_k_ptr + k_offset, mask=head_mask, other=0.0
-                    ).to(tl.float32)
+                    key = tl.load(chunk_k_ptr + k_offset, mask=head_mask, other=0.0).to(
+                        tl.float32
+                    )
                     score = tl.load(
                         chunk_score_ptr + score_offset,
                         mask=head_mask,
@@ -621,9 +621,7 @@ def _kpool_write_tail_and_maybe_compress_npu_kernel(
                 )
                 draft_tail_slot = (write_start + draft_offset) % TAIL_SIZE
                 draft_tail_k_offset = (
-                    req * tail_k_stride_0
-                    + draft_tail_slot * tail_k_stride_1
-                    + offs
+                    req * tail_k_stride_0 + draft_tail_slot * tail_k_stride_1 + offs
                 )
                 draft_tail_score_offset = (
                     req * tail_score_stride_0
@@ -648,9 +646,7 @@ def _kpool_write_tail_and_maybe_compress_npu_kernel(
             effective_n = tl.minimum(tl.maximum(effective_n, 0), N)
 
             base_pool = write_start // POOL_SIZE
-            completed_pools = (
-                (write_start + effective_n) // POOL_SIZE - base_pool
-            )
+            completed_pools = (write_start + effective_n) // POOL_SIZE - base_pool
             completed_pools = tl.minimum(
                 tl.maximum(completed_pools, 0), MAX_CLOSED_POOLS
             )
@@ -660,19 +656,13 @@ def _kpool_write_tail_and_maybe_compress_npu_kernel(
             # Only the runtime-completed prefix is reduced and written.
             for pool_offset in tl.static_range(0, MAX_CLOSED_POOLS):
                 if pool_offset < completed_pools:
-                    pool_logical_start = (
-                        tail_logical_start + pool_offset * POOL_SIZE
-                    )
-                    running_max = tl.full(
-                        (BLOCK_D,), -float("inf"), tl.float32
-                    )
+                    pool_logical_start = tail_logical_start + pool_offset * POOL_SIZE
+                    running_max = tl.full((BLOCK_D,), -float("inf"), tl.float32)
                     acc = tl.full((BLOCK_D,), 0.0, tl.float32)
                     denom = tl.full((BLOCK_D,), 0.0, tl.float32)
 
                     for slot in tl.static_range(0, POOL_SIZE):
-                        pool_tail_slot = (
-                            pool_logical_start + slot
-                        ) % TAIL_SIZE
+                        pool_tail_slot = (pool_logical_start + slot) % TAIL_SIZE
                         pool_tail_k_offset = (
                             req * tail_k_stride_0
                             + pool_tail_slot * tail_k_stride_1
@@ -708,14 +698,10 @@ def _kpool_write_tail_and_maybe_compress_npu_kernel(
 
                     pooled = (acc / denom).to(tl.bfloat16)
                     write_loc = tl.load(
-                        write_loc_ptr
-                        + batch * write_loc_stride_0
-                        + pool_offset
+                        write_loc_ptr + batch * write_loc_stride_0 + pool_offset
                     )
                     cache_offsets = write_loc * cache_stride_0 + offs
-                    tl.store(
-                        cache_ptr + cache_offsets, pooled, mask=dim_mask
-                    )
+                    tl.store(cache_ptr + cache_offsets, pooled, mask=dim_mask)
 
         batch += program_count
 
@@ -856,9 +842,7 @@ def kpool_write_tail_and_maybe_compress_npu(
     num_programs = min(num_programs, batch_size)
 
     if effective_n_per_batch is None:
-        effective_n_per_batch = torch.empty(
-            (1,), dtype=torch.int32, device=key.device
-        )
+        effective_n_per_batch = torch.empty((1,), dtype=torch.int32, device=key.device)
         has_effective_n = False
     else:
         has_effective_n = True
@@ -931,7 +915,6 @@ def _scatter_kpool_tail_updates_npu_kernel(
 
     # ===== 每个核跨步处理一组 row =====
     for row in range(pid, n_rows, NUM_CORES):
-
         # ===== 加载该 row 的元数据 (仅一次) =====
         n_w = tl.load(n_write_ptr + row).to(tl.int32)
         req = tl.load(req_pool_idx_ptr + row).to(tl.int64)
@@ -940,7 +923,6 @@ def _scatter_kpool_tail_updates_npu_kernel(
 
         # ===== 遍历该 row 需要写入的 slot =====
         for slot in range(n_w):
-
             # ===== 计算 chunk 源行 & tail 物理 slot (环形取模) =====
             src_row = src_base + slot.to(tl.int64)
             phys_slot = (dst_start + slot) % TAIL_SIZE
@@ -971,10 +953,9 @@ def _scatter_kpool_tail_updates_npu_kernel(
             s = tl.load(s_block)  # [HEAD_DIM] bf16 整行 DMA
 
             # ===== 计算 tail 目标偏移 =====
-            dst_offset = (
-                req * tail_stride_0.to(tl.int64)
-                + phys_slot.to(tl.int64) * tail_stride_1.to(tl.int64)
-            )
+            dst_offset = req * tail_stride_0.to(tl.int64) + phys_slot.to(
+                tl.int64
+            ) * tail_stride_1.to(tl.int64)
 
             # ===== Block Pointer 存储 tail_k[req, phys_slot, :] =====
             tail_k_block = tl.make_block_ptr(
@@ -1101,18 +1082,11 @@ def _update_kpool_write_plan_npu_kernel(
                 tl.maximum(token_page_row, 0), real_page_table_cols - 1
             )
             packed_page = tl.load(
-                real_page_table_ptr
-                + b * real_page_table_stride_0
-                + token_page_row
+                real_page_table_ptr + b * real_page_table_stride_0 + token_page_row
             ).to(tl.int64)
-            write_loc = (
-                packed_page * SLOTS_PER_PAGE
-                + (pool_id % SLOTS_PER_PAGE)
-            )
+            write_loc = packed_page * SLOTS_PER_PAGE + (pool_id % SLOTS_PER_PAGE)
             tl.store(
-                write_loc_out_ptr
-                + b * write_loc_out_stride_0
-                + pool_offset,
+                write_loc_out_ptr + b * write_loc_out_stride_0 + pool_offset,
                 write_loc.to(tl.int64),
             )
 
@@ -1148,9 +1122,9 @@ def update_kpool_write_plan_triton_npu(
     assert write_loc_out.stride(1) == 1, write_loc_out.stride()
 
     has_per_q_outputs = pool_seqlens_per_q_out is not None
-    assert has_per_q_outputs == (
-        seqlens_per_q_out is not None
-    ), "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+    assert has_per_q_outputs == (seqlens_per_q_out is not None), (
+        "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+    )
     per_q_dummy = (
         pool_seqlens_per_q_out
         if has_per_q_outputs

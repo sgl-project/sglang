@@ -425,7 +425,10 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda or dst.is_xpu or dst.device.type == "npu") or dst.device != src.device:
+    if (
+        not (dst.is_cuda or dst.is_xpu or dst.device.type == "npu")
+        or dst.device != src.device
+    ):
         raise ValueError(
             "fused_conv_window_scatter_with_mask requires dst and src to be "
             f"CUDA/XPU/NPU tensors on the same device ({dst.device=}, {src.device=})."

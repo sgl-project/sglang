@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.dsa.kpool_index_npu import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-
 HEAD_DIM = 128
 PAGE_SIZE = 128
 RTOL = 1e-2
@@ -132,9 +131,7 @@ class TestKPoolWriteTailAndMaybeCompressNPU(CustomTestCase):
         tail_size = pool_size + num_draft_tokens
         max_closed_pools = (num_draft_tokens + pool_size - 1) // pool_size
         required_cache_rows = batch_size * max_closed_pools + 3
-        cache_pages = max(
-            2, (required_cache_rows + PAGE_SIZE - 1) // PAGE_SIZE
-        )
+        cache_pages = max(2, (required_cache_rows + PAGE_SIZE - 1) // PAGE_SIZE)
         cache_rows = cache_pages * PAGE_SIZE
 
         def randn(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -305,12 +302,8 @@ class TestKPoolWriteTailAndMaybeCompressNPU(CustomTestCase):
                 inactive_locs, dtype=torch.int64, device=self.device
             )
             torch.testing.assert_close(
-                triton_cache.view(-1, HEAD_DIM)
-                .index_select(0, inactive_index)
-                .cpu(),
-                initial_cache.view(-1, HEAD_DIM)
-                .index_select(0, inactive_index)
-                .cpu(),
+                triton_cache.view(-1, HEAD_DIM).index_select(0, inactive_index).cpu(),
+                initial_cache.view(-1, HEAD_DIM).index_select(0, inactive_index).cpu(),
                 rtol=0,
                 atol=0,
             )

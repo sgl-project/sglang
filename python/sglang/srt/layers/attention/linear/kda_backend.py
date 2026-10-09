@@ -6,6 +6,8 @@ import torch
 from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update as causal_conv1d_update_triton,
 )
 from sglang.srt.environ import envs
@@ -39,6 +41,7 @@ if is_npu():
         causal_conv1d_fn_npu,
         causal_conv1d_update_npu,
     )
+
     from sglang.kernels.ops.mamba.causal_conv1d_target_verify import (
         causal_conv1d_target_verify_npu,
     )
@@ -1405,9 +1408,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # overlapping layout cannot be transposed.
         mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
         if is_npu():
-            conv_weights = getattr(
-                layer, "_npu_target_verify_conv_weights", None
-            )
+            conv_weights = getattr(layer, "_npu_target_verify_conv_weights", None)
             if conv_weights is None or conv_weights.dtype != mixed_qkv.dtype:
                 # Defensive fallback for backends constructed before model weight
                 # loading; the normal path prepares this before graph capture.

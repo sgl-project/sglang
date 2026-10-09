@@ -15,7 +15,6 @@
 import functools
 
 import torch
-import triton
 
 
 def _device_properties() -> dict:

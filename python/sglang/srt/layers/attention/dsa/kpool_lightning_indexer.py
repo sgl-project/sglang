@@ -32,13 +32,13 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ── Threshold: use fused single-kernel topk only for small caches ──
 # Beyond this, tl.argmax on large arrays causes excessive compilation time.
 _FUSED_TOPK_MAX_SORT_SIZE = 512
 
 
 # ── Optimized logits kernel: page-at-a-time access ──────────────────────
+
 
 @triton.jit
 def _paged_mqa_logits_kernel(
@@ -130,6 +130,7 @@ def _paged_mqa_logits_kernel(
 
 # ── Fused logits + topk kernel (small caches only) ──────────────────────
 
+
 @triton.jit
 def _fused_paged_mqa_topk_kernel(
     q_ptr,
@@ -212,19 +213,13 @@ def _fused_paged_mqa_topk_kernel(
         valid = pool_ids < pool_seq_len
         logits_page = tl.where(valid, logits_page, float("-inf"))
 
-        log_ptrs = (
-            logits_scratch_ptr
-            + row * log_stride_q
-            + pool_ids * log_stride_pool
-        )
+        log_ptrs = logits_scratch_ptr + row * log_stride_q + pool_ids * log_stride_pool
         tl.store(log_ptrs, logits_page, mask=pool_ids < max_pool_len)
 
     # ══ Phase 2: Read logits from scratch and extract topk via argmax ══
     offs_full = tl.arange(0, SORT_SIZE)
     logits = tl.load(
-        logits_scratch_ptr
-        + row * log_stride_q
-        + offs_full * log_stride_pool,
+        logits_scratch_ptr + row * log_stride_q + offs_full * log_stride_pool,
         mask=offs_full < max_pool_len,
         other=float("-inf"),
     )
@@ -364,7 +359,6 @@ def fused_topk_paged(
 
     # ── Fast path: fused single-kernel for small caches ──
 
-
     # ── Fallback: optimized logits kernel + torch.topk ──
     logits = fused_paged_mqa_logits(
         q_bf16,
@@ -376,7 +370,9 @@ def fused_topk_paged(
         page_size,
     )
 
-    topk_logits, topk_pool_indices = torch.topk(logits, actual_topk, dim=1, largest=True)
+    topk_logits, topk_pool_indices = torch.topk(
+        logits, actual_topk, dim=1, largest=True
+    )
     topk_pool_indices = torch.where(
         topk_logits.isneginf(),
         torch.full_like(topk_pool_indices, -1),

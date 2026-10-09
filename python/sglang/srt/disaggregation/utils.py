@@ -1337,8 +1337,10 @@ def merge_npu_hybrid_dsa_tail(target_pool, draft_pool):
         geometry = current
         layers = int(pool.layer_num)
         buf_infos = tuple(list(values) for values in pool.get_compress_tail_buf_infos())
-        if layers <= 0 or len(buf_infos) != 3 or any(
-            len(values) != 2 * layers for values in buf_infos
+        if (
+            layers <= 0
+            or len(buf_infos) != 3
+            or any(len(values) != 2 * layers for values in buf_infos)
         ):
             raise ValueError(f"Invalid {name} DSA tail metadata for {layers} layers")
         _, data_lens, item_lens = buf_infos
@@ -1538,9 +1540,7 @@ def setup_state_kv_args(
                     append_state_component(
                         kv_args,
                         StateType.DSA_TAIL,
-                        *merge_npu_hybrid_dsa_tail(
-                            dsa_pool, draft_token_to_kv_pool
-                        ),
+                        *merge_npu_hybrid_dsa_tail(dsa_pool, draft_token_to_kv_pool),
                     )
                 else:
                     append_dsa_tail(dsa_pool)

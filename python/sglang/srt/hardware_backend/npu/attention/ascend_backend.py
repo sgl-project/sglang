@@ -1389,9 +1389,7 @@ class AscendAttnBackend(AttentionBackend):
             k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
             q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
         elif self.qk_rope_head_dim == 0:
-            k_pe = k_nope.new_zeros(
-                (*k_nope.shape[:-1], 64)
-            )
+            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
             q_pe = q_nope.new_zeros(
                 (
                     q.shape[0],

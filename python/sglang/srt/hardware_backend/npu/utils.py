@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
-from sglang.srt.utils import get_npu_memory_capacity, is_npu, is_npu_a5
+from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -203,7 +203,7 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops      # noqa: F401
+        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)

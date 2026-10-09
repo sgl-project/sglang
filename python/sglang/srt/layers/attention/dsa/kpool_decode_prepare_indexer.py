@@ -21,7 +21,6 @@ kernels:
 
 import torch
 import torch.nn.functional as F
-import torch_npu
 import triton
 import triton.language as tl
 
@@ -33,9 +32,7 @@ import triton.language as tl
 def get_device_properties():
     """Query Ascend NPU device properties."""
     device = torch.npu.current_device()
-    device_properties = triton.runtime.driver.active.utils.get_device_properties(
-        device
-    )
+    device_properties = triton.runtime.driver.active.utils.get_device_properties(device)
     num_aicore = device_properties.get("num_aicore", -1)
     num_vectorcore = device_properties.get("num_vectorcore", -1)
     assert num_aicore > 0 and num_vectorcore > 0, "Failed to detect device properties."
@@ -104,9 +101,9 @@ def _fused_decode_prepare_indexer_gemm_kernel(
 
         w = acc * combined_scale
         w_bf16 = w.to(tl.bfloat16)
-        w_out_ptrs = w_bf16_ptr + rows64[:, None] * N_HEADS + tl.arange(0, N_HEADS)[
-            None, :
-        ]
+        w_out_ptrs = (
+            w_bf16_ptr + rows64[:, None] * N_HEADS + tl.arange(0, N_HEADS)[None, :]
+        )
         tl.store(w_out_ptrs, w_bf16, mask=mask_b[:, None])
 
 
@@ -151,7 +148,9 @@ def _fused_decode_prepare_indexer_vv_kernel(
         # 1) 1D 连续 load BLOCK_M_B 个元素, 可合并访存
         offs_in = tile_idx * BLOCK_M_B + tl.arange(0, BLOCK_M_B)
         mask_in = offs_in < N * NUM_BLOCKS
-        block = tl.load(block_tables_ptr + offs_in, mask=mask_in, other=0)  # [BLOCK_M_B]
+        block = tl.load(
+            block_tables_ptr + offs_in, mask=mask_in, other=0
+        )  # [BLOCK_M_B]
 
         # 2) reshape + split 抽取 ::4 (POOL_SIZE=4 固定: 两次 split 取偶数半)
         block = tl.reshape(block, [P_TOTAL, 2, 2])

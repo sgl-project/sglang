@@ -198,7 +198,6 @@ def kpool_decode_update_and_maybe_write_cache_bf16(
             buf_single[write_loc] = pooled
 
 
-
 def kpool_assemble_softmax_write_cache_bf16(
     pool,
     buf: torch.Tensor,
@@ -538,9 +537,9 @@ def topk_from_pooled_history_logits_bf16(
         # Restore -1 for invalid entries
         invalid = expanded == 0  # heuristic; may need adjustment
     elif topk_offsets is not None:
-        expanded = (expanded.to(torch.int64) + topk_offsets.to(torch.int64).unsqueeze(1)).to(
-            torch.int32
-        )
+        expanded = (
+            expanded.to(torch.int64) + topk_offsets.to(torch.int64).unsqueeze(1)
+        ).to(torch.int32)
 
     # Append tail
     if seq_lens is not None:
@@ -578,7 +577,9 @@ def _append_tail_bf16(
 
     for r in range(rows):
         pool_len = int(pool_lens[r].item())
-        seq_len = int(seq_lens[r].item()) if seq_lens is not None else pool_len * pool_size
+        seq_len = (
+            int(seq_lens[r].item()) if seq_lens is not None else pool_len * pool_size
+        )
         tail_start = pool_len * pool_size
         history_len = min(tail_start, n_cols)
         tail_count = seq_len % pool_size
@@ -594,7 +595,7 @@ def _append_tail_bf16(
                 safe_tail = min(max(tail_raw, 0), page_table.shape[1] - 1)
                 out[r, col] = page_table[r, safe_tail].to(topk_result.dtype)
             elif topk_offsets is not None:
-                out[r, col] = (tail_raw + int(topk_offsets[r].item()))
+                out[r, col] = tail_raw + int(topk_offsets[r].item())
             else:
                 out[r, col] = tail_raw
 

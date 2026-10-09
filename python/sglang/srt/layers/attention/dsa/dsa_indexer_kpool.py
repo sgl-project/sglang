@@ -174,7 +174,8 @@ def _expand_pool_topk_and_append_tail_batched_npu_kernel(
             pool_indices_ptr
             + row_offs[:, None] * stride_pi0
             + p_offs[None, :] * stride_pi1,
-            mask=row_mask[:, None], other=0,
+            mask=row_mask[:, None],
+            other=0,
         ).to(tl.int32)  # [BLOCK_M, N_POOL_TOPK]
 
         base = pid_val * POOL_SIZE  # [BLOCK_M, N_POOL_TOPK]
@@ -182,15 +183,14 @@ def _expand_pool_topk_and_append_tail_batched_npu_kernel(
 
         # [BLOCK_M, P, N] -> [BLOCK_M, N, P] -> [BLOCK_M, N * P]
         tmp = o_offs[None, :, None] + base[:, None, :]  # [BLOCK_M, P, N]
-        tmp = tl.trans(tmp, [0, 2, 1])                  # [BLOCK_M, N, P]
+        tmp = tl.trans(tmp, [0, 2, 1])  # [BLOCK_M, N, P]
         result = tl.reshape(tmp, (BLOCK_M, N_POOL_TOPK * POOL_SIZE))
 
         col_offs = tl.arange(0, N_POOL_TOPK * POOL_SIZE)
         tl.store(
-            out_ptr
-            + row_offs[:, None] * stride_o0
-            + col_offs[None, :] * stride_o1,
-            result, mask=row_mask[:, None],
+            out_ptr + row_offs[:, None] * stride_o0 + col_offs[None, :] * stride_o1,
+            result,
+            mask=row_mask[:, None],
         )
 
         # Phase 2: append each row's uncompressed tail.
@@ -198,7 +198,9 @@ def _expand_pool_topk_and_append_tail_batched_npu_kernel(
             r = r0 + m
             valid = r < n_real
             seq_len = tl.load(
-                seq_lens_per_token_ptr + r, mask=valid, other=0,
+                seq_lens_per_token_ptr + r,
+                mask=valid,
+                other=0,
             ).to(tl.int32)
             pool_len = seq_len // POOL_SIZE
             tail_start = pool_len * POOL_SIZE
@@ -208,7 +210,8 @@ def _expand_pool_topk_and_append_tail_batched_npu_kernel(
             tail_vals = tl.where(t_offs < tail_count, tail_start + t_offs, -1)
             tl.store(
                 out_ptr + r * stride_o0 + TOPK * stride_o1 + t_offs * stride_o1,
-                tail_vals, mask=valid,
+                tail_vals,
+                mask=valid,
             )
 
 
@@ -2079,7 +2082,6 @@ class IndexerKPool(MultiPlatformOp):
             key[..., : self.rope_head_dim] = k_rope
         gate_score = F.linear(x, self.index_kpool_compress_gate)
 
-
         # ── Write phase: compress + tail ──
         # Draft extend v2 is also an extend path, so identify MTP first to avoid
         # selecting the regular extend plan.
@@ -2106,9 +2108,8 @@ class IndexerKPool(MultiPlatformOp):
             )
 
         if (
-            (is_mtp or forward_batch.forward_mode.is_extend_without_speculative())
-            and not return_indices
-        ):
+            is_mtp or forward_batch.forward_mode.is_extend_without_speculative()
+        ) and not return_indices:
             # Layers that skip top-k only update the index cache and do not need
             # to continue with read-side computation.
             return None
@@ -2259,10 +2260,12 @@ class IndexerKPool(MultiPlatformOp):
         self, x, key, gate_score, positions, forward_batch, layer_id, metadata
     ):
         """NPU extend-step compress write (per-batch loop)."""
+        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (  # noqa: F401
+            scatter_kpool_tail_updates_bf16,
+        )
         from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
             compute_pooled_write_locs,
             kpool_softmax_write_cache_bf16,
-            scatter_kpool_tail_updates_bf16,  # noqa: F401
         )
 
         assert (
@@ -2273,7 +2276,7 @@ class IndexerKPool(MultiPlatformOp):
         pool = get_token_to_kv_pool()
         kpool = self.index_kpool
         block_tables = metadata.get_page_table_64()
-        buf = pool.get_index_k_with_scale_buffer(layer_id) # remove scale
+        buf = pool.get_index_k_with_scale_buffer(layer_id)  # remove scale
         tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
 
         attn_metadata = getattr(metadata, "attn_metadata", None)
@@ -2299,8 +2302,8 @@ class IndexerKPool(MultiPlatformOp):
                     n_from_tail=writes.n_from_tail,
                     chunk_src_start=writes.chunk_src,
                     tail_logical_base=writes.tail_logical_base,
-                    ape = self.index_kpool_compress_ape,
-                    loc=writes.write_loc
+                    ape=self.index_kpool_compress_ape,
+                    loc=writes.write_loc,
                 )
             if not tails.is_empty:
                 scatter_kpool_tail_updates_npu(
@@ -2342,9 +2345,7 @@ class IndexerKPool(MultiPlatformOp):
 
             if n_pools > 0:
                 slot_k = key_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
-                slot_score = score_chunk[:n_drain].view(
-                    n_pools, kpool, self.head_dim
-                )
+                slot_score = score_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
                 # Compute write locations
                 num_token_pages = (seq_len + pool.page_size - 1) // pool.page_size
                 token_page_table = block_tables[i, :num_token_pages].contiguous()
@@ -2468,6 +2469,7 @@ class IndexerKPool(MultiPlatformOp):
                 the fused decode prep op; skips the torch-side construction.
         """
         import torch_npu
+
         from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
             build_pooled_page_table_64,
         )
@@ -2486,9 +2488,9 @@ class IndexerKPool(MultiPlatformOp):
         if prepared is not None:
             pool_seqlens, pool_block_tables = prepared
         else:
-            pool_seqlens = torch.div(
-                seqlens_32, pool_size, rounding_mode="floor"
-            ).to(torch.int32)
+            pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
+                torch.int32
+            )
             pool_block_tables = build_pooled_page_table_64(
                 block_tables, pool_size
             ).contiguous()
@@ -2532,6 +2534,7 @@ class IndexerKPool(MultiPlatformOp):
         query token only sees pools up to its causal position.
         """
         import torch_npu
+
         from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
             build_pooled_page_table_64,
         )
@@ -2558,8 +2561,10 @@ class IndexerKPool(MultiPlatformOp):
 
         kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
 
-        q_tnd = query_bf16[:n_real_tokens].contiguous().view(
-            n_real_tokens, self.n_heads, self.head_dim
+        q_tnd = (
+            query_bf16[:n_real_tokens]
+            .contiguous()
+            .view(n_real_tokens, self.n_heads, self.head_dim)
         )
         w_2d = weights[:n_real_tokens]
         if w_2d.ndim == 3:
@@ -2627,9 +2632,9 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         pool_size = self.index_kpool
-        pool_seqlens = torch.div(
-            seqlens_32, pool_size, rounding_mode="floor"
-        ).to(torch.int32)
+        pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
+            torch.int32
+        )
         pool_block_tables = build_pooled_page_table_64(
             block_tables, pool_size
         ).contiguous()
@@ -2730,9 +2735,9 @@ class IndexerKPool(MultiPlatformOp):
         n_pool_topk = self.index_topk // pool_size
 
         # Build pooled page table and seqlens
-        pool_seqlens = torch.div(
-            seqlens_32, pool_size, rounding_mode="floor"
-        ).to(torch.int32)
+        pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
+            torch.int32
+        )
         pool_block_tables = build_pooled_page_table_64(
             block_tables, pool_size
         ).contiguous()
@@ -2771,7 +2776,9 @@ class IndexerKPool(MultiPlatformOp):
         if actual_topk < n_pool_topk:
             pad = torch.full(
                 (n_real, n_pool_topk - actual_topk),
-                -1, dtype=torch.int32, device=pool_indices.device,
+                -1,
+                dtype=torch.int32,
+                device=pool_indices.device,
             )
             pool_indices = torch.cat([pool_indices, pad], dim=1)
 
@@ -2855,7 +2862,9 @@ class IndexerKPool(MultiPlatformOp):
                 local_logits = bf16_ragged_mqa_logits(
                     query_bf16[q_slice],
                     k_bf16,
-                    weights[q_slice].squeeze(-1) if weights.ndim == 3 else weights[q_slice],
+                    weights[q_slice].squeeze(-1)
+                    if weights.ndim == 3
+                    else weights[q_slice],
                     row_starts,
                     local_pool_lens,
                 )
@@ -2882,12 +2891,17 @@ class IndexerKPool(MultiPlatformOp):
                 if actual_topk < n_pool_topk:
                     pad = torch.full(
                         (q_len, n_pool_topk - actual_topk),
-                        -1, dtype=torch.int32, device=query_bf16.device,
+                        -1,
+                        dtype=torch.int32,
+                        device=query_bf16.device,
                     )
                     local_pool_indices = torch.cat([local_pool_indices, pad], dim=1)
             else:
                 local_pool_indices = torch.full(
-                    (q_len, n_pool_topk), -1, dtype=torch.int32, device=query_bf16.device
+                    (q_len, n_pool_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=query_bf16.device,
                 )
 
             pool_indices_out[q_slice] = local_pool_indices

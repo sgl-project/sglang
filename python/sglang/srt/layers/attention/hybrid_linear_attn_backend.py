@@ -5,9 +5,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-    CHUNK_SIZE as KDA_CHUNK_SIZE,
-)
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as KDA_CHUNK_SIZE
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,

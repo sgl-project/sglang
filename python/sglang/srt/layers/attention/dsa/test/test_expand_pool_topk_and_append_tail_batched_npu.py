@@ -41,7 +41,7 @@ def _assert_close_by_dtype(cal, ref):
 
 
 def _expand_pool_topk_and_append_tail_batched_ref(
-    pool_indices: torch.Tensor,       # [n_real, n_pool_topk] int32
+    pool_indices: torch.Tensor,  # [n_real, n_pool_topk] int32
     seq_lens_per_token: torch.Tensor,  # [n_real] int32
     n_real: int,
     num_q_padded: int,
@@ -62,24 +62,20 @@ def _expand_pool_topk_and_append_tail_batched_ref(
     token_indices = token_indices.reshape(n_real, index_topk)
 
     out_cols = index_topk + tail_pool
-    out = torch.full(
-        (num_q_padded, out_cols), -1, dtype=torch.int32, device=device
-    )
+    out = torch.full((num_q_padded, out_cols), -1, dtype=torch.int32, device=device)
     out[:n_real, :index_topk] = token_indices
 
     seq_lens_used = seq_lens_per_token[:n_real]
-    pool_lens_per_token = torch.div(
-        seq_lens_used, pool_size, rounding_mode="floor"
-    ).to(torch.int32)
+    pool_lens_per_token = torch.div(seq_lens_used, pool_size, rounding_mode="floor").to(
+        torch.int32
+    )
     tail_starts = pool_lens_per_token * pool_size
     tail_counts = (seq_lens_used - tail_starts).to(torch.int32)
 
     for t in range(tail_pool):
         mask = tail_counts > t
         val = (tail_starts + t).to(torch.int32)
-        out[:n_real, index_topk + t] = torch.where(
-            mask, val, torch.full_like(val, -1)
-        )
+        out[:n_real, index_topk + t] = torch.where(mask, val, torch.full_like(val, -1))
 
     return out
 
@@ -107,9 +103,10 @@ def test_op(n_real: int, num_q_padded: int):
     pool_indices = torch.randint(
         0, 10000, (total_rows, n_pool_topk), dtype=torch.int32, device=DEVICE
     )
-    seq_lens_per_token = (
-        torch.arange(1, total_rows + 1, dtype=torch.int32, device=DEVICE) * pool_size
-        + torch.randint(0, pool_size, (total_rows,), device=DEVICE, dtype=torch.int32)
+    seq_lens_per_token = torch.arange(
+        1, total_rows + 1, dtype=torch.int32, device=DEVICE
+    ) * pool_size + torch.randint(
+        0, pool_size, (total_rows,), device=DEVICE, dtype=torch.int32
     )
 
     tri_out = _expand_pool_topk_and_append_tail_batched_npu(

@@ -87,9 +87,9 @@ def _create_test_inputs(
     cumsum = torch.cumsum(n_write_vals.to(torch.int64), dim=0)
     chunk_src_start = torch.zeros(n_rows, dtype=torch.int64, device=DEVICE)
     chunk_src_start[1:] = cumsum[:-1]
-    assert (
-        chunk_src_start[-1] + n_write_vals[-1] <= total_tokens
-    ), f"total_tokens={total_tokens} too small, need >={chunk_src_start[-1] + n_write_vals[-1]}"
+    assert chunk_src_start[-1] + n_write_vals[-1] <= total_tokens, (
+        f"total_tokens={total_tokens} too small, need >={chunk_src_start[-1] + n_write_vals[-1]}"
+    )
 
     return (
         chunk_k,
@@ -108,6 +108,7 @@ def _create_test_inputs(
 # ============================================================================
 # region precision test
 # ============================================================================
+
 
 def test_op(n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype):
     # 1. 参数合法性检查
@@ -186,14 +187,70 @@ def test_op(n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM,
 if __name__ == "__main__":
     HEAD_DIM = 128
     # 基础用例: 最小 POOL_SIZE=4, 最小 TAIL_SIZE=4
-    test_op(n_rows=1, total_tokens=16, req_pool_size=4, POOL_SIZE=4, TAIL_SIZE=4, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
+    test_op(
+        n_rows=1,
+        total_tokens=16,
+        req_pool_size=4,
+        POOL_SIZE=4,
+        TAIL_SIZE=4,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
     # 典型用例: 中等 n_rows
-    test_op(n_rows=8, total_tokens=64, req_pool_size=16, POOL_SIZE=4, TAIL_SIZE=8, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
+    test_op(
+        n_rows=8,
+        total_tokens=64,
+        req_pool_size=16,
+        POOL_SIZE=4,
+        TAIL_SIZE=8,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
     # TAIL_SIZE 边界: POOL_SIZE + 8 = 12
-    test_op(n_rows=8, total_tokens=64, req_pool_size=16, POOL_SIZE=4, TAIL_SIZE=12, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
-    test_op(n_rows=64, total_tokens=320, req_pool_size=128, POOL_SIZE=4, TAIL_SIZE=8, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
-    test_op(n_rows=128, total_tokens=640, req_pool_size=256, POOL_SIZE=4, TAIL_SIZE=4, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
-    test_op(n_rows=128, total_tokens=640, req_pool_size=256, POOL_SIZE=4, TAIL_SIZE=12, HEAD_DIM=HEAD_DIM, dtype=torch.bfloat16)
-    test_op(n_rows=4, total_tokens=32, req_pool_size=8, POOL_SIZE=4, TAIL_SIZE=8, HEAD_DIM=HEAD_DIM, dtype=torch.float16)
+    test_op(
+        n_rows=8,
+        total_tokens=64,
+        req_pool_size=16,
+        POOL_SIZE=4,
+        TAIL_SIZE=12,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    test_op(
+        n_rows=64,
+        total_tokens=320,
+        req_pool_size=128,
+        POOL_SIZE=4,
+        TAIL_SIZE=8,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    test_op(
+        n_rows=128,
+        total_tokens=640,
+        req_pool_size=256,
+        POOL_SIZE=4,
+        TAIL_SIZE=4,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    test_op(
+        n_rows=128,
+        total_tokens=640,
+        req_pool_size=256,
+        POOL_SIZE=4,
+        TAIL_SIZE=12,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    test_op(
+        n_rows=4,
+        total_tokens=32,
+        req_pool_size=8,
+        POOL_SIZE=4,
+        TAIL_SIZE=8,
+        HEAD_DIM=HEAD_DIM,
+        dtype=torch.float16,
+    )
 
 # endregion
