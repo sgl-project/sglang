@@ -30,19 +30,18 @@ class ExpertBackupClient:
         self,
         *,
         model_config,
-        moe_ep_size: int,
-        moe_ep_rank: int,
         get_model: Callable[[], Any],
     ):
         context = zmq.Context(2)
-        self.engine_num = get_parallel().nnodes
-        self.engine_rank = get_parallel().node_rank
+        parallel = get_parallel()
+        self.engine_num = parallel.nnodes
+        self.engine_rank = parallel.node_rank
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
         self._get_model = get_model
-        self.moe_ep_size = moe_ep_size
+        self.moe_ep_size = parallel.moe_ep_size
         self.model_config = model_config
-        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_rank = parallel.moe_ep_rank
         self.dram_map_list = [None] * self.engine_num
         self.session_id_list = [None] * self.engine_num
         self.transfer_engine = None

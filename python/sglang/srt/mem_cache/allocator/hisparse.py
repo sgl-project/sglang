@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseUnifiedC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_num_new_pages
 
 if TYPE_CHECKING:
@@ -39,7 +40,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
 
-        self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.logical_attn_allocator = paged_allocator_cls(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -47,7 +51,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.page_size,
             self.dtype,
@@ -297,7 +301,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.hisparse_page_size,
             self.dtype,
@@ -630,6 +637,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.free_group is None:
             self.logical_attn_allocator.free(free_index)
+            self.free_hisparse(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 

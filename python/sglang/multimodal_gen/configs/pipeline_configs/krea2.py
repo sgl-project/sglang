@@ -163,3 +163,17 @@ class Krea2PipelineConfig(ImagePipelineConfig):
         )
         latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.krea2 import (
+        Krea2SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Krea2SamplingParams,
+        pipeline_config_cls=Krea2PipelineConfig,
+        hf_model_paths=["krea/Krea-2"],
+        model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
+    )
