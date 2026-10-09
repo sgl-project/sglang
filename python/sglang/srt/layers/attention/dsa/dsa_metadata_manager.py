@@ -29,12 +29,9 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
-def kpool_metadata_fusion_supported(pool_size, page_size, topk):
+def kpool_metadata_fusion_supported(kpool, page_size, topk):
     return (
-        pool_size > 1
-        and page_size == 64
-        and page_size % pool_size == 0
-        and topk % pool_size == 0
+        kpool > 1 and page_size == 64 and page_size % kpool == 0 and topk % kpool == 0
     )
 
 
@@ -44,7 +41,7 @@ class DSAMetadataManagementMixin:
     def _init_kpool_metadata_fusion(self):
         requested = envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
         supported = kpool_metadata_fusion_supported(
-            self.dsa_index_kpool, self.real_page_size, self.dsa_index_topk
+            self.dsa_index_kpool, self.physical_page_size, self.dsa_index_topk
         )
         self.experimental_kpool_metadata_fusion = (
             requested and supported and is_cuda() and not is_hip()
