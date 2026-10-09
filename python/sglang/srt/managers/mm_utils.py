@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
 # Preserve the existing initialization import for downstream callers.
 from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
+    MMEmbeddingSegments,
     get_embedding_and_mask,
 )
 from sglang.srt.managers.mm_schedule import (
@@ -385,15 +386,45 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return padded_input_ids
 
 
+# Arbitrary bound on the copy that batches runs of small pieces into one
+# index_copy_, saving a kernel launch per piece.
+_SCATTER_STAGING_BYTES = 64 << 20
+
+
+def _split_runs(
+    pieces: MMEmbeddingSegments, max_rows: int
+) -> List[Tuple[MMEmbeddingSegments, int]]:
+    """Split pieces into (run, num_rows) runs of at most max_rows rows; a larger
+    piece is a run of its own."""
+    runs: List[Tuple[MMEmbeddingSegments, int]] = []
+    run: MMEmbeddingSegments = []
+    run_rows = 0
+    for piece in pieces:
+        num_rows = piece.shape[0]
+        if run and run_rows + num_rows > max_rows:
+            runs.append((run, run_rows))
+            run, run_rows = [], 0
+        run.append(piece)
+        run_rows += num_rows
+    if run:
+        runs.append((run, run_rows))
+    return runs
+
+
+def _cast_run(run: MMEmbeddingSegments, dest: torch.Tensor) -> torch.Tensor:
+    piece = run[0] if len(run) == 1 else torch.cat(run)
+    return piece.to(dest.device, dest.dtype)
+
+
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
 # an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
 # cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
 def _scatter_mm_embedding(
-    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
+    dest: torch.Tensor, mask: torch.Tensor, src: MMEmbeddingSegments
 ) -> None:
-    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
-    src = src.to(dest.device, dest.dtype)
-    num_src_rows = src.size(0)
+    # mask: [num_tokens, 1] bool; src: row pieces of [num_mm_tokens, width],
+    # in sequence order.
+    num_src_rows = sum(piece.shape[0] for piece in src)
     flat_mask = mask.view(-1)
     ranks = torch.cumsum(flat_mask, dim=0) - 1
     # False rows collapse into the discard slot num_src_rows; a mask/src
@@ -403,7 +434,16 @@ def _scatter_mm_embedding(
         (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
     )
     rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
-    dest.index_copy_(0, rows[:num_src_rows], src)
+    max_rows = max(1, _SCATTER_STAGING_BYTES // (dest.size(-1) * dest.element_size()))
+    row_offset = 0
+    for run, num_rows in _split_runs(pieces=src, max_rows=max_rows):
+        # A multi-piece run is staged in one copy that is freed when this returns.
+        dest.index_copy_(
+            0,
+            rows[row_offset : row_offset + num_rows],
+            _cast_run(run=run, dest=dest),
+        )
+        row_offset += num_rows
 
 
 def embed_mm_inputs(
@@ -500,10 +540,12 @@ def embed_mm_inputs(
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
-                embedding, deepstack_embedding = (
-                    multimodal_model.separate_deepstack_embeds(embedding)
-                )
-                deepstack_embeddings += [deepstack_embedding]
+                pairs = [
+                    multimodal_model.separate_deepstack_embeds(segment)
+                    for segment in embedding
+                ]
+                embedding = [main for main, _ in pairs]
+                deepstack_embeddings += [[deepstack for _, deepstack in pairs]]
             else:
                 deepstack_embeddings += [None]
             modalities += [modality]
