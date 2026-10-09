@@ -123,12 +123,16 @@ async def run_zeromq_broker(server_args: ServerArgs):
 
 
 def _session_key(batch: Any) -> str | None:
-    """Realtime sessions hold GPU state on one replica, so every request of a
-    session must land on the same one."""
+    """Return the affinity key for requests that hold state on one replica."""
     reqs = batch if isinstance(batch, list) else [batch]
     for req in reqs:
-        if isinstance(req, Req) and req.realtime_session_id:
-            return req.realtime_session_id
+        if isinstance(req, Req):
+            if req.realtime_session_id:
+                return req.realtime_session_id
+            extra = req.extra or {}
+            comfyui_session_id = extra.get("comfyui_session_id")
+            if comfyui_session_id:
+                return comfyui_session_id
     return None
 
 
