@@ -241,15 +241,15 @@ def _forward_diffusers_video_only(
     )
 
     for block in transformer.transformer_blocks:
-        hidden_states = _forward_refiner_video_block(
+        hidden_states = _forward_diffusers_video_block(
             block=block,
+            self_attention=_streaming_diffusers_self_attention,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb=temb,
             video_rotary_emb=video_rotary_emb,
             encoder_attention_mask=encoder_attention_mask,
             n_context_tokens=n_context_tokens,
-            self_attention=_streaming_diffusers_self_attention,
         )
 
     scale_shift_values = (
@@ -261,16 +261,16 @@ def _forward_diffusers_video_only(
     return transformer.proj_out(hidden_states)
 
 
-def _forward_refiner_video_block(
+def _forward_diffusers_video_block(
     *,
     block: nn.Module,
+    self_attention: Callable[..., torch.Tensor],
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     temb: torch.Tensor,
     video_rotary_emb: tuple[torch.Tensor, torch.Tensor],
     encoder_attention_mask: torch.Tensor | None,
     n_context_tokens: int,
-    self_attention: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     batch_size = hidden_states.size(0)
 

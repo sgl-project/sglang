@@ -31,7 +31,7 @@ from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
     _as_additive_attention_mask,
-    _forward_refiner_video_block,
+    _forward_diffusers_video_block,
     _unwrap_diffusers_ltx2_refiner,
     log_sana_wm_tensor_stats,
     sana_wm_skip_refiner_enabled,
@@ -283,15 +283,15 @@ class _RefinerCore:
             batch, -1, hidden_states.size(-1)
         )
         for block in transformer.transformer_blocks:
-            hidden_states = _forward_refiner_video_block(
+            hidden_states = _forward_diffusers_video_block(
                 block=block,
+                self_attention=streaming_self_attention,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 video_rotary_emb=video_rotary_emb,
                 encoder_attention_mask=encoder_attention_mask,
                 n_context_tokens=n_context_tokens,
-                self_attention=streaming_self_attention,
             )
         scale_shift = (
             transformer.scale_shift_table[None, None] + embedded_timestep[:, :, None]
