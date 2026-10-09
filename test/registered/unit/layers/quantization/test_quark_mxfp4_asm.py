@@ -5,9 +5,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
@@ -85,6 +87,34 @@ class TestQuarkMxfp4AsmTupleInput(CustomTestCase):
         for fused in ((x_q, x_scales, torch.empty(0)), (x_q,) * 5):
             with self.assertRaises(NotImplementedError):
                 _asm_fp4_prequantized_input(fused)
+
+
+class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
+    def test_narrow_layer_stays_on_triton(self):
+        """With the ASM flag on, a layer with N <= 128 (Qwen3.8 GDN in_proj_ba,
+        N=96) must keep the Triton GEMM: AITER's untuned ASM heuristic returns
+        wrong rows 1..M-1 for it at small batch sizes."""
+        n, k = 96, 5120
+        layer = torch.nn.Module()
+        weight = torch.nn.Parameter(
+            torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
+        )
+        layer.weight = weight
+        layer.weight_scale = torch.nn.Parameter(
+            torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
+        )
+        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
+
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+            ),
+        ):
+            scheme.process_weights_after_loading(layer)
+
+        self.assertFalse(layer.use_aiter_asm_fp4_gemm)
+        self.assertIs(layer.weight, weight)
 
 
 if __name__ == "__main__":
