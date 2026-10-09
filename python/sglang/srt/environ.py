@@ -1607,11 +1607,8 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
-    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
-    # anonymous mapping per rank holding only its rows, gathered with the
-    # all-reduce, and the only layout that gets huge pages without shmem THP.
-    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # "row_sharded" | "full_shared"
+    SGLANG_DSV41_ENGRAM_TABLE_LAYOUT = EnvStr("")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -2037,6 +2034,12 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
         note="The unified radix tree is the default tree cache now; unset this env."
+    ),
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT": _DeprecatedEnv(
+        replacement="SGLANG_DSV41_ENGRAM_TABLE_LAYOUT",
+        transform=lambda v: {"shared": "full_shared", "per_rank": "row_sharded"}.get(
+            v, v
+        ),
     ),
 }
 
