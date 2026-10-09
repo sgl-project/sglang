@@ -4798,6 +4798,14 @@ class DeepseekV4Model(nn.Module):
                         _win = False
                     if _win and _hi is not None and _lastpos > int(_hi):
                         _win = False
+                    # optional layer filter: DSV4_DUMP_LHID_LAYERS="0,1,2,3"
+                    # (unset => all layers). Keep the log small when only the
+                    # first divergent layers matter.
+                    _lay = _os.environ.get("DSV4_DUMP_LHID_LAYERS")
+                    if _win and _lay and str(i) not in {
+                        x.strip() for x in _lay.split(",") if x.strip()
+                    }:
+                        _win = False
                     if _win:
                         _parts = []
                         if hidden_states.numel():
