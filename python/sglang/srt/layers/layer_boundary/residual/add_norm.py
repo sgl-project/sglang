@@ -324,7 +324,11 @@ class NormQuantReadout:
     """The input is the residual's norm, fused with the quantization the
     consumer asks for (``quant_format``) and a post-residual addition; a plain
     add of the previous output runs in the same kernel. An empty batch skips
-    the norm."""
+    the norm.
+
+    ``post_residual_addition`` is added after a plain add and before the norm.
+    It is not applied by the aiter mxfp4 and fp8-group kernels, after an
+    update other than a plain add, or by ``read``, which has no add."""
 
     is_plain_norm = True
     completing_fusions = ()
@@ -362,7 +366,9 @@ class NormQuantReadout:
 @dataclass(frozen=True)
 class NormReadout:
     """The input is the residual's norm; a plain add of the previous output
-    runs in the same kernel. An empty batch skips the norm."""
+    runs in the same kernel. An empty batch skips the norm. It rejects a
+    ``quant_format`` and a ``post_residual_addition``, except that the latter
+    is not applied after an update other than a plain add."""
 
     is_plain_norm = True
     completing_fusions = ()

@@ -114,7 +114,8 @@ class GatedResidualState:
 
 class _AttnReadout:
     """The normalized, gated mix of the streams, from streams that already hold
-    the previous layer's output: such a layer takes its input written back."""
+    the previous layer's output: such a layer takes its input written back. A
+    ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
     completing_fusions = ()

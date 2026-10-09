@@ -219,7 +219,8 @@ class _BankReadout:
 
 class _AttnReadout(_BankReadout):
     """The attention input: the bank aggregation and this layer's input norm.
-    A write layer snapshots the residual this read forms."""
+    A write layer snapshots the residual this read forms. ``read`` rejects a
+    ``post_residual_addition``; ``update_and_read`` does not apply one."""
 
     @property
     def reads_after_attn_tp_gather(self):

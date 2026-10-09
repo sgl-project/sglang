@@ -101,7 +101,7 @@ class IHCState:
 class _AttnReadout:
     """The gated mix of the streams and the input norm, from streams that
     already hold the previous layer's output: an iHC layer takes its input
-    written back."""
+    written back. A ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
     completing_fusions = ()

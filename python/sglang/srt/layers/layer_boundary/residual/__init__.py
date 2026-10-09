@@ -165,6 +165,9 @@ class ResidualReadout(Protocol):
             norm: Consumer normalization module.
             quant_format: Requested input quantization format, as in read().
             post_residual_addition: Optional extra added after update, before norm.
+                Each read documents where it applies, rejects or does not
+                apply it. A stream that arrives already written is read with
+                ``read``, which is not given it.
 
         Returns:
             (compute_input, residual). A fused implementation can preserve FP32

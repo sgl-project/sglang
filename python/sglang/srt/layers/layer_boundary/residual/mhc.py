@@ -122,7 +122,8 @@ class MHCState:
 
 class _AttnReadout:
     """hc_pre and the input norm, from streams that already hold the previous
-    layer's output: an MHC layer takes its input written back."""
+    layer's output: an MHC layer takes its input written back. A
+    ``post_residual_addition`` is not applied."""
 
     is_plain_norm = False
     completing_fusions = ()
