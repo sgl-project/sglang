@@ -66,15 +66,36 @@ class TestDevicePoolInfo(CustomTestCase):
         )
 
     def test_model_layers_match_physical_layers_for_each_buffer_format(self):
+        from msgspec.structs import replace
+
         for info in _pool_infos():
-            with self.subTest(pool=info.pool_name):
-                with self.assertRaisesRegex(ValueError, "model layers must match"):
-                    DevicePoolInfo(
-                        pool_name=info.pool_name,
-                        indices_from_pool=info.indices_from_pool,
-                        layer_ids=info.layer_ids[:-1],
-                        buffer_info=info.buffer_info,
+            for layers in (info.layer_ids[:-1], (*info.layer_ids, 23)):
+                with (
+                    self.subTest(pool=info.pool_name, layers=layers),
+                    self.assertRaisesRegex(ValueError, "model layers must match"),
+                ):
+                    bind_packed_pool_buffers(
+                        target=replace(info, layer_ids=layers),
+                        drafts=(),
+                        model_to_transfer_layer={20: 0, 21: 1, 22: 2, 23: 3},
+                        target_layer_num=4,
                     )
+
+    def test_packed_draft_layers_match_physical_layers_for_each_buffer_format(self):
+        from msgspec.structs import replace
+
+        for target in _pool_infos():
+            draft = replace(target, layer_ids=(0,))
+            with (
+                self.subTest(pool=target.pool_name),
+                self.assertRaisesRegex(ValueError, "model layers must match"),
+            ):
+                bind_packed_pool_buffers(
+                    target=target,
+                    drafts=(draft,),
+                    model_to_transfer_layer={20: 0, 21: 1, 22: 2},
+                    target_layer_num=3,
+                )
 
     def test_packed_mla_rejects_strided_rows_before_linker_construction(self):
         from msgspec.structs import replace

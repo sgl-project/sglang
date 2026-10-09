@@ -24,11 +24,11 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     buffers: tuple[torch.Tensor, ...]
     compress_ratio: int = 1
 
-    @property
-    def layer_count(self) -> int:
-        return len(self.buffers)
-
-    def validate(self) -> None:
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        if layer_ids is not None and len(layer_ids) != len(self.buffers):
+            raise ValueError(
+                f"{len(layer_ids)} model layers must match {len(self.buffers)} buffers"
+            )
         if self.page_size <= 0 or self.compress_ratio != 1 or not self.buffers:
             raise ValueError("MLA host transfer requires uncompressed token rows")
         first = self.buffers[0]
@@ -52,14 +52,15 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     compress_ratio: int
 
     @property
-    def layer_count(self) -> int:
-        return len(self.buffers.buffers)
-
-    @property
     def page_bytes(self) -> int:
         return self.page_size // self.compress_ratio * (128 + 4)
 
-    def validate(self) -> None:
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        buffers = self.buffers.buffers
+        if layer_ids is not None and len(layer_ids) != len(buffers):
+            raise ValueError(
+                f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
+            )
         if (
             self.page_size <= 0
             or self.compress_ratio <= 0
@@ -71,7 +72,6 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
             )
         if self.buffers.encoding is not IndexPageEncoding.DSA_FP8:
             raise ValueError(f"unsupported index page encoding {self.buffers.encoding}")
-        buffers = self.buffers.buffers
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
         page_bytes = self.page_bytes
@@ -103,13 +103,11 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     shared_layer_to_owner: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        layer_count = self.buffer_info.layer_count
-        if not self.layer_ids or len(self.layer_ids) != layer_count:
-            raise ValueError(
-                f"{self.pool_name}: {len(self.layer_ids)} model layers must match "
-                f"{layer_count} buffers"
-            )
-        if len(set(self.layer_ids)) != len(self.layer_ids) or min(self.layer_ids) < 0:
+        if (
+            not self.layer_ids
+            or len(set(self.layer_ids)) != len(self.layer_ids)
+            or min(self.layer_ids) < 0
+        ):
             raise ValueError(f"{self.pool_name}: invalid model layers {self.layer_ids}")
         readers = set()
         for reader, owner in self.shared_layer_to_owner:
