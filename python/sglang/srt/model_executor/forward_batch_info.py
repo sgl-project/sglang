@@ -672,8 +672,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #                                      the eager forward and the cuda-graph
     #                                      registry localize from on each forward /
     #                                      replay. Present only when
-    #                                      enable_num_token_non_padded()
-    #                                      (moe_ep_size > 1).
+    #                                      enable_num_token_non_padded().
     #     global_num_token_non_padded_cpu  host int. Host-side attention/backend
     #                                      slices read it directly; the prefill
     #                                      graph registry derives its per-rank GPU
@@ -2102,8 +2101,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    # Elastic joiners also need graph padding masked after joining WORLD.
-    return get_parallel().moe_ep_size > 1 or world_dp_gather_enabled()
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    # Elastic joiners also need graph padding masked after joining WORLD; a
+    # customized A2A backend consumes the count whatever the EP size.
+    return (
+        get_parallel().moe_ep_size > 1
+        or world_dp_gather_enabled()
+        or get_moe_a2a_backend().is_customized()
+    )
 
 
 def build_inner_fb_view(
