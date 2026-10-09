@@ -641,6 +641,7 @@ class Resources(_FlagGroupBase):
     # Accessors with bespoke semantics (grow-only, per-device keys) manage
     # their entries directly.
     buffers: dict = msgspec.field(default_factory=dict)
+    bf16_cublaslt_ready: set[tuple[int, int, int]] = msgspec.field(default_factory=set)
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
