@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -24,19 +25,27 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
+    get_ascend_dispatcher_output_dtype,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_npu_moe_allgather,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
     is_hip,
+    is_npu,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _is_npu:
+    import torch_npu
 
 from sglang.srt.environ import envs as _envs
 
@@ -128,6 +137,8 @@ class StandardDispatcher(BaseDispatcher):
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
+        self._allgather_sizes: Optional[list[int]] = None
+        self._is_dp: bool = True
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -176,6 +187,60 @@ class StandardDispatcher(BaseDispatcher):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 router_logits=topk_output.router_logits,  # never tested
+            )
+        elif should_use_npu_moe_allgather():
+            # NPU all-gather (DP) / all-reduce (non-DP) MoE path.
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            dispatcher_dtype = get_ascend_dispatcher_output_dtype(self)
+            self._is_dp = is_dp_attention_enabled()
+
+            # Pre-quantize to MXFP8 before any communication to halve
+            # bandwidth.  Per-token quant is safe locally: each rank
+            # quantizes its own tokens and the gather (if any) just
+            # concatenates rows without mixing them.
+            if dispatcher_dtype is DispatcherOutputDtype.MXFP8:
+                if hidden_states.shape[0] > 0:
+                    hidden_states, hidden_states_scale = (
+                        torch_npu.npu_dynamic_mx_quant(
+                            hidden_states, dst_type=torch.float8_e4m3fn
+                        )
+                    )
+                else:
+                    hidden_size = hidden_states.shape[1]
+                    hidden_states = torch.empty(
+                        0, hidden_size,
+                        dtype=torch.float8_e4m3fn, device=hidden_states.device,
+                    )
+                    hidden_states_scale = torch.empty(
+                        0, hidden_size // 32,
+                        dtype=torch_npu.float8_e8m0fnu, device=hidden_states.device,
+                    )
+            else:
+                hidden_states_scale = None
+
+            if self._is_dp:
+                # DP path: all-gather different tokens from DP ranks, then
+                # reduce-scatter partial outputs back.
+                self._allgather_sizes = get_dp_global_num_tokens()
+                gather_list = [hidden_states, topk_weights, topk_ids]
+                if hidden_states_scale is not None:
+                    gather_list.append(hidden_states_scale)
+                gathered = get_parallel().tp_group.all_gatherv(
+                    gather_list, sizes=self._allgather_sizes,
+                )
+                if hidden_states_scale is not None:
+                    hidden_states, topk_weights, topk_ids, hidden_states_scale = gathered
+                else:
+                    hidden_states, topk_weights, topk_ids = gathered
+            else:
+                # Non-DP path: every rank already has the full token set.
+                # No all-gather needed; combine will all-reduce instead.
+                self._allgather_sizes = None
+
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=topk_output.router_logits,
             )
         else:
             hidden_states = hidden_states
@@ -256,4 +321,24 @@ class StandardDispatcher(BaseDispatcher):
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
+        elif should_use_npu_moe_allgather():
+            if self._is_dp:
+                # DP path: reduce-scatter partial outputs back to each
+                # DP rank's local token shard.
+                local_output, global_hidden_states = (
+                    get_local_dp_buffer(get_parallel().tp_group),
+                    hidden_states,
+                )
+                get_parallel().tp_group.reduce_scatterv(
+                    global_hidden_states,
+                    output=local_output,
+                    sizes=self._allgather_sizes,
+                )
+                hidden_states = local_output
+            else:
+                # Non-DP path: every rank has the same tokens, so just
+                # all-reduce to sum the per-rank partial expert outputs.
+                hidden_states = get_parallel().moe_ep_group.all_reduce(
+                    hidden_states
+                )
         return hidden_states

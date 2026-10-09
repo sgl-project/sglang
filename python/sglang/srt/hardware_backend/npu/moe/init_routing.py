@@ -96,8 +96,18 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         topk_ids: torch.Tensor,
         num_experts: int,
         top_k: int,
+        scale: Optional[torch.Tensor] = None,
+        x_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        kwargs = {}
+        if scale is not None:
+            # Pre-quantized input (e.g. MXFP8 activations quantized before an
+            # all-gather): consume the fp8 payload as-is via x_dtype and route
+            # the per-token block scale along with the tokens (PR 737 style:
+            # quant_mode=-1 + scale + x_dtype).
+            kwargs["scale"] = scale
+            kwargs["x_dtype"] = x_dtype
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
@@ -108,6 +118,7 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
                 quant_mode=self.quant_mode,
+                **kwargs,
             )
         )
         if self.quant_mode == -1:
