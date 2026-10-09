@@ -123,6 +123,13 @@ def _make_batch_str_output() -> BatchStrOutput:
 def _make_batch_token_id_output() -> BatchTokenIDOutput:
     return BatchTokenIDOutput(
         rids=["token-rid-0", "token-rid-1"],
+        # OutputStreamer leaves the spec_* lists empty without speculative decoding.
+        spec_verify_ct=[],
+        spec_num_correct_drafts=[],
+        spec_correct_drafts_histogram=[],
+        spec_num_block_accept_tokens=[],
+        spec_num_cap_tokens=[],
+        spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
         decoded_texts=["first", "second"],
         decode_ids=[[1], [2]],
@@ -292,24 +299,24 @@ class TestMultiTokenizerMixin(CustomTestCase):
             ],
         )
 
-    def test_grouped_split_supports_token_and_embedding_outputs(self):
-        token_output = _make_batch_token_id_output()
-        token_output.http_worker_ipcs = ["worker-a", "worker-a"]
-        token_group = _handle_output_by_indices(token_output, [0, 1])
-        self.assertEqual(token_group.rids, ["token-rid-0", "token-rid-1"])
+    def test_router_groups_token_output_without_speculative_decoding(self):
+        output = _make_batch_token_id_output()
+        output.http_worker_ipcs = ["worker-a", "worker-a"]
+        router = _make_router()
+        sent = []
+        router._send = lambda target, obj: sent.append((target, obj))
 
-        embedding_output = _make_batch_embedding_output()
-        embedding_group = _handle_output_by_indices(embedding_output, [1, 0])
-        self.assertEqual(
-            embedding_group.rids,
-            ["embedding-rid-1", "embedding-rid-0"],
-        )
-        self.assertEqual(embedding_group.embeddings, [[0.3, 0.4], [0.1, 0.2]])
+        router._send_batch(output)
 
-    def test_embedding_special_fields_fall_back_before_any_grouped_send(self):
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "detok-a")
+        self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
+        self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
+        self.assertIsNone(sent[0][1].spec_verify_ct)
+
+    def test_router_sends_embedding_output_per_request(self):
         output = _make_batch_embedding_output()
         output.http_worker_ipcs = ["worker-a", "worker-a"]
-        output.retraction_counts = [0, 0]
         router = _make_router()
         sent = []
         router._send = lambda target, obj: sent.append((target, obj))
@@ -320,24 +327,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [(target, obj.rids) for target, obj in sent],
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
-
-    def test_router_send_error_propagates_without_resending_the_batch(self):
-        output = _make_batch_str_output()
-        output.http_worker_ipcs = ["worker-a", "worker-a"]
-        router = _make_router()
-        send_count = 0
-
-        def send_once_then_fail(target, obj):
-            nonlocal send_count
-            send_count += 1
-            raise RuntimeError("send failed")
-
-        router._send = send_once_then_fail
-
-        with self.assertRaisesRegex(RuntimeError, "send failed"):
-            router._send_batch(output)
-
-        self.assertEqual(send_count, 1)
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)

@@ -425,6 +425,10 @@ def _extract_field_by_indices(
             return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
+    # Same as _extract_field_by_index: a field too short for every index (e.g.
+    # spec_* lists stay empty when speculative decoding is off) becomes None.
+    if check_length and len(field) <= min(indices):
+        return None
     if len(field) <= max_index:
         raise _CannotSplitBatch(f"{field_name} cannot provide index {max_index}")
 
@@ -612,29 +616,6 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
             beam_search_output=extract("beam_search_output"),
             weight_versions=extract("weight_versions"),
             token_steps=extract("token_steps", check_length=False),
-        )
-
-    if isinstance(output, BatchEmbeddingOutput):
-        if any(
-            object.__getattribute__(output, field_name) is not None
-            for field_name in (
-                "retraction_counts",
-                "cached_tokens_details",
-                "time_stats",
-                "pooled_hidden_states",
-            )
-        ):
-            raise _CannotSplitBatch(
-                "BatchEmbeddingOutput contains fields not covered by the existing splitter"
-            )
-        return BatchEmbeddingOutput(
-            rids=[output.rids[index] for index in indices],
-            finished_reasons=extract("finished_reasons"),
-            embeddings=extract("embeddings"),
-            prompt_tokens=extract("prompt_tokens"),
-            cached_tokens=extract("cached_tokens"),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
         )
 
     raise _CannotSplitBatch(f"Cannot split {type(output)}")
