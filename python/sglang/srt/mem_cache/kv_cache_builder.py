@@ -34,6 +34,7 @@ from sglang.srt.configs.hybrid_arch import (
     mamba2_config,
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -305,14 +306,30 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    disable_radix_cache = get_memory().disable_radix_cache or (
-        model_config.is_multimodal and uses_transformers_backend
+    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(
+        server_args, is_dsa=is_dsa
+    )
+    # [修改-PD DSA prefill CP 的 KV 重分片与 radix prefix cache 不兼容]
+    # [迁移自 v0.5.18_rel feat/glm-5.3-flash 756a2e8bf5] 旧代码如下：
+    # disable_radix_cache = get_memory().disable_radix_cache or (
+    #     model_config.is_multimodal and uses_transformers_backend
+    # )
+    disable_radix_cache = (
+        get_memory().disable_radix_cache
+        or (model_config.is_multimodal and uses_transformers_backend)
+        or bypass_dsa_cp_prefix_cache
     )
     if disable_radix_cache and not get_memory().disable_radix_cache:
-        logger.warning(
-            "Radix cache is disabled for multimodal models with the "
-            "Transformers backend to avoid multimodal prefix-cache mismatches."
-        )
+        if bypass_dsa_cp_prefix_cache:
+            logger.warning(
+                "Radix cache is disabled on this PD worker because DSA prefill "
+                "CP requires CP-aware KV-cache resharding."
+            )
+        else:
+            logger.warning(
+                "Radix cache is disabled for multimodal models with the "
+                "Transformers backend to avoid multimodal prefix-cache mismatches."
+            )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
