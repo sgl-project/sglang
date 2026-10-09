@@ -2758,23 +2758,49 @@ class DeepseekV4AscendAttnBackend(
                 actual_q = actual_seq_lengths_q_pa[1:].clone()
             else:
                 actual_q = actual_seq_lengths_kv
-            kernel_metadata["li_quant_metadata"] = (
-                torch.ops.custom.npu_quant_lightning_indexer_metadata(
-                    device=str(actual_q.device),
-                    actual_seq_lengths_query=actual_q,
-                    actual_seq_lengths_key=actual_seq_lengths_kv,
-                    layout_key="PA_BSND",
-                    sparse_count=self._dsv4_index_topk,
-                    sparse_mode=3,
-                    layout_query="TND",
-                    cmp_ratio=4,
-                    key_quant_mode=0,
-                    query_quant_mode=0,
-                    num_heads_q=self._dsv4_index_n_heads,
-                    num_heads_k=1,
-                    head_dim=self._dsv4_index_head_dim,
-                )
+            # S174: ops-transformer README passes batch_size/max_seqlen_q/max_seqlen_k to
+            # this metadata op; sglang omits them (schema default 0). Fill them only when
+            # SGLANG_DSV4_LI_META_MAXSEQ is set, so default behaviour is unchanged (A/B).
+            _li_meta_kwargs = dict(
+                device=str(actual_q.device),
+                actual_seq_lengths_query=actual_q,
+                actual_seq_lengths_key=actual_seq_lengths_kv,
+                layout_key="PA_BSND",
+                sparse_count=self._dsv4_index_topk,
+                sparse_mode=3,
+                layout_query="TND",
+                cmp_ratio=4,
+                key_quant_mode=0,
+                query_quant_mode=0,
+                num_heads_q=self._dsv4_index_n_heads,
+                num_heads_k=1,
+                head_dim=self._dsv4_index_head_dim,
             )
+            _fill_maxseq = bool(os.environ.get("SGLANG_DSV4_LI_META_MAXSEQ"))
+            if _fill_maxseq:
+                _li_meta_kwargs["batch_size"] = int(actual_q.numel())
+                _li_meta_kwargs["max_seqlen_q"] = int(actual_q.max().item())
+                _li_meta_kwargs["max_seqlen_k"] = int(actual_seq_lengths_kv.max().item())
+            _li_meta = torch.ops.custom.npu_quant_lightning_indexer_metadata(
+                **_li_meta_kwargs
+            )
+            kernel_metadata["li_quant_metadata"] = _li_meta
+            if os.environ.get("DSV4_DUMP_LIMETA"):
+                try:
+                    _xc = _li_meta.detach().to("cpu").contiguous()
+                    if _xc.dtype != torch.int32:
+                        _xc = _xc.to(torch.int32)
+                    _h = hashlib.md5(_xc.numpy().tobytes()).hexdigest()[:16]
+                    print(
+                        f"[LIMETA] maxseq={1 if _fill_maxseq else 0} "
+                        f"slq=({int(actual_q.min())},{int(actual_q.max())},{actual_q.numel()}) "
+                        f"slk=({int(actual_seq_lengths_kv.min())},{int(actual_seq_lengths_kv.max())},"
+                        f"{actual_seq_lengths_kv.numel()}) md5={_h} "
+                        f"shape={tuple(_li_meta.shape)} head={_xc.reshape(-1)[:24].tolist()}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[LIMETA] skipped: {exc}", flush=True)
 
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
