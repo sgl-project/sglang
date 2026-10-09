@@ -17,10 +17,9 @@ import os
 import tempfile
 import traceback
 import unittest
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -164,56 +163,6 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             ),
             [False, False],
         )
-
-
-class TestModelPrefillAutotune(CustomTestCase):
-    """Model kernel warmup must cover prefill without a speculative dummy batch."""
-
-    def setUp(self):
-        self.hook = Mock(return_value=1)
-        self.mr = SimpleNamespace(
-            model=SimpleNamespace(autotune_prefill_kernels=self.hook),
-            is_generation=True,
-            is_draft_worker=False,
-            dtype=torch.bfloat16,
-        )
-        self.runner = SimpleNamespace(model_runner=self.mr)
-        # No dummy-buffer or attention APIs: this path must not build a
-        # TARGET_VERIFY batch or mutate request/KV state.
-        for target, kwargs in (
-            ("max_prefill_buffer_tokens", {"return_value": 65536}),
-            (
-                "flashinfer_autotune_context",
-                {"side_effect": lambda *a, **k: nullcontext()},
-            ),
-        ):
-            p = patch.object(autotune, target, **kwargs)
-            setattr(self, target, p.start())
-            self.addCleanup(p.stop)
-        p = patch.object(
-            autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND, "get", return_value=False
-        )
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_declining_model_never_enters_the_autotune_context(self):
-        self.mr.model.wants_prefill_autotune = lambda: False
-        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=384)
-        self.hook.assert_not_called()
-        self.flashinfer_autotune_context.assert_not_called()
-
-    def test_extend_pass_is_opt_in(self):
-        # A draft worker keeps its own warmup; a model without the hook opts out.
-        for draft, has_hook in ((True, True), (False, False)):
-            with self.subTest(draft=draft, has_hook=has_hook):
-                self.mr.is_draft_worker = draft
-                if not has_hook:
-                    del self.mr.model.autotune_prefill_kernels
-                autotune.maybe_flashinfer_autotune_extend(
-                    self.runner, decode_num_tokens=384
-                )
-                self.hook.assert_not_called()
-                self.flashinfer_autotune_context.assert_not_called()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")

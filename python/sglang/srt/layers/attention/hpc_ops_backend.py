@@ -123,6 +123,7 @@ class HPCOpsAttnBackend(AttentionBackend):
     # The page table is built on-device from seq_lens, so the D2H sync for
     # seq_lens_cpu is not needed (same as trtllm_mha / triton).
     needs_cpu_seq_lens: bool = False
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__()

@@ -208,6 +208,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     def __init__(self, runner=None) -> None:
         self.runner = runner

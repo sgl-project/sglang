@@ -27,6 +27,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -47,13 +48,21 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
+from sglang.srt.model_executor.runner_utils import (
+    cp_extend_forward,
+    runner_owns_cp_boundary,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
     get_parallel,
 )
-from sglang.srt.speculative.spec_info import create_dummy_verify_input
+from sglang.srt.speculative.spec_info import (
+    can_run_dummy_draft_extend,
+    create_dummy_draft_extend_input,
+    create_dummy_verify_input,
+)
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -88,12 +97,17 @@ def _allocate_decode_buffers(
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
+    allocate_input_embeds: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     parallel = get_parallel()
     with torch.device(device):
         input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+        input_embeds = (
+            torch.zeros((max_num_token, hidden_size), dtype=dtype)
+            if allocate_input_embeds
+            else None
+        )
         req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
         seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
         out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
@@ -271,7 +285,11 @@ class BaseRunner(ABC):
                 "_autotune_buffers() must return a reusable buffer set for autotune"
             )
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
-            maybe_flashinfer_autotune_extend(self, decode_num_tokens=batch_size)
+            maybe_flashinfer_autotune_extend(runner=self, decode_num_tokens=batch_size)
+        elif should_run_flashinfer_autotune(
+            model_runner=self.model_runner, for_speculative_draft=True
+        ):
+            maybe_flashinfer_autotune_extend(runner=self, decode_num_tokens=0)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -406,6 +424,7 @@ class BaseRunner(ABC):
         *,
         num_tokens_per_req: int = 1,
         allocate_logits_buffer: bool = True,
+        allocate_input_embeds: bool = True,
     ):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_req).
@@ -445,6 +464,7 @@ class BaseRunner(ABC):
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,
+            allocate_input_embeds=allocate_input_embeds,
         )
 
     def _dummy_run(
@@ -459,7 +479,7 @@ class BaseRunner(ABC):
         """Run a dummy forward pass for warmup/profiling.
 
         forward_mode_override forces EXTEND/DECODE regardless of
-        is_generation (used by the PP-parallel DeepGEMM warmup).
+        is_generation.
 
         buffers: a prepared static buffer set (or lightweight adapter exposing
         the same fields), sized >= this dummy shape, which _dummy_run slices to
@@ -467,11 +487,11 @@ class BaseRunner(ABC):
         the flashinfer autotune reuses an existing runner's buffers via
         _autotune_buffers (the eager input registry, or the decode cuda-graph
         runner's captured buffers); the PP-DeepGEMM warmup builds one via
-        _alloc_dummy_decode_buffers. _dummy_run never allocates and never re-pads
-        (autotune must run at the reused shape; the PP warmup pre-pads and sizes
-        its buffer to match). next_token_logits_buffer is optional -- a live
-        autotune forward returns logits fresh, so the eager-reuse path passes
-        None (only the PP warmup set still carries one).
+        _alloc_dummy_decode_buffers. _dummy_run never allocates static buffers
+        and never re-pads (autotune must run at the reused shape; the PP warmup
+        pre-pads and sizes its buffer to match). next_token_logits_buffer is
+        optional -- a live autotune forward returns logits fresh, so the
+        eager-reuse path passes None (only the PP warmup set still carries one).
         """
         mr = self.model_runner
         if forward_mode_override is not None:
@@ -492,21 +512,21 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        is_extend_dummy = forward_mode_override == ForwardMode.EXTEND
+        if extend_num_tokens_per_req is not None:
+            assert is_extend_dummy, "extend_num_tokens_per_req requires an EXTEND dummy"
+            num_tokens_per_req = extend_num_tokens_per_req
+        if is_extend_dummy:
+            assert not mr.is_draft_worker or can_run_dummy_draft_extend(
+                mr.spec_algorithm
+            ), "this draft has no EXTEND-shaped prefill pass"
+        elif mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
                 )
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
-        if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
-            )
-            num_tokens_per_req = extend_num_tokens_per_req
 
         num_tokens = batch_size * num_tokens_per_req
 
@@ -597,19 +617,6 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if get_parallel().pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
-            if (
-                capture_forward_mode == ForwardMode.EXTEND
-                and get_parallel().pp_rank != 0
-                and get_parallel().attn_cp_size > 1
-            ):
-                pp_hidden_tokens = num_tokens // get_parallel().attn_cp_size
-            pp_proxy_tensors = PPProxyTensors(
-                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
-            )
-
         # TP-gather requirements for global token metadata.
         require_mlp_tp_gather_ = require_mlp_tp_gather()
         require_attn_tp_gather_ = require_attn_tp_gather()
@@ -635,14 +642,17 @@ class BaseRunner(ABC):
             global_num_tokens_cpu = None
 
         # Speculative metadata and hidden-state capture mode.
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            buffers.custom_mask,
-            num_tokens_per_req,
-            mr.is_draft_worker,
+        spec_info = _create_dummy_spec_info(
+            mr=mr,
+            is_extend_dummy=is_extend_dummy,
+            custom_mask=buffers.custom_mask,
+            num_tokens=num_tokens,
+            num_tokens_per_req=num_tokens_per_req,
         )
-        if spec_info is not None and (
-            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        if (
+            spec_info is not None
+            and not is_extend_dummy
+            and (mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone())
         ):
             # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
             # during forward; provide a dummy so warmup doesn't crash.
@@ -697,6 +707,7 @@ class BaseRunner(ABC):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             global_forward_mode=capture_forward_mode,
+            is_extend_in_batch=is_extend_dummy,
             lora_ids=lora_ids,
         )
         mr.kv_index_translator.bind_runner_slots(forward_batch)
@@ -709,7 +720,21 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
-        mr.attn_backend.init_forward_metadata(forward_batch)
+        cp_active = is_extend_dummy and is_cp_active(forward_batch)
+        if cp_active:
+            prepare_cp_forward(forward_batch)
+        if get_parallel().pp_size > 1:
+            # PP0 already cp-split hidden_states before send.
+            pp_hidden_tokens = num_tokens
+            if cp_active and get_parallel().pp_rank != 0:
+                pp_hidden_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token[
+                    get_parallel().attn_cp_rank
+                ]
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+            )
+        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+            mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
             mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
@@ -724,7 +749,9 @@ class BaseRunner(ABC):
                 forward_batch.dp_padding_mode.is_max_len(),
                 global_num_tokens_cpu,
             )
-            set_is_extend_in_batch(False)
+            set_is_extend_in_batch(is_extend_dummy)
+            if cp_active:
+                prepare_cp_forward(forward_batch)
 
             kwargs = {}
             if (
@@ -737,6 +764,10 @@ class BaseRunner(ABC):
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
+            if cp_active and runner_owns_cp_boundary(mr.model):
+                return cp_extend_forward(
+                    model=mr.model, forward_batch=forward_batch, kwargs=kwargs
+                )
             logits_output_or_pp_proxy_tensors = mr.model.forward(
                 input_ids,
                 forward_batch.positions,
@@ -772,3 +803,23 @@ class BaseRunner(ABC):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
+
+
+def _create_dummy_spec_info(
+    *,
+    mr: ModelRunner,
+    is_extend_dummy: bool,
+    custom_mask: Optional[torch.Tensor],
+    num_tokens: int,
+    num_tokens_per_req: int,
+):
+    if not is_extend_dummy:
+        return create_dummy_verify_input(
+            spec_algorithm=mr.spec_algorithm,
+            custom_mask=custom_mask,
+            num_tokens_per_req=num_tokens_per_req,
+            is_draft_worker=mr.is_draft_worker,
+        )
+    if not mr.is_draft_worker:
+        return None
+    return create_dummy_draft_extend_input(model_runner=mr, num_tokens=num_tokens)

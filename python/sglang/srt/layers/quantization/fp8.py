@@ -522,7 +522,6 @@ class Fp8LinearMethod(LinearMethodBase):
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
-        # Set by a model-owned startup hook after opting into prefill tuning.
         self.mxfp8_prefill_autotune_min_tokens = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
@@ -548,6 +547,8 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
                 self.mxfp8_dense_backend
             )
+            if self.mxfp8_dense_backend.is_flashinfer_cutedsl():
+                self.mxfp8_prefill_autotune_min_tokens = 4096
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )

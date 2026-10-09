@@ -344,8 +344,6 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     "block-fp8-as-MXFP8 prefill tuning needs the FlashInfer CuTe-DSL kernel",
 )
 class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
-    """The startup hook that tunes those layers for the prefill M buckets."""
-
     def setUp(self):
         super().setUp()
         patcher = mock.patch.object(
@@ -362,33 +360,6 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
         layer, _ = _build_block32_layer(n, k, keep_plain_weight_layout)
         layer.quant_method.process_weights_after_loading(layer)
         return layer
-
-    def test_model_hook_deduplicates_ready_block_fp8_weights(self):
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
-        layers = torch.nn.ModuleList()
-        methods = []
-        for _ in range(2):
-            layer = self._ready_layer(128, 128)
-            methods.append(layer.quant_method)
-            layer.quant_method.apply = mock.Mock()
-            layers.append(layer)
-        # An unprepared layer intentionally has no swizzled scale buffer.
-        fallback = self._ready_layer(128, 128, keep_plain_weight_layout=True)
-        layers.append(fallback)
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"), model=layers
-        )
-        count = DeepseekV4ForCausalLM.autotune_prefill_kernels(
-            model, 4096, dtype=torch.bfloat16
-        )
-        self.assertEqual(count, 1)
-        methods[0].apply.assert_called_once()
-        self.assertEqual(methods[0].apply.call_args.args[1].shape, (4096, 128))
-        methods[1].apply.assert_not_called()
-        for method in methods:
-            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
-        self.assertIsNone(fallback.quant_method.mxfp8_prefill_autotune_min_tokens)
 
     def test_block_fp8_dispatch_keeps_decode_and_determinism_pinned(self):
         layer = self._ready_layer(128, 128)
@@ -427,8 +398,6 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
         stamped min_tokens the output has to stay bit-for-bit what it was."""
         from flashinfer.autotuner import autotune
 
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
         runtime_patch = mock.patch(
             "sglang.srt.runtime_context.get_exec",
             return_value=SimpleNamespace(
@@ -441,15 +410,11 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
         method = layer.quant_method
         x = torch.randn(6, 5120, device="cuda", dtype=torch.bfloat16)
         original = method.apply(layer, x)
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"),
-            model=torch.nn.ModuleList([layer]),
-        )
-        with autotune(True):
-            DeepseekV4ForCausalLM.autotune_prefill_kernels(
-                model, 4096, dtype=torch.bfloat16
-            )
         self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+        with autotune(True):
+            method.apply(
+                layer, torch.zeros(4096, 5120, device="cuda", dtype=torch.bfloat16)
+            )
         torch.testing.assert_close(method.apply(layer, x), original, rtol=0, atol=0)
 
 

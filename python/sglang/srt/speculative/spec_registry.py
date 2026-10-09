@@ -99,6 +99,9 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
+    def supports_dummy_draft_extend(self) -> bool:
+        return False
+
     def supports_prefill_shared_read_done(self) -> bool:
         # Whether target EXTEND has no later speculative shared-buffer reader.
         return False
