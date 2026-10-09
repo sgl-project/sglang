@@ -59,7 +59,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     @abstractmethod
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
@@ -81,10 +81,12 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
-        """One token per row from ``step_logits(base_logits, bias)``: the argmax
-        at temperature 0, a Gumbel-max sample otherwise. ``logits_out`` receives
-        this rank's step logits, in the layout ``gather_vocab`` takes."""
+        """One token per row from the step logits ``base_logits + bias``,
+        rounded to ``step_logits_dtype``: the argmax at temperature 0, a
+        Gumbel-max sample otherwise. ``logits_out`` receives this rank's step
+        logits, in the layout ``gather_vocab`` takes."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -94,6 +96,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             step=step,
             step_dtype=self.step_logits_dtype(base_logits.dtype, bias.dtype),
             logits_out=logits_out,
+            has_sampled_rows=has_sampled_rows,
             **self._vocab_shard_args(),
         )
 
@@ -124,13 +127,13 @@ class VanillaMarkov(BaseDSparkMarkovHead):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids)), state
+        return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
 
 class Nemotron35VanillaMarkov(VanillaMarkov):
@@ -184,13 +187,13 @@ class GatedMarkovHead(VanillaMarkov):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        prev_embeddings = self.get_prev_embeddings(token_ids)
-        gate = self.compute_gate(token_ids, hidden_states).to(
+        prev_embeddings = self.get_prev_embeddings(prev_tokens)
+        gate = self.compute_gate(prev_tokens, hidden_states).to(
             dtype=prev_embeddings.dtype
         )
         return self.project_bias(gate * prev_embeddings), state
@@ -231,12 +234,12 @@ class RNNHead(VanillaMarkov):
 
     def step_bias(
         self,
-        token_ids: torch.Tensor,
+        prev_tokens: torch.Tensor,
         *,
         hidden_states: Optional[torch.Tensor],
         state: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        prev_emb = self.get_prev_embeddings(token_ids)
+        prev_emb = self.get_prev_embeddings(prev_tokens)
         state, bias = self._rnn_step(state, prev_emb, hidden_states)
         return bias, state
 

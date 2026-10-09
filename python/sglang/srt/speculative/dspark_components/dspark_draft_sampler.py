@@ -143,6 +143,15 @@ class DsparkDraftSampler:
         )
 
 
+def _step_logits_dtype(model) -> torch.dtype:
+    markov_dtype = next(model.markov_head.parameters()).dtype
+    # A quantized lm_head's packed weight carries no logits dtype; its kernel
+    # emits the activation dtype, the draft's own parameter dtype.
+    weight = model.lm_head.weight
+    base_dtype = weight.dtype if weight.is_floating_point() else markov_dtype
+    return model.markov_head.step_logits_dtype(base_dtype, markov_dtype)
+
+
 def _resolve_folded_sampling(
     *, model, gamma, max_bs, device, tp_rank, available_memory_gb: float
 ) -> bool:
@@ -154,10 +163,10 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
-    # Upper bound: FP32 step logits over the whole vocab; a sharded head keeps
-    # only its slice.
+    # Upper bound: the whole vocab, though a sharded head keeps only its slice.
     vocab = int(model.lm_head.org_vocab_size)
-    need_gb = max_bs * gamma * vocab * 4 / (1 << 30)
+    itemsize = _step_logits_dtype(model).itemsize
+    need_gb = max_bs * gamma * vocab * itemsize / (1 << 30)
     if available_memory_gb - need_gb >= DRAFT_CAPTURE_MIN_FREE_GB:
         return True
     if tp_rank == 0:

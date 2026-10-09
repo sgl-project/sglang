@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -122,11 +124,15 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 class TestDsparkFoldedSamplingDefault(CustomTestCase):
     def test_auto_folds_sampling_when_buffers_fit(self):
         from sglang.srt.environ import DsparkFoldedSampling, envs
+        from sglang.srt.models.dspark import VanillaMarkov
         from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
             _resolve_folded_sampling,
         )
 
-        model = SimpleNamespace(lm_head=SimpleNamespace(org_vocab_size=128))
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
+            markov_head=VanillaMarkov(vocab_size=128, markov_rank=4),
+        )
         args = dict(
             model=model,
             gamma=5,
