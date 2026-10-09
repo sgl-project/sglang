@@ -1609,10 +1609,8 @@ class SchedulerBatchResultProcessor:
             num_non_draft = result.num_non_draft_tokens_per_req
             retained = result.grammar_retained_tokens
             if retained is not None and retained[i] is not None:
-                # A grammar may truncate the committed run. Non-draft tokens
-                # ahead of the tracked verify window (UNO's root) are committed
-                # but never snapshotted, so they are excluded here as in the
-                # else-branch.
+                # NOTE(kpham-sgl): grammar-truncated run, minus non-draft
+                # tokens ahead of the tracked verify window (UNO's root).
                 num_committed = max(len(retained[i]) - (num_non_draft - 1), 0)
             else:
                 num_committed = result.num_correct_drafts_per_req_cpu[i] + 1
