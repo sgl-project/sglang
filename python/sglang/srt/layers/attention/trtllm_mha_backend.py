@@ -1864,7 +1864,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         page_table_override=page_table[:prefix_reqs],
                     )
                     # Eager DP batches can pad Q without adding requests.
-                    # Decode requires exactly one query row per tail request.
                     tail_end = prefix_tokens + (
                         self.forward_metadata.cache_seqlens_int32.shape[0] - prefix_reqs
                     )
