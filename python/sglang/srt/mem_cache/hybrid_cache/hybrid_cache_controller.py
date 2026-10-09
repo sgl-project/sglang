@@ -88,7 +88,6 @@ class PPPrefetchTicket:
     prefix_keys: Optional[List[str]]
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
-    storage_hit_count: int = 0
 
 
 class PPPrefetchDecision(Enum):
@@ -311,7 +310,6 @@ class HybridCacheController(BaseHiCacheController):
             )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"
-            and storage_backend == "mooncake"
             and self.pp_group is not None
             and torch.distributed.get_world_size(group=self.pp_group) > 1
         )
@@ -1082,32 +1080,8 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=pool_transfers,
         )
 
-        storage_hit_count = len(ticket.prefetch_key.token_ids)
-        try:
-            config = self.storage_config
-            for pp_rank in range(config.tp_rank, config.pp_size, config.tp_size):
-                _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
-                storage_hit_count = min(storage_hit_count, rank_hit_count)
-        except Exception:
-            logger.exception("PP HiCache hit query failed for req=%s.", rid)
-            storage_hit_count = 0
-
-        pp_group_ranks = set(torch.distributed.get_process_group_ranks(self.pp_group))
-        local_groups = [
-            group
-            for group in self.prefetch_hits_sync_groups
-            if set(torch.distributed.get_process_group_ranks(group)) != pp_group_ranks
-        ]
-        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce(hit_tensor, torch.distributed.ReduceOp.MIN, local_groups)
-        storage_hit_count = int(hit_tensor.item())
-        storage_hit_count -= storage_hit_count % self.page_size
-        if storage_hit_count < self.prefetch_threshold:
-            with self.pp_prefetch_state_lock:
-                self.pp_prefetch_decisions[rid] = PPPrefetchDecision.SKIPPED
-            return PrefetchSubmission(decision=False)
-
-        ticket.storage_hit_count = storage_hit_count
+        # Every rank queries and allocates in ticket order on the worker.
+        # Admission waits for the normal completion ACK, including misses.
         operation.is_pp_broadcast = True
         state = PPPrefetchState(ticket=ticket, operation=operation)
         with self.pp_prefetch_state_lock:
@@ -1139,7 +1113,7 @@ class HybridCacheController(BaseHiCacheController):
                 allocated.append((name, indices))
             return indices
 
-        host_indices = alloc(PoolName.KV, ticket.storage_hit_count)
+        host_indices = alloc(PoolName.KV, operation.storage_hit_count)
         if host_indices is None:
             return False
 
@@ -1158,7 +1132,7 @@ class HybridCacheController(BaseHiCacheController):
                         spec.num_slots,
                         min(
                             len(spec.keys or []),
-                            ticket.storage_hit_count // self.page_size,
+                            operation.storage_hit_count // self.page_size,
                         ),
                     )
                 if indices is None:
@@ -1262,7 +1236,6 @@ class HybridCacheController(BaseHiCacheController):
                     objects = [self.pp_prefetch_command_queue.get(timeout=60)]
                 except Empty:
                     pass  # Complete idle broadcasts before the group times out.
-            operation = None
             try:
                 objects = broadcast_pyobj(objects, rank, group, src=source)
                 if not objects:
@@ -1301,29 +1274,51 @@ class HybridCacheController(BaseHiCacheController):
                         self.pp_prefetch_decisions.pop(rid)
                     operation = state.operation
 
-                operation.hash_value = get_storage_hash_str(
-                    ticket.prefetch_key,
-                    ticket.last_hash,
-                    page_size=self.page_size,
-                )[: ticket.storage_hit_count // self.page_size]
-                operation.all_hash_values = list(operation.hash_value)
-                operation.storage_hit_count = ticket.storage_hit_count
+                try:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    storage_hit_count -= storage_hit_count % self.page_size
+                    operation.storage_hit_count = storage_hit_count
+                    if (
+                        storage_hit_count == 0
+                        or storage_hit_count < self.prefetch_threshold
+                        or not self._allocate_pp_prefetch_buffers(ticket, operation)
+                    ):
+                        storage_hit_count = 0
+                except Exception:
+                    logger.exception(
+                        "PP HiCache query or allocation failed for req=%s.", rid
+                    )
+                    operation.query_pool_hit_pages = {}
+                    hash_value, storage_hit_count = [], 0
+
+                # A failed query/allocation votes zero in the same MIN as hits.
+                storage_hit_count = self._sync_prefetch_hit_query(
+                    operation, storage_hit_count
+                )
+                if operation.host_indices is not None:
+                    tail = operation.host_indices[storage_hit_count:]
+                    if tail.numel():
+                        self.mem_pool_host.free(tail, pool=PoolName.KV)
+                        self.prefetch_tokens_occupied -= len(tail)
+                        operation.host_indices = operation.host_indices[
+                            :storage_hit_count
+                        ]
+                operation.hash_value = hash_value[: storage_hit_count // self.page_size]
+                operation.storage_hit_count = storage_hit_count
                 operation.storage_start = len(ticket.matched_prefix_tokens)
                 operation.pool_storage_result = PoolTransferResult.empty()
-                if not self._allocate_pp_prefetch_buffers(ticket, operation):
-                    operation.host_indices = torch.empty(0, dtype=torch.int64)
+                if storage_hit_count == 0:
+                    if operation.host_indices is None:
+                        operation.host_indices = torch.empty(0, dtype=torch.int64)
                     operation.mark_terminate()
+                if operation.pool_transfers:
+                    self._resolve_sidecar_kv_derived_pool_transfers(operation)
                 self.prefetch_buffer.put(operation)
             except Exception:
                 logger.exception("PP HiCache ticket processing failed.")
-                if operation is None or not operation.hash_value:
-                    # Without a received ticket/ACK schedule, continuing is unsafe.
-                    return
-                if operation.host_indices is None:
-                    operation.host_indices = torch.empty(0, dtype=torch.int64)
-                operation.mark_terminate()
-                # Preserve every KV/sidecar ACK even when local allocation fails.
-                self.prefetch_buffer.put(operation)
+                # Query/allocation failures already follow the agreed ACK path.
+                # An unexpected failure cannot safely continue the collectives.
+                return
             finally:
                 if is_source and objects:
                     self.pp_prefetch_command_queue.task_done()
@@ -1346,9 +1341,7 @@ class HybridCacheController(BaseHiCacheController):
         self.backup_queue.put(operation)
         return operation.id
 
-    def _storage_hit_query(
-        self, operation, pp_rank: Optional[int] = None
-    ) -> tuple[list[str], int]:
+    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
@@ -1365,7 +1358,6 @@ class HybridCacheController(BaseHiCacheController):
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1685,7 +1677,7 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
-            if transfer.host_indices is None:
+            if transfer.host_indices is None or transfer.indices_from_pool is not None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
             pool_page_size = (
