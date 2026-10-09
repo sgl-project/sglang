@@ -291,6 +291,22 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+# FlashInfer's JIT dispatch has no float32 entry, so an fp32 model only
+# surfaces as a bare KeyError deep in CUDA-graph capture. Gate it up front.
+_FLASHINFER_SUPPORTED_MODEL_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _validate_model_dtype(model_dtype: torch.dtype) -> None:
+    if model_dtype not in _FLASHINFER_SUPPORTED_MODEL_DTYPES:
+        raise ValueError(
+            f"The FlashInfer attention backend does not support model dtype "
+            f"{model_dtype}; its kernels are compiled for float16 and bfloat16 "
+            f'only. Run with --dtype float16 or bfloat16 ("auto" downcasts '
+            f"float32 checkpoints to float16), or pick an attention backend "
+            f"with float32 support, e.g. --attention-backend torch_native."
+        )
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -307,6 +323,7 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
+        _validate_model_dtype(model_runner.dtype)
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
