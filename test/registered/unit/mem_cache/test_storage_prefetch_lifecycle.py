@@ -51,7 +51,6 @@ def _staged_fixture(full_match=2):
         inc_full_pin=Mock(),
         dec_full_pin=Mock(),
         empty_match_result=SimpleNamespace(last_device_node=0),
-        empty_device_indices=torch.arange(0),
     )
     cache.host_memory_mode = "buffer_only"
     cache.linker = None

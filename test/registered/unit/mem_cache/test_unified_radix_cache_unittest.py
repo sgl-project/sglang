@@ -310,6 +310,103 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class _PagedFullComponent(FullComponent):
+    """FULL component whose device values are not backed one-to-one by pool
+    rows: a value lists two entries per row, and the component can hand rows
+    of a node back to the allocator while the value stays on device."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rows_handed_back: dict[int, int] = {}
+
+    def reclaimable_tokens(self, node):
+        return self.value_len(node) // 2 - self.rows_handed_back.get(node.id, 0)
+
+
+class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
+    def test_ledgers_count_reclaimable_tokens(self):
+        """The evictable and protected ledgers are in the allocator's units:
+        prefill admission adds the evictable ledger to the allocator's free
+        space and the eviction walk counts them toward its request. So every
+        ledger site (insert, lock, release, an in-place change, eviction)
+        reads ``TreeComponent.reclaimable_tokens`` rather than the value
+        length. A site that goes back to ``len(value)`` drifts the ledger from
+        the recount in ``sanity_check`` for a component that overrides it."""
+        cache, allocator, _ = build_fixture(
+            CacheConfig(),
+            component_registry_override={ComponentType.FULL: _PagedFullComponent},
+            tree_core_backend="python",
+        )
+        component = cache.components[ComponentType.FULL]
+
+        def ledgers():
+            cache.sanity_check()
+            return cache.evictable_size(), cache.protected_size()
+
+        tokens = array("q", range(1, 9))
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        self.assertEqual(ledgers(), (4, 0))
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+        lock_params = cache.inc_lock_ref(leaf).to_dec_params()
+        self.assertEqual(ledgers(), (0, 4))
+
+        # The figure changes in place, without a lock transition.
+        component.rows_handed_back[leaf] = 1
+        cache.tree_core.adjust_component_ledger(
+            node=cache.tree_core.node_by_id(leaf),
+            component_type=ComponentType.FULL,
+            delta=-1,
+        )
+        self.assertEqual(ledgers(), (0, 3))
+
+        cache.dec_lock_ref(leaf, lock_params)
+        self.assertEqual(ledgers(), (3, 0))
+
+        # The eviction walk is satisfied by what the node reclaims, not by
+        # its value length.
+        cache.evict(EvictParams(num_tokens=3))
+        self.assertEqual(ledgers(), (0, 0))
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(tokens))
+            ).device_prefix_len,
+            0,
+        )
+
+
+class TestDisabledUnifiedRadixCache(CustomTestCase):
+    def _params(self, disable):
+        return CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=disable,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+            enable_kv_cache_events=True,
+            eviction_policy="lru",
+            eviction_policy_config={"not_an_lru_option": 1},
+        )
+
+    def test_disabled_cache_skips_events_and_eviction_config(self):
+        cache = UnifiedRadixCache(params=self._params(disable=True))
+        cache.reset()
+        self.assertEqual(cache.take_events(), [])
+
+        with self.assertRaises(TypeError):
+            UnifiedRadixCache(params=self._params(disable=False))
+
+
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists (#26177)."""
@@ -3503,9 +3600,9 @@ class UnifiedRadixCacheSuite:
                 # A load-back committing here reads the path again for its
                 # slot-ownership check.
                 collect_indices.assert_called()
-        new_indices = (
-            cache.tree_core.empty_device_indices if loaded is None else loaded[0]
-        )
+        loaded_len, last_node = (0, req.last_node) if loaded is None else loaded
+        path = cache.path_device_indices(last_node)
+        new_indices = path[len(path) - loaded_len :]
         if on_dispatched is not None:
             on_dispatched()
         # Batch formation flushes the queued load into the batch's producer.
@@ -4253,6 +4350,120 @@ class UnifiedRadixCacheSuite:
             self.assertEqual(self._host_avail_sizes(cache), avail0)
         cache.sanity_check()
 
+    def _drain_buffer_writes(self, cache):
+        pipeline = cache.buffer_pipeline
+        self._pump_hicache_until(
+            cache,
+            lambda: (
+                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
+            ),
+            "buffer backup pipeline did not drain",
+        )
+        self.assertFalse(pipeline.pending_write_queue)
+        self.assertFalse(pipeline._queued_span_refs)
+        self.assertEqual(pipeline.write_backlog_tokens_, 0)
+        self.assertEqual(pipeline.write_staged_tokens_, 0)
+
+    def test_buffer_only_split_intent_writes_every_piece(self):
+        """Repeated splits preserve every pool's write once, parents first."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        pipeline = cache.buffer_pipeline
+        ps = self.cfg.page_size
+
+        seq = self._buffer_swa_seq(min_pages=4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        span_hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        aux_keys = _aux_storage_key_transfers(cache, leaf)
+        _write_backup(cache, leaf)
+        expected_keys = [
+            (i.pool, key) for i in pipeline.pending_write_queue for key in i.keys
+        ]
+        # SWA may already have split the leaf at its window boundary.
+        end = len(seq)
+        for node in reversed(chain):
+            node_len = _node_key_length(cache, node)
+            if node_len >= 3 * ps:
+                break
+            end -= node_len
+        else:
+            self.fail("no node of three pages to split")
+        for offset in (1, 2):
+            split_at = end - node_len + offset * ps
+            self._insert(
+                cache,
+                allocator,
+                req_to_token_pool,
+                seq[:split_at] + self._make_seq(9000, 2),
+            )
+            self.assertEqual(_node_key_length(cache, node), end - split_at)
+            _write_backup(cache, _node_parent(cache, node))
+
+        pipeline._refresh_pending_backup_intents()
+        kv_order = [
+            intent.snapshot.node_id
+            for intent in pipeline.pending_write_queue
+            if intent.pool == PoolName.KV
+        ]
+        self.assertEqual(kv_order, self._path_chain(cache, leaf))
+        self.assertCountEqual(
+            [(i.pool, key) for i in pipeline.pending_write_queue for key in i.keys],
+            expected_keys,
+        )
+        self.assertEqual(pipeline.write_backlog_tokens_, len(seq))
+        self._drain_buffer_writes(cache)
+        self.assertEqual(
+            self._storage_exists_count(cache, span_hashes, aux_keys), len(span_hashes)
+        )
+        cache.sanity_check()
+
+    def test_buffer_only_finish_writes_prompt_and_output(self):
+        """The finish-path split preserves both prompt and output writes."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("only FULL-only caches split the leaf at the prompt")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir)
+        cache.tree_core.write_through_threshold = 1  # the write_through trigger
+
+        req = self._make_req(req_to_token_pool)
+        prompt = self._make_seq(1, 6)
+        output = self._make_seq(3000, 4)
+        req.origin_input_ids = array("q", prompt)
+        req.output_ids = array("q", output)
+        req.full_untruncated_fill_ids = array("q", prompt + output)
+        req.extend_end = len(prompt) + len(output)
+        kv_len = req.extend_end
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
+        req.kv.kv_allocated_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        finish_req(cache, req, kv_len)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prompt + output)))
+        ).last_device_node
+        chain = self._path_chain(cache, leaf)
+        self.assertEqual(
+            [_node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
+        )
+        self._drain_buffer_writes(cache)
+        hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
+        cache.sanity_check()
+
     @staticmethod
     def _writes_by_pool(write_storage, extra):
         """Key tuples of the KV writes and of the ``extra`` pool's writes
@@ -4499,16 +4710,16 @@ class UnifiedRadixCacheSuite:
         req.last_node = cons.root_node_handle()
         req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        spliced, _last = cons.init_load_back(
+        spliced_len, spliced_node = cons.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=held.num_tokens, req=req
             )
         )
-        self.assertEqual(int(spliced.numel()), len(seq))
+        self.assertEqual(spliced_len, len(seq))
         cons.ready_to_load_host_cache()
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        self.assertTrue(
-            torch.equal(cons.path_device_indices(m.last_device_node), spliced)
+        self.assertEqual(
+            (m.device_prefix_len, m.last_device_node), (len(seq), spliced_node)
         )
 
         # Ack: bounce freed, beliefs fed, tree holds no host values, and the
@@ -4890,12 +5101,13 @@ class UnifiedRadixCacheSuite:
         req.last_node = cons.root_node_handle()
         req.prefix_len = held.matched_len
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        spliced, last_node = cons.init_load_back(
+        spliced_len, last_node = cons.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=held.num_tokens, req=req
             )
         )
-        self.assertEqual(int(spliced.numel()), len(seq), "load-back degraded")
+        self.assertEqual(spliced_len, len(seq), "load-back degraded")
+        spliced = cons.path_device_indices(last_node)
         cons.ready_to_load_host_cache()
         cons.inc_lock_ref(last_node)  # the admission lock
 
@@ -6694,7 +6906,7 @@ class UnifiedRadixCacheSuite:
         # returns the node's still-device-resident KV.
         req = self._make_req(req_to_token_pool)
         self._apply_match_to_req(req, m)
-        new_indices, last_node = cache.init_load_back(
+        loaded_len, last_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=m.best_match_node,
                 host_hit_length=m.host_hit_length,
@@ -6702,7 +6914,7 @@ class UnifiedRadixCacheSuite:
             )
         )
         self.assertEqual(last_node, node)
-        self.assertEqual(m.device_prefix_len + len(new_indices), len(seq_a))
+        self.assertEqual(m.device_prefix_len + loaded_len, len(seq_a))
         self.assertIsNotNone(
             _device_value(cache, node, ComponentType.MAMBA),
             "mamba state revived on device",
@@ -6826,7 +7038,7 @@ class UnifiedRadixCacheSuite:
         # the node's still-resident full KV serves the prefix.
         req = self._make_req(req_to_token_pool)
         self._apply_match_to_req(req, m)
-        new_indices, last_node = cache.init_load_back(
+        loaded_len, last_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=m.best_match_node,
                 host_hit_length=m.host_hit_length,
@@ -6834,7 +7046,7 @@ class UnifiedRadixCacheSuite:
             )
         )
         self.assertEqual(last_node, node)
-        self.assertEqual(m.device_prefix_len + len(new_indices), len(seq_a))
+        self.assertEqual(m.device_prefix_len + loaded_len, len(seq_a))
         self.assertIsNotNone(
             _device_value(cache, node, ComponentType.SWA),
             "SWA KV revived on device",
@@ -7669,7 +7881,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        loaded_len, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -7678,7 +7890,7 @@ class UnifiedRadixCacheSuite:
         )
 
         self.assertEqual(new_node, leaf)
-        self.assertEqual(req.prefix_len + len(new_indices), len(tokens))
+        self.assertEqual(req.prefix_len + loaded_len, len(tokens))
         self.assertIsNotNone(_device_value(cache, leaf, ComponentType.MAMBA))
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
@@ -7710,7 +7922,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        loaded_len, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -7719,8 +7931,9 @@ class UnifiedRadixCacheSuite:
         )
 
         self.assertEqual(new_node, leaf)
+        new_indices = cache.path_device_indices(new_node)[req.prefix_len :]
         self.assertEqual(new_indices.tolist(), leaf_full.tolist())
-        self.assertEqual(req.prefix_len + len(new_indices), len(tokens))
+        self.assertEqual(req.prefix_len + loaded_len, len(tokens))
         self.assertEqual(
             _device_value(cache, leaf, ComponentType.FULL).tolist(),
             leaf_full.tolist(),
@@ -7752,7 +7965,7 @@ class UnifiedRadixCacheSuite:
         # (that allocation is what a called-off load-back must free + not publish).
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        new_indices, new_node = cache.init_load_back(
+        loaded_len, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -7762,7 +7975,7 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(loaded_len, 0)
         self.assertEqual(new_node, match.last_device_node)
         self.assertIsNone(_device_value(cache, leaf, ComponentType.FULL))
         self.assertIsNone(_device_value(cache, leaf, ComponentType.MAMBA))
@@ -7796,7 +8009,7 @@ class UnifiedRadixCacheSuite:
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            new_indices, _ = cache.init_load_back(
+            loaded_len, _ = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -7805,7 +8018,7 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(loaded_len, 0)
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -7843,7 +8056,7 @@ class UnifiedRadixCacheSuite:
                 cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
             ),
         ):
-            new_indices, _ = cache.init_load_back(
+            loaded_len, _ = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -7852,7 +8065,7 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(loaded_len, 0)
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before

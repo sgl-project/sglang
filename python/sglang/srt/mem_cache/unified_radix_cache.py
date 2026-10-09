@@ -216,9 +216,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
+        tree_params = (
+            replace(
+                params,
+                enable_kv_cache_events=False,
+                eviction_policy="lru",
+                eviction_policy_config=None,
+            )
+            if self.disable
+            else params
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
-            params=params,
+            params=tree_params,
             components=self.components,
         )
         # Components execute boundary actions through the tree core.
@@ -598,6 +610,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
+        if self.disable:
+            return
+        result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self._apply_cache_actions(result.cache_actions)
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
@@ -3444,10 +3463,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
-        """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node), or None when buffer-mode
-        admission must retry without committing a load."""
+    ) -> Optional[tuple[int, NodeId]]:
+        """Only buffer mode returns None: its admission retries without
+        committing a load."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3471,22 +3489,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id, last_best_match_device_node_id
                 )
                 if new_indices.numel() == 0:
-                    return (
-                        self.tree_core.empty_device_indices,
-                        last_best_match_device_node_id,
-                    )
+                    return 0, last_best_match_device_node_id
 
                 logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node_id,
                 )
-                return new_indices, best_match_node_id
+                return len(new_indices), best_match_node_id
 
-        return (
-            self.tree_core.empty_device_indices,
-            last_best_match_device_node_id,
-        )
+        return 0, last_best_match_device_node_id
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""

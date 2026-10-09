@@ -1034,10 +1034,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         return self._empty_match_result
 
-    @property
-    def empty_device_indices(self) -> torch.Tensor:
-        return self._empty_device_indices
-
     def is_full_device_evicted(self, node_id: NodeId) -> bool:
         """Whether the node's FULL device value has been evicted."""
         return self.node_by_id(node_id).evicted
@@ -1500,7 +1496,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
+            BASE_COMPONENT_TYPE
+        ].reclaimable_tokens(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1520,8 +1518,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ct = BASE_COMPONENT_TYPE
         cd = node.component_data[ct]
         assert cd.value is None
-        n = len(fresh_value)
         cd.value = fresh_value.clone()
+        n = self.components_by_type[ct].reclaimable_tokens(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -2866,10 +2864,28 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
+        ledger = self.components_by_type[component_type].reclaimable_tokens(node)
         if cd.lock_ref > 0:
-            self.component_protected_size_[component_type] += len(value)
+            self.component_protected_size_[component_type] += ledger
         else:
-            self.component_evictable_size_[component_type] += len(value)
+            self.component_evictable_size_[component_type] += ledger
+
+    def adjust_component_ledger(
+        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    ) -> None:
+        """A component changed how many pool tokens evicting ``node`` would
+        reclaim (``TreeComponent.reclaimable_tokens``) while the value stays
+        on device: move the ledger the node is on by ``delta``. A tombstoned
+        value is on neither ledger."""
+        if delta == 0:
+            return
+        cd = node.component_data[component_type]
+        if cd.value is None:
+            return
+        if cd.lock_ref > 0:
+            self.component_protected_size_[component_type] += delta
+        else:
+            self.component_evictable_size_[component_type] += delta
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -3090,7 +3106,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 cd = n.component_data[ct]
                 if cd.value is not None:
-                    toks = len(cd.value)
+                    toks = self.components_by_type[ct].reclaimable_tokens(n)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:
