@@ -46,7 +46,7 @@ def _flashmla_runnable() -> bool:
 HAS_FLASHMLA = _flashmla_runnable()
 
 register_cuda_ci(
-    est_time=90, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=90, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 IS_CI = is_in_ci()

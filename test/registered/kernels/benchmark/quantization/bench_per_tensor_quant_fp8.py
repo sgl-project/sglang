@@ -11,7 +11,7 @@ from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 try:
