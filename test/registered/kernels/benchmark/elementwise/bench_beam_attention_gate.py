@@ -13,15 +13,25 @@ register_cuda_ci(
 
 
 @marker.parametrize("rows", [1, 16, 64, 128, 1024, 8192], [1, 128])
+@marker.parametrize("packed_gate", [False, True])
 @marker.benchmark("impl", ["triton", "torch"])
-def benchmark(rows: int, impl: str):
+def benchmark(rows: int, packed_gate: bool, impl: str):
     x = torch.randn(rows, 6 * 128, dtype=torch.bfloat16, device="cuda")
-    gate = torch.randn_like(x)
+    if packed_gate:
+        # TP8 QKV+gate widths: Q=768, K=128, V=128, gate=768.
+        gate_source = torch.randn(rows, 1792, dtype=x.dtype, device=x.device)
+    else:
+        gate_source = torch.randn_like(x)
+    gate_start = gate_source.shape[1] - x.shape[1]
     bias = torch.randn(6, dtype=x.dtype, device="cuda")
+    # The marker rotates clones, and a clone of a strided slice is contiguous;
+    # rotate the backing tensor and slice the gate inside the timed call.
     return marker.do_bench(
-        lambda *args: _BEAM_ATTENTION_GATE(*args, backend=KernelBackend(impl)),
-        input_args=(x, gate, bias, 128),
-        memory_args=(x, gate, bias),
+        lambda x, gate_source, bias: _BEAM_ATTENTION_GATE(
+            x, gate_source[:, gate_start:], bias, 128, backend=KernelBackend(impl)
+        ),
+        input_args=(x, gate_source, bias),
+        memory_args=(x, gate_source[:, gate_start:], bias),
         memory_output="out",
     )
 

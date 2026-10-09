@@ -214,6 +214,18 @@ class CustomAllReduceV2:
         self._graph_mode_allowed = False
         self.disabled = False
 
+    def supports_push(self, *, nbytes: int, num_blocks: int) -> bool:
+        """Whether the push plane can hold a payload and its synchronization blocks.
+
+        This checks allocated capacity, not algorithm-selection thresholds or
+        tensor eligibility. Disabled communicators have no usable capacity.
+        """
+        return (
+            not self.disabled
+            and 0 < nbytes <= self.max_push_size
+            and 0 < num_blocks <= self._push_counter.numel()
+        )
+
     def _init_workspace(self) -> None:
         """Slice one symmetric-memory allocation into every shared buffer.
 
