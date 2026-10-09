@@ -21,13 +21,13 @@ This middleware provides rate limiting:
 cd examples/wasm-guest-ratelimit
 ./build.sh
 
-# Deploy (replace file_path with actual path)
+# Deploy (the file must live under a --wasm-module-root directory)
 curl -X POST http://localhost:3000/wasm \
   -H "Content-Type: application/json" \
   -d '{
     "modules": [{
       "name": "ratelimit-middleware",
-      "file_path": "/absolute/path/to/wasm_guest_ratelimit.component.wasm",
+      "file_path": "/srv/wasm-modules/wasm_guest_ratelimit.component.wasm",
       "module_type": "Middleware",
       "attach_points": [{"Middleware": "OnRequest"}]
     }]
