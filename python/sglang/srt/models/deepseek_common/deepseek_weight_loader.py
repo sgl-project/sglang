@@ -36,10 +36,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
 )
-from sglang.srt.layers.quantization.mxfp8_block_convert import dequant_mxfp8_2d_to_bf16
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.mxfp8_block_convert import dequant_mxfp8_2d_to_bf16
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,

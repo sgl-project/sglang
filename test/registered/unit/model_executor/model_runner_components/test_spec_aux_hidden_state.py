@@ -38,7 +38,9 @@ def test_muse_target_layer_id_mapping(target_model_type, draft_architecture, exp
     )
 
 
-def test_an_mtp_depth_named_mtp_num_hidden_layers_counts_as_the_eagle_draft(monkeypatch):
+def test_an_mtp_depth_named_mtp_num_hidden_layers_counts_as_the_eagle_draft(
+    monkeypatch,
+):
     """Qwen3.5 names its MTP depth mtp_num_hidden_layers. Read as no draft, the target's
     KV budget leaves the draft's pool, of the target's token count, outside
     mem_fraction_static."""
