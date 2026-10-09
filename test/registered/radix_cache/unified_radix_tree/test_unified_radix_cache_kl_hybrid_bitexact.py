@@ -275,22 +275,26 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     """
 
     tree_core_backend = "python"
+    io_backend = "direct"
+    mem_layout = "page_first_direct"
+    extra_args = []
 
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            *cls.extra_args,
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
             "--hicache-write-policy",
             "write_through",
             "--hicache-io-backend",
-            "direct",
+            cls.io_backend,
             # The mamba host pool only supports page_first and page_first_direct.
             "--hicache-mem-layout",
-            "page_first_direct",
+            cls.mem_layout,
             # Tight pools and a small budget so decode crosses a track boundary and
             # the host tier is actually exercised instead of everything staying
             # resident on device.
@@ -349,51 +353,11 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
 
 
 class TestUnifiedMemoryMXFP8HiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
-    """Same exactness bar for mxfp8 KV on the unified pool with the host tier
-    in the loop: a page restored without its UE8M0 scales dequantizes against
-    stale exponents, and every logprob after the hit drifts.
-    """
+    """MXFP8 scales require the kernel backend and page-first host layout."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = _MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = _base_args() + [
-            "--enable-unified-memory",
-            "--kv-cache-dtype",
-            "mxfp8",
-            "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            "4",
-            "--hicache-write-policy",
-            "write_through",
-            # The MXFP8 host pool moves scales with the staged JIT kernels,
-            # which need io_backend=kernel and the page_first layout.
-            "--hicache-io-backend",
-            "kernel",
-            "--hicache-mem-layout",
-            "page_first",
-            "--chunked-prefill-size",
-            "2048",
-            "--max-total-tokens",
-            "65536",
-            "--max-mamba-cache-size",
-            "500",
-            "--max-running-requests",
-            "4",
-        ]
-        if _MODEL_REVISION:
-            other_args += ["--revision", _MODEL_REVISION]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-            env=unified_radix_tree_server_env(cls.tree_core_backend),
-        )
-        cls.input_ids = get_input_ids(
-            tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
-        )
+    io_backend = "kernel"
+    mem_layout = "page_first"
+    extra_args = ["--enable-unified-memory", "--kv-cache-dtype", "mxfp8"]
 
 
 class TestUnifiedHybridMTPBitExact(CustomTestCase):

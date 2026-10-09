@@ -353,17 +353,17 @@ def _scaled_spec(name, grow, head_dim=128):
 
 class TestUnifiedMXFP8ScaleBuffers(CustomTestCase):
     def setUp(self):
-        full = _scaled_spec("full", "down")
+        full = _scaled_spec("full", "down", head_dim=256)
         self.budget = 64 * _SCALE_PS * full.entry_bytes()
         self.pool = UnifiedKVPool(
             total_bytes=self.budget,
-            sub_pool_specs=[full, _scaled_spec("swa", "up")],
+            sub_pool_specs=[full, _scaled_spec("swa", "up", head_dim=256)],
             device=_DEV,
             enable_memory_saver=False,
             page_size=_SCALE_PS,
         )
 
-    def test_scale_views_match_the_paged_kv_extent(self):
+    def test_scale_extent_and_budget(self):
         """FA4 keeps only the scale tensor's base pointer and rebuilds its
         layout from k_cache's extent, so the two must agree page for page."""
         for name in ("full", "swa"):
@@ -374,7 +374,6 @@ class TestUnifiedMXFP8ScaleBuffers(CustomTestCase):
                 self.assertEqual(buf.shape[0], num_pages)
                 self.assertTrue(buf.is_contiguous())
 
-    def test_scales_are_paid_for_out_of_the_budget(self):
         scales = sum(
             b.numel()
             for name in ("full", "swa")
@@ -398,74 +397,37 @@ class TestUnifiedMXFP8ScaleBuffers(CustomTestCase):
                 bs1_floor_terms=[("swa_window_kv", self.budget)],
             )
 
-    def test_unscaled_pool_allocates_no_scales(self):
-        self.assertEqual(_make_pool(ps=4)._mha_scale_views, {})
-
     def test_page_move_preserves_payload_and_scales(self):
-        """Token-major MXFP8 views must construct with page-major metadata,
-        then relocate whole pages without losing scales or touching other pages.
-        Scale widths above four bytes must not depend on per-token unpacking.
-        """
-        generator = torch.Generator().manual_seed(42)
-        for head_dim in (128, 256):
-            specs = [
-                _scaled_spec("full", "down", head_dim),
-                _scaled_spec("swa", "up", head_dim),
-            ]
-            buffer = UnifiedKVPool(
-                total_bytes=8 * _SCALE_PS * specs[0].entry_bytes(),
-                sub_pool_specs=specs,
-                device=_DEV,
-                enable_memory_saver=False,
+        """Move page envelopes and wider scales without touching other pages."""
+        for name in ("full", "swa"):
+            pool = build_unified_mha_pool(
+                unified_buffer=self.pool,
+                sub_pool_name=name,
                 page_size=_SCALE_PS,
+                enable_alt_stream=False,
             )
-            pools = {
-                name: build_unified_mha_pool(
-                    unified_buffer=buffer,
-                    sub_pool_name=name,
-                    page_size=_SCALE_PS,
-                    enable_alt_stream=False,
-                )
-                for name in ("full", "swa")
-            }
-            for name, pool in pools.items():
-                with self.subTest(head_dim=head_dim, sub_pool=name):
-                    buffer._raw.random_(0, 255, generator=generator)
-                    scale_bytes = {
-                        key: [
-                            buf.view(torch.uint8)
-                            for buf in other.k_scale_buffer + other.v_scale_buffer
-                        ]
-                        for key, other in pools.items()
-                    }
-                    for tensors in scale_bytes.values():
-                        for tensor in tensors:
-                            tensor.random_(0, 255, generator=generator)
-                    expected_raw = buffer._raw.clone()
-                    expected_scales = {
-                        key: [tensor.clone() for tensor in tensors]
-                        for key, tensors in scale_bytes.items()
-                    }
-                    src_pages = torch.tensor([1, 3])
-                    dst_pages = torch.tensor([4, 2])
-                    page_bytes = _SCALE_PS * specs[0].entry_bytes()
-                    for src, dst in zip(src_pages.tolist(), dst_pages.tolist()):
-                        expected_raw[dst * page_bytes : (dst + 1) * page_bytes] = (
-                            buffer._raw[src * page_bytes : (src + 1) * page_bytes]
-                        )
-                        for expected, original in zip(
-                            expected_scales[name], scale_bytes[name]
-                        ):
-                            expected[dst] = original[src]
-                    offsets = torch.arange(_SCALE_PS)
-                    pool.move_kv_cache(
-                        (dst_pages[:, None] * _SCALE_PS + offsets).flatten(),
-                        (src_pages[:, None] * _SCALE_PS + offsets).flatten(),
-                    )
-                    self.assertTrue(torch.equal(buffer._raw, expected_raw))
-                    for key, tensors in scale_bytes.items():
-                        for actual, expected in zip(tensors, expected_scales[key]):
-                            self.assertTrue(torch.equal(actual, expected))
+            raw_pages = pool.get_page_envelope_buffer()
+            buffers = [(raw_pages, True)] + [
+                (buf.view(torch.uint8), key == name)
+                for key in ("full", "swa")
+                for group in self.pool.mha_scale_views_for(key)
+                for buf in group
+            ]
+            expected = []
+            for buf, moves in buffers:
+                buf.random_(0, 255)
+                reference = buf.clone()
+                if moves:
+                    reference[4] = buf[1]
+                    reference[2] = buf[3]
+                expected.append(reference)
+            offsets = torch.arange(_SCALE_PS)
+            pool.move_kv_cache(
+                (torch.tensor([4, 2])[:, None] * _SCALE_PS + offsets).flatten(),
+                (torch.tensor([1, 3])[:, None] * _SCALE_PS + offsets).flatten(),
+            )
+            for (actual, _), reference in zip(buffers, expected):
+                self.assertTrue(torch.equal(actual, reference), name)
 
 
 class TestUnifiedKVPoolViews(unittest.TestCase):

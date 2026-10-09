@@ -367,15 +367,6 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
             grow_direction=grow,
         )
 
-    def _random_scales(self, n):
-        return (
-            torch.randint(
-                100, 140, (n, self._H, self._D // self._SBS), dtype=torch.uint8
-            )
-            .cuda()
-            .view(torch.float8_e8m0fnu)
-        )
-
     def test_scales_round_trip_through_the_host_tier(self):
         from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
         from sglang.srt.mem_cache.unified_memory_pool import (
@@ -406,39 +397,26 @@ class TestUnifiedMXFP8ScaleReload(unittest.TestCase):
         self.addCleanup(host.destroy)
 
         loc = torch.arange(3 * self._PS, 4 * self._PS, dtype=torch.int64, device="cuda")
-        payload = (
-            torch.randint(1, 200, (self._PS, self._H, self._D), dtype=torch.uint8)
-            .cuda()
-            .view(torch.float8_e4m3fn)
-        )
-        expected = []
-        for layer in range(self._L):
-            k_sf, v_sf = self._random_scales(self._PS), self._random_scales(self._PS)
-            pool.set_kv_buffer(
-                None, loc, payload, payload, k_sf, v_sf, layer_id_override=layer
-            )
-            expected.append((k_sf, v_sf))
+        scales = [
+            buf.view(torch.uint8) for buf in pool.k_scale_buffer + pool.v_scale_buffer
+        ]
+        for buf in scales:
+            buf.random_(100, 140)
+        expected = [buf[3].clone() for buf in scales]
 
         host_loc = torch.arange(self._PS, dtype=torch.int64, device="cuda")
         host.backup_from_device_all_layer(pool, host_loc, loc, io_backend="kernel")
         torch.cuda.synchronize()
-        for layer in range(self._L):
-            pool.k_scale_buffer[layer].view(torch.uint8).fill_(0)
-            pool.v_scale_buffer[layer].view(torch.uint8).fill_(0)
+        for buf in scales:
+            buf.zero_()
         for layer in range(self._L):
             host.load_to_device_per_layer(
                 pool, host_loc, loc, layer, io_backend="kernel"
             )
         torch.cuda.synchronize()
 
-        for layer, (k_sf, v_sf) in enumerate(expected):
-            got_k, got_v = pool._read_scales(layer, loc)
-            self.assertTrue(
-                torch.equal(got_k.view(torch.uint8), k_sf.view(torch.uint8))
-            )
-            self.assertTrue(
-                torch.equal(got_v.view(torch.uint8), v_sf.view(torch.uint8))
-            )
+        for actual, reference in zip(scales, expected):
+            self.assertTrue(torch.equal(actual[3], reference))
 
 
 if __name__ == "__main__":
