@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import contextlib
 from typing import Optional
 
 import torch
+import triton
 from einops import rearrange
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -21,6 +23,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     input_guard,
     is_intel,
 )
+from sglang.srt.utils import is_gfx1250_supported
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -31,6 +34,22 @@ if is_intel:
     )
 
 CHUNK_SIZE = 64
+
+# gfx1250: Triton's AMD backend lowers the pipelined masked loads of these kernels to
+# global_load_async_to_lds (no bounds check), which faults the GPU during autotune. Compile
+# them without async copy, leaving it on for every other Triton kernel. The knob also sets
+# TRITON_HIP_USE_ASYNC_COPY, which is part of Triton's compile cache key.
+_GDN_NO_ASYNC_COPY = is_gfx1250_supported()
+
+
+@contextlib.contextmanager
+def _gdn_triton_scope():
+    if not _GDN_NO_ASYNC_COPY:
+        yield
+        return
+    with triton.knobs.amd.scope():
+        triton.knobs.amd.use_async_copy = False
+        yield
 
 
 def chunk_gated_delta_rule_fwd(
@@ -107,28 +126,29 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         q_orig = q
         k_orig = k
 
-        if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+        with _gdn_triton_scope():
+            if use_qk_l2norm_in_kernel:
+                q = l2norm_fwd(q)
+                k = l2norm_fwd(k)
 
-        chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-            if cu_seqlens is not None
-            else None
-        )
-        g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            initial_state_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            inplace_update=inplace_update,
-        )
+            chunk_indices = (
+                prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+                if cu_seqlens is not None
+                else None
+            )
+            g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                inplace_update=inplace_update,
+            )
         return o.to(q.dtype), h
 
 
