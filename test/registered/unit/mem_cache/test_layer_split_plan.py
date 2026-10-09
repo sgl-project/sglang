@@ -17,11 +17,10 @@ from sglang.srt.mem_cache.layer_split.layer_split_plan import (
     rotation_base,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
-
-CustomTestCase = unittest.TestCase
 
 PAGE_SIZE = 64
 SHARD_SIZE = 8
@@ -375,3 +374,7 @@ class TestRoundEdges(CustomTestCase):
 
     def test_component_order_is_shared_by_both_directions(self):
         self.assertEqual(EXCHANGE_COMPONENTS, ("target", "indexer"))
+
+
+if __name__ == "__main__":
+    unittest.main()
