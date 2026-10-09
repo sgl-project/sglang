@@ -427,7 +427,28 @@ class LayerNorm(CustomOp):
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
-class FP32LayerNorm(nn.LayerNorm):
+@CustomOp.register("fp32_layer_norm")
+class FP32LayerNorm(CustomOp, nn.LayerNorm):
+    def __init__(
+        self,
+        normalized_shape,
+        eps=1e-5,
+        elementwise_affine=True,
+        bias=True,
+        device=None,
+        dtype=None,
+    ):
+        nn.LayerNorm.__init__(
+            self,
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+        self._forward_method = self.dispatch_forward()
+
     def _cached_fp32_param(
         self, attr: str, param: torch.Tensor | None, device: torch.device
     ) -> torch.Tensor | None:
