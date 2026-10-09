@@ -302,9 +302,11 @@ class StageDeclaration:
             contiguous slice of the rows, it returns them all, in rank order,
             or None to leave the gather to the boundary. Called on every batch,
             so it must be CUDA-graph safe. Across a pipeline boundary the
-            producer's rank takes it from the neighbouring layer it builds on
-            the meta device, so it may use only the communication state of the
-            rank it runs on, not the declaring layer's weights or buffers.
+            producer's rank takes it from the neighbouring stage's declaration
+            (the model's shared declaration function, or, for a model on the
+            transitional list, the layer built again on the meta device), so it
+            may use only the communication state of the rank it runs on, not
+            the declaring layer's weights or buffers.
         previous: The stage whose output this stage consumes, as the stack
             records it: only the facts binding reads of it (see facts_of),
             on this rank or another.
