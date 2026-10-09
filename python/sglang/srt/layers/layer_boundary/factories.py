@@ -50,7 +50,6 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
     NORM_READOUT,
     PLAIN_ADD,
-    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
@@ -200,7 +199,7 @@ def _resolve_ffn(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
     # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update is REPLACE_AT_EXIT or output_complete
+    complete = on_rank_rows or update.writes_stream or output_complete
     produced = (
         OutputContract(rows, update=update, transform=output_transform)
         if complete

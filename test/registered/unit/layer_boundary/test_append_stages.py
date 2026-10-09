@@ -996,6 +996,7 @@ class TestRowsTheConsumerReads(CustomTestCase):
             is_plain_add = False
             applied_at_exit = False
             outlives_layer = True
+            writes_stream = False
 
         # One pipeline rank: an update other than a plain add can't cross one.
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1)

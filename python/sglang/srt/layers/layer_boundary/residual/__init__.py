@@ -31,6 +31,9 @@ class ResidualUpdate(Protocol):
             than leaving the operation for the next prepare.
         outlives_layer: Whether parameters/state remain valid after
             leaving the producer layer, including any offload or state reuse.
+        writes_stream: Whether the producer computes the next stream itself
+            and writes it at its exit, dropping the previous residual: what
+            reaches its exit is already complete.
 
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim is_plain_add.
@@ -46,6 +49,10 @@ class ResidualUpdate(Protocol):
     # Its parameters and state remain valid after leaving the producer layer.
     # Stateful or offloaded implementations must not opt in without that guarantee.
     outlives_layer: bool
+    # The producer builds the next stream itself and writes it at its exit, so
+    # its exit has no sum left to complete and the previous residual is dropped.
+    # Only an update applied at the exit can, and it is not a plain add.
+    writes_stream: bool
 
     def update(self, hidden_states, residual) -> torch.Tensor:
         """Write hidden_states, the producer contribution, into residual.

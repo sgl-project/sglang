@@ -150,6 +150,7 @@ class _AttnUpdate:
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
@@ -198,6 +199,7 @@ class _FfnUpdate:
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
 
     def __init__(self, state: GatedResidualState):
         self.state = state
