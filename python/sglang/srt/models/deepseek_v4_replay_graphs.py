@@ -76,13 +76,17 @@ def _flatten_state(state: HcState):
 
 
 class _ReplayGraph:
-    __slots__ = ("graph", "inputs", "residual", "pre")
+    __slots__ = ("graph", "inputs", "num_token_non_padded", "residual", "pre", "batch")
 
-    def __init__(self, graph, inputs, residual, pre):
+    def __init__(self, graph, inputs, num_token_non_padded, residual, pre, batch):
         self.graph = graph
         self.inputs = inputs
+        # MoE top-k masks rows at or past this count; captured by address.
+        self.num_token_non_padded = num_token_non_padded
         self.residual = residual
         self.pre = pre
+        # The capture batch; kept alive in case a captured kernel reads its tensors.
+        self.batch = batch
 
 
 class DecoderReplayGraphs:
@@ -139,6 +143,8 @@ class DecoderReplayGraphs:
             else:
                 for buf, t in zip(graph.inputs, live):
                     buf[:num_rows].copy_(t)
+                if graph.num_token_non_padded is not None:
+                    graph.num_token_non_padded.fill_(num_rows)
             graph.graph.replay()
         pre = None if graph.pre is None else graph.pre[:num_rows]
         return graph.residual[:num_rows], pre
@@ -171,6 +177,15 @@ class DecoderReplayGraphs:
         for buf, t in zip(inputs, live):
             buf[:num_rows].copy_(t)
         num_state = len(live) - 3
+        # The layers read the step's batch; the copy's count tensor is the graph's.
+        capture_batch = copy.copy(forward_batch)
+        capture_batch.global_num_token_non_padded_cpu = rows
+        num_token_non_padded = None
+        if forward_batch.num_token_non_padded is not None:
+            num_token_non_padded = torch.full_like(
+                forward_batch.num_token_non_padded, num_rows
+            )
+            capture_batch.num_token_non_padded = num_token_non_padded
 
         def body():
             return self._run_layers(
@@ -178,7 +193,7 @@ class DecoderReplayGraphs:
                 positions=inputs[num_state],
                 input_ids=inputs[num_state + 1],
                 input_ids_global=inputs[num_state + 2],
-                forward_batch=forward_batch,
+                forward_batch=capture_batch,
             )
 
         if self._pool is None:
@@ -201,7 +216,9 @@ class DecoderReplayGraphs:
                 residual, pre = body()
         torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
-        replay_graph = _ReplayGraph(graph, inputs, residual, pre)
+        replay_graph = _ReplayGraph(
+            graph, inputs, num_token_non_padded, residual, pre, capture_batch
+        )
         seconds = time.perf_counter() - start
         used = free_before - torch.cuda.mem_get_info()[0]
         self.capture_seconds += seconds

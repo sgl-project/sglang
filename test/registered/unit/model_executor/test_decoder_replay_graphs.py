@@ -67,7 +67,12 @@ class TestReplayRefill(CustomTestCase):
             for buf, t in zip(inputs, live):
                 buf[: t.shape[0]].copy_(t)
             graph = _ReplayGraph(
-                SimpleNamespace(replay=MagicMock()), inputs, inputs[0] * 2, None
+                SimpleNamespace(replay=MagicMock()),
+                inputs,
+                torch.zeros((), dtype=torch.int32),
+                inputs[0] * 2,
+                None,
+                forward_batch,
             )
             captured[key] = graph
             return graph
@@ -95,6 +100,8 @@ class TestReplayRefill(CustomTestCase):
         torch.testing.assert_close(graph.inputs[0][:90], state.streams)
         torch.testing.assert_close(graph.inputs[1][:90], torch.arange(90))
         self.assertEqual(graph.graph.replay.call_count, 2)
+        # MoE top-k must not route the pad rows of this step.
+        self.assertEqual(int(graph.num_token_non_padded), 90)
         self.assertEqual(residual.shape[0], 90)
         self.assertIsNone(pre)
         # The caller's batch is never edited; the breaks read a copy.
