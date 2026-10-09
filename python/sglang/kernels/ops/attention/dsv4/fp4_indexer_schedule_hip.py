@@ -20,6 +20,7 @@ thousand rows, so its scratch cannot be reserved once the KV pool owns the memor
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -62,7 +63,9 @@ def _pad_page_table_tile(
     tl.store(dst_ptr + row * dst_stride + cols, vals, mask=inside)
 
 
-@triton.jit
+# Every runtime arg varies per prefill batch (row count, table widths and strides,
+# view offsets); specializing them made the kernel recompile (~1.5 s) mid-serving.
+@triton.jit(do_not_specialize=range(17))
 def _prefill_schedule_prep_kernel(
     le_ptr,  # [T] int32  local_ends (== c4_seq_lens)
     chunks_ptr,  # [T] int32  out
@@ -145,6 +148,27 @@ def _prefill_schedule_prep_kernel(
             w_dst,
             PT_BLOCK,
         )
+
+
+@functools.cache
+def warmup_prefill_schedule_prep(device: torch.device, block_k: int = 256) -> None:
+    """Compile the prep kernel's BLOCK_T variants (its only ones) before serving."""
+    buf = torch.empty(16, dtype=torch.int32, device=device)
+    pt = buf.view(1, 16)
+    block_t = 16
+    while block_t <= MAX_FUSED_ROWS:
+        _prefill_schedule_prep_kernel.warmup(
+            *[buf] * 7, pt, pt, *[16] * 8,
+            BLOCK_K=block_k, BLOCK_T=block_t, PT_BLOCK=_PT_BLOCK, grid=(1,),
+        )  # fmt: skip
+        block_t *= 2
+    try:  # the same fix for AITER's row plan, which newer AITER ships
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+            warmup_prefill_row_plan,
+        )
+    except ImportError:
+        return
+    warmup_prefill_row_plan(device, block_k)
 
 
 @triton.jit
