@@ -1,9 +1,10 @@
 """Per-step scheduling traces of scripted runs, and a diff of two trace dirs.
 
 With SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR set, every executed script writes
-one JSONL file there: a ``header`` record with the server config the trace
-ran under, then a ``schedule`` record each time the scheduler picks the next
-batch and a ``result`` record each time a batch result is processed.
+one JSONL file there: a ``header`` record with the trace format and the
+server config the trace ran under, then a ``schedule`` record each time the
+scheduler picks the next batch and a ``result`` record each time a batch
+result is processed.
 A schedule record also carries what the scheduler's readers (the idle checks
 behind health check, pause and flush, the in-flight set that abort and weight
 updates reach, and the load report) saw at the top of that scheduler
@@ -20,8 +21,9 @@ different trace dir, then:
 
 SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS (a JSON object such as
 '{"disable_overlap_schedule": true}' or '{"enable_mixed_chunk": true}') runs
-the same tests under another server config. Traces whose headers differ are
-reported as a config mismatch and not compared.
+the same tests under another server config. Traces whose headers differ
+(another config or trace format) are reported as a config mismatch and not
+compared.
 """
 
 from __future__ import annotations
@@ -40,6 +42,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 DIFF_CONTEXT_RECORDS: int = 3
+
+# Bumped whenever records gain, drop or change fields, so a trace written in
+# an older format shows up as a config mismatch instead of a diff.
+TRACE_FORMAT: int = 2
 
 # Server args that decide scheduling, recorded in each trace's header.
 HEADER_SERVER_ARGS = (
@@ -81,6 +87,7 @@ class SchedulingTraceWriter:
         Path(trace_dir).mkdir(parents=True, exist_ok=True)
         extra_kwargs = envs.SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS.get()
         header = {
+            "format": TRACE_FORMAT,
             "extra_engine_kwargs": json.loads(extra_kwargs) if extra_kwargs else {},
             "server_args": {
                 name: getattr(scheduler.server_args, name)
