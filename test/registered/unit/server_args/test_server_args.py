@@ -2209,10 +2209,8 @@ class TestHiCacheArgs(CustomTestCase):
                     enable_mla_hicache_host_dedup=True,
                     hicache_storage_backend=backend,
                 )
-                if backend is not None:
-                    with self.assertRaisesRegex(
-                        ValueError, "requires the file L3 integration"
-                    ):
+                if backend == "mooncake":
+                    with self.assertRaisesRegex(ValueError, "only file storage"):
                         handle_hicache(args)
                 else:
                     handle_hicache(args)

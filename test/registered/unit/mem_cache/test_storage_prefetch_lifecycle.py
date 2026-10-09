@@ -836,6 +836,244 @@ class TestPrefetchQueryFailure(CustomTestCase):
         self.assertTrue(controller.prefetch_hit_queue.empty())
 
 
+class TestDedupStorageReads(CustomTestCase):
+    def test_reattach_replaces_groups_after_detach_or_startup_failure(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        for fail_start in (False, True):
+            with self.subTest(fail_start=fail_start):
+                original = [object(), object()]
+                replacement = [object(), object()]
+                controller = HiCacheController.__new__(HiCacheController)
+                controller.mla_dedup = SimpleNamespace(
+                    prefetch_hits_sync_groups=[original[0]],
+                    prefetch_completion_sync_groups=[original[1]],
+                )
+                controller.prefetch_hits_sync_groups = []
+                controller.prefetch_completion_sync_groups = []
+                controller.enable_storage = False
+                controller.storage_backend = None
+                controller.storage_host_pool = object()
+                controller.mem_pool_host = SimpleNamespace(size=32)
+                controller.page_size = 2
+                controller.host_memory_mode = "cache"
+                controller.storage_stop_event = Event()
+                controller._stop_storage_threads = Mock()
+                controller._start_storage_threads = Mock(
+                    side_effect=[RuntimeError("injected startup failure"), None]
+                    if fail_start
+                    else None
+                )
+                controller._generate_storage_config = Mock(
+                    return_value=SimpleNamespace(is_mla_model=True, tp_rank=0)
+                )
+                controller._create_sync_groups = Mock(
+                    side_effect=[[replacement[0]], [replacement[1]]]
+                )
+                destroyed = []
+                controller._destroy_sync_groups = Mock(side_effect=destroyed.extend)
+                first_backend, second_backend = Mock(), Mock()
+                with patch(
+                    "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend",
+                    side_effect=[first_backend, second_backend],
+                ):
+                    if fail_start:
+                        with self.assertRaisesRegex(RuntimeError, "injected startup"):
+                            controller.attach_storage_backend("file")
+                    else:
+                        controller.attach_storage_backend("file")
+                        controller.detach_storage_backend()
+                    self.assertEqual(destroyed, original)
+                    self.assertFalse(controller.enable_storage)
+                    self.assertIsNone(controller.storage_backend)
+                    self.assertIsNone(controller.mla_dedup.prefetch_hits_sync_groups)
+                    self.assertIsNone(
+                        controller.mla_dedup.prefetch_completion_sync_groups
+                    )
+                    first_backend.close.assert_called_once()
+                    controller._create_sync_groups.assert_not_called()
+
+                    controller.attach_storage_backend("file")
+                    self.assertTrue(controller.enable_storage)
+                    self.assertEqual(
+                        controller.prefetch_hits_sync_groups, replacement[:1]
+                    )
+                    self.assertEqual(
+                        controller.prefetch_completion_sync_groups, replacement[1:]
+                    )
+                    controller.detach_storage_backend()
+                    self.assertEqual(destroyed, original + replacement)
+                    second_backend.close.assert_called_once()
+
+    def test_storage_attach_rejects_unsupported_pools_before_mutation(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mla_dedup = object()
+        controller.enable_storage = False
+        controller.storage_backend = None
+        with self.assertRaisesRegex(ValueError, "only file storage"):
+            HiCacheController.attach_storage_backend(controller, "mooncake")
+        for name, pool in ((PoolName.DRAFT, Mock(spec=MHATokenToKVPoolHost)),):
+            with self.subTest(pool=name):
+                controller.mem_pool_host = SimpleNamespace(
+                    entries=[SimpleNamespace(name=name, host_pool=pool)]
+                )
+                with self.assertRaisesRegex(ValueError, "rank-sharded"):
+                    controller.attach_storage_backend("file")
+                self.assertFalse(controller.enable_storage)
+                self.assertIsNone(controller.storage_backend)
+
+    def test_dummy_reads_skip_only_deduplicated_pools(self):
+        """A dummy indexer must not suppress a rank-local draft's L3 read."""
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        for dummy in (False, True):
+            with self.subTest(dummy=dummy):
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mem_pool_host = SimpleNamespace(
+                    entry_map={
+                        name: SimpleNamespace(
+                            host_pool=SimpleNamespace(
+                                _is_dummy=dummy and name != PoolName.DRAFT
+                            )
+                        )
+                        for name in (PoolName.KV, PoolName.INDEXER, PoolName.DRAFT)
+                    }
+                )
+                controller.page_get_func = Mock(return_value=2)
+                controller.storage_backend = SimpleNamespace(
+                    batch_get_v2=Mock(
+                        return_value={
+                            PoolName.INDEXER: [True, True],
+                            PoolName.DRAFT: [True, False],
+                        }
+                    )
+                )
+                operation = PrefetchOperation(CacheRequestHandle("read", 0), [1, 2])
+                derived = [
+                    PoolTransfer(name=name, indices_from_pool=PoolName.KV)
+                    for name in (PoolName.INDEXER, PoolName.DRAFT)
+                ]
+                hits = controller._page_transfer_kv_batch(
+                    operation,
+                    ["a", "b"],
+                    torch.arange(4),
+                    HiCacheStorageExtraInfo(),
+                    derived,
+                )
+                self.assertEqual(hits, 1)
+                self.assertEqual(controller.page_get_func.call_count, int(not dummy))
+                controller.storage_backend.batch_get_v2.assert_called_once()
+                actual = controller.storage_backend.batch_get_v2.call_args.args[0]
+                self.assertEqual(
+                    [transfer.name for transfer in actual],
+                    [PoolName.DRAFT] if dummy else [PoolName.INDEXER, PoolName.DRAFT],
+                )
+                for transfer in actual:
+                    self.assertEqual(transfer.keys, ["a", "b"])
+                    torch.testing.assert_close(transfer.host_indices, torch.arange(4))
+
+    def test_dummy_trailing_sidecars_keep_logical_hits_and_read_real_state(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        target_names = (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        )
+        for dummy in (False, True):
+            with self.subTest(dummy=dummy):
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.page_size = 2
+                controller.prefetch_sync_queue = Queue()
+                controller.mem_pool_host = SimpleNamespace(
+                    entry_map={
+                        name: SimpleNamespace(
+                            host_pool=SimpleNamespace(
+                                page_size=1,
+                                _is_dummy=dummy and name != PoolName.MAMBA,
+                            )
+                        )
+                        for name in (*target_names, PoolName.MAMBA)
+                    }
+                )
+                seen = []
+
+                def read(transfers, **kwargs):
+                    for transfer in transfers:
+                        # Dummy pools have no host storage, but real rank-local
+                        # state must still participate in storage I/O.
+                        self.assertFalse(
+                            controller.mem_pool_host.entry_map[
+                                transfer.name
+                            ].host_pool._is_dummy
+                        )
+                        self.assertEqual(transfer.keys, ["b"])
+                        seen.append(transfer.name)
+                    return {transfer.name: [True] for transfer in transfers}
+
+                controller.storage_backend = SimpleNamespace(batch_get_v2=read)
+                operation = PrefetchOperation(
+                    CacheRequestHandle("sidecars", 0), [1, 2, 3, 4]
+                )
+                operation.hash_value = ["a", "b"]
+                operation.pool_transfers = [
+                    PoolTransfer(
+                        name=name,
+                        host_indices=torch.tensor([0]),
+                        keys=["old-tail"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                    for name in (*target_names, PoolName.MAMBA)
+                ]
+                controller._page_transfer_sidecar(operation, 2)
+                ack = controller.prefetch_sync_queue.get_nowait()
+                self.assertEqual(
+                    ack.pool_hits,
+                    {name: 1 for name in (*target_names, PoolName.MAMBA)},
+                )
+                self.assertEqual(
+                    seen, [PoolName.MAMBA] if dummy else [*target_names, PoolName.MAMBA]
+                )
+                self.assertTrue(controller.prefetch_sync_queue.empty())
+
+    def test_all_dummy_pools_leave_storage_reads_to_owner(self):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                name: SimpleNamespace(host_pool=SimpleNamespace(_is_dummy=True))
+                for name in (PoolName.KV, PoolName.INDEXER)
+            }
+        )
+        controller.page_get_func = Mock(side_effect=AssertionError("dummy KV read"))
+        controller.storage_backend = SimpleNamespace(
+            batch_get_v2=Mock(side_effect=AssertionError("dummy indexer read"))
+        )
+        hits = controller._page_transfer_kv_batch(
+            PrefetchOperation(CacheRequestHandle("dummy", 0), [1, 2]),
+            ["a", "b"],
+            torch.arange(4),
+            HiCacheStorageExtraInfo(),
+            [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)],
+        )
+        self.assertEqual(hits, 2)
+        controller.page_get_func.assert_not_called()
+        controller.storage_backend.batch_get_v2.assert_not_called()
+
+
 class TestPrefetchTransferFailure(CustomTestCase):
     def test_failed_sidecar_read_emits_ack_and_allows_next_request(self):
         """A failed state read must still publish a verdict for waiting peers."""

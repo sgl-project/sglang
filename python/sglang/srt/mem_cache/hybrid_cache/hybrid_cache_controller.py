@@ -312,6 +312,15 @@ class HybridCacheController(BaseHiCacheController):
             raise ValueError(
                 "Shared MLA host restore currently supports L2 cache only."
             )
+        if self.mla_dedup_enabled and storage_backend == "file":
+            pools = host_pools or getattr(self.mem_pool_host, "entries", ())
+            if any(
+                isinstance(entry.host_pool, MHATokenToKVPoolHost) for entry in pools
+            ):
+                raise ValueError(
+                    "MLA host dedup with file storage does not yet support "
+                    "rank-sharded MHA draft pools."
+                )
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -1494,6 +1503,12 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
+    def _skip_storage_pool_io(self, pool_name: PoolName) -> bool:
+        entry = self.mem_pool_host.entry_map.get(pool_name)
+        if entry is None:
+            return super()._skip_storage_pool_io(pool_name)
+        return bool(getattr(entry.host_pool, "_is_dummy", False))
+
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
         with self.mem_pool_host.layout_lease():
             return self._page_transfer_with_stable_layout(operation)
@@ -1534,12 +1549,26 @@ class HybridCacheController(BaseHiCacheController):
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             try:
-                results = {}
+                # Dummy sidecars have no physical host storage. Keep their
+                # logical hit counts for the existing MIN reduction with the
+                # owner's actual reads; rank-local state still performs I/O.
+                results = {
+                    transfer.name: [True] * len(transfer.keys or ())
+                    for transfer in transfers_nonkv
+                    if self._skip_storage_pool_io(transfer.name)
+                }
+                physical_transfers = [
+                    transfer
+                    for transfer in transfers_nonkv
+                    if not self._skip_storage_pool_io(transfer.name)
+                ]
                 for extra_info, transfers in _trailing_chain_groups(
                     operation.prefix_keys,
                     sidecar_hashes,
-                    transfers_nonkv,
+                    physical_transfers,
                 ):
+                    if not transfers:
+                        continue
                     results.update(
                         self.storage_backend.batch_get_v2(
                             transfers, extra_info=extra_info

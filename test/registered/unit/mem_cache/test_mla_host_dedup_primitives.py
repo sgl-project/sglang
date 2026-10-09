@@ -470,6 +470,30 @@ class TestMLAHostDedupPrimitives(CustomTestCase):
             ],
         )
 
+    def test_storage_group_handoff_does_not_reuse_or_double_destroy(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        context = MLAHostDedupContext(mock.Mock(), ["hits"], ["completion"])
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mla_dedup = context
+        controller._create_sync_groups = mock.Mock(return_value=["reattached"])
+        owned = controller._take_or_create_sync_groups("prefetch_hits_sync_groups")
+        owned += controller._take_or_create_sync_groups(
+            "prefetch_completion_sync_groups"
+        )
+        self.assertEqual(owned, ["hits", "completion"])
+        controller._create_sync_groups.assert_not_called()
+        with mock.patch.object(torch.distributed, "destroy_process_group") as destroy:
+            controller._destroy_sync_groups(owned)
+            context.destroy()
+            self.assertEqual(
+                destroy.call_args_list,
+                [mock.call("hits"), mock.call("completion")],
+            )
+        rebuilt = controller._take_or_create_sync_groups("prefetch_hits_sync_groups")
+        self.assertEqual(rebuilt, ["reattached"])
+        controller._create_sync_groups.assert_called_once()
+
     def test_broadcast_preparation_translates_rank_local_physical_indices(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
         broadcaster.device = "cpu"

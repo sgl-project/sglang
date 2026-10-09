@@ -475,6 +475,14 @@ class HiCacheController:
         return 0, 1
 
     def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+        if self.mla_dedup_enabled:
+            from sglang.srt.mem_cache.mla_host_dedup import (
+                _prebuild_prefetch_sync_groups,
+            )
+
+            return _prebuild_prefetch_sync_groups(
+                self.tp_group, self.attn_cp_group, self.attn_tp_group, self.pp_group
+            )
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         groups: List[torch.distributed.ProcessGroup] = []
@@ -500,6 +508,16 @@ class HiCacheController:
                 )
             )
         return groups
+
+    def _take_or_create_sync_groups(self, field: str):
+        if self.mla_dedup_enabled:
+            groups = getattr(self.mla_dedup, field)
+            if groups is not None:
+                # Controller detach/rollback now owns destruction. A later
+                # attach creates fresh groups rather than reusing freed ones.
+                setattr(self.mla_dedup, field, None)
+                return groups
+        return self._create_sync_groups()
 
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
@@ -619,8 +637,8 @@ class HiCacheController:
             raise ValueError(
                 "Shared MLA host restore currently supports L2 cache only."
             )
-        if self.mla_dedup_enabled:
-            raise ValueError("MLA host dedup storage requires the file L3 integration.")
+        if self.mla_dedup_enabled and storage_backend != "file":
+            raise ValueError("MLA host dedup currently supports only file storage.")
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
@@ -676,8 +694,12 @@ class HiCacheController:
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            self.prefetch_hits_sync_groups = self._take_or_create_sync_groups(
+                "prefetch_hits_sync_groups"
+            )
+            self.prefetch_completion_sync_groups = self._take_or_create_sync_groups(
+                "prefetch_completion_sync_groups"
+            )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -1389,6 +1411,12 @@ class HiCacheController:
             self.prefetch_sync_queue.put(ack)
         return completed_pages
 
+    def _skip_storage_pool_io(self, pool_name: PoolName) -> bool:
+        """Keep logical prefetch progress on ranks without a physical mirror."""
+        return pool_name == PoolName.KV and bool(
+            getattr(getattr(self, "storage_host_pool", None), "_is_dummy", False)
+        )
+
     def _page_transfer_kv_batch(
         self,
         operation: PrefetchOperation,
@@ -1404,9 +1432,14 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
-        # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        # Dummy ranks have no host buffer. Their optimistic count is reduced
+        # with the owner's actual result by the existing batch ACK protocol.
+        kv_hits = (
+            len(batch_hashes)
+            if self._skip_storage_pool_io(PoolName.KV)
+            else self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
         )
 
         # Read from KV-derived sidecar pools, if any.
@@ -1419,11 +1452,13 @@ class HiCacheController:
                     keys=batch_hashes,
                 )
                 for transfer in kv_derived_transfers
+                if not self._skip_storage_pool_io(transfer.name)
             ]
-            sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers, extra_info=extra_info
-            )
-            sidecar_hits = count_pool_hits(sidecar_results)
+            if current_kv_derived_transfers:
+                sidecar_results = self.storage_backend.batch_get_v2(
+                    current_kv_derived_transfers, extra_info=extra_info
+                )
+                sidecar_hits = count_pool_hits(sidecar_results)
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
