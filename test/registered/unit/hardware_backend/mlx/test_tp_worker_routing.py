@@ -64,6 +64,7 @@ class _FakeRunner:
         # (op, rid) -> needs_logits as received; guards the worker's
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
+        self.removed_sync_kv: dict[str, bool] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -73,6 +74,11 @@ class _FakeRunner:
 
     def flush_all_decode_kv(self):
         pass
+
+    def remove_request(self, rid, sync_kv=True):
+        self.calls.append(("remove_request", rid))
+        self.removed_sync_kv[rid] = sync_kv
+        self._known.discard(rid)
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -253,6 +259,23 @@ class TestMlxExtendRouting(CustomTestCase):
     def test_route_seen_and_in_decoding_reqs_is_decode(self):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
+
+    # ---------- retraction ----------
+
+    def test_retracted_request_reprefills_from_scratch(self):
+        """A retracted request's MLX state is dropped without a pool sync, so
+        its re-prefill routes as a fresh prefill, not a continuation."""
+        worker = self._worker(known_rids={"r1", "r2"})
+        worker._mlx_active_rids = {"r1", "r2"}
+        worker.on_reqs_retracted([_FakeReq("r1")])
+        self.assertEqual(worker._mlx_runner.removed_sync_kv, {"r1": False})
+        self.assertEqual(worker._mlx_active_rids, {"r2"})
+
+        batch = _FakeBatch(ForwardMode.EXTEND, [_FakeReq("r1")], [4])
+        worker._async_extend_batch(batch)
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"), ["remove_request", "prefill_start"]
+        )
 
     # ---------- sync path: _forward_batch_generation_mlx ----------
 

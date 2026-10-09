@@ -84,6 +84,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
         scheduler.hisparse_coordinator = MagicMock()
+        scheduler.tp_worker = MagicMock()
         scheduler.result_queue = deque()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
@@ -359,6 +360,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(
             [req.retraction_count for req in (run_req_a, run_req_b, last_req)],
             [1, 1, 1],
+        )
+        # The worker drops per-request state of every retracted request.
+        scheduler.tp_worker.on_reqs_retracted.assert_called_once_with(
+            [run_req_a, run_req_b, last_req]
         )
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertFalse(scheduler.running_batch.batch_is_full)

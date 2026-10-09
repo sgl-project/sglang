@@ -1678,9 +1678,10 @@ class MlxModelRunner:
         """Check if a request has active state."""
         return req_id in self._req_caches
 
-    def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
+    def remove_request(self, req_id: str, sync_kv: bool = True):
+        """Release request state, first syncing its remaining decode KV to the
+        pool unless *sync_kv* is False (the caller discards that KV)."""
+        if sync_kv and not self.disable_radix_cache:
             self._sync_decode_kv_to_pool(req_id)
 
         self._req_token_ids.pop(req_id, None)

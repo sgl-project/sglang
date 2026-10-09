@@ -29,7 +29,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     MlxStepLogprobs,
     lazy_logprob_arrays,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -172,6 +172,17 @@ class MlxTpModelWorker(TpModelWorker):
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
+
+    def on_reqs_retracted(self, reqs: list[Req]) -> None:
+        """Drop the MLX state of retracted requests.
+
+        Their KV was freed without a tree insert, so nothing is synced to the
+        pool. Kept state would make the re-prefill route as a continuation
+        and extend the old KV a second time.
+        """
+        for req in reqs:
+            self._mlx_runner.remove_request(req.rid, sync_kv=False)
+            self._mlx_active_rids.discard(req.rid)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
