@@ -142,5 +142,159 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
                         asyncio.run(scenario(from_tensors, duplicate))
 
 
+class TestLoadLoRACapacity(CustomTestCase):
+    def make_manager(self, adapters):
+        manager = TokenizerControlMixin()
+        manager.auto_create_handle_loop = Mock()
+        manager.lora_update_lock = asyncio.Lock()
+        manager.lora_registry = LoRARegistry(adapters)
+        manager.pending_lora_unloads = {}
+        manager.lora_ref_cache = {ref.lora_name: ref for ref in adapters}
+        backend = {ref.lora_name: ref.lora_path for ref in adapters}
+
+        async def update(request):
+            # Yield so concurrent loads exercise the real update lock.
+            await asyncio.sleep(0)
+            if isinstance(request, UnloadLoRAAdapterReqInput):
+                del backend[request.lora_name]
+            elif request.lora_name in backend:
+                return [_err("already loaded", dict(backend))]
+            else:
+                backend[request.lora_name] = getattr(request, "lora_path", "__tensor__")
+            return [_ok(dict(backend))]
+
+        manager.update_lora_adapter_communicator = AsyncMock(side_effect=update)
+        return manager, backend
+
+    async def load(self, manager, from_tensors, name="new", pinned=True):
+        if from_tensors:
+            request = LoadLoRAAdapterFromTensorsReqInput(
+                lora_name=name,
+                config_dict={},
+                serialized_named_tensors=[b""],
+                pinned=pinned,
+            )
+            result = await manager.load_lora_adapter_from_tensors(request)
+        else:
+            request = LoadLoRAAdapterReqInput(
+                lora_name=name, lora_path=f"{name}-path", pinned=pinned
+            )
+            result = await manager.load_lora_adapter(request)
+        return request, result
+
+    def test_pinned_capacity_rejects_before_loading(self):
+        async def scenario(from_tensors, pinned):
+            adapters = [
+                LoRARef(lora_name=name, lora_path=name, pinned=True)
+                for name in ("a", "b")
+            ]
+            manager, backend = self.make_manager(adapters)
+            request, result = await self.load(manager, from_tensors, pinned=pinned)
+            self.assertFalse(result.success)
+            manager.update_lora_adapter_communicator.assert_not_awaited()
+            self.assertIn("max_loaded_loras", result.error_message)
+            self.assertIsNone(request.lora_id)
+            self.assertEqual(
+                manager.lora_registry.get_all_adapters(), manager.lora_ref_cache
+            )
+            self.assertEqual(set(backend), {"a", "b"})
+            self.assertEqual(manager.lora_registry.num_registered_loras, 2)
+
+        with get_context().override_server_args(
+            enable_lora=True, dp_size=1, max_loaded_loras=2
+        ):
+            for from_tensors in (False, True):
+                for pinned in (False, True):
+                    with self.subTest(from_tensors=from_tensors, pinned=pinned):
+                        asyncio.run(scenario(from_tensors, pinned))
+
+    def test_evictable_adapter_still_makes_room(self):
+        async def scenario(from_tensors, pinned):
+            adapters = [
+                LoRARef(lora_name="keep", lora_path="keep-path", pinned=True),
+                LoRARef(lora_name="evict", lora_path="evict-path", pinned=False),
+            ]
+            manager, backend = self.make_manager(adapters)
+            _, result = await self.load(manager, from_tensors, pinned=pinned)
+            self.assertTrue(result.success)
+            self.assertEqual(set(backend), {"keep", "new"})
+            self.assertEqual(
+                set(manager.lora_registry.get_all_adapters()), {"keep", "new"}
+            )
+            self.assertEqual(set(result.loaded_adapters), {"keep", "new"})
+            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 2)
+            self.assertNotIn(adapters[1].lora_id, manager.lora_registry._counters)
+
+        with get_context().override_server_args(
+            enable_lora=True, dp_size=1, max_loaded_loras=2
+        ):
+            for from_tensors in (False, True):
+                for pinned in (False, True):
+                    with self.subTest(from_tensors=from_tensors, pinned=pinned):
+                        asyncio.run(scenario(from_tensors, pinned))
+
+    def test_pinned_adapters_allow_spare_or_unlimited_capacity(self):
+        async def scenario(from_tensors):
+            manager, backend = self.make_manager(
+                [LoRARef(lora_name="old", lora_path="old-path", pinned=True)]
+            )
+            _, result = await self.load(manager, from_tensors)
+            self.assertTrue(result.success)
+            self.assertEqual(set(backend), {"old", "new"})
+            self.assertEqual(
+                set(manager.lora_registry.get_all_adapters()), {"old", "new"}
+            )
+            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 1)
+
+        for limit in (2, None):
+            with get_context().override_server_args(
+                enable_lora=True, dp_size=1, max_loaded_loras=limit
+            ):
+                for from_tensors in (False, True):
+                    with self.subTest(limit=limit, from_tensors=from_tensors):
+                        asyncio.run(scenario(from_tensors))
+
+    def test_duplicate_at_pinned_capacity_keeps_backend_error(self):
+        async def scenario(from_tensors):
+            existing = LoRARef(lora_name="old", lora_path="old-path", pinned=True)
+            manager, backend = self.make_manager([existing])
+            _, result = await self.load(manager, from_tensors, name="old")
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_message, "already loaded")
+            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 1)
+            self.assertEqual(
+                manager.lora_registry.get_all_adapters(), {"old": existing}
+            )
+            self.assertEqual(backend, {"old": "old-path"})
+            self.assertEqual(manager.pending_lora_unloads, {})
+
+        with get_context().override_server_args(
+            enable_lora=True, dp_size=1, max_loaded_loras=1
+        ):
+            for from_tensors in (False, True):
+                with self.subTest(from_tensors=from_tensors):
+                    asyncio.run(scenario(from_tensors))
+
+    def test_concurrent_pinned_loads_cannot_exceed_capacity(self):
+        async def scenario():
+            manager, backend = self.make_manager([])
+            responses = await asyncio.gather(
+                self.load(manager, False, name="disk"),
+                self.load(manager, True, name="tensor"),
+            )
+            self.assertEqual(sum(result.success for _, result in responses), 1)
+            self.assertEqual(manager.update_lora_adapter_communicator.await_count, 1)
+            self.assertEqual(len(backend), 1)
+            self.assertEqual(
+                set(manager.lora_registry.get_all_adapters()), set(backend)
+            )
+            self.assertEqual(set(manager.lora_ref_cache), set(backend))
+
+        with get_context().override_server_args(
+            enable_lora=True, dp_size=1, max_loaded_loras=1
+        ):
+            asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
