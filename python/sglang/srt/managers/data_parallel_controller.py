@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import queue
 import signal
 import threading
 import time
@@ -377,7 +378,7 @@ class DataParallelController:
 
         threads = []
         sockets = []
-        ready_events = []
+        startup_results = queue.SimpleQueue()
         for dp_rank in range(get_parallel().num_dp_ranks):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
@@ -388,13 +389,16 @@ class DataParallelController:
             # We hold it first so that the next dp worker gets a different port
             sockets.append(bind_port(tmp_port_args.nccl_port))
 
-            ready_event = threading.Event()
-            ready_events.append(ready_event)
-
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                    startup_results,
+                ),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -418,8 +422,10 @@ class DataParallelController:
         # Start all threads
         for thread in threads:
             thread.start()
-        for event in ready_events:
-            event.wait()
+        for _ in threads:
+            dp_rank, error = startup_results.get()
+            if error is not None:
+                raise RuntimeError(f"DP{dp_rank} scheduler startup failed") from error
 
     def launch_tensor_parallel_group_thread(
         self,
@@ -427,10 +433,16 @@ class DataParallelController:
         port_args: PortArgs,
         base_gpu_id: int,
         dp_rank: int,
-        ready_event: threading.Event,
+        startup_results: queue.SimpleQueue,
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
-        ready_event.set()
+        try:
+            self.launch_tensor_parallel_group(
+                server_args, port_args, base_gpu_id, dp_rank
+            )
+        except Exception as error:
+            startup_results.put((dp_rank, error))
+            return
+        startup_results.put((dp_rank, None))
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
         # function in scheduler.py will kill the scheduler.
