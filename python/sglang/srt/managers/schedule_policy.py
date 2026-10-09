@@ -596,6 +596,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        chunked_prefill_ratio: float = 1.0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -709,6 +710,7 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.chunked_prefill_ratio = chunked_prefill_ratio
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1076,7 +1078,7 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = self.memory_budget.available_chunk_tokens(
-                self.rem_chunk_tokens
+                int(self.rem_chunk_tokens * self.chunked_prefill_ratio)
             )
             if _rem_tokens is None:
                 return req
@@ -1156,7 +1158,7 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
@@ -1267,7 +1269,7 @@ class PrefillAdder:
                 compute_charge=(req.extend_len if self.exact_chunk_fill else None),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if self.rem_chunk_tokens <= 0 or has_chunked_req:
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -1302,7 +1304,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1498,9 +1500,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                get_schedule().schedule_policy == "shortest-prefill-first"
+                or get_schedule().chunked_prefill_ratio < 1
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
