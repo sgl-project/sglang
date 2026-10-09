@@ -30,7 +30,7 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.jit.utils.occupancy import (
+    from sglang.kernels.jit.utils.cuda.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
