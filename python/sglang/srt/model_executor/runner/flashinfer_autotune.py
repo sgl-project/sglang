@@ -35,7 +35,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_prefill_buffer_tokens,
 )
-from sglang.srt.speculative.spec_info import supports_dummy_draft_extend
+from sglang.srt.speculative.spec_info import can_run_dummy_draft_extend
 from sglang.srt.utils import cdiv, ceil_align, empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -361,7 +361,7 @@ def maybe_flashinfer_autotune_extend(
         return  # decode-shaped autotune already covered these buckets
     if not mr.is_generation or get_disagg().disaggregation_mode == "decode":
         return
-    if mr.is_draft_worker and not supports_dummy_draft_extend(mr.spec_algorithm):
+    if mr.is_draft_worker and not can_run_dummy_draft_extend(mr.spec_algorithm):
         return
 
     batch_size, per_req = _extend_dummy_shape(

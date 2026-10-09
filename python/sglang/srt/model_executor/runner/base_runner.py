@@ -56,9 +56,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import (
+    can_run_dummy_draft_extend,
     create_dummy_draft_extend_input,
     create_dummy_verify_input,
-    supports_dummy_draft_extend,
 )
 from sglang.srt.utils import (
     empty_context,
@@ -512,7 +512,7 @@ class BaseRunner(ABC):
             assert is_extend_dummy, "extend_num_tokens_per_req requires an EXTEND dummy"
             num_tokens_per_req = extend_num_tokens_per_req
         if is_extend_dummy:
-            assert not mr.is_draft_worker or supports_dummy_draft_extend(
+            assert not mr.is_draft_worker or can_run_dummy_draft_extend(
                 mr.spec_algorithm
             ), "this draft has no EXTEND-shaped prefill pass"
         elif mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:

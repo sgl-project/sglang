@@ -136,6 +136,9 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_dummy_draft_extend(self) -> bool:
+        return self.is_standalone() or (self.is_eagle() and not self.is_frozen_kv_mtp())
+
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
 
@@ -531,14 +534,10 @@ def create_dummy_verify_input(
     return spec_info
 
 
-def supports_dummy_draft_extend(spec_algorithm: SpeculativeAlgorithm) -> bool:
-    if spec_algorithm.is_standalone():
-        return True
-    return (
-        spec_algorithm.is_eagle()
-        and not spec_algorithm.is_frozen_kv_mtp()
-        and not get_spec_config().enable_multi_layer_eagle
-    )
+def can_run_dummy_draft_extend(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    if spec_algorithm.is_eagle() and get_spec_config().enable_multi_layer_eagle:
+        return False
+    return spec_algorithm.supports_dummy_draft_extend()
 
 
 def create_dummy_draft_extend_input(
