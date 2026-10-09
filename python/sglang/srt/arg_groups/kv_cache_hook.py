@@ -318,6 +318,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         "torch_native",
                         "flex_attention",
                         "trtllm_mha",
+                        "flashinfer",
                     ]
                     assert attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES, (
                         f"KV4 MHA expects attention_backend to be one of "
