@@ -54,6 +54,11 @@ TOKEN_STEP = 256
 
 _in_replay_graph = False
 
+# One private pool and capture stream for every range: the ranges never run
+# concurrently, so their graphs reuse each other's free blocks.
+_pool = None
+_stream = None
+
 
 def in_decoder_replay_graph() -> bool:
     """True while a layer range captures or replays an eager replay graph."""
@@ -229,8 +234,6 @@ class EagerReplayGraphs:
         self._static: dict[tuple, list[torch.Tensor]] = {}
         self._static_out: dict[tuple, list[torch.Tensor]] = {}
         self._layers = None
-        self._pool = None
-        self._stream = None
         self._capture_open = False
         self.capture_seconds = 0.0
         self.capture_bytes = 0
@@ -373,12 +376,13 @@ class EagerReplayGraphs:
             for buf, t in zip(out_static[0], out_leaves):
                 buf[: t.shape[0]].copy_(t)
 
-        if self._pool is None:
-            self._pool = torch.cuda.graph_pool_handle()
-            self._stream = torch.cuda.Stream()
+        global _pool, _stream
+        if _pool is None:
+            _pool = torch.cuda.graph_pool_handle()
+            _stream = torch.cuda.Stream()
         tp_group = get_parallel().tp_group
         graph = BreakableCUDAGraph()
-        with graph_capture(stream=self._stream) as context:
+        with graph_capture(stream=_stream) as context:
             # The warmups run eagerly; their KV writes repeat the replay's.
             for _ in range(2):
                 torch.cuda.synchronize()
@@ -386,12 +390,12 @@ class EagerReplayGraphs:
                 body()
             with BreakableCUDAGraphCapture(
                 cuda_graph=graph,
-                pool=self._pool,
+                pool=_pool,
                 stream=context.stream,
                 barrier_fn=tp_group.barrier,
             ):
                 body()
-        torch.cuda.current_stream().wait_stream(self._stream)
+        torch.cuda.current_stream().wait_stream(_stream)
         torch.cuda.synchronize()
         metadata = get_attn_backend().forward_metadata
         owned = {
@@ -490,10 +494,18 @@ def capture_at_startup(
     if request_window is not None:
         # Dummy requests used slots [0, max_bs); real requests start clean.
         request_window.reset(torch.arange(max_bs, device=buffers.positions.device))
+    del buffers
+    # The warmups cached activation blocks of every bucket size; serving reuses none.
+    torch.cuda.empty_cache()
     if get_parallel().tp_rank == 0:
+        free, _ = torch.cuda.mem_get_info()
         logger.info(
-            "Eager replay graphs captured at startup in %.1f s: %s",
+            "Eager replay graphs captured at startup in %.1f s (free %.2f GiB, "
+            "allocated %.2f GiB, reserved %.2f GiB after capture): %s",
             time.perf_counter() - start,
+            free / 2**30,
+            torch.cuda.memory_allocated() / 2**30,
+            torch.cuda.memory_reserved() / 2**30,
             ", ".join(
                 f"{g.name} {g.num_graphs} graphs {g.capture_bytes / 2**30:.2f} GiB"
                 for g in graphs
