@@ -131,7 +131,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "handle_pd_disaggregation",
                 disable_radix_cache=True,
             )
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            logger.warning("Radix cache is disabled for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the

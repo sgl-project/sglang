@@ -357,15 +357,16 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
 @dataclass
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
-    """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
+    """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
-    num_inference_steps: int = 5
+    num_inference_steps: int = 9
+    quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 5:
+        if self.num_inference_steps != 9:
             raise ValueError(
-                "FastH3 is distilled for exactly five sigma grid points (four DiT "
+                "FastH3 is distilled for exactly nine sigma grid points (eight DiT "
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )

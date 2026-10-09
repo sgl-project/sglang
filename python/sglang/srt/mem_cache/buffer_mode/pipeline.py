@@ -86,9 +86,10 @@ class _UnifiedBackupIntent(msgspec.Struct):
 
     Snapshots node identity at enqueue time: a split rewrites the node's
     key/hash in place while these copies stay intact, so a key-length change
-    detects a split and a missing FULL device value detects eviction
-    (``_validate_backup_intent``). ``keys`` is the admission view (it sizes
-    drop metrics); the D2H launch re-reads rows and keys off the node.
+    detects a split (repaired during queue refresh) and a missing FULL device
+    value detects eviction (``_validate_backup_intent``). ``keys`` is the
+    admission view (it sizes drop metrics); the D2H launch re-reads rows and
+    keys off the node.
     """
 
     snapshot: BufferBackupSnapshot
@@ -721,35 +722,92 @@ class BufferModePipeline:
         self, intent: _UnifiedBackupIntent
     ) -> Optional[BufferBackupState]:
         # Arena-lookup failure = deleted, key-length mismatch vs the snapshot
-        # = split, a None FULL device value = evicted. Stale
-        # intents are counted as dropped; the node re-triggers on a later hit.
+        # = split, a None FULL device value = evicted.
         snapshot = intent.snapshot
         return self._cache.tree_core.validate_buffer_backup(
             snapshot.node_id, len(snapshot.key)
         )
 
-    def _sweep_stale_backup_intents(self) -> dict[NodeId, BufferBackupState]:
-        """Cancel stale intents anywhere in the queue, not just at the head:
-        a dead intent would otherwise inflate the backlog accounting and
-        hold FIFO position ahead of live segments."""
+    def _split_pieces(
+        self, snapshot: BufferBackupSnapshot
+    ) -> Optional[list[BufferBackupSnapshot]]:
+        """Resolve a split span, parents first, or return None if it is gone.
+
+        The original node retains the tail; its ancestors must cover exactly
+        the admitted span and end at the original parent.
+        """
+        tree_core = self._cache.tree_core
+        pass_prefix_keys = self._cache.hicache_storage_pass_prefix_keys
+        pieces: list[BufferBackupSnapshot] = []
+        node_id, remaining = snapshot.node_id, len(snapshot.key)
+        while remaining > 0:
+            piece = tree_core.snapshot_buffer_backup(node_id, pass_prefix_keys)
+            if piece is None or len(piece.key) > remaining:
+                return None
+            pieces.append(piece)
+            remaining -= len(piece.key)
+            node_id = piece.parent_node_id
+        if node_id != snapshot.parent_node_id:
+            return None
+        pieces.reverse()
+        return pieces
+
+    def _refresh_pending_backup_intents(self) -> dict[NodeId, BufferBackupState]:
+        """Drop dead spans and replace split intents in FIFO order.
+
+        The earliest intent for each (node, pool) wins, including split pieces.
+        """
         if not self.pending_write_queue:
             return {}
         page_size = self._cache.page_size
-        survivors: deque[_UnifiedBackupIntent] = deque()
+        queued = {(i.snapshot.node_id, i.pool) for i in self.pending_write_queue}
+        survivors: dict[tuple[NodeId, PoolName], _UnifiedBackupIntent] = {}
         states: dict[NodeId, BufferBackupState] = {}
         swept_tokens = 0
         for intent in self.pending_write_queue:
             snapshot = intent.snapshot
-            state = self._validate_backup_intent(intent)
-            if state is None:
-                self._finish_inflight(snapshot.node_id, intent.pool)
-                intent_tokens = len(intent.keys) * page_size
+            key = (snapshot.node_id, intent.pool)
+            if key in survivors:
+                # The replacement retains this intent's inflight ownership.
                 self._release_queued_span(intent)
-                swept_tokens += intent_tokens
                 continue
-            survivors.append(intent)
-            states[snapshot.node_id] = state
-        self.pending_write_queue = survivors
+            state = self._validate_backup_intent(intent)
+            if state is not None:
+                survivors[key] = intent
+                states[snapshot.node_id] = state
+                continue
+            self._finish_inflight(snapshot.node_id, intent.pool)
+            self._release_queued_span(intent)
+            pieces = self._split_pieces(snapshot)
+            if pieces is None:
+                swept_tokens += len(intent.keys) * page_size
+                continue
+            for piece in pieces:
+                key = (piece.node_id, intent.pool)
+                if key in survivors:
+                    continue
+                if (
+                    intent.pool in self.inflight_backup_pools.get(piece.node_id, ())
+                    and key not in queued
+                ):
+                    continue  # staged or awaiting its storage ack
+                keys = dict(self._write_intents(piece)).get(intent.pool)
+                if not keys:
+                    continue  # covered since admission
+                repaired = _UnifiedBackupIntent(
+                    snapshot=piece, pool=intent.pool, keys=list(keys)
+                )
+                survivors[key] = repaired
+                states[piece.node_id] = BufferBackupState(
+                    parent_node_id=piece.parent_node_id,
+                    parent_is_root=piece.parent_is_root,
+                    parent_last_hash=piece.parent_last_hash,
+                )
+                self.inflight_backup_pools.setdefault(piece.node_id, set()).add(
+                    intent.pool
+                )
+                self._retain_queued_span(repaired)
+        self.pending_write_queue = deque(survivors.values())
         self._log_backup_dropped(swept_tokens)
         return states
 
@@ -764,7 +822,7 @@ class BufferModePipeline:
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
-        states = self._sweep_stale_backup_intents()
+        states = self._refresh_pending_backup_intents()
         # Loads have priority (writes are deferrable): the write window is
         # the pool minus prefetch occupancy minus a 10% margin, floored at
         # the configured fraction.
@@ -1193,7 +1251,7 @@ class BufferModePipeline:
             cache_salt=span_key.cache_salt,
         )
         match = self._cache.match_prefix(MatchPrefixParams(key=key))
-        return len(match.device_indices) >= len(key)
+        return match.device_prefix_len >= len(key)
 
     def set_prefix_ctx(
         self,
@@ -1375,7 +1433,7 @@ class BufferModePipeline:
 
     def init_load_back(
         self, params: InitLoadBackParams
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
+    ) -> Optional[tuple[int, NodeId]]:
         """Materialize a selected prefill under the caller's prefix lock.
 
         The caller has finished selecting its prefill shape and must acquire
@@ -1391,8 +1449,7 @@ class BufferModePipeline:
         req = params.req
         assert req is not None
         request = req.cache_request_handle
-        empty = cache.tree_core.empty_match_result.device_indices
-        unchanged = (empty, req.last_node)
+        unchanged = (0, req.last_node)
         f = self.staged_prefetches.get(request)
         if f is None:
             self.release_anchor_lock(request)
@@ -1632,10 +1689,12 @@ class BufferModePipeline:
             aux_device_releases=aux_device_releases,
         )
         match = cache.match_prefix(MatchPrefixParams(key=key))
+        canonical = cache.path_device_indices(match.last_device_node)[
+            splice_base:span_end
+        ]
         self.release_anchor_lock(request)
-        canonical = match.device_indices[splice_base:span_end]
-        owned = len(match.device_indices) >= span_end and torch.equal(
-            match.device_indices[splice_base:span_end], device_indices
+        owned = match.device_prefix_len >= span_end and torch.equal(
+            canonical, device_indices
         )
         if not owned:
             # Fail-stop: the insert freed or replaced slots the in-flight H2D
@@ -1644,13 +1703,11 @@ class BufferModePipeline:
                 "HiCache buffer load-back ownership violation "
                 f"req={f.request.rid}: "
                 f"insert prefix_len={insert_result.prefix_len} "
-                f"expected={splice_base}, matched={len(match.device_indices)} "
+                f"expected={splice_base}, matched={match.device_prefix_len} "
                 f"span_end={span_end} splice_base={splice_base}; "
                 f"in-flight H2D targets freed slots"
             )
-        # Canonical ownership: return the post-insert tree slice, never the
-        # raw cc.load allocation (torch.equal here; the tree slice is truth).
-        return canonical, match.last_device_node
+        return len(canonical), match.last_device_node
 
     def try_finish_load_back(self, ack_id: int) -> bool:
         """Fill ack: free the host bounce and return True when the ack id is

@@ -19,12 +19,14 @@ pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    dynamo_tool_parser_name,
+    ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
+    dynamo_tool_parser_name, split_reasoning, tool_constraint,
 };
 #[cfg(feature = "render")]
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekV4Profile, OneOrMany, TemplateError,
-    ThinkingTemplates, load_chat_formatter, select_chat_formatter,
+    ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
+    select_chat_formatter,
 };
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
