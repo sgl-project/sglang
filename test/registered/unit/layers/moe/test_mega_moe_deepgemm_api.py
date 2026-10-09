@@ -22,7 +22,13 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopKConfig
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_parallel,
+    get_resources,
+)
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -564,6 +570,41 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                             expected[valid_rows:] = 0.0
                             torch.testing.assert_close(out[:, 0], expected)
                             self.assertTrue(torch.isnan(hidden[valid_rows:]).all())
+
+    def test_mega_gate_preserves_target_only_routed_experts_capture(self):
+        """Draft and hash routing must leave the target's capture buffer intact.
+
+        Reusing normal TopK postprocessing for HashTopK otherwise opts hash
+        layers into capture even though HashTopK never writes this buffer.
+        """
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        hidden = torch.ones((32, 256), dtype=torch.bfloat16)
+        capture_buffer = torch.full((32, 2), -17, dtype=torch.int64)
+        capturer = SimpleNamespace(
+            capture=lambda layer_id, topk_indices: capture_buffer.copy_(topk_indices)
+        )
+        with (
+            get_resources().override(experts_capturer=capturer),
+            get_parallel().override(moe_ep_rank=0),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(topk_module, "_is_cuda", True),
+        ):
+            for routing in ("target", "draft", "hash"):
+                with self.subTest(routing=routing):
+                    capture_buffer.fill_(-17)
+                    moe = self._mega_gate_moe(0, False, routing == "hash")
+                    if routing == "draft":
+                        moe.topk.topk_config.allow_routed_experts_capture = False
+                    mega_gate_runtime.run_mega_gate(
+                        moe, hidden, torch.full((32,), 7), None, None
+                    )
+                    expected = (
+                        torch.tensor([[0, 1]]).expand(32, -1)
+                        if routing == "target"
+                        else torch.full((32, 2), -17)
+                    )
+                    torch.testing.assert_close(capture_buffer, expected)
 
     def test_mega_gate_admission_preserves_unsupported_router_fallbacks(self):
         """Do not silently change routing when the fused API cannot express it."""

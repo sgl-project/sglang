@@ -82,6 +82,8 @@ def run_mega_gate(moe, hidden_states, input_ids, num_token_non_padded, dispatch_
             num_fused_shared_experts=moe.topk.num_fused_shared_experts,
             routed_scaling_factor=moe.topk.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=moe.topk.apply_routed_scaling_factor_on_output,
+            # HashTopK never captures into the target's routed-expert buffer.
+            allow_routed_experts_capture=False,
         )
     else:
         config = moe.topk.topk_config
