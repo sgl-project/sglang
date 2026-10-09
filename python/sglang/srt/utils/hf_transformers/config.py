@@ -224,12 +224,33 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
-            config = AutoConfig.from_pretrained(
-                model,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            try:
+                config = AutoConfig.from_pretrained(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            except ValueError as e:
+                import json
+                import os
+                from transformers import PretrainedConfig
+                from huggingface_hub import hf_hub_download
+
+                cfg_file = None
+                if os.path.isdir(model) and os.path.exists(os.path.join(model, "config.json")):
+                    cfg_file = os.path.join(model, "config.json")
+                else:
+                    try:
+                        cfg_file = hf_hub_download(model, "config.json", revision=revision)
+                    except Exception:
+                        pass
+                if cfg_file and os.path.exists(cfg_file):
+                    with open(cfg_file, "r") as f:
+                        data = json.load(f)
+                    config = PretrainedConfig(**data)
+                else:
+                    raise e
 
         if (
             config.architectures is not None
