@@ -394,9 +394,8 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        self.do_classifier_free_guidance = (
-            self.sampling_params.should_use_classifier_free_guidance()
-        )
+        if self.sampling_params.should_use_classifier_free_guidance():
+            self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
         if self.guidance_scale_2 is None:

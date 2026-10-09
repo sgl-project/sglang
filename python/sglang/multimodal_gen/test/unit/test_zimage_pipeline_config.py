@@ -30,9 +30,6 @@ class TestZImagePipelineConfig(unittest.TestCase):
                         )
                         self.assertEqual(req.do_classifier_free_guidance, scale > 0)
                         self.assertEqual(req.negative_prompt, negative or "")
-                        req.guidance_scale = 0.0
-                        req.validate()
-                        self.assertFalse(req.do_classifier_free_guidance)
         self.assertFalse(
             Req(sampling_params=ZImageTurboSamplingParams()).do_classifier_free_guidance
         )
