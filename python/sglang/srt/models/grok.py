@@ -59,17 +59,16 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cpu, is_npu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
 
-_is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 logger = logging.getLogger(__name__)
 
 
-def _grok_dual_residual_rmsnorm(x, residual, weight1, weight2, eps):
-    if not _is_cpu:
-        return fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps)
+def dual_residual_rmsnorm_naive(x, residual, weight1, weight2, eps):
     hidden_size = (x.shape[-1],)
     mid = residual + F.rms_norm(x.float(), hidden_size, weight1.float(), eps).to(
         residual.dtype
@@ -78,13 +77,13 @@ def _grok_dual_residual_rmsnorm(x, residual, weight1, weight2, eps):
     return output, mid
 
 
-def _grok_rmsnorm(x, weight, eps):
-    if not _is_cpu:
-        return fused_rmsnorm(x, weight, eps)
+def fused_rmsnorm_cpu(x, weight, eps):
+    if _is_cpu_amx_available:
+        return torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, eps)
     return F.rms_norm(x.float(), (x.shape[-1],), weight.float(), eps).to(x.dtype)
 
 
-def _grok_cpu_moe_router(
+def moe_router_shim_naive(
     softcap, hidden_states, gating_output, topk, renormalize, **kwargs
 ):
     assert not renormalize
@@ -93,6 +92,18 @@ def _grok_cpu_moe_router(
     probabilities = torch.softmax(logits, dim=-1)
     weights, indices = torch.topk(probabilities, topk, dim=-1)
     return weights, indices.to(torch.int32)
+
+
+def grok_gelu_and_mul_naive(x):
+    gate, up = x.chunk(2, dim=-1)
+    return up * F.gelu(gate.float(), approximate="none").to(gate.dtype), None
+
+
+if _is_cpu:
+    fused_rmsnorm = fused_rmsnorm_cpu
+    fused_dual_residual_rmsnorm = dual_residual_rmsnorm_naive
+    fused_moe_router_shim = moe_router_shim_naive
+    gelu_and_mul_triton = grok_gelu_and_mul_naive
 
 
 class Grok1MLP(nn.Module):
@@ -131,11 +142,7 @@ class Grok1MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        if _is_cpu:
-            gate, up = gate_up.chunk(2, dim=-1)
-            x = up * F.gelu(gate.float(), approximate="none").to(gate.dtype)
-        else:
-            x, _ = gelu_and_mul_triton(gate_up)
+        x, _ = gelu_and_mul_triton(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -170,8 +177,7 @@ class Grok1MoE(nn.Module):
 
         self.router_logit_softcapping = 30.0
         custom_routing_function = functools.partial(
-            _grok_cpu_moe_router if _is_cpu else fused_moe_router_shim,
-            self.router_logit_softcapping,
+            fused_moe_router_shim, self.router_logit_softcapping
         )
 
         self.topk = TopK(
@@ -596,7 +602,7 @@ class Grok1DecoderLayer(nn.Module):
         if deferred_norm is not None:
             assert residual is not None
             # here hidden_states is output of ffn, residual is residual from after previous attn layer
-            hidden_states, residual = _grok_dual_residual_rmsnorm(
+            hidden_states, residual = fused_dual_residual_rmsnorm(
                 hidden_states,
                 residual,
                 deferred_norm.weight,
@@ -606,7 +612,7 @@ class Grok1DecoderLayer(nn.Module):
         else:
             # here hidden_states is the residual
             hidden_states, residual = (
-                _grok_rmsnorm(
+                fused_rmsnorm(
                     hidden_states,
                     self.pre_attn_norm.weight,
                     self.pre_attn_norm.variance_epsilon,
@@ -623,7 +629,7 @@ class Grok1DecoderLayer(nn.Module):
         if get_parallel().tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        hidden_states, residual = _grok_dual_residual_rmsnorm(
+        hidden_states, residual = fused_dual_residual_rmsnorm(
             hidden_states,
             residual,
             self.post_attn_norm.weight,
@@ -710,7 +716,7 @@ class Grok1Model(nn.Module):
                 positions, hidden_states, forward_batch, residual, deferred_norm
             )
 
-        hidden_states, _ = _grok_dual_residual_rmsnorm(
+        hidden_states, _ = fused_dual_residual_rmsnorm(
             hidden_states,
             residual,
             deferred_norm.weight,
