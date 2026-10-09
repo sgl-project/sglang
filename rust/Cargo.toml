@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "sglang-api-codegen",
     "sglang-api-types",
+    "sglang-bench",
     "sglang-grpc",
     "sglang-mm",
     "sglang-processor",

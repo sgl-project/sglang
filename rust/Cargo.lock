@@ -3707,6 +3707,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "hf-hub",
+ "indicatif",
+ "pyo3",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+]
+
+[[package]]
 name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [
