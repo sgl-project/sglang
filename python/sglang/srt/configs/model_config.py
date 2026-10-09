@@ -291,6 +291,23 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
     return config
 
 
+@lru_cache
+def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """joint_head_config.json of a Clef checkpoint, whose joint schema head
+    answers /v1/systemone decisions from the backbone's hidden states."""
+    path = cached_file(
+        model_path,
+        "joint_head_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
@@ -544,6 +561,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        self.joint_head_config = None
+        if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            self.joint_head_config = load_joint_head_config(self.model_path, revision)
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
