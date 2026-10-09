@@ -573,17 +573,25 @@ class TestBeamResponseTemplate(CustomTestCase):
                 self.assertEqual(kind, "json_schema")
 
     def test_strict_tools_constrain_automatic_tool_choice(self):
+        """Strict tools hold their arguments, while calls may still name
+        undeclared tools."""
         count = _tool("set_count", {"count": {"type": "integer"}})
         count.function.strict = True
         answer = "<|channel|>final<|message|>Sunny."
+        undeclared = _parameter("x", "1") + _parameter("x", "y")
         cases = [
-            (_continuation_call("get_weather", _parameter("city", "P")), True),
-            (answer + "<|return|>", True),
+            (_continuation_call("get_weather", _parameter("city", "P")), True, True),
+            (_continuation_call("get_weather", _parameter("town", "P")), True, False),
+            (answer + "<|return|>", True, True),
             (
                 answer + "<|end|>" + _full_call("get_weather", _parameter("city", "P")),
                 False,
+                False,
             ),
-            (_continuation_call("set_count", _parameter("count", "x")), False),
+            (_continuation_call("set_count", _parameter("count", "x")), False, False),
+            (_continuation_call("search_files", undeclared), True, True),
+            (_continuation_call("set_coun", undeclared), True, True),
+            (_continuation_call("set_counts", undeclared), True, True),
         ]
 
         self.assertIsNone(
@@ -591,13 +599,20 @@ class TestBeamResponseTemplate(CustomTestCase):
                 tools=[_tool()], tool_call_parser="beam"
             ).get_structure_constraint("auto")
         )
-        parser = FunctionCallParser(tools=[_tool(), count], tool_call_parser="beam")
-        kind, tag = parser.get_structure_constraint("auto")
-        grammar = Grammar.from_structural_tag(tag.model_dump_json())
-        self.assertEqual(kind, "structural_tag")
-        for text, expected in cases:
-            with self.subTest(text=text):
-                self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+        for level in (ToolStrictLevel.OFF, ToolStrictLevel.PARAMETER):
+            with envs.SGLANG_TOOL_STRICT_LEVEL.override(level.value):
+                parser = FunctionCallParser(
+                    tools=[_tool(), count], tool_call_parser="beam"
+                )
+                kind, tag = parser.get_structure_constraint("auto")
+            grammar = Grammar.from_structural_tag(tag.model_dump_json())
+            self.assertEqual(kind, "structural_tag")
+            for text, loose, strict in cases:
+                with self.subTest(level=level, text=text):
+                    self.assertIs(
+                        _is_grammar_accept_string(grammar, text),
+                        strict if level else loose,
+                    )
 
     def test_forced_call_with_unencodable_tool_name_is_rejected(self):
         parser = FunctionCallParser(

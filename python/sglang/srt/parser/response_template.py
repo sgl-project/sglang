@@ -611,15 +611,10 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             for event in adapter.parse(text)
         )
 
-    def _forward_unknown_tools(self) -> bool:
-        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
-
     def admits_undeclared_tools(self) -> bool:
-        """Whether grammars may let automatic calls name undeclared tools."""
-        return (
-            self._forward_unknown_tools()
-            and envs.SGLANG_TOOL_STRICT_LEVEL.get() < ToolStrictLevel.FUNCTION
-        )
+        """Whether automatic calls may name undeclared tools, which parsing
+        then forwards."""
+        return self.forwards_unknown_tools or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
 
     def _to_tool_call_item(
         self, value: Any, tool_indices: dict[str, int], tool_index: int
@@ -638,7 +633,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         if name not in tool_indices:
             logger.warning("Model attempted to call undefined function: %s", name)
-            if not self._forward_unknown_tools():
+            if not self.admits_undeclared_tools():
                 return None
 
         if not isinstance(arguments, str):
@@ -750,7 +745,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         ordered_parts: list[str | ToolCallItem] = []
 
         def on_open(name: str) -> bool:
-            if name not in tool_indices and not self._forward_unknown_tools():
+            if name not in tool_indices and not self.admits_undeclared_tools():
                 return False
             self._emit_tool_name(name, pending_calls)
             ordered_parts.append(pending_calls[-1])

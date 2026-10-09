@@ -1272,7 +1272,7 @@ class ServingChatTestCase(CustomTestCase):
         for fields, text, admitted in (
             ({"tools": [strict]}, call, True),
             ({"tools": [strict]}, call.replace('"Paris"', "1"), False),
-            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), False),
+            ({"tools": [strict]}, call.replace("get_weather", "delete_all"), True),
             ({"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}, call, True),
             (
                 {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False},

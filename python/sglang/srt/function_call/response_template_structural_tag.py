@@ -267,6 +267,37 @@ def _call_opener(
     return before + name + after
 
 
+def _other_names(pattern: str, names: list[str]) -> str | None:
+    """A regex for the names `pattern` matches besides `names`, or `None` if
+    `pattern` is no negatable character class repeated."""
+    if not names:
+        return pattern
+    match = re.fullmatch(r"\\([wS])\+|\[\^((?:\\.|[^\]\\])+)\]\+", pattern)
+    if match is None:
+        return None
+    negated = {"w": r"\W", "S": r"\s"}[match[1]] if match[1] else match[2]
+
+    def other(chars: set[str]) -> str:
+        return f"[^{negated}{''.join(map(_class_escape, sorted(chars)))}]"
+
+    trie: dict[str, dict] = {}
+    for name in names:
+        node = trie
+        for char in name:
+            node = node.setdefault(char, {})
+        node[""] = {}
+
+    def rest(node: dict[str, dict], first: bool) -> str:
+        """The rest of a name past `node` that ends on none of `names`."""
+        branches = [other(set(node) - {""}) + other(set()) + "*"]
+        branches += [
+            _escape(char) + rest(child, False) for char, child in node.items() if char
+        ]
+        return f"(?:{'|'.join(branches)})" + ("" if first or "" in node else "?")
+
+    return rest(trie, True)
+
+
 def _thinking_format(
     thinking: ResponseTemplateField,
     message_start: list[str] | None,
@@ -881,9 +912,10 @@ def tool_call_structural_tag(
     """Derive native calls, respecting strict arguments, count and reasoning.
 
     An `answer` field lets the model answer instead, in `answer_format` if
-    given; without tools, only the answer is derived. With `undeclared_names`
-    and no strict tool, calls may name any tool the template can spell.
-    Strict `xml-inline` arguments come in declared order, or also
+    given; without tools, only the answer is derived. With `undeclared_names`,
+    calls may also name any other tool the template can spell, with any
+    arguments, where its name pattern lets the grammar tell strict tools
+    apart. Strict `xml-inline` arguments come in declared order, or also
     alphabetical with `sorted_arguments`. Raises `ValueError` for names the
     template cannot encode."""
     if not tools and answer is not None:
@@ -922,9 +954,16 @@ def tool_call_structural_tag(
         if not re.fullmatch(opener[1], name):
             raise ValueError(f"tool name {name!r} cannot be encoded in tool calls")
         names.append(_escape(name))
-    if undeclared_names and not any(tool["function"].get("strict") for tool in tools):
-        # Calls to tools that are not strict all take the same arguments.
-        names, arguments = [f"(?:{opener[1]})"], arguments[:1]
+    if undeclared_names:
+        held = [bool(tool["function"].get("strict")) for tool in tools]
+        others = _other_names(
+            opener[1], [tool["function"]["name"] for tool, h in zip(tools, held) if h]
+        )
+        loose = _arguments_format(field, {}, strict=False)
+        if others is not None and loose is not None:
+            # Calls to tools that are not strict all take the same arguments.
+            names = [name for name, h in zip(names, held) if h] + [f"(?:{others})"]
+            arguments = [args for args, h in zip(arguments, held) if h] + [loose]
     closers = _const_strings(closer_literals) if closer_literals else None
 
     def call(start: list[str] | None) -> dict[str, Any]:
