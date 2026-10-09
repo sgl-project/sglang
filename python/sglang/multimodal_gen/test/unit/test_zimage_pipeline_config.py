@@ -35,6 +35,12 @@ class TestZImagePipelineConfig(unittest.TestCase):
         )
 
     def test_standard_cfg_activation_is_unchanged(self):
+        self.assertTrue(
+            Req(
+                sampling_params=SamplingParams(guidance_scale=1.0),
+                do_classifier_free_guidance=True,
+            ).do_classifier_free_guidance
+        )
         for scale, negative, true_scale, expected in (
             (1.0, "", None, False),
             (3.5, None, None, False),
