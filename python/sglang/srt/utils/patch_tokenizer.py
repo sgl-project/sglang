@@ -74,8 +74,15 @@ class _PadPaddingSideShim:
         original_pad = tokenizer_cls._pad
 
         def patched_pad(self, *args, **kwargs):
-            kwargs.pop("padding_side", None)
-            return original_pad(self, *args, **kwargs)
+            padding_side = kwargs.pop("padding_side", None)
+            if padding_side is None or padding_side == self.padding_side:
+                return original_pad(self, *args, **kwargs)
+            previous_padding_side = self.padding_side
+            self.padding_side = padding_side
+            try:
+                return original_pad(self, *args, **kwargs)
+            finally:
+                self.padding_side = previous_padding_side
 
         tokenizer_cls._original_pad = original_pad
         tokenizer_cls._pad = patched_pad
