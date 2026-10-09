@@ -2352,8 +2352,7 @@ class KVCacheConfigurator:
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
-        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
-            return dsa_pool_class
+        # Ascend DSA uses the NPU MLA pool even when the model also has Mamba layers.
         if _is_npu:
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -2369,6 +2368,8 @@ class KVCacheConfigurator:
             )
 
             return NPUMHATokenToKVPool
+        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            return dsa_pool_class
         if self.use_mla_backend:
             return mla_pool_class
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
