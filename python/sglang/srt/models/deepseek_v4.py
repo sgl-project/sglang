@@ -3363,12 +3363,16 @@ class DeepseekV4Model(nn.Module):
         hidden_states: torch.Tensor,
         input_ids_global: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, List[torch.Tensor]]:
         from sglang.srt.afd.microbatch_overlap import (
             run_afd_microbatch_wavefront,
         )
 
         children = forward_batch.afd_microbatch_children
+        capture_layer_ids = set(self.dspark_layers_to_capture or ())
+        captured_children = {
+            layer_id: [None] * len(children) for layer_id in capture_layer_ids
+        }
         if is_afd_attn_moe_scattered():
             child_input_ids_global = [
                 input_ids_global[slice(*child.tbo_parent_token_range)]
@@ -3408,6 +3412,18 @@ class DeepseekV4Model(nn.Module):
 
         def finish_child_layer(layer, child, pending, child_index):
             state = layer.forward_afd_microbatch_finish(child, pending)
+            if layer.layer_id in captured_children:
+                completed = (
+                    layer.hc_post(
+                        state.hidden_states,
+                        state.prev_residual,
+                        state.prev_post,
+                        state.prev_comb,
+                    )
+                    if self.use_fused_mhc_post_pre
+                    else state.hidden_states
+                )
+                captured_children[layer.layer_id][child_index] = completed.mean(dim=1)
             return state
 
         child_states = run_afd_microbatch_wavefront(
@@ -3434,7 +3450,11 @@ class DeepseekV4Model(nn.Module):
         else:
             child_hidden_states = [state.hidden_states for state in child_states]
 
-        return torch.cat(child_hidden_states)
+        aux_hidden_states = [
+            torch.cat(captured_children[layer_id])
+            for layer_id in self.dspark_layers_to_capture or ()
+        ]
+        return torch.cat(child_hidden_states), aux_hidden_states
 
     def forward(
         self,
@@ -3503,8 +3523,10 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         if forward_batch.can_run_afd_microbatch_overlap:
-            hidden_states = self._forward_afd_microbatch(
-                hidden_states, input_ids_global, forward_batch
+            hidden_states, dspark_aux_hidden_states = self._forward_afd_microbatch(
+                hidden_states,
+                input_ids_global,
+                forward_batch,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is

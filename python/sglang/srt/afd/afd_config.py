@@ -233,6 +233,18 @@ def finalize_afd_speculative_args(server_args: ServerArgs) -> None:
     """Validate AFD after speculative arguments have been normalized."""
     role = afd_role_from_args(server_args)
     if role is not None:
+        cfg = resolving_view(server_args)
+        if (
+            role.is_attn()
+            and cfg.speculative_algorithm == "DSPARK"
+            and cfg.speculative_moe_runner_backend == "auto"
+            and model_config_of(server_args).is_fp4_experts
+        ):
+            declare_resolution(
+                server_args,
+                "finalize_afd_speculative_args",
+                speculative_moe_runner_backend="deep_gemm",
+            )
         _check_speculative_args(server_args, role)
 
 
@@ -325,10 +337,10 @@ def _check_speculative_args(server_args: ServerArgs, role: AFDRole) -> None:
     algorithm = cfg.speculative_algorithm
     if algorithm is None:
         return
-    if not role.is_attn() or algorithm != "EAGLE":
+    if not role.is_attn() or algorithm not in ("EAGLE", "DSPARK"):
         raise ValueError(
             "AFD speculative decoding requires an attn instance with "
-            f"speculative_algorithm='EAGLE'; got role={role.value!r}, "
+            f"speculative_algorithm in {{'EAGLE', 'DSPARK'}}; got role={role.value!r}, "
             f"speculative_algorithm={algorithm!r}"
         )
 
@@ -394,7 +406,11 @@ def get_afd_decode_num_tokens_per_bs() -> int:
 
     role = afd_role_from_args(get_disagg())
     spec = get_spec()
-    if role is not None and role.is_attn() and spec.speculative_algorithm == "EAGLE":
+    if (
+        role is not None
+        and role.is_attn()
+        and spec.speculative_algorithm in ("EAGLE", "DSPARK")
+    ):
         num_tokens_per_bs = spec.speculative_num_draft_tokens
         if not isinstance(num_tokens_per_bs, int) or num_tokens_per_bs <= 0:
             raise RuntimeError(

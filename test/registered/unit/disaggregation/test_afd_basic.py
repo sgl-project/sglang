@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -318,6 +318,318 @@ class TestAFDDPMetadata(unittest.TestCase):
                 forward_batch.global_num_tokens_for_logprob_cpu,
             ),
             ([4, 8, 6, 7], [4, 8, 6, 7], [4, 8, 6, 7]),
+        )
+
+
+class TestAFDDSparkVerify(unittest.TestCase):
+    def test_verify_graph_preparation_respects_afd_callback(self):
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        for callback_result in (None, False, True):
+            with self.subTest(callback_result=callback_result):
+                events = []
+                prepared = SimpleNamespace(
+                    mark_forward_metadata_ready=lambda: events.append("ready")
+                )
+                runner = SimpleNamespace(
+                    decode_cuda_graph_runner=SimpleNamespace(
+                        can_run_graph=lambda _: events.append("can_run") or True,
+                        load_batch=lambda _: events.append("load"),
+                    ),
+                    afd_target_verify_prepare_callback=(
+                        None
+                        if callback_result is None
+                        else lambda _: events.append("afd") or callback_result
+                    ),
+                )
+                verify = DFlashVerifyInput(torch.empty(0), torch.empty(0), 8)
+                with patch(
+                    "sglang.srt.speculative.dflash_info.ForwardBatch.init_new",
+                    return_value=prepared,
+                ):
+                    _, can_run = verify.prepare_for_verify(
+                        SimpleNamespace(forward_mode=ForwardMode.IDLE),
+                        SimpleNamespace(model_runner=runner),
+                    )
+                expected = [] if callback_result is None else ["afd"]
+                if callback_result is not False:
+                    expected += ["can_run", "load", "ready"]
+                self.assertEqual(can_run, callback_result is not False)
+                self.assertEqual(events, expected)
+
+    def test_microbatch_slices_keep_whole_verify_blocks(self):
+        from sglang.srt.afd.microbatch_overlap import _split_afd_spec_info
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        verify = DFlashVerifyInput(
+            draft_token=torch.arange(40),
+            positions=torch.arange(40) + 100,
+            draft_token_num=8,
+            live_seq_lens_cpu=torch.arange(5),
+        )
+        for sizes in ((5,), (3, 2), (2, 2, 1), (1, 0, 0)):
+            offset = 0
+            for size in sizes:
+                child = _split_afd_spec_info(
+                    verify, offset, offset + size, offset * 8, (offset + size) * 8
+                )
+                torch.testing.assert_close(
+                    child.draft_token,
+                    verify.draft_token[offset * 8 : (offset + size) * 8],
+                )
+                torch.testing.assert_close(
+                    child.positions,
+                    verify.positions[offset * 8 : (offset + size) * 8],
+                )
+                torch.testing.assert_close(
+                    child.live_seq_lens_cpu,
+                    verify.live_seq_lens_cpu[offset : offset + size],
+                )
+                self.assertEqual(child.num_tokens_per_req, 8)
+                offset += size
+
+    def test_static_verify_capture_without_draft_tensors(self):
+        from sglang.srt.afd.microbatch_overlap import _split_afd_spec_info
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        verify = DFlashVerifyInput(None, None, 8)
+        child = _split_afd_spec_info(verify, 0, 2, 0, 16)
+        self.assertIsNone(child.draft_token)
+        self.assertIsNone(child.positions)
+        self.assertEqual(child.num_tokens_per_req, 8)
+
+    def test_microbatch_rejects_non_linear_verify_layouts(self):
+        from sglang.srt.afd.microbatch_overlap import _split_afd_spec_info
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        for field in ("custom_mask", "ragged_verify_layout"):
+            with self.subTest(field=field):
+                verify = DFlashVerifyInput(None, None, 8)
+                setattr(verify, field, object())
+                with self.assertRaisesRegex(ValueError, "static linear verify"):
+                    _split_afd_spec_info(verify, 0, 2, 0, 16)
+
+    def test_target_verify_restores_cross_dp_counts_before_scaling(self):
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        verify = DFlashVerifyInput(
+            draft_token=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+            draft_token_num=8,
+        )
+        forward = SimpleNamespace()
+        init_afd_mlp_sync_metadata(
+            forward,
+            SimpleNamespace(
+                global_num_tokens_across_dp=[0, 3],
+                global_num_tokens_for_logprob_across_dp=[0, 3],
+                spec_info=verify,
+            ),
+            SimpleNamespace(is_draft_worker=False, device="cpu"),
+        )
+        self.assertEqual(forward.original_global_num_tokens_cpu, [0, 3])
+        self.assertEqual(forward.global_num_tokens_cpu, [0, 24])
+
+    def test_local_draft_preserves_cross_dp_counts_for_graph_replay(self):
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            DraftBlockProposer,
+        )
+
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_moe_sync = True
+        proposer._draft_block_spec_info = DFlashVerifyInput(
+            torch.empty(0), torch.empty(0), 8
+        )
+        batch = SimpleNamespace(
+            can_run_decode_cuda_graph=True,
+            global_num_tokens=[0],
+            global_num_tokens_for_logprob=[0],
+            global_num_tokens_across_dp=[0, 3],
+            global_num_tokens_for_logprob_across_dp=[0, 3],
+        )
+        for role, counts in (("attn", [0, 24]), (None, [0])):
+            with (
+                self.subTest(role=role),
+                get_context().override_server_args(afd_role=role),
+                patch(
+                    "sglang.srt.speculative.dspark_components.dspark_draft._make_num_token_non_padded",
+                    return_value=None,
+                ),
+            ):
+                proposer.draft_model_runner = SimpleNamespace(
+                    device="cpu", afd_cuda_graph_batch_size=None
+                )
+                forward = SimpleNamespace(input_ids=torch.empty(0, dtype=torch.int64))
+                proposer._fill_dp_moe_sync_metadata(forward, batch)
+                self.assertEqual(forward.global_num_tokens_cpu, counts)
+                self.assertEqual(
+                    forward.original_global_num_tokens_cpu,
+                    (
+                        batch.global_num_tokens_across_dp
+                        if role == "attn"
+                        else batch.global_num_tokens
+                    ),
+                )
+                self.assertIsNone(proposer.draft_model_runner.afd_cuda_graph_batch_size)
+
+    def test_local_draft_selects_configured_fp4_runner_and_restores_target(self):
+        from sglang.srt.layers.moe.utils import (
+            MoeA2ABackend,
+            MoeRunnerBackend,
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+        from sglang.srt.runtime_context import get_flags
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._draft_dp_context_enabled = False
+        method = Fp8MoEMethod.__new__(Fp8MoEMethod)
+        method.is_fp4_expert = True
+        runner_config = SimpleNamespace()
+        for role in ("attn", None):
+            with (
+                self.subTest(role=role),
+                get_context().override_server_args(afd_role=role),
+                patch.object(get_flags().moe, "runner_backend", MoeRunnerBackend.AUTO),
+                patch.object(
+                    get_flags().moe,
+                    "speculative_runner_backend",
+                    MoeRunnerBackend.DEEP_GEMM,
+                ),
+                patch.object(get_flags().moe, "a2a_backend", MoeA2ABackend.AFD_ATTN),
+                patch.object(
+                    get_flags().moe, "speculative_a2a_backend", MoeA2ABackend.NONE
+                ),
+                patch("sglang.srt.layers.quantization.fp8.MoeRunner") as runner,
+                patch("sglang.srt.layers.quantization.fp8._is_hip", False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "draft failure"):
+                    with worker._draft_context():
+                        method.create_moe_runner(SimpleNamespace(), runner_config)
+                        runner.assert_called_once_with(
+                            (
+                                MoeRunnerBackend.DEEP_GEMM
+                                if role == "attn"
+                                else MoeRunnerBackend.TRITON
+                            ),
+                            runner_config,
+                        )
+                        raise RuntimeError("draft failure")
+                self.assertEqual(get_moe_runner_backend(), MoeRunnerBackend.AUTO)
+                self.assertEqual(get_moe_a2a_backend(), MoeA2ABackend.AFD_ATTN)
+
+    def test_idle_draft_enters_local_moe_context_and_restores_target(self):
+        from sglang.srt.layers.moe.utils import (
+            MoeA2ABackend,
+            MoeRunnerBackend,
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+        from sglang.srt.runtime_context import get_flags
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+            DSparkWorkerV2,
+        )
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._draft_is_moe = True
+        worker._draft_dp_context_enabled = False
+        worker._observers = SimpleNamespace(note_idle_decode_step=lambda: None)
+        observed = []
+        worker._proposer = SimpleNamespace(
+            run_idle_participation=lambda _: observed.append(
+                (get_moe_a2a_backend().value, get_moe_runner_backend().value)
+            )
+        )
+        worker._verify_executor = SimpleNamespace(
+            run_idle_participation=lambda **_: observed.append(
+                (get_moe_a2a_backend().value, get_moe_runner_backend().value)
+            )
+        )
+        worker._idle_verify_ragged_layout = lambda _: None
+        worker._decode_idle_result = lambda **_: None
+        batch = SimpleNamespace(
+            spec_info=DFlashDraftInputV2.create_idle_input(device="cpu"),
+            forward_mode=ForwardMode.IDLE,
+        )
+        with (
+            get_context().override_server_args(
+                afd_role="attn",
+                enable_dp_attention=True,
+            ),
+            patch.object(get_flags().moe, "runner_backend", MoeRunnerBackend.AUTO),
+            patch.object(
+                get_flags().moe,
+                "speculative_runner_backend",
+                MoeRunnerBackend.DEEP_GEMM,
+            ),
+            patch.object(get_flags().moe, "a2a_backend", MoeA2ABackend.AFD_ATTN),
+            patch.object(
+                get_flags().moe, "speculative_a2a_backend", MoeA2ABackend.NONE
+            ),
+        ):
+            worker._forward_decode(batch, on_publish=None)
+            self.assertEqual(observed, [("none", "deep_gemm"), ("afd", "auto")])
+            self.assertEqual(get_moe_a2a_backend().value, "afd")
+            self.assertEqual(get_moe_runner_backend(), MoeRunnerBackend.AUTO)
+
+    def test_afd_eager_verify_defers_attention_metadata(self):
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        events = []
+        graph_runner = SimpleNamespace(can_run_graph=lambda _: events.append("graph"))
+        model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=graph_runner,
+            afd_target_verify_prepare_callback=lambda _: events.append("afd") or False,
+            attn_backend=SimpleNamespace(
+                init_forward_metadata=lambda _: events.append("metadata")
+            ),
+        )
+        verify = DFlashVerifyInput(torch.empty(0), torch.empty(0), 8)
+        with (
+            patch(
+                "sglang.srt.speculative.dflash_info.ForwardBatch.init_new",
+                return_value=SimpleNamespace(),
+            ),
+            patch("sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify"),
+        ):
+            _, can_run_graph = verify.prepare_for_verify(
+                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                SimpleNamespace(model_runner=model_runner),
+            )
+        self.assertFalse(can_run_graph)
+        self.assertEqual(events, ["afd"])
+
+    def test_non_afd_eager_verify_preserves_metadata_preparation(self):
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        prepared = SimpleNamespace(mark_forward_metadata_ready=Mock())
+        attn_backend = SimpleNamespace(init_forward_metadata=Mock())
+        runner = SimpleNamespace(
+            decode_cuda_graph_runner=SimpleNamespace(can_run_graph=lambda _: False),
+            attn_backend=attn_backend,
+        )
+        verify = DFlashVerifyInput(torch.empty(0), torch.empty(0), 8)
+        with (
+            patch(
+                "sglang.srt.speculative.dflash_info.ForwardBatch.init_new",
+                return_value=prepared,
+            ),
+            patch("sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify"),
+        ):
+            _, can_run = verify.prepare_for_verify(
+                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                SimpleNamespace(model_runner=runner),
+            )
+        self.assertFalse(can_run)
+        attn_backend.init_forward_metadata.assert_called_once_with(prepared)
+        prepared.mark_forward_metadata_ready.assert_called_once_with(
+            replan_equivalent=True
         )
 
 
@@ -727,11 +1039,55 @@ class TestAFDServerArgsCheck(unittest.TestCase):
                     resolving_view(args).speculative_moe_a2a_backend, "none"
                 )
 
+    def test_dspark_all_afd_backends_and_overlap_modes(self):
+        for backend in ("nccl", "nvshmem", "direct_deepep", "direct_megamoe"):
+            for microbatches in (1, 2, 3):
+                with self.subTest(backend=backend, microbatches=microbatches):
+                    args = _make_eagle_args(
+                        speculative_algorithm="DSPARK",
+                        speculative_moe_runner_backend="deep_gemm",
+                        speculative_num_steps=1,
+                        speculative_num_draft_tokens=8,
+                        afd_backend=backend,
+                        afd_decode_num_microbatches=microbatches,
+                        tp_size=2,
+                        dp_size=2,
+                        enable_dp_attention=True,
+                        enable_dp_lm_head=True,
+                    )
+                    check_afd_server_args(args)
+                    finalize_afd_speculative_args(args)
+                    self.assertEqual(
+                        resolving_view(args).speculative_moe_a2a_backend, "none"
+                    )
+
+    def test_dspark_fp4_resolves_deferred_auto_runner(self):
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        args = _make_eagle_args(
+            speculative_algorithm="DSPARK",
+            speculative_moe_runner_backend=None,
+            speculative_num_steps=1,
+            speculative_num_draft_tokens=8,
+        )
+        declare_resolution(
+            args, "speculative_default", speculative_moe_runner_backend="auto"
+        )
+        check_afd_server_args(args)
+        with patch(
+            "sglang.srt.afd.afd_config.model_config_of",
+            return_value=SimpleNamespace(is_fp4_experts=True),
+        ):
+            finalize_afd_speculative_args(args)
+        self.assertEqual(
+            resolving_view(args).speculative_moe_runner_backend, "deep_gemm"
+        )
+
     def test_rejects_unsupported_speculative_combinations(self):
         disabled_graph = default_cuda_graph_config()
         disabled_graph.decode.backend = Backend.DISABLED
         cases = (
-            ({"speculative_algorithm": "MTP"}, "speculative_algorithm='EAGLE'"),
+            ({"speculative_algorithm": "MTP"}, "speculative_algorithm in"),
             ({"speculative_eagle_topk": 2}, "speculative-eagle-topk 1"),
             (
                 {"cuda_graph_config": disabled_graph},

@@ -35,6 +35,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 _AFD_MICROBATCH_OVERLAP_SUPPORTED_MODEL_ARCHS = frozenset(
@@ -334,6 +335,49 @@ class AFDMicrobatchAttentionBackend(AttentionBackend):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
 
+def _split_afd_spec_info(
+    spec_info: Optional[SpecInput],
+    start_seq_index: int,
+    end_seq_index: int,
+    start_token_index: int,
+    end_token_index: int,
+    mask_offset_cache: Optional[dict[int, int]] = None,
+):
+    if spec_info is None:
+        return None
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+    if not isinstance(spec_info, DFlashVerifyInput):
+        return split_spec_info(
+            spec_info,
+            start_seq_index,
+            end_seq_index,
+            start_token_index,
+            end_token_index,
+            mask_offset_cache=mask_offset_cache,
+        )
+    if spec_info.custom_mask is not None or spec_info.ragged_verify_layout is not None:
+        raise ValueError("AFD DSpark microbatches require static linear verify")
+    return replace(
+        spec_info,
+        draft_token=(
+            spec_info.draft_token[start_token_index:end_token_index]
+            if spec_info.draft_token is not None
+            else None
+        ),
+        positions=(
+            spec_info.positions[start_token_index:end_token_index]
+            if spec_info.positions is not None
+            else None
+        ),
+        live_seq_lens_cpu=(
+            spec_info.live_seq_lens_cpu[start_seq_index:end_seq_index]
+            if spec_info.live_seq_lens_cpu is not None
+            else None
+        ),
+    )
+
+
 def prepare_afd_microbatch_forward_batch(
     forward_batch: ForwardBatch,
     num_microbatches: int,
@@ -400,7 +444,7 @@ def prepare_afd_microbatch_forward_batch(
             out_num_token_non_padded=child_num_tokens_gpu[child_index],
             out_num_token_non_padded_cpu=child_num_tokens[child_index],
         )
-        child.spec_info = split_spec_info(
+        child.spec_info = _split_afd_spec_info(
             spec_info,
             start_seq_index=start_seq,
             end_seq_index=end_seq,
@@ -489,7 +533,7 @@ def _build_afd_microbatch_child_replay_views(
                     if forward_batch.out_cache_loc is not None
                     else None
                 ),
-                spec_info=split_spec_info(
+                spec_info=_split_afd_spec_info(
                     spec_info,
                     start_seq_index=start_seq,
                     end_seq_index=end_seq,

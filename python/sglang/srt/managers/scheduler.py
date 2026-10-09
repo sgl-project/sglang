@@ -4226,6 +4226,8 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
+        self._afd_pre_run_batch(batch)
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -4238,8 +4240,6 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
-
-        self._afd_pre_run_batch(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -815,7 +815,13 @@ def init_afd_mlp_sync_metadata(
     batch: ScheduleBatch,
     model_runner,
 ) -> None:
-    if not model_runner.is_draft_worker:
+    from sglang.srt.speculative.spec_info import SpecInputType
+
+    is_dspark_target_verify = (
+        batch.spec_info is not None
+        and batch.spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
+    if not model_runner.is_draft_worker and not is_dspark_target_verify:
         forward_batch.init_mlp_sync_metadata(batch, model_runner.device)
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens_across_dp
         return

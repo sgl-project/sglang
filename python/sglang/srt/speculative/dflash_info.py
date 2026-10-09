@@ -101,8 +101,17 @@ class DFlashVerifyInput(SpecInput):
             return_hidden_states_before_norm=False,
         )
 
+        afd_prepare_callback = getattr(
+            target_worker.model_runner, "afd_target_verify_prepare_callback", None
+        )
+        afd_graph_allowed = (
+            afd_prepare_callback(verify_forward_batch)
+            if afd_prepare_callback is not None
+            else True
+        )
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
+            afd_graph_allowed
+            and target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
@@ -117,10 +126,12 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
+            verify_forward_batch.mark_forward_metadata_ready()
+        elif afd_prepare_callback is None and not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
             )
+            verify_forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
 
         return verify_forward_batch, can_run_cuda_graph
 

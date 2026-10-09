@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -478,14 +478,21 @@ class DraftBlockProposer:
         # Graph bucket selection uses the raw per-rank request counts.  Keep
         # them separate from global_num_tokens_cpu below, which is scaled into
         # draft-token units for DP/MoE synchronization.
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        raw_counts = batch.global_num_tokens
+        raw_logprob_counts = batch.global_num_tokens_for_logprob
+        if (
+            get_disagg().afd_role == "attn"
+            and batch.global_num_tokens_across_dp is not None
+        ):
+            raw_counts = batch.global_num_tokens_across_dp
+            raw_logprob_counts = batch.global_num_tokens_for_logprob_across_dp
+        forward_batch.original_global_num_tokens_cpu = raw_counts
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
-            batch.global_num_tokens,
-            batch.global_num_tokens_for_logprob,
+            raw_counts,
+            raw_logprob_counts,
         )
         device = self.draft_model_runner.device
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
         num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
         if num_token_non_padded is not None:

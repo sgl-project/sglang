@@ -508,14 +508,19 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "DSpark speculative decoding only supports CUDA or NPU device."
         )
 
+    target_uses_afd = cfg.afd_role == "attn" and cfg.moe_a2a_backend == "afd"
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
+        if (
+            not _is_npu
+            and not target_uses_afd
+            and cfg.moe_a2a_backend not in ("none", "megamoe")
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
+                "(built-in TP MoE), 'megamoe', or an AFD target, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":
@@ -537,6 +542,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         if (
             not _is_npu
+            and not target_uses_afd
             and cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):

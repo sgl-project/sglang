@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
@@ -59,6 +60,14 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config.read_draft_checkpoint_config",
+                return_value=None,
+            )
+        )
+
     def test_bundled_checkpoint_defaults_draft_path_to_model_path(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
@@ -94,6 +103,14 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
+    def setUp(self):
+        self.enterContext(
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config.read_draft_checkpoint_config",
+                return_value=None,
+            )
+        )
+
     def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
@@ -105,7 +122,14 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
+    def test_afd_target_allows_local_draft(self):
+        args = self._dp_server_args(moe_a2a_backend="afd")
+        args.afd_role = "attn"
+        args.speculative_moe_a2a_backend = "none"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+    def test_non_afd_a2a_backend_allowlist(self):
         """Both sides of the allowlist: megamoe passes, others raise by name."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
