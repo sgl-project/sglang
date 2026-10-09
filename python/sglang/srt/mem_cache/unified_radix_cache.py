@@ -1024,6 +1024,8 @@ class UnifiedRadixCache(BasePrefixCache):
         params: Optional[DecLockRefParams] = None,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
+        if params is None:
+            params = DecLockRefParams()
         if self.disable:
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
