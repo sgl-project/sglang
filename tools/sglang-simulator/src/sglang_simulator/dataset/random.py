@@ -48,5 +48,4 @@ class RandomDataset(RandomIDsDataset):
         if req.token_ids is not None:
             req.prompt = self.tokenizer.decode(req.token_ids, skip_special_tokens=True)
             req.token_ids = None
-        self.cached.append(req)
         return req

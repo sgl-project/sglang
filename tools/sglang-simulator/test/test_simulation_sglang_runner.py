@@ -1,18 +1,65 @@
 import atexit
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang_simulator.dataset import GenericRequest, SimpleDataset
+import pytest
+from sglang_simulator.dataset import (
+    DatasetArgs,
+    GenericRequest,
+    SimpleDataset,
+    get_dataset,
+)
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
+from transformers import PreTrainedTokenizerFast
 
 ASSETS = Path(__file__).parent / "assets"
 SGLANG_ROOT = Path(__file__).parents[3]
 if str(SGLANG_ROOT) not in sys.path:
     sys.path.insert(0, str(SGLANG_ROOT))
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+
+@pytest.mark.parametrize("dataset_name", ["random", "random_ids"])
+def test_random_dataset_caches_each_request_once(dataset_name):
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(
+        ASSETS.parent.parent / "examples" / "assets" / "tokenizer",
+        local_files_only=True,
+    )
+    rng_state = random.getstate()
+    try:
+        random.seed(42)
+        dataset = get_dataset(
+            dataset_args=DatasetArgs(
+                name=dataset_name,
+                num_prompts=8,
+                min_input_len=32,
+                max_input_len=32,
+                min_output_len=4,
+                max_output_len=4,
+            ),
+            tokenizer=tokenizer,
+        )
+        requests = list(dataset)
+        assert len(requests) == 8
+        assert len({id(request) for request in requests}) == len(requests)
+        assert all(dataset[i] is request for i, request in enumerate(requests))
+        assert dataset[::2] == requests[::2]
+        assert all(request.input_length == 32 for request in requests)
+        assert all(request.output_length == 4 for request in requests)
+        if dataset_name == "random":
+            assert all(request.token_ids is None for request in requests)
+            assert len({request.prompt for request in requests}) == len(requests)
+        else:
+            assert all(request.prompt is None for request in requests)
+            assert len({tuple(request.token_ids) for request in requests}) == len(
+                requests
+            )
+    finally:
+        random.setstate(rng_state)
 
 
 def make_fixed_dataset(
