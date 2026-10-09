@@ -58,10 +58,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
-)
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
@@ -1510,7 +1507,7 @@ class MQALayer(MqaAttentionBase):
         stream_compressor = self.alt_streams[1]
         stream_indexer = self.alt_streams[2]
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_cp = is_cp_active(forward_batch)
         if not use_cp:
             stream_kv.wait_stream(current_stream)
             stream_compressor.wait_stream(current_stream)
@@ -1684,7 +1681,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch):
+        if is_cp_active(forward_batch):
             return self._forward_prepare_low_ratio_cp_multi_stream(
                 x,
                 positions,
@@ -2332,9 +2329,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         unified = is_unified_kv_triton()
-        use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
-            forward_batch
-        )
+        use_prefill_cp = is_cp_active(forward_batch)
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
