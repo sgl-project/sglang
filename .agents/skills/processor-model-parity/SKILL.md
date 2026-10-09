@@ -186,7 +186,7 @@ once its render parity holds. Two more fixtures then cover the rest of Python's
 OpenAI layer:
 - `tests/fixtures/reasoning_parity/<parser>.json`, from
   `tests/scripts/generate_reasoning_parity.py`: SGLang's `ReasoningParser` on
-  chunked outputs. A parser is served once `src/parser/models/` ports it.
+  chunked outputs. A parser is served once `src/think/models/` ports it.
 - `tests/fixtures/openai_parity/<model-id>.json`, from
   `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's

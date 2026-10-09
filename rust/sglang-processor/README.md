@@ -128,11 +128,12 @@ dynamo_tool_parser_name(sglang_name) -> &str
 
 `mod.rs` holds the events and the stream processor, `reasoning.rs` the
 reasoning split, and `tools.rs` tool schemas, constraints and call deltas.
-`models/` lists the parser names SGLang ports from Python because Dynamo's
-parsers split them differently; `think.rs` is the port of SGLang's
-`BaseReasoningFormatDetector` they configure. `tests/reasoning_parity.rs`
-checks them against SGLang's `ReasoningParser`. To port another model, add
-`models/<model>.rs` and its names in `models/mod.rs`.
+`src/think/models/` lists the parser names SGLang ports from Python because
+Dynamo's parsers split them differently; `src/think/` is the port of SGLang's
+`BaseReasoningFormatDetector` they configure, free of Dynamo so `openai` needs
+no `parser` feature. `tests/reasoning_parity.rs` checks them against SGLang's
+`ReasoningParser`. To port another model, add `think/models/<model>.rs` and its
+names in `think/models/mod.rs`.
 
 Pass-through for parsing:
 - Other reasoning parsers go through
@@ -166,8 +167,8 @@ output into the response SGLang's handler would return. Anything not reproduced
 exactly is `Unsupported`, and the host sends it to the engine's own route.
 `tests/openai_parity.rs` replays fixtures recorded by
 `tests/scripts/generate_openai_parity.py`, which runs SGLang's handler on the
-`/generate` output of a live engine. Chat parses output with `parser/`, and
-serves only the parser names `parser/models/` ports.
+`/generate` output of a live engine. Chat splits reasoning with `think/`, and
+serves only the parser names `think/models/` ports.
 
 ## Host example
 

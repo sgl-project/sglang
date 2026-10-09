@@ -11,7 +11,7 @@ parser = ["dep:dynamo-parsers", "dep:dynamo-protocols"]
 render = ["dep:dynamo-protocols", "dep:dynamo-renderer", "dep:minijinja"]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
-openai = ["parser"]
+openai = []
 
 [dependencies]
 async-stream = { workspace = true }

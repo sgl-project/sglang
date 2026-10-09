@@ -20,13 +20,12 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::ProcessorError;
+use crate::think::ReasoningOptions;
 
-pub(crate) mod models;
 mod reasoning;
-mod think;
 mod tools;
 
-pub use self::reasoning::{ReasoningOptions, ReasoningStreamSplitter, split_reasoning};
+pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
 pub use self::tools::{
     ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
     tool_constraint,

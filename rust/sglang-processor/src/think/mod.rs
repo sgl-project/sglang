@@ -1,6 +1,32 @@
-//! SGLang's `BaseReasoningFormatDetector` (`parser/reasoning_parser.py`).
+//! SGLang's `BaseReasoningFormatDetector` (`parser/reasoning_parser.py`),
+//! for the parser names `models/` ports. Free of Dynamo, so the `openai`
+//! layer uses it without the `parser` feature.
 
-use super::reasoning::ReasoningOptions;
+mod models;
+
+pub(crate) use self::models::think_config;
+
+/// The request settings Python passes its reasoning parser. Dynamo-backed
+/// names only honour `force_reasoning`; `None` keeps the parser's default.
+#[derive(Debug, Clone)]
+pub struct ReasoningOptions {
+    pub force_reasoning: Option<bool>,
+    pub stream_reasoning: bool,
+    /// The final assistant message continued under `continue_final_message`.
+    pub previous_content: Option<String>,
+    pub force_nonempty_content: bool,
+}
+
+impl Default for ReasoningOptions {
+    fn default() -> Self {
+        Self {
+            force_reasoning: None,
+            stream_reasoning: true,
+            previous_content: None,
+            force_nonempty_content: false,
+        }
+    }
+}
 
 /// The tokens one `--reasoning-parser` configures the base detector with.
 #[derive(Debug, Clone, Copy)]
@@ -13,7 +39,7 @@ pub(crate) struct ThinkConfig {
 
 /// Streaming and one-shot `<think>` splitting, as SGLang's base detector does it.
 #[derive(Debug, Clone)]
-pub(super) struct ThinkDetector {
+pub(crate) struct ThinkDetector {
     start: &'static str,
     end: &'static str,
     tool_start: Option<&'static str>,
@@ -29,7 +55,7 @@ pub(super) struct ThinkDetector {
 }
 
 impl ThinkDetector {
-    pub(super) fn new(config: ThinkConfig, options: &ReasoningOptions) -> Self {
+    pub(crate) fn new(config: ThinkConfig, options: &ReasoningOptions) -> Self {
         let previous_content = options.previous_content.clone().unwrap_or_default();
         let mut in_reasoning = options.force_reasoning.unwrap_or(false);
         if previous_content.contains(config.start) {
@@ -55,7 +81,7 @@ impl ThinkDetector {
     }
 
     /// `detect_and_parse`: `(reasoning_text, normal_text)` of a whole output.
-    pub(super) fn parse(&mut self, text: &str) -> (String, String) {
+    pub(crate) fn parse(&mut self, text: &str) -> (String, String) {
         let split = self.parse_impl(text);
         self.nonempty_content(split)
     }
@@ -85,7 +111,7 @@ impl ThinkDetector {
     }
 
     /// `parse_streaming_increment`: the `(reasoning, normal)` delta of one chunk.
-    pub(super) fn push(&mut self, text: &str) -> (String, String) {
+    pub(crate) fn push(&mut self, text: &str) -> (String, String) {
         let split = self.push_impl(text);
         if self.force_nonempty_content {
             if self.in_reasoning {
@@ -152,7 +178,7 @@ impl ThinkDetector {
     }
 
     /// `finish`: flush what the stream still holds when it ends.
-    pub(super) fn finish(&mut self) -> (String, String) {
+    pub(crate) fn finish(&mut self) -> (String, String) {
         if !self.in_reasoning {
             return (String::new(), std::mem::take(&mut self.buffer));
         }

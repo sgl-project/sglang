@@ -6,30 +6,7 @@ use dynamo_parsers::reasoning::{
     ReasoningParser as _, ReasoningParserType, ReasoningParserWrapper,
 };
 
-use super::models::think_config;
-use super::think::ThinkDetector;
-
-/// The request settings Python passes its reasoning parser. Dynamo-backed
-/// names only honour `force_reasoning`; `None` keeps the parser's default.
-#[derive(Debug, Clone)]
-pub struct ReasoningOptions {
-    pub force_reasoning: Option<bool>,
-    pub stream_reasoning: bool,
-    /// The final assistant message continued under `continue_final_message`.
-    pub previous_content: Option<String>,
-    pub force_nonempty_content: bool,
-}
-
-impl Default for ReasoningOptions {
-    fn default() -> Self {
-        Self {
-            force_reasoning: None,
-            stream_reasoning: true,
-            previous_content: None,
-            force_nonempty_content: false,
-        }
-    }
-}
+use crate::think::{ReasoningOptions, ThinkDetector, think_config};
 
 /// Build the parser a Python `--reasoning-parser` name selects. Names Dynamo
 /// does not know fall back to its non-forced basic parser.

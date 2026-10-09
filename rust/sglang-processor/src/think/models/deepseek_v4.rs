@@ -1,6 +1,6 @@
 //! DeepSeek-V4 (`DeepSeekV4Detector` in `parser/reasoning_parser.py`).
 
-use crate::parser::think::ThinkConfig;
+use crate::think::ThinkConfig;
 
 pub(super) const THINK: ThinkConfig = ThinkConfig {
     start: "<think>",

@@ -3,7 +3,7 @@
 
 mod deepseek_v4;
 
-use super::think::ThinkConfig;
+use super::ThinkConfig;
 
 /// The base-detector tokens a `--reasoning-parser` name selects.
 pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {

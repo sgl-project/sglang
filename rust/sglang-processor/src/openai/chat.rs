@@ -16,8 +16,7 @@ use super::wire::{
     stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
-use crate::parser::models::think_config;
-use crate::parser::{ReasoningOptions, ReasoningStreamSplitter, split_reasoning};
+use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 
 /// Facts about the served model that Python's chat layer reads.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -168,10 +167,10 @@ pub fn lower_chat(
     if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
         return Err(Unsupported("sglext_output"));
     }
-    let parser = settings.reasoning_parser.as_deref();
-    if parser.is_some_and(|parser| think_config(parser).is_none()) {
-        return Err(Unsupported("reasoning_parser"));
-    }
+    let parser = match settings.reasoning_parser.as_deref() {
+        Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
+        None => None,
+    };
     // Fields the typed request below does not read, typed as Pydantic types them.
     let task = raw.get("task").filter(|t| !t.is_null());
     let tool_choice = raw.get("tool_choice").filter(|c| !c.is_null());
@@ -236,8 +235,8 @@ pub fn lower_chat(
         usage_flags(request.stream_options.as_ref(), settings);
     let reasoning = parser
         .filter(|_| request.separate_reasoning)
-        .map(|parser| ReasoningConfig {
-            parser: parser.to_owned(),
+        .map(|config| ReasoningConfig {
+            think: config,
             options: ReasoningOptions {
                 force_reasoning: Some(thinking),
                 stream_reasoning: request.stream_reasoning,
@@ -535,7 +534,7 @@ fn generate_body(
 }
 
 struct ReasoningConfig {
-    parser: String,
+    think: ThinkConfig,
     options: ReasoningOptions,
 }
 
@@ -551,7 +550,7 @@ pub struct ChatResponder {
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
     stream: StreamState,
     roles_sent: HashSet<u64>,
-    detectors: HashMap<u64, ReasoningStreamSplitter>,
+    detectors: HashMap<u64, ThinkDetector>,
     finish_reasons: Vec<(u64, Value)>,
 }
 
@@ -574,8 +573,7 @@ impl ChatResponder {
             let mut text = text.to_owned();
             let mut reasoning = String::new();
             if let Some(config) = &self.reasoning {
-                (reasoning, text) =
-                    split_reasoning::<u32>(Some(&config.parser), &config.options, &text, &[]);
+                (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
             }
             let finish_reason = &meta["finish_reason"];
             choices.push(json!({
@@ -691,10 +689,11 @@ impl ChatResponder {
         };
         let mut remaining_logprobs = logprobs;
         if let Some(config) = &self.reasoning {
-            let detector = self.detectors.entry(index).or_insert_with(|| {
-                ReasoningStreamSplitter::new(Some(&config.parser), config.options.clone())
-            });
-            let (mut reasoning, mut normal) = detector.split::<u32>(&delta, &[]);
+            let detector = self
+                .detectors
+                .entry(index)
+                .or_insert_with(|| ThinkDetector::new(config.think, &config.options));
+            let (mut reasoning, mut normal) = detector.push(&delta);
             if finish_type.as_deref().is_some_and(|t| t != "abort") {
                 let (end_reasoning, end_normal) = detector.finish();
                 reasoning.push_str(&end_reasoning);
