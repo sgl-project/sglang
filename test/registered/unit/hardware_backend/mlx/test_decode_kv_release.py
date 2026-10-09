@@ -1,12 +1,5 @@
-"""MLX decode KV reaches the shared pool only through the request's own row.
-
-Chained decode steps in the MLX overlap loop allocate no pool slots, so a
-request's req_to_token row holds scheduler-allocated slots only for its first
-``owned_kv_len()`` positions; the rest of the row is whatever an earlier owner
-left there, often slots the radix tree still keys on. The decode KV must be
-synced at the release hook, clamped to that prefix, and never again once the
-row is handed back.
-"""
+"""Decode KV must never be written through req_to_token entries past
+``owned_kv_len()``, nor after the request's row is released."""
 
 from __future__ import annotations
 
@@ -86,7 +79,7 @@ def _runner(req_to_token_pool):
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx + mlx_lm")
 class TestDecodeKvRelease(CustomTestCase):
-    def test_release_syncs_owned_prefix_and_nothing_after(self):
+    def _decoded_runner(self):
         req_to_token_pool = ReqToTokenPool(
             size=2, max_context_len=64, device="cpu", enable_memory_saver=False
         )
@@ -107,7 +100,16 @@ class TestDecodeKvRelease(CustomTestCase):
         )
         for _ in range(DECODE_STEPS):
             runner.decode_batch(["r"])
+        return runner
 
+    def _assert_foreign_slots_untouched(self, runner):
+        pool = runner._attention_kv_pool
+        foreign_k, foreign_v = pool.get_kv(0, mx.array(FOREIGN_SLOTS, dtype=mx.int32))
+        self.assertEqual(mx.abs(foreign_k).max().item(), 0.0)
+        self.assertEqual(mx.abs(foreign_v).max().item(), 0.0)
+
+    def test_release_syncs_owned_prefix_and_nothing_after(self):
+        runner = self._decoded_runner()
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = runner
         req = SimpleNamespace(
@@ -120,12 +122,18 @@ class TestDecodeKvRelease(CustomTestCase):
         # dropped later, when it leaves the running batch.
         runner.remove_request("r")
 
-        pool = runner._attention_kv_pool
-        own_k, _ = pool.get_kv(0, mx.array([OWN_SLOTS[-1]], dtype=mx.int32))
+        own_k, _ = runner._attention_kv_pool.get_kv(
+            0, mx.array([OWN_SLOTS[-1]], dtype=mx.int32)
+        )
         self.assertGreater(mx.abs(own_k).max().item(), 0.0)
-        foreign_k, foreign_v = pool.get_kv(0, mx.array(FOREIGN_SLOTS, dtype=mx.int32))
-        self.assertEqual(mx.abs(foreign_k).max().item(), 0.0)
-        self.assertEqual(mx.abs(foreign_v).max().item(), 0.0)
+        self._assert_foreign_slots_untouched(runner)
+
+    def test_retracted_request_writes_nothing(self):
+        # A retraction frees the row with no release hook; dropping the
+        # state afterwards must not write through the (reusable) row.
+        runner = self._decoded_runner()
+        runner.remove_request("r")
+        self._assert_foreign_slots_untouched(runner)
 
 
 if __name__ == "__main__":

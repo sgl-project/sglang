@@ -868,15 +868,9 @@ class MlxModelRunner:
         self._req_synced_offset[req_id] = current_offset
 
     def release_request_row(self, req_id: str, owned_len: int) -> None:
-        """Sync *req_id*'s decode KV to the pool, then forget its row.
-
-        Called right before the scheduler releases the request's
-        req_to_token row. Only the first *owned_len* positions of the row
-        hold slots the scheduler gave this request: chained decode steps get
-        none, so the rest is stale and may point at slots the radix tree or
-        another request owns. Forgetting the row makes later syncs no-ops,
-        since the row can be reused once released.
-        """
+        """Sync decode KV only within the first *owned_len* positions (chained
+        decode steps own no slots past it), then forget the row, which the
+        scheduler may reuse once released."""
         if not self.disable_radix_cache:
             self._sync_decode_kv_to_pool(req_id, end=owned_len)
         self._req_pool_idx.pop(req_id, None)
@@ -1688,12 +1682,9 @@ class MlxModelRunner:
         """Check if a request has active state."""
         return req_id in self._req_caches
 
-    def remove_request(self, req_id: str, sync_kv: bool = True):
-        """Release request state, first syncing its remaining decode KV to the
-        pool unless *sync_kv* is False (the caller discards that KV)."""
-        if sync_kv and not self.disable_radix_cache:
-            self._sync_decode_kv_to_pool(req_id)
-
+    def remove_request(self, req_id: str):
+        """Release request state without syncing: decode KV reaches the pool
+        only through release_request_row, while the request owns its row."""
         self._req_token_ids.pop(req_id, None)
         self._req_sampling.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)

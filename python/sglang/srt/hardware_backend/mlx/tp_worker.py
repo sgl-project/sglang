@@ -188,7 +188,7 @@ class MlxTpModelWorker(TpModelWorker):
         made_at = self._req_retraction_count.get(req.rid)
         if made_at is not None and made_at != req.retraction_count:
             del self._req_retraction_count[req.rid]
-            self._mlx_runner.remove_request(req.rid, sync_kv=False)
+            self._mlx_runner.remove_request(req.rid)
             self._mlx_active_rids.discard(req.rid)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
