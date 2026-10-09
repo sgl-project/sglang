@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 
-
 pytest.importorskip("torch_mlu")
 if not torch.mlu.is_available():
     pytest.skip("Cambricon MLU is not available", allow_module_level=True)

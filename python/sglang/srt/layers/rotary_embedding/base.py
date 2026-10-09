@@ -477,7 +477,9 @@ class RotaryEmbedding(BaseFusedOp):
             return self.forward_native(positions, query, key)
 
         num_tokens = positions.numel()
-        cu_seqlens = torch.tensor([0, num_tokens], device=query.device, dtype=torch.int32)
+        cu_seqlens = torch.tensor(
+            [0, num_tokens], device=query.device, dtype=torch.int32
+        )
         token_offsets = positions.view(1, num_tokens)
         q = query.view(num_tokens, -1, self.head_size)
         k = key.view(num_tokens, -1, self.head_size)
@@ -486,14 +488,24 @@ class RotaryEmbedding(BaseFusedOp):
         q_out = torch.empty_like(q_rot)
         k_out = torch.empty_like(k_rot)
         apply_rotary(
-            q_out, q_rot, cos, sin, BLOCK_M=2,
-            token_offsets=token_offsets, cu_seqlens=cu_seqlens,
+            q_out,
+            q_rot,
+            cos,
+            sin,
+            BLOCK_M=2,
+            token_offsets=token_offsets,
+            cu_seqlens=cu_seqlens,
             max_seqlen=num_tokens,
             interleaved=not self.is_neox_style,
         )
         apply_rotary(
-            k_out, k_rot, cos, sin, BLOCK_M=2,
-            token_offsets=token_offsets, cu_seqlens=cu_seqlens,
+            k_out,
+            k_rot,
+            cos,
+            sin,
+            BLOCK_M=2,
+            token_offsets=token_offsets,
+            cu_seqlens=cu_seqlens,
             max_seqlen=num_tokens,
             interleaved=not self.is_neox_style,
         )
