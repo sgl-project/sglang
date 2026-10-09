@@ -151,6 +151,48 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
+class TestEvictionReadiness(HiCacheFileLRUTestBase):
+    def test_failed_unlink_does_not_block_other_victims(self):
+        backend = self.make_backend(
+            max_size="128", eviction_ratio=1.0, enable_metadata_cache=True
+        )
+        self.assertTrue(backend.set("blocked", _t(64, 1)))
+        self.assertTrue(backend.set("victim", _t(64, 2)))
+        blocked_key = backend._get_suffixed_key("blocked")
+        blocked_path = os.path.join(backend.file_path, f"{blocked_key}.bin")
+        original_remove = os.remove
+
+        def remove(path):
+            if path == blocked_path:
+                raise PermissionError("cannot unlink this page")
+            return original_remove(path)
+
+        with mock.patch("os.remove", side_effect=remove):
+            self.assertTrue(backend.set("new", _t(64, 3)))
+        self.assertTrue(backend.exists("blocked"))
+        self.assertFalse(backend.exists("victim"))
+        self.assertTrue(backend.exists("new"))
+        self.assertEqual(backend._evictor._total_bytes, 128)
+        self.assertEqual(backend._evictor._lru[blocked_key], 64)
+        self.assertTrue(backend.metadata_cache.contains(blocked_key))
+        self.assertTrue(torch.equal(backend.get("new", _t(64)), _t(64, 3)))
+
+    def test_all_unlinks_fail_without_spinning_or_refunding_bytes(self):
+        backend = self.make_backend(max_size="128", eviction_ratio=1.0)
+        for key in ("a", "b"):
+            self.assertTrue(backend.set(key, _t(64)))
+        with mock.patch("os.remove", side_effect=PermissionError("blocked")) as remove:
+            self.assertFalse(backend.set("new", _t(64)))
+        self.assertEqual(remove.call_count, 2)
+        self.assertEqual(backend._evictor._total_bytes, 128)
+        self.assertEqual(len(backend._evictor._lru), 2)
+        self.assertFalse(backend._evictor._pending_writes)
+        self.assertFalse(backend.exists("new"))
+        # Once the filesystem permits unlink again, the next write can retry.
+        self.assertTrue(backend.set("new", _t(64)))
+        self.assertEqual(backend._evictor._total_bytes, 128)
+
+
 class TestEnvDefaults(CustomTestCase):
     """Verify the env var defaults match the documented opt-in behavior."""
 
