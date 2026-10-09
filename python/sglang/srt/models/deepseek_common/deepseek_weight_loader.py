@@ -15,6 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
+from itertools import islice
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -70,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+_EXPERT_MAPPING_CACHE_MAX_ENTRIES = 262_144
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -211,6 +213,19 @@ class DeepseekV2WeightLoaderMixin:
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
 
+    def _iter_expert_mappings(self, name: str, mapping):
+        cache = self._expert_mapping_start_cache
+        start = cache.get(name)
+        if start is None:
+            start = next(
+                (i for i, entry in enumerate(mapping) if entry[1] in name),
+                len(mapping),
+            )
+            if len(cache) < _EXPERT_MAPPING_CACHE_MAX_ENTRIES:
+                cache[name] = start
+        # Keep ordered fallthrough after a name matches but its target is absent.
+        return islice(mapping, start, None)
+
     def do_load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -249,6 +264,11 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+
+        mapping_snapshot = tuple(expert_params_mapping)
+        if mapping_snapshot != getattr(self, "_expert_mapping_snapshot", None):
+            self._expert_mapping_snapshot = mapping_snapshot
+            self._expert_mapping_start_cache = {}
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -372,7 +392,9 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in self._iter_expert_mappings(
+                        name, expert_params_mapping
+                    ):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
