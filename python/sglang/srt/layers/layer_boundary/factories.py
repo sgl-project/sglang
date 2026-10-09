@@ -838,6 +838,32 @@ def _handed_off(declaration):
     )
 
 
+def _return_before_trailing_attention(line):
+    """When the stack ends on attentions that always leave their sum, the next
+    rank or the final read takes the residual on the rows they ran on, which
+    is where the FFN before them returned it: no exit moves it after them.
+    That FFN returns it on the attention's rows, as one that ends the stack or
+    hands off does, instead of on its own rows."""
+    trailing = False
+    for append in reversed(line):
+        declarations = append.declarations
+        for index in reversed(range(len(declarations))):
+            declaration = declarations[index]
+            if (
+                declaration.kind is StageKind.ATTENTION
+                and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
+            ):
+                trailing = True
+                continue
+            if (
+                trailing
+                and declaration.kind is StageKind.FFN
+                and _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
+            ):
+                declarations[index] = replace(declaration, exit_rows=ExitRows.ATTENTION)
+            return
+
+
 def _detached(declaration):
     """The declaration a following append extends, without its own history.
 
@@ -853,10 +879,11 @@ def _detached(declaration):
 def _bind_stack(appends, *, previous, following, final_read=None):
     """Bind every appended stage, in order, and fill in the boundaries each
     append returned."""
+    line = [a for a in appends if a.prepared_from is None]
     if following is not None:
         # The last stage hands off to the next rank.
-        last = next(a for a in reversed(appends) if a.prepared_from is None)
-        last.declarations[-1] = _handed_off(last.declarations[-1])
+        line[-1].declarations[-1] = _handed_off(line[-1].declarations[-1])
+    _return_before_trailing_attention(line)
     chain = _Chain(previous)
     # A returned declaration's boundary as bound, for the branches that read it.
     sources = {}

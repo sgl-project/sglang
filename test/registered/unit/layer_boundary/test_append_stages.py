@@ -260,6 +260,35 @@ class TestOneStagePerAppend(CustomTestCase):
                     self.assertEqual(edges.outgoing.residual, incoming.residual)
                     self.assertEqual(edges.outgoing.residual_to, incoming.residual_to)
 
+    def test_a_stack_that_ends_on_an_attention_leaves_the_residual_on_its_rows(self):
+        # No exit moves the residual after the last attention: the next rank,
+        # or the final read, takes it on the rows that attention ran on, so
+        # the a2a MoE before it returns it on the attention's rows.
+        def ffn_layer():
+            append_stages((declare_ffn(sparse=True), fixture.Norm()))
+
+        for next_layers in ((), (ffn_layer,)):
+            with self.subTest(hands_off=bool(next_layers)):
+                with fixture.planning(
+                    fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True
+                ):
+                    with layer_stack(next_layers=next_layers):
+                        stages = [
+                            append_stages(
+                                (
+                                    declare_attn()
+                                    if i % 2 == 0
+                                    else declare_ffn(sparse=True),
+                                    fixture.Norm(),
+                                )
+                            )[0]
+                            for i in range(3)
+                        ]
+                for variant, edges in stages[-1].plan.edges.items():
+                    self.assertEqual(
+                        edges.incoming.residual_to, edges.incoming.need.layout
+                    )
+
 
 class TestMakeLayers(CustomTestCase):
     """make_layers builds its layers in one stack, and on a pipeline stage
