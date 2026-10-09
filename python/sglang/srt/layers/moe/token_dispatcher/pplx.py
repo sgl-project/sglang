@@ -187,6 +187,16 @@ class PplxAllToAllManager:
         return cls._all_to_all
 
 
+def _route_padded_slots(topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+    # pplx-kernels has no skip for -1 (padded rows), so send each one to a
+    # distinct expert with zero weight; distinct keeps per-expert capacity.
+    invalid = topk_ids < 0
+    fill = torch.arange(
+        topk_ids.shape[1], device=topk_ids.device, dtype=topk_ids.dtype
+    ).expand_as(topk_ids)
+    return torch.where(invalid, fill, topk_ids), topk_weights.masked_fill(invalid, 0.0)
+
+
 class _PplxDispatcherImpl:
     def __init__(
         self,
@@ -283,6 +293,8 @@ class _PplxDispatcherImpl:
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids, topk_weights = _route_padded_slots(topk_ids, topk_weights)
+
         ata = self._get_all_to_all()
 
         num_tokens = hidden_states.shape[0]
