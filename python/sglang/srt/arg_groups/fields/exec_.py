@@ -329,8 +329,16 @@ class ExecKernel(msgspec.Struct):
         bool, "Not using ragged prefill wrapper when running flashinfer mla"
     ] = False
     enable_fused_qk_norm_rope: A[
-        bool, "Enable fused qk normalization and rope rotary embedding."
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Fuse q/k normalization and rope rotary embedding into one "
+            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
+            "to force it either way.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
