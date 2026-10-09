@@ -48,8 +48,11 @@ def run_sm90_mega_routed(
     num_tokens: int,
     *,
     hidden_size: int,
-    activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    activation: str = "swiglu",
+    activation_alpha: float = 1.0,
+    activation_up_bias: float = 0.0,
+    activation_clamp: Optional[float] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -77,7 +80,9 @@ def run_sm90_mega_routed(
         experts.mega_l2_weights,
         buf,
         recipe=(128, 128, 128),
-        activation="swiglu",
+        activation=activation,
+        activation_alpha=activation_alpha,
+        activation_up_bias=activation_up_bias,
         activation_clamp=activation_clamp,
         fast_math=True,
     )
