@@ -11,13 +11,10 @@ from unittest.mock import patch
 import numpy as np
 
 from sglang.multimodal_gen.test.test_utils import encode_audio_gt_wav
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
 SCRIPT = (
-    Path(__file__).resolve().parents[3]
+    Path(__file__).resolve().parents[5]
     / "scripts/ci/utils/diffusion/publish_diffusion_gt.py"
 )
 spec = importlib.util.spec_from_file_location("publish_diffusion_gt", SCRIPT)
