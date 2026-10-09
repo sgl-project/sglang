@@ -52,6 +52,9 @@ class BatchVariant(Enum):
     CONTEXT_PARALLEL = auto()
     INPUT_SCATTERED = auto()
     SEQUENCE_PARALLEL = auto()
+    # A batch whose rows do not divide over attention TP, which only arrives
+    # unpadded (--disable-attn-tp-gather without attention DP).
+    UNPADDED = auto()
 
 
 class InputContract(msgspec.Struct, frozen=True):
@@ -233,6 +236,8 @@ class StagePath(msgspec.Struct, frozen=True):
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
+        writes_at_handoff: Whether the exit completes the output and writes it
+            into the residual, for an FFN that hands off to another pipeline rank.
     """
 
     entry: EntryPath
@@ -242,6 +247,7 @@ class StagePath(msgspec.Struct, frozen=True):
     output_move_completes_sum: bool = False
 
     returns_over_dp: bool = False
+    writes_at_handoff: bool = False
 
 
 class StageKind(Enum):

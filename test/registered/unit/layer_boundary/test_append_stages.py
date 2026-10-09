@@ -1,20 +1,33 @@
 """A layer stack connects the stages appended to it in order."""
 
 import unittest
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import test_declared_decoder_boundary as fixture
 import torch
 from torch import nn
 
 from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
+    ExitRows,
     ProducerReduction,
     append_stages,
     declare_attn,
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary import prepare as boundary_prepare
+from sglang.srt.layers.layer_boundary.layout import SumGroup, TokenAxis
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_tp_gather_input,
+    keep_output,
+    update_attn_tp_gather_output,
+)
 from sglang.srt.layers.rotary_embedding import factory as rope_factory
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils.common import is_building_neighbour_layer, make_layers
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -291,6 +304,179 @@ class TestMakeLayers(CustomTestCase):
             make_layers(NUM_LAYERS, layer_fn, pp_rank=0, pp_size=2)
             added = {key for key in rope_factory._ROPE_DICT if key[0] == "test"}
         self.assertEqual(added, {("test", 0), ("test", 1)})
+
+
+class TestPipelineHandoff(CustomTestCase):
+    """With an a2a MoE over attention TP, an FFN leaves its output on this
+    rank's slice of the rows for the next layer to gather; across a pipeline
+    handoff it returns to the attention's rows, which both ranks agree on."""
+
+    def setUp(self):
+        self.planning = fixture.planning(
+            fixture.parallel_of(attn_dp=1, attn_tp=2),
+            a2a=True,
+            boundary_reduction="ar",
+        )
+        self.planning.__enter__()
+        self.addCleanup(self.planning.__exit__, None, None, None)
+
+    @staticmethod
+    def path(stage):
+        return stage.plan.paths[BatchVariant.ORDINARY]
+
+    def test_the_sending_rank_returns_to_the_attention_rows(self):
+        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+            first_attn, first_ffn, second_attn, second_ffn = [
+                s for _ in range(2) for s in layer(sparse=True)
+            ]
+        # Within the rank the output stays on the slice, and the next
+        # attention gathers its input.
+        self.assertIs(self.path(first_ffn).output_move, keep_output)
+        self.assertIs(self.path(second_attn).entry.input_move, attn_tp_gather_input)
+        self.assertIs(
+            self.path(second_ffn).output_move.func, update_attn_tp_gather_output
+        )
+        self.assertFalse(self.path(first_ffn).writes_at_handoff)
+        self.assertTrue(self.path(second_ffn).writes_at_handoff)
+
+    def test_the_handoff_writes_what_the_move_leaves(self):
+        # A move that leaves the residual, as for an FFN on an unpadded batch's
+        # rows: the exit still writes the output into it.
+        with layer_stack(next_layers=[partial(layer, sparse=True)]):
+            ffn = [s for s in layer(sparse=True)][-1]
+        steps = msgspec.structs.replace(self.path(ffn), output_move=keep_output)
+        hidden, residual = torch.ones(4, 4), torch.full((4, 4), 2.0)
+        want = hidden + residual
+        written, left = ffn.plan.output._complete_now(
+            hidden,
+            residual,
+            forward_batch=None,
+            dp_step=None,
+            steps=steps,
+            output_move=keep_output,
+            owes_sum=False,
+        )
+        self.assertIsNone(left)
+        torch.testing.assert_close(written, want)
+
+    def test_the_receiving_rank_reads_the_attention_rows(self):
+        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+            attention, _ = layer(sparse=True)
+        self.assertIsNone(self.path(attention).entry.input_move)
+        self.assertIs(attention.declaration.previous.exit_rows, ExitRows.ATTENTION)
+
+    def test_the_receiving_rank_reads_the_stream_as_written(self):
+        # A residual beside it, as a captured graph's input buffer holds, is
+        # not read.
+        with layer_stack(previous_layers=[partial(layer, sparse=True)]):
+            attention, _ = layer(sparse=True)
+        attention.plan.path_for = lambda _: self.path(attention)
+        hidden, stale = torch.ones(4, 4), torch.full((4, 4), 2.0)
+        for wire in (
+            {"hidden_states": hidden},
+            {"hidden_states": hidden, "residual": stale},
+        ):
+            with self.subTest(keys=sorted(wire)):
+                batch = SimpleNamespace(residual_stream=None)
+                attention.from_pp(PPProxyTensors(wire), batch)
+                self.assertIs(batch.residual_stream.residual, hidden)
+                self.assertIsNone(batch.residual_stream.pending)
+
+    def test_a_handoff_from_the_attention_rows_carries_its_residual(self):
+        # A dense FFN over the TP group computes on the attention's rows and
+        # leaves the residual add to the receiver, which requires it.
+        with layer_stack(previous_layers=[partial(layer, sparse=False)]):
+            attention, _ = layer(sparse=False)
+        self.assertFalse(attention.declaration.previous.writes_at_handoff)
+        attention.plan.path_for = lambda _: self.path(attention)
+        hidden, residual = torch.ones(4, 4), torch.full((4, 4), 2.0)
+        batch = SimpleNamespace(residual_stream=None)
+        wire = PPProxyTensors({"hidden_states": hidden, "residual": residual})
+        attention.from_pp(wire, batch)
+        self.assertIs(batch.residual_stream.residual, residual)
+        self.assertIs(batch.residual_stream.pending.value, hidden)
+        with self.assertRaises(KeyError):
+            attention.from_pp(PPProxyTensors({"hidden_states": hidden}), batch)
+
+
+class TestUnpaddedBatches(CustomTestCase):
+    """Without attention DP, --disable-attn-tp-gather lets a batch reach the
+    stages with rows that do not divide over attention TP. Such a batch keeps
+    an FFN that would run on this rank's attention-TP slice on the
+    attention's rows instead."""
+
+    def build(self, parallel, *, sparse):
+        with fixture.planning(parallel, a2a=True, boundary_reduction="ar"):
+            with layer_stack():
+                return [s for _ in range(2) for s in layer(sparse=sparse)]
+
+    def test_an_unpadded_batch_keeps_the_attention_rows(self):
+        for sparse in (True, False):
+            with self.subTest(sparse=sparse):
+                parallel = fixture.parallel_of(
+                    attn_dp=1,
+                    attn_tp=2,
+                    disable_attn_tp_gather=True,
+                    moe_dense_tp_size=None if sparse else 1,
+                )
+                _, ffn, attention, _ = self.build(parallel, sparse=sparse)
+                ordinary = ffn.plan.paths[BatchVariant.ORDINARY]
+                unpadded = ffn.plan.paths[BatchVariant.UNPADDED]
+                # Rows that divide take the slice; the others complete the
+                # attention's sum on every row and hand on a complete output.
+                self.assertIn(TokenAxis.ATTN_TP, ordinary.entry.input_rows.sharded)
+                self.assertEqual(unpadded.entry.input_rows.sharded, frozenset())
+                self.assertIs(
+                    unpadded.entry.prepare.keywords["step"].func,
+                    boundary_prepare._reduce_update_read,
+                )
+                self.assertIsNone(unpadded.output.group)
+                self.assertIs(unpadded.output_move, keep_output)
+                # The next attention reads those rows as they are.
+                self.assertIs(
+                    attention.plan.paths[BatchVariant.ORDINARY].entry.input_move,
+                    attn_tp_gather_input,
+                )
+                self.assertIsNone(
+                    attention.plan.paths[BatchVariant.UNPADDED].entry.input_move
+                )
+
+    def test_padded_batches_have_no_unpadded_path(self):
+        for attn_dp, disabled in ((2, True), (1, False)):
+            with self.subTest(attn_dp=attn_dp, disable_attn_tp_gather=disabled):
+                parallel = fixture.parallel_of(
+                    attn_dp=attn_dp, attn_tp=2, disable_attn_tp_gather=disabled
+                )
+                _, ffn, _, _ = self.build(parallel, sparse=True)
+                self.assertNotIn(BatchVariant.UNPADDED, ffn.plan.paths)
+
+
+class TestDenseFfnOverAttentionTp(CustomTestCase):
+    """A dense FFN sharded over attention TP under attention DP computes on
+    the attention's rows and sums over attention TP, with no DP move."""
+
+    def test_the_ffn_stays_on_the_attention_rows(self):
+        parallel = fixture.parallel_of(attn_dp=2, attn_tp=2)
+        with fixture.planning(parallel, boundary_reduction="ar"), layer_stack():
+            stages = [
+                stage
+                for _ in range(2)
+                for stage in append_stages(
+                    (declare_attn(), fixture.Norm()),
+                    (declare_ffn(dense_tp_size=2), fixture.Norm()),
+                )
+            ]
+        for ffn in stages[1::2]:
+            path = ffn.plan.paths[BatchVariant.ORDINARY]
+            # The attention's sum completes on this rank's rows, ungathered.
+            self.assertIs(
+                path.entry.prepare.keywords["step"].func,
+                boundary_prepare._reduce_update_read,
+            )
+            self.assertEqual(path.output.layout.sharded, {TokenAxis.ATTN_DP})
+            self.assertIs(path.output.group, SumGroup.ATTN_TP)
+            self.assertFalse(path.returns_over_dp)
+            self.assertIs(path.output_move, keep_output)
 
 
 if __name__ == "__main__":

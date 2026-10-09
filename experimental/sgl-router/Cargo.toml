@@ -31,7 +31,7 @@ dynamo-renderer = "=7.0.1"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
-sglang-processor = { path = "../../rust/sglang-processor", default-features = false, features = ["render"] }
+sglang-processor = { path = "../../rust/sglang-processor", default-features = false, features = ["render", "openai"] }
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }

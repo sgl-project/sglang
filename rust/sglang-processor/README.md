@@ -23,6 +23,7 @@ src/
     models/        model-specific SGLang code
     legacy/        conversation.py templates
   parser/          engine output -> chat events
+  openai/          OpenAI requests over /generate
 ```
 
 ## model_files
@@ -143,6 +144,22 @@ SGLang additions:
 - **`parallel_tool_calls=false`** keeps only the first call.
 - **`tool_constraint`** turns `tool_choice` into the parser's structural tag,
   or a `json_schema` array of calls for `required` and named choices.
+
+## openai
+
+```rust
+lower_completion(body, &headers, &settings, tokenizer) -> Result<(generate_body, CompletionResponder), Unsupported>
+responder.unary(status, body) / responder.stream_data(frame) -> OpenAI JSON or SSE events
+```
+
+SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
+`/generate`, for hosts that send generation there. Lowering builds the
+`GenerateReqInput` SGLang's handler would, and the responder turns `/generate`
+output into the response SGLang's handler would return. Anything not reproduced
+exactly is `Unsupported`, and the host sends it to the engine's own route.
+`tests/openai_parity.rs` replays fixtures recorded by
+`tests/scripts/generate_openai_parity.py`, which runs SGLang's handler on the
+`/generate` output of a live engine.
 
 ## Host example
 
