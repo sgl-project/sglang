@@ -103,7 +103,10 @@ def _pack_mem_desc_lists(mems_per_comp: List[List[MemoryDesc]]) -> bytes:
     if not mems_per_comp:
         return b""
     return msgspec.msgpack.encode(
-        [[mem.pack() for mem in comp] for comp in mems_per_comp]
+        [
+            [None if mem is None else mem.pack() for mem in comp]
+            for comp in mems_per_comp
+        ]
     )
 
 
@@ -111,7 +114,9 @@ def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
     if not blob:
         return []
     nested = msgspec.msgpack.decode(blob)
-    return [[MemoryDesc.unpack(b) for b in comp] for comp in nested]
+    return [
+        [None if b is None else MemoryDesc.unpack(b) for b in comp] for comp in nested
+    ]
 
 
 @dataclasses.dataclass
@@ -334,7 +339,7 @@ class MoriKVManager(CommonKVManager):
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
-        self.state_mem_descs: List[List[MemoryDesc]] = []
+        self.state_mem_descs: List[List[Optional[MemoryDesc]]] = []
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
@@ -454,8 +459,13 @@ class MoriKVManager(CommonKVManager):
             self.kv_args.state_data_ptrs,
             getattr(self.kv_args, "state_data_lens", []),
         ):
-            component_descs: List[MemoryDesc] = []
+            component_descs: List[Optional[MemoryDesc]] = []
             for ptr, length in zip(component_ptrs, component_lens):
+                if length == 0:
+                    # Elided DSA index-K; ibv_reg_mr would abort on size 0.
+                    # Keep the slot so descs stay index-aligned.
+                    component_descs.append(None)
+                    continue
                 desc = self.engine.register_memory(
                     ptr,
                     length,
@@ -1003,6 +1013,8 @@ class MoriKVManager(CommonKVManager):
                         pass
             for component_descs in self.state_mem_descs:
                 for desc in component_descs:
+                    if desc is None:
+                        continue
                     try:
                         self.engine.deregister_memory(desc)
                     except Exception:

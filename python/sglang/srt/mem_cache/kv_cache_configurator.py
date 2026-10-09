@@ -118,6 +118,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
     if _is_npu and get_disagg().disaggregation_mode != "null":
         return False
+    # The NPU HiCache host pool has no compact index-K layout.
+    if _is_npu and memory_config.enable_hierarchical_cache:
+        return False
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker

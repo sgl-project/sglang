@@ -841,7 +841,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"{state_type} decode published {len(dst_item_lens)} item "
                         f"lengths but paired entry dst[{j}] needs one"
                     )
-                if is_elided_entry(item_lens[i], dst_item_lens, j):
+                if is_elided_entry(
+                    item_lens[i],
+                    dst_item_lens,
+                    j,
+                    allow_dst_elision=state_type == StateType.DSA,
+                ):
                     # One peer elided this shared-topk layer's index-K (e.g. a
                     # dense HiSparse decode); no bytes move, so no stride to match.
                     continue
@@ -866,7 +871,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"lengths for this stage's {layers_current_pp_stage} entries"
             )
         for layer_id in range(layers_current_pp_stage):
-            if is_elided_entry(item_lens[layer_id], mapped_dst_lens, layer_id):
+            if is_elided_entry(
+                item_lens[layer_id],
+                mapped_dst_lens,
+                layer_id,
+                allow_dst_elision=state_type == StateType.DSA,
+            ):
                 continue  # Elided by one peer; see the paired loop above.
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
@@ -1057,7 +1067,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
                     for i, j in pairs
-                    if not is_elided_entry(item_lens[i], dst_item_lens, j)
+                    if not is_elided_entry(
+                        item_lens[i],
+                        dst_item_lens,
+                        j,
+                        allow_dst_elision=state_type == StateType.DSA,
+                    )
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1078,7 +1093,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for layer_id in range(layers_current_pp_stage)
                     if not is_elided_entry(
-                        item_lens[layer_id], mapped_dst_lens, layer_id
+                        item_lens[layer_id],
+                        mapped_dst_lens,
+                        layer_id,
+                        allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]
         else:
