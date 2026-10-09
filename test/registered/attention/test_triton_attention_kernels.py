@@ -1071,6 +1071,79 @@ class TestTritonAttention(CustomTestCase):
                     B, N_CTX, H_Q, H_KV, D
                 )
 
+    def _extend_attention_unified_swa_once(
+        self, q, k_buffer, v_buffer, prefix_len, window_size, sinks
+    ):
+        """Run the unified kernel for one sequence the way TritonAttnBackend does for a
+        sliding-window layer: the prefix is trimmed to its last `window_size` tokens and
+        window_start_pos holds the absolute position of the first kept key."""
+        device = q.device
+        seq_len = q.shape[0]
+        extend_len = seq_len - prefix_len
+        window_len = min(prefix_len, window_size)
+        window_start = prefix_len - window_len
+
+        unified_kv_indptr, unified_kv_indices, prefix_lens = build_unified_kv_indices(
+            torch.tensor([0, window_len], dtype=torch.int32, device=device),
+            torch.arange(window_start, prefix_len, dtype=torch.int64, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            torch.tensor([extend_len], dtype=torch.int32, device=device),
+            torch.arange(prefix_len, seq_len, dtype=torch.int64, device=device),
+            1,
+        )
+        o = torch.empty_like(q[prefix_len:])
+        extend_attention_fwd_unified(
+            q[prefix_len:],
+            o,
+            k_buffer,
+            v_buffer,
+            1.0,
+            1.0,
+            torch.tensor([0, extend_len], dtype=torch.int32, device=device),
+            unified_kv_indptr,
+            unified_kv_indices,
+            prefix_lens.to(torch.int32),
+            max_len_extend=extend_len,
+            is_causal=True,
+            sliding_window_size=window_size,
+            sinks=sinks,
+            window_start_pos=torch.tensor(
+                [window_start], dtype=torch.int32, device=device
+            ),
+        )
+        return o
+
+    def test_extend_attention_unified_swa_split_invariance(self):
+        """Deterministic inference must not depend on how much of the prefix came from
+        the radix cache (#43055). For a sliding-window layer, extending on top of a
+        cached, window-trimmed prefix must be bitwise identical to computing the same
+        tokens in one extend. The prefix lengths cover both BLOCK_N-aligned and
+        misaligned window starts (BLOCK_N is 64 or 128 depending on the GPU)."""
+        torch.manual_seed(0)
+        dtype = torch.bfloat16
+        device = get_device()
+        window_size, seq_len, H_Q, H_KV, D = 127, 800, 8, 1, 64
+
+        q = torch.randn((seq_len, H_Q, D), dtype=dtype, device=device)
+        k_buffer = torch.randn((seq_len, H_KV, D), dtype=dtype, device=device)
+        v_buffer = torch.randn((seq_len, H_KV, D), dtype=dtype, device=device)
+        sinks = torch.randn((H_Q,), dtype=torch.float32, device=device)
+
+        fresh = self._extend_attention_unified_swa_once(
+            q, k_buffer, v_buffer, 0, window_size, sinks
+        )
+        for prefix_len in [97, 127, 128, 200, 255, 256, 368, 775]:
+            with self.subTest(prefix_len=prefix_len):
+                cached = self._extend_attention_unified_swa_once(
+                    q, k_buffer, v_buffer, prefix_len, window_size, sinks
+                )
+                expected = fresh[prefix_len:]
+                self.assertTrue(
+                    torch.equal(cached, expected),
+                    f"prefix_len={prefix_len}: max diff "
+                    f"{(cached.float() - expected.float()).abs().max().item()}",
+                )
+
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""
         B = 4

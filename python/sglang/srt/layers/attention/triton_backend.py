@@ -2070,7 +2070,8 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window_size = (
                 -1 if bidirectional_extend else layer.sliding_window_size
             )
-            # Note: for unified kernel, we use full kv_indptr (not window)
+            # The prefix part is the window-trimmed tail of the cached prefix;
+            # window_start_pos maps its indices back to absolute positions.
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr
             prefix_kv_indices = self.forward_metadata.window_kv_indices
             # Compute window start positions (absolute position of first key in window)
