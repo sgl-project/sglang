@@ -64,9 +64,10 @@ class TestDeepseekV41PDCPDSpark(PDDisaggregationServerBase, GSM8KMixin):
 
     extra_prefill_args = COMMON_ARGS + [
         "--enable-prefill-cp",
+        "--attn-cp-size",
+        "4",
         "--cp-strategy",
         "interleave",
-        # The model's CP resolver derives attn_cp_size=tp_size=4.
         # Small chunks exercise continuation as well as the P-to-D handoff.
         "--chunked-prefill-size",
         "1024",
