@@ -990,15 +990,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// node would silently release (or steal) another holder's segment.
     fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
         let node_handle = self.arena.node(node_idx).id;
-        let anchored = match params.node_id {
-            Some(anchor) => anchor == node_handle,
-            None => node_idx == self.arena.root(),
-        };
-        assert!(
-            anchored,
-            "lock receipt anchored on node {:?} released on node {node_handle}",
-            params.node_id
-        );
+        if node_idx == self.arena.root() {
+            // A root pin carries no anchor; a root acquire anchors on root.
+            assert!(
+                params.node_id.is_none_or(|anchor| anchor == node_handle),
+                "lock receipt anchored on node {:?} released on root",
+                params.node_id
+            );
+        } else {
+            assert!(
+                params.node_id == Some(node_handle),
+                "lock receipt anchored on node {:?} released on node {node_handle}",
+                params.node_id
+            );
+        }
     }
 
     /// Release each component this receipt acquired. Auxiliaries go first so

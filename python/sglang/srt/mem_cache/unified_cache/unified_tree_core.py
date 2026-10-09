@@ -694,13 +694,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         return result
 
-    @staticmethod
-    def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
+    def _assert_receipt_anchor(
+        self, node: UnifiedTreeNode, params: DecLockRefParams
+    ) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
         node would silently release (or steal) another holder's segment."""
-        assert params.node_id == node.id or (
-            params.node_id is None and node.parent is None
-        ), f"lock receipt anchored on node {params.node_id} released on node {node.id}"
+        if node is self.root_node:
+            # A root pin carries no anchor; a root acquire anchors on root.
+            assert params.node_id in (None, node.id), (
+                f"lock receipt anchored on node {params.node_id} released on root"
+            )
+        else:
+            assert params.node_id == node.id, (
+                f"lock receipt anchored on node {params.node_id} released on node {node.id}"
+            )
 
     def _release_components(
         self,

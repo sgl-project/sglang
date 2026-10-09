@@ -11198,6 +11198,8 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
+    _backup_node = UnifiedRadixCacheSuite._backup_node
+    _path_chain = UnifiedRadixCacheSuite._path_chain
 
     @staticmethod
     def _swa_ref(cache, node_id):
@@ -11320,6 +11322,20 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         released = core.dec_swa_lock_only(root, DecLockRefParams())
         self.assertFalse(released.device_frees)
         self.assertFalse(released.host_frees)
+        released = core.dec_window_lock_only(
+            root, ComponentType.SWA, DecLockRefParams()
+        )
+        self.assertFalse(released.device_frees)
+        self.assertFalse(released.host_frees)
+        cache.sanity_check()
+
+    def test_root_acquire_receipt_releases_on_root(self):
+        """A cold request locks the root, so its receipt is anchored on root."""
+        cache, _, _ = build_fixture(self.cfg)
+        root = cache.root_node_handle()
+        lock = cache.inc_lock_ref(root).to_dec_params()
+        self.assertEqual(lock.node_id, root)
+        cache.dec_lock_ref(root, lock)
         cache.sanity_check()
 
     def test_release_with_incorrect_root_boundary_fails_loud(self):
@@ -11359,6 +11375,103 @@ class TestSegmentLockProtocol(_InsertWalkSuite):
         self._assert_protocol_violation(
             lambda: cache.dec_lock_ref(parent, lock.to_dec_params()),
             "lock receipt anchored on node",
+        )
+
+    def _locked_path_state(self, cache, allocator, leaf):
+        """Every lock count on the leaf's path plus every free-slot count."""
+        refs = [
+            (_device_lock_ref(cache, n, ct), _host_lock_ref(cache, n, ct))
+            for n in self._full_path(cache, leaf)
+            for ct in self.cfg.components
+        ]
+        free_slots = [
+            allocator.full_attn_allocator.available_size(),
+            allocator.swa_attn_allocator.available_size(),
+        ]
+        if cache.cache_controller is not None:
+            free_slots.append(cache.cache_controller.mem_pool_host.available_size())
+        return refs, free_slots
+
+    def _leaf_with_lock_path(self, *, hicache=False):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        if hicache:
+            self._init_hicache(cache, write_policy="write_back")
+        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        self.assertFalse(cache.tree_core.is_root(leaf))
+        return cache, allocator, leaf
+
+    def _assert_unanchored_release_rejected(
+        self, cache, allocator, leaf, release, unlock
+    ):
+        """The anchor check runs before any lock count or free list changes."""
+        before = self._locked_path_state(cache, allocator, leaf)
+        self._assert_protocol_violation(release, "lock receipt anchored on node")
+        if cache._tree_core_backend == "rust":
+            # A Rust panic poisons the core; the crate's own test checks state.
+            return
+        self.assertEqual(self._locked_path_state(cache, allocator, leaf), before)
+        unlock()
+        cache.sanity_check()
+
+    def test_unanchored_device_release_fails_loud(self):
+        """#41261 replay: a receipt that lost its anchor must not walk the
+        node's segment and drop locks other holders own."""
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_host_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path(hicache=True)
+        self._backup_node(cache, leaf)
+        lock = cache.inc_host_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.dec_host_lock_ref(leaf, replace(lock, node_id=None)),
+            lambda: cache.dec_host_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_swa_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_swa_lock_only(
+                leaf, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_unanchored_window_only_release_fails_loud(self):
+        cache, allocator, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        self._assert_unanchored_release_rejected(
+            cache,
+            allocator,
+            leaf,
+            lambda: cache.tree_core.dec_window_lock_only(
+                leaf, ComponentType.SWA, replace(lock, node_id=None)
+            ),
+            lambda: cache.dec_lock_ref(leaf, lock),
+        )
+
+    def test_receipt_anchored_off_root_fails_loud_on_root(self):
+        cache, _, leaf = self._leaf_with_lock_path()
+        lock = cache.inc_lock_ref(leaf).to_dec_params()
+        root = cache.root_node_handle()
+        self._assert_protocol_violation(
+            lambda: cache.dec_lock_ref(root, lock), "released on root"
         )
 
     def test_double_release_fails_loud(self):
