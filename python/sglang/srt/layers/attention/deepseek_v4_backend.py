@@ -3806,6 +3806,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            req_pool_indices_cpu=_as_int_list(forward_batch.req_pool_indices_cpu),
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)

@@ -5,6 +5,9 @@ and workload for PDMux and the ordinary scheduler. Set `MODEL_PATH` to that
 checkpoint. CPU tests cover state and scheduling; the GPU checks below remain
 required before claiming output parity or performance.
 
+For implementation steps, model differences and previous failure modes, see
+[the model adaptation guide](model_adaptation_guide.md).
+
 PDMux uses layerwise prefill directly. Token chunking and layer slicing can be
 combined. Intermediate slices preserve batch-owned mHC/carry state; only the last
 slice computes logits. A prefill with no decode work executes its remaining layers
@@ -71,8 +74,8 @@ fourth adds speculative decoding. Earlier branches reject unsupported combinatio
 Add `--enable-hierarchical-cache` for cache reload checks. The loop drains acks
 before admission and every 16 in-flight/waiting iterations; device frees and
 mapping updates publish a dependency to decode. Host-only write-through acks
-leave prefill/decode overlap intact. Buffer-mode load acks can release auxiliary
-device slots and also need that dependency.
+leave plain-TP prefill/decode overlap intact. Buffer-mode load acks can release
+auxiliary device slots and also need that dependency.
 
 ```bash
 SGLANG_TEST_DSV4_FLASH_MODEL_PATH="$MODEL_PATH" \
@@ -92,16 +95,127 @@ Run the same launch with `--enable-dp-attention --attn-dp-size 8` (TP8/DP8), the
 `--attn-dp-size 2` (TP8/DP2 with attention TP4). Exercise balanced and uneven prompt
 sizes, peer-only prefill/decode and all ranks IDLE. Check matching layer boundaries,
 no collective hang, correct greedy output and pad/unpad restoration across slices.
-The prefill lane switches only the full-TP handle to its duplicate communicator;
-attention and MoE group handles retain the ordinary groups, as in the reference
-branch. Stream selection uses the local running decode batch before decode's DP
-metadata gather. Peer-only work still creates IDLE participants through that
-gather. Scheduling keeps a separate global token vector even when the model
-consumes local MLP counts, and honors the ordinary scheduler's optional skip-gather
-environment setting. Each slice uses the existing DP pad/unpad path without a
-second unpadded token-count snapshot.
+Scheduling retains the default `layer_split` submission order of
+`feat/pdmux-standard@17761860cc`, with two DP adaptations from
+`feat/glm53-flash-pdmux@a4c3f271fb`. Decode metadata is gathered before selecting
+streams; active and IDLE participants use the maximum global decode count. A
+locally empty rank remains active for peer-only decode. The prefill scope replaces
+full-TP and handles that alias that exact coordinator, including MoE-EP in
+TP8/EP8. Independent attention/MoE groups retain their ordinary handles; only the
+full-TP duplicate is created. PDMux cross-DP metadata uses CPU/Gloo even with
+`--disable-overlap-schedule`, and cannot be skipped by
+`SGLANG_SCHEDULER_SKIP_ALL_GATHER`. Ordinary scheduler policies remain unchanged.
+Scheduling keeps a separate global token vector even when the model consumes
+local MLP counts. Each slice uses the existing DP pad/unpad path without a second
+unpadded token-count snapshot.
+
+The loop submits decode, then a prefill slice, then waits for the local decode
+stream and processes its result. Prefill completion is polled and merged after
+the existing full-TP ready vote. There are no per-phase submission barriers or
+extra decode-to-prefill events. The prefill-to-decode formation/HiCache and merge
+events remain, as do the drains when changing stream groups. Formation-time
+HiCache draining lives in `update_split_prefill_batch` to accommodate this
+branch's cache API without changing the reference loop's lane order.
+
+The SM90 V4.1 Torch indexer uses CPU request lengths and slots to build its row
+ranges, avoiding CUDA unique/nonzero/item during submission. The FP4 pool uploads
+its dequant table at initialization, rather than inside each request. Decode
+sequence-length copies use pinned buffers and are published after the completion
+fence. Engram extend supplies repeat_interleave's known CPU output size, matching
+the standard branch, and eager logits budgets avoid a live CUDA memory query.
+The model-specific CPU-mirror retirement runs after the existing lane completion
+fence. It adds no collective or stream drain. The rejected GPU-serial and
+five-rendezvous protocols have been removed; the restored reference scheduling
+still requires GPU liveness and performance validation on the V4.1 workload.
 
 This matrix covers TP/attention DP. EP, CP and DCP need their own validation.
+
+### Uneven-rank hang regression
+
+The communicator-only candidate `34f75d6e6b` failed the original GPU regression:
+44 completed requests in 2 minutes 9 seconds, then all eight workers became
+unhealthy. DP0/1/3/4 waited in `decode_stream.synchronize()`, DP2/5/6 in
+`torch.unique_consecutive`, and DP7 in decode's `new_seq_lens.to("cpu")`.
+Only DP2/5/6/7 had cold prefill work. This result supersedes that candidate's
+CPU-only validation; communicator isolation did not establish liveness.
+
+The GLM-aligned candidate `439624b4b4` also failed: 234 requests / 6 minutes
+14 seconds, seven ranks in decode synchronization and DP5 in prefill's low-ratio
+compressor `linear`. The loop calls decode before prefill, so this Python stack
+alone does not establish that DP5 omitted decode. The actual process had implicit
+ordering unset, PyNCCL 2.30.7, PyTorch NCCL reporting 2.29.7, CUDA 13.0 and driver
+580.105.08. GLM's reported success remains a control, not V4.1 acceptance.
+
+Re-run the original SM90 TP8/DP8/EP8 + DSpark + HiCache stress configuration,
+including its original MoE backend, graph settings and SM layout. Keep
+`chunked_prefill_size: 1024`, `max_split_forward_layers: 2`, cold longcodebench
+prompts and concurrency 10. Require at least 30 minutes of continuing request
+completion and healthy workers. Preserve token-budget, sampling and cache
+settings; increasing the slice cap would change the reproduction. The cap-0
+variant already ran for 30 minutes in the reported control and should remain a
+separate control. Cap 0 remains the default; cap 2 is deliberately retained for
+this regression despite its 20 slices for a 40-layer chunk with decode work.
+
+Also exercise peer-only prefill/decode and swap busy ranks, graph replay on/off,
+both SM layouts and TP8/DP2. CPU tests cover local lane submission and result
+retirement, HiCache pump cadence, TP-only communicator scope, DP metadata and
+model-specific host-sync avoidance. Their simulated CUDA streams do not
+establish NCCL kernel liveness or GPU overlap.
+GPU liveness, full-model output parity and performance remain unverified on this
+CPU-only machine. Capture a CUDA timeline demonstrating simultaneous decode and
+prefill computation as well as 30 minutes of progress with the original cap-2
+configuration; a healthy service with serialized kernels is not a passing result.
+
+Run the native CUDA submission check on the GPU node before the full-model test:
+
+```bash
+PYTHONPATH=python python3 -m pytest -q \
+  test/registered/unit/layers/test_dsv41_prefill_submission.py
+```
+
+It checks the real FP4 dequant pool and Engram kernels with CUDA sync-debug mode
+set to error, plus selection/hash parity. This small test does not replace the
+eight-GPU regression.
+
+Check that every rank has a split-prefill participant whenever any rank has
+prefill work. An IDLE rank can legitimately skip the indexer but must execute the
+same MoE layer collectives as active ranks. Capture per-rank stacks, stream IDs,
+communicator IDs and layer indices if progress stops; record completed requests,
+output parity, TTFT/ITL and throughput when it succeeds.
+
+Before multi-GPU CUDA PDMux communicator creation, set and validate
+`NCCL_LAUNCH_ORDER_IMPLICIT=1`, NCCL >= 2.26 in both callers, and CUDA runtime/driver
+>= 12.3. This supplies device ordering while retaining overlap, without the
+rejected five handshakes or per-phase GPU drains. An explicit value of 0 is
+rejected; unsupported stacks are not silently serialized. Graph mixing retains
+its configured/default policy. The original cap2 GPU regression is still required.
+
+Enable `SGLANG_PDMUX_TRACE=1` for the next diagnostic run. Host-only phase records
+distinguish D/P submission return from GPU completion and include global counts,
+mode, layer interval, stream and TP handle. Actual graph begin/returned records
+are separate from the worker result's graph flag. Capture DP5's native stack if
+the new candidate freezes. Detailed interpretation and the optional multi-GPU
+graph/eager probe are in [the adaptation guide](model_adaptation_guide.md#111-区分host-未提交与已提交但-gpu-不推进).
+Disable trace for performance measurements. Require c10 progress for 30 minutes
+before attempting c24; the latest failed c10 did not proceed to c24.
+
+### Why the reported V4-Flash standard configuration is a different control
+
+The working H100 command also enables TP8/DP8, DSpark and HiCache. It uses
+`DeepSeek-V4-Flash-0731`, budget 65536 without a layer cap, EP's default of 1,
+auto MoE selection with `SGLANG_DSV4_FP4_DEQUANT=1`, prefill SM 112 and full-SM
+decode. There is no prefill-mode override, so it uses the standard branch's
+default layer_split loop. The failed V4.1 command uses EP8, explicit
+flashinfer_mxfp4 and 1024-token chunks capped at two layers per slice. With 40
+layers and concurrent decode, the latter makes 20 slices; without the cap, the
+same 1024-token chunk fits in the 65536 budget and runs in one slice.
+
+The model dispatches ratio-4 layers through the C4 indexer and ratio-1/2 layers
+through the V4.1 indexer, whose DeepGEMM path requires SM100+. On SM90 it uses the
+Torch request scorer. The standard branch also contains that scorer's host
+syncs, so a successful V4 run is not proof that standard fixes the V4.1 hang.
+For a branch A/B, keep the same V4.1 checkpoint, EP/MoE backend, slice cap, SM
+layout and cold-prompt workload. Preserve the successful V4 command separately.
 
 ## Single-layer MTP/EAGLE and DSpark layer
 

@@ -358,7 +358,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_confidential_compute, is_npu
+from sglang.srt.utils.common import async_d2h, is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -4797,8 +4797,11 @@ class Scheduler(
                     if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
                         batch.seq_lens = new_seq_lens
                         if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = new_seq_lens.to("cpu")
-                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                            if self.enable_pdmux:
+                                batch_result.new_seq_lens_cpu = async_d2h(new_seq_lens)
+                            else:
+                                batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     self.update_cache_from_scheduler(batch, batch_result)
                     # Only the last PP rank owns real results requiring D2H; other ranks
@@ -4927,8 +4930,7 @@ class Scheduler(
             if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
                 batch.seq_lens = new_seq_lens
                 if batch.seq_lens_cpu is not None:
-                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
-                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    result.new_seq_lens_cpu = async_d2h(new_seq_lens)
         if result.has_sampled_token_ids or result.next_draft_input is not None:
             self._relay_forward_payload(batch, batch.req_pool_indices, result)
         batch.input_ids = None

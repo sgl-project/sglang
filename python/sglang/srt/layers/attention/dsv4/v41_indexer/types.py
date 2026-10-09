@@ -55,6 +55,7 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens_cpu: Optional[List[int]]
     rows_per_request: Optional[List[int]]
     rows_per_request_device: Optional[torch.Tensor]
+    req_pool_indices_cpu: Optional[List[int]] = None
 
     # The selection, unordered, -1 padded: [rows, topk] int32 request-local
     # compressed positions, and the same picks as index-K pool slots, which is

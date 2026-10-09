@@ -21,6 +21,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -153,8 +156,8 @@ class _FakeScheduler(SchedulerMultiplexMixin):
         return self.check_hicache_events_if_enabled()
 
     def get_new_batch_prefill(self, running_batch):
-        # Formation admits one request, then finds none. The loop has already
-        # drained cache events before entering this method.
+        # Formation admits one request, then finds none. The formation helper
+        # has already drained cache events before entering this method.
         batch, self.pending_split_batch = self.pending_split_batch, None
         return SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
 
@@ -164,7 +167,7 @@ class _FakeScheduler(SchedulerMultiplexMixin):
     def on_idle(self):
         pass
 
-    def adjust_stream_groups(self, running_batch, has_prefill):
+    def adjust_stream_groups(self, decode_batch):
         return 0, self.stream_groups[0]
 
     def run_batch(self, batch):
@@ -182,13 +185,13 @@ class _FakeScheduler(SchedulerMultiplexMixin):
 
 
 @contextlib.contextmanager
-def _stubbed_cuda():
+def _stubbed_cuda(*, attn_dp_enabled=False):
     with (
         patch("torch.cuda.stream", lambda _stream: contextlib.nullcontext()),
         patch("torch.cuda.empty_cache", lambda: None),
         patch(
             "sglang.srt.multiplex.multiplexing_mixin.get_parallel",
-            return_value=SimpleNamespace(tp_size=1),
+            return_value=SimpleNamespace(tp_size=1, attn_dp_enabled=attn_dp_enabled),
         ),
         patch(
             "sglang.srt.multiplex.multiplexing_mixin.pdmux_prefill_tp_group",
@@ -217,7 +220,92 @@ def _run_loop(*, max_iterations, query_results, pump_interval=1):
 
 
 class TestPDMuxHiCacheEvents(unittest.TestCase):
-    def test_stream_switch_uses_local_batch_before_decode_sync(self):
+    def test_trace_distinguishes_submission_return_from_gpu_completion(self):
+        scheduler = _FakeScheduler(max_iterations=1, query_results=[])
+        scheduler.running_batch.forward_mode = SimpleNamespace(name="DECODE")
+        with (
+            _stubbed_cuda(),
+            envs.SGLANG_PDMUX_TRACE.override(True),
+            patch("sglang.srt.multiplex.multiplexing_mixin.logger.info") as log,
+        ):
+            with self.assertRaises(_LoopFinished):
+                scheduler.event_loop_pdmux()
+        phases = [
+            call.args[2] for call in log.call_args_list if "PDMux trace" in call.args[0]
+        ]
+        self.assertLess(
+            phases.index("decode_submit_end"), phases.index("prefill_submit_begin")
+        )
+        self.assertLess(
+            phases.index("prefill_submit_end"), phases.index("decode_wait_begin")
+        )
+        self.assertLess(
+            phases.index("decode_wait_begin"), phases.index("decode_wait_end")
+        )
+
+    def test_attention_dp_submits_prefill_with_local_decode_pending(self):
+        for local_idle in (False, True):
+            with self.subTest(local_idle=local_idle):
+                scheduler = _FakeScheduler(max_iterations=3, query_results=[])
+                decode_batch = scheduler.running_batch
+                decode_batch.scheduler_global_num_tokens = [0, 1]
+                if local_idle:
+                    scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+                scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch = lambda batch: (
+                    decode_batch if batch is None else batch
+                )
+                decode_batch.seq_lens_cpu = torch.tensor([0])
+                prefill_stream = _Stream([])
+                decode_stream = _Stream([])
+                scheduler.stream_groups = [(prefill_stream, decode_stream)]
+                submissions = []
+                retired = []
+                pending_decode = False
+
+                def drain_decode():
+                    nonlocal pending_decode
+                    pending_decode = False
+
+                decode_stream.synchronize = drain_decode
+
+                def run_batch(batch):
+                    nonlocal pending_decode
+                    if batch is scheduler.split_prefill_batch:
+                        self.assertTrue(pending_decode)
+                        submissions.append("prefill")
+                        return object()
+                    pending_decode = True
+                    submissions.append("decode")
+                    # The ready CPU mirror remains unchanged until retirement.
+                    self.assertEqual(int(batch.seq_lens_cpu[0]), scheduler.iteration)
+                    return SimpleNamespace(
+                        new_seq_lens_cpu=torch.tensor([scheduler.iteration + 1])
+                    )
+
+                def process_result(batch, result):
+                    if batch is decode_batch:
+                        self.assertFalse(pending_decode)
+                        self.assertIsNone(result.new_seq_lens_cpu)
+                        retired.append(int(batch.seq_lens_cpu[0]))
+
+                scheduler.run_batch = run_batch
+                scheduler.process_batch_result = process_result
+                # Only the reference loop's final-prefill readiness vote is
+                # allowed. Any submission barrier would fail immediately.
+                scheduler.tp_cpu_group = SimpleNamespace(
+                    barrier=Mock(side_effect=AssertionError("unexpected lane barrier")),
+                    allreduce=Mock(return_value=SimpleNamespace(wait=lambda: None)),
+                )
+                with _stubbed_cuda(attn_dp_enabled=True):
+                    with self.assertRaises(_LoopFinished):
+                        scheduler.event_loop_pdmux()
+
+                self.assertEqual(submissions, ["decode", "prefill"] * NUM_LAYERS)
+                self.assertEqual(retired, [1, 2, 3])
+                scheduler.tp_cpu_group.barrier.assert_not_called()
+                scheduler.tp_cpu_group.allreduce.assert_called_once()
+
+    def test_stream_switch_uses_peer_decode_after_metadata_gather(self):
         scheduler = _FakeScheduler(max_iterations=1, query_results=[])
         scheduler.stream_groups.append(scheduler.stream_groups[0])
         scheduler.sm_counts.append((1, 1))
@@ -245,13 +333,32 @@ class TestPDMuxHiCacheEvents(unittest.TestCase):
                 scheduler.event_loop_pdmux()
 
         self.assertIs(
-            scheduler.adjust_stream_groups.call_args.kwargs["running_batch"],
-            local_idle,
+            scheduler.adjust_stream_groups.call_args.kwargs["decode_batch"],
+            peer_decode,
         )
-        self.assertTrue(scheduler.adjust_stream_groups.call_args.kwargs["has_prefill"])
-        self.assertEqual(calls, ["prefill_sync", "switch", "decode_sync"])
+        self.assertEqual(calls, ["prefill_sync", "decode_sync", "switch"])
         self.assertEqual(prepare.call_count, 2)
         scheduler.on_idle.assert_not_called()
+
+    def test_local_empty_rank_stays_active_for_peer_only_decode(self):
+        for peer_has_work in (False, True):
+            with self.subTest(peer_has_work=peer_has_work):
+                scheduler = _FakeScheduler(max_iterations=1, query_results=[])
+                scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
+                scheduler.pending_split_batch = None
+                peer_decode = (
+                    SimpleNamespace(scheduler_global_num_tokens=[0, 1])
+                    if peer_has_work
+                    else None
+                )
+                scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch = Mock(
+                    side_effect=[None, peer_decode]
+                )
+                scheduler.on_idle = Mock()
+                with _stubbed_cuda(attn_dp_enabled=True):
+                    with self.assertRaises(_LoopFinished):
+                        scheduler.event_loop_pdmux()
+                self.assertEqual(scheduler.on_idle.call_count, int(not peer_has_work))
 
     def test_every_iteration_pumps_hicache_events_exactly_once(self):
         """At interval 1, one pump per iteration across all formation states.

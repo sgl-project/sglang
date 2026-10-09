@@ -1,13 +1,14 @@
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -309,7 +310,7 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         with self._stubbed_stream_idx():
             stream_idx, stream_group = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, decode_batch, has_prefill=True
+                scheduler, decode_batch
             )
 
         self.assertEqual(stream_idx, 1)
@@ -323,12 +324,12 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         with self._stubbed_stream_idx():
             stream_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, decode_batch, has_prefill=True
+                scheduler, decode_batch
             )
 
         self.assertEqual(stream_idx, 2)
 
-    def test_idle_decode_rank_uses_prefill_only_stream_group(self):
+    def test_idle_decode_rank_uses_active_peers_stream_group(self):
         scheduler = self._make_stream_group_scheduler(
             manual_divisions=[[104, 0, 0]], group_num=3
         )
@@ -345,23 +346,21 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         with self._stubbed_stream_idx():
             active_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, active, has_prefill=True
+                scheduler, active
             )
-            idle_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, idle, has_prefill=True
-            )
+            idle_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(scheduler, idle)
 
         self.assertEqual(active_idx, 1)
-        self.assertEqual(idle_idx, 0)
+        self.assertEqual(idle_idx, 1)
 
         idle.scheduler_global_num_tokens = [0, 0]
         with self._stubbed_stream_idx():
             no_decode_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, idle, has_prefill=True
+                scheduler, idle
             )
         self.assertEqual(no_decode_idx, 0)
 
-    def test_manual_division_uses_local_running_batch_size(self):
+    def test_manual_division_uses_global_decode_size(self):
         scheduler = self._make_stream_group_scheduler(
             manual_divisions=[[32, 0, 1], [64, 0, 8]], group_num=4
         )
@@ -376,13 +375,11 @@ class TestPDMuxScheduler(unittest.TestCase):
 
         with self._stubbed_stream_idx():
             indices = [
-                SchedulerMultiplexMixin.adjust_stream_groups(
-                    scheduler, batch, has_prefill=True
-                )[0]
+                SchedulerMultiplexMixin.adjust_stream_groups(scheduler, batch)[0]
                 for batch in batches
             ]
 
-        self.assertEqual(indices, [1, 2, 0])
+        self.assertEqual(indices, [2, 2, 2])
 
     def test_stream_switch_uses_speculative_worker_backend_hook(self):
         scheduler = self._make_stream_group_scheduler(
@@ -393,13 +390,34 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
         batch = SimpleNamespace(is_empty=lambda: False, batch_size=lambda: 2)
         with self._stubbed_stream_idx():
-            index, _ = SchedulerMultiplexMixin.adjust_stream_groups(
-                scheduler, batch, has_prefill=True
-            )
+            index, _ = SchedulerMultiplexMixin.adjust_stream_groups(scheduler, batch)
         scheduler.model_worker.update_pdmux_decode_attn_backend.assert_called_once_with(
             index
         )
         scheduler.tp_worker.model_runner.update_decode_attn_backend.assert_not_called()
+
+    def test_decode_only_and_globally_idle_stream_selection(self):
+        scheduler = self._make_stream_group_scheduler(
+            manual_divisions=[[32, 0, 1]], group_num=3
+        )
+        scheduler.split_prefill_batch = None
+        idle_peer = SimpleNamespace(
+            is_empty=lambda: True,
+            batch_size=lambda: 0,
+            scheduler_global_num_tokens=[2, 0],
+        )
+        with self._stubbed_stream_idx():
+            active_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, idle_peer
+            )
+            idle_peer.scheduler_global_num_tokens = [0, 0]
+            empty_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, idle_peer
+            )
+            absent_idx, _ = SchedulerMultiplexMixin.adjust_stream_groups(
+                scheduler, None
+            )
+        self.assertEqual((active_idx, empty_idx, absent_idx), (2, 0, 0))
 
     def test_split_prefill_routes_spec_worker_and_publishes_only_final_draft(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -449,7 +467,13 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler.tp_worker.forward_batch_split_prefill.assert_not_called()
         self.assertIs(batch.spec_info, final_draft)
         self.assertIs(batch.seq_lens, new_seq_lens)
+        self.assertEqual(batch.seq_lens_sum, 7)
+        torch.testing.assert_close(batch.seq_lens_cpu, seq_lens)
+        self.assertIsNotNone(final.new_seq_lens_cpu)
+        scheduler._retire_pdmux_seq_lens(batch, final)
         self.assertEqual(batch.seq_lens_sum, 9)
+        torch.testing.assert_close(batch.seq_lens_cpu, new_seq_lens)
+        self.assertIsNone(final.new_seq_lens_cpu)
         self.assertIsNone(batch.input_ids)
         scheduler._relay_forward_payload.assert_called_once_with(
             batch, batch.req_pool_indices, final
@@ -466,6 +490,65 @@ class TestPDMuxScheduler(unittest.TestCase):
         batch = SimpleNamespace(split_index=1, spec_algorithm=SpeculativeAlgorithm.NONE)
         self.assertIs(scheduler._run_pdmux_split_prefill(batch), result)
         scheduler.model_worker.forward_batch_split_prefill.assert_not_called()
+
+    def test_decode_seq_lens_cpu_is_published_only_after_retirement(self):
+        for pdmux in (True, False):
+            with self.subTest(pdmux=pdmux):
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.metrics_reporter = Mock()
+                scheduler.forward_ct = 0
+                scheduler._sched_idled = False
+                scheduler.scripted_scheduler_hook = None
+                scheduler.profiler_manager = Mock()
+                scheduler.forward_sleep_time = None
+                scheduler.disaggregation_mode = DisaggregationMode.NULL
+                scheduler.is_generation = True
+                scheduler.enable_overlap = False
+                scheduler.enable_pdmux = pdmux
+                scheduler.split_prefill_batch = None
+                scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+                scheduler.future_map = Mock()
+                scheduler._forward_isolation = lambda *args, **kwargs: nullcontext()
+                scheduler.update_cache_from_scheduler = Mock()
+                scheduler._maybe_report_active_ranks = Mock()
+                scheduler.device_module = SimpleNamespace(Event=Mock())
+                result = GenerationBatchResult(
+                    logits_output=None,
+                    can_run_cuda_graph=False,
+                    next_draft_input=object(),
+                    new_seq_lens=torch.tensor([4, 6]),
+                )
+                scheduler.model_worker = Mock()
+                scheduler.model_worker.forward_batch_generation.return_value = result
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    extend_num_tokens=0,
+                    spec_algorithm=SpeculativeAlgorithm.DSPARK,
+                    spec_info=None,
+                    seq_lens=torch.tensor([3, 4]),
+                    seq_lens_cpu=torch.tensor([3, 4]),
+                    seq_lens_sum=7,
+                    return_logprob=False,
+                    return_hidden_states=False,
+                )
+                with (
+                    patch("sglang.srt.managers.scheduler.resolve_forward_inputs"),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_parallel",
+                        return_value=SimpleNamespace(pp_size=1),
+                    ),
+                ):
+                    # Exercise the actual run_batch body, without the metrics decorator.
+                    self.assertIs(
+                        Scheduler.run_batch.__wrapped__(scheduler, batch), result
+                    )
+                self.assertIs(batch.seq_lens, result.new_seq_lens)
+                if pdmux:
+                    self.assertEqual(batch.seq_lens_sum, 7)
+                    torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([3, 4]))
+                    scheduler._retire_pdmux_seq_lens(batch, result)
+                self.assertEqual(batch.seq_lens_sum, 10)
+                torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([4, 6]))
 
     def test_first_target_slice_passes_hidden_capture_request(self):
         worker = TpModelWorker.__new__(TpModelWorker)
@@ -540,6 +623,10 @@ class TestPDMuxScheduler(unittest.TestCase):
             patch(
                 "sglang.srt.multiplex.multiplexing_mixin.get_device",
                 return_value=SimpleNamespace(gpu_id=3),
+            ),
+            patch(
+                "sglang.srt.multiplex.multiplexing_mixin.get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=False),
             ),
             patch(
                 "sglang.srt.multiplex.multiplexing_mixin.initialize_stream_groups"
@@ -782,6 +869,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler = SimpleNamespace(
             split_prefill_batch=None,
             process_pending_chunked_abort=Mock(),
+            _process_hicache_events=Mock(),
             get_new_batch_prefill=Mock(
                 return_value=SimpleNamespace(
                     batch_to_run=None, running_batch=running_batch
@@ -797,6 +885,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
         scheduler.process_pending_chunked_abort.assert_called_once_with()
+        scheduler._process_hicache_events.assert_called_once_with()
         scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.assert_called_once_with(
             None
         )
@@ -814,6 +903,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler = SimpleNamespace(
             split_prefill_batch=None,
             process_pending_chunked_abort=Mock(),
+            _process_hicache_events=Mock(),
             get_new_batch_prefill=Mock(
                 return_value=SimpleNamespace(
                     batch_to_run=None, running_batch=running_batch
@@ -843,6 +933,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         scheduler = SimpleNamespace(
             split_prefill_batch=Mock(),
             process_pending_chunked_abort=Mock(),
+            _process_hicache_events=Mock(),
         )
 
         created, returned = SchedulerMultiplexMixin.update_split_prefill_batch(
@@ -850,6 +941,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         )
 
         scheduler.process_pending_chunked_abort.assert_not_called()
+        scheduler._process_hicache_events.assert_not_called()
         self.assertFalse(created)
         self.assertIs(returned, running_batch)
 

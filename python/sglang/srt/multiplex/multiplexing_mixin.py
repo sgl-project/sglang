@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
@@ -32,6 +33,31 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
+    def _trace_pdmux_phase(self, phase, batch=None, *, stream_idx, graph=None):
+        if not self._pdmux_trace_enabled:
+            return
+        mode = getattr(batch, "forward_mode", None)
+        start = getattr(batch, "split_index", None)
+        count = getattr(batch, "split_forward_count", None)
+        lane = 0 if phase.startswith("prefill") else 1
+        stream = self.stream_groups[stream_idx][lane]
+        group = getattr(get_parallel(), "tp_group", None)
+        logger.info(
+            "PDMux trace tick=%s phase=%s stream_idx=%s stream=%s tp_comm=%s mode=%s local_bs=%s "
+            "global=%s layers=[%s,%s) worker_result_graph=%s",
+            self._pdmux_tick,
+            phase,
+            stream_idx,
+            getattr(stream, "cuda_stream", None),
+            getattr(group, "unique_name", None),
+            getattr(mode, "name", mode),
+            batch.batch_size() if batch is not None else 0,
+            getattr(batch, "scheduler_global_num_tokens", None),
+            start,
+            start + count if start is not None and count is not None else None,
+            graph,
+        )
+
     def init_pdmux(self: Scheduler):
         # The current layerwise prefill batch.
         self.split_prefill_batch: Optional[ScheduleBatch] = None
@@ -46,6 +72,14 @@ class SchedulerMultiplexMixin:
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
 
+    def _retire_pdmux_seq_lens(self: Scheduler, batch, result) -> None:
+        """Publish a staged CPU mirror after the lane's completion fence."""
+        pending = getattr(result, "new_seq_lens_cpu", None)
+        if pending is not None:
+            batch.seq_lens_cpu = pending
+            batch.seq_lens_sum = int(pending.sum())
+            result.new_seq_lens_cpu = None
+
     def _update_decode_attn_backends(self: Scheduler, stream_idx: int) -> None:
         model_worker = getattr(self, "model_worker", None)
         if model_worker is not None and hasattr(
@@ -55,13 +89,24 @@ class SchedulerMultiplexMixin:
             return
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
 
+    @staticmethod
+    def _global_decode_size(decode_batch: Optional[ScheduleBatch]) -> int:
+        if decode_batch is None:
+            return 0
+        # The DP sync creates IDLE participants and publishes the same vector
+        # on every rank. Local batch sizes cannot select a shared stream group.
+        global_num_tokens = getattr(decode_batch, "scheduler_global_num_tokens", None)
+        if global_num_tokens is not None:
+            return max(global_num_tokens, default=0)
+        return 0 if decode_batch.is_empty() else decode_batch.batch_size()
+
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(
-        self: Scheduler, running_batch: ScheduleBatch, has_prefill: bool
+        self: Scheduler, decode_batch: Optional[ScheduleBatch]
     ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
-        """Pick the stream group from local decode load and prefill presence."""
-        if not running_batch.is_empty() and has_prefill:
-            decode_bs = running_batch.batch_size()
+        """Pick the stream group for the next step."""
+        decode_bs = SchedulerMultiplexMixin._global_decode_size(decode_batch)
+        if decode_bs > 0 and self.split_prefill_batch is not None:
             manual_divisions = self.pdmux_config.manual_divisions
             if manual_divisions:
                 # A decode batch under every configured threshold still has to
@@ -83,7 +128,7 @@ class SchedulerMultiplexMixin:
                     ),
                 )
             set_current_stream_idx(stream_idx)
-        elif not running_batch.is_empty():
+        elif decode_bs > 0:
             set_current_stream_idx(self.real_sm_group_num - 1)
         else:
             set_current_stream_idx(0)
@@ -103,6 +148,10 @@ class SchedulerMultiplexMixin:
         # "top of the scheduling step" safe point for tearing down an aborted
         # chunked request before its next chunk is formed.
         self.process_pending_chunked_abort()
+        # This branch drains formation-time cache events outside
+        # get_new_batch_prefill(). Keep that drain with formation so the lane
+        # loop follows pdmux-standard without adding a scheduling phase.
+        self._process_hicache_events()
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
@@ -283,6 +332,7 @@ class SchedulerMultiplexMixin:
         The PDMux loop never assigns `last_batch`, so its normal merge path
         does not handle the prefill result.
         """
+        SchedulerMultiplexMixin._retire_pdmux_seq_lens(self, batch, prefill_result)
         self.process_batch_result(batch, prefill_result)
 
         assert batch.split_prefill_finished
@@ -341,6 +391,8 @@ class SchedulerMultiplexMixin:
         wait_prefill_kernel_done = False
         adjust_stream_group = False
         self._hicache_pump_tick = 0
+        self._pdmux_trace_enabled = envs.SGLANG_PDMUX_TRACE.get()
+        self._pdmux_tick = -1
         stream_idx = get_current_stream_idx()
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
@@ -350,11 +402,17 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            self._pdmux_tick += 1
             with torch.cuda.stream(decode_stream):
                 self.ingest_requests()
                 running_batch = self.running_batch
 
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
+                self._trace_pdmux_phase(
+                    "prefill_prepare_begin",
+                    self.split_prefill_batch,
+                    stream_idx=stream_idx,
+                )
                 sm_count = self.sm_counts[stream_idx][0]
                 formation_done = None
                 # Batch formation is the only other caller of the HiCache pump,
@@ -382,8 +440,6 @@ class SchedulerMultiplexMixin:
                         if self.check_hicache_events_if_enabled():
                             formation_done = prefill_stream.record_event()
                 if not wait_prefill_kernel_done:
-                    if not had_inflight_split:
-                        self._process_hicache_events()
                     created, running_batch = self.update_split_prefill_batch(
                         sm_count, running_batch=running_batch
                     )
@@ -403,43 +459,73 @@ class SchedulerMultiplexMixin:
                         # ~50% TPOT regression under prefill-heavy load, for
                         # no ordering benefit.
                         formation_done = prefill_stream.record_event()
+                self._trace_pdmux_phase(
+                    "prefill_prepare_end",
+                    self.split_prefill_batch,
+                    stream_idx=stream_idx,
+                )
 
             with torch.cuda.stream(decode_stream):
                 if formation_done is not None:
                     decode_stream.wait_event(formation_done)
                 running_batch = self.update_running_batch(running_batch)
                 self.running_batch = running_batch
-                adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0 and running_batch.is_empty()
+                self._trace_pdmux_phase(
+                    "decode_prepare_begin", running_batch, stream_idx=stream_idx
                 )
-                if running_batch.is_empty() and self.split_prefill_batch is None:
+                # Gather DP metadata before selecting streams: an empty local
+                # decode batch may still have active peers and run an IDLE
+                # participant. This is the existing gather, moved ahead of the
+                # stream switch so every rank makes the same decision.
+                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    running_batch if not running_batch.is_empty() else None
+                )
+                has_decode = (
+                    SchedulerMultiplexMixin._global_decode_size(decode_batch) > 0
+                )
+                self._trace_pdmux_phase(
+                    "decode_prepare_end", decode_batch, stream_idx=stream_idx
+                )
+                adjust_stream_group = adjust_stream_group or (
+                    stream_idx > 0 and not has_decode
+                )
+                if not has_decode and self.split_prefill_batch is None:
                     self._sched_idled = True
                     self.on_idle()
 
             if adjust_stream_group:
+                self._trace_pdmux_phase("stream_switch_begin", stream_idx=stream_idx)
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
                 stream_idx, stream_group = self.adjust_stream_groups(
-                    running_batch=running_batch,
-                    has_prefill=self.split_prefill_batch is not None,
+                    decode_batch=decode_batch,
                 )
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
+                self._trace_pdmux_phase("stream_switch_end", stream_idx=stream_idx)
                 logger.debug(
                     f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
                 )
 
             with torch.cuda.stream(decode_stream):
                 # process decode batch
-                decode_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    running_batch if not running_batch.is_empty() else None
+                self._trace_pdmux_phase(
+                    "decode_submit_begin", decode_batch, stream_idx=stream_idx
                 )
                 if decode_batch is not None:
                     decode_result = self.run_batch(decode_batch)
                     decode_done = True
                 else:
                     decode_done = False
+                self._trace_pdmux_phase(
+                    "decode_submit_end",
+                    decode_batch,
+                    stream_idx=stream_idx,
+                    graph=getattr(decode_result, "can_run_cuda_graph", None)
+                    if decode_done
+                    else None,
+                )
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
                 if (
                     self.split_prefill_batch is not None
@@ -456,7 +542,18 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.split_prefill_batch.split_forward_count = forward_count
+                    self._trace_pdmux_phase(
+                        "prefill_submit_begin",
+                        self.split_prefill_batch,
+                        stream_idx=stream_idx,
+                    )
                     prefill_result = self.run_batch(self.split_prefill_batch)
+                    self._trace_pdmux_phase(
+                        "prefill_submit_end",
+                        self.split_prefill_batch,
+                        stream_idx=stream_idx,
+                        graph=getattr(prefill_result, "can_run_cuda_graph", None),
+                    )
                     if next_split_index == self.model_config.num_hidden_layers:
                         self.split_prefill_batch.split_prefill_finished = True
                         prefill_exe_done = prefill_stream.record_event()
@@ -468,8 +565,15 @@ class SchedulerMultiplexMixin:
                     prefill_done = False
 
             with torch.cuda.stream(decode_stream):
+                self._trace_pdmux_phase(
+                    "decode_wait_begin", decode_batch, stream_idx=stream_idx
+                )
                 decode_stream.synchronize()
+                self._trace_pdmux_phase(
+                    "decode_wait_end", decode_batch, stream_idx=stream_idx
+                )
                 if decode_done:
+                    self._retire_pdmux_seq_lens(decode_batch, decode_result)
                     self.process_batch_result(decode_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():
