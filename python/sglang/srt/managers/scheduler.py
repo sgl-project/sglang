@@ -3717,6 +3717,10 @@ class Scheduler(
             if not last_batch.is_empty():
                 if running_batch.is_empty():
                     running_batch = last_batch
+                    # The reset above went to the empty batch this one
+                    # replaces; a batch converted from decode by DP attention
+                    # would otherwise bring back its old flag.
+                    running_batch.batch_is_full = False
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
