@@ -1562,16 +1562,19 @@ def _speculative_moe_runner_default(view: Any) -> dict:
     target-model backend. Invoked at the head of the speculative-decoding
     hook, after the MoE kernel chain has resolved.
 
-    megamoe's global-expert-id dispatch assumes a quantized layer; MTP/NextN
-    drafts never are, so inheriting it here mismatches their actual (Triton)
-    runner and corrupts expert-id dispatch (issue #40623;
-    _deepseek_spec_moe_resolution above carries the same fact for the
-    HIP+DeepSeek-fp4 case). Fall back to auto instead.
+    flashinfer_megamoe routes by global expert id inside the mega kernel and
+    only supports the quantized MoE layers it prepared weights for. Draft
+    (MTP/NextN) layers are typically unquantized and run through a regular
+    runner, so inheriting it would mismatch the draft's runner and corrupt
+    expert-id dispatch. Default the draft to flashinfer_trtllm instead; users
+    with a quantized draft can set --speculative-moe-runner-backend explicitly.
+    (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
+    when its weights are not prepared, so it needs no override.)
     """
     if view.speculative_moe_runner_backend is None:
         default = view.moe_runner_backend
         if default == "flashinfer_megamoe":
-            default = "auto"
+            default = "flashinfer_trtllm"
         return {"speculative_moe_runner_backend": default}
     return {}
 

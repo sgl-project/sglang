@@ -216,11 +216,11 @@ def _validate_nvfp4_fc1_alpha(layer: FusedMoE) -> None:
         return
     gate_alpha = _local_expert_vector(layer.g1_alphas, layer.num_local_experts)
     up_alpha = _local_expert_vector(layer.g1_alphas_up, layer.num_local_experts)
-   if not torch.allclose(gate_alpha, up_alpha):
-       raise ValueError(
-           "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "
-           "values because the kernel accepts one alpha per expert."
-       )
+    if not torch.allclose(gate_alpha, up_alpha):
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "
+            "values because the kernel accepts one alpha per expert."
+        )
 
 
 def _bind_transformed_weights(

@@ -440,7 +440,14 @@ def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     )
 
 
-def _default_speculative_a2a_backend(target_a2a_backend: MoeA2ABackend) -> MoeA2ABackend:
+# Only flashinfer_megamoe is special-cased: its global-expert-id dispatch
+# assumes quantized layers, which draft (MTP/NextN) layers typically are not.
+# DeepGEMM megamoe (a2a "megamoe") falls back per-layer when its weights
+# are not prepared, so drafts can inherit it. A quantized draft that wants
+# flashinfer_megamoe must set the --speculative-moe-* flags explicitly.
+def _default_speculative_a2a_backend(
+    target_a2a_backend: MoeA2ABackend,
+) -> MoeA2ABackend:
     if target_a2a_backend.is_flashinfer_megamoe():
         return MoeA2ABackend.NONE
     return target_a2a_backend
