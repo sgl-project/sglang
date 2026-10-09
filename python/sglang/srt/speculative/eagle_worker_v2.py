@@ -97,6 +97,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
+    build_hot_token_lm_head,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -344,13 +345,42 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
+                if get_parallel().attn_dp_enabled and get_parallel().tp_size > 1:
+                    raise ValueError(
+                        "--speculative-token-map is not yet supported with dp "
+                        "attention at tp_size > 1: the replicated reduced draft "
+                        "lm_head and the logits-gather bypass are unverified on "
+                        "that path. Drop --enable-dp-attention or file an issue."
+                    )
+                if target_lm_head is None and get_parallel().tp_size > 1:
+                    raise ValueError(
+                        "--speculative-token-map at tp_size > 1 needs the target "
+                        "lm_head module to resolve vocab shard ranges, but it is "
+                        "missing on this rank."
+                    )
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                head = build_hot_token_lm_head(
+                    head_weight=head,
+                    lm_head_module=target_lm_head,
+                    hot_token_id=self.hot_token_id,
+                    vocab_size=self.target_worker.model_config.vocab_size,
+                )
+                # The reduced head is replicated on every TP rank, so each
+                # rank's [tokens, len(hot_token_id)] draft logits are already
+                # complete -- the TP=1 layout. The vocab-parallel logits
+                # gather must not run: at tp_size > 1 it would concatenate tp
+                # copies of the same reduced logits.
+                self._disable_draft_logits_tp_gather()
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _disable_draft_logits_tp_gather(self):
+        lp = getattr(self.draft_runner.model, "logits_processor", None)
+        if lp is not None:
+            lp.do_tensor_parallel_all_gather = False
+            lp.do_tensor_parallel_all_gather_dp_attn = False
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
