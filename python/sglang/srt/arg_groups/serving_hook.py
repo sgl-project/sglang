@@ -464,6 +464,11 @@ def handle_other_validations(server_args: Any):
     ):
         raise ValueError("--default-chat-template-kwargs must decode to a JSON object")
 
+    if cfg.mem_fraction_static is not None and not 0.0 < cfg.mem_fraction_static <= 1.0:
+        raise ValueError(
+            f"--mem-fraction-static must be in (0, 1], got {cfg.mem_fraction_static}."
+        )
+
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
         if cfg.pp_size > 1:

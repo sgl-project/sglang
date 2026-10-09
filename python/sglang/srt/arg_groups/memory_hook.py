@@ -23,6 +23,10 @@ from sglang.srt.utils.common import get_device_memory_capacity
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
+# Floor for the *derived* mem_fraction_static. The activation/graph reserve
+# is a model-agnostic upper bound; without a floor it can push the derived
+# fraction below zero on small devices and kill the engine at startup.
+_MIN_DERIVED_MEM_FRACTION_STATIC = 0.5
 
 
 def handle_offload_compatibility(server_args: Any) -> None:
@@ -319,6 +323,29 @@ def handle_gpu_memory_settings(server_args: Any):
             if gpu_mem is not None
             else 0.95
         )
+
+        # The reservation is a worst-case estimate; it can exceed the whole
+        # device (e.g. chunked_prefill_size=-1 makes the activation term scale
+        # with max_prefill_tokens), which derived a negative fraction and the
+        # engine then died at profiling with a confusing "--mem-fraction-static
+        # is negative" style error for a flag the user never set. Floor the
+        # derived value; the profiler still reports a precise minimum fraction
+        # when the weights genuinely do not fit.
+        if (
+            gpu_mem is not None
+            and mem_fraction_static < _MIN_DERIVED_MEM_FRACTION_STATIC
+        ):
+            logger.warning(
+                "Estimated non-static memory reservation (%.1f GiB) exceeds the "
+                "GPU memory (%.1f GiB); clamping derived mem_fraction_static "
+                "from %.3f to %.3f. Set --mem-fraction-static explicitly to "
+                "override.",
+                reserved_mem / 1024,
+                gpu_mem / 1024,
+                mem_fraction_static,
+                _MIN_DERIVED_MEM_FRACTION_STATIC,
+            )
+            mem_fraction_static = _MIN_DERIVED_MEM_FRACTION_STATIC
 
         # Multimodal models need more memory for the image processing.
         if is_vlm:
