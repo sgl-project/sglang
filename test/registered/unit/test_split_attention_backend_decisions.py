@@ -235,11 +235,6 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(product.prefill_attention_backend_str, "trtllm_mha")
 
     def test_cutedsl_draft_extend_stamps_the_effective_kernel(self):
-        # cutedsl_mla only supports decode; the draft-extend map builds the
-        # trtllm-mla backend, and the *constructor* answers the effective
-        # name, so the stamp says what actually runs with no rename table --
-        # and the conv-sidecar wrapper that enters the ForwardContext must
-        # answer with the wrapped backend's stamp.
         from types import SimpleNamespace
         from unittest import mock
 
@@ -247,19 +242,67 @@ class TestDraftFactoryStamping(CustomTestCase):
 
         self._publish(attention_backend="triton")
         factory = self._factory(draft_backend="cutedsl_mla")
+        factory.draft_model_runner.use_mla_backend = True
         built = SimpleNamespace()
-        factory._create_trtllm_mla_prefill_backend = lambda: ("trtllm_mla", built)
+        constructor = mock.Mock(return_value=built)
         wrapper = SimpleNamespace()
-        with mock.patch.object(
-            attention_registry,
-            "attn_backend_wrapper_for_draft_extend",
-            lambda runner, backend: wrapper,
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.layers.attention.cutedsl_mla_backend": SimpleNamespace(
+                        CuteDslMLABackend=constructor
+                    )
+                },
+            ),
+            mock.patch.object(
+                attention_registry,
+                "attn_backend_wrapper_for_draft_extend",
+                return_value=wrapper,
+            ) as wrap,
         ):
             product = factory.create_draft_extend_backend()
+        constructor.assert_called_once_with(
+            factory.draft_model_runner, skip_prefill=False
+        )
+        wrap.assert_called_once_with(factory.draft_model_runner, built)
         self.assertIs(product, wrapper)
-        self.assertEqual(built.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.prefill_attention_backend_str, "trtllm_mla")
-        self.assertEqual(product.decode_attention_backend_str, "trtllm_mla")
+        self.assertEqual(built.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.prefill_attention_backend_str, "cutedsl_mla")
+        self.assertEqual(product.decode_attention_backend_str, "cutedsl_mla")
+
+    def test_cutedsl_draft_extend_requires_mla(self):
+        factory = self._factory(draft_backend="cutedsl_mla")
+        factory.draft_model_runner.use_mla_backend = False
+        with self.assertRaises(AssertionError):
+            factory._create_cutedsl_mla_prefill_backend()
+
+    def test_cutedsl_prefill_uses_the_unabsorbed_head_dimensions(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models.deepseek_common.attention_backend_handler import (
+            AttentionBackendRegistry,
+        )
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+            AttnForwardMethod,
+        )
+
+        handler = AttentionBackendRegistry.get_handler("cutedsl_mla")
+        attn = SimpleNamespace(disable_chunked_prefix_cache=False)
+        for mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            with self.subTest(mode=mode):
+                batch = SimpleNamespace(forward_mode=mode, extend_prefix_lens_cpu=[0])
+                expected = (
+                    AttnForwardMethod.MHA_CHUNKED_KV
+                    if mode == ForwardMode.EXTEND
+                    else AttnForwardMethod.MLA
+                )
+                self.assertEqual(handler(attn, batch), expected)
 
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
         # `hybrid_linear_attn` picks fa3/intel_amx/triton by host inside its
