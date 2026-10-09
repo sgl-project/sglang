@@ -286,6 +286,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self._batched_backup = envs.SGLANG_ENABLE_HICACHE_BATCHED_BACKUP.get()
         self.work_list: list[torch.distributed.Work] = []
 
         # HiCache D↔H defaults (overridden by init_hicache)
@@ -1358,7 +1359,11 @@ class UnifiedRadixCache(BasePrefixCache):
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
-            elif self.buffer_pipeline is None and not self.is_write_back:
+            elif (
+                self._batched_backup
+                and self.buffer_pipeline is None
+                and not self.is_write_back
+            ):
                 # Write-through backups are queued and merged at flush; write-back
                 # backs up only its target, so it stays at insert time.
                 self._queue_write_through_backup(action)

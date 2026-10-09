@@ -1678,7 +1678,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
 class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
     """Write-through backups queued (locked) at insert time and backed up merged
-    by flush_pending_backups."""
+    by flush_pending_backups when SGLANG_ENABLE_HICACHE_BATCHED_BACKUP is set."""
 
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
     swa_cfg = CacheConfig(
@@ -1690,7 +1690,7 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
     )
     seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
 
-    def _build(self, cfg=None):
+    def _build(self, batched=True, cfg=None):
         cfg = cfg or self.cfg
         cache, allocator, _ = build_fixture(cfg)
         server_args = ServerArgs(
@@ -1705,6 +1705,7 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1
         cache.load_back_threshold = 0
+        cache._batched_backup = batched
         return cache, allocator
 
     def _insert(self, cache, allocator, tokens):
@@ -1844,17 +1845,35 @@ class TestUnifiedRadixCacheBatchedWriteThrough(CustomTestCase):
         )
         self._assert_all_backed_up(cache, [parent, child])
 
-    def test_buffer_pipeline_and_write_back_back_up_at_insert_time(self):
+    def test_disabled_backs_up_at_insert_time(self):
+        cache, allocator = self._build(batched=False)
+        node = self._insert(cache, allocator, [1, 2, 3, 4])
+        self.assertEqual(cache.queued_backups, {})
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertEqual(list(cache.ongoing_write_through), [node])
+        cache.writing_check(write_back=True)
+        cache.sanity_check()
+
+    def test_backup_dispatch_queues_only_batched_write_through(self):
         action = BackupKV(node_ids=[7])
-        for pipeline, write_back in ((None, False), (object(), False), (None, True)):
+        cases = [
+            (False, None, False),
+            (True, None, False),
+            (True, object(), False),
+            (True, None, True),
+        ]
+        for batched, pipeline, write_back in cases:
             with self.subTest(
-                buffer_pipeline=pipeline is not None, write_back=write_back
+                batched=batched, pipeline=pipeline is not None, write_back=write_back
             ):
                 cache = mock.MagicMock(
-                    linker=None, buffer_pipeline=pipeline, is_write_back=write_back
+                    linker=None,
+                    buffer_pipeline=pipeline,
+                    is_write_back=write_back,
+                    _batched_backup=batched,
                 )
                 UnifiedRadixCache._apply_cache_action(cache, action)
-                queue = pipeline is None and not write_back
+                queue = batched and pipeline is None and not write_back
                 queued = cache._queue_write_through_backup.call_args_list
                 executed = cache._execute_and_commit_kv_backup.call_args_list
                 self.assertEqual(queued, [mock.call(action)] if queue else [])
@@ -8722,7 +8741,6 @@ class UnifiedRadixCacheSuite:
         cache.write_through_threshold = 1
 
         self._insert(cache, allocator, req_to_token_pool, next_tokens)
-        cache.flush_pending_backups()
 
         d = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", next_tokens)))
@@ -10220,10 +10238,62 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite):
 class TestResumableInsertWalk(_InsertWalkSuite):
     cfg = CacheConfig()
 
-    def test_queued_backup_reuses_the_on_path_h_leaf(self):
+    def test_walk_backup_can_host_evict_on_path_h_leaf(self):
+        """A crossing node's backup runs at its walk step, so its host eviction
+        can still take an H-leaf deeper on the inserted path."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        (top,) = _node_children(cache, cache.root_node_handle())
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
+        (h_leaf,) = _node_children(cache, top)
+        self.assertGreater(_write_backup(cache, h_leaf, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(h_leaf))
+
+        # Fill the host pool below len(top) free, keeping the on-path H-leaf
+        # the oldest host entry and pinning the unbacked path root.
+        top_lock = cache.inc_lock_ref(top)
+        host_pool = cache.cache_controller.mem_pool_host
+        start = 1000
+        top_len = _node_key_length(cache, top)
+        while host_pool.available_size() >= top_len:
+            count = min(host_pool.available_size() - top_len + 1, 250)
+            tokens = list(range(start, start + count))
+            start += 1000
+            self._insert(cache, allocator, req_to_token_pool, tokens)
+            filler = None
+            for child in _node_children(cache, cache.root_node_handle()):
+                if child != top and not cache.tree_core.is_full_device_evicted(child):
+                    filler = child
+            self.assertIsNotNone(filler)
+            self.assertGreater(_write_backup(cache, filler, write_back=True), 0)
+            cache.writing_check(write_back=True)
+            cache.evict(EvictParams(num_tokens=count))
+            self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
+        cache.dec_lock_ref(top, top_lock.to_dec_params())
+
+        # The crossing backup evicts exactly the on-path H-leaf, then the
+        # remaining suffix is recreated as a fresh leaf.
+        cache.write_through_threshold = cache.tree_core.get_node_hit_count(top) + 1
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 13)))
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(cache.tree_core.is_backuped(top))
+        self.assertNotIn(h_leaf, _node_children(cache, top))
+        self.assertFalse(cache.tree_core.contains_node(h_leaf))
+        (child_key_len,) = {
+            _node_key_length(cache, child) for child in _node_children(cache, top)
+        }
+        self.assertEqual(child_key_len, 8)
+        cache.sanity_check()
+
+    def test_batched_backup_reuses_the_on_path_h_leaf(self):
         """A crossing node's backup runs at flush, after the walk re-attached the
         on-path H-leaf, so its host eviction takes another node and the leaf stays."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache._batched_backup = True
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         (top,) = _node_children(cache, cache.root_node_handle())
@@ -10277,7 +10347,7 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
 
         with mock.patch.object(
-            cache, "_queue_write_through_backup", side_effect=RuntimeError("boom")
+            cache, "_execute_and_commit_kv_backup", side_effect=RuntimeError("boom")
         ):
             with self.assertRaises(RuntimeError):
                 self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
@@ -10469,9 +10539,8 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         the finalizers, so a finalizer failure cannot strand the stale record."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         cache.write_through_threshold = 1
-        # The leaf backs up at flush; its ack stays pending (no writing_check).
+        # The leaf backs up on insert; its ack stays pending (no writing_check).
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        cache.flush_pending_backups()
         self.assertTrue(cache.ongoing_write_through)
 
         full_comp = cache.components[ComponentType.FULL]
