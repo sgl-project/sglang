@@ -138,15 +138,17 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
-            if not is_mhc:
-                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models use [T, H].
-                residual_shape = (
-                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
-                    if pp_proxy_residual_num_blocks is not None
-                    else (max_num_token, hidden_size)
+            if pp_proxy_residual_num_blocks is not None:
+                # Only Kimi K3 supplies num_blocks: its attention-residual bank
+                # is token-major [T, blocks, H] and takes the residual's place.
+                pp_proxy_tensors["attn_res_bank"] = torch.zeros(
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size),
+                    dtype=dtype,
                 )
-                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+            elif not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=dtype
+                )
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32

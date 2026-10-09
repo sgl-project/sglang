@@ -242,6 +242,8 @@ class TestBoundaryReductionDefaults(CustomTestCase):
             for architecture, default in (
                 ("Qwen3ForCausalLM", "ar"),
                 ("Qwen3Model", "ar"),
+                ("KimiK3ForConditionalGeneration", "ar"),
+                ("KimiK3LinearForCausalLM", "ar"),
                 ("MossVLForConditionalGeneration", "ar"),
                 ("Qwen4ExpForConditionalGeneration", "ar"),
                 ("Qwen4ExpForCausalLMMTP", "ar"),

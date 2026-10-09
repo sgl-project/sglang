@@ -558,7 +558,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             int(config.full_max_total_num_tokens * 0.5),
         )
 
-    def test_chunk_cache_cap_accounts_for_spec_topk_page_rounding(self):
+    def test_swa_request_cap_accounts_for_spec_topk_page_rounding(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -593,7 +593,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 104)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
+    def test_swa_request_cap_doubles_decode_alloc_for_spec_v2_overlap(self):
         # Overlap on -> spec-v2: decode_alloc = 2 * get_alloc_len_per_decode =
         # 2 * max(steps*topk, max_draft) = 2 * max(6, 5) = 12 (page=1, since the
         # v2 allocator does not support page>1 & topk>1). trailing = 8 + 20 +
@@ -629,7 +629,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 91)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_accounts_for_draft_swa_layers(self):
+    def test_swa_request_cap_accounts_for_draft_swa_layers(self):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
         mr = _make_model_runner(
@@ -663,7 +663,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
-    def test_chunk_cache_cap_drops_prefill_for_disagg_decode(self):
+    def test_swa_request_cap_drops_prefill_for_disagg_decode(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -691,7 +691,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 100)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_prefill_holds_window_plus_chunk(self):
+    def test_swa_request_cap_prefill_holds_window_plus_chunk(self):
         available = 1_000_000
         mr = _make_model_runner(
             self,
@@ -722,7 +722,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 76)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
-    def test_chunk_cache_cap_disagg_decode_pre_alloc(self):
+    def test_swa_request_cap_disagg_decode_pre_alloc(self):
         # decode adds disaggregation_decode_extra_slots in-transfer slots to the
         # request count (num_reserved_decode_tokens is a full-pool concern, not SWA).
         available = 2_000_000
@@ -1003,8 +1003,8 @@ class TestFactory(CustomTestCase):
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
 
     def test_chunk_cap_configurator_selection(self):
-        # SWAChunkCapPoolConfigurator is selected only when max_running_requests is set.
-        def _cfg(max_running_requests):
+        # SWARequestCapPoolConfigurator is selected only when max_running_requests is set.
+        def _cfg(max_running_requests, chunked_prefill_size=4):
             mr = _make_model_runner(
                 self,
                 is_hybrid_swa=True,
@@ -1012,7 +1012,7 @@ class TestFactory(CustomTestCase):
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
                 disable_radix_cache=True,
-                chunked_prefill_size=4,
+                chunked_prefill_size=chunked_prefill_size,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
             )
@@ -1024,11 +1024,15 @@ class TestFactory(CustomTestCase):
                 return create_memory_pool_configurator(mr)
 
         from sglang.srt.model_executor.pool_configurator import (
-            SWAChunkCapPoolConfigurator,
+            SWARequestCapPoolConfigurator,
         )
 
-        self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
-        self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(_cfg(2), SWARequestCapPoolConfigurator)
+        self.assertNotIsInstance(_cfg(None), SWARequestCapPoolConfigurator)
+        # Chunked prefill off: a whole prompt can exceed the cap.
+        self.assertNotIsInstance(
+            _cfg(2, chunked_prefill_size=-1), SWARequestCapPoolConfigurator
+        )
 
 
 class TestDflashDraftKvBudget(CustomTestCase):
@@ -1521,7 +1525,7 @@ class TestFusedDraftPricing(unittest.TestCase):
 
     def test_chunk_cap_solve_prices_the_fused_entry(self):
         from sglang.srt.model_executor.pool_configurator import (
-            SWAChunkCapPoolConfigurator,
+            SWARequestCapPoolConfigurator,
         )
 
         available = 50_000_000
@@ -1534,7 +1538,7 @@ class TestFusedDraftPricing(unittest.TestCase):
             sliding_window_size=8,
             max_running_requests=2,
         )
-        self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+        self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         config = cfg.calculate_pool_sizes(available, 1)
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
 
