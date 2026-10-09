@@ -614,6 +614,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Setwise pooling readout positions (CPU tensors, one per request)
     token_indices_to_pool: Optional[List[torch.Tensor]] = None
 
+    # Joint schema head decision layouts (one per request, None if absent)
+    decision_layouts: Optional[List[Optional[List[int]]]] = None
+
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -672,8 +675,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #                                      the eager forward and the cuda-graph
     #                                      registry localize from on each forward /
     #                                      replay. Present only when
-    #                                      enable_num_token_non_padded()
-    #                                      (moe_ep_size > 1).
+    #                                      enable_num_token_non_padded().
     #     global_num_token_non_padded_cpu  host int. Host-side attention/backend
     #                                      slices read it directly; the prefill
     #                                      graph registry derives its per-rank GPU
@@ -1267,6 +1269,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     torch.tensor(r.token_indices_to_pool, dtype=torch.int64)
                     for r in batch.reqs
                 ]
+
+            if any(r.decision_layout is not None for r in batch.reqs):
+                self.decision_layouts = [r.decision_layout for r in batch.reqs]
 
         token_type_ids = [
             r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
@@ -2106,8 +2111,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    # Elastic joiners also need graph padding masked after joining WORLD.
-    return get_parallel().moe_ep_size > 1 or world_dp_gather_enabled()
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    # Elastic joiners also need graph padding masked after joining WORLD; a
+    # customized A2A backend consumes the count whatever the EP size.
+    return (
+        get_parallel().moe_ep_size > 1
+        or world_dp_gather_enabled()
+        or get_moe_a2a_backend().is_customized()
+    )
 
 
 def build_inner_fb_view(

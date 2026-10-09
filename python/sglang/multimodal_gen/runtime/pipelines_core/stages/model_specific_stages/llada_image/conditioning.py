@@ -61,7 +61,8 @@ class LLaDAImageTextEncoderRunner:
         )
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.chunk_cache import ChunkCache
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import SpawnRanks, create_context, use_context
         from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
@@ -143,12 +144,14 @@ class LLaDAImageTextEncoderRunner:
             self.req_to_token_pool, self.token_to_kv_pool_allocator = (
                 self.worker.get_memory_pool()
             )
-            self.tree_cache = ChunkCache(
+            # The radix-disabled cache srt builds for a full-attention model.
+            self.tree_cache = UnifiedRadixCache(
                 CacheInitParams(
                     disable=True,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
+                    tree_components=(ComponentType.FULL,),
                 )
             )
 
