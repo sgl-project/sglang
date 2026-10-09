@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.mamba import qwen4_short_conv
 from sglang.kernels.ops.mamba.qwen4_short_conv import (
     can_fuse_qwen4_varlen_conv,
     fused_qwen4_varlen_conv,
@@ -19,6 +20,21 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+
+
+def can_fuse_qwen4_direct_decode_conv(*args, **kwargs):
+    assert hasattr(qwen4_short_conv, "can_fuse_qwen4_direct_decode_conv")
+    return qwen4_short_conv.can_fuse_qwen4_direct_decode_conv(*args, **kwargs)
+
+
+def fused_qwen4_direct_decode_conv(*args, **kwargs):
+    assert hasattr(qwen4_short_conv, "fused_qwen4_direct_decode_conv")
+    return qwen4_short_conv.fused_qwen4_direct_decode_conv(*args, **kwargs)
+
+
+def use_qwen4_direct_decode(*args, **kwargs):
+    assert hasattr(qwen4_exp, "_use_qwen4_direct_decode")
+    return qwen4_exp._use_qwen4_direct_decode(*args, **kwargs)
 
 
 def _metadata(lengths, state_indices):
@@ -46,6 +62,7 @@ def _inputs(
     dilation,
     seed,
     *,
+    dtype=torch.bfloat16,
     state_dtype=torch.bfloat16,
 ):
     generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -53,13 +70,13 @@ def _inputs(
     x = torch.randn(
         (tokens, channels),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
         generator=generator,
     )
     weight = torch.randn(
         (channels, 1, kernel_size),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
         generator=generator,
     )
     state = torch.randn(
@@ -95,8 +112,198 @@ def _reference(x, weight, state, query_start_loc, state_indices, dilation):
     return output, next_state
 
 
+def _fused_output_reference(
+    x, residual, weight, state, query_start_loc, state_indices, dilation
+):
+    conv, next_state = _reference(
+        x, weight, state, query_start_loc, state_indices, dilation
+    )
+    return residual + F.silu(conv), next_state
+
+
+def _decode_reference(
+    x, residual, weight, state, state_indices, dilation, track_indices=None
+):
+    selected = state.index_select(0, state_indices).to(dtype=x.dtype)
+    conv_input = torch.cat([selected, x.unsqueeze(-1)], dim=-1)
+    conv = F.conv1d(
+        conv_input,
+        weight.to(dtype=x.dtype),
+        dilation=dilation,
+        groups=x.shape[1],
+    ).squeeze(-1)
+    output = residual + F.silu(conv)
+    next_state = conv_input[:, :, 1:]
+    expected_state = state.clone()
+    real = state_indices.ne(0)
+    expected_state[state_indices[real]] = next_state[real].to(dtype=state.dtype)
+    if track_indices is not None:
+        tracked = track_indices.ne(0)
+        expected_state[track_indices[tracked]] = next_state[tracked].to(
+            dtype=state.dtype
+        )
+    return output, expected_state
+
+
 @requires_cuda
 class TestQwen4ShortConv(CustomTestCase):
+    def test_direct_decode_matches_native_for_batch_dtype_state_and_reuse(self):
+        for batch_size in (1, 8, 32):
+            for dtype in (torch.bfloat16, torch.float16):
+                for state_dtype in (dtype, torch.float32):
+                    x, weight, initial_state = _inputs(
+                        batch_size,
+                        257,
+                        batch_size + 3,
+                        kernel_size=3,
+                        dilation=4,
+                        seed=1000 + batch_size,
+                        state_dtype=state_dtype,
+                    )
+                    x = x.to(dtype=dtype)
+                    weight = weight.to(dtype=dtype)
+                    residual = torch.randn_like(x)
+                    indices = torch.arange(
+                        2, batch_size + 2, device="cuda", dtype=torch.long
+                    )
+                    actual_state = initial_state.clone()
+                    actual_state[indices] = 0
+                    # Iteration one is a fresh slot; iteration two reuses the
+                    # state advanced by the direct kernel.
+                    for _ in range(2):
+                        expected, expected_state = _decode_reference(
+                            x,
+                            residual,
+                            weight,
+                            actual_state,
+                            indices,
+                            dilation=4,
+                        )
+                        actual = fused_qwen4_direct_decode_conv(
+                            x,
+                            residual,
+                            weight,
+                            actual_state,
+                            indices,
+                            dilation=4,
+                        )
+                        if dtype == torch.bfloat16:
+                            self.assertTrue(torch.equal(actual, expected))
+                        else:
+                            torch.testing.assert_close(
+                                actual, expected, rtol=5e-4, atol=5e-4
+                            )
+                        self.assertTrue(torch.equal(actual_state, expected_state))
+
+    def test_direct_decode_supports_strided_state_track_and_padding_slot(self):
+        batch_size = 8
+        x, weight, backing = _inputs(
+            batch_size,
+            129,
+            24,
+            kernel_size=3,
+            dilation=4,
+            seed=2001,
+            state_dtype=torch.float32,
+        )
+        strided_backing = torch.empty((24, 129, 16), device="cuda", dtype=torch.float32)
+        state = strided_backing[:, :, ::2]
+        state.copy_(backing)
+        self.assertFalse(state.is_contiguous())
+        residual = torch.randn_like(x)
+        indices = torch.tensor(
+            [0, 2, 4, 6, 8, 10, 12, 14], device="cuda", dtype=torch.long
+        )
+        track_indices = torch.tensor(
+            [0, 3, 5, 7, 9, 11, 13, 15], device="cuda", dtype=torch.long
+        )
+        slot_zero = state[0].clone()
+        expected, expected_state = _decode_reference(
+            x,
+            residual,
+            weight,
+            state,
+            indices,
+            dilation=4,
+            track_indices=track_indices,
+        )
+
+        self.assertTrue(
+            can_fuse_qwen4_direct_decode_conv(
+                x, residual, weight, state, indices, 4, track_indices
+            )
+        )
+        actual = fused_qwen4_direct_decode_conv(
+            x,
+            residual,
+            weight,
+            state,
+            indices,
+            dilation=4,
+            track_indices=track_indices,
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+        self.assertTrue(torch.equal(state, expected_state))
+        self.assertTrue(torch.equal(state[0], slot_zero))
+
+    def test_direct_decode_cuda_graph_replay_uses_live_inputs_and_state(self):
+        batch_size = 8
+        x, weight, state = _inputs(
+            batch_size, 129, 12, kernel_size=3, dilation=4, seed=3001
+        )
+        residual = torch.randn_like(x)
+        indices = torch.arange(2, batch_size + 2, device="cuda", dtype=torch.long)
+        static_state = state.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fused_qwen4_direct_decode_conv(
+                x, residual, weight, static_state, indices, dilation=4
+            )
+
+        for scale in (0.5, -1.25):
+            x.copy_(torch.randn_like(x) * scale)
+            residual.copy_(torch.randn_like(residual) * scale)
+            before = static_state.clone()
+            expected, expected_state = _decode_reference(
+                x, residual, weight, before, indices, dilation=4
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+            self.assertTrue(torch.equal(static_state, expected_state))
+
+    def test_direct_decode_guard_keeps_unsupported_fallbacks(self):
+        x, weight, state = _inputs(1, 65, 4, kernel_size=3, dilation=4, seed=4001)
+        residual = torch.randn_like(x)
+        indices = torch.tensor([2], device="cuda", dtype=torch.long)
+        args = (x, residual, weight, state, indices, 4, None)
+        self.assertTrue(can_fuse_qwen4_direct_decode_conv(*args))
+        self.assertFalse(
+            can_fuse_qwen4_direct_decode_conv(
+                x.float(), residual.float(), weight, state, indices, 4, None
+            )
+        )
+        self.assertFalse(
+            can_fuse_qwen4_direct_decode_conv(
+                x, residual[:, ::2], weight, state, indices, 4, None
+            )
+        )
+
+    def test_direct_decode_dispatch_is_narrow_and_fusion_gated(self):
+        x, weight, state = _inputs(8, 65, 12, kernel_size=3, dilation=4, seed=5001)
+        residual = torch.randn_like(x)
+        indices = torch.arange(2, 10, device="cuda", dtype=torch.long)
+        args = (x, residual, weight, state, indices, 4, None)
+        self.assertTrue(use_qwen4_direct_decode(ForwardMode.DECODE, *args))
+        self.assertFalse(use_qwen4_direct_decode(ForwardMode.EXTEND, *args))
+        with patch.object(
+            qwen4_exp.envs.SGLANG_ENABLE_QWEN4_PLE_FUSION,
+            "get",
+            return_value=False,
+        ):
+            self.assertFalse(use_qwen4_direct_decode(ForwardMode.DECODE, *args))
+
     def test_packed_varlen_matches_padded_reference(self):
         lengths = [1, 2, 8, 9, 10, 33, 0]
         state_indices = [7, 2, 9, 4, 11, 6, 0]
@@ -114,6 +321,8 @@ class TestQwen4ShortConv(CustomTestCase):
             state_indices_tensor,
             dilation=4,
         )
+        residual = torch.randn_like(x)
+        expected = residual + F.silu(expected)
         actual_state = initial_state.clone()
         actual = fused_qwen4_varlen_conv(
             x,
@@ -124,12 +333,124 @@ class TestQwen4ShortConv(CustomTestCase):
             req_indices,
             token_offsets,
             dilation=4,
+            residual=residual,
         )
 
         torch.testing.assert_close(
             actual.float(), expected.float(), rtol=0.02, atol=0.05
         )
         self.assertTrue(torch.equal(actual_state, expected_state))
+
+    def test_varlen_output_fusion_covers_mixed_equal_fp16_and_fp32_state(self):
+        cases = (
+            ("mixed", [1, 5, 0, 9], [2, 4, 0, 6]),
+            ("equal", [4, 4, 4], [2, 4, 6]),
+        )
+        for name, lengths, state_indices in cases:
+            for dtype in (torch.bfloat16, torch.float16):
+                for state_dtype in (dtype, torch.float32):
+                    with self.subTest(case=name, dtype=dtype, state_dtype=state_dtype):
+                        x, weight, initial_state = _inputs(
+                            sum(lengths),
+                            129,
+                            8,
+                            kernel_size=3,
+                            dilation=4,
+                            seed=6000 + sum(lengths),
+                            dtype=dtype,
+                            state_dtype=state_dtype,
+                        )
+                        residual = torch.randn_like(x)
+                        meta = _metadata(lengths, state_indices)
+                        expected, expected_state = _fused_output_reference(
+                            x,
+                            residual,
+                            weight,
+                            initial_state,
+                            meta[0],
+                            meta[3],
+                            dilation=4,
+                        )
+                        actual_state = initial_state.clone()
+                        self.assertTrue(
+                            can_fuse_qwen4_varlen_conv(
+                                x,
+                                weight,
+                                actual_state,
+                                meta[3],
+                                *meta[:3],
+                                4,
+                                residual,
+                            )
+                        )
+                        actual = fused_qwen4_varlen_conv(
+                            x,
+                            weight,
+                            actual_state,
+                            meta[3],
+                            *meta[:3],
+                            dilation=4,
+                            residual=residual,
+                        )
+
+                        if dtype == torch.bfloat16:
+                            self.assertTrue(torch.equal(actual, expected))
+                        else:
+                            torch.testing.assert_close(
+                                actual, expected, rtol=5e-4, atol=5e-4
+                            )
+                        self.assertTrue(torch.equal(actual_state, expected_state))
+
+    def test_varlen_output_fusion_preserves_low_precision_rounding_points(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                conv_value, residual_value = {
+                    torch.bfloat16: (-0.1630859375, -0.0250244140625),
+                    torch.float16: (0.11907958984375, 0.11846923828125),
+                }[dtype]
+                x = torch.tensor(
+                    [[conv_value]],
+                    device="cuda",
+                    dtype=dtype,
+                )
+                # Only the newest tap contributes, so conv1d materializes the
+                # chosen low-precision value exactly before SiLU.
+                weight = torch.tensor([[[0.0, 0.0, 1.0]]], device="cuda", dtype=dtype)
+                state = torch.zeros((3, 1, 8), device="cuda", dtype=torch.float32)
+                residual = torch.tensor(
+                    [[residual_value]],
+                    device="cuda",
+                    dtype=dtype,
+                )
+                meta = _metadata([1], [2])
+                conv, _ = _reference(x, weight, state, meta[0], meta[3], dilation=4)
+                expected = residual + F.silu(conv)
+                unmaterialized = (residual.float() + F.silu(conv.float())).to(
+                    dtype=dtype
+                )
+                self.assertFalse(torch.equal(expected, unmaterialized))
+
+                actual = fused_qwen4_varlen_conv(
+                    x,
+                    weight,
+                    state,
+                    meta[3],
+                    *meta[:3],
+                    dilation=4,
+                    residual=residual,
+                )
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_varlen_output_fusion_keeps_raw_output_compatibility_api(self):
+        x, weight, initial_state = _inputs(
+            5, 65, 5, kernel_size=3, dilation=4, seed=7001
+        )
+        meta = _metadata([2, 3], [2, 4])
+        expected, _ = _reference(x, weight, initial_state, meta[0], meta[3], dilation=4)
+        actual = fused_qwen4_varlen_conv(
+            x, weight, initial_state.clone(), meta[3], *meta[:3], dilation=4
+        )
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_writeback_updates_main_and_track_boundaries(self):
         lengths = [12]
@@ -142,6 +463,7 @@ class TestQwen4ShortConv(CustomTestCase):
         track_indices = torch.tensor([8], device="cuda", dtype=torch.long)
         track_offsets = torch.tensor([5], device="cuda", dtype=torch.long)
         actual_state = initial_state.clone()
+        residual = torch.randn_like(x)
         fused_qwen4_varlen_conv(
             x,
             weight,
@@ -151,6 +473,7 @@ class TestQwen4ShortConv(CustomTestCase):
             req_indices,
             token_offsets,
             dilation=4,
+            residual=residual,
             track_indices=track_indices,
             track_offsets=track_offsets,
         )
@@ -165,19 +488,34 @@ class TestQwen4ShortConv(CustomTestCase):
         )
         one_state = initial_state.clone()
         one_meta = _metadata([12], [5])
+        residual = torch.randn_like(x)
         one_output = fused_qwen4_varlen_conv(
-            x, weight, one_state, one_meta[3], *one_meta[:3], dilation=4
+            x,
+            weight,
+            one_state,
+            one_meta[3],
+            *one_meta[:3],
+            dilation=4,
+            residual=residual,
         )
 
         chunk_state = initial_state.clone()
         outputs = []
+        start = 0
         for chunk in (x[:5], x[5:]):
             meta = _metadata([chunk.shape[0]], [5])
             outputs.append(
                 fused_qwen4_varlen_conv(
-                    chunk, weight, chunk_state, meta[3], *meta[:3], dilation=4
+                    chunk,
+                    weight,
+                    chunk_state,
+                    meta[3],
+                    *meta[:3],
+                    dilation=4,
+                    residual=residual[start : start + chunk.shape[0]],
                 )
             )
+            start += chunk.shape[0]
 
         torch.testing.assert_close(
             torch.cat(outputs).float(), one_output.float(), rtol=0.02, atol=0.05
@@ -219,9 +557,17 @@ class TestQwen4ShortConv(CustomTestCase):
         expected, expected_state = _reference(
             x, weight, initial_state, meta[0], meta[3], dilation=4
         )
+        residual = torch.randn_like(x)
+        expected = residual + F.silu(expected)
         actual_state = initial_state.clone()
         actual = fused_qwen4_varlen_conv(
-            x, weight, actual_state, meta[3], *meta[:3], dilation=4
+            x,
+            weight,
+            actual_state,
+            meta[3],
+            *meta[:3],
+            dilation=4,
+            residual=residual,
         )
 
         torch.testing.assert_close(
