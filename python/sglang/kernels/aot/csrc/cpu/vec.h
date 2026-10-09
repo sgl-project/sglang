@@ -54,6 +54,10 @@ inline at::vec::Vectorized<float> load_float_vec(const scalar_t* __restrict__ da
   }
   return out;
 }
+inline at::vec::Vectorized<float> load_float_vec(const float* __restrict__ data) {
+  using fVec = at::vec::Vectorized<float>;
+  return fVec::loadu(data);
+}
 
 #if defined(CPU_CAPABILITY_AVX512)
 
