@@ -1696,21 +1696,9 @@ def make_pp_layers(
 # under pipeline parallelism.
 _NEIGHBOUR_BUILD_MODULES = frozenset(
     (
-        "sglang.srt.models.deepseek_v2",
-        "sglang.srt.models.exaone4",
-        "sglang.srt.models.gemma4_causal",
-        "sglang.srt.models.gigachat35",
-        "sglang.srt.models.glm4",
         "sglang.srt.models.glm5_next",
-        "sglang.srt.models.granitemoehybrid",
         "sglang.srt.models.kimi_k3",
-        "sglang.srt.models.llama",
-        "sglang.srt.models.ministral3",
-        "sglang.srt.models.nemotron_nas",
-        "sglang.srt.models.qwen2",
-        "sglang.srt.models.qwen2_moe",
         "sglang.srt.models.qwen3_5",
-        "sglang.srt.models.zaya",
     )
 )
 
