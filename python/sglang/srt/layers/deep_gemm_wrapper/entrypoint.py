@@ -234,6 +234,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            compiled_dims="nk",
         )
 
 
@@ -259,6 +260,7 @@ def gemm_nt_mxfp8_f8f8bf16(
             out,
             recipe_a=(1, 32),
             recipe_b=(1, 32),
+            compiled_dims="nk",
             disable_ue8m0_cast=disable_cast,
         )
 
@@ -274,7 +276,7 @@ def gemm_nt_bf16bf16f32(
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16F32
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+        deep_gemm.bf16_gemm_nt(lhs, rhs, out, compiled_dims="nk")
 
 
 def tf32_hc_prenorm_gemm(
