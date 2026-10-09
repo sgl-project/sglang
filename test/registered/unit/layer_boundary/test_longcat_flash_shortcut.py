@@ -78,7 +78,12 @@ class TestLongcatShortcut(CustomTestCase):
             ),
             patch_communicator(
                 "get_parallel",
-                return_value=SimpleNamespace(attn_tp_group=object()),
+                return_value=SimpleNamespace(
+                    attn_tp_group=object(),
+                    attn_tp_size=tp,
+                    attn_dp_enabled=False,
+                    disable_attn_tp_gather=False,
+                ),
             ),
         ):
             hidden, _ = layer(
