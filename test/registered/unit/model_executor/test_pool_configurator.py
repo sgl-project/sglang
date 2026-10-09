@@ -1065,6 +1065,21 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_draft_kv_heads_follow_draft_tp_placement(self):
+        """The draft pool and its budget shard KV heads as the draft model does: by
+        full TP under context parallelism, by attention TP when the draft owns it."""
+        from sglang.srt.speculative.spec_info import dflash_draft_kv_head_tp_size
+
+        for widths, expected in (
+            (dict(tp_size=4, attn_tp_size=1, attn_cp_size=4, attn_dp_size=1), 4),
+            (dict(tp_size=8, attn_tp_size=2, attn_cp_size=1, attn_dp_size=4), 2),
+        ):
+            with self.subTest(**widths):
+                with get_parallel().override(
+                    **widths, attn_dp_enabled=widths["attn_dp_size"] > 1
+                ):
+                    self.assertEqual(dflash_draft_kv_head_tp_size(), expected)
+
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
