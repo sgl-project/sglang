@@ -133,7 +133,9 @@ class DecoderReplayGraphs:
         with self._break_context(tail_batch), _replay_graph_scope():
             graph = self._graphs.get(key)
             if graph is None:
-                graph = self._capture(key, live, rebuild, forward_batch)
+                graph = self._graphs[key] = self._capture(
+                    key, live, rebuild, forward_batch
+                )
             else:
                 for buf, t in zip(graph.inputs, live):
                     buf[:num_rows].copy_(t)
@@ -200,7 +202,6 @@ class DecoderReplayGraphs:
         torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
         replay_graph = _ReplayGraph(graph, inputs, residual, pre)
-        self._graphs[key] = replay_graph
         seconds = time.perf_counter() - start
         used = free_before - torch.cuda.mem_get_info()[0]
         self.capture_seconds += seconds
@@ -213,7 +214,7 @@ class DecoderReplayGraphs:
                 len(graph._segments),
                 seconds,
                 used / 2**30,
-                len(self._graphs),
+                len(self._graphs) + 1,
                 self.capture_seconds,
                 self.capture_bytes / 2**30,
             )
