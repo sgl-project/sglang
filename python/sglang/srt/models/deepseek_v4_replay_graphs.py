@@ -126,7 +126,8 @@ class _ReplayGraph:
         self.num_token_non_padded = num_token_non_padded
         self.residual = residual
         self.pre = pre
-        # The capture batch; kept alive in case a captured kernel reads its tensors.
+        # The capture step's batch and tail attention metadata. Kernels write
+        # buffers cached on them (the TP-padded query heads), so the graph owns them.
         self.batch = batch
 
 
@@ -272,7 +273,12 @@ class DecoderReplayGraphs:
         torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
         replay_graph = _ReplayGraph(
-            graph, inputs, num_token_non_padded, residual, pre, capture_batch
+            graph,
+            inputs,
+            num_token_non_padded,
+            residual,
+            pre,
+            (capture_batch, get_attn_backend().forward_metadata),
         )
         seconds = time.perf_counter() - start
         used = free_before - torch.cuda.mem_get_info()[0]
