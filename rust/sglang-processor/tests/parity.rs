@@ -22,7 +22,7 @@ fn fixtures_match_sglang() {
         std::env::remove_var("SGLANG_DSV41_REASONING_EFFORT");
     }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity");
-    for entry in std::fs::read_dir(dir).unwrap() {
+    for entry in std::fs::read_dir(dir).expect("run tests/scripts/fetch_fixtures.sh") {
         let fixture: Value =
             serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
         check(&fixture);

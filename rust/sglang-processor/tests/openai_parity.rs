@@ -89,7 +89,7 @@ impl Checkpoint {
 #[test]
 fn fixtures_match_sglang() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openai_parity");
-    for entry in std::fs::read_dir(dir).unwrap() {
+    for entry in std::fs::read_dir(dir).expect("run tests/scripts/fetch_fixtures.sh") {
         let fixture: Value =
             serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
         let model = fixture["model"].as_str().unwrap();

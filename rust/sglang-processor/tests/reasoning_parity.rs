@@ -12,7 +12,7 @@ use sglang_processor::{ReasoningOptions, ReasoningStreamSplitter, split_reasonin
 #[test]
 fn fixtures_match_sglang() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reasoning_parity");
-    for entry in std::fs::read_dir(dir).unwrap() {
+    for entry in std::fs::read_dir(dir).expect("run tests/scripts/fetch_fixtures.sh") {
         let fixture: Value =
             serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap()).unwrap();
         let parser = fixture["parser"].as_str().unwrap();
