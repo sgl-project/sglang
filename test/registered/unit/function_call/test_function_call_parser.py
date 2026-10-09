@@ -1562,6 +1562,115 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def test_parse_streaming_keeps_code_fences_in_normal_text(self):
+        """Code fences in a plain answer survive streaming, as they do in non-streaming."""
+        text = 'Here is an example:\n```json\n{"a": 1}\n```\nDone.'
+        chunks = [
+            "Here",
+            " is",
+            " an",
+            " example",
+            ":\n",
+            "```",
+            "json",
+            "\n",
+            '{"',
+            "a",
+            '":',
+            " ",
+            "1",
+            "}\n",
+            "```\n",
+            "Done",
+            ".",
+        ]
+        self.assertEqual("".join(chunks), text)
+
+        streamed = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertEqual(result.calls, [])
+            streamed += result.normal_text
+
+        self.assertEqual(streamed, text)
+        self.assertEqual(
+            DeepSeekV3Detector().detect_and_parse(text, self.tools).normal_text, text
+        )
+
+    def test_parse_streaming_code_fence_then_tool_call(self):
+        """A fenced answer followed by a tool call keeps the fence and parses the call."""
+        chunks = [
+            "Run",
+            " this",
+            ":\n",
+            "```",
+            "python",
+            "\n",
+            "print",
+            "(1)",
+            "\n",
+            "```\n",
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>",
+            "function",
+            "<｜tool▁sep｜>",
+            "get",
+            "_weather",
+            "\n",
+            "```",
+            "json",
+            "\n",
+            '{"',
+            "city",
+            '":',
+            ' "',
+            "Paris",
+            '"}',
+            "\n",
+            "```",
+            "<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ]
+
+        normal_text = ""
+        names = []
+        arguments = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                arguments += call.parameters or ""
+
+        self.assertEqual(normal_text, "Run this:\n```python\nprint(1)\n```\n")
+        self.assertEqual(names, ["get_weather"])
+        self.assertEqual(json.loads(arguments), {"city": "Paris"})
+
+    def test_parse_streaming_multi_token_call_end_emits_no_fence(self):
+        """A delta with the closing fence and the call-end token adds no normal text."""
+        chunks = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n",
+            '{"city": "Paris"}',
+            "\n```<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ]
+
+        normal_text = ""
+        names = []
+        arguments = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                arguments += call.parameters or ""
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(names, ["get_weather"])
+        self.assertEqual(json.loads(arguments), {"city": "Paris"})
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
