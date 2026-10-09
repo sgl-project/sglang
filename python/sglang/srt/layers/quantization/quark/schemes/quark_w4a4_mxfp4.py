@@ -6,7 +6,6 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -19,6 +18,7 @@ from sglang.srt.layers.quantization.dequantization import (
     dequantize_fp8,
     dequantize_nvfp4,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -32,11 +32,6 @@ _is_hip = is_hip()
 
 _ASM_FP4_SCALE_ROW_MULTIPLE = 32
 _ASM_FP4_SCALE_COL_MULTIPLE = 8
-
-# Keep this path opt-in while the AITER ASM integration is validated across the
-# Quark model matrix. Unlike the Triton fallback, it consumes AITER's
-# a4w4_blockscale_tuned_gemm CSVs.
-_use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
 
 
 def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
@@ -345,6 +340,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        # --fp4-gemm-backend aiter: unlike the Triton path, AITER's gemm_a4w4
+        # consumes the a4w4_blockscale_tuned_gemm CSVs.
+        self.use_aiter_fp4_gemm = _is_hip and get_fp4_gemm_runner_backend().is_aiter()
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -374,7 +372,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
-        if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
+        if not self.use_aiter_fp4_gemm:
             return
 
         if not _asm_fp4_scale_swizzle_supported(layer.weight_scale.data):
@@ -820,8 +818,8 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             if isinstance(x, tuple):
                 raise NotImplementedError(
                     "AITER ASM FP4 GEMM does not yet support Quark tuple-input "
-                    "fusion paths. Disable SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM "
-                    "for models that use these projections."
+                    "fusion paths. Use --fp4-gemm-backend triton for models "
+                    "that use these projections."
                 )
 
             output_shape = None

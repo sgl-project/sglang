@@ -200,7 +200,7 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), **NVFP4**, and ROCm **MXFP4** (Quark dense linear) GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
 ### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
@@ -261,7 +261,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 
-### `--fp4-gemm-backend` (NVFP4 GEMM)
+### `--fp4-gemm-backend` (NVFP4 / MXFP4 GEMM)
 
 <table>
   <thead>
@@ -274,8 +274,8 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
   <tbody>
     <tr>
       <td><code>auto</code></td>
-      <td>SM80+</td>
-      <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
+      <td>SM80+, ROCm</td>
+      <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>triton</code> on ROCm; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
     </tr>
     <tr>
       <td><code>flashinfer_cutlass</code></td>
@@ -302,10 +302,22 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
       <td>SM80-SM90</td>
       <td>Weight-only W4A16 fallback for NVFP4 checkpoints</td>
     </tr>
+    <tr>
+      <td><code>aiter</code></td>
+      <td>AMD gfx95 (MI350/MI355)</td>
+      <td>AITER CK/ASM MXFP4 GEMM for Quark MXFP4 dense linear; preshuffles weights at load and uses AITER's tuned a4w4 GEMM configs</td>
+    </tr>
+    <tr>
+      <td><code>triton</code></td>
+      <td>AMD ROCm</td>
+      <td>AITER Triton MXFP4 GEMM for Quark MXFP4 dense linear (the ROCm default)</td>
+    </tr>
   </tbody>
 </table>
 
-On SM80-SM90, `auto` selects Marlin for NVFP4. NVFP4 GEMM requires FlashInfer to be installed.
+On SM80-SM90, `auto` selects Marlin for NVFP4. The FlashInfer NVFP4 backends require FlashInfer to be installed.
+
+On ROCm, `auto` selects `triton`. `aiter` is opt-in because it does not yet support the fused tuple-input projections used by some models (for example DeepSeek MLA attention), which raise an error under it. The deprecated `SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1` is still honored as `--fp4-gemm-backend aiter` when the flag is left at `auto`.
 
 ## Offline Quantization
 
