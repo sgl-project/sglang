@@ -4006,6 +4006,21 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
             )
             self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
 
+    def test_prefill_only_capture_defaults_off(self):
+        # Decode capture off, prefill still capturing into the same pausable
+        # pool: the collective is in a graph either way, so the registration has
+        # to go regardless of which phase holds it.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NCCL_GRAPH_REGISTER", None)
+            self._resolve(
+                enable_memory_saver=True,
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(backend=Backend.DISABLED),
+                    prefill=PhaseConfig(backend=Backend.FULL),
+                ),
+            )
+            self.assertEqual(os.environ.get("NCCL_GRAPH_REGISTER"), "0")
+
     def test_single_rank_env_is_untouched(self):
         # One rank issues no collective, so a capture registers nothing.
         with patch.dict(os.environ, {}, clear=False):

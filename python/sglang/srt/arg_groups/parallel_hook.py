@@ -301,21 +301,23 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if _decode_graph_may_capture_collectives(server_args):
+    if _graph_may_capture_collectives(server_args):
         _disable_nccl_graph_buffer_registration(
             "graph-captured collectives run on graph-pool temporaries whose "
             "addresses the pool also hands to other tensors"
         )
 
 
-def _decode_graph_may_capture_collectives(server_args: Any) -> bool:
-    """Whether a decode CUDA graph can capture a cross-rank collective.
+def _graph_may_capture_collectives(server_args: Any) -> bool:
+    """Whether any captured CUDA graph can hold a cross-rank collective.
 
     Capture binds a collective's send/recv buffers to graph-pool temporaries,
     and the pool hands those same addresses to other tensors. Which collective
-    got captured, and whether the pool is later remapped by torch_memory_saver,
-    only change how that aliasing is reached - not whether it exists - so the
-    guard tracks the hazard rather than the feature flags that expose it.
+    got captured, which phase captured it, and whether the pool is later
+    remapped by torch_memory_saver only change how that aliasing is reached -
+    not whether it exists - so the guard tracks the hazard rather than the
+    feature flags that expose it. A decode-only check would miss a prefill
+    capture into a pausable pool, which the pool guard used to cover.
 
     Errs toward True. Later passes can still narrow cuda_graph_config, and
     turning the registration off has no measured throughput cost, so a false
@@ -325,9 +327,9 @@ def _decode_graph_may_capture_collectives(server_args: Any) -> bool:
     if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
         return False
     config = getattr(view, "cuda_graph_config", None)
-    if config is not None and config[Phase.DECODE].backend == Backend.DISABLED:
-        return False
-    return True
+    if config is None:
+        return True
+    return any(config[phase].backend != Backend.DISABLED for phase in Phase.ALL)
 
 
 def _disable_nccl_graph_buffer_registration(reason: str) -> None:
