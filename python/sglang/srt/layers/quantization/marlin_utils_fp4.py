@@ -304,10 +304,18 @@ def _repack_moe_fp4_weight_for_marlin(
     size_n: int,
     size_k: int,
     perm: torch.Tensor,
+    in_place: bool = False,
 ) -> torch.Tensor:
     assert weight.shape == (num_experts, size_n, size_k // 2)
+    assert weight.is_contiguous() or not in_place
 
-    tensor_list = []
+    # The Marlin layout has the same byte count as the packed checkpoint layout, so a
+    # layer's own weight can take the repacked experts one at a time (no second copy).
+    out = (
+        weight
+        if in_place
+        else torch.empty_like(weight, memory_format=torch.contiguous_format)
+    )
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
         marlin_qweight = gptq_marlin_repack(
@@ -317,8 +325,8 @@ def _repack_moe_fp4_weight_for_marlin(
             size_n=size_n,
             num_bits=4,
         )
-        tensor_list.append(marlin_qweight)
-    return torch.stack(tensor_list)
+        out[i].view(torch.int32).view(-1).copy_(marlin_qweight.view(-1))
+    return out.view(torch.int32).view(num_experts, size_k // 16, size_n * 2)
 
 
 def _permute_moe_fp4_scales_for_marlin(
@@ -423,10 +431,20 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         return torch.stack(tensor_list)
 
     w13_marlin = _repack_moe_fp4_weight_for_marlin(
-        w13, num_experts=num_experts, size_n=w13_size_n, size_k=w13_size_k, perm=perm
+        w13,
+        num_experts=num_experts,
+        size_n=w13_size_n,
+        size_k=w13_size_k,
+        perm=perm,
+        in_place=True,
     )
     w2_marlin = _repack_moe_fp4_weight_for_marlin(
-        w2, num_experts=num_experts, size_n=w2_size_n, size_k=w2_size_k, perm=perm
+        w2,
+        num_experts=num_experts,
+        size_n=w2_size_n,
+        size_k=w2_size_k,
+        perm=perm,
+        in_place=True,
     )
     w13_scale_marlin = _permute_moe_fp4_scales_for_marlin(
         w13_scale_data,
@@ -529,12 +547,18 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n=w13_size_n,
             size_k=w13_size_k,
             perm=perm,
+            in_place=True,
         ),
         requires_grad=False,
     )
     layer.w2_weight = torch.nn.Parameter(
         _repack_moe_fp4_weight_for_marlin(
-            w2, num_experts=num_experts, size_n=w2_size_n, size_k=w2_size_k, perm=perm
+            w2,
+            num_experts=num_experts,
+            size_n=w2_size_n,
+            size_k=w2_size_k,
+            perm=perm,
+            in_place=True,
         ),
         requires_grad=False,
     )
