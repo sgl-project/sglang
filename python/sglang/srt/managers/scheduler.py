@@ -122,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlTrainingCaptureReqInput,
+    ControlTrainingCaptureReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -1008,6 +1010,14 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
+        self.tp_worker.init_training_capture(
+            metrics_labels=(
+                self.metrics_collector.labels
+                if self.metrics_collector is not None
+                else None
+            )
+        )
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -1298,7 +1308,7 @@ class Scheduler(
             )
 
         draft_token_to_kv_pool = (
-            self.draft_worker.primary_draft_kv_pool
+            self.draft_worker.disaggregation_draft_kv_pool
             if self.draft_worker is not None
             else None
         )
@@ -1446,6 +1456,9 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        # Worker-side KV projection/capture can need the mirror even when the
+        # attention backend consumes device lengths exclusively.
+        needs_cpu_seq_lens |= getattr(self.draft_worker, "needs_cpu_seq_lens", False)
         needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
@@ -1586,6 +1599,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (ControlTrainingCaptureReqInput, self.control_training_capture),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1616,12 +1630,26 @@ class Scheduler(
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
-        if running_batch.is_empty():
+        pp_dspark = getattr(self, "dspark_pp_coordinator", None) is not None
+        if running_batch.is_empty() and not pp_dspark:
             return
 
         deadline = time.perf_counter() - timeout_s
+        expired = (
+            self._pp_dspark_timeout_ids(
+                running_batch.reqs, "forward_entry_time", timeout_s, running=True
+            )
+            if pp_dspark
+            else None
+        )
         for req in running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+            timed_out = (
+                req.rid in expired
+                if expired is not None
+                else not req.finished()
+                and 0 < req.time_stats.forward_entry_time < deadline
+            )
+            if timed_out:
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -2020,6 +2048,9 @@ class Scheduler(
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            training_capture_router=getattr(
+                self.tp_worker.training_capture, "request_router", None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -2359,6 +2390,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        capture_router = getattr(
+            getattr(self, "request_receiver", None), "training_capture_router", None
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2421,7 +2455,14 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                training_capture_ticket=(
+                    recv_req.training_capture_ticket
+                    if capture_router is not None
+                    else None
+                ),
             )
+            if capture_router is not None:
+                capture_router.attach(recv_req, req)
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
@@ -2707,7 +2748,12 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if getattr(req, "training_capture_cancel", None) is not None and (
+            req.finished() or req.to_finish is not None
+        ):
+            self._cancel_training_capture_request(req, "request_rejected")
         if not self._set_or_validate_priority(req):
+            self._cancel_training_capture_request(req, "priority_rejected")
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
@@ -2729,6 +2775,12 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    @staticmethod
+    def _cancel_training_capture_request(req, reason):
+        callback = getattr(req, "training_capture_cancel", None)
+        if callback is not None:
+            callback(req, reason)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2801,6 +2853,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        self._cancel_training_capture_request(req_to_abort, "queue_rejected")
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
@@ -2810,9 +2863,16 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
+        expired = (
+            self._pp_dspark_timeout_ids(
+                self.waiting_queue, "wait_queue_entry_time", timeout_s
+            )
+            if getattr(self, "dspark_pp_coordinator", None) is not None
+            else None
+        )
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
+            if req.rid in expired if expired is not None else 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2828,6 +2888,7 @@ class Scheduler(
                     req,
                 )
                 deleted_reqs.add(req)
+                self._cancel_training_capture_request(req, "waiting_timeout")
 
         if deleted_reqs:
             self.waiting_queue = [
@@ -3751,7 +3812,12 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    coordinator = getattr(self, "dspark_pp_coordinator", None)
+                    batch_result = (
+                        coordinator.run_batch(batch)
+                        if coordinator is not None
+                        else self.model_worker.forward_batch_generation(batch)
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3926,6 +3992,11 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.after_result(
+                result.training_capture, requests=batch.reqs
+            )
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
@@ -4061,6 +4132,8 @@ class Scheduler(
         self.publish_load_snapshot(force=True)
 
         # sleep until next event
+        if self.tp_worker.training_capture is not None:
+            self.tp_worker.training_capture.on_idle()
         self.maybe_sleep_on_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
@@ -4280,6 +4353,8 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.tp_worker.training_capture is not None:
+            ret["training_capture"] = self.tp_worker.training_capture.stats()
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -4313,6 +4388,19 @@ class Scheduler(
         ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
+
+    def control_training_capture(self, recv_req: ControlTrainingCaptureReqInput):
+        capture = self.tp_worker.training_capture
+        if capture is None:
+            return ControlTrainingCaptureReqOutput(
+                success=False, message="Training capture is not configured."
+            )
+        capture.control(recv_req.action)
+        return ControlTrainingCaptureReqOutput(
+            success=True,
+            message="Capture control applied; publication and cleanup are asynchronous.",
+            state=msgspec_to_builtins(capture.stats()),
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -4426,6 +4514,9 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                self._cancel_training_capture_request(
+                    chunked_req, "chunked_request_aborted"
+                )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -4440,6 +4531,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._cancel_training_capture_request(req, "queued_request_aborted")
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4557,6 +4649,7 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                self._cancel_training_capture_request(req, "running_request_aborted")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -4887,7 +4980,10 @@ def dispatch_event_loop(scheduler: Scheduler):
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
         elif server_args.pp_size > 1:
-            scheduler.event_loop_pp()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
         elif scheduler.enable_overlap:
@@ -4896,14 +4992,20 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
         if server_args.pp_size > 1:
-            scheduler.event_loop_pp_disagg_prefill()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if server_args.pp_size > 1:
-            scheduler.event_loop_pp_disagg_decode()
+            if scheduler.spec_algorithm.is_dspark():
+                scheduler.event_loop_pp_dspark()
+            else:
+                scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()
         else:

@@ -66,6 +66,7 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    training_capture_router: Any = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -89,6 +90,14 @@ class SchedulerRequestReceiver:
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
+
+        if (
+            self.training_capture_router is not None
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            self.training_capture_router.prepare(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 

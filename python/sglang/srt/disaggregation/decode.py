@@ -709,6 +709,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
+        sync = getattr(self.scheduler, "dspark_pd_queue_coordinator", None)
+        if sync is not None:
+            sync.agree(
+                "decode_retracted", tuple(req.rid for req in self.retracted_queue)
+            )
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         if uses_swa_tail_prealloc:
             full_allocatable_tokens, swa_allocatable_tokens = (
@@ -723,7 +728,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            request_budget = self.req_to_token_pool.available_size()
+            if sync is not None:
+                request_budget, full_allocatable_tokens = sync.minimum(
+                    "decode_resume_capacity", (request_budget, full_allocatable_tokens)
+                )
+            if request_budget <= 0:
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
@@ -913,12 +923,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         is_pp_mode = self.pp_size > 1
-        if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
+        sync = getattr(self.scheduler, "dspark_pd_queue_coordinator", None)
+        if (
+            is_pp_mode
+            and sync is None
+            and (pp_good_rids is None or pp_bad_rids is None)
+        ):
             raise ValueError("PP consensus is required when pp_size > 1")
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
         self._resolve_pending_reqs()
+        if sync is not None:
+            polls = sync.poll("decode_preallocate", self.queue, is_send=False)
+            pp_good_rids = [
+                item.req.rid
+                for item, poll in zip(self.queue, polls)
+                if poll == KVPoll.WaitingForInput
+            ]
+            pp_bad_rids = [
+                item.req.rid
+                for item, poll in zip(self.queue, polls)
+                if poll == KVPoll.Failed
+            ]
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
@@ -1011,10 +1038,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            request_budget = self.req_to_token_pool.available_size()
+            metadata_budget = self.req_to_metadata_buffer_idx_allocator.available_size()
+            if sync is not None:
+                request_budget, metadata_budget, full_allocatable_tokens = sync.minimum(
+                    "decode_preallocate_capacity",
+                    (request_budget, metadata_budget, full_allocatable_tokens),
+                )
+            if request_budget <= 0:
                 break
 
-            if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+            if metadata_budget <= 0:
                 break
 
             if hisparse_req_budget <= 0:
@@ -1294,6 +1328,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if (
+                self.scheduler.tp_worker.training_capture is not None
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                capture_context = (
+                    self.scheduler.tp_worker.training_capture.begin_pd_transfer(
+                        decode_req.req
+                    )
+                )
+                if capture_context is not None:
+                    metadata_kwargs["training_capture_context"] = capture_context
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
@@ -1976,6 +2021,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        if decode_req.req.training_capture_context is not None:
+            self.scheduler.tp_worker.training_capture.accept_pd_handoff(
+                decode_req.req,
+                decode_req.kv_receiver.take_training_capture_handoff(),
+            )
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2016,7 +2066,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        if not self.queue:
+        sync = getattr(self.scheduler, "dspark_pd_queue_coordinator", None)
+        if sync is not None:
+            polls = sync.poll(
+                "decode_transfer",
+                self.queue,
+                is_send=False,
+                metadata_buffers=self.metadata_buffers,
+                terminal=True,
+            )
+        elif not self.queue:
             return []
 
         if self.scheduler.enable_decode_hicache:
@@ -2028,7 +2087,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if sync is not None:
+            pass
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()

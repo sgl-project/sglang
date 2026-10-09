@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaptureCatalog capability response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version", "contracts", "store_protocols", "hard_pin",
+    "retention_policy", "max_request_bytes"
+  ],
+  "properties": {
+    "protocol_version": { "type": "integer", "minimum": 1 },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["contract_id", "schema_version", "payload_format", "kv_codecs"],
+        "properties": {
+          "contract_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "schema_version": { "type": "integer", "minimum": 1 },
+          "payload_format": { "type": "string" },
+          "kv_codecs": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "store_protocols": { "type": "array", "items": { "type": "string" } },
+    "hard_pin": { "type": "boolean" },
+    "retention_policy": { "type": "string" },
+    "max_request_bytes": { "type": "integer", "minimum": 1 }
+  }
+}

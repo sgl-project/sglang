@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.dspark.rounding import bf16_split_half_rope
+
 
 @triton.jit
 def _fused_kv_norm_rope_write_kernel(
@@ -21,6 +23,8 @@ def _fused_kv_norm_rope_write_kernel(
     L: tl.constexpr,
     EPS: tl.constexpr,
     HAS_COMMIT_LENS: tl.constexpr,
+    CAST_BEFORE_WEIGHT: tl.constexpr,
+    ROUND_ROPE_INTERMEDIATES: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     l = tl.program_id(1).to(tl.int64)
@@ -53,12 +57,16 @@ def _fused_kv_norm_rope_write_kernel(
         k = tl.load(row + h * D + d_ar).to(tl.float32)
         ms = tl.sum(k * k, 0) / D
         inv = 1.0 / tl.sqrt(ms + EPS)
-        k1 = tl.load(row + h * D + half_ar).to(tl.float32) * inv * knw1
-        k2 = tl.load(row + h * D + HALF + half_ar).to(tl.float32) * inv * knw2
+        k1 = tl.load(row + h * D + half_ar).to(tl.float32) * inv
+        k2 = tl.load(row + h * D + HALF + half_ar).to(tl.float32) * inv
+        if CAST_BEFORE_WEIGHT:
+            k1 = k1.to(tl.bfloat16).to(tl.float32)
+            k2 = k2.to(tl.bfloat16).to(tl.float32)
+        k1 = k1 * knw1
+        k2 = k2 * knw2
         k1 = k1.to(tl.bfloat16).to(tl.float32)
         k2 = k2.to(tl.bfloat16).to(tl.float32)
-        o1 = k1 * cos - k2 * sin
-        o2 = k2 * cos + k1 * sin
+        o1, o2 = bf16_split_half_rope(k1, k2, cos, sin, ROUND_ROPE_INTERMEDIATES)
         tl.store(k_buf + loc * ks0 + h * D + half_ar, o1.to(tl.bfloat16))
         tl.store(k_buf + loc * ks0 + h * D + HALF + half_ar, o2.to(tl.bfloat16))
 
@@ -79,6 +87,9 @@ def fused_kv_norm_rope_write(
     eps: float,
     commit_lens: Optional[torch.Tensor] = None,
     locs_row_width: Optional[int] = None,
+    *,
+    cast_x_before_out_mul: bool = False,
+    round_rope_intermediates: bool = False,
 ) -> None:
     """Write per-layer normed+roped K and raw V rows into the KV pools.
 
@@ -123,4 +134,7 @@ def fused_kv_norm_rope_write(
         L=num_layers,
         EPS=eps,
         HAS_COMMIT_LENS=has_commit_lens,
+        CAST_BEFORE_WEIGHT=cast_x_before_out_mul,
+        ROUND_ROPE_INTERMEDIATES=round_rope_intermediates,
+        enable_fp_fusion=not round_rope_intermediates,
     )

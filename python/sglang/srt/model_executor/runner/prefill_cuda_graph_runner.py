@@ -278,15 +278,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Hidden-state capture mode cases:
         # - Breakable EAGLE draft: LAST.
         # - Breakable EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
-        # - Otherwise: NULL.
+        # - Hidden-input DFlash family: FULL.
+        # - Otherwise (including target-KV DSpark): the server return mode.
         is_breakable_eagle = (
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
+        elif is_breakable_eagle or (
+            model_runner.spec_algorithm.is_dflash_family()
+            and model_runner.spec_aux_config.dflash_use_aux_hidden_state
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
             self.capture_hidden_mode = self.return_hidden_states_mode
@@ -303,6 +306,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_size=self.pp_size,
+            hc_hidden_size=getattr(model_runner.model_config, "hc_hidden_size", None),
+            pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=model_runner.get_pp_proxy_residual_num_blocks(),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -647,6 +654,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
+        kwargs = {}
+        if self.pp_size > 1:
+            kwargs["pp_proxy_tensors"] = self._get_pp_proxy_tensors(num_tokens)
         with self._prefill_forward_context(forward_batch):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
@@ -656,13 +666,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **kwargs,
             )
+
+    def _get_pp_proxy_tensors(self, num_tokens: int) -> PPProxyTensors:
+        # Full/Breakable capture the clone itself, isolating in-place norms.
+        # TC pieces capture only the model: their inputs must keep the staging
+        # addresses that load_batch refreshes before every replay.
+        clone_inputs = self._uses_eager_prefill_tail()
+        return PPProxyTensors(
+            {
+                name: (
+                    value[:num_tokens].clone() if clone_inputs else value[:num_tokens]
+                )
+                for name, value in self.buffers.pp_proxy_tensors.items()
+            }
+        )
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
         """Build a dummy ForwardBatch at this shape, init attn metadata,
@@ -1410,6 +1436,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         the model code reads during replay.
         """
         num_tokens = len(forward_batch.input_ids)
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if self.pp_size > 1 and not self.model_runner.pp_group.is_first_rank:
+            if pp_proxy_tensors is None:
+                raise ValueError("Prefill graph requires preceding-stage activations")
+            for name, buffer in self.buffers.pp_proxy_tensors.items():
+                value = pp_proxy_tensors.tensors.get(name)
+                if value is None or value.shape != (num_tokens, *buffer.shape[1:]):
+                    raise ValueError(f"Prefill graph PP input {name!r} has wrong shape")
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
             forward_batch
@@ -1438,6 +1472,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         registry = self.buffer_registry
@@ -1684,6 +1719,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         raw_num_tokens: int,
         **kwargs,
     ):
+        if self.pp_size > 1:
+            kwargs["pp_proxy_tensors"] = self._get_pp_proxy_tensors(static_num_tokens)
         with self._prefill_forward_context(
             static_forward_batch,
             num_tokens=static_num_tokens,
@@ -1733,9 +1770,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
-        )
+        return output[: self.raw_num_tokens]
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

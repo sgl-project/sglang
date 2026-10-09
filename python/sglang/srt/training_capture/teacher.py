@@ -1,0 +1,106 @@
+"""Compact raw teacher scores, captured before any serving-side mutation."""
+
+from __future__ import annotations
+
+import msgspec
+import torch
+from sglang.srt.training_capture.protocol import ContractError
+
+
+class TeacherRows(msgspec.Struct, frozen=True):
+    token_ids: torch.Tensor
+    logits: torch.Tensor
+    logsumexp: torch.Tensor
+
+
+def _top128(scores, backend):
+    if (
+        backend == "flashinfer"
+        and scores.is_cuda
+        and scores.dtype == torch.float32
+        and scores.shape[0] > 0
+        and scores.shape[1] >= 32768
+    ):
+        from flashinfer.topk import get_topk_module
+
+        # The pinned FlashInfer public wrapper shares a per-device workspace.
+        # Own this scratch so concurrent producer streams cannot overwrite it.
+        with torch.cuda.device(scores.device):
+            scores = scores.contiguous()
+            workspace = torch.zeros(1 << 20, dtype=torch.uint8, device=scores.device)
+            values = torch.empty(
+                (scores.shape[0], 128), dtype=scores.dtype, device=scores.device
+            )
+            ids = get_topk_module().radix_topk(
+                scores, 128, True, True, 1, workspace, values, False
+            )
+        return values, ids
+    return torch.topk(scores, k=128, dim=-1, sorted=True)
+
+
+@torch.no_grad()
+def capture_teacher(
+    raw_logits: torch.Tensor,
+    vocab_size: int,
+    row_indices: torch.Tensor | list[int] | None = None,
+    *,
+    topk_backend: str = "torch",
+) -> TeacherRows:
+    """All returned tensors own storage independent of the logits/graph buffer."""
+    if raw_logits.ndim != 2 or not raw_logits.is_floating_point():
+        raise ContractError(
+            "teacher logits must be a floating [rows, vocabulary] tensor"
+        )
+    if not 128 <= vocab_size <= raw_logits.shape[1]:
+        raise ContractError("teacher capture requires the complete unpadded vocabulary")
+    if topk_backend not in ("torch", "flashinfer"):
+        raise ContractError("unknown teacher top-k backend")
+    scores = raw_logits[:, :vocab_size]
+    if isinstance(row_indices, list):
+        if any(
+            type(row) is not int or not 0 <= row < scores.shape[0]
+            for row in row_indices
+        ):
+            raise ContractError("teacher row indices are outside the logits batch")
+        start = row_indices[0] if row_indices else 0
+        if all(row == start + offset for offset, row in enumerate(row_indices)):
+            # Host-known contiguous rows need neither an index upload nor a
+            # full-vocabulary gather. Only the owned compact outputs survive.
+            scores = scores.narrow(0, start, len(row_indices))
+            row_indices = None
+        else:
+            row_indices = torch.tensor(
+                row_indices, dtype=torch.long, device=scores.device
+            )
+    if row_indices is not None:
+        scores = scores.index_select(0, row_indices)
+    values, ids = _top128(scores, topk_backend)
+    if scores.is_cuda and scores.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        from sglang.srt.layers.logsumexp import row_logsumexp
+
+        maximum, log_sum = row_logsumexp(scores)
+        logsumexp = maximum + log_sum
+    else:
+        logsumexp = torch.logsumexp(scores.float(), dim=-1)
+    return TeacherRows(
+        token_ids=ids.to(torch.int32),
+        logits=values.float(),
+        logsumexp=logsumexp,
+    )
+
+
+def warmup_teacher_capture(
+    vocab_size: int, device: torch.device | str, *, topk_backend: str = "torch"
+):
+    """Compile the FP32 serving path before admitting the first capture."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    with torch.cuda.device(device):
+        scores = torch.zeros((1, vocab_size), dtype=torch.float32, device=device)
+        capture_teacher(scores, vocab_size, topk_backend=topk_backend)
+        torch.cuda.current_stream(device).synchronize()

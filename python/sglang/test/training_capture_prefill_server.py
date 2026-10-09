@@ -1,0 +1,58 @@
+"""Observe the actual prefill graph buffers without changing capture behavior."""
+
+import itertools
+import os
+import sys
+
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
+from sglang.test.dspark_capture_observer import install_capture_observer
+
+_load_batch = PrefillCudaGraphRunner.load_batch
+_execute = PrefillCudaGraphRunner.execute
+_replays = itertools.count()
+
+
+def load_batch(self, forward_batch, **kwargs):
+    static = _load_batch(self, forward_batch, **kwargs)
+    forward_batch.training_capture_test_prefill_graph = {
+        "replay_id": next(_replays),
+        "raw_tokens": forward_batch.input_ids.numel(),
+        "padded_tokens": static.input_ids.numel(),
+        "input_buffer": static.input_ids.data_ptr(),
+        "request_slots": self._capture_req_slots if self._is_full_backend else None,
+        "capture_hidden_mode": self.capture_hidden_mode.name,
+        "runtime_hidden_mode": forward_batch.capture_hidden_mode.name,
+    }
+    return static
+
+
+def execute(self, forward_batch, **kwargs):
+    output = _execute(self, forward_batch, **kwargs)
+    frame = forward_batch.training_capture_test_prefill_graph
+    frame["output_hidden_states"] = getattr(output, "hidden_states", None) is not None
+    frame["output_kind"] = type(output).__name__
+    frame["pipeline_output_rows"] = (
+        {name: value.shape[0] for name, value in output.tensors.items()}
+        if isinstance(output, PPProxyTensors)
+        else None
+    )
+    return output
+
+
+PrefillCudaGraphRunner.load_batch = load_batch
+PrefillCudaGraphRunner.execute = execute
+install_capture_observer()
+
+
+if __name__ == "__main__":
+    from sglang.launch_server import run_server
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.srt.utils import kill_process_tree
+
+    try:
+        run_server(prepare_server_args(sys.argv[1:]))
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)

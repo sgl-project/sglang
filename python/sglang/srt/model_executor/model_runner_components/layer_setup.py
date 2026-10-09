@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
+from sglang.srt.layers.utils.common import PPMissingLayer
 from torch import nn
 
 if TYPE_CHECKING:
@@ -65,7 +66,9 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if attn_layer is not None:
             attention_layers.append(attn_layer)
             mha_companion_layers.append(mha_companion_layer)
-        elif hasattr(layer, "mixer"):
+        elif hasattr(layer, "mixer") or isinstance(layer, PPMissingLayer):
+            # Split attention ops use global layer IDs on every PP stage.
+            # Keep remote-stage holes without accepting unknown local layers.
             attention_layers.append(None)
             mha_companion_layers.append(None)
 

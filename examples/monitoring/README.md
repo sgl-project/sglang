@@ -36,6 +36,29 @@ You'll be prompted to change the password on first login.
 
 4. The SGLang dashboard will be automatically available in the "SGLang Monitoring" folder.
 
+### Training Capture
+
+The provisioned **SGLang Training Capture** dashboard uses the same Prometheus
+data source. Start the producer with both `--training-capture-config <path>` and
+`--enable-metrics`. Select the data source, model and instance in the dashboard.
+Its queries use the native `sglang:training_capture_*` names from `/metrics`.
+Deployments that rename metrics at ingestion must adjust the queries accordingly.
+
+The dashboard shows admission ratios, publication/failure events, reservations,
+registered Host slots, writer age, cooldown, disabled state, metric freshness and
+existing serving latency histograms. It also shows scheduler latency protection,
+background writer stages, capture device memory/budget and HiCache KV export
+enqueue rate. The latter is zero with the default Torch exporter and is not
+completed D2H or RDMA bandwidth. Inter-token latency histograms require streaming
+traffic; a producer receiving only non-streaming requests can have no series.
+Details and counter semantics are in the
+[producer metrics guide](../../python/sglang/srt/training_capture/README.md#prometheus-metrics).
+This dashboard does not configure alerts or establish service latency thresholds.
+
+The producer metrics guide describes metric semantics, pause/resume behavior,
+and post-exit Mooncake readback. Deployment-specific service discovery,
+authentication, alerting, and latency thresholds still require validation.
+
 ## Troubleshooting
 
 ### Port Conflicts

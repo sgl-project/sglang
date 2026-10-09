@@ -124,12 +124,12 @@ def _allocate_decode_buffers(
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
-                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                # Both residual layouts are token-major, including multi-token
+                # speculative verification and extended dummy forwards.
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
@@ -214,7 +214,7 @@ class BaseRunner(ABC):
         self.tp_size = model_runner.server_args.tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = model_runner.ps.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
@@ -344,7 +344,7 @@ class BaseRunner(ABC):
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
             dp_size=get_parallel().dp_size,
-            pp_size=mr.server_args.pp_size,
+            pp_size=mr.ps.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
@@ -514,7 +514,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if mr.server_args.pp_size > 1:
+        if mr.ps.pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
@@ -639,7 +639,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                mr.server_args.pp_size > 1
+                mr.ps.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(

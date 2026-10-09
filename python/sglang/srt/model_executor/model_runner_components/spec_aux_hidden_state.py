@@ -118,6 +118,21 @@ def _resolve_dflash_aux_hidden_state(
             draft_hf_config=draft_model_config.hf_config
         )
         draft_num_layers = dflash_draft_config.require_num_layers()
+        from sglang.srt.speculative.dspark_components.dspark_target_kv_contract import (
+            read_target_kv_draft_contract,
+        )
+
+        kv_contract = read_target_kv_draft_contract(draft_model_config.hf_config)
+        if kv_contract is not None:
+            if not spec_algorithm.is_dspark():
+                raise ValueError("target-KV draft architecture requires DSPARK")
+            config.dflash_draft_num_layers = int(draft_num_layers)
+            config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
+                server_args=server_args,
+                draft_model_config=draft_model_config,
+                draft_num_layers=int(draft_num_layers),
+            )
+            return
         trained_target_layers = dflash_draft_config.num_target_layers
 
         target_num_layers = getattr(

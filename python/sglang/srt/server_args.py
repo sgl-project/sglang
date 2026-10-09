@@ -494,6 +494,13 @@ class ServerArgs:
         NS("model"),
     ]
     tokenizer_path: A[Optional[str], "The path of the tokenizer.", NS("serving")] = None
+    training_capture_config: A[
+        Optional[str],
+        Arg(
+            help="Path to a JSON configuration for opt-in target KV and raw teacher capture to Mooncake."
+        ),
+        NS("serving"),
+    ] = None
     tokenizer_mode: A[
         str,
         Arg(
@@ -6251,9 +6258,7 @@ class ServerArgs:
                     "linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            from sglang.srt.arg_groups.overrides import (
-                mamba_extra_buffer_of,
-            )
+            from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
@@ -7541,7 +7546,10 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:
@@ -8881,9 +8889,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of
 
         return attention_backends_of(resolved_view(self))
 
@@ -8969,6 +8975,9 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        from sglang.srt.training_capture.config import validate_capture_server_args
+
+        validate_capture_server_args(self)
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (
@@ -8991,9 +9000,27 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule and self.speculative_algorithm in (
+                None,
+                "DSPARK",
+            ), "Pipeline parallelism requires non-overlap AR or target-KV DSPARK"
+            if self.speculative_algorithm == "DSPARK":
+                assert (
+                    self.dp_size == 1
+                    and self.attn_cp_size == 1
+                    and self.dcp_size == 1
+                    and not self.enable_dp_attention
+                    and not self.enable_hierarchical_cache
+                    and not self.enable_lmcache
+                    and not self.enable_flexkv
+                ), "Pipeline DSPARK requires DP1/CP1 and device KV cache"
+                if self.disaggregation_mode != "null":
+                    assert (
+                        self.disaggregation_transfer_backend == "mooncake"
+                        and self.optimistic_prefill_attempts == 0
+                        and not self.disaggregation_decode_enable_offload_kvcache
+                        and not envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                    ), "Pipeline DSPARK P/D requires Mooncake without optimistic prefill, KV offload or transfer staging"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

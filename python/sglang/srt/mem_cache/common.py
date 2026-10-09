@@ -130,6 +130,8 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if req.training_capture_finalize is not None:
+        req.training_capture_finalize(req)
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache

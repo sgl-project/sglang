@@ -32,6 +32,7 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    training_capture_handoff: Optional[bytes] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

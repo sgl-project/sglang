@@ -193,7 +193,7 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = target_model.get_input_embeddings()
+        embed_module = self.draft_model.embed_tokens
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(

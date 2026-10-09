@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
@@ -51,7 +50,13 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_schedule,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -385,6 +390,27 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        self.training_capture = None
+
+    def init_training_capture(self, *, metrics_labels=None):
+        from sglang.srt.training_capture.coordinator import CaptureCoordinator
+
+        self.training_capture = CaptureCoordinator.create(
+            config_path=get_serving().training_capture_config,
+            model=self.model_runner.model,
+            model_config=self.model_config,
+            tokenizer_path=get_serving().tokenizer_path,
+            pool=self.model_runner.token_to_kv_pool,
+            req_to_token=self.model_runner.req_to_token_pool,
+            enable_overlap=self.enable_overlap,
+            metrics_labels=metrics_labels,
+            startup_group=self.world_group.cpu_group,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            pp_size=self.ps.pp_size,
+            dp_rank=self.ps.dp_rank or 0,
+        )
 
     def alloc_memory_pool(
         self,
@@ -570,6 +596,8 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
+            if self.training_capture is not None:
+                self.training_capture.before_forward(batch.reqs)
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
@@ -582,9 +610,9 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+            assert capture_hidden_mode is None, (
+                "capture_hidden_mode override requires a ScheduleBatch input"
+            )
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -605,6 +633,14 @@ class TpModelWorker(BaseTpWorker):
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
             )
+
+            if self.training_capture is not None and batch is not None:
+                batch_result.training_capture = self.training_capture.after_forward(
+                    batch,
+                    forward_batch,
+                    logits_output,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
@@ -654,11 +690,16 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
-            return GenerationBatchResult(
+            batch_result = GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+            if self.training_capture is not None and batch is not None:
+                batch_result.training_capture = self.training_capture.after_forward(
+                    batch, forward_batch, None, can_run_cuda_graph=can_run_cuda_graph
+                )
+            return batch_result
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

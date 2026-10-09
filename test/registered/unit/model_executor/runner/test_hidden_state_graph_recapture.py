@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -9,12 +9,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import BaseCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +24,127 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiddenStateGraphRecapture(CustomTestCase):
+    def test_prefill_capture_uses_resolved_speculative_hidden_requirement(self):
+        for backend in (Backend.FULL, Backend.BREAKABLE, Backend.TC_PIECEWISE):
+            for algorithm, aux_hidden, draft, server_mode, expected in (
+                (
+                    SpeculativeAlgorithm.DSPARK,
+                    False,
+                    False,
+                    CaptureHiddenMode.NULL,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    SpeculativeAlgorithm.DSPARK,
+                    False,
+                    False,
+                    CaptureHiddenMode.LAST,
+                    CaptureHiddenMode.LAST,
+                ),
+                (
+                    SpeculativeAlgorithm.DSPARK,
+                    False,
+                    False,
+                    CaptureHiddenMode.FULL,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    SpeculativeAlgorithm.DSPARK,
+                    True,
+                    False,
+                    CaptureHiddenMode.NULL,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    SpeculativeAlgorithm.DFLASH,
+                    True,
+                    False,
+                    CaptureHiddenMode.NULL,
+                    CaptureHiddenMode.FULL,
+                ),
+                (
+                    SpeculativeAlgorithm.DSPARK,
+                    False,
+                    True,
+                    CaptureHiddenMode.NULL,
+                    CaptureHiddenMode.NULL,
+                ),
+                (
+                    SpeculativeAlgorithm.NONE,
+                    False,
+                    False,
+                    CaptureHiddenMode.LAST,
+                    CaptureHiddenMode.LAST,
+                ),
+                (
+                    SpeculativeAlgorithm.EAGLE,
+                    False,
+                    False,
+                    CaptureHiddenMode.NULL,
+                    (
+                        CaptureHiddenMode.FULL
+                        if backend == Backend.BREAKABLE
+                        else CaptureHiddenMode.NULL
+                    ),
+                ),
+                (
+                    SpeculativeAlgorithm.EAGLE,
+                    False,
+                    True,
+                    CaptureHiddenMode.NULL,
+                    (
+                        CaptureHiddenMode.LAST
+                        if backend == Backend.BREAKABLE
+                        else CaptureHiddenMode.NULL
+                    ),
+                ),
+            ):
+                model_runner = SimpleNamespace(
+                    model=SimpleNamespace(),
+                    model_config=SimpleNamespace(is_multimodal=False),
+                    server_args=SimpleNamespace(
+                        enable_lora=False,
+                        cuda_graph_config=SimpleNamespace(
+                            prefill=SimpleNamespace(backend=backend, bs=[16])
+                        ),
+                    ),
+                    is_generation=True,
+                    is_draft_worker=draft,
+                    spec_algorithm=algorithm,
+                    spec_aux_config=SimpleNamespace(
+                        dflash_use_aux_hidden_state=aux_hidden
+                    ),
+                    req_to_token_pool=SimpleNamespace(size=4),
+                )
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                with (
+                    self.subTest(
+                        backend=backend,
+                        algorithm=algorithm,
+                        aux_hidden=aux_hidden,
+                        draft=draft,
+                        server_mode=server_mode,
+                    ),
+                    patch.object(
+                        BaseCudaGraphRunner,
+                        "__init__",
+                        autospec=True,
+                        side_effect=lambda value, _, mode=server_mode: setattr(
+                            value, "return_hidden_states_mode", mode
+                        ),
+                    ),
+                    patch.object(
+                        PrefillCudaGraphRunner,
+                        "_is_mamba_track_enabled",
+                        side_effect=RuntimeError("capture mode selected"),
+                    ),
+                ):
+                    # Stop before CUDA allocation, after the real constructor
+                    # selects the mode used to build every captured shape.
+                    with self.assertRaisesRegex(RuntimeError, "capture mode selected"):
+                        runner.__init__(model_runner)
+                    self.assertEqual(runner.capture_hidden_mode, expected)
+
     def test_server_mode_sets_graph_capture_ceiling(self):
         disabled = SimpleNamespace(
             enable_return_hidden_states=False,

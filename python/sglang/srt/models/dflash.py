@@ -82,6 +82,8 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
+    round_rope_intermediates = False
+
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -205,7 +207,11 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
-        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+        elif (
+            self.use_table_qk_norm_rope
+            and qkv.dtype == torch.bfloat16
+            and self.q_norm.cast_x_before_out_mul == self.k_norm.cast_x_before_out_mul
+        ):
             from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
 
             table_qk_norm_rope_(
@@ -218,12 +224,24 @@ class DFlashAttention(nn.Module):
                 self.num_kv_heads,
                 self.head_dim,
                 self.q_norm.variance_epsilon,
+                cast_x_before_out_mul=self.q_norm.cast_x_before_out_mul,
+                round_rope_intermediates=self.round_rope_intermediates,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = apply_qk_norm(
+                q,
+                k,
+                self.q_norm,
+                self.k_norm,
+                self.head_dim,
+                allow_inplace=not (
+                    self.q_norm.cast_x_before_out_mul
+                    or self.k_norm.cast_x_before_out_mul
+                ),
+            )
+            q, k = self.apply_qk_rope(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
@@ -269,6 +287,9 @@ class DFlashAttention(nn.Module):
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
+
+    def apply_qk_rope(self, positions, q, k):
+        return self.rotary_emb(positions, q, k)
 
 
 class DFlashMLP(nn.Module):

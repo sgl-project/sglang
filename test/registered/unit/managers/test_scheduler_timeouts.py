@@ -117,5 +117,64 @@ class TestRunningTimeout(CustomTestCase):
         self.assertIsNone(req.to_finish)
 
 
+class TestPipelineDSparkTimeout(CustomTestCase):
+    def make_scheduler(self, reqs, *, leader, selected=None):
+        scheduler = _scheduler(reqs)
+        scheduler.dspark_pp_coordinator = object()
+        scheduler.world_group = SimpleNamespace(
+            is_first_rank=leader,
+            broadcast_object=MagicMock(
+                side_effect=lambda value, src: value if leader else selected
+            ),
+        )
+        return scheduler
+
+    def test_entry_rank_broadcasts_only_expired_running_requests(self):
+        now = time.perf_counter()
+        reqs = [
+            _req("old", forward_entry=now - 10),
+            _req("fresh", forward_entry=now),
+            _req("finished", forward_entry=now - 10, finished=True),
+            _req("unstamped"),
+        ]
+        scheduler = self.make_scheduler(reqs, leader=True)
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1):
+            scheduler._abort_on_running_timeout(TestRunningTimeout._batch(reqs))
+        scheduler.world_group.broadcast_object.assert_called_once_with(["old"], src=0)
+        self.assertIsNotNone(reqs[0].to_finish)
+        self.assertTrue(all(req.to_finish is None for req in reqs[1:]))
+
+    def test_other_stage_uses_entry_decision_despite_local_timestamps(self):
+        reqs = [
+            _req("local_old", forward_entry=time.perf_counter() - 10),
+            _req("entry_old", forward_entry=time.perf_counter()),
+        ]
+        scheduler = self.make_scheduler(reqs, leader=False, selected=["entry_old"])
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1):
+            scheduler._abort_on_running_timeout(TestRunningTimeout._batch(reqs))
+        scheduler.world_group.broadcast_object.assert_called_once_with(None, src=0)
+        self.assertIsNone(reqs[0].to_finish)
+        self.assertIsNotNone(reqs[1].to_finish)
+
+    def test_waiting_queue_uses_common_cancellation_ids(self):
+        reqs = [
+            _req("local_old", wait_entry=time.perf_counter() - 10),
+            _req("entry_old", wait_entry=time.perf_counter()),
+        ]
+        scheduler = self.make_scheduler(reqs, leader=False, selected=["entry_old"])
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1):
+            scheduler._abort_on_waiting_timeout()
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["local_old"])
+        self.assertEqual(
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_count, 1
+        )
+
+    def test_empty_rank_still_enters_timeout_collective(self):
+        scheduler = self.make_scheduler([], leader=False, selected=[])
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1):
+            scheduler._abort_on_running_timeout(TestRunningTimeout._batch([]))
+        scheduler.world_group.broadcast_object.assert_called_once_with(None, src=0)
+
+
 if __name__ == "__main__":
     unittest.main()

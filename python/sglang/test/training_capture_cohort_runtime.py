@@ -1,0 +1,589 @@
+"""Four-rank collector/worker callbacks with synthetic forwards and real Store."""
+
+import socket
+import threading
+import time
+from array import array
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import msgspec
+import torch
+import torch.distributed as dist
+
+from sglang.srt.managers.io_struct import (
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
+from sglang.srt.training_capture.cohort import CaptureCohortAllocator
+from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
+from sglang.srt.training_capture.config import CaptureConfig, StoreSetup
+from sglang.srt.training_capture.coordinator import CaptureCoordinator
+from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
+from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
+from sglang.srt.training_capture.protocol import canonical_bytes
+from sglang.srt.training_capture.resources import CaptureResources
+from sglang.srt.training_capture.topology import plan_capture_layout
+from sglang.test.training_capture_partition import synthetic_rank_contract
+from sglang.test.training_capture_utils import make_snapshot
+
+
+def _connect(master):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        address = f"127.0.0.1:{sock.getsockname()[1]}"
+    return MooncakeSnapshotStore.connect(
+        {
+            "local_hostname": address,
+            "master_server_addr": master,
+            "metadata_server": "P2PHANDSHAKE",
+            "protocol": "tcp",
+            "rdma_devices": "",
+            "global_segment_size": 0,
+            "local_buffer_size": 16 << 20,
+        }
+    )
+
+
+def _incoming(rid):
+    return TokenizedGenerateReqInput(
+        rid=rid,
+        input_text=None,
+        input_ids=array("q", [3, 4]),
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(
+            max_new_tokens=4, temperature=0.8, is_normalized=True
+        ),
+        return_logprob=False,
+        logprob_start_len=-1,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+    )
+
+
+def _wait(coordinator, predicate):
+    deadline = time.monotonic() + 30
+    while not predicate():
+        assert coordinator.error is None
+        assert coordinator.service.error is None
+        assert coordinator.writer_actor.error is None
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"collector did not progress: {coordinator.stats()}")
+        time.sleep(0.01)
+
+
+def _sources(base, tensors, partition):
+    buffers = {}
+    heads = {head.layer_id: head for head in partition.heads}
+    for layer in partition.local_layers(base.kv):
+        for component in ("k", "v"):
+            buffers[f"target_{component}.{layer.layer_id}"] = torch.zeros(
+                16, layer.num_kv_heads, 4, dtype=torch.bfloat16
+            )
+    for obj in base.objects:
+        if obj.kind == "kv" and obj.layer_id in heads:
+            head = heads[obj.layer_id]
+            start, end = obj.token_range
+            for offset in (0, 8):
+                buffers[obj.name][offset + start : offset + end].copy_(
+                    tensors[obj.key][:, head.start : head.end]
+                )
+    return buffers
+
+
+def _forward(coordinator, req, *, end, raw_logits, pp_last, token):
+    extend = end == 2
+    batch = SimpleNamespace(
+        reqs=[req],
+        forward_mode=ForwardMode.EXTEND if extend else ForwardMode.DECODE,
+        seq_lens_cpu=torch.tensor([end]),
+        hicache_consumer_index=None,
+    )
+    forward = SimpleNamespace(
+        extend_seq_lens_cpu=[2] if extend else None,
+        positions=torch.arange(0 if extend else end - 1, end, device=raw_logits.device),
+        is_prefill_only=False,
+        return_logprob=False,
+        apply_deprecated_skip_attn_backend_init=lambda _: None,
+    )
+    logits = SimpleNamespace(next_token_logits=raw_logits.clone()) if pp_last else None
+    out = SimpleNamespace(
+        logits_output=logits,
+        can_run_graph=False,
+        expert_distribution_metrics=None,
+        routed_experts_output=None,
+        indexer_topk_output=None,
+    )
+
+    def sample(logits_output, _):
+        # The real worker's capture callback must run before these mutations.
+        logits_output.next_token_logits.fill_(-999)
+        return torch.tensor([token])
+
+    worker = SimpleNamespace(
+        training_capture=coordinator,
+        set_hicache_consumer=lambda _: None,
+        is_dllm=lambda: False,
+        pp_group=SimpleNamespace(is_last_rank=pp_last),
+        model_runner=SimpleNamespace(
+            forward=lambda *args, **kwargs: out, sample=sample
+        ),
+        enable_overlap=False,
+        enable_spec=False,
+    )
+    with patch(
+        "sglang.srt.managers.tp_worker.ForwardBatch.init_new", return_value=forward
+    ):
+        result = TpModelWorker.forward_batch_generation(worker, batch)
+    if pp_last:
+        assert result.next_token_ids.tolist() == [token]
+    return result.training_capture if pp_last else None
+
+
+def _route_request(coordinator, raw, *, rank, index):
+    if rank == 0:
+        coordinator.request_router.prepare([raw])
+        assert raw.training_capture_ticket is not None, coordinator.stats()
+    messages = [msgpack_encode(raw) if rank == 0 else None]
+    dist.broadcast_object_list(messages, src=0)
+    raw = msgpack_decode(messages[0])
+    req = Req(
+        raw.rid,
+        raw.input_text,
+        raw.input_ids,
+        raw.sampling_params,
+        vocab_size=256,
+        training_capture_ticket=raw.training_capture_ticket,
+    )
+    req.req_pool_idx = index
+    coordinator.request_router.attach(raw, req)
+    assert req.training_capture_route is not None
+    return req
+
+
+def _reject_manifest(coordinator, *, rank, case, pp_last):
+    raw = _incoming(f"{case}-rejected")
+    peer = case == "budget_peer_cuda"
+    if not peer:
+        # Fits the request identity budget but exceeds the smaller manifest arena.
+        raw.sampling_params.stop_strs = ["x" * (32 << 10)]
+    req = _route_request(coordinator, raw, rank=rank, index=0)
+    ticket = req.training_capture_route.ticket.cohort
+    gate_entered, gate_release = threading.Event(), threading.Event()
+    copy_patch = None
+    record = None
+    try:
+        if peer:
+            if rank != 1:
+                coordinator.before_forward([req])
+                record = req.training_capture_context
+                assert record is not None, coordinator.stats()
+                first = _forward(
+                    coordinator,
+                    req,
+                    end=2,
+                    raw_logits=torch.randn(1, 256, device="cuda"),
+                    pp_last=pp_last,
+                    token=5,
+                )
+                req.output_ids.append(5)
+                coordinator.after_result(first, requests=[req])
+                assert record.context.kv_end == 2
+                if rank == 2:
+                    wait_for_copies = record.context.wait_for_copies
+
+                    def held_completion():
+                        gate_entered.set()
+                        assert gate_release.wait(30), "copy completion gate timed out"
+                        wait_for_copies()
+
+                    copy_patch = patch.object(
+                        record.context, "wait_for_copies", side_effect=held_completion
+                    )
+                    copy_patch.start()
+            dist.barrier()
+            if rank == 1:
+                provenance = coordinator._provenance(req)
+                oversized = msgspec.structs.replace(
+                    provenance,
+                    sampling_config={"local_test_metadata": "x" * (32 << 10)},
+                )
+                with patch.object(coordinator, "_provenance", return_value=oversized):
+                    coordinator.before_forward([req])
+                assert req.training_capture_context is None
+                assert coordinator.counters["admission_manifest_budget"] == 1
+            dist.barrier()
+            if record is not None:
+                _wait(
+                    coordinator,
+                    lambda: (
+                        coordinator.service.status(record.cohort_handle)[1] is not None
+                    ),
+                )
+                coordinator.before_forward([])
+                assert req.training_capture_context is None
+            if rank == 2:
+                assert gate_entered.wait(15)
+            dist.barrier()
+            with coordinator.service.lock:
+                handle = coordinator.service.records[ticket.capture_id]
+                assert handle.invalid_reason is not None
+                assert handle.cohort.slot.state == "filling"
+                if rank == 2:
+                    assert not handle.drained
+            assert (
+                coordinator.writer_actor.stats()["stage_timings"]["store_payload"][
+                    "calls"
+                ]
+                == 0
+            )
+            dist.barrier()
+            gate_release.set()
+        else:
+            coordinator.before_forward([req])
+            assert req.training_capture_context is None
+        _wait(
+            coordinator,
+            lambda: (
+                ticket.capture_id not in coordinator.service.records
+                and not coordinator.records
+                and coordinator.writer_actor.stats()["pending"] == 0
+                and coordinator.stats()["states"].get("available", 0) == 2
+            ),
+        )
+        assert coordinator.service.bind(ticket, ticket.request_sha256) is None
+        assert coordinator.stats()["host_pool"]["quarantined"] == 0
+        timings = coordinator.writer_actor.stats()["stage_timings"]
+        assert timings["snapshot_build"]["calls"] == 0
+        assert timings["store_payload"]["calls"] == 0
+        if not peer:
+            assert timings["copy_wait"]["calls"] == 0
+        handle = req.training_capture_route.handle
+        if handle is not None:
+            assert handle.drained and handle.transfer_complete
+        return {
+            "capture_id": ticket.capture_id,
+            "expected": "FAILED",
+            "rejected_before_capture": record is None,
+            "budget_rejections": coordinator.counters["admission_manifest_budget"],
+            "copy_gate_checked": peer,
+            "stale_ticket_rejected": True,
+        }
+    finally:
+        gate_release.set()
+        if copy_patch is not None:
+            copy_patch.stop()
+
+
+def _run_case(rank, root, master, endpoint, case):
+    base, tensors = make_snapshot(response_length=4)
+    factory = case in ("factory_cuda", "budget_peer_cuda")
+    replicated = case in ("replicated", "budget_replicated")
+    inactive_ingress = case in ("inactive_ingress", "budget_inactive")
+    ranges = (
+        [(0, 4)]
+        if replicated
+        else ([(0, 1), (1, 4)] if inactive_ingress else [(0, 2), (2, 4)])
+    )
+    tp_size = 4 if replicated else 2
+    layout = plan_capture_layout(
+        base.kv,
+        tp_size=tp_size,
+        pp_layer_ranges=ranges,
+        aux_tp_rank=0 if factory else 1,
+    )
+    partition = layout.partitions[rank]
+    config = CaptureConfig(
+        dataset_id=f"coordinator-{case}",
+        model_id=base.teacher.model_id,
+        producer_revision="test",
+        selected_layer_ids=base.kv.selected_layer_ids,
+        storage_chunk_tokens=base.kv.storage_chunk_tokens,
+        catalog_endpoint=endpoint,
+        journal_directory=str(Path(root) / f"journal-{case}-{rank}"),
+        store=StoreSetup(local_hostname=f"rank-{rank}", master_server_addr=master),
+        max_sample_tokens=8,
+        max_inflight_samples=2,
+        max_host_bytes=4 << 20,
+        manifest_buffer_bytes=(32 << 10) if case.startswith("budget_") else (1 << 20),
+        sample_ratio=1.0,
+    )
+    sources = _sources(base, tensors, partition)
+    control = None
+    if factory:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        torch.cuda.set_device(0)
+        start, end = ranges[rank // tp_size]
+        source_pool = MHATokenToKVPool(
+            size=16,
+            page_size=base.kv.source_page_size,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=4,
+            layer_num=end - start,
+            device="cuda",
+            start_layer=start,
+            end_layer=end,
+            enable_memory_saver=False,
+            enable_alt_stream=False,
+        )
+        for layer in partition.local_layers(base.kv):
+            for component, get_buffer in (
+                ("k", source_pool.get_key_buffer),
+                ("v", source_pool.get_value_buffer),
+            ):
+                name = f"target_{component}.{layer.layer_id}"
+                buffer = get_buffer(layer.layer_id)
+                buffer[:16].copy_(sources[name])
+                sources[name] = buffer
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            hostname = f"127.0.0.1:{sock.getsockname()[1]}"
+        config = msgspec.structs.replace(
+            config, store=StoreSetup(local_hostname=hostname, master_server_addr=master)
+        )
+        path = Path(root) / f"capture-{rank}.json"
+        path.write_bytes(msgspec.json.encode(config))
+        with patch(
+            "sglang.srt.training_capture.coordinator.bind_rank_target_contract",
+            return_value=synthetic_rank_contract(
+                base, rank, tp_size=tp_size, pp_layer_ranges=ranges
+            ),
+        ):
+            coordinator = CaptureCoordinator.create(
+                config_path=str(path),
+                model=None,
+                model_config=None,
+                tokenizer_path=None,
+                pool=source_pool,
+                req_to_token=SimpleNamespace(
+                    req_to_token=torch.arange(16, device="cuda").reshape(2, 8)
+                ),
+                startup_group=dist.group.WORLD,
+                tp_rank=rank % tp_size,
+                tp_size=tp_size,
+                pp_rank=rank // tp_size,
+                pp_size=len(ranges),
+            )
+        resources = coordinator.resources
+        assert coordinator.layout == layout
+        assert all(slot.storage.is_pinned() for slot in resources.pool.slots)
+    else:
+        resources = CaptureResources()
+        if partition.active:
+            resources.store = _connect(master)
+            resources.catalog = HTTPCaptureCatalog(endpoint)
+            if partition.heads:
+                resources.exporter = SelectedLayerKVExporter(
+                    base.kv, sources, partition=partition
+                )
+            resources._allocate(config, base.kv, partition, pin_memory=False)
+        control = dist.new_group(backend="gloo", timeout=timedelta(seconds=20))
+        coordinator = CohortCaptureCoordinator(
+            allocator=CaptureCohortAllocator(
+                group=control,
+                layout=layout,
+                config=config,
+                teacher=base.teacher,
+                kv=base.kv,
+                resources=resources,
+                timeout_seconds=15,
+            ),
+            req_to_token=SimpleNamespace(req_to_token=torch.arange(16).reshape(2, 8)),
+            capture_mode="speculative_accepted_target_path"
+            if case == "verify"
+            else "autoregressive",
+            autostart=False,
+        )
+    recovery_entered, release_recovery = threading.Event(), threading.Event()
+    startup_patch = None
+    if case == "inactive_ingress" and partition.include_aux:
+        recover = coordinator.writer_actor.writer.recover
+
+        def held_recovery():
+            recovery_entered.set()
+            assert release_recovery.wait(15)
+            return recover()
+
+        startup_patch = patch.object(
+            coordinator.writer_actor.writer, "recover", held_recovery
+        )
+        startup_patch.start()
+    try:
+        if not factory:
+            coordinator.activate()
+        if case == "inactive_ingress":
+            if partition.include_aux:
+                assert recovery_entered.wait(10)
+            dist.barrier()
+            if rank == 0:
+                state = coordinator.stats()
+                assert state["reservations"] == 0, state
+                assert state["admission"]["effective_ratio"] == 0, state
+                raw = _incoming("not-ready")
+                coordinator.request_router.prepare([raw])
+                assert raw.training_capture_ticket is None
+            dist.barrier()
+            release_recovery.set()
+        _wait(
+            coordinator, lambda: coordinator.stats()["states"].get("available", 0) == 2
+        )
+        pp_last = rank // tp_size == len(ranges) - 1
+        rejected = (
+            _reject_manifest(coordinator, rank=rank, case=case, pp_last=pp_last)
+            if case.startswith("budget_")
+            else None
+        )
+        requests = []
+        for index in range(2):
+            req = _route_request(
+                coordinator, _incoming(f"{case}-{index}"), rank=rank, index=index
+            )
+            requests.append(req)
+        coordinator.before_forward(requests)
+        records = [req.training_capture_context for req in requests]
+        assert all(record is not None for record in records), coordinator.stats()
+        dist.barrier()
+        raw_rows = torch.randn(4, 256, generator=torch.Generator().manual_seed(42))
+        if factory:
+            raw_rows = raw_rows.cuda()
+        for index in (0, 1) if rank < 2 else (1, 0):
+            req = requests[index]
+            first = _forward(
+                coordinator,
+                req,
+                end=2,
+                raw_logits=raw_rows[:1],
+                pp_last=pp_last,
+                token=5,
+            )
+            req.output_ids.append(5)
+            coordinator.after_result(first, requests=[req])
+            if case == "verify":
+                batch = SimpleNamespace(reqs=[req], seq_lens_cpu=torch.tensor([2]))
+                forward = SimpleNamespace(
+                    input_ids=torch.tensor([5, 6, 7]),
+                    positions=torch.arange(2, 5),
+                    out_cache_loc=torch.arange(index * 8 + 2, index * 8 + 5),
+                )
+                logits = (
+                    SimpleNamespace(next_token_logits=raw_rows[1:].clone())
+                    if pp_last
+                    else None
+                )
+                ticket = coordinator.after_verify_forward(
+                    batch, forward, logits, width=3, can_run_cuda_graph=False
+                )
+                assert ticket is not None
+                if logits is not None:
+                    logits.next_token_logits.zero_()
+                ticket = coordinator.after_verify_accept(
+                    ticket,
+                    commit_lens=torch.tensor([3]),
+                    out_tokens=torch.tensor([[6, 7, 8]]),
+                )
+                req.output_ids.extend([6, 7, 8])
+            else:
+                for step, end in enumerate((3, 4, 5), start=1):
+                    ticket = _forward(
+                        coordinator,
+                        req,
+                        end=end,
+                        raw_logits=raw_rows[step : step + 1],
+                        pp_last=pp_last,
+                        token=5 + step,
+                    )
+                    req.output_ids.append(5 + step)
+                    if end < 5:
+                        coordinator.after_result(ticket, requests=[req])
+            req.finished_len = 4
+            req.finished_reason = (
+                FINISH_ABORT("test cancellation")
+                if case == "abort" and index == 0 and rank == 0
+                else FINISH_LENGTH(4)
+            )
+            if rank == 0 and req.training_capture_finalize is not None:
+                # Match KV cache release invoking finalization before result bookkeeping.
+                req.training_capture_finalize(req)
+            coordinator.after_result(ticket if pp_last else None, requests=[req])
+            for source in sources.values():
+                source[index * 8 : index * 8 + 8].zero_()
+        _wait(
+            coordinator,
+            lambda: (
+                not coordinator.records
+                and coordinator.writer_actor.stats()["pending"] == 0
+            ),
+        )
+        rows = [
+            {
+                "capture_id": req.training_capture_route.handle.cohort.lease.capture_id,
+                "sample_id": req.training_capture_route.handle.cohort.lease.sample_id,
+                "expected": "FAILED" if case == "abort" and index == 0 else "AVAILABLE",
+            }
+            for index, req in enumerate(requests)
+        ]
+        if case != "abort":
+            assert all(record.context.state == "SEALED" for record in records)
+        dist.barrier()
+        assert coordinator.close(), coordinator.stats()
+        assert resources.closed
+        return {
+            "case": case,
+            "samples": rows,
+            "rejection": rejected,
+            "stats": coordinator.stats(),
+        }
+    finally:
+        release_recovery.set()
+        if startup_patch is not None:
+            startup_patch.stop()
+        if not coordinator.close():
+            raise RuntimeError("collector still owns live capture state")
+        if control is not None:
+            dist.destroy_process_group(control)
+
+
+def cohort_runtime_worker(rank, root, master, endpoint, cases=None):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=(Path(root) / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=45),
+    )
+    try:
+        results = []
+        for case in cases or (
+            "tp_pp",
+            "replicated",
+            "inactive_ingress",
+            "verify",
+            "abort",
+            "factory_cuda",
+        ):
+            with (
+                get_context().override_server_args(enable_dp_attention=False),
+                get_parallel().override(
+                    tp_rank=rank % (4 if "replicated" in case else 2)
+                ),
+            ):
+                results.append(_run_case(rank, root, master, endpoint, case))
+            dist.barrier()
+        (Path(root) / f"rank-{rank}.json").write_bytes(canonical_bytes(results))
+    finally:
+        dist.destroy_process_group()

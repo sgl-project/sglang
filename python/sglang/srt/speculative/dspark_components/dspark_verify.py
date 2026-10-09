@@ -4,7 +4,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -28,7 +27,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -39,6 +42,9 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
+)
+from sglang.srt.speculative.dspark_components.dspark_target_kv_inject import (
+    TargetKVInjector,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
@@ -72,6 +78,8 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    training_capture: object = None
+    pp_proxy_tensors: PPProxyTensors | None = None
 
 
 class TargetVerifyExecutor:
@@ -82,7 +90,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: TargetHiddenKvInjector | TargetKVInjector,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -91,6 +99,11 @@ class TargetVerifyExecutor:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
+        self.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if isinstance(kv_injector, TargetKVInjector)
+            else CaptureHiddenMode.FULL
+        )
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -197,7 +210,7 @@ class TargetVerifyExecutor:
             ),
             draft_token_num=self.verify_num_draft_tokens,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
             ragged_verify_layout=idle_layout,
         )
         batch.out_cache_loc = torch.zeros(
@@ -232,6 +245,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -242,7 +256,7 @@ class TargetVerifyExecutor:
             positions=positions_2d.reshape(-1),
             draft_token_num=verify_w,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -260,9 +274,10 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        if sampling_info is not None and result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -278,25 +293,45 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> TargetVerifyResult:
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
+        try:
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+        finally:
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        training_capture = None
+        if self.target_worker.training_capture is not None:
+            training_capture = self.target_worker.training_capture.after_verify_forward(
+                batch,
+                verify_forward_batch,
+                target_out.logits_output,
+                width=self.verify_num_draft_tokens,
+                can_run_cuda_graph=target_out.can_run_cuda_graph,
+                verify_lens=(
+                    verify_input.ragged_verify_layout.verify_lens
+                    if verify_input.ragged_verify_layout is not None
+                    else None
+                ),
+            )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            training_capture=training_capture,
+            pp_proxy_tensors=target_out.pp_hidden_states_proxy_tensors,
         )
 
-    def commit_hidden(
+    def commit_target_context(
         self,
         *,
         batch: ScheduleBatch,
@@ -308,6 +343,13 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        if isinstance(self.kv_injector, TargetKVInjector):
+            if run_compact:
+                raise RuntimeError("target-KV DSpark requires static verify")
+            self.kv_injector.inject_verify(
+                batch=batch, verify_window=verify_window, commit_lens=commit_lens
+            )
+            return
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -353,7 +395,7 @@ class TargetVerifyExecutor:
             positions=ragged_window.positions,
             draft_token_num=self.verify_num_draft_tokens,
             custom_mask=None,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=self.capture_hidden_mode,
             ragged_verify_layout=layout,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
@@ -457,7 +499,6 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
@@ -474,7 +515,6 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,

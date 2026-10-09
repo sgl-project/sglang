@@ -14,7 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -52,6 +55,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
+        and not batch.spec_algorithm.is_dspark()
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
@@ -65,6 +69,101 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    @DynamicGradMode()
+    def event_loop_pp_dspark(self: Scheduler):
+        """Complete a target-KV speculative step on every stage before scheduling."""
+        from sglang.srt.speculative.dspark_components.dspark_pp_coordinator import (
+            DSparkPPCoordinator,
+        )
+
+        self.init_pp_loop_state()
+        self.dspark_pp_coordinator = DSparkPPCoordinator(
+            worker=self.model_worker,
+            world_group=self.world_group,
+            pp_group=self.pp_group,
+            tp_group=self.tp_group,
+        )
+        pd_mode = self.disaggregation_mode
+        if pd_mode != DisaggregationMode.NULL:
+            from sglang.srt.speculative.dspark_components.dspark_pd_queue import (
+                DSparkPDQueueCoordinator,
+            )
+
+            self.dspark_pd_queue_coordinator = DSparkPDQueueCoordinator(
+                self.world_group, self.server_args
+            )
+        while not self.gracefully_exit:
+            self.running_mbs[0] = self.running_batch
+            self.mbs[0] = self.last_batch
+            recv_reqs = self.request_receiver.recv_requests()
+            # Request handlers and projection can enter world collectives. Relay
+            # before either, so later stages are not still waiting for requests.
+            if not self.pp_group.is_last_rank:
+                self._pp_send_pyobj_to_next_stage(recv_reqs)
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+            if pd_mode == DisaggregationMode.PREFILL:
+                self.waiting_queue.extend(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
+                plan = self.get_next_disagg_prefill_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
+            elif pd_mode == DisaggregationMode.DECODE:
+                self.process_decode_queue()
+                plan = self.get_next_disagg_decode_batch_to_run(
+                    running_batch=self.running_batch
+                )
+            else:
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
+            self.running_mbs[0] = self.running_batch
+            self.mbs[0] = batch
+            if batch:
+                result = self.run_batch(batch)
+                if pd_mode == DisaggregationMode.PREFILL:
+                    self._pp_dspark_prefill_handoffs(batch, result)
+                self.process_batch_result(batch, result)
+            else:
+                self.dspark_pp_coordinator.run_batch(None)
+                self._sched_idled = True
+                self.on_idle()
+            if pd_mode == DisaggregationMode.PREFILL:
+                self.process_disagg_prefill_inflight_queue()
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
+
+    def _pp_dspark_prefill_handoffs(self, batch, result):
+        capture = self.tp_worker.training_capture
+        if capture is None:
+            return
+        owner = (self.pp_group.world_size - 1) * self.tp_group.world_size
+        payload = None
+        if self.world_group.rank_in_group == owner:
+            result.copy_done.synchronize()
+            payload = capture.pack_pp_handoffs(batch, result.next_token_ids)
+        payload = self.world_group.broadcast_object(payload, src=owner)
+        capture.accept_pp_handoffs(batch, payload)
+
+    def _pp_dspark_timeout_ids(self, reqs, field, timeout_s, *, running=False):
+        """Use one clock and one request timeline for timeout decisions."""
+        expired = None
+        if self.world_group.is_first_rank:
+            deadline = time.perf_counter() - timeout_s
+            expired = [
+                req.rid
+                for req in reqs
+                if (not running or not req.finished())
+                and 0 < getattr(req.time_stats, field) < deadline
+            ]
+        return set(self.world_group.broadcast_object(expired, src=0))
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -1019,6 +1118,21 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                pack_dspark_pp_result,
+            )
+
+            tensor_dict = pack_dspark_pp_result(result, batch)
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and self.tp_worker.training_capture is not None
+        ):
+            handoffs = self.tp_worker.training_capture.pack_pp_handoffs(
+                batch, result.next_token_ids
+            )
+            if handoffs is not None:
+                tensor_dict["training_capture_pd_handoffs"] = handoffs
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1140,6 +1254,36 @@ class SchedulerPPMixin:
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                unpack_dspark_pp_result,
+            )
+
+            result = unpack_dspark_pp_result(
+                pp_outputs.tensors,
+                batch,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            )
+            if (
+                get_disagg().disaggregation_mode == "prefill"
+                and self.tp_worker.training_capture is not None
+            ):
+                self.tp_worker.training_capture.accept_pp_handoffs(
+                    batch, pp_outputs.tensors.get("training_capture_pd_handoffs")
+                )
+            # Only the bonus enters the next forward; the padded accepted block
+            # remains available to the normal spec-v2 output processor.
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload(bonus_tokens=result.next_draft_input.bonus_tokens),
+            )
+            batch.input_ids = None
+            result.copy_done = self.device_module.Event()
+            result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+            return result
+        if any(name.startswith("dspark_") for name in pp_outputs.tensors):
+            raise ValueError("PP DSpark output received for a non-DSpark batch")
+
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -1158,6 +1302,13 @@ class SchedulerPPMixin:
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
         batch.input_ids = None
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and self.tp_worker.training_capture is not None
+        ):
+            self.tp_worker.training_capture.accept_pp_handoffs(
+                batch, pp_outputs.tensors.get("training_capture_pd_handoffs")
+            )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1171,6 +1322,12 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_pp_result import (
+                install_dspark_pp_result,
+            )
+
+            install_dspark_pp_result(output_result, batch)
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
@@ -1318,7 +1475,11 @@ class SchedulerPPMixin:
         return result, event
 
     def get_rids(
-        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
+        self: Scheduler,
+        req_queue: List[Req],
+        is_send: bool,
+        *poll_statuses_group,
+        metadata_buffers=None,
     ):
         """
         Used by PP, get the required rids with the given poll statuses.
@@ -1327,6 +1488,9 @@ class SchedulerPPMixin:
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            decode_reqs=req_queue if metadata_buffers is not None else None,
+            metadata_buffers=metadata_buffers,
+            server_args=self.server_args if metadata_buffers is not None else None,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
@@ -1410,12 +1574,14 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Include metadata readiness before PP consensus. Once one stage consumes
+        # a rid, a later stage cannot defer it and form a second intersection.
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                metadata_buffers=self.disagg_decode_transfer_queue.metadata_buffers,
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
@@ -1427,6 +1593,7 @@ class SchedulerPPMixin:
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                metadata_buffers=self.disagg_decode_transfer_queue.metadata_buffers,
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(

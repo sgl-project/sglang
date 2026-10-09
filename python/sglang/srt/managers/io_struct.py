@@ -49,7 +49,6 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
-
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -953,6 +952,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Scheduler-owned, bounded capture metadata. Appended for array IPC compatibility.
+    training_capture_ticket: bytes | None = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
@@ -1861,7 +1863,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -1871,7 +1874,8 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):
@@ -1975,6 +1979,16 @@ class SetInternalStateReq(BaseReq, kw_only=True):
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
+
+
+class ControlTrainingCaptureReqInput(BaseReq, kw_only=True):
+    action: Literal["pause", "resume", "abort"]
+
+
+class ControlTrainingCaptureReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    state: dict[str, Any] | None = None
 
 
 class ProfileReqType(Enum):

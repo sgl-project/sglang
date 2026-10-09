@@ -964,6 +964,60 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
 
+    def test_speculative_pp_buffers_cover_all_tokens_and_replay_slots(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+        from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
+
+        for blocks in (None, 3):
+            buffers = DecodeInputBuffers.create(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=16,
+                hidden_size=8,
+                next_token_logits_buffer=torch.zeros(16, 67),
+                dtype=torch.float32,
+                dp_size=1,
+                pp_size=2,
+                is_encoder_decoder=False,
+                require_mlp_tp_gather=False,
+                seq_len_fill_value=5,
+                encoder_len_fill_value=0,
+                num_tokens_per_req=4,
+                cache_loc_dtype=torch.int64,
+                enable_mamba_track=False,
+                pp_proxy_residual_num_blocks=blocks,
+            )
+            self.assertEqual(buffers.pp_proxy_tensors["hidden_states"].shape, (16, 8))
+            self.assertEqual(
+                buffers.pp_proxy_tensors["residual"].shape,
+                (16, 8) if blocks is None else (16, 3, 8),
+            )
+            registry = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=16,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                source=buffers,
+            )
+            incoming = {
+                name: torch.full_like(value[:12], 7)
+                for name, value in buffers.pp_proxy_tensors.items()
+            }
+            registry.fill_from(
+                _MiniForwardBatch(batch_size=3),
+                raw_bs=3,
+                padded_bs=4,
+                raw_num_tokens=12,
+                padded_num_tokens=16,
+                pp_proxy_tensors=SimpleNamespace(tensors=incoming),
+            )
+            for value in buffers.pp_proxy_tensors.values():
+                self.assertTrue(torch.all(value[:12] == 7))
+                self.assertTrue(torch.all(value[12:] == 0))
+
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,

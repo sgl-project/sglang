@@ -1,0 +1,411 @@
+"""Strict registered-buffer adapter for immutable training objects.
+
+``put_from`` returns a status; ``get_into`` returns a byte count. Failed or
+ambiguous transfers retain their registrations and buffers until client close.
+Hard pinning is mandatory, without a compatibility downgrade.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import logging
+import math
+from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
+from typing import ClassVar
+
+import torch
+from sglang.srt.training_capture.payload_hash import PayloadHasher
+from sglang.srt.training_capture.protocol import (
+    CaptureError,
+    ContractError,
+    digest_bytes,
+    tensor_bytes,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class TransportError(CaptureError):
+    pass
+
+
+class MooncakeSnapshotStore:
+    _retained: ClassVar[set[MooncakeSnapshotStore]] = set()
+
+    def __init__(
+        self,
+        client,
+        replicate_config,
+        *,
+        max_receive_bytes: int = 2 << 30,
+        payload_hash_workers: int = 1,
+    ):
+        try:
+            # Capability checks are intentional at this external SDK boundary.
+            required = (
+                client.register_buffer,
+                client.unregister_buffer,
+                client.put_from,
+                client.get_into,
+                client.is_exist,
+                client.remove,
+                client.close,
+            )
+            if not all(callable(method) for method in required):
+                raise AttributeError("non-callable Store method")
+            _ = replicate_config.with_hard_pin
+            replicate_config.with_hard_pin = True
+            if not replicate_config.with_hard_pin:
+                raise AttributeError("hard pin not enabled")
+        except AttributeError as error:
+            raise ContractError(
+                "Mooncake SDK must support registered buffers and hard pinning"
+            ) from error
+        if replicate_config.replica_num < 1 or max_receive_bytes <= 0:
+            raise ValueError("positive replica count and receive budget are required")
+        self.client = client
+        self.replicate_config = replicate_config
+        self.max_receive_bytes = max_receive_bytes
+        self.registered: dict[int, torch.Tensor] = {}
+        self.quarantined: set[int] = set()
+        self.closed = False
+        self.payload_hasher = PayloadHasher(payload_hash_workers)
+
+    @classmethod
+    def connect(
+        cls,
+        setup: dict,
+        *,
+        replica_num: int = 1,
+        max_receive_bytes: int = 2 << 30,
+        payload_hash_workers: int = 1,
+    ):
+        from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+
+        config = ReplicateConfig()
+        config.replica_num = replica_num
+        client = MooncakeDistributedStore()
+        try:
+            adapter = cls(
+                client,
+                config,
+                max_receive_bytes=max_receive_bytes,
+                payload_hash_workers=payload_hash_workers,
+            )
+        except Exception:
+            client.close()
+            raise
+        try:
+            rc = client.setup(**setup)
+            if rc != 0:
+                raise TransportError(f"Mooncake setup failed: status={rc}")
+        except Exception:
+            adapter.close()
+            raise
+        versions = {}
+        for distribution in (
+            "mooncake-transfer-engine",
+            "mooncake-transfer-engine-cuda13",
+        ):
+            try:
+                versions[distribution] = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                pass
+        logger.info(
+            "Training snapshot Store connected: sdk=%s protocol=%s replicas=%d hard_pin=true",
+            versions,
+            setup["protocol"],
+            replica_num,
+        )
+        return adapter
+
+    def register(self, tensor: torch.Tensor) -> None:
+        tensor_bytes(tensor)
+        if self.closed or not tensor.numel() or tensor.data_ptr() in self.registered:
+            raise ContractError("invalid or duplicate buffer registration")
+        pointer = tensor.data_ptr()
+        self.registered[pointer] = tensor
+        try:
+            rc = self.client.register_buffer(
+                pointer, tensor.numel() * tensor.element_size()
+            )
+            if rc != 0:
+                raise TransportError(f"Mooncake register_buffer failed: status={rc}")
+        except Exception:
+            self.quarantined.add(pointer)
+            raise
+
+    def unregister(self, tensor: torch.Tensor) -> None:
+        pointer = tensor.data_ptr()
+        if pointer not in self.registered or pointer in self.quarantined:
+            raise TransportError("cannot unregister an unknown or quarantined buffer")
+        try:
+            rc = self.client.unregister_buffer(pointer)
+            if rc != 0:
+                raise TransportError(f"Mooncake unregister_buffer failed: status={rc}")
+        except Exception:
+            self.quarantined.add(pointer)
+            raise
+        del self.registered[pointer]
+
+    def _registration(self, tensor: torch.Tensor) -> int:
+        tensor_bytes(tensor)
+        begin = tensor.data_ptr()
+        end = begin + tensor.numel() * tensor.element_size()
+        for pointer, storage in self.registered.items():
+            if (
+                pointer
+                <= begin
+                < end
+                <= pointer + storage.numel() * storage.element_size()
+            ):
+                if pointer in self.quarantined:
+                    raise TransportError("buffer has an uncertain outstanding transfer")
+                return pointer
+        raise ContractError("tensor is outside all registered buffers")
+
+    def put_registered(
+        self, key: str, tensor: torch.Tensor, expected_digest: str
+    ) -> None:
+        pointer = self._registration(tensor)
+        if digest_bytes(tensor_bytes(tensor)) != expected_digest:
+            raise ContractError("immutable source changed before Store write")
+        exists = self.client.is_exist(key)
+        if exists not in (0, 1):
+            raise TransportError(f"Mooncake is_exist failed: status={exists}")
+        if exists:
+            existing = self.get_tensor(
+                key, list(tensor.shape), tensor.dtype, expected_digest
+            )
+            del existing
+            return
+        try:
+            rc = self.client.put_from(
+                key,
+                tensor.data_ptr(),
+                tensor.numel() * tensor.element_size(),
+                self.replicate_config,
+            )
+            if rc != 0:
+                raise TransportError(f"Mooncake put_from failed: status={rc}")
+        except Exception as error:
+            self.quarantined.add(pointer)
+            raise TransportError(
+                "Mooncake write completion is uncertain; source quarantined"
+            ) from error
+
+    def put_registered_batch(
+        self, objects: Sequence[tuple[str, torch.Tensor, str]]
+    ) -> None:
+        """Write immutable payloads together, retaining every uncertain source."""
+        if not objects:
+            return
+        keys = [key for key, _, _ in objects]
+        if len(set(keys)) != len(keys):
+            raise ContractError("duplicate keys in a registered Store batch")
+        registrations = []
+        buffers = []
+        for _, tensor, _ in objects:
+            registrations.append(self._registration(tensor))
+            buffers.append(tensor_bytes(tensor))
+        for actual, (_, _, expected_digest) in zip(
+            self.payload_hasher.digests(buffers), objects, strict=True
+        ):
+            if actual != expected_digest:
+                raise ContractError("immutable source changed before Store write")
+        batch_exists = getattr(self.client, "batch_is_exist", None)
+        batch_put = getattr(self.client, "batch_put_from", None)
+        if not callable(batch_exists) or not callable(batch_put):
+            for key, tensor, expected_digest in objects:
+                self.put_registered(key, tensor, expected_digest)
+            return
+        try:
+            exists = batch_exists(keys)
+        except Exception as error:
+            raise TransportError("Mooncake batch existence check failed") from error
+        if (
+            not isinstance(exists, (list, tuple))
+            or len(exists) != len(objects)
+            or any(type(value) is not int or value not in (0, 1) for value in exists)
+        ):
+            raise TransportError("invalid Mooncake batch existence results")
+        # Existence alone never proves an immutable retry is identical.
+        self.verify_tensors(
+            (key, list(tensor.shape), tensor.dtype, digest)
+            for (key, tensor, digest), present in zip(objects, exists)
+            if present
+        )
+        pending = [index for index, present in enumerate(exists) if not present]
+        if not pending:
+            return
+        try:
+            results = batch_put(
+                [keys[i] for i in pending],
+                [objects[i][1].data_ptr() for i in pending],
+                [objects[i][1].numel() * objects[i][1].element_size() for i in pending],
+                self.replicate_config,
+            )
+            if (
+                not isinstance(results, (list, tuple))
+                or len(results) != len(pending)
+                or any(type(value) is not int for value in results)
+            ):
+                raise TransportError("invalid Mooncake batch write results")
+        except Exception as error:
+            self.quarantined.update(registrations[i] for i in pending)
+            raise TransportError(
+                "Mooncake batch write completion is uncertain; sources quarantined"
+            ) from error
+        failed = [i for i, status in zip(pending, results) if status != 0]
+        if failed:
+            self.quarantined.update(registrations[i] for i in failed)
+            raise TransportError(
+                f"Mooncake batch put_from failed for {len(failed)} objects; "
+                "sources quarantined"
+            )
+
+    @staticmethod
+    def _receive_size(shape, dtype):
+        if not shape or any(type(d) is not int or d <= 0 for d in shape):
+            raise ContractError("invalid receive shape")
+        return (
+            math.prod(shape) * torch.empty((), dtype=dtype, device="cpu").element_size()
+        )
+
+    def _receive_budget(self):
+        retained = sum(
+            self.registered[p].numel() * self.registered[p].element_size()
+            for p in self.quarantined
+        )
+        return self.max_receive_bytes - retained
+
+    def get_tensor(
+        self, key: str, shape: list[int], dtype: torch.dtype, expected_digest: str
+    ) -> torch.Tensor:
+        nbytes = self._receive_size(shape, dtype)
+        if nbytes > self._receive_budget():
+            raise ContractError("receive/quarantine budget exceeded")
+        if self.client.is_exist(key) != 1:
+            raise TransportError("Mooncake object is missing or unavailable")
+        out = torch.empty(shape, dtype=dtype, device="cpu")
+        self.register(out)
+        pointer = out.data_ptr()
+        try:
+            count = self.client.get_into(key, pointer, nbytes)
+            if type(count) is not int or count < 0:
+                raise TransportError(f"Mooncake get_into failed: status={count}")
+        except Exception as error:
+            self.quarantined.add(pointer)
+            raise TransportError(
+                "Mooncake read completion is uncertain; destination quarantined"
+            ) from error
+        self.unregister(out)
+        if count != nbytes:
+            raise ContractError(
+                f"short Mooncake read: expected={nbytes}, actual={count}"
+            )
+        if digest_bytes(tensor_bytes(out)) != expected_digest:
+            raise ContractError("Mooncake object digest mismatch")
+        return out
+
+    def get_tensors(
+        self, objects: Sequence[tuple[str, list[int], torch.dtype, str]]
+    ) -> list[torch.Tensor]:
+        """Read an ordered batch into owned CPU tensors within one receive budget.
+
+        The caller holds the Catalog read lease. This synchronous transport API
+        does not grant retention or bound tensors retained by previous calls.
+        """
+        if not objects:
+            return []
+        sizes = [self._receive_size(shape, dtype) for _, shape, dtype, _ in objects]
+        if sum(sizes) > self._receive_budget():
+            raise ContractError("receive/quarantine budget exceeded")
+        batch_get = getattr(self.client, "batch_get_into", None)
+        if not callable(batch_get):
+            return [self.get_tensor(*obj) for obj in objects]
+        with ExitStack() as cleanup:
+            outputs = []
+            for _, shape, dtype, _ in objects:
+                out = torch.empty(shape, dtype=dtype, device="cpu")
+                self.register(out)
+                outputs.append(out)
+                cleanup.callback(self._release_receive, out)
+            pointers = [out.data_ptr() for out in outputs]
+            try:
+                counts = batch_get([obj[0] for obj in objects], pointers, sizes)
+                if (
+                    not isinstance(counts, (list, tuple))
+                    or len(counts) != len(objects)
+                    or any(type(count) is not int for count in counts)
+                ):
+                    raise TransportError("invalid Mooncake batch read results")
+            except Exception as error:
+                self.quarantined.update(pointers)
+                raise TransportError(
+                    "Mooncake batch read completion is uncertain; destinations quarantined"
+                ) from error
+            failed = [i for i, count in enumerate(counts) if count < 0]
+            if failed:
+                self.quarantined.update(pointers[i] for i in failed)
+                raise TransportError(
+                    f"Mooncake batch get_into failed for {len(failed)} objects; "
+                    "destinations quarantined"
+                )
+            if list(counts) != sizes:
+                raise ContractError("Mooncake batch read byte count mismatch")
+            digests = self.payload_hasher.digests(
+                [tensor_bytes(out) for out in outputs]
+            )
+            for actual, (_, _, _, digest) in zip(digests, objects, strict=True):
+                if actual != digest:
+                    raise ContractError("Mooncake object digest mismatch")
+            return outputs
+
+    def _release_receive(self, tensor):
+        if tensor.data_ptr() not in self.quarantined:
+            self.unregister(tensor)
+
+    def verify_tensors(
+        self, objects: Iterable[tuple[str, list[int], torch.dtype, str]]
+    ) -> None:
+        """Verify immutable objects, discarding each bounded batch before the next."""
+        batch = []
+        nbytes = 0
+        budget = self._receive_budget()
+        for obj in objects:
+            size = self._receive_size(obj[1], obj[2])
+            if size > budget:
+                raise ContractError("receive/quarantine budget exceeded")
+            if batch and (nbytes + size > budget or len(batch) == 64):
+                self.get_tensors(batch)
+                batch.clear()
+                nbytes = 0
+            batch.append(obj)
+            nbytes += size
+        if batch:
+            self.get_tensors(batch)
+
+    def remove(self, key: str) -> None:
+        """Only the retention authority may call this, after lease/checkpoint checks."""
+        rc = self.client.remove(key, force=False)
+        if rc != 0:
+            raise TransportError(f"Mooncake remove failed: status={rc}")
+
+    def close(self) -> None:
+        """Caller first stops all threads and synchronizes all outstanding CUDA copies."""
+        if self.closed:
+            return
+        try:
+            self.payload_hasher.close()
+            rc = self.client.close()
+            if rc not in (None, 0):
+                raise TransportError(f"Mooncake close failed: status={rc}")
+        except Exception:
+            self._retained.add(self)
+            raise
+        self.closed = True
+        self.registered.clear()
+        self.quarantined.clear()
+        self._retained.discard(self)

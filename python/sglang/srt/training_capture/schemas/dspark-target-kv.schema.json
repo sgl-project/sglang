@@ -1,0 +1,439 @@
+{
+  "$defs": {
+    "KVCompatibility": {
+      "additionalProperties": false,
+      "properties": {
+        "serving_contract": {
+          "default": "sglang_dspark_target_kv_v1",
+          "enum": [
+            "sglang_dspark_target_kv_v1"
+          ]
+        },
+        "sglang_revision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "specforge_revision": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sglang_revision",
+        "specforge_revision"
+      ],
+      "title": "KVCompatibility",
+      "type": "object"
+    },
+    "KVEncoderConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "bias": {
+          "default": false,
+          "type": "boolean"
+        },
+        "hidden_size": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "norm_semantics": {
+          "default": "fp32_variance_and_weight_then_cast",
+          "enum": [
+            "fp32_variance_and_weight_then_cast"
+          ]
+        },
+        "rms_norm_eps": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "hidden_size",
+        "rms_norm_eps"
+      ],
+      "title": "KVEncoderConfig",
+      "type": "object"
+    },
+    "KVSequenceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "backbone_input": {
+          "default": "anchor_then_masks",
+          "enum": [
+            "anchor_then_masks"
+          ]
+        },
+        "context_boundary": {
+          "default": "strictly_before_anchor",
+          "enum": [
+            "strictly_before_anchor"
+          ]
+        },
+        "input_length": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "label_shift": {
+          "default": 1,
+          "enum": [
+            1
+          ]
+        },
+        "markov_previous": {
+          "default": "anchor_then_previous_labels",
+          "enum": [
+            "anchor_then_previous_labels"
+          ]
+        },
+        "mask_token_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "position_semantics": {
+          "default": "actual_target_positions",
+          "enum": [
+            "actual_target_positions"
+          ]
+        },
+        "prediction_count": {
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "prediction_count",
+        "mask_token_id",
+        "input_length"
+      ],
+      "title": "KVSequenceContract",
+      "type": "object"
+    },
+    "KVSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "codec": {
+          "enum": [
+            "dense_bf16_post_rope_v1",
+            "dense_bf16_pre_rope_v1",
+            "dense_fp16_post_rope_v1",
+            "dense_fp16_pre_rope_v1"
+          ]
+        },
+        "dtype": {
+          "enum": [
+            "bfloat16",
+            "float16"
+          ]
+        },
+        "layer_numbering": {
+          "default": "target_attention_layer_zero_based",
+          "enum": [
+            "target_attention_layer_zero_based"
+          ]
+        },
+        "layers": {
+          "items": {
+            "$ref": "#/$defs/LayerGeometry"
+          },
+          "type": "array"
+        },
+        "layout": {
+          "default": "token_head_dim",
+          "enum": [
+            "token_head_dim"
+          ]
+        },
+        "rope_config": {
+          "type": "object"
+        },
+        "rope_config_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "selected_layer_ids": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "source_k_norm": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_k_stage": {
+          "enum": [
+            "post_rope",
+            "pre_rope"
+          ]
+        },
+        "source_page_size": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "storage_chunk_tokens": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "validity_policy": {
+          "default": "all_selected_layers_per_valid_token",
+          "enum": [
+            "all_selected_layers_per_valid_token"
+          ]
+        }
+      },
+      "required": [
+        "codec",
+        "dtype",
+        "selected_layer_ids",
+        "layers",
+        "source_k_stage",
+        "source_k_norm",
+        "rope_config",
+        "rope_config_sha256",
+        "storage_chunk_tokens",
+        "source_page_size"
+      ],
+      "title": "KVSpec",
+      "type": "object"
+    },
+    "KVTrainingContract": {
+      "additionalProperties": false,
+      "properties": {
+        "base_logits_dtype": {
+          "default": "float32",
+          "enum": [
+            "float32"
+          ]
+        },
+        "confidence_policy": {
+          "default": "disabled",
+          "enum": [
+            "disabled"
+          ]
+        },
+        "lambda_tv": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "objective": {
+          "default": "ce_tv128_full_vocabulary_lse_t1_v1",
+          "enum": [
+            "ce_tv128_full_vocabulary_lse_t1_v1"
+          ]
+        },
+        "shared_head_transform_placement": {
+          "default": "before_markov",
+          "enum": [
+            "before_markov"
+          ]
+        },
+        "shared_modules": {
+          "default": "frozen_target_reference",
+          "enum": [
+            "frozen_target_reference"
+          ]
+        },
+        "tv_tail_policy": {
+          "default": "omit_tail_without_renormalization",
+          "enum": [
+            "omit_tail_without_renormalization"
+          ]
+        }
+      },
+      "required": [
+        "lambda_tv"
+      ],
+      "title": "KVTrainingContract",
+      "type": "object"
+    },
+    "KVValidation": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_report_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "golden_fixture_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "parity_atol": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "parity_rtol": {
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "golden_fixture_sha256",
+        "parity_rtol",
+        "parity_atol"
+      ],
+      "title": "KVValidation",
+      "type": "object"
+    },
+    "LayerGeometry": {
+      "additionalProperties": false,
+      "properties": {
+        "key_head_dim": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "layer_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "num_kv_heads": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "value_head_dim": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "layer_id",
+        "num_kv_heads",
+        "key_head_dim",
+        "value_head_dim"
+      ],
+      "title": "LayerGeometry",
+      "type": "object"
+    },
+    "TargetKVDraftContract": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture_revision": {
+          "default": "dspark_target_kv_v1",
+          "enum": [
+            "dspark_target_kv_v1"
+          ]
+        },
+        "compatibility": {
+          "$ref": "#/$defs/KVCompatibility"
+        },
+        "encoder": {
+          "$ref": "#/$defs/KVEncoderConfig"
+        },
+        "feature_k_stage": {
+          "default": "pre_rope",
+          "enum": [
+            "post_rope",
+            "pre_rope"
+          ]
+        },
+        "feature_order": {
+          "default": "layer_then_k_v_head_dim",
+          "enum": [
+            "layer_then_k_v_head_dim"
+          ]
+        },
+        "input_mode": {
+          "default": "target_kv",
+          "enum": [
+            "target_kv"
+          ]
+        },
+        "kv": {
+          "$ref": "#/$defs/KVSpec"
+        },
+        "schema_version": {
+          "default": 1,
+          "enum": [
+            1
+          ]
+        },
+        "sequence": {
+          "$ref": "#/$defs/KVSequenceContract"
+        },
+        "teacher": {
+          "$ref": "#/$defs/TeacherIdentity"
+        },
+        "training": {
+          "$ref": "#/$defs/KVTrainingContract"
+        },
+        "validation": {
+          "$ref": "#/$defs/KVValidation"
+        }
+      },
+      "required": [
+        "teacher",
+        "kv",
+        "encoder",
+        "sequence",
+        "training",
+        "compatibility",
+        "validation"
+      ],
+      "title": "TargetKVDraftContract",
+      "type": "object"
+    },
+    "TeacherIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_revision": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "model_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_transform": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tokenizer_revision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "vocab_size": {
+          "maximum": 2147483647,
+          "minimum": 128,
+          "type": "integer"
+        },
+        "weights_revision": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_id",
+        "weights_revision",
+        "adapter_revision",
+        "tokenizer_revision",
+        "fingerprint_sha256",
+        "vocab_size",
+        "output_transform"
+      ],
+      "title": "TeacherIdentity",
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/TargetKVDraftContract",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

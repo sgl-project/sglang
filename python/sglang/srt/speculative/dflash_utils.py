@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.dspark.rounding import bf16_split_half_rope
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
@@ -919,6 +920,8 @@ def _table_qk_norm_rope_kernel(
     NHQ: tl.constexpr,
     D: tl.constexpr,
     EPS: tl.constexpr,
+    CAST_BEFORE_WEIGHT: tl.constexpr,
+    ROUND_ROPE_INTERMEDIATES: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
@@ -942,12 +945,16 @@ def _table_qk_norm_rope_kernel(
     inv = 1.0 / tl.sqrt(ms + EPS)
     w1 = tl.load(w_ptr + half_ar).to(tl.float32)
     w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    x1 = tl.load(row + half_ar).to(tl.float32) * inv
+    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv
+    if CAST_BEFORE_WEIGHT:
+        x1 = x1.to(tl.bfloat16).to(tl.float32)
+        x2 = x2.to(tl.bfloat16).to(tl.float32)
+    x1 = x1 * w1
+    x2 = x2 * w2
     x1 = x1.to(tl.bfloat16).to(tl.float32)
     x2 = x2.to(tl.bfloat16).to(tl.float32)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
+    o1, o2 = bf16_split_half_rope(x1, x2, cos, sin, ROUND_ROPE_INTERMEDIATES)
     tl.store(row + half_ar, o1.to(tl.bfloat16))
     tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
 
@@ -962,6 +969,9 @@ def table_qk_norm_rope_(
     num_k_heads: int,
     head_dim: int,
     eps: float,
+    *,
+    cast_x_before_out_mul: bool = False,
+    round_rope_intermediates: bool = False,
 ) -> None:
     """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
 
@@ -984,4 +994,7 @@ def table_qk_norm_rope_(
         NHQ=num_q_heads,
         D=head_dim,
         EPS=eps,
+        CAST_BEFORE_WEIGHT=cast_x_before_out_mul,
+        ROUND_ROPE_INTERMEDIATES=round_rope_intermediates,
+        enable_fp_fusion=not round_rope_intermediates,
     )

@@ -228,10 +228,20 @@ def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
+    *,
+    decode_reqs=None,
+    metadata_buffers=None,
+    server_args=None,
 ):
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+    polls = poll_and_all_reduce(
+        pollers,
+        attn_tp_cpu_group,
+        decode_reqs=decode_reqs,
+        metadata_buffers=metadata_buffers,
+        server_args=server_args,
+    )
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.

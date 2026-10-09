@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.training_capture.coordinator import CaptureBatch
 
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    training_capture: Optional[CaptureBatch] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

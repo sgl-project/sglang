@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.models.dflash import DFlashAttention
 from sglang.srt.models.dspark import DSparkDraftMixin
+from sglang.srt.models.dspark_target_kv import TargetKVAttention
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,6 +59,7 @@ def _make_attn(rope, *, eps=EPS, has_bias=False, quantized=False, g=None):
         k_norm.weight.copy_(torch.randn(HEAD_DIM, device=DEVICE, generator=g))
     attn.k_norm = k_norm
     attn.rotary_emb = rope
+    attn.round_rope_intermediates = False
     for name in ("kv_proj_only", "apply_k_norm", "apply_k_rope"):
         setattr(attn, name, types.MethodType(getattr(DFlashAttention, name), attn))
     return attn
@@ -99,7 +101,16 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             is_neox_style=True,
         ).to(DEVICE)
 
-    def _check_parity(self, *, num_layers=4, tokens=5, has_bias=False, dtype):
+    def _check_parity(
+        self,
+        *,
+        num_layers=4,
+        tokens=5,
+        has_bias=False,
+        dtype,
+        cast_before_weight=False,
+        round_rope_intermediates=False,
+    ):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         model = _make_model(self.rope, num_layers, has_bias=has_bias, g=g)
         for layer in model.layers:
@@ -108,6 +119,15 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
             if attn.qkv_proj.bias is not None:
                 attn.qkv_proj.bias = attn.qkv_proj.bias.to(dtype)
             attn.k_norm.to(dtype)
+            attn.k_norm.cast_x_before_out_mul = cast_before_weight
+            attn.round_rope_intermediates = round_rope_intermediates
+            if round_rope_intermediates:
+                for name in ("_rotate", "apply_k_rope"):
+                    setattr(
+                        attn,
+                        name,
+                        types.MethodType(getattr(TargetKVAttention, name), attn),
+                    )
         ctx_hidden = torch.randn(
             tokens, HIDDEN, device=DEVICE, dtype=dtype, generator=g
         )
@@ -135,6 +155,28 @@ class TestDSparkStackedCtxKvParity(CustomTestCase):
 
     def test_parity_with_bias(self):
         self._check_parity(dtype=torch.float16, has_bias=True)
+
+    def test_parity_with_training_norm_semantics(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_parity(dtype=dtype, cast_before_weight=True)
+
+    def test_fallback_inconsistent_norm_semantics(self):
+        model = _make_model(self.rope, 3)
+        model.layers[1].self_attn.k_norm.cast_x_before_out_mul = True
+        self.assertIsNone(model._stacked_ctx_kv_params())
+
+    def test_parity_with_training_rope_semantics(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_parity(
+                    dtype=dtype, cast_before_weight=True, round_rope_intermediates=True
+                )
+
+    def test_fallback_inconsistent_rope_semantics(self):
+        model = _make_model(self.rope, 3)
+        model.layers[1].self_attn.round_rope_intermediates = True
+        self.assertIsNone(model._stacked_ctx_kv_params())
 
     def test_fallback_quantized_layer(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)

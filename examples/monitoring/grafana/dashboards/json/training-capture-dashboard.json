@@ -1,0 +1,224 @@
+{
+  "id": null,
+  "uid": "sglang-training-capture",
+  "title": "SGLang Training Capture",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "tags": ["sglang", "training-capture"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1
+      },
+      {
+        "name": "model_name",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "query": "label_values(sglang:training_capture_disabled, model_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "query": "label_values(sglang:training_capture_disabled{model_name=~\"$model_name\"}, instance)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Capture Admission Probability",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_sample_ratio{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{kind}}"}]
+    },
+    {
+      "id": 2,
+      "title": "Capture Events / Second",
+      "description": "Rank-local lifecycle events can overlap. One distributed request is admitted on several ranks; only the publisher records READY. Cohort selection decisions are reported by the separate routing panels.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_events_total{model_name=~\"$model_name\",instance=~\"$instance\",event=~\"admitted|ready|sampled_out|adaptive_sampled_out|admission_backpressure|capture_failed|writer_failed|admission_catalog_error|lease_renew_error\"}[$__rate_interval]))", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{event}}"}]
+    },
+    {
+      "id": 3,
+      "title": "Reservations by State",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_reservations{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{state}}"}]
+    },
+    {
+      "id": 4,
+      "title": "Registered Host Slots",
+      "description": "filling includes spare reserved leases. occupied_fraction excludes spare leases. Quarantined slots remain unavailable until the transport is stopped.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_host_slots{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{state}}"}]
+    },
+    {
+      "id": 5,
+      "title": "Oldest Writer Work and Cooldown",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sglang:training_capture_writer_age_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} writer age"},
+        {"refId": "B", "expr": "sglang:training_capture_cooldown_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} cooldown"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Capture Disabled or Paused",
+      "description": "Failure/shutdown disable and operator admission pause are independent. Pausing retains active publication and lease renewal.",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 16, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value"},
+      "targets": [
+        {"refId": "A", "expr": "sglang:training_capture_disabled{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} disabled", "instant": true},
+        {"refId": "B", "expr": "sglang:training_capture_admission_paused{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} paused", "instant": true}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Metrics Age",
+      "description": "Monitor with Prometheus up. A missing producer is not evidence of healthy capture.",
+      "type": "timeseries",
+      "gridPos": {"x": 18, "y": 16, "w": 6, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "time() - sglang:training_capture_metrics_update_timestamp_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}"}]
+    },
+    {
+      "id": 8,
+      "title": "Serving p99 TTFT and Inter-token Latency",
+      "description": "Existing serving metrics; inter-token latency follows response streaming semantics. This panel does not define or certify a capture overhead SLO.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.99, sum by (le,instance,is_streaming) (rate(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])))", "legendFormat": "{{instance}} TTFT streaming={{is_streaming}}"},
+        {"refId": "B", "expr": "histogram_quantile(0.99, sum by (le,instance) (rate(sglang:inter_token_latency_seconds_bucket{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])))", "legendFormat": "{{instance}} inter-token"}
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Allocated Capture Host Memory",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_host_allocated_bytes{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}}"}]
+    },
+    {
+      "id": 10,
+      "title": "Scheduler Latency Budgets",
+      "description": "Bounded-window configured percentile. TTFT starts at scheduler request creation; TPOT is output interval divided by newly committed tokens. Not client/network latency. Missing observations are NaN.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_scheduler_latency_seconds{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} {{metric}} {{kind}}"}]
+    },
+    {
+      "id": 11,
+      "title": "Latency Protection State",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sglang:training_capture_latency_state{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} {{state}}"}]
+    },
+    {
+      "id": 12,
+      "title": "Mean Capture Stage Duration",
+      "description": "Wall time per completed stage attempt, including failures and retries. Queue wait and copy wait are not GPU kernel or RDMA transfer timings. Ranks contribute their local owner work; this is not per-sample end-to-end latency.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_seconds_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval])) / sum by (instance,stage) (rate(sglang:training_capture_stage_calls_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{stage}}"}]
+    },
+    {
+      "id": 13,
+      "title": "Capture Stage Failures / Second",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,stage) (rate(sglang:training_capture_stage_failures_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{stage}}"}]
+    },
+    {
+      "id": 14,
+      "title": "Capture Device Memory and Budget",
+      "description": "Capture device arenas include KV staging, teacher staging and HiCache export metadata. Allocated capacity is not transfer volume or total CUDA allocator usage.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 48, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sglang:training_capture_device_allocated_bytes{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} allocated"},
+        {"refId": "B", "expr": "sglang:training_capture_device_limit_bytes{model_name=~\"$model_name\",instance=~\"$instance\"}", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} budget"}
+      ]
+    },
+    {
+      "id": 15,
+      "title": "HiCache KV Export Enqueued Bytes / Second",
+      "description": "Only the optional HiCache exporter increments these counters; Torch reports zero. Host stores run in a CUDA kernel. Device counts gather into staging before a separate Host flush. Includes lookahead and aborted work, not completed copies, published payloads or RDMA bytes.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 48, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,destination) (rate(sglang:training_capture_kv_export_enqueued_bytes_total{model_name=~\"$model_name\",instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{destination}}"}]
+    },
+    {
+      "id": 16,
+      "title": "Cohort Ingress Decisions / Second",
+      "description": "Only the ingress rank selects capture tickets. sampled_out includes the current sampling probability and readiness gate; excluded includes health checks and unsupported requests. selected is not a publication count.",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 56, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,event) (rate(sglang:training_capture_routing_events_total{model_name=~\"$model_name\",instance=~\"$instance\",event=~\"considered|excluded|sampled_out|backpressure|selected|selection_failed\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{event}}"}]
+    },
+    {
+      "id": 17,
+      "title": "Cohort Ticket Events / Second",
+      "description": "Each rank attaches and binds the same ticket locally. These counts are not independent requests or published samples. other aggregates unknown event names without exposing them as labels.",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 56, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (instance,tp_rank,pp_rank,event) (rate(sglang:training_capture_routing_events_total{model_name=~\"$model_name\",instance=~\"$instance\",event=~\"attached|attachment_failed|bound|binding_failed|cancelled|other\"}[$__rate_interval]))", "legendFormat": "{{instance}} TP{{tp_rank}} PP{{pp_rank}} {{event}}"}]
+    }
+  ]
+}

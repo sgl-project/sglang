@@ -62,7 +62,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -120,6 +119,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlTrainingCaptureReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
@@ -1660,6 +1660,22 @@ async def separate_reasoning_request(
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/control_training_capture")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def control_training_capture(
+    obj: Annotated[ControlTrainingCaptureReqInput, Body()], request: Request
+):
+    results = await _global_state.tokenizer_manager.control_training_capture(obj)
+    success = all(result.success for result in results)
+    return ORJSONResponse(
+        content={
+            "success": success,
+            "results": [msgspec_to_builtins(result) for result in results],
+        },
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.post("/pause_generation")
