@@ -7,6 +7,7 @@ directory, a moved clone still hits — are checked without a GPU or a compiler.
 
 from __future__ import annotations
 
+import builtins
 import os
 import pathlib
 import sys
@@ -127,6 +128,14 @@ def test_musa_home_uses_mcc_path_when_unconfigured(monkeypatch):
     monkeypatch.delenv("MUSA_HOME", raising=False)
     monkeypatch.delenv("MUSA_PATH", raising=False)
     monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/opt/musa/bin/mcc")
+    real_import = builtins.__import__
+
+    def import_without_torch_musa_extension(name, *args, **kwargs):
+        if name == "torch_musa.utils.musa_extension":
+            raise ImportError
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_torch_musa_extension)
 
     assert toolchain.musa_home.__wrapped__() == "/opt/musa"
 
@@ -136,6 +145,15 @@ def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
     monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
 
     assert arch.get_activation_cuda_cflags() == []
+
+
+def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
+    assert "-std=c++17" in arch.get_default_target_flags()
+
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: False)
+    assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
 
 
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:
@@ -513,7 +531,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(cpu_only).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" not in ldflags and "amdhip" not in ldflags
+    assert all(runtime not in ldflags for runtime in ("cudart", "amdhip", "musart"))
 
     with_device = _spec(cuda_files=("/tmp/a.cu",), cpp_wrappers=(), header_only=False)
     ldflags = next(
@@ -521,7 +539,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(with_device).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" in ldflags or "amdhip" in ldflags
+    assert any(runtime in ldflags for runtime in ("cudart", "amdhip", "musart"))
 
 
 def test_generated_ninja_is_deterministic():

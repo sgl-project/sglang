@@ -8,14 +8,13 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
-#include <concepts>
 #include <cstddef>
 #include <limits>
 #include <type_traits>
 
 namespace sglang {
 
-template <typename T>
+template <typename T, typename = void>
 struct DTypeTrait {};
 
 #define SGL_REGISTER_PACKED(SELF, PACKED) \
@@ -56,8 +55,8 @@ struct DTypeTrait {};
   }                                                                 \
   static_assert(true)
 
-template <std::integral T>
-struct DTypeTrait<T> {
+template <typename T>
+struct DTypeTrait<T, std::enable_if_t<std::is_integral_v<T>>> {
   SGL_REGISTER_PACKED(T, void);
   SGL_REGISTER_UNPACK(T, 1);
   SGL_REGISTER_FROM_DEFAULT();

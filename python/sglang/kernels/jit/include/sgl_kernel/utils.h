@@ -38,11 +38,14 @@
 
 #include <dlpack/dlpack.h>
 
-#include <concepts>
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <initializer_list>
+#include <iterator>
 #include <ostream>
-#include <ranges>
 #include <sstream>
+#include <type_traits>
 #include <utility>
 
 namespace sglang {
@@ -138,12 +141,12 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
 inline auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
 inline auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }
@@ -151,7 +154,7 @@ inline auto offset(const void* ptr, U... offset) -> const void* {
 }  // namespace pointer
 
 /// \brief Integer ceiling division: ceil(a / b).
-template <std::integral T, std::integral U>
+template <typename T, typename U, std::enable_if_t<std::is_integral_v<T> && std::is_integral_v<U>, int> = 0>
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -161,19 +164,104 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
 
-namespace stdr = std::ranges;
-namespace stdv = stdr::views;
+template <typename T>
+class Span {
+ public:
+  Span() = default;
+  Span(const T* data, std::size_t size) : m_data(data), m_size(size) {}
+  template <typename U, std::enable_if_t<std::is_convertible_v<const U*, T*>, int> = 0>
+  Span(std::initializer_list<U> data) : m_data(data.begin()), m_size(data.size()) {}
+  template <typename U, std::size_t N, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
+  Span(const std::array<U, N>& data) : m_data(data.data()), m_size(N) {}
+
+  const T* data() const {
+    return m_data;
+  }
+  std::size_t size() const {
+    return m_size;
+  }
+  bool empty() const {
+    return m_size == 0;
+  }
+  const T* begin() const {
+    return m_data;
+  }
+  const T* end() const {
+    return m_data + m_size;
+  }
+  const T& operator[](std::size_t index) const {
+    return m_data[index];
+  }
+
+ private:
+  const T* m_data = nullptr;
+  std::size_t m_size = 0;
+};
+
+template <typename T>
+class IntegerRange {
+ public:
+  class Iterator {
+   public:
+    explicit Iterator(T value) : m_value(value) {}
+    T operator*() const {
+      return m_value;
+    }
+    Iterator& operator++() {
+      ++m_value;
+      return *this;
+    }
+    bool operator!=(const Iterator& other) const {
+      return m_value != other.m_value;
+    }
+
+   private:
+    T m_value;
+  };
+
+  IntegerRange(T begin, T end) : m_begin(begin), m_end(end) {}
+  Iterator begin() const {
+    return Iterator(m_begin);
+  }
+  Iterator end() const {
+    return Iterator(m_end);
+  }
+
+ private:
+  T m_begin;
+  T m_end;
+};
+
+namespace stdr {
+using std::copy_n;
+using std::end;
+
+template <typename Range>
+inline bool empty(const Range& range) {
+  return range.empty();
+}
+
+template <typename Range, typename T>
+inline auto find(const Range& range, const T& value) {
+  return std::find(range.begin(), range.end(), value);
+}
+
+template <typename Range, typename Predicate>
+inline bool any_of(const Range& range, Predicate&& predicate) {
+  return std::any_of(range.begin(), range.end(), std::forward<Predicate>(predicate));
+}
+}  // namespace stdr
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
-template <std::integral T>
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 inline auto irange(T end) {
-  return stdv::iota(static_cast<T>(0), end);
+  return IntegerRange<T>(static_cast<T>(0), end);
 }
 
 /// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
-template <std::integral T>
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 inline auto irange(T start, T end) {
-  return stdv::iota(start, end);
+  return IntegerRange<T>(start, end);
 }
 
 /** \brief Error class for stream-style error logging. */

@@ -135,7 +135,7 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     elif is_musa_runtime():
-        return ["-DUSE_MUSA", "-std=c++20", "-O3"]
+        return ["-DUSE_MUSA", "-std=c++17", "-O3"]
     else:
         if arch is None:
             arch = get_jit_cuda_arch()

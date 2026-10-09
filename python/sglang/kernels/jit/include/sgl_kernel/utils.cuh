@@ -22,7 +22,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -207,6 +206,14 @@ inline constexpr uint32_t kWarpThreads = 32u;
 /// \brief Most implementations prefer this name; keep the alias for them.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
+template <typename T>
+struct TypeIdentity {
+  using type = T;
+};
+
+template <typename T>
+using type_identity_t = typename TypeIdentity<T>::type;
+
 /**
  * \brief This thread's index within its logical `kNumThreads` group.
  *
@@ -298,7 +305,7 @@ SGL_DEVICE void PDLTriggerSecondary() {
 #endif
 }
 
-template <std::integral T, std::integral U>
+template <typename T, typename U, std::enable_if_t<std::is_integral_v<T> && std::is_integral_v<U>, int> = 0>
 SGL_DEVICE constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -324,7 +331,7 @@ SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
  * the template parameter `T`, which can avoid accidentally using the wrong type.
  */
 template <typename T>
-SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
+SGL_DEVICE void store_as(void* ptr, type_identity_t<T> val, int64_t offset = 0) {
   static_cast<T*>(ptr)[offset] = val;
 }
 
@@ -333,12 +340,12 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
 SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T = char, std::integral... U>
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
 SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }

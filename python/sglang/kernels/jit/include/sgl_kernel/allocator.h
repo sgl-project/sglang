@@ -1,6 +1,5 @@
 #pragma once
 
-#include <concepts>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -17,7 +16,7 @@ namespace sglang::host {
  * Otherwise, different call-sites may hit the same cache entry.
  * In case where `Fn` is not unique (e.g. std::function), make `Salt` unique to avoid cache collision.
  */
-template <bool kThreadSafe = true, typename Salt = void, typename Key, std::invocable Fn>
+template <bool kThreadSafe = true, typename Salt = void, typename Key, typename Fn>
 inline auto allocate_once(Key&& key, Fn&& callback) -> std::decay_t<std::invoke_result_t<Fn>>& {
   using Value = std::decay_t<std::invoke_result_t<Fn>>;
   static std::unordered_map<std::decay_t<Key>, Value> s_map;
