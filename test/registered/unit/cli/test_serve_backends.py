@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
+import sys
+import textwrap
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -243,6 +246,45 @@ class TestServeBackendDispatch(unittest.TestCase):
         self.assertIsNone(request.model_path)
         mock_load_plugins.assert_not_called()
         mock_kill.assert_not_called()
+
+
+class TestDiffusionImportIsolation(unittest.TestCase):
+    def test_package_import_does_not_load_the_generator_runtime(self):
+        """Importing sglang.multimodal_gen must not import the generator runtime.
+
+        Backend auto-detection imports this package in the CLI process before a
+        backend has been chosen. The generator runtime pulls in the accelerator
+        libraries the diffusion pipelines bundle, so on Ascend an eager import
+        here would load a second copy of libcust_opapi.so next to CANN's and
+        break operator registration in the process that is about to serve an
+        LLM. A fresh interpreter is used because ``sys.modules`` is process-wide
+        and other tests may already have imported the runtime.
+        """
+        script = textwrap.dedent(
+            """
+            import sys
+
+            import sglang.multimodal_gen
+
+            runtime = "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator"
+            assert runtime not in sys.modules, f"{runtime} was imported eagerly"
+            assert hasattr(sglang.multimodal_gen, "DiffGenerator"), (
+                "sglang.multimodal_gen.DiffGenerator is no longer exported"
+            )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
 
 
 if __name__ == "__main__":
