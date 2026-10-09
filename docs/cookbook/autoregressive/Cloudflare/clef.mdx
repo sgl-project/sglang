@@ -10,9 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Clef support merged in [#42721](https://github.com/sgl-project/sglang/pull/42721), after v0.5.21. Until a release includes it, use a [nightly build](/docs/get-started/install#nightly-builds) built after that merge. For all installation methods, see the [SGLang installation guide](/docs/get-started/install).
-
-The Python installation below requires a nightly wheel containing #42721. The Docker image below is built from the merge commit.
+Clef support merged after v0.5.21 in [#42721](https://github.com/sgl-project/sglang/pull/42721). Use a [nightly wheel](/docs/get-started/install#nightly-builds) containing that change or the Docker image below, built from the merge commit. See the [installation guide](/docs/get-started/install) for other methods.
 
 <Tabs>
 
@@ -26,7 +24,7 @@ source .venv/bin/activate
 uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://docs.sglang.ai/whl/cu130/ sglang
 ```
 
-Run the **Python** output of the command panel below in that environment.
+Run the command from the wizard’s Python tab in this environment.
 
 </Tab>
 
@@ -36,7 +34,7 @@ Run the **Python** output of the command panel below in that environment.
 docker pull lmsysorg/sglang:dev-clef
 ```
 
-The [Clef image build](https://github.com/sgl-project/sglang/actions/runs/37893990016) publishes `lmsysorg/sglang:dev-clef` from the #42721 merge commit. Run the **Docker** output of the command panel below. Both checkpoints are public and do not require a Hugging Face token.
+The [Clef image build](https://github.com/sgl-project/sglang/actions/runs/37893990016) produces this image from the #42721 merge commit. Run the command from the wizard’s Docker tab. Both checkpoints are public; no Hugging Face token is required.
 
 </Tab>
 
@@ -44,7 +42,7 @@ The [Clef image build](https://github.com/sgl-project/sglang/actions/runs/378939
 
 </Accordion>
 
-Select **Clef** or **Clef Flash** under **Variant**, then select your GPU. Both recipes use the SGLang defaults and run on one NVIDIA GPU in BF16 with TP=1. Only the model path, host, and port are needed. Changing the variant updates the checkpoint in the launch command and the sample request.
+Choose your GPU, then Clef or Clef Flash. The wizard updates the model in the launch command and sample request. Both models run on one GPU in BF16 with TP=1 using the default settings; the commands need only the model path, host, and port.
 
 import { Deployment } from "/src/snippets/_deployment.jsx"
 import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
@@ -52,12 +50,12 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
 <Deployment config={config} />
 
 <Note>
-  Both variants were tested on one B200 and one H200 using the Python server from [#42721 at e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed short text, short text with an image, long text, and long text with an image. Both long requests used the full 16,384-token prompt budget. These are serving checks, not throughput or accuracy benchmarks; the Docker wrapper was not separately tested.
+  We tested both models on one B200 and one H200 with [SGLang e122069670a7](https://github.com/sgl-project/sglang/commit/e122069670a74611be5a566c5a14f7b7422a1154), PyTorch 2.14.1, and Transformers 5.17.0. Each configuration passed four requests: short and long text, each with and without an image. The long requests used all 16,384 prompt tokens. These checks covered serving behavior. We did not measure throughput or accuracy, or run the Docker command on hardware.
 </Note>
 
 ## 1. Model introduction
 
-**Clef** and **Clef Flash** are decision models from Cloudflare, post-trained from Qwen3.8-27B and Qwen3.5-9B under the Apache-2.0 license. Each keeps its backbone and vision encoder and adds a small joint schema head that reads the backbone's final hidden states. One prompt holds the state and every question with its allowed options. The head routes evidence from the state to each option, lets the questions attend to each other, and returns one logit per allowed option of every question, without generating text.
+Cloudflare post-trained Clef from Qwen3.8-27B and Clef Flash from Qwen3.5-9B, then released both under the Apache-2.0 license. Each model keeps its backbone and vision encoder and adds a joint schema head. The head reads the backbone’s final hidden states, routes state evidence to each option, and lets questions attend to one another. It returns one logit per allowed option in a single prefill, with no text generation.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -86,21 +84,21 @@ import { config } from "/src/snippets/configs/Cloudflare/clef.jsx"
   </tbody>
 </table>
 
-Both variants accept a text string, JSON object, or JSON array as the state, with optional images. Their `/v1/systemone` responses contain one answer per question: a `choice` over allowed options, a `noul` probability of true, or a `score` over ordered levels.
+Pass a text string, JSON object, or JSON array as the state, with optional images. `/v1/systemone` returns one answer per question: a `choice` over allowed options, a `noul` probability of true, or a `score` over ordered levels.
 
 ## 2. Configuration tips
 
-- **Route.** Send requests to `/v1/systemone`. Clients of the System One API, including the TypeSafe SDKs, work by pointing their base URL at the server. See [System One compatible API](/docs/supported-models/decision_models#system-one-compatible-api) for the request and response reference. `/v1/decisions`, chat, and generation requests are refused, because the checkpoint answers through its head rather than its language model head.
-- **One GPU, one prefill per request.** Keep TP=1 and PP=1. All questions share one prompt, so the state is read once however many questions you ask. SGLang detects `joint_head_config.json`, loads `joint_head.safetensors`, and enables embedding mode without radix cache, chunked prefill, or CUDA graphs automatically. No reasoning parser, tool-call parser, or chat-template override is needed.
-- **Answers.** `probabilities` are the softmax of the head's logits for each question, and `confidence` uses the same formulas as other models on this route, so it can differ from the `confidence` of the checkpoint's reference `systemone()`, which is the probability of the top option. Answers omit `x_label_mass`, because the head scores only the allowed options.
-- **Long states.** The prompt, images included, holds at most 16,384 tokens, the default `max_length` of the checkpoint's reference `encode_record`, or fewer when the server's context length, KV cache, or `--max-prefill-tokens` is smaller. If the questions and images fit, a longer state is truncated to leave room for them. If they do not fit without the state, the request is rejected.
-- **Images.** Pass each image in `images` as a data URL, such as `data:image/jpeg;base64,...`, or as an HTTP(S) URL. A bare base64 JPEG starts with `/`, which the shared image loader reads as a file path, so the request fails. Images precede the state, as in the reference code.
+- **Route.** Send requests to `/v1/systemone`, or set your System One client’s base URL to the server. This includes TypeSafe SDK clients. See the [API reference](/docs/supported-models/decision_models#system-one-compatible-api) for request and response fields. Clef refuses `/v1/decisions`, chat, and generation requests.
+- **One GPU, one prefill per request.** Keep TP=1 and PP=1. All questions share one prompt, so the model reads the state once. SGLang detects `joint_head_config.json`, loads `joint_head.safetensors`, and enables embedding mode. It disables radix caching, chunked prefill, and CUDA graphs. No reasoning parser, tool-call parser, or chat-template override is needed.
+- **Answers.** `probabilities` are the softmax of the head’s logits for each question. `confidence` uses the System One adapter formulas. It can differ from the checkpoint’s reference `systemone()`, which reports the top option’s probability as confidence. Answers omit `x_label_mass` because the head scores only the allowed options.
+- **Long states.** Prompts, including images, are capped at 16,384 tokens, the reference `encode_record` function’s default `max_length`. The effective limit can be lower, depending on the server context, KV token pool, and `--max-prefill-tokens`. The server truncates the state to leave room for the questions and images. If those do not fit even without the state, it rejects the request.
+- **Images.** Send each image in `images` as a data URL, such as `data:image/jpeg;base64,...`, or an HTTP(S) URL. Keep the data-URL prefix for JPEGs: bare base64 starts with `/`, which the loader treats as a file path, causing the request to fail. Images precede the state.
 
 ## 3. Advanced usage
 
 ### 3.1 Text decisions
 
-The same request shape works with either variant. Set `MODEL` to the checkpoint selected in the wizard.
+Set `MODEL` to the checkpoint you selected in the wizard. The request works with either variant.
 
 <Accordion title="Text decision example (Python)">
 
