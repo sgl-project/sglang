@@ -2643,6 +2643,20 @@ class DeepseekSparseAttnBackend(
             sink_input[:num_heads].copy_(attn_sink)
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
+        # PPU int8: kpool tail tokens can break the 128 alignment of topk_indices,
+        # which the PPU FlashMLA sparse kernel asserts on; -1 padding is masked
+        # by the kernel just like the existing short-context tail padding.
+        if _is_ppu and page_table_1.shape[-1] % 128 != 0:
+            old_topk = page_table_1.shape[-1]
+            new_topk = ((old_topk + 127) // 128) * 128
+            padding_size = new_topk - old_topk
+            padding = torch.full(
+                (page_table_1.shape[0], padding_size),
+                -1,
+                dtype=page_table_1.dtype,
+                device=page_table_1.device,
+            )
+            page_table_1 = torch.cat([page_table_1, padding], dim=-1)
         indices_input = page_table_1.unsqueeze(1)
 
         # topk_length is the per-row count of valid indices

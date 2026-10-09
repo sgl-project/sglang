@@ -41,7 +41,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # [PPU-int8] allow flashmla_sparse for kpool on SM80
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
         ):
             return
         raise NotImplementedError(
