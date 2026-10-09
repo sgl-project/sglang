@@ -43,6 +43,12 @@ class SweepOrchestrator:
     def sweep_passes(self) -> int:
         return self._sweep_passes
 
+    @property
+    def is_enabled(self) -> bool:
+        # The sweep walks the radix cache, so it never launches on a runner the
+        # scheduler attaches none to (an EAGLE draft runner).
+        return self._config.sweep_interval > 0 and self._radix_cache is not None
+
     def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._radix_cache = radix_cache
 
