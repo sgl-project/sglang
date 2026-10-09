@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -189,6 +191,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    f.name: self._alloc_full_buffer(getattr(output, f.name), size)
+                    for f in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, f.name))
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -202,6 +213,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    f.name: self._slice_output(getattr(output, f.name), num_tokens)
+                    for f in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, f.name))
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -233,6 +253,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for f in dataclasses.fields(output):
+                value = getattr(output, f.name)
+                if torch.is_tensor(value):
+                    self._copy_output_to_buffer(
+                        value, getattr(output_buffer, f.name), num_tokens
+                    )
             return
         if (isinstance(output, list) and isinstance(output_buffer, list)) or (
             isinstance(output, tuple) and isinstance(output_buffer, tuple)
