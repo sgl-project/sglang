@@ -20,7 +20,7 @@ import re
 import sys
 from collections import defaultdict
 
-TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|OSHAPE|XIN)\]")
+TAG = re.compile(r"\[(CMPIDX|IDXK|C4KV|OSHAPE|XIN|LHID)\]")
 KV = re.compile(r"(\w+)=(\[[^\]]*\]|\([^)]*\)|[^\s]+)")
 MAX_REQ_SHOWN = 20
 MAX_DIFF_SHOWN = 8
@@ -114,7 +114,7 @@ def compare(tag, a_steps, b_steps):
 
 def main(path):
     recs = parse(path)
-    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
         print(f"parsed {tag}: {len(recs.get(tag, []))} lines")
     if not recs.get("CMPIDX"):
         print("\nno [CMPIDX] lines found. Enable DSV4_DUMP_CMPIDX and re-run.")
@@ -131,7 +131,7 @@ def main(path):
         print(f"  ... {len(cmp_reqs) - MAX_REQ_SHOWN} more requests")
     print(f"\nMISS = req{miss_i} (largest prefill ntok); each HIT compared to it.")
 
-    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN"):
+    for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
         rows = recs.get(tag, [])
         if not rows:
             continue
