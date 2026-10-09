@@ -1003,8 +1003,9 @@ class MambaAttnBackendBase(AttentionBackend):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`).
 
-        Unaligned rows read the fp32 ``h_track_buf`` snapshot written in-kernel
-        when given (its rows follow the batch, selected by the integer index
+        Unaligned rows read the ``h_track_buf`` snapshot written in-kernel
+        when given (in the kernel's native state dtype; its rows follow the batch,
+        selected by the integer index
         ``track_ssm_h_batch_src`` — a boolean mask would nonzero() and sync the
         stream once per layer); otherwise they fall back to the per-chunk
         states ``h`` (already rounded to the activation dtype)."""
