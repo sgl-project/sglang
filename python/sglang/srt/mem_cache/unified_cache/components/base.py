@@ -99,23 +99,25 @@ class PrepareLoadBackResult:
     allocated_mamba_slot: Optional[torch.Tensor] = None
 
 
-class BufferLoadBack:
+class BufferLoadBackContext:
     """A component's part in one buffer-mode load-back; the default has none.
 
-    ``load_xfers`` are H2D destinations beyond the staged transfers. After
-    ``cc.load``, ``finish`` sees its outcome; on success the insert takes
-    ``insert_fields()`` and the transfer ack frees ``redundant_destinations``.
+    ``load_transfers`` are H2D destinations beyond the staged transfers. After
+    ``cc.load``, ``finalize_allocation`` commits or rolls back preparation;
+    on success, ``get_insert_fields()`` supplies the node data for insert.
+    ``get_redundant_device_slots()`` returns slots to free after the H2D ack.
     """
 
-    load_xfers: tuple[PoolTransfer, ...] = ()
+    load_transfers: tuple[PoolTransfer, ...] = ()
 
-    def finish(self, success: bool) -> None:
+    def finalize_allocation(self, success: bool) -> None:
+        """Commit or roll back after allocation; H2D may still be pending."""
         pass
 
-    def insert_fields(self) -> dict[str, Any]:
+    def get_insert_fields(self) -> dict[str, Any]:
         return {}
 
-    def redundant_destinations(
+    def get_redundant_device_slots(
         self, insert_result: InsertResult
     ) -> list[tuple[PoolName, torch.Tensor]]:
         return []
@@ -776,10 +778,13 @@ class TreeComponent(ABC):
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
-    ) -> Optional[BufferLoadBack]:
-        """This component's part in loading a staged prefetch at admission;
-        None when the device cannot take it yet."""
-        return BufferLoadBack()
+    ) -> Optional[BufferLoadBackContext]:
+        """Validate staged data and prepare this component's load-back context.
+
+        Return None on insufficient device capacity. Invalid staged data is
+        an invariant violation, not a capacity failure.
+        """
+        return BufferLoadBackContext()
 
     def build_hicache_transfers(
         self,

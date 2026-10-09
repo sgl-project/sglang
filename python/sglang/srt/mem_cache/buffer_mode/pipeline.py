@@ -1276,7 +1276,7 @@ class BufferModePipeline:
         return request in self.staged_prefetches
 
     def prepare_staged_prefetch(self, req: Req) -> bool:
-        """Rebuild the admission plan from this pass's joint FULL/SWA match."""
+        """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None
         f = self.staged_prefetches.get(req.cache_request_handle)
         if f is None:
@@ -1287,16 +1287,7 @@ class BufferModePipeline:
         if joint_len >= f.matched_len + f.num_tokens:
             # The joint match already covers the staged span; a shorter FULL-only
             # prefix would strand the slots recomputed below cache_protected_len.
-            self._drop_staged_hit(req, reason="device_covered")
-            return True
-        mamba_slots = sum(
-            len(t.host_indices)
-            for t in f.aux_xfers
-            if t.name == PoolName.MAMBA and t.host_indices is not None
-        )
-        if not mamba_slots and ComponentType.MAMBA in self._cache.components:
-            # A span is reusable only up to the recurrent state ending it.
-            self._drop_staged_hit(req, reason="no_mamba_state")
+            self._resolve_device_covered(req)
             return True
         key = RadixKey(
             f.key_tokens,
@@ -1325,8 +1316,13 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.SWA and t.host_indices is not None
         )
+        mamba_slots = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.MAMBA and t.host_indices is not None
+        )
         if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
-            self._drop_staged_hit(req, reason="device_covered")
+            self._resolve_device_covered(req)
             return True
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
@@ -1341,12 +1337,12 @@ class BufferModePipeline:
         )
         return True
 
-    def _drop_staged_hit(self, req: Req, reason: str) -> None:
+    def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
-        self.release_staged_hold(req.cache_request_handle, reason=reason)
+        self.release_staged_hold(req.cache_request_handle, reason="device_covered")
 
     @staticmethod
     def _clear_storage_hit(req: Req) -> None:
@@ -1452,11 +1448,10 @@ class BufferModePipeline:
         prefix lock protects allocation-time eviction. None retains staging
         and its anchor for the next admission attempt.
 
-        Ownership contract: cc.load queues the H2D before insert adjudicates
-        ownership, so the prepared boundary must ensure the insert can only
-        ADD FULL nodes — a dedup would free slots the in-flight copy still
-        targets (queued use-after-free). Redundant aux destinations live
-        until the transfer ack."""
+        cc.load queues H2D before insert. Insert must preserve all FULL
+        destinations queued for H2D; freeing them during dedup would let the
+        pending copy overwrite reused slots. Free redundant auxiliary
+        destinations only after the transfer ack."""
         cache = self._cache
         req = params.req
         assert req is not None
@@ -1540,25 +1535,25 @@ class BufferModePipeline:
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
         # FULL suffix and may remain nonempty for an aux-only load.
-        load_xfers = list(f.aux_xfers)
+        load_transfers = list(f.aux_xfers)
         staged_swa = next(
             (
                 len(t.host_indices)
-                for t in load_xfers
+                for t in load_transfers
                 if t.name == PoolName.SWA and t.host_indices is not None
             ),
             0,
         )
-        shares = []
+        component_load_contexts = []
         for component in cache.components.values():
-            share = component.prepare_buffer_load_back(req, f.aux_xfers)
-            if share is None:
-                for prepared in shares:
-                    prepared.finish(success=False)
+            load_context = component.prepare_buffer_load_back(req, f.aux_xfers)
+            if load_context is None:
+                for load_context in component_load_contexts:
+                    load_context.finalize_allocation(success=False)
                 return _defer_for_capacity(component.component_type.name.lower())
-            shares.append(share)
+            component_load_contexts.append(load_context)
             # Not staging, so these stay out of the aux_xfers the ack frees.
-            load_xfers.extend(share.load_xfers)
+            load_transfers.extend(load_context.load_transfers)
         swa_entry = cc.mem_pool_host.entry_map.get(PoolName.SWA)
         binds_swa_to_full = (
             swa_entry is not None
@@ -1589,11 +1584,11 @@ class BufferModePipeline:
                 host_parts.append(
                     slice(tail_start - window_start, span_end - window_start)
                 )
-            for i, transfer in enumerate(load_xfers):
+            for i, transfer in enumerate(load_transfers):
                 if transfer.name != PoolName.SWA:
                     continue
                 # Keep the original complete host bounce for ack/drop release.
-                load_xfers[i] = replace(
+                load_transfers[i] = replace(
                     transfer,
                     host_indices=(
                         torch.cat([transfer.host_indices[part] for part in host_parts])
@@ -1603,15 +1598,15 @@ class BufferModePipeline:
                     anchor_index_parts=anchor_parts,
                 )
             if not anchor_parts:
-                load_xfers = [t for t in load_xfers if t.name != PoolName.SWA]
+                load_transfers = [t for t in load_transfers if t.name != PoolName.SWA]
 
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
-            extra_pools=load_xfers or None,
+            extra_pools=load_transfers or None,
         )
-        for share in shares:
-            share.finish(success=device_indices is not None)
+        for load_context in component_load_contexts:
+            load_context.finalize_allocation(success=device_indices is not None)
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
@@ -1626,7 +1621,7 @@ class BufferModePipeline:
         swa_dev = next(
             (
                 t.device_indices
-                for t in load_xfers
+                for t in load_transfers
                 if t.name == PoolName.SWA
                 and t.device_indices is not None
                 and t.device_indices.numel() > 0
@@ -1697,8 +1692,8 @@ class BufferModePipeline:
         # the caller's request lock then pins the span (load_back pattern).
         # prev_prefix_len covers the already-device-resident head.
         insert_fields = {}
-        for share in shares:
-            insert_fields.update(share.insert_fields())
+        for load_context in component_load_contexts:
+            insert_fields.update(load_context.get_insert_fields())
         insert_result = cache.insert(
             InsertParams(
                 key=key,
@@ -1710,8 +1705,10 @@ class BufferModePipeline:
                 **insert_fields,
             )
         )
-        for share in shares:
-            aux_device_releases.extend(share.redundant_destinations(insert_result))
+        for load_context in component_load_contexts:
+            aux_device_releases.extend(
+                load_context.get_redundant_device_slots(insert_result)
+            )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(
             request=f.request,
             num_tokens=load_tokens,

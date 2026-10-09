@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
-    BufferLoadBack,
+    BufferLoadBackContext,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -735,21 +735,20 @@ class MambaComponent(TreeComponent):
 
     def prepare_buffer_load_back(
         self, req: Req, staged: list[PoolTransfer]
-    ) -> Optional[BufferLoadBack]:
-        node_copy = next(
-            t
-            for t in staged
-            if t.name == PoolName.MAMBA
-            and t.host_indices is not None
-            and t.host_indices.numel() > 0
-        )
+    ) -> Optional[BufferLoadBackContext]:
+        node_copy = next((t for t in staged if t.name == PoolName.MAMBA), None)
+        assert (
+            node_copy is not None
+            and node_copy.host_indices is not None
+            and node_copy.host_indices.numel() == 1
+        ), "Mamba buffer load-back requires one staged checkpoint"
         prep = PrepareLoadBackResult()
         if not req.kv.holds_mamba:
             dst = self._alloc_request_state_slot(req)
             if dst is None:
                 return None
             prep = PrepareLoadBackResult(allocated_mamba_slot=dst)
-        return _MambaBufferLoadBack(self, req, node_copy, prep)
+        return _MambaBufferLoadBackContext(self, req, node_copy, prep)
 
     def prepare_prefetch(
         self,
@@ -1008,7 +1007,7 @@ class MambaComponent(TreeComponent):
         )
 
 
-class _MambaBufferLoadBack(BufferLoadBack):
+class _MambaBufferLoadBackContext(BufferLoadBackContext):
     """Loads the staged state into the published node's slot and, layer-gated,
     into the request's own: a device CoW would run before the layer gate."""
 
@@ -1023,7 +1022,7 @@ class _MambaBufferLoadBack(BufferLoadBack):
         self.req = req
         self.node_copy = node_copy
         self.prep = prep
-        self.load_xfers = (
+        self.load_transfers = (
             PoolTransfer(
                 name=PoolName.MAMBA,
                 host_indices=node_copy.host_indices,
@@ -1031,7 +1030,7 @@ class _MambaBufferLoadBack(BufferLoadBack):
             ),
         )
 
-    def finish(self, success: bool) -> None:
+    def finalize_allocation(self, success: bool) -> None:
         req = self.req
         if not success:
             self.component.finalize_load_back(req, self.prep, success=False)
@@ -1045,10 +1044,10 @@ class _MambaBufferLoadBack(BufferLoadBack):
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
 
-    def insert_fields(self) -> dict[str, torch.Tensor]:
+    def get_insert_fields(self) -> dict[str, torch.Tensor]:
         return {"mamba_value": self.node_copy.device_indices}
 
-    def redundant_destinations(
+    def get_redundant_device_slots(
         self, insert_result: InsertResult
     ) -> list[tuple[PoolName, torch.Tensor]]:
         # A SWA-only repair can keep the tail's existing checkpoint.
