@@ -99,10 +99,7 @@ def handle_gpu_memory_settings(server_args: Any):
                 decode_cuda_graph_config.max_bs = 8
         elif gpu_mem < 35 * 1024:
             # A10, 4090, 5090
-            # (chunked_prefill_size 4k, max_bs 48 if tp < 4 else 160)
-            # 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past
-            # bs=24; the previous cap forced eager decode at bs>=32 and
-            # collapsed high-concurrency throughput vs vLLM.
+            # (chunked_prefill_size 4k, max_bs 48 or 128 for 32GB SM120 if tp < 4)
             if cfg.chunked_prefill_size is None:
                 declare_resolution(
                     server_args,
@@ -111,7 +108,9 @@ def handle_gpu_memory_settings(server_args: Any):
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 48
+                    decode_cuda_graph_config.max_bs = (
+                        128 if gpu_mem >= 31 * 1024 and get_platform().is_sm120 else 48
+                    )
                 else:
                     decode_cuda_graph_config.max_bs = 160
         elif gpu_mem < 60 * 1024:
