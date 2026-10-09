@@ -24,10 +24,18 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
     TokenAxis,
+    append_stages,
 )
 from sglang.srt.layers.layer_boundary import boundary as comm_boundary
 from sglang.srt.layers.layer_boundary import construction as comm_layer
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+)
 from sglang.srt.layers.layer_boundary import exit as comm_exit
+from sglang.srt.layers.layer_boundary import (
+    layer_stack,
+)
 from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
@@ -48,6 +56,7 @@ from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
+    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
@@ -1956,6 +1965,159 @@ class TestTwoLayers(CustomTestCase):
                         first_layer_hands_on,
                         OwedOutput if owes else torch.Tensor,
                     )
+
+
+class RecordingGroup(Group):
+    """A Group that also records which collective each call runs."""
+
+    def all_reduce(self, x):
+        state().ops.append("all_reduce")
+        return super().all_reduce(x)
+
+    def reduce_scatter_tensor(self, output, input):
+        state().ops.append("reduce_scatter")
+        return super().reduce_scatter_tensor(output, input)
+
+    def all_gather_into_tensor(self, output, input):
+        state().ops.append("all_gather")
+        return super().all_gather_into_tensor(output, input)
+
+
+class TestCompleteOutputsOnInputScatteredBatches(CustomTestCase):
+    """On an input-scattered batch an FFN that hands on a complete output, one
+    its compute summed or the next stream it wrote itself, gets no further
+    sum, at its exit or at the next attention's entry. The next attention
+    still keeps this rank's slice of the residual and takes every row of its
+    input, as after an FFN whose output owes its sum."""
+
+    ATTN_TP = 2
+    ROWS = 4
+
+    def run_ranks(self, output, *, reduction, qkv_hook):
+        tp = self.ATTN_TP
+        world = World(tp)
+        WORLD[0] = world
+        group = RecordingGroup(world, "tp", range(tp))
+        x = torch.arange(1.0, self.ROWS * HIDDEN + 1, dtype=torch.double)
+        x = x.reshape(self.ROWS, HIDDEN)
+        # Norm doubles; the attention is 3x and the FFN 5x of its input.
+        before_ffn = x + 3 * (2 * x)
+        after_ffn = 5 * (2 * before_ffn) + before_ffn
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_context_parallel_extend=lambda: False,
+                is_decode_or_idle=lambda: False,
+                is_extend=lambda: True,
+            ),
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+            global_dp_buffer_len=self.ROWS,
+            input_ids=torch.zeros(self.ROWS),
+        )
+        ffn_declaration = {
+            "summed by its compute": dict(output_complete=True),
+            "written at its exit": dict(update=REPLACE_AT_EXIT),
+            "owing its sum": {},
+        }[output]
+        states = [
+            SimpleNamespace(
+                rank=rank,
+                parallel=parallel_of(
+                    attn_dp=1,
+                    attn_tp=tp,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    tp_group=group,
+                    attn_tp_group=group,
+                    enable_attn_tp_input_scattered=True,
+                ),
+                flags=Flags(),
+                calls=[],
+                ops=[],
+                attn_inputs=[],
+            )
+            for rank in range(tp)
+        ]
+        context = SimpleNamespace(
+            input_scattered=True,
+            is_dsa=False,
+            set_attn_inputs=lambda inputs: state().attn_inputs.append(inputs),
+        )
+
+        def ffn(hidden, s):
+            if output == "owing its sum":
+                return dense_mlp(hidden, s)
+            if output == "summed by its compute":
+                return 5 * hidden
+            # It adds the residual itself and writes the next stream.
+            return 5 * hidden + before_ffn
+
+        def build():
+            hook = {"qkv_latent_func": lambda h, fb: 11 * h} if qkv_hook else {}
+            with layer_stack():
+                attention_1, ffn_1 = append_stages(
+                    (declare_attn(), Norm()),
+                    (declare_ffn(**ffn_declaration), Norm()),
+                )
+                attention_2, _ = append_stages(
+                    (declare_attn(), Norm(), hook), (declare_ffn(), Norm())
+                )
+            return attention_1, ffn_1, attention_2
+
+        def forward(rank):
+            s = states[rank]
+            attention_1, ffn_1, attention_2 = stages[rank]
+            hidden, stream = prepare_input(
+                attention_1, x * WEIGHTS[tp][rank], None, forward_batch
+            )
+            hidden = stream.record(
+                attention(hidden, s),
+                comm.PLAIN_ADD,
+                declared_sum=ffn_1.entry(forward_batch).declared_sum,
+            )
+            hidden, stream = prepare_input(ffn_1, hidden, stream, forward_batch)
+            with ffn_1.plan.output.ffn_exit(
+                forward_batch, stream=ResidualStream()
+            ) as ffn_exit:
+                hidden = ffn(hidden, s)
+            computed = len(s.ops)
+            hidden, stream = finish_exit(ffn_exit, hidden, stream)
+            hidden, stream = prepare_input(attention_2, hidden, stream, forward_batch)
+            if qkv_hook:
+                hidden = s.attn_inputs[-1].fetch_qkv_latent()
+            return hidden, stream.residual, s.ops[computed:]
+
+        with (
+            running(reduce_scatterv=False, use_reduce_scatter=reduction == "rs"),
+            patch_communicator("get_attn_tp_context", lambda: context),
+        ):
+            stages = []
+            for s in states:
+                # Each rank binds its own stages; the stack is not shared
+                # between threads.
+                world.local.state = s
+                stages.append(build())
+            results, errors = world.run(states, forward)
+        for rank, error in enumerate(errors):
+            if error is not None:
+                raise AssertionError(f"rank {rank} raised") from error
+        rows = self.ROWS // tp
+        for rank, (hidden, residual, ops) in enumerate(results):
+            want = 2 * after_ffn * (11 if qkv_hook else 1)
+            torch.testing.assert_close(hidden, want, rtol=0, atol=0)
+            torch.testing.assert_close(
+                residual, after_ffn[rank * rows : (rank + 1) * rows], rtol=0, atol=0
+            )
+            sums = [op for op in ops if op != "all_gather"]
+            self.assertEqual(len(sums), output == "owing its sum", ops)
+
+    def test_a_complete_output_is_summed_no_further(self):
+        for output, reduction, qkv_hook in itertools.product(
+            ("summed by its compute", "written at its exit", "owing its sum"),
+            ("ar", "rs"),
+            (False, True),
+        ):
+            with self.subTest(output=output, reduction=reduction, qkv_hook=qkv_hook):
+                self.run_ranks(output, reduction=reduction, qkv_hook=qkv_hook)
 
 
 class TestTheFfnInputReduction(CustomTestCase):

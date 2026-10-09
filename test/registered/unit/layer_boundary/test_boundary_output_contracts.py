@@ -217,11 +217,16 @@ class TestBoundaryIntegrations(unittest.TestCase):
 
     def test_an_ffn_that_completes_its_own_sum_owes_none(self):
         # Its compute completes the sum, so the exit neither sums nor defers it,
-        # under DP too.
-        for attn_dp in (1, 2):
+        # under DP and on an input-scattered batch too.
+        for attn_dp, scattered in ((1, False), (2, False), (1, True)):
+            parallel = fixture.parallel_of(
+                attn_dp=attn_dp,
+                attn_tp=2,
+                enable_attn_tp_input_scattered=scattered,
+            )
             with (
-                self.subTest(attn_dp=attn_dp),
-                fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
+                self.subTest(attn_dp=attn_dp, input_scattered=scattered),
+                fixture.planning(parallel),
             ):
                 for sparse in (False, True):
                     stages = {
@@ -237,6 +242,10 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     }
                     owed = stages[False].plan.paths[BatchVariant.ORDINARY].output
                     self.assertIsNotNone(owed.group, sparse)
+                    if scattered:
+                        self.assertIn(
+                            BatchVariant.INPUT_SCATTERED, stages[True].plan.paths
+                        )
                     for variant, path in stages[True].plan.paths.items():
                         self.assertIsNone(path.output.group, (sparse, variant))
                         self.assertFalse(path.output.may_defer_to_next)

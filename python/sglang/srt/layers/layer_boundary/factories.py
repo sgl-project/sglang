@@ -152,6 +152,8 @@ def _resolve_ffn(
         group = SumGroup.MOE_OUTPUT
     else:
         group = SumGroup.ATTN_TP if on_attention_rows else SumGroup.TP
+    # An FFN that writes the next stream itself hands on a complete output.
+    complete = on_rank_rows or update.writes_stream or output_complete
     if variant is BatchVariant.SEQUENCE_PARALLEL:
         return (
             StageContract(
@@ -174,8 +176,9 @@ def _resolve_ffn(
                 InputContract(full, read=read),
                 OutputContract(
                     attention,
-                    group=group,
-                    may_reduce_scatter=use_reduce_scatter
+                    group=None if complete else group,
+                    may_reduce_scatter=not complete
+                    and use_reduce_scatter
                     and (scattered_residual or not terminal),
                     update=update,
                     transform=output_transform,
@@ -201,8 +204,6 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
-    # An FFN that writes the next stream itself hands on a complete output.
-    complete = on_rank_rows or update.writes_stream or output_complete
     produced = (
         OutputContract(rows, update=update, transform=output_transform)
         if complete
