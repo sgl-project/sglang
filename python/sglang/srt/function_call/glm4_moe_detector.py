@@ -136,7 +136,9 @@ def parse_arguments(
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = safe_literal_eval(json_value)
-        return parsed_value, True
+        # Bare comma expressions form Python tuples, not JSON argument values.
+        if not isinstance(parsed_value, tuple):
+            return parsed_value, True
     except (ValueError, SyntaxError):
         pass
 
