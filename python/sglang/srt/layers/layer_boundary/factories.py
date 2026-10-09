@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, NamedTuple, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -518,7 +518,49 @@ def _reject_unsupported(stage):
         )
 
 
-def _resolve_stage(stage, variant, following=None):
+class _Arrival(NamedTuple):
+    """What reaches a stage's entry from its producer, for one batch variant.
+    ``plain_add`` is None after an attention that always leaves its sum: the
+    entry receives that update with the output."""
+
+    produced: OutputContract
+    residual: Layout
+    plain_add: Optional[bool]
+    written: bool
+
+
+class _Flow(NamedTuple):
+    """One stage's residual data flow for one batch variant."""
+
+    contract: StageContract
+    arrival: _Arrival
+    during: Layout
+    returned: Layout
+
+
+def _stack_arrival(variant):
+    """What reaches the first stage of the model's layer stack: its input, on
+    the attention's rows (this rank's slice of them under sequence
+    parallelism), owing the TP sum an input-scattered batch leaves."""
+    _, attention, local, _ = _row_layouts(variant)
+    rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
+    owes = variant is BatchVariant.INPUT_SCATTERED
+    return _Arrival(
+        OutputContract(
+            rows,
+            group=SumGroup.TP if owes else None,
+            always_partial=owes,
+            update=None,
+        ),
+        rows,
+        True,
+        False,
+    )
+
+
+def _resolve_stage(stage, variant, arrival, following=None):
+    """``stage``'s data flow for ``variant``, given what arrives at its entry
+    and the stage after it (None when it ends the stack or a branch)."""
     axes, attention, local, full = _row_layouts(variant)
     _reject_unsupported(stage)
     if stage.kind is StageKind.FFN:
@@ -541,7 +583,7 @@ def _resolve_stage(stage, variant, following=None):
             # The residual's rows during the FFN: this rank's slice for an FFN
             # on its own rows, else the attention's.
             returned = residual
-        return declaration, residual, returned
+        return _Flow(declaration, arrival, residual, returned)
     sp = variant is BatchVariant.SEQUENCE_PARALLEL
     scattered = variant is BatchVariant.INPUT_SCATTERED
     gathers = (
@@ -587,145 +629,160 @@ def _resolve_stage(stage, variant, following=None):
             transform=stage.output_transform,
         ),
     )
-    return declaration, None, attention
+    # An attention moves no residual: it keeps the rows it arrives on, except
+    # that one that always leaves its sum completes an input-scattered sum
+    # it receives onto this rank's slice of them.
+    during = arrival.residual
+    if (
+        variant is BatchVariant.INPUT_SCATTERED
+        and arrival.produced.always_partial
+        and arrival.produced.update is None
+        and stage.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        during = Layout(during.sharded | {TokenAxis.ATTN_TP})
+    return _Flow(declaration, arrival, during, attention)
 
 
-def _connect(producer, consumer, *, residual_from=None):
-    """Resolve producer and consumer declarations; None denotes an external endpoint.
-
-    A missing producer is the stack input; a missing consumer is a layer or stack exit
-    whose next read is bound separately (or the terminal output).
-    ``residual_from`` names the boundary that placed the producer's residual.
-    It is needed for attention, whose residual can stay on finer rows than its
-    compute input. No executable stage participates in this construction.
-    """
-    if producer is None and consumer is None:
-        raise ValueError("a boundary needs at least one declared side")
-    before, after = producer, consumer
-    exits, entries = {}, {}
-    for variant in _active_variants():
-        _, attention, local, _ = _row_layouts(variant)
-        written = False
-        if before is None:
-            rows = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
-            owes = variant is BatchVariant.INPUT_SCATTERED
-            arrived = OutputContract(
-                rows,
-                group=SumGroup.TP if owes else None,
-                always_partial=owes,
-                update=None,
-            )
-            residual = rows
-            arriving_plain_add = True
-        else:
-            decl, during, returned = _resolve_stage(before, variant, following=after)
-            if during is None:
-                if residual_from is not None:
-                    if _detached(residual_from.consumer) != _detached(producer):
-                        raise ValueError("residual source must enter the producer")
-                    during = residual_from.entries[variant].residual_to
-                elif (
-                    before.kind is StageKind.ATTENTION
-                    and before.reduction is ProducerReduction.EXIT_SCOPED
-                ):
-                    during = attention
-                else:
-                    raise ValueError(
-                        "attention output needs its incoming residual placement"
-                    )
-            exits[variant] = EdgeContract(
-                decl.output, InputContract(returned), during, returned
-            )
-            if (
-                before.kind is StageKind.ATTENTION
-                and before.reduction is ProducerReduction.ALWAYS_PARTIAL
-            ):
-                arrived, residual, arriving_plain_add = decl.output, during, None
-            else:
-                owes = (
-                    variant is BatchVariant.INPUT_SCATTERED
-                    and not before.update.applied_at_exit
-                )
-                carries = (
-                    (
-                        before.kind is StageKind.ATTENTION
-                        and before.reduction is ProducerReduction.EXIT_SCOPED
-                    )
-                    or resolve_exit_rows(before.exit_rows) is ExitRows.ATTENTION
-                ) and (decl.output.always_partial or decl.output.may_defer_to_next)
-                arrived = OutputContract(
-                    returned,
-                    group=decl.output.group
-                    if carries
-                    else (SumGroup.TP if owes else None),
-                    always_partial=decl.output.always_partial if carries else owes,
-                    may_defer_to_next=decl.output.may_defer_to_next
-                    if carries
-                    else False,
-                    update=None,
-                )
-                residual = returned
-                arriving_plain_add = before.update.is_plain_add
-                written = before.update.applied_at_exit
-        if after is None:
-            continue
-        decl, during, _ = _resolve_stage(after, variant)
-        if after.kind is StageKind.ATTENTION:
-            during = (
-                Layout(residual.sharded | {TokenAxis.ATTN_TP})
-                if variant is BatchVariant.INPUT_SCATTERED
-                and arrived.always_partial
-                and arrived.update is None
-                and after.reduction is ProducerReduction.ALWAYS_PARTIAL
-                else residual
-            )
-        joins = (
-            variant is BatchVariant.INPUT_SCATTERED
-            and arrived.update is not None
-            and arrived.update.is_plain_add
-            and after.kind is StageKind.FFN
+def _arrival(producer, flow, variant):
+    """What reaches the stage after ``producer`` from it, given its flow."""
+    output = flow.contract.output
+    if (
+        producer.kind is StageKind.ATTENTION
+        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        # The output owes its sum, and the residual is where it ran.
+        return _Arrival(output, flow.during, None, False)
+    owes = (
+        variant is BatchVariant.INPUT_SCATTERED and not producer.update.applied_at_exit
+    )
+    carries = (
+        (
+            producer.kind is StageKind.ATTENTION
+            and producer.reduction is ProducerReduction.EXIT_SCOPED
         )
-        edge = EdgeContract(
-            arrived,
-            decl.input,
-            residual,
-            during,
-            residual_joins_sum=joins,
-            arriving_plain_add=arriving_plain_add,
-            arrives_written=written,
+        or resolve_exit_rows(producer.exit_rows) is ExitRows.ATTENTION
+    ) and (output.always_partial or output.may_defer_to_next)
+    return _Arrival(
+        OutputContract(
+            flow.returned,
+            group=output.group if carries else (SumGroup.TP if owes else None),
+            always_partial=output.always_partial if carries else owes,
+            may_defer_to_next=output.may_defer_to_next if carries else False,
+            update=None,
+        ),
+        flow.returned,
+        producer.update.is_plain_add,
+        producer.update.applied_at_exit,
+    )
+
+
+def _entry_edge(stage, flow, variant):
+    """The edge into ``stage`` as its entry binds it."""
+    arrival = flow.arrival
+    joins = (
+        variant is BatchVariant.INPUT_SCATTERED
+        and arrival.produced.update is not None
+        and arrival.produced.update.is_plain_add
+        and stage.kind is StageKind.FFN
+    )
+    return EdgeContract(
+        arrival.produced,
+        flow.contract.input,
+        arrival.residual,
+        flow.during,
+        residual_joins_sum=joins,
+        arriving_plain_add=arrival.plain_add,
+        arrives_written=arrival.written,
+    )
+
+
+def _exit_edge(stage, flow, entry):
+    """The edge out of ``stage`` as its exit binds it. An attention that always
+    leaves its sum has no exit: its edge is its consumer's entry edge, when
+    there is a consumer."""
+    if entry is not None and (
+        stage.kind is StageKind.ATTENTION
+        and stage.reduction is ProducerReduction.ALWAYS_PARTIAL
+    ):
+        return entry
+    return EdgeContract(
+        flow.contract.output, InputContract(flow.returned), flow.during, flow.returned
+    )
+
+
+def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
+    """The connections along a chain of stages, each resolved once per batch
+    variant: into ``line[0]``, between each two, and out of ``line[-1]`` to
+    ``after`` (a stage on the next rank, or None at the end of the stack or a
+    branch). What arrives at ``line[0]`` is ``arrivals``, else what ``before``
+    (a stage on the previous rank, or None for the stack input) hands on; that
+    rank's own entry is taken as the stack input's. An error resolving a stage
+    names the append at ``origins[i]`` that declared ``line[i]``, or the one
+    next to the neighbouring rank's stage."""
+    variants = tuple(_active_variants())
+
+    def resolve(position, stage, arrivals, following=None):
+        try:
+            return {
+                v: _resolve_stage(stage, v, arrivals[v], following) for v in variants
+            }
+        except Exception as error:
+            _note_origin(error, origins[position])
+            raise
+
+    if arrivals is None:
+        arrivals = {v: _stack_arrival(v) for v in variants}
+        if before is not None:
+            flow = resolve(0, before, arrivals, line[0])
+            arrivals = {v: _arrival(before, flow[v], v) for v in variants}
+    flows = []
+    for position, stage in enumerate(line):
+        following = line[position + 1] if position + 1 < len(line) else after
+        flow = resolve(position, stage, arrivals, following)
+        flows.append(flow)
+        arrivals = {v: _arrival(stage, flow[v], v) for v in variants}
+    if after is not None:
+        flows.append(resolve(len(line) - 1, after, arrivals))
+    entries = [
+        {v: _entry_edge(stage, flow[v], v) for v in variants}
+        for stage, flow in zip([*line, after], flows)
+    ]
+    connections = [StageConnection(before, line[0], {}, entries[0])]
+    for position, stage in enumerate(line):
+        consumer = line[position + 1] if position + 1 < len(line) else after
+        following = entries[position + 1] if consumer is not None else {}
+        connections.append(
+            StageConnection(
+                stage,
+                consumer,
+                {
+                    v: _exit_edge(stage, flows[position][v], following.get(v))
+                    for v in variants
+                },
+                following,
+            )
         )
-        entries[variant] = edge
-        if (
-            before is not None
-            and before.kind is StageKind.ATTENTION
-            and before.reduction is ProducerReduction.ALWAYS_PARTIAL
-        ):
-            exits[variant] = edge
-    return StageConnection(producer, consumer, exits, entries)
+    return connections
 
 
-def _fork_input(prepared, consumer):
-    """Place an already-read input onto a branch's computation rows.
-
-    The branch adapter performs the move and forks the stream. It does not
-    execute the branch's input norm again.
-    """
-    entries = {}
+def _fork_input(prepared):
+    """What reaches a branch's first stage: an already-read input, placed onto
+    the branch's computation rows by the branch adapter, which forks the
+    stream without running the branch's input norm again."""
+    arrivals = {}
     for variant in _active_variants():
         if variant is not BatchVariant.ORDINARY:
             raise NotImplementedError(
                 "prepared branch transport requires ordinary token rows"
             )
         source = prepared.entries[variant]
-        declaration, during, _ = _resolve_stage(consumer, variant)
-        entries[variant] = EdgeContract(
+        arrivals[variant] = _Arrival(
             OutputContract(source.need.layout, update=None),
-            declaration.input,
             source.residual_to,
-            during,
-            arriving_plain_add=True,
+            True,
+            False,
         )
-    return StageConnection(prepared.consumer, consumer, {}, entries)
+    return arrivals
 
 
 class _Append:
@@ -918,20 +975,12 @@ def _bind_stack(appends, *, previous, following, final_read=None):
             replace(append.declarations[index], previous=producer, prepared_from=None)
         )
         producer = _detached(chained[-1])
-    connections = []
-    for position, declaration in enumerate(chained):
-        try:
-            if not connections:
-                connections.append(_stack_entry(declaration, declaration.previous))
-            consumer = (
-                chained[position + 1] if position + 1 < len(chained) else following
-            )
-            connections.append(
-                _connect(declaration, consumer, residual_from=connections[position])
-            )
-        except Exception as error:
-            _note_origin(error, stages[position][0].origin)
-            raise
+    connections = _connect_line(
+        chained,
+        [append.origin for append, _ in stages],
+        before=chained[0].previous,
+        after=following,
+    )
     _bind_line(
         stages,
         chained,
@@ -961,17 +1010,16 @@ def _bind_stack(appends, *, previous, following, final_read=None):
                 )
             )
         try:
-            connections = [_fork_input(source_incoming, chained[0])]
-            for position, declaration in enumerate(chained):
-                consumer = (
-                    chained[position + 1] if position + 1 < len(chained) else None
-                )
-                connections.append(
-                    _connect(declaration, consumer, residual_from=connections[position])
-                )
+            arrivals = _fork_input(source_incoming)
         except Exception as error:
             _note_origin(error, append.origin)
             raise
+        connections = _connect_line(
+            chained,
+            [append.origin] * len(chained),
+            before=source_declaration,
+            arrivals=arrivals,
+        )
         _bind_line(branch, chained, connections, bound, sources)
     bound = [tuple(bound[id(append)]) for append in appends]
     _check_declared_gathers(appends, bound, remote_producer=previous is not None)
@@ -979,21 +1027,6 @@ def _bind_stack(appends, *, previous, following, final_read=None):
         for returned, boundary in zip(append.boundaries, boundaries):
             returned.plan = boundary.plan
             returned.declaration = boundary.declaration
-
-
-def _stack_entry(stage, producer):
-    """The connection into a stack's first stage from ``producer``: the
-    stage before it on the previous rank, or None for the stack input. An
-    attention that always leaves its sum keeps its residual on the rows it ran
-    on, which this rank takes as the stack input's."""
-    source = None
-    if (
-        producer is not None
-        and producer.kind is StageKind.ATTENTION
-        and producer.reduction is ProducerReduction.ALWAYS_PARTIAL
-    ):
-        source = _connect(None, producer)
-    return _connect(producer, stage, residual_from=source)
 
 
 def _bind_line(stages, chained, connections, bound, sources, *, final_read=None):
