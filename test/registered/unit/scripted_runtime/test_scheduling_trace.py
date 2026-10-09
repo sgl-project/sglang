@@ -65,6 +65,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
     def test_paused_iterations_record_reader_values(self):
         # A paused iteration plans nothing, so no schedule record would carry
         # the idle values that flush_cache and pause see in that state.
+        inflight = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b")]
         scheduler = SimpleNamespace(
             _engine_paused=False,
             load_inquirer=SimpleNamespace(
@@ -73,10 +74,13 @@ class TestSchedulingTraceWriter(CustomTestCase):
                 )
             ),
             is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
+            # Unordered in the scheduler (a set): the record sorts the labels.
+            collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "t.jsonl")
             writer = SchedulingTraceWriter(path, {})
+            writer._labels(inflight)
             writer.observe_readers(scheduler)
             scheduler._engine_paused = True
             writer.observe_readers(scheduler)
@@ -91,6 +95,7 @@ class TestSchedulingTraceWriter(CustomTestCase):
                     "step": 0,
                     "idle": False,
                     "idle_ignore_waiting": True,
+                    "inflight": ["r0", "r1"],
                     "load": {"running": 0, "waiting": 1},
                 }
             ],

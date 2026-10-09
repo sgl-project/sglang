@@ -5,10 +5,11 @@ one JSONL file there: a ``header`` record with the server config the trace
 ran under, then a ``schedule`` record each time the scheduler picks the next
 batch and a ``result`` record each time a batch result is processed.
 A schedule record also carries what the scheduler's readers (the idle checks
-behind health check, pause and flush, and the load report) saw at the top of
-that scheduler iteration, where they run. Iterations while the engine is
-paused plan nothing, so each writes those reader values as a ``paused``
-record instead; the script's yields fix how many there are.
+behind health check, pause and flush, the in-flight set that abort and weight
+updates reach, and the load report) saw at the top of that scheduler
+iteration, where they run. Iterations while the engine is paused plan
+nothing, so each writes those reader values as a ``paused`` record instead;
+the script's yields fix how many there are.
 Records hold only what two runs of one commit reproduce: rids are relabeled
 r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
 
@@ -104,6 +105,9 @@ class SchedulingTraceWriter:
         self._readers = {
             "idle": scheduler.is_fully_idle(),
             "idle_ignore_waiting": scheduler.is_fully_idle(ignore_waiting=True),
+            # The reqs abort-all and weight-version changes reach. A set, so
+            # sorted; each was already labeled by an earlier schedule record.
+            "inflight": sorted(self._labels(scheduler.collect_inflight_reqs())),
             "load": {
                 "running": load.num_running_reqs,
                 "waiting": load.num_waiting_reqs,
