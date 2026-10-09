@@ -80,8 +80,8 @@ def tag_sig(tag, rec):
     if tag == "OSHAPE":
         return oshape_sig(rec)
     if tag in ("IDXK", "C4KV"):
-        # both carry two windows: deep prefix (written once) + tail (rewritten)
-        return f"pre={rec.get('pre')}|tail={rec.get('tail')}"
+        # logical = md5 of the pages the request actually reads (via its page table)
+        return f"logical={rec.get('logical')}"
     return rec.get("md5")
 
 
@@ -98,6 +98,13 @@ def compare(tag, a_steps, b_steps):
                 ta, tb = a.get("tail", "?"), b.get("tail", "?")
                 if ta != tb:
                     prefill.append((lp, ly, ta, tb))
+                continue
+            if (
+                tag != "CMPIDX"
+                and a.get("ntok") is not None
+                and a.get("ntok") != b.get("ntok")
+            ):
+                # shape-confounded (e.g. XIN prefill-vs-suffix): not a real diff
                 continue
             ea, eb = tag_sig(tag, a), tag_sig(tag, b)
             if ea != eb:

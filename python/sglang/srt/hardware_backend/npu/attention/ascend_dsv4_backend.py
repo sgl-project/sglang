@@ -89,6 +89,28 @@ def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
 _walsh_hadamard_matrix._cache = {}
 
 
+def _read_page_table_md5(buf, tbl, pages, max_pages: int = 256):
+    """md5 of the LOGICAL content the request actually reads: gather the pages
+    its page table points at, so identical prompts hash equal regardless of
+    physical page reuse. CPU gather (A5 fp8 has no index_select)."""
+    import hashlib
+
+    if tbl is None or not torch.is_tensor(tbl) or not tbl.numel():
+        return "none"
+    ids = torch.unique(tbl.reshape(-1).to(torch.int64))
+    ids = ids[(ids >= 0) & (ids < pages)]
+    if ids.numel() == 0:
+        return "empty"
+    if ids.numel() > max_pages:
+        ids = ids[-max_pages:]
+    slab = buf.detach().to("cpu")[ids.cpu()]
+    try:
+        raw = slab.contiguous().view(torch.uint8).numpy().tobytes()
+    except Exception:
+        raw = slab.to(torch.float32).numpy().tobytes()
+    return hashlib.md5(raw).hexdigest()[:16]
+
+
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
@@ -1050,7 +1072,7 @@ class C4IndexerAscendBackendMixin:
                 xt = x.detach().contiguous().to("cpu")
                 print(
                     f"[XIN] layer={layer_id} lastpos={lastpos} "
-                    f"shape={tuple(xt.shape)} md5={_md5(xt)}",
+                    f"ntok={int(xt.shape[0])} shape={tuple(xt.shape)} md5={_md5(xt)}",
                     flush=True,
                 )
             except Exception as exc:
@@ -1072,19 +1094,14 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, True)
                 pages = int(buf.shape[0])
-                pre_hi = min(pages, 8)            # deep prefix: written once at prefill, never rewritten
-                tail_lo = max(0, pages - 16)      # recent tail: added/rewritten during decode
-                parts = (
-                    f"prehi={pre_hi} pre={_md5(buf[0:pre_hi])} "
-                    f"taillo={tail_lo} tail={_md5(buf[tail_lo:pages])}"
+                # LOGICAL content the request reads (via its c4 page table), not
+                # fixed physical pages (which hold other requests' data).
+                logical = _read_page_table_md5(
+                    buf, getattr(self.forward_metadata, "c4_page_table", None), pages
                 )
-                win = os.environ.get("DSV4_DUMP_IDXK_PAGES")  # optional extra window, e.g. "120:128"
-                if win:
-                    lo_s, hi_s = win.split(":")
-                    lo, hi = max(0, int(lo_s)), min(pages, int(hi_s))
-                    parts += f" winlo={lo} winhi={hi} win={_md5(buf[lo:hi])}"
                 print(
-                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} {parts}",
+                    f"[IDXK] layer={layer_id} lastpos={lastpos} pages={pages} "
+                    f"logical={logical}",
                     flush=True,
                 )
             except Exception as exc:
@@ -1094,17 +1111,12 @@ class C4IndexerAscendBackendMixin:
             try:
                 buf = self.token_to_kv_pool.get_compress_buffer(layer_id, False)
                 pages = int(buf.shape[0])
-                pre_hi = min(pages, 8)        # deep prefix: written once, never rewritten
-                tail_lo = max(0, pages - 16)  # recent tail: added/rewritten during decode
-                tbl = getattr(self.forward_metadata, "c4_page_table", None)
-                ids = list(range(max(0, pages - 8), pages))
-                if torch.is_tensor(tbl) and tbl.numel():
-                    row = [int(v) for v in tbl[0].reshape(-1).tolist()]
-                    ids = sorted({max(0, min(int(v), pages - 1)) for v in row[-8:]})
+                logical = _read_page_table_md5(
+                    buf, getattr(self.forward_metadata, "c4_page_table", None), pages
+                )
                 print(
                     f"[C4KV] layer={layer_id} lastpos={lastpos} pages={pages} "
-                    f"prehi={pre_hi} pre={_md5(buf[0:pre_hi])} "
-                    f"taillo={tail_lo} tail={_md5(buf[tail_lo:pages])} lastids={ids}",
+                    f"logical={logical}",
                     flush=True,
                 )
             except Exception as exc:
