@@ -217,6 +217,33 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         self.assertIsNone(path.output.group, (sparse, variant))
                         self.assertFalse(path.output.may_defer_to_next)
 
+    def test_an_ffn_that_completes_its_own_sum_owes_none(self):
+        # Its compute completes the sum, so the exit neither sums nor defers it,
+        # under DP too.
+        for attn_dp in (1, 2):
+            with (
+                self.subTest(attn_dp=attn_dp),
+                fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
+            ):
+                for sparse in (False, True):
+                    stages = {
+                        complete: build_stages(
+                            (declare_attn(), fixture.Norm()),
+                            (
+                                declare_ffn(sparse=sparse, output_complete=complete),
+                                fixture.Norm(),
+                            ),
+                            previous=declare_ffn(sparse=sparse),
+                        )[1]
+                        for complete in (False, True)
+                    }
+                    owed = stages[False].plan.paths[BatchVariant.ORDINARY].output
+                    self.assertIsNotNone(owed.group, sparse)
+                    for variant, path in stages[True].plan.paths.items():
+                        self.assertIsNone(path.output.group, (sparse, variant))
+                        self.assertFalse(path.output.may_defer_to_next)
+                        self.assertFalse(path.output.may_reduce_scatter)
+
     def test_only_an_ffn_writing_the_next_stream_sums_its_parts(self):
         summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
         fb = SimpleNamespace()
