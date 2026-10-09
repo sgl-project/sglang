@@ -36,12 +36,11 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.srt.environ import envs
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REPO,
     SGL_TEST_FILES_CI_DATA_REVISION,
 )
-
+from sglang.srt.environ import envs
 
 @dataclass
 class ToleranceConfig:
