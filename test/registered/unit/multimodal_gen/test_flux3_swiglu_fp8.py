@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+
 from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Fp8RowwiseLinear
 from sglang.test.ci.ci_register import register_cuda_ci
