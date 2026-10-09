@@ -804,18 +804,22 @@ class ModelRunner:
         """Whether the PP-boundary hidden states entering this rank's first local
         layer are attn-TP-scattered (num_tokens // attn_tp_size rows per rank).
 
-        A2A-MoE backends (e.g. deepep) leave the boundary in ScatterMode.SCATTERED,
-        so pp_proxy buffers used for graph capture and warmup must be sliced to the
-        scattered row count; full-length slicing trips the ``world_size * size``
-        check in the first local layer's scattered->TP_ATTN_FULL all-gather. Models
-        without per-layer scatter modes always transfer full-length tensors.
+        The layer_boundary refactor replaced the old ScatterMode machinery:
+        when the first local stage declares its incoming residual rows
+        ATTN_TP_SCATTER, it gathers them itself on read, so the tensor crossing
+        the PP boundary is rank-local — the scheduler transport must not
+        all-gather it, and pp_proxy buffers used for graph capture and warmup
+        must be sliced to the scattered row count (full-length slicing trips
+        the ``world_size * size`` check in the first local layer's
+        scattered->TP_ATTN_FULL all-gather). Models whose boundary rows stay
+        replicated always transfer full-length tensors.
         """
         if get_parallel().pp_size <= 1 or get_parallel().pp_rank == 0:
             return False
-        from sglang.srt.layers.communicator import ScatterMode
-
-        modes = self._local_layer_scatter_modes(first=True)
-        return modes is not None and modes.layer_input_mode == ScatterMode.SCATTERED
+        first_attn_stage = self._pp_boundary_stages()[0]
+        return first_attn_stage is not None and (
+            first_attn_stage.input_on_attention_tp_slices
+        )
 
     def is_pp_proxy_output_scattered(self) -> bool:
         """Whether the hidden states sent across the next PP boundary (this
@@ -823,23 +827,38 @@ class ModelRunner:
         transport, whose send-slice + recv-all-gather assumes replicated tensors."""
         if get_parallel().pp_size <= 1 or get_parallel().pp_rank == get_parallel().pp_size - 1:
             return False
-        from sglang.srt.layers.communicator import ScatterMode
+        from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+        from sglang.srt.layers.layer_boundary.layout import TokenAxis
 
-        modes = self._local_layer_scatter_modes(first=False)
-        return modes is not None and modes.layer_output_mode == ScatterMode.SCATTERED
+        last_ffn_stage = self._pp_boundary_stages()[1]
+        edges = (
+            last_ffn_stage.plan.variants.get(BatchVariant.ORDINARY)
+            if last_ffn_stage is not None
+            else None
+        )
+        produced = getattr(edges, "outgoing", None)
+        produced = getattr(produced, "produced", None) if produced else None
+        layout = getattr(produced, "layout", None)
+        return layout is not None and (
+            TokenAxis.ATTN_TP_SCATTER in layout.sharded
+        )
 
-    def _local_layer_scatter_modes(self, *, first: bool):
-        """Scatter modes of this rank's first (or last) local decoder layer; its
-        input (output) mode is the mode of the tensor crossing the adjacent PP
-        boundary. None for models that manage the boundary at the model level."""
-        modes = None
+    def _pp_boundary_stages(self):
+        """(first local attn stage, last local ffn stage) for PP boundary queries.
+
+        Modules are visited in registration order, so the first module exposing
+        an attn_boundary is the first local layer and the last one exposing an
+        ffn_boundary is the last local layer.
+        """
+        first_attn = last_ffn = None
         for module in self.model.modules():
-            found = getattr(module, "layer_scatter_modes", None)
-            if found is not None:
-                modes = found
-                if first:
-                    break
-        return modes
+            attn = getattr(module, "attn_boundary", None)
+            if attn is not None and first_attn is None:
+                first_attn = attn
+            ffn = getattr(module, "ffn_boundary", None)
+            if ffn is not None:
+                last_ffn = ffn
+        return first_attn, last_ffn
 
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
