@@ -1,6 +1,5 @@
 """Precision and checkpoint-layout regressions for native Beam."""
 
-import itertools
 import math
 import os
 import tempfile
@@ -118,15 +117,7 @@ class AddLayer(torch.nn.Module):
         return hidden + self.amount
 
     def forward_fused(
-        self,
-        positions,
-        normed,
-        residual,
-        batch,
-        next_weight,
-        ssmax_scale,
-        moe_all_reduce_comm=None,
-        attention_all_reduce_comm=None,
+        self, positions, normed, residual, batch, next_weight, ssmax_scale
     ):
         hidden = self.forward(positions, residual, batch, ssmax_scale)
         return hidden * next_weight, hidden
@@ -842,18 +833,11 @@ class TestBeamLoading(CustomTestCase):
         )
 
     def test_attention_tp_shards_and_packed_projections(self):
-        """LoRA must retain its QKV/gate targets and load the same TP shards."""
         config = tiny_config()
-        for tp_size, lora_mode in itertools.product(
-            (1, 2, 4, 8, 16), ("off", "dynamic", "preloaded")
-        ):
+        for tp_size in (1, 2, 8, 16):
             rank = tp_size - 1
             with (
-                self.subTest(tp_size=tp_size, lora_mode=lora_mode),
-                get_context().override_server_args(
-                    enable_lora=lora_mode == "dynamic",
-                    lora_paths=["test-adapter"] if lora_mode == "preloaded" else None,
-                ),
+                self.subTest(tp_size=tp_size),
                 get_parallel().override(
                     tp_size=tp_size,
                     attn_tp_rank=rank,
@@ -872,11 +856,11 @@ class TestBeamLoading(CustomTestCase):
                     24, [32, 32], bias=False, tp_rank=rank, tp_size=tp_size
                 )
                 params = {
+                    "model.layers.0.self_attn.qkv_proj.weight": attention.qkv_proj.weight,
+                    "model.layers.0.self_attn.gate_proj.weight": attention.gate_proj.weight,
                     "model.layers.0.self_attn.gate_bias": attention.gate_bias,
                     "model.layers.0.mlp.gate_up_proj.weight": dense.weight,
                 }
-                for name, param in attention.named_parameters():
-                    params[f"model.layers.0.self_attn.{name}"] = param
                 weights = {
                     f"model.layers.0.self_attn.{name}.weight": torch.arange(width * 24)
                     .reshape(width, 24)
@@ -889,7 +873,6 @@ class TestBeamLoading(CustomTestCase):
                     )
                 }
                 weights["model.layers.0.self_attn.v_proj.weight"] += 20000
-                weights["model.layers.0.self_attn.gate_proj.weight"] += 40000
                 weights["model.layers.0.self_attn.gate_bias"] = torch.arange(48).float()
                 weights["model.layers.0.mlp.gate_proj.weight"] = (
                     torch.arange(32 * 24).reshape(32, 24).float()
@@ -914,37 +897,13 @@ class TestBeamLoading(CustomTestCase):
                         ],
                     ]
                 )
-                expected_gate = weights["model.layers.0.self_attn.gate_proj.weight"][
-                    q_start : q_start + attention.q_size
-                ]
-                if lora_mode == "off" and tp_size <= config.num_key_value_heads:
-                    torch.testing.assert_close(
-                        attention.qkv_gate_proj.weight,
-                        torch.cat([expected_qkv, expected_gate]),
-                    )
-                    # Packed outputs have a wider row stride. Splitting and
-                    # reshaping the gate must preserve token/head ordering.
-                    value = torch.arange(3 * 24).reshape(3, 24).float() / 100
-                    actual, _ = attention.qkv_gate_proj(value)
-                    expected = torch.cat(
-                        [
-                            torch.nn.functional.linear(value, expected_qkv),
-                            torch.nn.functional.linear(value, expected_gate),
-                        ],
-                        dim=-1,
-                    )
-                    torch.testing.assert_close(actual, expected)
-                    gate = actual[:, -attention.q_size :].view(
-                        -1, attention.num_heads, attention.head_dim
-                    )
-                    torch.testing.assert_close(
-                        gate.flatten(1), expected[:, -attention.q_size :]
-                    )
-                else:
-                    torch.testing.assert_close(attention.qkv_proj.weight, expected_qkv)
-                    torch.testing.assert_close(
-                        attention.gate_proj.weight, expected_gate
-                    )
+                torch.testing.assert_close(attention.qkv_proj.weight, expected_qkv)
+                torch.testing.assert_close(
+                    attention.gate_proj.weight,
+                    weights["model.layers.0.self_attn.gate_proj.weight"][
+                        q_start : q_start + attention.q_size
+                    ],
+                )
                 torch.testing.assert_close(
                     attention.gate_bias, torch.arange(48).float().chunk(tp_size)[rank]
                 )

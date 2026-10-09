@@ -1,4 +1,4 @@
-"""Tiny BF16-activation GEMM for skinny ``x[m, k] @ w[n, k].T`` with a handful of rows.
+"""Tiny bf16 GEMM for skinny ``x[m, k] @ w[n, k].T`` with a handful of rows.
 
 Two kernels behind one entry point, picked by whichever of N / K is the tiny
 dimension: the N variant spreads K across a block and walks N, the K variant
@@ -14,7 +14,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -43,24 +42,10 @@ def _prefer_k_variant(n: int, k: int) -> bool:
 
 @cache_once
 def _jit_tiny_gemm_module(
-    n: int,
-    k: int,
-    max_m: int,
-    n_split: int,
-    out_dtype: torch.dtype,
-    weight_dtype: torch.dtype = torch.bfloat16,
+    n: int, k: int, max_m: int, n_split: int, out_dtype: torch.dtype
 ) -> Module:
     use_k_variant = _prefer_k_variant(n, k)
-    if weight_dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("tiny_gemm requires BF16 or FP32 weights")
-    if use_k_variant and weight_dtype != torch.bfloat16:
-        raise ValueError(
-            "FP32 weights require the tiny-N variant (N >= K is unsupported)"
-        )
-    weight_args = () if use_k_variant else (weight_dtype,)
-    args = make_cpp_args(
-        n, k, max_m, n_split, out_dtype, is_arch_support_pdl(), *weight_args
-    )
+    args = make_cpp_args(n, k, max_m, n_split, out_dtype, is_arch_support_pdl())
     name = "tiny_k_gemm" if use_k_variant else "tiny_n_gemm"
     kernel = "TinyKGemmKernel" if use_k_variant else "TinyNGemmKernel"
     return load_jit(
@@ -107,13 +92,7 @@ def _supports_k_variant(n: int, k: int) -> bool:
 
 
 @cache_once
-def _default_n_gemm_n_split(
-    n: int, k: int, max_m: int, weight_dtype: torch.dtype = torch.bfloat16, m: int = 16
-) -> int:
-    if weight_dtype == torch.float32 and (n, k) == (256, 5120) and max_m <= 16:
-        # Rotating 49 FP32 router weights under CUDA graph replay.
-        small_m = 8 if get_jit_cuda_arch().major == 10 else 4
-        return 1 if m <= small_m else 2
+def _default_n_gemm_n_split(n: int, k: int, max_m: int) -> int:
     split_cap = _n_gemm_block_threads(k) // max_m
     candidates = [d for d in range(1, min(n, split_cap) + 1) if n % d == 0]
     if not candidates:
@@ -158,7 +137,7 @@ def _tiny_gemm_custom_op(
     n_split: int,
 ) -> None:
     n, k = w.shape
-    module = _jit_tiny_gemm_module(n, k, max_m, n_split, out.dtype, w.dtype)
+    module = _jit_tiny_gemm_module(n, k, max_m, n_split, out.dtype)
     module.run(x, w, out)
 
 
@@ -188,7 +167,7 @@ def tiny_gemm_bf16(
     rather than falling back.
 
     :param x: Shape [m, k], must be bf16_t, `m <= max_m`
-    :param w: Shape [n, k], BF16 or (for N < K) FP32; never downcast
+    :param w: Shape [n, k], must be bf16_t
     """
     n, k = w.shape
     if out is None:
@@ -200,7 +179,7 @@ def tiny_gemm_bf16(
         n_split = (
             _default_k_gemm_n_split(n, k)
             if _prefer_k_variant(n, k)
-            else _default_n_gemm_n_split(n, k, max_m, w.dtype, x.shape[0])
+            else _default_n_gemm_n_split(n, k, max_m)
         )
     _tiny_gemm_custom_op(x, w, out, max_m, n_split)
     return out
