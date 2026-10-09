@@ -145,6 +145,82 @@ def _zero_c4_boundary(
     )
 
 
+def _zero_c128_boundary(
+    batch: "ScheduleBatch",
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+) -> None:
+    """Diagnostic A/B (env ``SGLANG_DSV4_ZERO_C128_BOUNDARY`` /
+    ``SGLANG_DSV4_DUMP_C128_BOUNDARY``): like :func:`_zero_c4_boundary` but for
+    the ratio-128 compress-STATE ring, which is REQUEST-SCOPED
+    (``req_pool_idx*ring_size + pos%ring_size``) and is NOT in the SWA/PD
+    transport list (``get_state_buf_infos`` only carries ``ratio == 4``), so a
+    radix hit does not restore it. Layer 3 is the first ratio-128 layer and the
+    first to diverge; this tests whether its boundary state
+    ``[prefix-128, prefix)`` drives the hit != miss split. Default off.
+    """
+    import os
+
+    do_zero = bool(os.environ.get("SGLANG_DSV4_ZERO_C128_BOUNDARY"))
+    do_dump = bool(os.environ.get("SGLANG_DSV4_DUMP_C128_BOUNDARY"))
+    if not (do_zero or do_dump):
+        return
+    tree_cache = getattr(batch, "tree_cache", None)
+    alloc = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if alloc is None:
+        return
+    kvcache = alloc.get_kvcache()
+    state_pools = getattr(kvcache, "compress_state_pools", None)
+    if not state_pools:
+        return
+
+    ratio = 128
+    coff = 2
+    window = (coff - 1) * ratio  # 128
+    total = 0
+    hit_reqs = 0
+    for i in range(len(batch.reqs)):
+        prefix_len = int(prefix_lens_cpu[i])
+        lo = prefix_len - window
+        if prefix_len <= 0 or lo < 0:
+            continue
+        hit_reqs += 1
+        for pool in state_pools:
+            if pool is None or pool.ratio != ratio:
+                continue
+            state = pool.kv_score_buffer.kv_score
+            dev = state.device
+            positions = torch.arange(lo, prefix_len, device=dev, dtype=torch.int64)
+            rp = req_pool_indices_cpu.to(dev, dtype=torch.int64).reshape(-1)
+            sloc = (
+                pool.translate_from_req_position_to_state_loc(
+                    rp[i].reshape(1), positions
+                )
+                .reshape(-1)
+                .to(torch.int64)
+            )
+            valid = (sloc >= 0) & (sloc < state.shape[0])
+            if not bool(valid.any()):
+                continue
+            if do_dump:
+                import hashlib
+
+                rows = state[sloc[valid]].detach().to(torch.float32).cpu().numpy()
+                print(
+                    f"[C128BNDV] pid={os.getpid()} prefix_len={prefix_len} "
+                    f"req={i} ratio={pool.ratio} n={int(valid.sum().item())} "
+                    f"md5={hashlib.md5(rows.tobytes()).hexdigest()[:16]}",
+                    flush=True,
+                )
+            if do_zero:
+                state[sloc[valid]] = 0
+                total += int(valid.sum().item())
+    print(
+        f"[C128BND] pid={os.getpid()} hit_reqs={hit_reqs} zeroed_rows={total}",
+        flush=True,
+    )
+
+
 def maybe_write_dsv4_extend(
     batch: ScheduleBatch,
     req_pool_indices_cpu: torch.Tensor,
@@ -160,6 +236,7 @@ def maybe_write_dsv4_extend(
     """
     _resync_swa_window(batch, prefix_lens_cpu)
     _zero_c4_boundary(batch, req_pool_indices_cpu, prefix_lens_cpu)
+    _zero_c128_boundary(batch, req_pool_indices_cpu, prefix_lens_cpu)
 
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
     # None on CUDA / non-V4 paths → no-op.
