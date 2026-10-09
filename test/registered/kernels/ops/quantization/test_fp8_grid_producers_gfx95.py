@@ -2,6 +2,7 @@
 
 import unittest
 from typing import Optional
+from unittest import mock
 
 import torch
 
@@ -158,6 +159,23 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         self.assertTrue(torch.equal(plain, ref))
         grid = batched_gemm_bf16_fp8_grid(x, w, split_k=False)
         self.assertTrue(torch.equal(grid, fake_quant_fp8_activation(ref)))
+
+    def test_single_launch_tile_table_is_bitwise_the_16_row_tile(self):
+        """Every single-launch tile picked by row count gives the 16-row tile's output bit for
+        bit (plain and fp8 grid), at each bucket edge."""
+        from sglang.kernels.ops.gemm import gfx95_batched_gemm_bf16_fp8_grid as mod
+
+        only_16_row_tile = ((None, mod._TILE_BY_MAX_M[0][1]),)
+        w = _weights(11)
+        for t in (65, 128, 129, 256, 257, 384):
+            x = torch.randn(t, G, D, device="cuda").bfloat16()
+            for fp8_grid in (False, True):
+                out = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=fp8_grid, split_k=False)
+                with mock.patch.object(mod, "_TILE_BY_MAX_M", only_16_row_tile):
+                    ref = batched_gemm_bf16_fp8_grid(
+                        x, w, fp8_grid=fp8_grid, split_k=False
+                    )
+                self.assertTrue(torch.equal(out, ref), (t, fp8_grid))
 
     def test_split_k_regime(self):
         """T <= 64 takes the split-K launches by default: within one bf16 rounding of the
