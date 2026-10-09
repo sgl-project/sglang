@@ -36,7 +36,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
 )
 from sglang.srt.speculative.spec_info import supports_dummy_draft_extend
-from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.utils import cdiv, ceil_align, empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -364,12 +364,16 @@ def maybe_flashinfer_autotune_extend(
     if mr.is_draft_worker and not supports_dummy_draft_extend(mr.spec_algorithm):
         return
 
-    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
-        pool_size = mr.req_to_token_pool.size
-        per_req = (num_tokens + pool_size - 1) // pool_size
-    else:
-        per_req = 1
-    batch_size = num_tokens // per_req
+    batch_size, per_req = _extend_dummy_shape(
+        num_tokens=num_tokens,
+        max_seqs=(
+            mr.req_to_token_pool.size
+            if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool
+            else None
+        ),
+        max_tokens_per_req=mr.req_to_token_pool.max_context_len,
+        token_alignment=get_parallel().attn_tp_size,
+    )
     num_tokens = batch_size * per_req
 
     sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
@@ -430,6 +434,50 @@ def maybe_flashinfer_autotune_extend(
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
         torch.cuda.empty_cache()
+
+
+def _extend_dummy_shape(
+    *,
+    num_tokens: int,
+    max_seqs: Optional[int],
+    max_tokens_per_req: int,
+    token_alignment: int,
+) -> tuple[int, int]:
+    if max_seqs is not None:
+        num_tokens = min(num_tokens, max_seqs * max_tokens_per_req)
+    # Real batches are padded to a multiple of attn_tp_size;
+    # Kimi-K3 SP-MoE skips its MoE reduce-scatter for unaligned rows.
+    num_tokens = max(num_tokens // token_alignment, 1) * token_alignment
+    if max_seqs is None:
+        return num_tokens, 1
+    pow2_tokens = 1 << (num_tokens.bit_length() - 1)
+    for target in (num_tokens, pow2_tokens):
+        if target % token_alignment:
+            continue
+        per_req = _even_split(
+            num_tokens=target,
+            max_seqs=max_seqs,
+            max_tokens_per_req=max_tokens_per_req,
+        )
+        if per_req is not None:
+            return target // per_req, per_req
+    aligned_max_per_req = max_tokens_per_req // token_alignment * token_alignment
+    per_req = min(
+        ceil_align(cdiv(num_tokens, max_seqs), token_alignment),
+        aligned_max_per_req or max_tokens_per_req,
+    )
+    return min(num_tokens // per_req, max_seqs), per_req
+
+
+def _even_split(
+    *, num_tokens: int, max_seqs: int, max_tokens_per_req: int
+) -> Optional[int]:
+    min_per_req = cdiv(num_tokens, max_seqs)
+    upper = min(2 * min_per_req, max_tokens_per_req + 1, num_tokens + 1)
+    return next(
+        (d for d in range(min_per_req, upper) if num_tokens % d == 0),
+        None,
+    )
 
 
 def _all_ranks_agree(
