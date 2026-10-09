@@ -348,7 +348,7 @@ def qwen3_5_gdn_prefill_projection_views(
     head_qk,
     head_v,
 ):
-    """Return strided views accepted by the prefill GDN consumers."""
+    """Return strided views accepted by the prefill and Triton decode GDN consumers."""
     tokens = mixed_qkvz.shape[0]
     qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = mixed_qkvz[:, :qkv_dim]

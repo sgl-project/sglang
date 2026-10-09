@@ -160,6 +160,26 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                     )
                     self.assertTrue(torch.equal(s, rs))
 
+    def test_fused_quant_reads_projection_view_z(self):
+        """GDN decode on projection views hands the producer a row-strided 3D z
+        sliced from in_proj_qkvz; it must quantize as if z were contiguous."""
+        from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+
+        for tp, t in itertools.product((4, 2), (1, 4, 33)):
+            nv = 64 // tp
+            x = torch.randn(t * nv, 128, device="cuda", dtype=torch.bfloat16)
+            qkvz = 3 * torch.randn(t, 3 * nv * 128, device="cuda", dtype=torch.bfloat16)
+            z_view = qkvz[:, 2 * nv * 128 :].view(t, nv, 128)
+            w = torch.randn(128, device="cuda", dtype=torch.bfloat16) * 0.5 + 1
+            (q, s), (rq, rs) = (
+                _layer_norm_fwd(
+                    x, w, None, 1e-6, z=z, is_rms_norm=True, quant_heads=nv
+                )[0]
+                for z in (z_view, z_view.reshape(-1, 128))
+            )
+            self.assertTrue(torch.equal(q.view(torch.uint8), rq.view(torch.uint8)))
+            self.assertTrue(torch.equal(s, rs))
+
     def test_quark_row_linear_takes_producer_tuple(self):
         from sglang.srt.layers.linear import RowParallelLinear
         from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod

@@ -196,6 +196,15 @@ _GDN_FUSED_QKVZBA_RATIOS = (
     (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )
 
+
+def _gdn_decode_reads_projection_views() -> bool:
+    # The Triton decode consumers (Conv1D update, packed recurrence and gated
+    # RMSNorm) honor row strides, so decode can read the projections in place.
+    mamba = get_exec().mamba
+    decode_backend = mamba.linear_attn_decode_backend or mamba.linear_attn_backend
+    return (_is_cuda or _is_hip) and decode_backend == "triton"
+
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -408,6 +417,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
         self._fused_in_proj_sources = None
         self._derived_weight_cache_error = None
+        self._decode_reads_projection_views = _gdn_decode_reads_projection_views()
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -975,7 +985,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
-        use_strided_prefill_z = False
+        use_projection_views = False
         use_fused_decode_proj_conv = (
             _gdn_decode_fused_proj_conv
             and forward_batch.forward_mode.is_decode()
@@ -985,6 +995,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
+        # Views need no head-group kernel, so they also cover ratios outside
+        # _GDN_FUSED_QKVZBA_RATIOS.
+        use_decode_projection_views = (
+            self._decode_reads_projection_views
+            and forward_batch.forward_mode.is_decode()
+        )
         if use_fused_decode_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
@@ -992,19 +1008,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
-        elif use_fused_contiguous_unpack:
+        elif use_fused_contiguous_unpack or use_decode_projection_views:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            use_strided_prefill_z = (
+            use_projection_views = use_decode_projection_views or (
                 _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
+                if use_projection_views
                 else fused_qkvzba_split_reshape_cat_contiguous
             )
             mixed_qkv, z, b, a = split_fn(
@@ -1047,7 +1063,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        if use_strided_prefill_z:
+        if use_projection_views:
             z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
         else:
             z = z.reshape(-1, z.shape[-1])
@@ -1060,7 +1076,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        # _layer_norm_fwd reads the 3D z view of the projection-view path in place.
+        if _fp8_tuple_input(self.out_proj, z_flat_shape[0] // nv):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,
