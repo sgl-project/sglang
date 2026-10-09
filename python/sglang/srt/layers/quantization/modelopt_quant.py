@@ -1802,13 +1802,24 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             else params_dtype
         )
 
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                # 2 fp4 data is packed in one uint8 in the input dimension
+        try:
+            w_data = torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
-            ),
+            )
+        except torch.OutOfMemoryError:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            w_data = torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // 2,
+                dtype=torch.uint8,
+            )
+        weight = ModelWeightParameter(
+            data=w_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
@@ -1842,12 +1853,24 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
-        weight_scale = ModelWeightParameter(
-            data=torch.empty(
+        try:
+            ws_data = torch.empty(
                 output_size_per_partition,
                 input_size_per_partition // self.quant_config.group_size,
                 dtype=weight_dtype,
-            ),
+            )
+        except torch.OutOfMemoryError:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            ws_data = torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.quant_config.group_size,
+                dtype=weight_dtype,
+            )
+        weight_scale = ModelWeightParameter(
+            data=ws_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,

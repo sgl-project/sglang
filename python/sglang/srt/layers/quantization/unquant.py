@@ -442,12 +442,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight = Parameter(
-            torch.empty(
+        try:
+            data = torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
-            ),
+            )
+        except torch.OutOfMemoryError:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            data = torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            )
+        weight = Parameter(
+            data,
             requires_grad=False,
         )
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
