@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
@@ -93,8 +93,8 @@ class _PipelineBuffers:
 
     Input slots are group-major ([2, groups, world, chunk]) so a group's rows
     form one [S, group_heads, 3 * head_dim] tensor for attention; output slots
-    are source-major ([2, world, groups, chunk]) so a single merge over
-    world * groups blocks restores the global head order.
+    are source-major ([2, world, groups, chunk]), each block a peer's rows for
+    one head group, copied into the merged output as it arrives.
     """
 
     def __init__(self, state, s_local, heads, head_dim, groups, dtype):
@@ -322,6 +322,11 @@ class IpcA2AMultiState:
                         )
                     for p in peers:
                         mem.write(cin, bufs.fin[p].narrow(0, r, 1), base + g + 1)
+        # Head block b = p * groups + g of the output is group g of rank p's
+        # heads. Each group stream writes its blocks as soon as they exist, so
+        # the merge overlaps the groups still attending instead of trailing them.
+        merged = torch.empty(s_local, heads, head_dim, dtype=q.dtype, device=q.device)
+        merged_blocks = merged.view(s_local, world * groups, hg, head_dim)
         done = []
         for g in range(groups):
             stream = self.pipe_group_streams[g]
@@ -335,24 +340,25 @@ class IpcA2AMultiState:
                     qkv[..., head_dim : 2 * head_dim],
                     qkv[..., 2 * head_dim :],
                 )
-                rows = lambda p: out[p * s_local : (p + 1) * s_local].reshape(-1)
-                bufs.outb[r][slot, r, g].copy_(rows(r), non_blocking=True)
+                rows = lambda p: out[p * s_local : (p + 1) * s_local]
                 for p in peers:
-                    bufs.outb[p][slot, r, g].copy_(rows(p), non_blocking=True)
+                    bufs.outb[p][slot, r, g].copy_(
+                        rows(p).reshape(-1), non_blocking=True
+                    )
                 for p in peers:
                     mem.write(stream, bufs.fout[p][g].narrow(0, r, 1), call)
+                merged_blocks[:, r * groups + g].copy_(rows(r))
+                for p in peers:
+                    mem.wait(stream, bufs.fout[r][g].narrow(0, p, 1), call)
+                    merged_blocks[:, p * groups + g].copy_(
+                        bufs.outb[r][slot, p, g].view(s_local, hg, head_dim)
+                    )
                 done.append(stream.record_event())
         for event in done:
             main.wait_event(event)
-        for g in range(groups):
-            for p in peers:
-                mem.wait(main, bufs.fout[r][g].narrow(0, p, 1), call)
-        merged = usp_merge_heads(
-            bufs.outb[r][slot].view(world * groups, s_local, 1, hg, head_dim)
-        )
         # the next call's pack rewrites `send`, which the copy stream reads
         main.wait_stream(cin)
-        return merged.view(s_local, heads, head_dim)
+        return merged
 
     def exchange(self, send: torch.Tensor) -> torch.Tensor | None:
         """``all_to_all_single`` with equal splits: row p of the contiguous
