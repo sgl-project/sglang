@@ -6,6 +6,7 @@ positions, deployment-contract parsing, request validation, and registry
 wiring."""
 
 import copy
+import importlib.util
 import os
 import tempfile
 import unittest
@@ -77,9 +78,11 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_decoder import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
     Cosmos3LidarEncoder,
+    _natten_backend_cache,
     _SpaceToDepth,
     pad_lidar_sweeps,
     required_lidar_sweeps,
+    resolve_natten_backend,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
     lidar_output_payload,
@@ -2035,3 +2038,127 @@ class TestRegistry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLidarNeighborhoodAttentionBackend(unittest.TestCase):
+    """natten's eager FlexAttention fallback must be refused, never attempted."""
+
+    def setUp(self):
+        _natten_backend_cache.clear()
+
+    def _qkv(self):
+        q = torch.zeros(1, 4, 8, 2, 32)
+        return q, q.clone(), q.clone()
+
+    @unittest.skipUnless(importlib.util.find_spec("natten"), "needs natten")
+    def test_refuses_the_eager_flex_fallback(self):
+        q, k, v = self._qkv()
+        with mock.patch("natten.backends.choose_backend", return_value="flex-fna"):
+            with self.assertRaisesRegex(RuntimeError, "whl.natten.org"):
+                resolve_natten_backend(q, k, v)
+        self.assertEqual(_natten_backend_cache, {})
+
+    @unittest.skipUnless(importlib.util.find_spec("natten"), "needs natten")
+    def test_caches_a_compiled_kernel_choice(self):
+        q, k, v = self._qkv()
+        with mock.patch(
+            "natten.backends.choose_backend", return_value="cutlass-fna"
+        ) as chooser:
+            self.assertEqual(resolve_natten_backend(q, k, v), "cutlass-fna")
+            self.assertEqual(resolve_natten_backend(q, k, v), "cutlass-fna")
+        chooser.assert_called_once()
+
+
+def _dense_neighborhood_attention(q, k, v, kernel, dilation, scale):
+    """Brute-force na2d: per query, softmax over its inward-shifted dilated window."""
+    from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+        neighborhood_window_start,
+    )
+
+    batch, height, width, heads, head_dim = q.shape
+    out = torch.zeros_like(q, dtype=torch.float64)
+    for i in range(height):
+        for j in range(width):
+            start_h = int(
+                neighborhood_window_start(
+                    torch.tensor(i), height, kernel[0], dilation[0]
+                )
+            )
+            start_w = int(
+                neighborhood_window_start(
+                    torch.tensor(j), width, kernel[1], dilation[1]
+                )
+            )
+            rows = [
+                (start_h + a) * dilation[0] + i % dilation[0] for a in range(kernel[0])
+            ]
+            cols = [
+                (start_w + b) * dilation[1] + j % dilation[1] for b in range(kernel[1])
+            ]
+            keys = k[:, rows][:, :, cols].reshape(batch, -1, heads, head_dim).double()
+            vals = v[:, rows][:, :, cols].reshape(batch, -1, heads, head_dim).double()
+            scores = torch.einsum("bhd,bnhd->bhn", q[:, i, j].double(), keys) * scale
+            out[:, i, j] = torch.einsum("bhn,bnhd->bhd", scores.softmax(-1), vals)
+    return out.to(q.dtype)
+
+
+class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
+    """The FlexAttention block mask must reproduce na2d's windows exactly."""
+
+    def test_window_start_shifts_inward_and_respects_residue_classes(self):
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+            neighborhood_window_start,
+        )
+
+        idx = torch.arange(9)
+        # kernel 3, no dilation: windows [0,3) at the top edge, [6,9) at the bottom.
+        self.assertEqual(
+            neighborhood_window_start(idx, 9, 3, 1).tolist(),
+            [0, 0, 1, 2, 3, 4, 5, 6, 6],
+        )
+        # dilation 2 on length 9: even class has 5 members, odd class 4.
+        self.assertEqual(
+            neighborhood_window_start(idx, 9, 3, 2).tolist(),
+            [0, 0, 0, 0, 1, 1, 2, 1, 2],
+        )
+
+    def test_matches_dense_reference_on_cpu(self):
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+            neighborhood_attention_2d,
+        )
+
+        torch.manual_seed(0)
+        for kernel, dilation in (((3, 5), (1, 1)), ((3, 3), (2, 1)), ((1, 5), (1, 2))):
+            with self.subTest(kernel=kernel, dilation=dilation):
+                q, k, v = (torch.randn(2, 6, 11, 2, 8) for _ in range(3))
+                out = neighborhood_attention_2d(
+                    q, k, v, kernel_size=kernel, dilation=dilation, scale=0.7
+                )
+                ref = _dense_neighborhood_attention(q, k, v, kernel, dilation, 0.7)
+                torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+    def test_rejects_windows_larger_than_a_residue_class(self):
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+            neighborhood_block_mask,
+        )
+
+        with self.assertRaisesRegex(ValueError, "smaller than kernel"):
+            neighborhood_block_mask(6, 11, (3, 5), (3, 1), torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_matches_natten_fp32_kernel(self):
+        if importlib.util.find_spec("natten") is None:
+            self.skipTest("needs natten")
+        from natten.functional import na2d
+
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+            neighborhood_attention_2d,
+        )
+
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(2, 16, 134, 4, 32, device="cuda") for _ in range(3))
+        out = neighborhood_attention_2d(
+            q, k, v, kernel_size=(5, 45), dilation=(1, 1), scale=1.0
+        )
+        ref = na2d(q, k, v, kernel_size=(5, 45), dilation=(1, 1), scale=1.0)
+        torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-5)

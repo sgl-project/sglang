@@ -14,6 +14,7 @@ FlashAttention-4 block-sparse kernels).
 
 import importlib.util
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     COSMOS3_MULTIVIEW_AUTO_BACKEND,
     Cosmos3MultiviewConfig,
@@ -112,14 +113,19 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         lidar_encoder = None
         lidar_decoder = None
         if deployment.supports_lidar:
-            if importlib.util.find_spec("natten") is None:
-                # Weights load without it; the first joint request would fail in
-                # the LiDAR encoder's neighborhood attention. Say so at startup.
-                logger.warning(
-                    "This checkpoint supports joint camera+LiDAR requests but the "
-                    "natten package is not installed; camera-only requests work, LiDAR "
-                    "requests will fail. Install it in the image: "
-                    "pip install natten==0.21.7 -f https://whl.natten.org"
+            if envs.SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN:
+                if importlib.util.find_spec("natten") is None:
+                    raise ImportError(
+                        "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1 but the natten "
+                        "package is not installed; unset it to use the built-in "
+                        "FlexAttention neighborhood attention, or install the wheel: "
+                        "pip install natten==0.21.7 -f https://whl.natten.org"
+                    )
+                logger.info("Cosmos3 LiDAR neighborhood attention: natten na2d")
+            else:
+                logger.info(
+                    "Cosmos3 LiDAR neighborhood attention: compiled FlexAttention "
+                    "(fp32, IEEE); first LiDAR request compiles its three levels"
                 )
             # The LiDAR range-map VAE is not a model_index component; it ships
             # as lidar_vae/ next to the transformer and stays in FP32. Read it

@@ -10,8 +10,9 @@ mean, and the latent affine are needed at inference; the decoder weights that
 ship next to them in ``lidar_vae/`` are ignored.
 
 Parameter names mirror the exported ``lidar_vae/diffusion_pytorch_model.safetensors``
-so the state dict loads without remapping. Spatial neighborhood attention
-requires the ``natten`` package.
+so the state dict loads without remapping. Spatial neighborhood attention runs
+as a compiled FlexAttention block mask (``cosmos3_lidar_neighborhood_attention``);
+``SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1`` selects NATTEN's ``na2d`` instead.
 """
 
 from __future__ import annotations
@@ -26,8 +27,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     validate_lidar_config,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+    neighborhood_attention_2d,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -42,15 +47,51 @@ COSMOS3_LIDAR_VALIDITY_THRESHOLD = 0.5
 _SDPA_MAX_BATCH = 65535
 
 
+_NATTEN_INSTALL_HINT = (
+    "install the natten wheel built for this torch/CUDA pair: "
+    "pip install natten==0.21.7 -f https://whl.natten.org"
+)
+_natten_backend_cache: dict[tuple[int, torch.dtype, int], str] = {}
+
+
 def _natten_na2d():
     try:
         from natten.functional import na2d
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ImportError(
             "Cosmos3 LiDAR encoding needs the natten package for neighborhood "
-            "attention: pip install natten -f https://whl.natten.org"
+            f"attention; {_NATTEN_INSTALL_HINT}"
         ) from exc
     return na2d
+
+
+def resolve_natten_backend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> str:
+    """natten kernel for these tensors; refuses the eager FlexAttention fallback.
+
+    natten picks "flex-fna" when none of its compiled kernels can serve the
+    call (no libnatten in the wheel, or fp32 on a GPU whose only kernel is the
+    half-precision one). Without torch.compile that path materializes the full
+    (tokens x tokens) score matrix: about 1 TB for one 20-sweep range-image
+    chunk, so it must never run here.
+    """
+    key = (q.device.index or 0, q.dtype, q.shape[-1])
+    backend = _natten_backend_cache.get(key)
+    if backend is not None:
+        return backend
+    from natten.backends import choose_backend
+
+    backend = choose_backend(q, k, v, torch_compile=False)
+    if backend == "flex-fna":
+        raise RuntimeError(
+            "natten has no compiled neighborhood-attention kernel for "
+            f"{q.dtype} on {q.device} (head_dim {q.shape[-1]}) and would fall "
+            "back to its eager FlexAttention path, which materializes a dense "
+            "score matrix and runs out of memory on the LiDAR range image; "
+            f"{_NATTEN_INSTALL_HINT}"
+        )
+    logger.info("Cosmos3 LiDAR neighborhood attention: natten backend %s", backend)
+    _natten_backend_cache[key] = backend
+    return backend
 
 
 def required_lidar_sweeps(
@@ -193,14 +234,20 @@ class LidarNeighborhoodAttention(nn.Module):
             q = F.pad(q, (0, 0, 0, 0, pad, pad), mode="circular")
             k = F.pad(k, (0, 0, 0, 0, pad, pad), mode="circular")
             v = F.pad(v, (0, 0, 0, 0, pad, pad), mode="circular")
-        out = _natten_na2d()(
-            query=q,
-            key=k,
-            value=v,
-            kernel_size=self.kernel_size,
-            dilation=self.dilation,
-            scale=1.0,
-        )
+        if envs.SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN:
+            out = _natten_na2d()(
+                query=q,
+                key=k,
+                value=v,
+                kernel_size=self.kernel_size,
+                dilation=self.dilation,
+                scale=1.0,
+                backend=resolve_natten_backend(q, k, v),
+            )
+        else:
+            out = neighborhood_attention_2d(
+                q, k, v, kernel_size=self.kernel_size, dilation=self.dilation, scale=1.0
+            )
         out = out.reshape(batch, height, out.shape[2], self.num_heads * self.head_dim)
         if pad:
             out = out[:, :, pad:-pad]

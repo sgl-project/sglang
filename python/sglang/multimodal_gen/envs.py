@@ -267,6 +267,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK": _lazy_bool(
         "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK"
     ),
+    "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
+        "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
+    ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
