@@ -11,7 +11,6 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_interleaved_rope_fp64,
     fused_interleaved_rope_fp64,
     mark_sana_video_linear_attention_site,
     tensors_equal,
@@ -34,7 +33,10 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
     sana_residual_gate_add,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -66,7 +68,9 @@ def apply_interleaved_rotary_emb_pair(
     verified = _SANA_VIDEO_ROPE.verified
     if (
         not _SANA_VIDEO_ROPE.disabled
-        and can_use_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
+        and _is_cuda
+        and query.is_cuda
+        and query.dtype is torch.bfloat16
         and (verified or _SANA_VIDEO_ROPE.can_attempt_once())
     ):
         try:

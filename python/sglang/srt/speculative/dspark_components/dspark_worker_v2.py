@@ -8,6 +8,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -85,6 +86,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
     is_pin_memory_available,
 )
@@ -94,6 +96,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -231,9 +234,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
-        self._tp_sync = SpecTpSync(
-            parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._draft_graph_group = (
             parallel.attn_tp_group
             if self._draft_dp_context_enabled
@@ -365,6 +366,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._simulate_acc_greedy = (
+            _is_hip
+            and self._simulate_acc_len > 0
+            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+        )
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -392,6 +398,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            block_verification=get_spec().speculative_use_block_verification,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -636,6 +643,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=True,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -699,7 +707,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
-        cache_loc = batch.out_cache_loc
+        # The draft KV goes to the slots the target prefill just wrote.
+        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
+        batch_output.kv_loc_plan = None
         token_indices = logits_output.hidden_states_token_indices
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
@@ -836,9 +846,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else draft_input.nxt_kv_lens_cpu
+            ),
         )
 
         sampling_info = batch.sampling_info
+        # Simulated acceptance overrides correct_len, so only the bonus token needs the
+        # request's temperature: draft + accept run greedy, the bonus is still sampled.
+        simulate_bonus_sampling_info = None
+        if (
+            self._simulate_acc_greedy
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            simulate_bonus_sampling_info = sampling_info
+            sampling_info = None
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -915,6 +945,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,
+                    verify_window=verify_window,
                     inject_gate=fold_eligible,
                 )
             else:
@@ -963,6 +994,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
