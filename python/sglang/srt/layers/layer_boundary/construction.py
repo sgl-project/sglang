@@ -47,10 +47,6 @@ from sglang.srt.layers.layer_boundary.layout import (
     batches_are_unpadded,
     is_dense_ffn_fully_dp,
 )
-from sglang.srt.layers.layer_boundary.ops import (
-    attn_tp_gather_input,
-    update_attn_tp_gather_output,
-)
 from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
@@ -191,6 +187,7 @@ class StagePlan:
         qkv_latent_func=None,
         fusions=None,
         attn_tp_gather=None,
+        exit_gather=None,
     ):
         self.norm = norm
         self.edges = dict(variants)
@@ -242,7 +239,7 @@ class StagePlan:
                 else bind_exit(
                     edges.outgoing,
                     cp_moves=edges.cp_moves,
-                    attn_tp_gather=attn_tp_gather,
+                    attn_tp_gather=exit_gather,
                 )
             )
             self.paths[variant] = StagePath(
@@ -252,15 +249,6 @@ class StagePlan:
                 output_move_completes_sum=out.output_move_completes_sum,
                 returns_over_dp=out.returns_over_dp,
                 writes_at_handoff=writes_at_handoff,
-            )
-        if attn_tp_gather is not None and not any(
-            getattr(path.output_move, "func", None) is update_attn_tp_gather_output
-            or getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
-            for path in self.paths.values()
-        ):
-            raise ValueError(
-                "an attention-TP gather is declared, but no batch variant "
-                "gathers over attention TP at this stage's boundaries"
             )
 
     @property
@@ -319,7 +307,7 @@ class StagePlan:
         )
 
 
-def _bind_stage(declaration, norm, incoming, outgoing, **options):
+def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **options):
     if incoming.consumer != declaration or outgoing.producer != declaration:
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
@@ -354,6 +342,13 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
         terminal=declaration.terminal,
         writes_at_handoff=declaration.writes_at_handoff,
         attn_tp_gather=declaration.attn_tp_gather,
+        # The exit runs its consumer's gather: the next stage's, or the
+        # final read's.
+        exit_gather=getattr(
+            outgoing.consumer if outgoing.consumer is not None else final_read,
+            "attn_tp_gather",
+            None,
+        ),
         finishes_directly=declaration.kind is StageKind.ATTENTION
         and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL,
         **options,

@@ -1,5 +1,6 @@
-"""A stack read through the attention-residual bank's stage reads computes
-what the decoder computed when its MLP folded the pending add itself."""
+"""A stack read through the attention-residual bank's stage reads matches a
+reference that drives AttnResidual directly, with each MLP adding the pending
+residual itself."""
 
 import unittest
 from types import SimpleNamespace
@@ -11,7 +12,6 @@ import torch
 from sglang.srt.layers import attn_residual
 from sglang.srt.layers.layer_boundary import (
     BatchVariant,
-    ExitRows,
     ReadoutFusion,
     SumGroup,
     append_stages,
@@ -85,7 +85,7 @@ class _Layer:
     def mlp(self, x):
         return torch.sin(x) * self.mlp_weight
 
-    def ops(self, bank):
+    def ops(self, bank, *, reads_slices=False):
         return AttnBankState(
             bank,
             self.attn_proj,
@@ -93,6 +93,7 @@ class _Layer:
             self.ffn_proj,
             self.ffn_score_norm,
             writes_block=self.writes_block,
+            reads_slices=reads_slices,
         ).residual_ops()
 
 
@@ -100,9 +101,9 @@ LAYER_LIST = [_Layer(i) for i in range(LAYERS)]
 OUT_PROJ, OUT_SCORE_NORM, FINAL_NORM = _Proj(99), _Norm(99), _Norm(100)
 
 
-def _legacy(hidden, layers, bank_rows=None, *, final=True):
-    """The decoder's own order: the MLP adds the pending prefix to its output,
-    so each layer hands on the whole head."""
+def _reference(hidden, layers, bank_rows=None, *, final=True):
+    """The reference order: the MLP adds the pending prefix to its output, so
+    each layer hands on the whole head."""
     bank = attn_residual.AttnResidual(
         hidden, -(-(layers.stop) // BLOCK), block_residual=bank_rows
     )
@@ -193,8 +194,8 @@ class TestAttnBankResidualOps(CustomTestCase):
     def assert_identical(self, got, want):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
-    def test_the_stack_matches_the_decoders_own_order(self):
-        want = _legacy(self.hidden, slice(0, LAYERS))
+    def test_the_stack_matches_the_reference_order(self):
+        want = _reference(self.hidden, slice(0, LAYERS))
         for read_after_write in (False, True):
             for writes_stream in ((), (1, 3), (LAYERS - 1,)):
                 with self.subTest(
@@ -209,7 +210,7 @@ class TestAttnBankResidualOps(CustomTestCase):
                     self.assert_identical(got, want)
 
     def test_a_pipeline_rank_continues_from_the_head_and_the_bank(self):
-        want = _legacy(self.hidden, slice(0, LAYERS))
+        want = _reference(self.hidden, slice(0, LAYERS))
         # Split before a layer that writes a block and before one that reads,
         # after a layer that adds the residual itself and after one that
         # leaves the add to the next read.
@@ -223,12 +224,12 @@ class TestAttnBankResidualOps(CustomTestCase):
                         writes_stream=writes_stream,
                         final=False,
                     )
-                    legacy_head, legacy_rows = _legacy(
+                    want_head, want_rows = _reference(
                         self.hidden, slice(0, split), final=False
                     )
-                    # The wire carries what the decoder's own order sent.
-                    self.assert_identical(head, legacy_head)
-                    self.assert_identical(bank_rows, legacy_rows)
+                    # The wire carries what the reference order sends.
+                    self.assert_identical(head, want_head)
+                    self.assert_identical(bank_rows, want_rows)
                     got = _staged(
                         head,
                         slice(split, LAYERS),
@@ -346,9 +347,9 @@ class TestAttnBankSpMoeStages(CustomTestCase):
     """A latent MoE dispatched over an a2a backend with attention TP runs on
     this rank's shard of the rows: the FFN's entry reduce-scatters the
     attention output and slices the residual, and each MoE layer's exit
-    gathers its stream back to every row, as the decoder did."""
+    gathers its stream back to every row, which the bank's next read needs."""
 
-    def build(self, exit_rows):
+    def build(self, *, reads_slices=False):
         holder = AttnBank()
         with (
             fixture.planning(
@@ -371,12 +372,14 @@ class TestAttnBankSpMoeStages(CustomTestCase):
                             sparse=True,
                             next_layer_sparse=True,
                             output_complete=True,
-                            exit_rows=exit_rows,
                         ),
                         fixture.Norm(),
                     ),
                 )[1]
-                for ops in (LAYER_LIST[i].ops(holder) for i in range(3))
+                for ops in (
+                    LAYER_LIST[i].ops(holder, reads_slices=reads_slices)
+                    for i in range(3)
+                )
             ]
 
     def entry_step(self, ffn):
@@ -384,7 +387,7 @@ class TestAttnBankSpMoeStages(CustomTestCase):
         return prepare.keywords["step"]
 
     def test_each_moe_layer_returns_to_every_row(self):
-        for ffn in self.build(ExitRows.ATTENTION):
+        for ffn in self.build():
             step = self.entry_step(ffn)
             self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
             self.assertTrue(step.keywords["scatters_residual"])

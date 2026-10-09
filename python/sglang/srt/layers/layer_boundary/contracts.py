@@ -45,9 +45,9 @@ class ExitRows(Enum):
 
     ATTENTION = auto()
     TBO_SPLIT = auto()
-    # The rows the FFN ran on, also at the stack's end: an FFN on this rank's
-    # attention-TP slice leaves its output there, and the model's final read
-    # must read that slice and gather it.
+    # The rows the FFN ran on, also at the stack's end: the layer stack's last
+    # FFN, when the model's final read reads this rank's attention-TP slice
+    # and gathers it.
     SLICE = auto()
 
 

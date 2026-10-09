@@ -96,6 +96,9 @@ class AttnBankState:
     # A read on this rank's attention-TP slice first tries the bank's kernels
     # that also run the collective around it.
     fuses_slice_collectives: bool = False
+    # The bank stays on each rank's attention-TP slice across layers;
+    # otherwise every rank writes every row and the attention reads them all.
+    reads_slices: bool = False
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -217,6 +220,10 @@ class _AttnReadout(_BankReadout):
     A write layer snapshots the residual this read forms."""
 
     @property
+    def reads_after_attn_tp_gather(self):
+        return not self.state.reads_slices
+
+    @property
     def gathering_reads(self):
         state = self.state
         return (
@@ -269,20 +276,29 @@ class AttnBankOutputRead:
     side's scoring parameters, then the final norm. A callable final norm for
     `residual_batch.final_norm`.
 
-    A stack that ends on this rank's attention-TP slice of the rows is read
-    there, against the bank rows this rank wrote, and what it read is
-    gathered: by the bank's kernel that does both when it takes the batch,
-    else by ``attn_tp_gather`` when that does, else over the attention-TP
-    group."""
+    With ``reads_attn_tp_slices``, the stack may end on this rank's
+    attention-TP slice of the rows: such a batch is read there, against the
+    bank rows this rank wrote, and what it read is gathered: by the bank's
+    kernel that does both when it takes the batch, else by ``attn_tp_gather``
+    when that does, else over the attention-TP group. Otherwise the stack's
+    last FFN brings its output to the attention's rows, in ``attn_tp_gather``
+    when that takes the batch."""
 
     def __init__(
-        self, bank: AttnBank, score_proj, score_norm, norm, attn_tp_gather=None
+        self,
+        bank: AttnBank,
+        score_proj,
+        score_norm,
+        norm,
+        attn_tp_gather=None,
+        reads_attn_tp_slices=False,
     ):
         self.bank = bank
         self.score_proj = score_proj
         self.score_norm = score_norm
         self.norm = norm
         self.attn_tp_gather = attn_tp_gather
+        self.reads_attn_tp_slices = reads_attn_tp_slices
 
     def __call__(self, hidden_states, residual=None):
         bank = self.bank.require()

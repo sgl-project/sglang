@@ -44,6 +44,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_tp_gather_input,
+    update_attn_tp_gather_output,
+)
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -261,10 +265,14 @@ class StageDeclaration:
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
         attn_tp_gather: Optional implementation of the gather over attention
-            TP this stage's boundaries run: given this rank's contiguous slice
-            of the rows, it returns them all, in rank order, or None to leave
-            the gather to the boundary. Called on every batch, so it must be
-            CUDA-graph safe.
+            TP that brings rows into this stage: at its own entry, or at its
+            producer's exit, which runs its consumer's gather. Given this rank's
+            contiguous slice of the rows, it returns them all, in rank order,
+            or None to leave the gather to the boundary. Called on every batch,
+            so it must be CUDA-graph safe. Across a pipeline boundary the
+            producer's rank takes it from the neighbouring layer it builds on
+            the meta device, so it may use only the communication state of the
+            rank it runs on, not the declaring layer's weights or buffers.
         previous: Declaration whose output this stage consumes, as the stack
             records it; across pipeline ranks it is built locally.
         prepared_from: Declaration whose already-read input a branch reuses.
@@ -346,8 +354,8 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
-        attn_tp_gather: Implementation of this stage's gathers over attention
-            TP, tried before the boundary's own (see StageDeclaration).
+        attn_tp_gather: Implementation of the gather over attention TP into
+            this stage, tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -379,7 +387,6 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
-    attn_tp_gather=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -396,8 +403,6 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
-        attn_tp_gather: Implementation of this stage's gathers over attention
-            TP, tried before the boundary's own (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -411,7 +416,6 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
-        attn_tp_gather=attn_tp_gather,
     )
 
 
@@ -438,7 +442,10 @@ def _resolve_stage(stage, variant, following=None):
             output_complete=stage.output_complete,
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
-        if exit_rows is ExitRows.ATTENTION:
+        if exit_rows is ExitRows.ATTENTION or (
+            following is not None
+            and getattr(following.read, "reads_after_attn_tp_gather", False)
+        ):
             returned = attention
         elif exit_rows is ExitRows.SLICE:
             # The residual's rows during the FFN: this rank's slice for an FFN
@@ -674,12 +681,13 @@ class _LayerStack:
     """A layer stack under construction: what was appended, in order, and how
     to reach the layers other pipeline ranks hold on either side of it."""
 
-    __slots__ = ("appends", "previous_layers", "next_layers")
+    __slots__ = ("appends", "previous_layers", "next_layers", "final_read")
 
-    def __init__(self, previous_layers=(), next_layers=()):
+    def __init__(self, previous_layers=(), next_layers=(), final_read=None):
         self.appends = []
         self.previous_layers = previous_layers
         self.next_layers = next_layers
+        self.final_read = final_read
 
 
 # The stack being built; layer_stack saves and restores an outer one.
@@ -687,7 +695,7 @@ _stack: Optional[_LayerStack] = None
 
 
 @contextlib.contextmanager
-def layer_stack(*, previous_layers=(), next_layers=()):
+def layer_stack(*, previous_layers=(), next_layers=(), final_read=None):
     """Open a layer stack that append_stages extends in order.
 
     Every stage binds when the stack closes, once its producer and its
@@ -702,10 +710,15 @@ def layer_stack(*, previous_layers=(), next_layers=()):
             stack's first. What they build is discarded.
         next_layers: Likewise for the layers after this stack, whose first
             declared stage is the consumer of this stack's last.
+        final_read: The model's final read of the stack's output, when it is
+            not a plain final norm: the consumer of the last stage when no
+            later layer declares one. Its ``attn_tp_gather`` gathers the rows
+            that stage leaves on this rank's attention-TP slice, and with
+            ``reads_attn_tp_slices`` it reads that slice instead.
     """
     global _stack
     outer = _stack
-    stack = _LayerStack(previous_layers, next_layers)
+    stack = _LayerStack(previous_layers, next_layers, final_read)
     _stack = stack
     try:
         yield stack
@@ -714,6 +727,7 @@ def layer_stack(*, previous_layers=(), next_layers=()):
                 stack.appends,
                 previous=_neighbour_stage(stack.previous_layers, last=True),
                 following=_neighbour_stage(stack.next_layers, last=False),
+                final_read=stack.final_read,
             )
     finally:
         _stack = outer
@@ -831,7 +845,7 @@ def _detached(declaration):
     return replace(declaration, previous=None, prepared_from=None)
 
 
-def _bind_stack(appends, *, previous, following):
+def _bind_stack(appends, *, previous, following, final_read=None):
     """Bind every appended stage, in order, and fill in the boundaries each
     append returned."""
     if following is not None:
@@ -857,21 +871,77 @@ def _bind_stack(appends, *, previous, following):
             sources[id(returned.declaration)] = boundary
         bound.append(boundaries)
     # The last stage's consumer is the next rank's first stage, if any;
-    # without one it ends the model's layer stack.
-    _bind_pending(chain, consumer=following, terminal=following is None)
+    # without one it ends the model's layer stack, read by the final read.
+    _bind_pending(
+        chain,
+        consumer=following,
+        terminal=following is None,
+        final_read=final_read if following is None else None,
+    )
+    _check_declared_gathers(appends, bound, remote_producer=previous is not None)
     for append, boundaries in zip(appends, bound):
         for returned, boundary in zip(append.boundaries, boundaries):
             returned.plan = boundary.plan
             returned.declaration = boundary.declaration
 
 
-def _bind_pending(chain: _Chain, *, consumer, terminal):
+def _check_declared_gathers(appends, bound, *, remote_producer):
+    """A stage that declares its gather over attention TP must have one: at
+    its own entry, or at its producer's exit. A producer on another pipeline
+    rank runs it there."""
+    line = [
+        (append.origin, boundary)
+        for append, boundaries in zip(appends, bound)
+        if append.prepared_from is None
+        for boundary in boundaries
+    ]
+    for (origin, consumer), producer in zip(line, [None, *(b for _, b in line)]):
+        if consumer.declaration.attn_tp_gather is None or any(
+            _gathers_input(path) for path in consumer.plan.paths.values()
+        ):
+            continue
+        if producer is None and remote_producer:
+            continue
+        if producer is not None and any(
+            _gathers_output(path) for path in producer.plan.paths.values()
+        ):
+            continue
+        error = ValueError(
+            "an attention-TP gather is declared, but neither this stage's entry "
+            "nor its producer's exit gathers over attention TP"
+        )
+        _note_origin(error, origin)
+        raise error
+
+
+def _gathers_input(path):
+    return getattr(path.entry.input_move, "func", None) is attn_tp_gather_input
+
+
+def _gathers_output(path):
+    return getattr(path.output_move, "func", None) is update_attn_tp_gather_output
+
+
+def _ended(declaration, final_read):
+    """The stack's last stage as the final read takes it: an FFN on this
+    rank's attention-TP slice leaves its output there for a read that reads
+    the slice and gathers what it read."""
+    if declaration.kind is StageKind.FFN and getattr(
+        final_read, "reads_attn_tp_slices", False
+    ):
+        return replace(declaration, exit_rows=ExitRows.SLICE)
+    return declaration
+
+
+def _bind_pending(chain: _Chain, *, consumer, terminal, final_read=None):
     pending = chain.pending
     if pending is None:
         return
     chain.pending = None
     try:
         declaration = replace(pending.declaration, terminal=terminal)
+        if terminal:
+            declaration = _ended(declaration, final_read)
         if pending.predecessor is None:
             incoming = _incoming(declaration)
         else:
@@ -882,7 +952,12 @@ def _bind_pending(chain: _Chain, *, consumer, terminal):
             )
         outgoing = _connect(declaration, consumer, residual_from=incoming)
         bound = _bind_stage(
-            declaration, pending.norm, incoming, outgoing, **pending.options
+            declaration,
+            pending.norm,
+            incoming,
+            outgoing,
+            final_read=final_read,
+            **pending.options,
         )
     except Exception as error:
         _note_origin(error, pending.origin)
