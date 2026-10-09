@@ -100,10 +100,14 @@ class ExitPolicy:
         hidden_states: torch.Tensor,
         stream: ResidualStream,
         forward_batch: ForwardBatch,
+        *,
+        already_reduced: bool = False,
     ):
         """Complete the output of the operation-scheduled producer path, which
         never defers: the sum it owes, then its move and write-back."""
         steps = self.plan.path_for(forward_batch)
+        if already_reduced and steps.output_move_completes_sum:
+            raise ValueError("already-reduced output cannot use a reduce-scatter move")
         hidden_states, residual = self._complete_now(
             hidden_states,
             stream.residual,
@@ -111,7 +115,8 @@ class ExitPolicy:
             dp_step=None,
             steps=steps,
             output_move=steps.output_move,
-            owes_sum=steps.output.group is not None
+            owes_sum=not already_reduced
+            and steps.output.group is not None
             and not steps.output_move_completes_sum,
         )
         return self._record_output(
