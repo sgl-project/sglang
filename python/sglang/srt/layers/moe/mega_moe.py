@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -260,35 +261,49 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
             if forward_batch is not None
             else None
         )
         dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        if (
-            not moe.is_hash
-            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-        ):
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-            )
+        if should_use_mega_gate(moe, hidden_states, _device_sm, dispatch_info):
+            import deep_gemm
+
+            # Keep MegaGate under the same SM budget as MegaMoE when the
+            # alternate stream overlaps with shared-expert work.
+            with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+                topk_weights, topk_ids = run_mega_gate(
+                    moe,
+                    hidden_states,
+                    input_ids_global,
+                    num_token_non_padded,
+                    dispatch_info,
+                )
         else:
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            if (
+                not moe.is_hash
+                and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+            ):
+                topk_output = vision_topk(
+                    moe,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                )
+            else:
+                topk_output = moe.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
     else:
         topk_ids = None
         topk_weights = None
