@@ -182,6 +182,65 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertEqual(output.shape, query.shape)
                     self.assertTrue(torch.all(output == 5))
 
+    def test_sparse_attention_breaks_the_graph_under_breakable(self):
+        """Breakable replays captured segments with the capture batch's metadata
+        baked in, so sparse attention must run as an eager break. Called inline,
+        MiniMax-M3 replayed stale metadata and hit an illegal memory access."""
+        layer = self._new_layer()
+        query = torch.zeros((4, 2, 3))
+        idx_q = torch.zeros((4, 1, 3))
+        op_names = {
+            False: "unified_sparse_attention_with_output",
+            True: "breakable_unified_sparse_attention_with_output",
+        }
+
+        def fill_outputs(*args, **kwargs):
+            args[3].fill_(5)
+            args[4].fill_(7)
+
+        for breakable in (False, True):
+            with self.subTest(breakable=breakable):
+                forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            radix_attention_module,
+                            "get_tc_piecewise_forward_context",
+                            return_value=SimpleNamespace(),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            radix_attention_module,
+                            "is_in_breakable_cuda_graph",
+                            return_value=breakable,
+                        )
+                    )
+                    backend = stack.enter_context(
+                        patch.object(radix_attention_module, "get_attn_backend")
+                    )
+                    backend.return_value.forward.return_value = (
+                        torch.zeros((4, 3)),
+                        torch.zeros((4, 6)),
+                    )
+                    mocks = {
+                        name: stack.enter_context(
+                            patch.object(
+                                radix_attention_module, name, side_effect=fill_outputs
+                            )
+                        )
+                        for name in op_names.values()
+                    }
+                    idx_out, attn_out = layer(
+                        query, query, query, forward_batch, idx_q=idx_q, idx_k=query
+                    )
+
+                backend.assert_not_called()
+                for name, mock in mocks.items():
+                    self.assertEqual(mock.call_count, int(name == op_names[breakable]))
+                self.assertTrue(torch.all(attn_out == 5))
+                self.assertTrue(torch.all(idx_out == 7))
+
     def test_prefill_wrapper_opt_out_preserves_expanded_rows_and_batch(self):
         """Expanded attention rows must not be sliced using the runner's token count."""
         layer = RadixAttention(
