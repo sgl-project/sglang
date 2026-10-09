@@ -45,7 +45,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     token_axis_sizes,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
-from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual import (
+    ResidualReadout,
+    ResidualUpdate,
+)
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
     NORM_READOUT,
@@ -300,6 +303,48 @@ class StageDeclaration:
         for source in (self.previous, self.prepared_from):
             if source is not None and not isinstance(source, StageDeclaration):
                 raise TypeError("stage sources must be declarations")
+        _check_update(self.update)
+        _check_read(self.read)
+
+
+# The members every ResidualUpdate and ResidualReadout must set: the binding
+# reads each of them, and none has a default that is correct for every
+# implementation.
+_UPDATE_FACTS = (
+    "is_plain_add",
+    "applied_at_exit",
+    "outlives_layer",
+    "writes_stream",
+    "quantized_sum",
+)
+_READ_FACTS = ("is_plain_norm", "reads_before_dp_gather", "reads_after_attn_tp_gather")
+
+
+def _require(protocol, implementation, facts):
+    missing = [name for name in facts if not hasattr(implementation, name)]
+    if missing:
+        raise TypeError(
+            f"{type(implementation).__name__} does not set {', '.join(missing)}, "
+            f"which every {protocol} must"
+        )
+
+
+def _check_update(update):
+    _require("ResidualUpdate", update, _UPDATE_FACTS)
+    name = type(update).__name__
+    if update.writes_stream and (update.is_plain_add or not update.applied_at_exit):
+        raise ValueError(
+            f"{name} writes the next stream itself, which only an update "
+            "applied at its exit and other than a plain add does"
+        )
+    if update.quantized_sum and not update.is_plain_add:
+        raise ValueError(
+            f"{name} lets its sum run quantized, which only a plain add does"
+        )
+
+
+def _check_read(read):
+    _require("ResidualReadout", read, _READ_FACTS)
 
 
 @dataclass(frozen=True)

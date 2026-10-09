@@ -313,6 +313,14 @@ def _bind_stage(declaration, norm, incoming, outgoing, *, final_read=None, **opt
         raise ValueError("connections do not match the stage declaration")
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
+    update = declaration.update
+    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+        # The final read adds the last output into the residual itself, as a
+        # plain add, before its norm.
+        raise NotImplementedError(
+            f"the layer stack ends on a stage whose {type(update).__name__} "
+            "update the final read would apply as a plain add"
+        )
     variants = {}
     for variant, edge in incoming.entries.items():
         if (

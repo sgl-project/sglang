@@ -997,6 +997,7 @@ class TestRowsTheConsumerReads(CustomTestCase):
             applied_at_exit = False
             outlives_layer = True
             writes_stream = False
+            quantized_sum = False
 
         # One pipeline rank: an update other than a plain add can't cross one.
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1)
@@ -1012,14 +1013,16 @@ class TestRowsTheConsumerReads(CustomTestCase):
                 ):
                     stages = [
                         stage
-                        for _ in range(2)
+                        for i in range(2)
                         for stage in append_stages(
                             (declare_attn(read=GatheringRead()), fixture.Norm()),
                             (
                                 declare_ffn(
                                     sparse=True,
                                     next_layer_sparse=True,
-                                    update=update,
+                                    # The final read adds the last output as a
+                                    # plain add.
+                                    update=update if i == 0 else PLAIN_ADD,
                                 ),
                                 fixture.Norm(),
                             ),
