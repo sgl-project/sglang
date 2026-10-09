@@ -39,9 +39,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-)
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -55,9 +53,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     prime_rope_cos_sin,
     rope_cos_sin,
 )
-from sglang.srt.hardware_backend.npu.utils import (
-    use_npu_arch35_mxfp8_wo_a,
-)
+from sglang.srt.hardware_backend.npu.utils import use_npu_arch35_mxfp8_wo_a
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
@@ -1614,12 +1610,9 @@ class MQALayer(MqaAttentionBase):
             )
 
         captured = is_in_breakable_cuda_graph()
-        indexer_buffers = None
-        if captured and self.indexer is not None:
+        capture_indexer = captured and self.indexer is not None
+        if capture_indexer:
             assert attn_backend.low_ratio_prefill_graph
-            indexer_buffers = attn_backend._cp_indexer_projection_buffers(
-                x.shape[0], self.compress_ratio
-            )
 
         stream_kv.wait_stream(current_stream)
         stream_compressor.wait_stream(current_stream)
@@ -1640,35 +1633,37 @@ class MQALayer(MqaAttentionBase):
                     run_indexer=not captured,
                     precomputed_x_global=x_global,
                 )
-            if indexer_buffers is not None:
+            if capture_indexer:
                 # The compressor above writes this layer's index-K cache. Gather
                 # its live dense prefixes on the same stream after that write.
                 prepared_dense_k = attn_backend._low_ratio_gather_k_prefill_graph(self)
-        prepared_q = None
+        projected_q = projected_w = prepared_q = None
         with torch.cuda.stream(stream_indexer):
-            if indexer_buffers is not None:
+            if capture_indexer:
                 # Capture the full CP-local bucket; the paged metadata masks
                 # padding when the indexer runs after the worker join.
-                indexer_buffers["q"].copy_(
-                    self.indexer.queries(q_lora, self.freqs_cis[positions])
-                )
-                indexer_buffers["w"].copy_(self.indexer.head_weights(x))
+                # These projections are graph-owned intermediates, so consume
+                # them directly after the join without persistent staging copies.
+                projected_q = self.indexer.queries(q_lora, self.freqs_cis[positions])
+                projected_w = self.indexer.head_weights(x)
                 prepared_q = attn_backend._low_ratio_quantize_q_prefill_graph(
-                    indexer_buffers["q"]
+                    projected_q
                 )
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
-        current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
-        if indexer_buffers is not None:
+        if capture_indexer:
             attn_backend._low_ratio_index_topk_captured(
                 self,
-                indexer_buffers["q"],
-                indexer_buffers["w"],
+                projected_q,
+                projected_w,
                 prepared_q=prepared_q,
                 prepared_dense_k=prepared_dense_k,
             )
+        # Indexer logits need index-K, not SWA KV. Join the SWA writer only at
+        # the attention boundary so it can overlap logits and top-k as well.
+        current_stream.wait_stream(stream_kv)
         del qkv_a
         return q
 

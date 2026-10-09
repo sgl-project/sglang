@@ -76,6 +76,134 @@ def _row_tensors(rows: List[Tuple[int, int]], pad: int):
 
 
 class TestC2PrefillRing(CustomTestCase):
+    @unittest.skipUnless(_sm100(), "the c2 JIT kernels are the SM100 build")
+    def test_graph_replay_global_offsets_padding_and_ring_carry(self):
+        # CP materializes request-major global rows before compression. The
+        # request axis must stay fixed even when a token bucket replays B=1/5/1.
+        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+            with self.subTest(layout=layout.name):
+                self._run_graph_replay(layout)
+
+    def _run_graph_replay(self, layout):
+        gen = torch.Generator(device="cuda").manual_seed(19)
+        bucket, capacity, ring_size = 32, 8, 8
+        inputs = _make_inputs(gen, bucket)
+        weight = torch.randn(
+            HEAD_DIM, generator=gen, device="cuda", dtype=torch.bfloat16
+        )
+        angles = torch.randn(128, ROPE_DIM // 2, generator=gen, device="cuda")
+        freqs = torch.view_as_real(
+            torch.polar(torch.ones_like(angles), angles)
+        ).flatten(-2)
+        state = _make_inputs(gen, capacity * ring_size + 1)
+        eager_state = state.clone()
+        cache = torch.zeros(
+            NUM_PAGES, layout.page_bytes(PAGE_SIZE), device="cuda", dtype=torch.uint8
+        )
+        eager_cache = cache.clone()
+        req = torch.zeros(bucket, device="cuda", dtype=torch.int64)
+        pos = torch.zeros(bucket, device="cuda", dtype=torch.int64)
+        loc = torch.zeros(bucket, device="cuda", dtype=torch.int64)
+        starts = torch.zeros(capacity, device="cuda", dtype=torch.int32)
+        lengths = torch.zeros_like(starts)
+        latent = torch.full(
+            (bucket, HEAD_DIM), 123, device="cuda", dtype=torch.bfloat16
+        )
+
+        def run(ring, dst_cache, offsets, out=None):
+            return c2_prefill_norm_rope_store(
+                inputs,
+                ring,
+                weight,
+                pos,
+                req,
+                loc,
+                EPS,
+                freqs,
+                dst_cache,
+                *offsets,
+                page_size=PAGE_SIZE,
+                ring_size=ring_size,
+                layout=layout,
+                out=out,
+            )
+
+        # Warm on a side stream before capturing; all rows initially pad.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(state, cache, (starts, lengths), latent)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(state, cache, (starts, lengths), latent)
+
+        request_ids = [4, 1, 6, 2, 0]
+        next_pos = {4: 1, 1: 8, 6: 7, 2: 0, 0: 3}
+        for sizes in ([4], [9, 0, 3, 4, 2], [5], []):
+            rows, begin = [], []
+            for rid, n in zip(request_ids, sizes):
+                begin.append(len(rows))
+                rows.extend((rid, next_pos[rid] + i) for i in range(n))
+                next_pos[rid] += n
+            n = len(rows)
+            req.zero_()
+            pos.zero_()
+            loc.zero_()
+            starts.zero_()
+            lengths.zero_()
+            if n:
+                req[:n].copy_(torch.tensor([r for r, _ in rows], device="cuda"))
+                pos[:n].copy_(torch.tensor([p for _, p in rows], device="cuda"))
+                loc[:n].copy_(
+                    torch.tensor(
+                        [SLOT_BASE * (1 + r) + p for r, p in rows], device="cuda"
+                    )
+                )
+            m = len(sizes)
+            starts[:m].copy_(torch.tensor(begin, device="cuda", dtype=torch.int32))
+            lengths[:m].copy_(torch.tensor(sizes, device="cuda", dtype=torch.int32))
+            inputs.copy_(_make_inputs(gen, bucket))
+            before = eager_state.clone()
+            latent.fill_(123)
+            graph.replay()
+            eager = run(eager_state, eager_cache, (starts, lengths))
+            self.assertTrue(torch.equal(cache, eager_cache))
+            self.assertTrue(torch.equal(state, eager_state))
+            odd = [i for i, (_, p) in enumerate(rows) if p % 2]
+            self.assertTrue(torch.equal(latent[odd], eager[odd]))
+            untouched = [i for i in range(bucket) if i not in odd]
+            self.assertTrue(torch.all(latent[untouched] == 123).item())
+
+            # Independently check Torch's pair selection/softmax/finish, not
+            # only another invocation of the fused kernel. FP32 reduction order
+            # can cross a bf16 rounding boundary, so do not require byte equality.
+            for i in odd:
+                rid, p = rows[i]
+                previous = (
+                    inputs[i - 1]
+                    if i and rows[i - 1] == (rid, p - 1)
+                    else before[rid * ring_size + (p - 1) % ring_size]
+                )
+                pair = torch.stack((previous, inputs[i]))
+                kv, score = pair[:, :HEAD_DIM], pair[:, HEAD_DIM:]
+                pooled = (kv * score.softmax(0)).sum(0).to(torch.bfloat16).float()
+                expected = (
+                    pooled * torch.rsqrt(pooled.square().mean() + EPS) * weight.float()
+                ).to(torch.bfloat16)
+                torch.testing.assert_close(latent[i], expected, rtol=0.016, atol=0.016)
+            # The ring contains exactly each request's most recent rows, even
+            # when a request has more new rows than its ring capacity.
+            for start, size in zip(begin, sizes):
+                for i in range(start + max(0, size - ring_size), start + size):
+                    rid, p = rows[i]
+                    torch.testing.assert_close(
+                        state[rid * ring_size + p % ring_size],
+                        inputs[i],
+                        rtol=0,
+                        atol=0,
+                    )
+
     def _run(self, stream: Stream, layout: KVLayout, ring_size: int, seed: int):
         """The fused chunked path and the row-at-a-time decode path over the same
         stream; returns (cache, latents) for each."""

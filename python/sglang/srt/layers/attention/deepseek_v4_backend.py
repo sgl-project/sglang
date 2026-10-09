@@ -1037,6 +1037,10 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Global request offsets, not CP-local rows. A token bucket can replay with
+    # more requests than it captured, so keep the request axis pool-sized.
+    low_ratio_cp_extend_start_loc: Optional[torch.Tensor] = None
+    low_ratio_cp_extend_seq_lens: Optional[torch.Tensor] = None
     low_ratio_local_req_indices: Optional[torch.Tensor] = None
     low_ratio_dense_req_indices: Optional[torch.Tensor] = None
     low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
@@ -1068,6 +1072,14 @@ class DSV4Metadata:
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c1_indexer_metadata, src=other.c1_indexer_metadata)
         maybe_copy_inplace(self.c2_indexer_metadata, src=other.c2_indexer_metadata)
+        maybe_copy_inplace(
+            self.low_ratio_cp_extend_start_loc,
+            src=other.low_ratio_cp_extend_start_loc,
+        )
+        maybe_copy_inplace(
+            self.low_ratio_cp_extend_seq_lens,
+            src=other.low_ratio_cp_extend_seq_lens,
+        )
         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
         maybe_copy_inplace(
             self.c128_compress_metadata, src=other.c128_compress_metadata
@@ -1091,6 +1103,14 @@ class DSV4Metadata:
         )
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
+        )
+        maybe_copy_inplace(
+            self.low_ratio_cp_extend_start_loc,
+            src=static_metadata.low_ratio_cp_extend_start_loc,
+        )
+        maybe_copy_inplace(
+            self.low_ratio_cp_extend_seq_lens,
+            src=static_metadata.low_ratio_cp_extend_seq_lens,
         )
         if self.prefill_graph_dense_indexer:
             maybe_copy_inplace(
@@ -1584,6 +1604,13 @@ class DeepseekV4AttnBackend(
                 else None
             )
             metadata.low_ratio_req_indices = req_pool_indices_repeated.to(torch.int64)
+            if cp_active and 2 in low:
+                (
+                    metadata.low_ratio_cp_extend_start_loc,
+                    metadata.low_ratio_cp_extend_seq_lens,
+                ) = self._low_ratio_cp_compressor_offsets(
+                    extend_start_loc, extend_seq_lens, self.req_to_token_pool.size
+                )
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
@@ -2718,36 +2745,16 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
-        if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
+        if (
+            self.low_ratio_prefill_graph
+            and forward_batch.forward_mode.is_extend()
+            and not dsa_use_prefill_cp(forward_batch)
+        ):
             for ratio in self.low_ratios:
-                if dsa_use_prefill_cp(forward_batch):
-                    self._cp_indexer_projection_buffers(
-                        forward_batch._cp_positions.shape[0], ratio
-                    )
-                else:
-                    self._source_projection_buffers(
-                        forward_batch.out_cache_loc.shape[0], ratio
-                    )
+                self._source_projection_buffers(
+                    forward_batch.out_cache_loc.shape[0], ratio
+                )
         return self.forward_metadata
-
-    def _cp_indexer_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
-        """Capture-stable CP-local Q and weight rows for the paged indexer."""
-        sets = getattr(self, "_cp_indexer_proj_bufs", None)
-        if sets is None:
-            sets = self._cp_indexer_proj_bufs = {}
-        key = (ratio, num_tokens)
-        if key not in sets:
-            cfg = self.model_runner.model_config.hf_text_config
-            heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
-            sets[key] = {
-                "q": torch.zeros(
-                    num_tokens, heads, dim, dtype=torch.bfloat16, device=self.device
-                ),
-                "w": torch.zeros(
-                    num_tokens, heads, dtype=torch.bfloat16, device=self.device
-                ),
-            }
-        return sets[key]
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2983,7 +2990,24 @@ class DeepseekV4AttnBackend(
                     req_global = token_req_indices(forward_batch, num_tokens=total)
                     pos_global = forward_batch.positions[:total].to(torch.int64)
                 x_global = x_global[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            metadata = self.forward_metadata
+            if (
+                self._low_ratio_in_prefill_graph()
+                and layer.compressor.use_fused_compress
+            ):
+                offsets = None
+                if layer.compress_ratio == 2:
+                    assert metadata.low_ratio_cp_extend_start_loc is not None
+                    assert metadata.low_ratio_cp_extend_seq_lens is not None
+                    offsets = (
+                        metadata.low_ratio_cp_extend_start_loc,
+                        metadata.low_ratio_cp_extend_seq_lens,
+                    )
+                self._low_ratio_compress_fused(
+                    layer, x_global, req_global, pos_global, extend_offsets=offsets
+                )
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
             if self._low_ratio_in_prefill_graph():
                 q = layer.indexer.queries(q_lora, layer.freqs_cis[positions])
@@ -3063,6 +3087,19 @@ class DeepseekV4AttnBackend(
         )
 
         return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+
+    @staticmethod
+    def _low_ratio_cp_compressor_offsets(start_loc, seq_lens, capacity):
+        # The compact ring write-back launches over this static request axis.
+        # Zero lengths make unused entries no-ops, including after B shrinks.
+        assert start_loc is not None
+        count = start_loc.numel()
+        assert count <= capacity and seq_lens.numel() >= count
+        starts = start_loc.new_zeros(capacity, dtype=torch.int32)
+        lengths = seq_lens.new_zeros(capacity, dtype=torch.int32)
+        starts[:count].copy_(start_loc)
+        lengths[:count].copy_(seq_lens[:count])
+        return starts, lengths
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.
