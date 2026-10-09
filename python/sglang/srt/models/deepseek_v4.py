@@ -4787,25 +4787,34 @@ class DeepseekV4Model(nn.Module):
                     )
                 if __import__("os").environ.get("DSV4_DUMP_LHID"):
                     import hashlib as _hl
+                    import os as _os
 
                     _pos = forward_batch.positions
                     _lastpos = int(_pos.reshape(-1)[-1].item()) if _pos.numel() else -1
-                    if hidden_states.numel():
-                        _arr = (
-                            hidden_states.detach()
-                            .reshape(-1)
-                            .to(torch.float32)
-                            .cpu()
-                            .numpy()
+                    _lo = _os.environ.get("DSV4_DUMP_MIN_POS")
+                    _hi = _os.environ.get("DSV4_DUMP_MAX_POS")
+                    _win = _lastpos >= 0
+                    if _win and _lo is not None and _lastpos < int(_lo):
+                        _win = False
+                    if _win and _hi is not None and _lastpos > int(_hi):
+                        _win = False
+                    if _win:
+                        if hidden_states.numel():
+                            _arr = (
+                                hidden_states.detach()
+                                .reshape(-1)
+                                .to(torch.float32)
+                                .cpu()
+                                .numpy()
+                            )
+                            _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
+                        else:
+                            _h = "empty"
+                        print(
+                            f"[LHID] layer={i} lastpos={_lastpos} "
+                            f"ntok={int(hidden_states.shape[0])} md5={_h}",
+                            flush=True,
                         )
-                        _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
-                    else:
-                        _h = "empty"
-                    print(
-                        f"[LHID] layer={i} lastpos={_lastpos} "
-                        f"ntok={int(hidden_states.shape[0])} md5={_h}",
-                        flush=True,
-                    )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(

@@ -112,6 +112,44 @@ def compare(tag, a_steps, b_steps):
     return n_lp, same_shape, prefill, n_pre
 
 
+def report_lhid(rows):
+    """Order-independent [LHID] verdict.
+
+    Every request (4 miss + 1 hit) runs deterministically, so at a given
+    (ntok, lastpos, layer) the hidden-state md5 must be a *single* value across
+    all requests. A group with >1 distinct md5 is a REAL divergence at that
+    layer/step. This needs no request segmentation (robust to interleaving).
+    """
+    groups = defaultdict(set)
+    for r in rows:
+        if "md5" not in r or r["md5"] == "empty":
+            continue
+        try:
+            ntok = int(r.get("ntok", "-1"))
+            lp = int(r.get("lastpos", "-1"))
+        except (TypeError, ValueError):
+            continue
+        if ntok <= 0 or lp < 0:
+            continue
+        groups[(ntok, lp, _int(r, "layer"))].add(r["md5"])
+    div = [(lp, ly, sorted(s)) for (ntok, lp, ly), s in groups.items() if len(s) > 1]
+    if not div:
+        print("  no divergence: every (ntok,lastpos,layer) group has one md5")
+        print("  -> hit and miss hidden IDENTICAL on all sampled layers/steps")
+        return
+    div.sort(key=lambda t: (t[0], t[1]))
+    lp0 = div[0][0]
+    print(f"  groups={len(groups)}  divergent_groups={len(div)}"
+          f"  first_lastpos={lp0}")
+    print(f"  FIRST divergent step lastpos={lp0}; layers there = "
+          f"{sorted(ly for lp, ly, _ in div if lp == lp0)}")
+    print("  sample (lastpos, layer, distinct_md5):")
+    for lp, ly, s in div[:MAX_DIFF_SHOWN]:
+        print(f"     lastpos={lp} layer={ly}  md5s={s}")
+    if len(div) > MAX_DIFF_SHOWN:
+        print(f"     ... {len(div) - MAX_DIFF_SHOWN} more divergent groups")
+
+
 def main(path):
     recs = parse(path)
     for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
@@ -134,6 +172,10 @@ def main(path):
     for tag in ("CMPIDX", "IDXK", "C4KV", "OSHAPE", "XIN", "LHID"):
         rows = recs.get(tag, [])
         if not rows:
+            continue
+        if tag == "LHID":
+            print("\n== [LHID] per-layer hidden (order-independent) ==")
+            report_lhid(rows)
             continue
         reqs = cmp_reqs if tag == "CMPIDX" else segment(rows)
         print(f"\n== [{tag}] ==")
