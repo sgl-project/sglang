@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 import torch
+from safetensors import safe_open
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (
@@ -24,9 +25,18 @@ def _build_dit_config(server_args: ServerArgs) -> FluxConfig:
         dit_config = FluxConfig()
         server_args.pipeline_config.dit_config = dit_config
 
-    # ComfyUI Flux checkpoints always carry guidance_in weights.
-    dit_config.arch_config.guidance_embeds = True
+    # ComfyUI decides guidance_embeds the same way: whether the checkpoint
+    # actually carries guidance_in weights. FLUX.1-dev has them; FLUX.1-schnell
+    # does not.
+    dit_config.arch_config.guidance_embeds = _checkpoint_has_guidance_embeds(
+        server_args.model_path
+    )
     return dit_config
+
+
+def _checkpoint_has_guidance_embeds(model_path: str) -> bool:
+    with safe_open(model_path, framework="pt", device="cpu") as checkpoint:
+        return "guidance_in.in_layer.weight" in checkpoint.keys()
 
 
 def _split_sizes(dit_config: FluxConfig) -> tuple[int, int]:
