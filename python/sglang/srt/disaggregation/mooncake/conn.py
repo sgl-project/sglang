@@ -1841,6 +1841,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if indices is None:
                 continue
+            # Diagnostic kill-switch: isolate whether the transfer engine's
+            # contact with DSV4 state buffers (radix-only path) is the fault.
+            if envs.SGLANG_DEBUG_SKIP_DSV4_STATE_TRANSFER.get() and str(
+                st.value
+            ).startswith("dsv4_"):
+                continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
             src_dim_per_tensor = (

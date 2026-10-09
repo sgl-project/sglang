@@ -3,6 +3,7 @@ import importlib
 import logging
 import math
 import threading
+import time
 from typing import Tuple
 
 import torch
@@ -2124,6 +2125,52 @@ def hc_post(
     return out.view(s, -1)
 
 
+_mte_trace_prev_reserved = None
+_mte_trace_hook_installed = False
+
+
+def _mte_trace_call(x, y, post, comb) -> None:
+    # SGLANG_DEBUG_MTE_TRACE probe: per-call tensor addresses, allocator
+    # reserved delta (segment growth/release), and a one-time empty_cache
+    # hook. Parsed by test/manual/parse_mte_trace.py after an MTE fault.
+    global _mte_trace_prev_reserved, _mte_trace_hook_installed
+    print(
+        f"[mte.hcpre] t={time.time():.3f} T={x.shape[0]} x=0x{x.data_ptr():x} "
+        f"y=0x{y.data_ptr():x} post=0x{post.data_ptr():x} comb=0x{comb.data_ptr():x}",
+        flush=True,
+    )
+    try:
+        reserved = torch.npu.memory_stats().get("reserved_bytes.all.current")
+        if reserved is not None:
+            if _mte_trace_prev_reserved is not None and reserved != _mte_trace_prev_reserved:
+                print(
+                    f"[mte.alloc] t={time.time():.3f} reserved_delta="
+                    f"{reserved - _mte_trace_prev_reserved:+d} now={reserved}",
+                    flush=True,
+                )
+            _mte_trace_prev_reserved = reserved
+    except Exception:
+        pass
+    if not _mte_trace_hook_installed:
+        _mte_trace_hook_installed = True
+        try:
+            import traceback
+
+            orig = torch.npu.empty_cache
+
+            def _traced_empty_cache(*args, **kwargs):
+                print(
+                    "[mte.hook] t=%.3f torch.npu.empty_cache from:\n%s"
+                    % (time.time(), "".join(traceback.format_stack()[-6:-1])),
+                    flush=True,
+                )
+                return orig(*args, **kwargs)
+
+            torch.npu.empty_cache = _traced_empty_cache
+        except Exception:
+            pass
+
+
 def npu_hc_pre(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2165,6 +2212,17 @@ def npu_hc_pre(
     # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
     # cast back to the input dtype before the downstream
     # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    if envs.SGLANG_DEBUG_MTE_TRACE.get():
+        # Pre-launch print: a device fault surfaces inside the op call
+        # (the wrapper syncs and raises), so the post-call trace never
+        # runs for the faulting launch. Without this line the faulting
+        # call's tensors are invisible — its x/y only appear in the plog.
+        print(
+            f"[mte.launch] t={time.time():.3f} T={x.shape[0]} "
+            f"x=0x{x.data_ptr():x} hc_fn=0x{hc_fn.data_ptr():x} "
+            f"hc_scale=0x{hc_scale.data_ptr():x} hc_base=0x{hc_base.data_ptr():x}",
+            flush=True,
+        )
     y, post, comb = torch.ops.custom.npu_hc_pre(
         x,
         hc_fn,
@@ -2175,6 +2233,8 @@ def npu_hc_pre(
         norm_eps=rms_norm_eps,
         hc_eps=hc_eps,
     )
+    if envs.SGLANG_DEBUG_MTE_TRACE.get():
+        _mte_trace_call(x, y, post, comb)
     # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
     # not fold input_layernorm. Return norm_fused=False so the caller
     # applies the layernorm itself, matching the deepgemm/torch paths.

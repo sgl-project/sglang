@@ -818,6 +818,21 @@ class Envs:
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
+    # MemFabric (memfabric_hybrid) host_rdma data-plane nic endpoint; the
+    # per-worker port is derived from this base (see AscendTransferEngine).
+    ASCEND_MF_HCOM_URL = EnvStr(None)
+    # Diagnostic: skip transferring DSV4 state components (radix-only path)
+    # to isolate transfer-engine faults. Outputs will be wrong when enabled.
+    SGLANG_DEBUG_SKIP_DSV4_STATE_TRANSFER = EnvBool(False)
+    # Diagnostic: skip the per-layer KV send entirely (Ascend backend) to
+    # bisect prefill faults between mf's static engine/registration setup and
+    # its concurrent transfer activity. Decode times out when enabled.
+    SGLANG_DEBUG_SKIP_KV_SEND = EnvBool(False)
+    # Diagnostic master switch for the MTE-out-of-range investigation: logs
+    # every npu_hc_pre tensor address, allocator reserved-delta jumps/drops,
+    # empty_cache call stacks, radix prefix installs/early-sends/write-through
+    # chunks, and mf send batches. Parse with test/manual/parse_mte_trace.py.
+    SGLANG_DEBUG_MTE_TRACE = EnvBool(False)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)

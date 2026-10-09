@@ -563,6 +563,15 @@ class SchedulerDisaggregationPrefillMixin:
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
+        if envs.SGLANG_DEBUG_MTE_TRACE.get():
+            import time
+
+            print(
+                f"[mte.radix] t={time.time():.3f} write_through chunked={chunked} "
+                f"pending_bootstrap={req.pending_bootstrap} "
+                f"prefix_len={len(req.prefix_indices) if req.prefix_indices is not None else 0}",
+                flush=True,
+            )
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
             req.prefix_len = req.extend_end
@@ -1417,6 +1426,13 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        if envs.SGLANG_DEBUG_MTE_TRACE.get():
+            import time
+
+            print(
+                f"[mte.radix] t={time.time():.3f} early_send cached_end={cached_end}",
+                flush=True,
+            )
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
