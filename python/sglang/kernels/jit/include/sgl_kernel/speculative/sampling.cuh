@@ -103,10 +103,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 
   // sample from relu(target_probs - draft_probs)
   DType sum_relu_q_minus_p(0);
-  DType sum_q(0);
   vec_t<DType, VEC_SIZE> q_vec, p_vec;
   DType relu_q_minus_p[VEC_SIZE];
-  DType q_arr[VEC_SIZE];
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));
@@ -120,12 +118,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], DType(0));
-      q_arr[j] = q_vec[j];
     }
     sum_relu_q_minus_p += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
                               .Sum<VEC_SIZE>(relu_q_minus_p);
-    __syncthreads();
-    sum_q += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum<VEC_SIZE>(q_arr);
     __syncthreads();
   }
   if (tx == 0) {
@@ -137,11 +132,6 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.block_aggregate.value;
   __syncthreads();
-  if (tx == 0) {
-    temp_storage.block_aggregate.value = sum_q;
-  }
-  __syncthreads();
-  sum_q = temp_storage.block_aggregate.value;
 
   // The residual relu(q - p) can be empty: every token the target gives mass to was a
   // rejected draft (so p == q there). That happens when the coin equals the target's
@@ -151,7 +141,35 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   // token id d - 1 - a token with zero target probability. Sample from the target
   // distribution itself in that case.
   const bool residual_empty = !(sum_relu_q_minus_p > DType(0));
-  DType u = coin * (residual_empty ? sum_q : sum_relu_q_minus_p);
+  DType sampling_mass = sum_relu_q_minus_p;
+  if (residual_empty) {
+    // sum_relu_q_minus_p was broadcast from block_aggregate, so this branch is uniform
+    // across the block and the block-wide reductions inside it are safe. The target
+    // mass is only needed on this (rare) path; keeping it here leaves the common
+    // nonempty-residual and bonus paths with a single reduction per tile.
+    DType sum_q(0);
+    DType q_arr[VEC_SIZE];
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      q_vec.fill(DType(0));
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        q_arr[j] = q_vec[j];
+      }
+      sum_q += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum<VEC_SIZE>(q_arr);
+      __syncthreads();
+    }
+    if (tx == 0) {
+      temp_storage.block_aggregate.value = sum_q;
+    }
+    __syncthreads();
+    sampling_mass = temp_storage.block_aggregate.value;
+    // Complete the broadcast before the sampling scan below reuses shared storage.
+    __syncthreads();
+  }
+  DType u = coin * sampling_mass;
 
   DType aggregate_relu_q_minus_p(0);
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
