@@ -185,5 +185,26 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         assert meta.num_splits is None
 
 
+@pytest.mark.parametrize("b", range(2210, 2216))
+def test_precompute_launches_at_shared_memory_limit(b: int):
+    """A schedule within the kernel's static shared memory of 48 KiB must take the
+    fallback, not fail to launch (b = 2,212 to 2,214 on a 152-SM GB300)."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend
+
+    topk = 512
+    meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+    backend._maybe_precompute_flashmla_sched_meta(
+        meta,
+        q=torch.empty((b, 1, H_Q, D_QK), device="cuda", dtype=torch.bfloat16),
+        indices=torch.zeros((b, 1, topk), device="cuda", dtype=torch.int32),
+        topk_length=torch.full((b,), topk, device="cuda", dtype=torch.int32),
+        extra_indices=None,
+        extra_topk_length=None,
+    )
+    torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
