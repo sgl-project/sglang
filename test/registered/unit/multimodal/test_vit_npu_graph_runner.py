@@ -97,5 +97,34 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     )
 
 
+def test_npu_vit_graph_replay_output_survives_the_next_replay():
+    """Callers cache a replay's result and may replay again before consuming it,
+    so replay must not hand out the graph's static output buffer."""
+    runner_cls = _load_npu_graph_runner()
+    vit = SimpleNamespace(
+        blocks=[_Block()],
+        merger=lambda x: x,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        deepstack_visual_indexes=[],
+        deepstack_merger_list=None,
+    )
+    with patch(
+        "torch.get_device_module",
+        return_value=SimpleNamespace(graph_pool_handle=lambda: object()),
+    ):
+        runner = runner_cls(vit)
+    runner.block_input["key"] = torch.empty(4, 1, 2)
+    runner.block_output["key"] = torch.empty(4, 1, 2)
+    runner.block_graphs["key"] = SimpleNamespace(
+        replay=lambda: runner.block_output["key"].copy_(runner.block_input["key"] * 2)
+    )
+
+    first = runner.replay(graph_key="key", x_3d=torch.ones(4, 1, 2))
+    runner.replay(graph_key="key", x_3d=torch.full((4, 1, 2), 3.0))
+
+    assert torch.equal(first, torch.full((4, 1, 2), 2.0))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
