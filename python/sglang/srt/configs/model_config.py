@@ -2086,7 +2086,7 @@ class ModelConfig:
             generation_eos_ids = getattr(
                 self.hf_generation_config, "eos_token_id", None
             )
-            if generation_eos_ids:
+            if generation_eos_ids is not None:
                 generation_eos_ids = (
                     {generation_eos_ids}
                     if isinstance(generation_eos_ids, int)
