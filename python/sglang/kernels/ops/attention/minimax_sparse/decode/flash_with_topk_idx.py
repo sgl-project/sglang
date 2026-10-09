@@ -18,6 +18,10 @@ from ..common.utils import (
     unit_scale,
 )
 
+# Largest row the single-stage top-k takes: kMaxNumBlocks of sgl-kernel-xpu's own
+# kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
+
 
 def _prune_decode_configs(configs, named_args, **kwargs):
     """Drop autotune configs whose token tile is smaller than a sparse block.
@@ -896,7 +900,7 @@ def flash_decode_with_topk_idx(
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and score.shape[2] <= _JIT_TOPK_MAX_NUM_BLOCKS
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense

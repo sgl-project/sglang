@@ -34,9 +34,9 @@ def _make_backend():
     backend.kv_pool = _FakeKVPool()
     backend.req_to_token = torch.empty(1, dtype=torch.int32)
     backend.disable_value_layer_ids = set()
-    backend.fp8_attn_gemm = backend.is_npu = backend.use_msa = False
+    backend.fp8_attn_gemm = backend.is_npu = backend.is_hip = backend.use_msa = False
     backend._max_seqlen_q, backend._max_seqlen_k = 8, 128
-    backend.block_size_q = backend.block_size_k = 64
+    backend.block_size_q = backend.block_size_k = backend.page_size = 64
     backend.topk_blocks, backend.init_blocks, backend.local_blocks = 8, 1, 1
     backend.score_type = "indexer"
     backend._prefill_seqblock_meta = None
@@ -53,6 +53,7 @@ def _make_batch(**overrides):
         extend_seq_lens_cpu=None,
         extend_prefix_lens=None,
         seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([5, 7], dtype=torch.int32),
         out_cache_loc=torch.empty(0, dtype=torch.int32),
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         minimax_m3_precached_sparse_layers=None,
