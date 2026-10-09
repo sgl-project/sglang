@@ -1228,7 +1228,10 @@ async def freeze_gc_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
-    await _global_state.tokenizer_manager.start_expert_distribution_record()
+    try:
+        await _global_state.tokenizer_manager.start_expert_distribution_record()
+    except ValueError as e:
+        return _create_error_response(e)
     return Response(
         content="Start recording the expert distribution.\n",
         status_code=200,
@@ -1239,7 +1242,10 @@ async def start_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
-    await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    try:
+        await _global_state.tokenizer_manager.stop_expert_distribution_record()
+    except ValueError as e:
+        return _create_error_response(e)
     return Response(
         content="Stop recording the expert distribution.\n",
         status_code=200,
@@ -1250,7 +1256,10 @@ async def stop_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
-    await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    try:
+        await _global_state.tokenizer_manager.dump_expert_distribution_record()
+    except ValueError as e:
+        return _create_error_response(e)
     return Response(
         content="Dump expert distribution record.\n",
         status_code=200,
