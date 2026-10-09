@@ -116,4 +116,6 @@ mkdir -p cann-custom-ops
 rm -rf cann-custom-ops
 
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-${UV_PIP_INSTALL} -v -e "python[dev_npu]"
+# triton-ascend pins numpy==1.26.4, and pyarrow 26 requires NumPy 2 at import
+# without declaring it, so a fresh resolve breaks `import datasets`.
+${UV_PIP_INSTALL} -v -e "python[dev_npu]" "pyarrow<26"
