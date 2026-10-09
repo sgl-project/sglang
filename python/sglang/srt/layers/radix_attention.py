@@ -117,6 +117,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        use_prefill_attention_wrapper: bool = True,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -131,6 +132,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.use_prefill_attention_wrapper = use_prefill_attention_wrapper
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
@@ -175,7 +177,8 @@ class RadixAttention(nn.Module):
 
         context = get_tc_piecewise_forward_context()
         if (
-            forward_batch.forward_mode.is_extend()
+            self.use_prefill_attention_wrapper
+            and forward_batch.forward_mode.is_extend()
             and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading
@@ -209,21 +212,7 @@ class RadixAttention(nn.Module):
                     idx_v=idx_v,
                 )
                 return idx_out, attn_out
-            # Output dtype follows v (the model dtype) when available: qk-norm
-            # may emit q in a different dtype without changing the dtype the
-            # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
-            # produce a bf16 attention output; sizing the buffer off an fp8
-            # dtype would silently cast-copy the result to fp8.
-            out_dtype = v.dtype if v is not None else q.dtype
-            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                out_dtype = torch.bfloat16
-            if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty(
-                    (q.shape[0], self.tp_q_head_num * self.v_head_dim),
-                    dtype=out_dtype,
-                )
-            else:
-                output = torch.empty_like(q, dtype=out_dtype)
+            output = _new_attention_output(self, q, v)
             if any(
                 key in kwargs
                 for key in (
@@ -234,12 +223,13 @@ class RadixAttention(nn.Module):
                     "q_descale",
                     "k_descale",
                     "v_descale",
+                    "mxfp8_norm_rope_positions",
                 )
             ):
-                # A score_mod callable, aux_tensors, rel_bias, or mxfp8 descale
-                # tensors can't cross the unified_attention_with_output custom-op
-                # schema; route this backend's extend attention through the plain
-                # eager path.
+                # A score_mod callable, aux_tensors, rel_bias, mxfp8 descale
+                # tensors, or the mxfp8 deferred norm/RoPE operands can't cross
+                # the unified_attention_with_output custom-op schema; route this
+                # backend's extend attention through the plain eager path.
                 if is_in_breakable_cuda_graph():
                     lse = breakable_attention_with_output_extra_kwargs(
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
@@ -287,6 +277,19 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
+            real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+            if real_num_tokens is not None:
+                return _attention_on_real_rows(
+                    self,
+                    real_num_tokens,
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    save_kv_cache,
+                    key_value_num_tokens=key_value_num_tokens,
+                    **kwargs,
+                )
             return get_attn_backend().forward(
                 q,
                 k,
@@ -296,6 +299,158 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+
+
+def _new_attention_output(
+    layer: RadixAttention, q: torch.Tensor, v: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """An uninitialized buffer for the layer's attention output over q's rows.
+
+    Its dtype follows v (the model dtype) when available: qk-norm may emit q in
+    a different dtype without changing the dtype the backend writes. FP8 q/v
+    (e.g. mxfp8 KV-cache attention) still produce a bf16 attention output;
+    sizing the buffer off an fp8 dtype would silently cast-copy the result to
+    fp8.
+    """
+    out_dtype = v.dtype if v is not None else q.dtype
+    if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        out_dtype = torch.bfloat16
+    if layer.qk_head_dim != layer.v_head_dim:
+        return q.new_empty(
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+        )
+    return torch.empty_like(q, dtype=out_dtype)
+
+
+# Per-row attention inputs beside Q, K and V that the tc-piecewise op schema
+# cannot carry. The padded paths narrow them with the rows they belong to.
+_PER_ROW_EXTRA_KWARGS = (
+    "rel_bias",
+    "q_descale",
+    "k_descale",
+    "v_descale",
+    "mxfp8_norm_rope_positions",
+    "mxfp8_norm_rope_temp_scale",
+)
+# The per-row inputs that follow K and V rather than the queries.
+_KEY_ROW_KWARGS = frozenset({"k_rope", "k_descale", "v_descale", "idx_k", "idx_v"})
+
+
+def padded_extend_real_tokens(
+    q: torch.Tensor, forward_batch: ForwardBatch
+) -> Optional[int]:
+    """The number of real rows of an extend batch that MLP sync padded to a multiple of
+    attention TP, whose attention metadata covers only those rows; None for a
+    batch without such padding. Target verify plans its padded rows itself."""
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_target_verify():
+        return None
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens is None or not 0 < real_num_tokens < q.shape[0]:
+        return None
+    return real_num_tokens
+
+
+def _attention_on_real_rows(
+    layer: RadixAttention,
+    real_num_tokens: int,
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    *,
+    key_value_num_tokens: Optional[int] = None,
+    **kwargs,
+):
+    """Run the backend on a padded batch's real rows, with the cache locations
+    and positions narrowed for the call, and return its output padded back
+    with zero rows, as the prefill graph path does. K and V, and the per-row
+    inputs that follow them, are narrowed with the queries unless the caller
+    gives their own extent (K and V that hold a cached prefix), the layer is a
+    cross-attention (K and V are the encoder's), or they have a different row
+    count. A sparse indexer's q, k and v go with the rows they
+    index. A backend that writes into forward_batch._attn_output fills the
+    padded output's real rows in place."""
+    num_tokens = q.shape[0]
+
+    def queries(t):
+        return t[:real_num_tokens] if t is not None else None
+
+    keys_own_rows = key_value_num_tokens is not None or layer.is_cross_attention
+
+    def keys(t):
+        if t is None or keys_own_rows or t.shape[0] != num_tokens:
+            return t
+        return t[:real_num_tokens]
+
+    for name in (
+        "q_rope",
+        "k_rope",
+        "topk_indices",
+        "idx_q",
+        "idx_k",
+        "idx_v",
+        *_PER_ROW_EXTRA_KWARGS,
+    ):
+        if kwargs.get(name) is not None:
+            narrow = keys if name in _KEY_ROW_KWARGS else queries
+            kwargs[name] = narrow(kwargs[name])
+    if kwargs.get("aux_tensors") is not None:
+        kwargs["aux_tensors"] = [queries(t) for t in kwargs["aux_tensors"]]
+    # A backend that returns more than the output (its LSE, or a sparse
+    # indexer's output beside it) returns a tuple, padded as it comes.
+    output = (
+        None
+        if kwargs.get("return_lse")
+        or forward_batch.mha_return_lse
+        or kwargs.get("idx_q") is not None
+        else _new_attention_output(layer, q, v)
+    )
+    out_cache_loc = forward_batch.out_cache_loc
+    positions = forward_batch.positions
+    attn_output = forward_batch._attn_output
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    if output is not None:
+        forward_batch._attn_output = output[:real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            queries(q),
+            keys(k),
+            keys(v),
+            layer,
+            forward_batch,
+            save_kv_cache,
+            **kwargs,
+        )
+    finally:
+        forward_batch.out_cache_loc = out_cache_loc
+        forward_batch.positions = positions
+        forward_batch._attn_output = attn_output
+
+    def padded(t):
+        if not isinstance(t, torch.Tensor) or t.shape[0] != real_num_tokens:
+            return t
+        full = t.new_empty((num_tokens, *t.shape[1:]))
+        full[:real_num_tokens].copy_(t)
+        full[real_num_tokens:].zero_()
+        return full
+
+    if isinstance(ret, tuple):
+        return tuple(padded(t) for t in ret)
+    if (
+        output is None
+        or not isinstance(ret, torch.Tensor)
+        or ret.shape[0] != real_num_tokens
+        or ret.numel() != output[:real_num_tokens].numel()
+    ):
+        return padded(ret)
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
+    output[real_num_tokens:].zero_()
+    return output.view(num_tokens, *ret.shape[1:])
 
 
 def _unified_attention_with_output_impl(
@@ -601,7 +756,8 @@ def attention_with_output_extra_kwargs(
     """Breakable/tc_piecewise attention for backends whose forward needs kwargs
     that cannot cross the ``unified_attention_with_output`` custom-op schema --
     a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
-    fa4 attention). Plain (not a custom op) so the callable passes through; still
+    fa4 attention), or the per-token mxfp8 deferred norm/RoPE operands. Plain
+    (not a custom op) so the callable passes through; still
     runs eagerly between graph segments under BCG via the wrapper below. Mirrors
     the real-token narrowing + padded-output write of
     ``unified_attention_with_output``, and narrows per-token ``aux_tensors`` too.
@@ -625,7 +781,7 @@ def attention_with_output_extra_kwargs(
     aux_tensors = kwargs.get("aux_tensors")
     if aux_tensors is not None:
         kwargs["aux_tensors"] = [t[:real_num_tokens] for t in aux_tensors]
-    for per_token_key in ("rel_bias", "q_descale", "k_descale", "v_descale"):
+    for per_token_key in _PER_ROW_EXTRA_KWARGS:
         t = kwargs.get(per_token_key)
         if t is not None:
             kwargs[per_token_key] = t[:real_num_tokens]

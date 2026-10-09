@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported, is_xpu
 
 from ..common.utils import (
     _bitonic_merge,
@@ -16,6 +17,10 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+
+# Largest row the single-stage top-k takes: kMaxNumBlocks of sgl-kernel-xpu's own
+# kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
+_JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
 
 
 def _prune_decode_configs(configs, named_args, **kwargs):
@@ -34,8 +39,10 @@ _ON_HIP = torch.version.hip is not None
 
 
 def _decode_score_block_n(args):
-    # gfx950 pick: 512 for tiny batches (few CTAs), else 128.
-    return max(512 if args["batch_size"] <= 4 else 128, args["block_size"])
+    # gfx950 pick: 512 for tiny batches (few CTAs), else 128. A 512-token bf16
+    # K tile needs 128 KB of LDS, more than gfx942's 64 KB, so other archs keep 128.
+    small_batch = args["batch_size"] <= 4 and is_gfx95_supported()
+    return max(512 if small_batch else 128, args["block_size"])
 
 
 # On ROCm the autotune sweep is replaced by a fixed config plus the
@@ -895,7 +902,7 @@ def flash_decode_with_topk_idx(
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and score.shape[2] <= _JIT_TOPK_MAX_NUM_BLOCKS
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
@@ -1039,7 +1046,12 @@ def flash_decode_with_topk_idx(
         # Equivalent output to the 2-stage path (set of block ids, front-packed,
         # -1 padded); ~2-16x faster for long context. See
         # sglang/kernels/ops/attention/minimax_decode_topk.py.
-        from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+        if is_xpu():
+            from sgl_kernel import minimax_decode_topk
+        else:
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
 
         minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
     else:

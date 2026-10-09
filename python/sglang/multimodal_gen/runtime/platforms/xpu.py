@@ -63,11 +63,6 @@ class XpuPlatform(Platform):
         return True
 
     @classmethod
-    def log_warnings(cls) -> None:
-        """Log any XPU-specific warnings."""
-        pass
-
-    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
@@ -187,7 +182,8 @@ class XpuPlatform(Platform):
         )
 
     @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        """Get device communicator class for Intel XPU distributed communication."""
-        # Use base communicator for now; can be updated to use oneCCL-based communicator
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )

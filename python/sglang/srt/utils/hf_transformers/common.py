@@ -24,6 +24,8 @@ from huggingface_hub import snapshot_download
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
+    BailingMM2Config,
+    BailingMoeV3VLConfig,
     ChatGLMConfig,
     Cosmos3Config,
     Cosmos3EdgeConfig,
@@ -37,6 +39,8 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    FalconMambaConfig,
+    GigaChat35Config,
     Glm5NextConfig,
     Glm5NextTextConfig,
     GraniteMoeHybridConfig,
@@ -48,6 +52,8 @@ from sglang.srt.configs import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
     InternS2PreviewConfig,
+    IQuestQ1Config,
+    IQuestQ1MTPConfig,
     JetNemotronConfig,
     JetVLMConfig,
     K2HorizonConfig,
@@ -58,6 +64,8 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
@@ -86,6 +94,7 @@ from sglang.srt.configs import (
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -108,6 +117,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     for cls in [
         AfmoeConfig,
         BailingHybridConfig,
+        BailingMM2Config,
+        BailingMoeV3VLConfig,
         ChatGLMConfig,
         DbrxConfig,
         ExaoneConfig,
@@ -132,6 +143,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Qwen4ExpConfig,
         Qwen4ExpTextConfig,
         FalconH1Config,
+        FalconMambaConfig,
+        Mamba2Config,
+        MambaConfig,
+        GigaChat35Config,
         GraniteMoeHybridConfig,
         HYV4Config,
         DotsVLMConfig,
@@ -149,6 +164,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Qwen3_5TextConfig,
         Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
+        IQuestQ1Config,
+        IQuestQ1MTPConfig,
         InternS2MobiusConfig,
         InternS2MobiusTextConfig,
         JetNemotronConfig,
@@ -182,9 +199,28 @@ try:
 
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
+        hc_pre_from_prev_sublayer = False
+        # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
+        q_head_norm = True
+        kv_source_layer_ids = ()
+        index_source_layer_ids = ()
+        candidate_source_layer_id = -1
+        candidate_topk_blocks = 0
+        candidate_block_size = 0
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_token_id = 2
+        engram_compressed_vocab_size = 0
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+    _CONFIG_REGISTRY.update(
+        {cls.model_type: cls for cls in DEEPSEEK_V41_CONFIG_CLASSES}
+    )
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):
@@ -234,6 +270,11 @@ try:
 except ImportError:
     pass
 
+# Bare register: `get_config` re-parses every registry entry through its own
+# class, so AutoConfig need not resolve to it.
+#
+# `_LazyAutoMapping` keys on the config class `__name__`, so a differently-named
+# shadow drops out of PROCESSOR/TOKENIZER/MODEL_MAPPING.
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
@@ -247,6 +288,9 @@ for name, cls in _CONFIG_REGISTRY.items():
 # flattened onto the top-level config in `get_config` — the same path the base
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
+#
+# transformers owns `cosmos3_omni` as `Cosmos3OmniConfig`, so the name
+# constraint above means this registration must lose to it.
 try:
     AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
 except ValueError as e:
@@ -259,6 +303,9 @@ except ValueError as e:
 # `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
 # root config after `AutoConfig.from_pretrained`, matching other multimodal
 # configs that use a text sub-config.
+#
+# `exist_ok=True`: no registry re-parse backs these up, so AutoConfig itself
+# must resolve to SGLang's. Safe because they reuse the native class names.
 for _cosmos3_edge_config_cls in (
     Cosmos3EdgeTextConfig,
     Cosmos3EdgeVisionConfig,
@@ -267,16 +314,16 @@ for _cosmos3_edge_config_cls in (
 ):
     try:
         AutoConfig.register(
-            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
+            _cosmos3_edge_config_cls.model_type,
+            _cosmos3_edge_config_cls,
+            exist_ok=True,
         )
     except ValueError as e:
-        err = str(e).lower()
-        if "already registered" not in err and "already used" not in err:
-            logger.warning(
-                "Failed to register config %s: %s",
-                _cosmos3_edge_config_cls.model_type,
-                e,
-            )
+        logger.warning(
+            "Failed to register config %s: %s",
+            _cosmos3_edge_config_cls.model_type,
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------
