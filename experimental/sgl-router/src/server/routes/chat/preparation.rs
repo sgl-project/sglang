@@ -103,8 +103,16 @@ impl PreparedRequest {
                 ..Self::generate_value(ctx, model, generate, None)?
             });
         }
-        // Router-rendered `input_ids` go only into chat; completions are forwarded as sent.
-        let forwarding_scope = (path == CHAT_PATH).then(|| forwarding_scope(ctx, &model));
+        // Router-rendered `input_ids` go only into chat, and only to engines that
+        // render it alike; completions are forwarded as sent.
+        let renders_alike = ctx
+            .registry
+            .workers_for(&model)
+            .iter()
+            .filter_map(|worker| worker.openai_settings())
+            .all(|settings| renders_as_router(ctx, settings));
+        let forwarding_scope =
+            (path == CHAT_PATH && renders_alike).then(|| forwarding_scope(ctx, &model));
         let can_forward_input_ids =
             forwarding_scope.is_some_and(|scope| scope != ForwardingScope::Never);
         let needs_tokens = should_tokenize_request(
@@ -414,13 +422,7 @@ fn lower_openai(
     if forwarding_scope(ctx, model) != ForwardingScope::AllText {
         return Err("chat_rendering_unverified");
     }
-    let engine_kwargs = settings
-        .default_chat_template_kwargs
-        .clone()
-        .unwrap_or_default();
-    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
-        != ctx.config.model.default_chat_template_kwargs
-    {
+    if !renders_as_router(ctx, &settings) {
         return Err("default_chat_template_kwargs_differ");
     }
     let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
@@ -428,6 +430,16 @@ fn lower_openai(
     lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
         .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         .map_err(|unsupported| unsupported.0)
+}
+
+/// Whether an engine with `settings` renders chats with the router's default kwargs.
+fn renders_as_router(ctx: &AppContext, settings: &OpenAiSettings) -> bool {
+    let engine_kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    engine_kwargs.into_iter().collect::<HashMap<_, _>>()
+        == ctx.config.model.default_chat_template_kwargs
 }
 
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.

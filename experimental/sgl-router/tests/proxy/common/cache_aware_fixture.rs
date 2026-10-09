@@ -121,6 +121,15 @@ pub fn openai_router(workers: &[(&MockWorker, WorkerMode)]) -> axum::Router {
     radix_router_with(workers, HashTree::new(), Some(Arc::default()))
 }
 
+/// [`openai_router`] whose workers report `settings`.
+#[allow(dead_code)] // Only some test files set engine OpenAI settings.
+pub fn openai_router_with(
+    workers: &[(&MockWorker, WorkerMode)],
+    settings: OpenAiSettings,
+) -> axum::Router {
+    radix_router_with(workers, HashTree::new(), Some(Arc::new(settings)))
+}
+
 fn radix_router_with(
     workers: &[(&MockWorker, WorkerMode)],
     tree: HashTree,

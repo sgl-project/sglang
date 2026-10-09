@@ -10,10 +10,11 @@ use axum::Router;
 use serde_json::{json, Value};
 use sgl_router::discovery::WorkerMode;
 use sgl_router::state::kv_events::HashTree;
+use sglang_processor::openai::OpenAiSettings;
 use std::time::Duration;
 use tower::ServiceExt;
 
-use crate::common::cache_aware_fixture::{openai_router, radix_router, MODEL};
+use crate::common::cache_aware_fixture::{openai_router, openai_router_with, radix_router, MODEL};
 use crate::common::mock_worker::MockWorker;
 use crate::common::streaming::{collect_body, parse_sse_data};
 
@@ -109,6 +110,28 @@ async fn completions_go_to_the_engine_route_when_unsupported() {
     let mut sent = engine.captured_json().await;
     sent.as_object_mut().unwrap().remove("rid"); // for abort-on-disconnect, as chat
     assert_eq!(sent, request);
+}
+
+/// The router renders with its own default chat-template kwargs, so an engine
+/// whose defaults differ gets the chat as sent, not the router's `input_ids`.
+#[tokio::test]
+async fn chat_keeps_engine_rendering_when_default_kwargs_differ() {
+    let engine = MockWorker::start(vec![]).await;
+    let kwargs = json!({"thinking": true}).as_object().cloned();
+    let settings = OpenAiSettings {
+        default_chat_template_kwargs: kwargs,
+        ..Default::default()
+    };
+    let app = openai_router_with(&[(&engine, WorkerMode::Plain)], settings);
+
+    let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]});
+    assert_eq!(
+        post(&app, "/v1/chat/completions", request).await.0,
+        StatusCode::OK
+    );
+    let sent = engine.captured_json().await;
+    assert!(sent.get("input_ids").is_none(), "{sent}");
+    assert_eq!(sent["messages"][0]["content"], "hi");
 }
 
 #[tokio::test]
