@@ -715,8 +715,7 @@ class TestMooncakePPStaging(unittest.TestCase):
 
 class TestEagleDsaSeedTransfer(CustomTestCase):
     def test_pd_seed_metadata_keeps_kpool_tail_width(self):
-        """Migrated from v0.5.18_rel commit 3dcb7d5eb6 (#15) DSA-tail state transfer patch.
-        Verifies get_dsa_seed_metadata_dim returns topk + kpool - 1 for GLM-5.3 config."""
+        """Verifies get_dsa_seed_metadata_dim returns topk + kpool - 1 for GLM-5.3 config."""
         config = SimpleNamespace(
             architectures=["Glm5NextForConditionalGeneration"],
             index_share_for_mtp_iteration=True,
@@ -1159,7 +1158,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
 
 
 class TestDSAKPoolDisaggregationState(unittest.TestCase):
-    """Migrated from v0.5.18_rel commit 3dcb7d5eb6 (#15) DSA-tail state transfer patch.
+    """DSA-tail state transfer tests.
 
     Tests cover HybridLinearKVPool state registration (MAMBA + DSA + DSA_TAIL),
     tail-ring index calculation, cross-ring-size transfer remapping, and PP-slice

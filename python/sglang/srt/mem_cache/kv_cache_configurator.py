@@ -1649,10 +1649,7 @@ class KVCacheConfigurator:
                 is_fp4_indexer_cache_enabled,
             )
 
-            # [patch #7 38ca55bb0f - MTP KPool INT8 index cache guard] 旧代码：
-            # pool_kwargs["use_fp4_indexer"] = (
-            #     current_platform.is_ppu() and is_fp4_indexer_cache_enabled()
-            # )
+            # Only enable the FP4 indexer cache when index_kpool == 1 (guards MTP KPool INT8).
             pool_kwargs["use_fp4_indexer"] = (
                 current_platform.is_ppu()
                 and get_dsa_index_kpool(self.model_config.hf_config) == 1

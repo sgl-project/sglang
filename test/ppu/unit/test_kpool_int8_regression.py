@@ -4,10 +4,7 @@ Validates that on PPU SM80 (get_device_sm() < 89) **every** KPool indexer code
 path routes through INT8 APIs (int8_mqa_logits / int8_paged_mqa_logits /
 per_token_quant_int8) and never reaches FP8 counterparts genuinely.
 
-Migrated from v0.5.20_rel ``feat/glm-5.3-flash-migrate-0520`` (original source
-patch 022ea71d54 in v0.5.18_rel) and adapted to the v0.5.21 forms introduced by
-commits ``3efd3513fb`` (KPool INT8 routing + topk 128-align padding) and
-``304cbd73e2`` (FA3 INT8 fail-fast, CR Finding W5):
+The v0.5.21 forms validated here:
 
 - ``dsa_indexer_kpool.py`` uses an **instance flag** ``self.use_int8`` (set from
   ``get_device_sm() < 89 and is_ppu()``) instead of a module-level ``_is_ppu``
@@ -19,9 +16,6 @@ commits ``3efd3513fb`` (KPool INT8 routing + topk 128-align padding) and
 - FA3 INT8 KV-cache handling is a fail-fast ``ValueError``, not an up-cast copy.
 
 These tests operate purely on source text / AST – no GPU or CUDA required.
-
-Source patch: 022ea71d54 (v0.5.18_rel)
-Migration: 3efd3513fb + 304cbd73e2 (v0.5.21 branch feat/glm-5.3-flash-migrate-0521)
 """
 
 import ast

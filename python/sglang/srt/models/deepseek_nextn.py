@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -42,7 +43,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import (  # PPU glm5.3-flash CP: can_cp_split / is_prefill_context_parallel_enabled /; mla_use_prefill_cp are not ported (the mla CP path does not exist in the; DSA-only source panel).
+from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
@@ -68,10 +69,9 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
-# PPU glm5.3-flash CP: was absent (ported from the source NextN). The shared
-# head consumes the full token set, so the raw topk indices must be gathered
-# back like the hidden states; round-robin shards may be shorter than the
-# local token count and are padded with -1 rows before the rerange gather.
+# The shared head consumes the full token set, so the raw topk indices must be
+# gathered back like the hidden states; round-robin shards may be shorter than
+# the local token count and are padded with -1 rows before the rerange gather.
 def _gather_dsa_topk_indices_for_cp(
     topk_indices: torch.Tensor,
     local_num_tokens: int,
@@ -167,18 +167,13 @@ class DeepseekModelNextN(nn.Module):
             layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
-        # PPU glm5.3-flash CP: was absent (the source also had an mla flag
-        # here, dropped because this model is DSA-only on 0.5.21).
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
-        # PPU glm5.3-flash CP: the source forwarded dsa_enable_prefill_cp /
-        # mla_enable_prefill_cp to DeepseekV2DecoderLayer; not ported because
-        # 0.5.21's DeepseekV2DecoderLayer takes no such kwargs. The CP metadata
-        # injected and re-indexed at the model boundary is what the attention
-        # layer consumes.
+        # DeepseekV2DecoderLayer takes no CP kwargs; the attention layer consumes
+        # the CP metadata injected and re-indexed at the model boundary.
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
@@ -274,13 +269,10 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            # PPU glm5.3-flash CP: was absent. The source gated the V2 path with
-            # is_cp_v2_active(); 0.5.21's is_cp_active() gates the same CP-v2
-            # runner path, which arrives here already sharded -- never re-split.
-            # V1 keeps the strategy dormant on PPU, so this model must split
-            # activations itself (same scheme as deepseek_v4). eh_proj runs on
-            # the global tokens; the source's mla_use_prefill_cp arm is dropped
-            # because this model is DSA-only on 0.5.21.
+            # is_cp_active() gates the CP-v2 runner path, which arrives here
+            # already sharded -- never re-split. V1 keeps the strategy dormant on
+            # PPU, so this model splits activations itself; eh_proj runs on the
+            # global tokens.
             cp_v2_active = is_cp_active(forward_batch)
             use_cp_v1 = (
                 dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
@@ -305,10 +297,8 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = residual_batch.norm(
                     hidden_states, forward_batch, self.shared_head.norm
                 )
-                # PPU glm5.3-flash CP: was absent. Split-token bodies must hand
-                # the full token set to the shared head; the source's V2 arm
-                # (cp_gather_after_forward) is dropped because on 0.5.21 that
-                # helper asserts the CP-v2 strategy, which stays dormant on PPU.
+                # Split-token bodies must hand the full token set to the shared
+                # head, so gather the V1 round-robin shards back before it.
                 if use_cp_v1:
                     local_num_tokens = hidden_states.shape[0]
                     hidden_states = cp_all_gather_rerange_output(
@@ -376,8 +366,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()
-        # PPU glm5.3-flash CP: was absent (the source also had an mla flag
-        # here, dropped because this model is DSA-only on 0.5.21).
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -412,10 +400,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # PPU glm5.3-flash CP: was absent. TODO current just support prefill
-        # batch=1 and len(input_ids) > self.cp_size * 2. Inject the CP metadata
-        # and re-index the already-initialized backend metadata before the model
-        # forward splits the activations (mirrors deepseek_v4_nextn).
+        # TODO: currently only supports prefill batch=1 and
+        # len(input_ids) > self.cp_size * 2. Inject the CP metadata and re-index
+        # the already-initialized backend metadata before the model forward
+        # splits the activations.
         if self.dsa_enable_prefill_cp and not is_cp_active(forward_batch):
             if can_dsa_cp_split(
                 len(input_ids), self.cp_size, self.use_dsa, forward_batch
@@ -427,7 +415,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                if is_dsa_prefill_cp_round_robin_split():
+                # On PPU the CP-v2 strategy is dormant and the DSA backend has no
+                # apply_cp_reindex, so only reindex when a CP-v2 strategy is present.
+                if (
+                    is_dsa_prefill_cp_round_robin_split()
+                    and get_cp_strategy() is not None
+                ):
                     attn_backend = get_attn_backend()
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata

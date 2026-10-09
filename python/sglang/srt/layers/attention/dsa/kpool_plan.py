@@ -694,7 +694,7 @@ def _alloc_kpool_write_plan_buffers(
             max_bs, max_closed_pools, dtype=torch.int64, device=device
         ),
         num_draft_tokens=num_draft_tokens,
-        # [patch #8 ac5a621fa1 - freeze batch size at planning time]
+        # Freeze the batch size at planning time.
         plan_bs=max_bs,
         **verify_extras,
     )

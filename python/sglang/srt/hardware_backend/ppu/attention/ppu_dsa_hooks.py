@@ -65,7 +65,7 @@ def _ppu_dsa_init_forward_metadata_in_graph(self, forward_batch):
         self.forward_metadata.flashmla_metadata.flashmla_metadata.have_initialized = (
             False
         )
-        # [patch #17 3304cedac4 - HS64 CUDA Graph metadata reset: fix MTP accept 5.85→3.97 regression]
+        # Reset the HS64 CUDA Graph tile-scheduler metadata so replay rebuilds it.
         metadata = self.forward_metadata.flashmla_metadata.flashmla_metadata
         metadata.tile_scheduler_metadata = None
         metadata.num_splits = None

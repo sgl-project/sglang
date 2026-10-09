@@ -72,7 +72,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
-from sglang.srt.layers.utils.cp_utils import (  # PPU glm5.3-flash CP: can_cp_split / is_prefill_context_parallel_enabled are; not ported (the mla CP path does not exist in the DSA-only source panel).
+from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
@@ -411,11 +411,6 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        # PPU glm5.3-flash CP: was
-        # self.tp_size = get_parallel().tp_size
-        # head_shard_size = get_parallel().attn_tp_size
-        # head_shard_rank = get_parallel().attn_tp_rank
-        # _head_shard_rank_getter = partial(getattr, get_parallel(), "attn_tp_rank")
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.enable_prefill_cp = enable_prefill_cp
         self.tp_size = get_parallel().tp_size
@@ -623,8 +618,8 @@ class Glm5NextLinearAttention(nn.Module):
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        # PPU glm5.3-flash CP: gather the round-robin scattered CP tokens back to
-        # the natural order so this rank sees the full sequence
+        # Gather the round-robin scattered CP tokens back to natural order so
+        # this rank sees the full sequence.
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -655,8 +650,8 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-        # PPU glm5.3-flash CP: gather the round-robin scattered CP tokens back to
-        # the natural order so this rank sees the full sequence
+        # Gather the round-robin scattered CP tokens back to natural order so
+        # this rank sees the full sequence.
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -712,18 +707,13 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
-        # PPU glm5.3-flash CP: was
-        # return self.o_proj(core_attn_out)[0]
         output = self.o_proj(core_attn_out)[0]
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
-            # PPU: the source contract was block-contiguous (cp_plain_reduce_scatter);
-            # on 0.5.21 the model-level layout is round-robin, so all-reduce the
-            # attn_cp head shards and then re-scatter the tokens modulo cp_size.
+            # Model-level CP layout is round-robin: all-reduce the attn_cp head
+            # shards, then re-scatter the tokens modulo cp_size.
             if self.dsa_enable_prefill_cp:
                 output = get_parallel().attn_cp_group.all_reduce(output)
                 output = dsa_cp_round_robin_split_data(output)
-            # PPU: the source also had an mla-only `cp_plain_split(output)` branch
-            # here; it is not ported (this model is DSA-only on 0.5.21).
         elif self.dsa_enable_prefill_cp:
             output = get_parallel().attn_cp_group.all_reduce(output)
         return output
@@ -739,7 +729,6 @@ class Glm5NextDecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        # PPU glm5.3-flash CP: was absent
         dsa_enable_prefill_cp: bool = False,
     ) -> None:
         super().__init__()
@@ -751,7 +740,6 @@ class Glm5NextDecoderLayer(nn.Module):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
-        # PPU glm5.3-flash CP: was absent
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
@@ -766,7 +754,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 rms_norm_eps=config.rms_norm_eps,
                 reduce_results=False,
-                # PPU glm5.3-flash CP: was absent
                 enable_prefill_cp=self.dsa_enable_prefill_cp,
             )
         else:
@@ -999,7 +986,6 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
         capture_output=None,
-        # PPU glm5.3-flash CP: was absent
         next_full_attention_layer_id: Optional[int] = None,
     ):
         hidden_states_orig = residual_access.buffer(hidden_states)
@@ -1023,8 +1009,8 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
-        # PPU glm5.3-flash CP: was absent. Kick off the next full-attention
-        # layer's DSA KV owner-broadcast one layer ahead (no-op otherwise).
+        # Kick off the next full-attention layer's DSA KV owner-broadcast one
+        # layer ahead (no-op otherwise).
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
@@ -1072,8 +1058,6 @@ class Glm5NextModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_parallel().pp_group
-        # PPU glm5.3-flash CP: was absent (the source also had an mla flag here,
-        # dropped because this model is DSA-only on 0.5.21).
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -1107,14 +1091,12 @@ class Glm5NextModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
-                # PPU glm5.3-flash CP: was absent
                 dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-        # PPU glm5.3-flash CP: was absent
         local_full_attention_layer_ids = [
             layer_id
             for layer_id in config.full_attention_layer_ids
@@ -1233,11 +1215,9 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
-        # PPU glm5.3-flash CP: was absent. The source split block-contiguously
-        # (cp_plain_split); on 0.5.21 the activation layout contract is
-        # round-robin, so entry split / exit gather use the 0.5.21 CP helpers
-        # (same scheme as deepseek_v4). is_cp_active() gates the CP-v2 runner
-        # path, which arrives here already sharded -- never re-split.
+        # Activation layout is round-robin: entry split / exit gather use the CP
+        # helpers. is_cp_active() gates the CP-v2 runner path, which arrives here
+        # already sharded -- never re-split.
         run_tbo = forward_batch.can_run_tbo and not self.dflash_capture
         use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
             forward_batch
@@ -1285,7 +1265,6 @@ class Glm5NextModel(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
-                    # PPU glm5.3-flash CP: was absent
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
                     ),
@@ -1315,9 +1294,7 @@ class Glm5NextModel(nn.Module):
                     hidden_states, forward_batch, self.norm
                 )
 
-        # PPU glm5.3-flash CP: was absent. The source gathered block-contiguously
-        # (cp_plain_all_gather); on 0.5.21 the scattered round-robin shards are
-        # reassembled into natural order by cp_all_gather_rerange_output.
+        # Reassemble the scattered round-robin shards into natural order.
         if (
             self.pp_group.is_last_rank
             and use_prefill_cp
@@ -1335,24 +1312,8 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
-    # [patch #5(a') 1c8267b9fe 蓝本 fb9024683b - MXFP4 quant-metadata 名称映射] 旧代码（v0.5.21-native）：
-    # hf_to_sglang_mapper = WeightsMapper(
-    #     orig_to_new_substr={
-    #         "model.visual": "visual",
-    #     },
-    #     orig_to_new_prefix={
-    #         "model.language_model.": "model.",
-    #     },
-    #     orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
-    # )
-    # 旧 suffix 形式只按 ".attn.qkv" 结尾匹配，无法命中文本层 "…self_attn.qkv"
-    # 条目（其结尾是 "_attn.qkv"，不含前置点号），会导致 quant metadata
-    # （ignored_layers / fp8_channelwise_layers）漏映射。改用源 patch 的两阶段
-    # 语义：substring 做 qkv 映射、prefix 做层级映射，_map_name 按
-    # substr→prefix→suffix 三阶段顺序执行，组合路径两步都能命中。
-    # substr 会连带命中 "attn.qkv_conv1d" / 已映射的 "attn.qkv_proj"，但该
-    # mapper 仅作用于 quant metadata 名称列表（checkpoint 原名、单次幂等），
-    # load_weights 内的 qkv 重写带点号且独立处理（见 load_weights）。
+    # Two-stage mapping (substr for qkv, prefix for layer) so quant-metadata
+    # names ending in "_attn.qkv" are not missed by a suffix-only match.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "attn.qkv": "attn.qkv_proj",
@@ -1430,8 +1391,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         )
         self.capture_aux_hidden_states = False
-        # PPU glm5.3-flash CP: was absent (the source also had an mla flag here,
-        # dropped because this model is DSA-only on 0.5.21).
         self.dsa_enable_prefill_cp = (
             not self.encoder_only and is_dsa_enable_prefill_cp()
         )
@@ -1671,11 +1630,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
         return video_embeds
 
-    # PPU glm5.3-flash CP: was absent. The source also had an mla branch
-    # here (`elif self.mla_enable_prefill_cp: can_cp_split(...)`), dropped
-    # because this model is DSA-only on 0.5.21. Inject the CP metadata and
-    # re-index the already-initialized backend metadata before the model
-    # forward splits the activations.
+    # Inject the CP metadata and re-index the already-initialized backend
+    # metadata before the model forward splits the activations.
     def _prepare_context_parallel_metadata(
         self,
         input_ids: torch.Tensor,
@@ -1700,23 +1656,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
-                # [patch GLM5.3-Flash v21 PPU dormant-CP 补缺] PPU 上 CP-v2 strategy 恒休眠
-                # （cp/base.py init_cp_strategy 的 is_ppu 守卫 → get_cp_strategy() 返回 None），
-                # 且 PPU DSA backend 无 core_attn_metadata/apply_cp_reindex；PPU 由 dsa_backend.py
-                # 内部 V1 回退完成 round-robin 切分（对齐 v0.5.18）。此外 glm5_next 为 hybrid 模型，
-                # get_attn_backend() 返回 HybridLinearAttnBackend wrapper，其 forward_metadata 会
-                # 落到 ABC 类属性 None。故仅在 CP-v2 strategy 存在（非 PPU）时执行 reindex。
-                # 旧代码：
-                # if is_dsa_prefill_cp_round_robin_split():
-                #     attn_backend = get_attn_backend()
-                #     metadata = attn_backend.forward_metadata
-                #     core_meta = metadata.core_attn_metadata
-                #     core_meta.apply_cp_reindex()
-                #     core_meta.init_flashmla_related(is_prefill=True)
-                #     if metadata.indexer_metadata is not None:
-                #         metadata.indexer_metadata = (
-                #             attn_backend.init_forward_metadata_indexer(core_meta)
-                #         )
+                # On PPU the CP-v2 strategy is dormant and the DSA backend has no
+                # apply_cp_reindex, so only reindex when a CP-v2 strategy is present.
                 if (
                     is_dsa_prefill_cp_round_robin_split()
                     and get_cp_strategy() is not None
@@ -1743,7 +1684,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        # PPU glm5.3-flash CP: was absent
         self._prepare_context_parallel_metadata(
             input_ids, input_embeds, forward_batch, pp_proxy_tensors
         )

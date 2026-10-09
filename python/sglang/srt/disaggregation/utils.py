@@ -113,8 +113,7 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-# [迁移自 v0.5.18_rel feat/glm-5.3-flash 756a2e8bf5]
-# PD DSA prefill CP 的 KV 重分片与 radix prefix cache 不兼容。
+# PD DSA prefill CP KV resharding is incompatible with the radix prefix cache.
 def should_bypass_dsa_cp_prefix_cache(
     server_args: ServerArgs, *, is_dsa: bool = True
 ) -> bool:

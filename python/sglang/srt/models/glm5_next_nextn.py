@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-# [patch #12 df1cb1102c - remap NextN quant_config.ignore prefixes for INT8 MTP]
 import copy
 import logging
 
@@ -24,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
-    # [patch #9 9418627c11 - fix INT8 MTP draft accept via nextn weight mapper]
     # Draft checkpoints fuse q_a_proj/kv_a_proj_with_mqa. The loader only adds
     # this packing automatically for quark, so the INT8 path needs the class to
     # declare it or should_ignore_layer() cannot split the fused draft name.
@@ -44,7 +42,7 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             draft_rules[f"{ckpt_prefix}.eh_proj"] = "model.eh_proj"
             draft_rules[f"{ckpt_prefix}.enorm"] = "model.enorm"
             draft_rules[f"{ckpt_prefix}.hnorm"] = "model.hnorm"
-            # [patch #9 9418627c11 - shared_head.norm also sits under `model`]
+            # shared_head.norm also sits under `model`.
             draft_rules[f"{ckpt_prefix}.shared_head.norm"] = "model.shared_head.norm"
             draft_rules[ckpt_prefix] = "model.decoder"
         # target rules still normalize the non-draft layers and vision tower in `exclude`
@@ -77,26 +75,6 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         ``WeightsMapper`` that ``load_weights`` uses, so the target model's
         config stays intact.
         """
-        # [patch #12 df1cb1102c - remap NextN quant_config.ignore prefixes for INT8 MTP] 旧代码：
-        # """Mixed checkpoints list the BF16 NextN block in ``quantization_config.ignore``;
-        # inheriting global FP8 quantization would corrupt its QKV weights."""
-        # raw_quant_config = getattr(config, "quantization_config", None) or {}
-        # if hasattr(raw_quant_config, "to_dict"):
-        #     raw_quant_config = raw_quant_config.to_dict()
-        # ignored = (
-        #     raw_quant_config.get("ignore", [])
-        #     if isinstance(raw_quant_config, dict)
-        #     else []
-        # )
-        # nextn_layer_pattern = f"model.layers.{config.num_hidden_layers}.*"
-        # if nextn_layer_pattern in ignored:
-        #     logger.warning(
-        #         "GLM5 NextN layer %s is checkpoint-declared unquantized; "
-        #         "using BF16 draft modules",
-        #         nextn_layer_pattern,
-        #     )
-        #     return None
-        # return super()._resolve_nextn_quant_config(config, quant_config)
         if quant_config is None:
             return None
 

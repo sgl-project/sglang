@@ -309,11 +309,7 @@ def build_kv_cache(
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(
         server_args, is_dsa=is_dsa
     )
-    # [修改-PD DSA prefill CP 的 KV 重分片与 radix prefix cache 不兼容]
-    # [迁移自 v0.5.18_rel feat/glm-5.3-flash 756a2e8bf5] 旧代码如下：
-    # disable_radix_cache = get_memory().disable_radix_cache or (
-    #     model_config.is_multimodal and uses_transformers_backend
-    # )
+    # Also disable the radix cache when PD DSA prefill CP needs CP-aware KV resharding.
     disable_radix_cache = (
         get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)

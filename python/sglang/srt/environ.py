@@ -1988,8 +1988,6 @@ class Envs:
     # SAIL FLA CUDA: top-level gate for SAIL-accelerated FLA (Flash Linear
     # Attention) paths on PPU. When False, all SAIL FLA dispatch (including
     # PLA decode fast-paths) falls back to community Triton kernels.
-    # Migrated from v0.5.18_rel/glm-5.3-flash dirty WIP (originally had no
-    # consumer; wired into fused_sigmoid_gating_recurrent.py in this tree).
     SGLANG_SAIL_FLA_CUDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)

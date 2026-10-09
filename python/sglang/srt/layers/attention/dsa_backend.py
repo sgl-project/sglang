@@ -85,6 +85,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -117,20 +118,31 @@ def prepare_kv_for_attention(
     defer_materialization: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Materialize KV needed before attention for the active layout."""
-    if (
-        defer_materialization
-        or not dsa_use_prefill_cp(forward_batch)
-        or not is_cp_active(forward_batch)
-    ):
+    # On PPU the CP-v2 strategy stays dormant, so V1 prefill CP holds local
+    # round-robin rows while out_cache_loc is full-slot; all-gather back to full
+    # rows to keep set_mla_kv_buffer indexing in bounds.
+    if defer_materialization or not dsa_use_prefill_cp(forward_batch):
         return k_nope, k_pe
-    strategy = get_cp_strategy()
-    assert strategy is not None
-    return strategy.materialize_full_mla_kv(
+    if is_cp_active(forward_batch):
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.materialize_full_mla_kv(
+            forward_batch,
+            attn_mla.attn_mqa,
+            k_nope,
+            k_pe,
+        )
+    kv_lora_rank = k_nope.shape[-1]
+    latent_cache = torch.cat([k_nope, k_pe], dim=-1).squeeze(1)
+    latent_cache_output = cp_all_gather_rerange_output(
+        latent_cache.contiguous(),
+        get_parallel().attn_cp_size,
         forward_batch,
-        attn_mla.attn_mqa,
-        k_nope,
-        k_pe,
+        torch.cuda.current_stream(),
     )
+    k_nope = latent_cache_output[..., :kv_lora_rank].unsqueeze(1)
+    k_pe = latent_cache_output[..., kv_lora_rank:].unsqueeze(1)
+    return k_nope, k_pe
 
 
 _is_hip = is_hip()
@@ -1100,11 +1112,9 @@ class DeepseekSparseAttnBackend(
             # init_cp_strategy) run prefill CP with the batch already CP-sharded
             # upstream -- this rewrite must stay off there.
             #
-            # NOTE(rebase onto 1a0c0fbe6b): the fork-local V1 round-robin fallback
-            # that used to sit in the `strategy is None` arm is dropped here.
-            # can_dsa_prefill_cp_interleave() requires cp_strategy == "interleave",
-            # and init_cp_strategy now binds InterleaveCPStrategy on PPU for exactly
-            # that kind, so the fallback was unreachable on PPU.
+            # The fork-local V1 round-robin fallback is dropped: init_cp_strategy
+            # binds InterleaveCPStrategy on PPU, so can_dsa_prefill_cp_interleave()
+            # already covers it and the `strategy is None` arm is unreachable there.
             strategy = (
                 get_cp_strategy()
                 if can_dsa_prefill_cp_interleave(forward_batch)
@@ -1125,6 +1135,18 @@ class DeepseekSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
+                # Under CP, pass local-row info to the kpool extend plan so its query
+                # row count matches the local q_fp8 rows (no-op when CP is off).
+                if use_kpool:
+                    kpool_inputs.cp_overrides = dict(
+                        local_real_page_table=self._transform_table_1_to_real(
+                            page_table
+                        ),
+                        local_seqlens_expanded=seqlens_expanded,
+                        local_extend_seq_lens_cpu=list(extend_seq_lens_cpu),
+                        local_seq_lens_cpu=indexer_seq_lens_cpu.tolist(),
+                        local_req_pool_indices=forward_batch.req_pool_indices[bs_idx],
+                    )
 
             if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
@@ -1327,9 +1349,7 @@ class DeepseekSparseAttnBackend(
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
             assert can_dsa_prefill_cp_interleave(forward_batch)
-            # 旧代码：
-            # split_per_token = get_cp_strategy().shard_local_tokens
-            # [patch GLM5.3-Flash v21 PPU dormant-CP 补缺] strategy 休眠时回退 V1 逐 token 切分
+            # Fall back to V1 per-token round-robin split when the strategy is dormant.
             _cp_strategy = get_cp_strategy()
             split_per_token = (
                 _cp_strategy.shard_local_tokens
@@ -3082,8 +3102,8 @@ class DeepseekSparseAttnBackend(
 
         topk_length = None
         if _is_ppu and self.dsa_index_kpool > 1:
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] KPool tails: pad the
-            # index list to a kernel-friendly multiple and pass per-item lengths.
+            # KPool tails: pad the index list to a kernel-friendly multiple and
+            # pass per-item lengths.
             assert (
                 page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
             )
@@ -3098,11 +3118,6 @@ class DeepseekSparseAttnBackend(
                 )
             topk_length = cache_seqlens[: page_table_1.shape[0]]
         else:
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48 - replace strict topk assert with KPool tail padding] 旧代码：
-            # indices = page_table_1.unsqueeze(1)
-            # assert (
-            #     indices.shape[-1] == self.dsa_index_topk
-            # )  # requirement of FlashMLA decode kernel
             assert (
                 page_table_1.shape[-1] == self.dsa_index_topk
             )  # requirement of FlashMLA decode kernel
@@ -3840,24 +3855,11 @@ class DeepseekSparseAttnBackend(
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] Pass topk_length to
-        # scheduler so it builds metadata based on actual per-item token counts
-        # instead of global topk=2048, eliminating the scheduler/kernel topk
-        # semantic mismatch that causes SM80 HS64 page-walk faults on odd batch
-        # sizes. Condition mirrors _forward_flashmla_kv: only PPU with kpool>1.
+        # Pass topk_length so the scheduler builds metadata from per-item token
+        # counts instead of the global topk, avoiding the topk semantic mismatch
+        # that faults SM80 HS64 page-walks. Only PPU with kpool>1.
         topk_length = cache_seqlens if (_is_ppu and self.dsa_index_kpool > 1) else None
 
-        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
-        # flashmla_metadata, num_splits = get_mla_metadata(
-        #     cache_seqlens=cache_seqlens,
-        #     # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
-        #     #      but the name looks like need seq_len_q?
-        #     num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
-        #     num_heads_k=1,
-        #     num_heads_q=num_heads_q,
-        #     is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
-        #     topk=self.dsa_index_topk,
-        # )
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
@@ -3867,7 +3869,6 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             topk=self.dsa_index_topk,
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
             topk_length=topk_length,
         )
 

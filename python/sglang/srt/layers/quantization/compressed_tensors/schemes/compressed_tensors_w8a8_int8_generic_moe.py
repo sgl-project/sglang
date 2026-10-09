@@ -1,22 +1,7 @@
-# Migrated from v0.5.18_rel/glm-5.3-flash dirty WIP:
-#   sglang/srt/layers/quantization/compressed_tensors/schemes/
-#     compressed_tensors_w8a8_int8_generic_moe.py  (213 lines, class
-#     CompressedTensorsW8A8Int8MoE).
-#
-# The upstream cherry-pick only shipped the NPU-specific
-# NPUCompressedTensorsW8A8Int8DynamicMoE; on PPU/CUDA the dynamic-token
-# W8A8 MoE branch raised NotImplementedError.  This file adds a portable
-# (Triton / DeepGEMM / acext) counterpart validated on PPU GLM-5.3-Flash
-# INT8 W8A8 MoE workloads.
-#
-# API drift from v0.5.18 → v0.5.21:
-#   - MoeRunnerBackend moved from sglang.srt.layers.moe to
-#     sglang.srt.layers.moe.utils.
-#   - get_moe_runner_backend / get_moe_a2a_backend moved to
-#     sglang.srt.layers.moe.utils.
-#   - is_ppu lives in sglang.srt.utils.common (re-exported via utils).
-#   - DeepGemmMoeQuantInfo grew extra optional fields (is_fp4_experts,
-#     use_mxfp8); the W8A8 fields used here are unchanged.
+# Portable dynamic-token W8A8 INT8 MoE scheme (Triton / DeepGEMM / acext) for
+# PPU/CUDA, the counterpart to the NPU-specific
+# NPUCompressedTensorsW8A8Int8DynamicMoE. Validated on PPU GLM-5.3-Flash INT8
+# W8A8 MoE workloads.
 from __future__ import annotations
 
 import logging

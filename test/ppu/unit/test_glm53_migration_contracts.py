@@ -1,24 +1,17 @@
-"""Static contract & dispatcher tests for GLM-5.3-Flash migration (v0.5.18 → v0.5.21).
+"""Static contract & dispatcher tests for GLM-5.3-Flash migration.
 
 These tests are designed to run on Mac/CPU without GPU/CUDA/PPU dependencies.
 They use AST analysis and monkeypatching instead of real imports where GPU
 extensions would be loaded at import time.
-
-Migrated from the v0.5.20 migration branch (commit 8f4fff8345 + later CR
-revisions) and adapted to the v0.5.21 APIs.
 
 Covers:
   - INT8 W8A8 MoE dispatcher: monkeypatch-driven branch selection
   - W8A8 INT8 MoE scheme: AST-level structural contract
   - GLM-5.3 MXFP4 weight-name mapper: behavioral test on real WeightsMapper
 
-Part 1 of the v0.5.20 source file (CP hybrid communicator AST contract on
-communicator_mhc_hybrid_cp.py) is intentionally omitted: the v0.5.20
-migration built a dedicated MHCHybridDSACPLayerCommunicator, but v0.5.21's
-layer_boundary system already provides the CP collectives natively (migrated
-commit 0f962b3247), so there is no equivalent module to contract-test.
-Part numbering is kept aligned with the v0.5.20 source file for
-cross-reference.
+The CP hybrid communicator AST contract is intentionally omitted: v0.5.21's
+layer_boundary system already provides the CP collectives natively, so there
+is no dedicated communicator module to contract-test.
 """
 
 import ast
@@ -68,12 +61,9 @@ def _parse_module(rel_path: str) -> ast.Module:
 # ===================================================================
 # Part 1: CP hybrid communicator — N/A in v0.5.21 (intentionally omitted)
 # ===================================================================
-# The v0.5.20 migration (commit 21692be5ec) built a dedicated
-# MHCHybridDSACPLayerCommunicator in communicator_mhc_hybrid_cp.py and
-# contract-tested it with ScatterMode-based AST checks. v0.5.21's
-# layer_boundary system already provides the CP collectives natively
-# (migrated commit 0f962b3247), so no equivalent module exists and there
-# is nothing to contract-test here.
+# v0.5.21's layer_boundary system provides the CP collectives natively, so
+# there is no dedicated MHCHybridDSACPLayerCommunicator module to contract-test
+# here.
 
 
 # ===================================================================
@@ -86,8 +76,8 @@ class TestW8A8Int8MoEDispatcherSelection(unittest.TestCase):
       - PPU -> CompressedTensorsW8A8Int8MoE
       - Other -> NotImplementedError
 
-    [CR Warning 6 - real dispatch] 旧代码直接实例化 scheme 或手写 if/else 模拟。
-    改为 mock get_scheme_dict 旁路层名匹配，真正执行 get_moe_scheme 的生产分支。
+    Mocks get_scheme_dict to bypass layer-name matching so the real
+    get_moe_scheme production branch is exercised.
     """
 
     @classmethod
@@ -402,7 +392,7 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
     """Behavioral test: real WeightsMapper.apply_list on combined paths.
 
     Validates the two-stage substr→prefix semantics required by the MXFP4
-    channelwise metadata remap (patch #5 1c8267b9fe).
+    channelwise metadata remap.
     """
 
     mapper = _GLM5_MAPPER
@@ -497,7 +487,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
     """AST contract for construction._bind_stage's MHC + attention-CP guard.
 
     v0.5.21 upstream raised NotImplementedError for any at-producer update
-    whose producer layout is sharded over ATTN_CP (commit 49b5e76e45). For
+    whose producer layout is sharded over ATTN_CP. For
     the GLM-5.3-Flash DSA prefill-CP path this blocked server startup with
     a full token shard over ATTN_CP, even though the transport is
     implemented (input gather in boundary._select_input_steps L415-430 /

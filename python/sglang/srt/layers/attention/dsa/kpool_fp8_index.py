@@ -1762,7 +1762,7 @@ def kpool_write_tail_and_maybe_compress(
     write_loc: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
-    # [patch #8 ac5a621fa1 - frozen batch size from KPoolWritePlan]
+    # Frozen batch size from the KPoolWritePlan.
     plan_bs: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
@@ -1783,9 +1783,7 @@ def kpool_write_tail_and_maybe_compress(
     if bn == 0:
         return
 
-    # [patch #8 ac5a621fa1 - use frozen plan_bs instead of bn // num_draft_tokens] 旧代码：
-    # assert bn % num_draft_tokens == 0
-    # bs = bn // num_draft_tokens
+    # Use the frozen plan_bs rather than deriving it from bn // num_draft_tokens.
     bs = plan_bs
     assert bs > 0, f"plan_bs must be positive, got {bs} (bn={bn})"
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)

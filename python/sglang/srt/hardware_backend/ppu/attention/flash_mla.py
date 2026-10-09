@@ -50,7 +50,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
-    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] kpool scheduler metadata
+    # Per-item kpool lengths for the scheduler metadata.
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return MLA tile scheduler metadata for PPU.
@@ -78,15 +78,6 @@ def get_mla_metadata(
             "FlashMLA dense FP8 get_mla_metadata is not supported on PPU."
         )
 
-    # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
-    # return _flashmla.get_mla_metadata(
-    #     cache_seqlens,
-    #     num_q_tokens_per_head_k,
-    #     num_heads_k,
-    #     num_heads_q=num_heads_q,
-    #     is_fp8_kvcache=is_fp8_kvcache,
-    #     topk=topk,
-    # )
     return _flashmla.get_mla_metadata(
         cache_seqlens,
         num_q_tokens_per_head_k,

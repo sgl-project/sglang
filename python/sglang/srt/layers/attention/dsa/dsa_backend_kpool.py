@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,10 +14,10 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_pooled_paged_mqa_metadata,
 )
 
-# [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] PPU flashmla_kv KPool tail support
+# PPU flashmla_kv KPool tail support
 from sglang.srt.utils import is_ppu
 
-# [CR Finding W7 - E402 fix] _is_ppu moved after all imports
+# _is_ppu resolved after all imports to avoid E402
 _is_ppu = is_ppu()
 
 if TYPE_CHECKING:
@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 class _KPoolForwardInputs:
     full_real_page_table: Optional[torch.Tensor] = None
     full_seqlens_expanded: Optional[torch.Tensor] = None
+    # Per-rank CP overrides: after CP sharding, dsa_backend.py fills local_*
+    # values so the kpool extend plan query rows match the local q_fp8 rows.
+    cp_overrides: dict = field(default_factory=dict)
 
 
 class DeepseekSparseAttnBackendKPoolMixin:
@@ -47,18 +50,14 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
-            # [PPU-int8] allow flashmla_sparse for kpool on SM80
+            # PPU int8: allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] allow FlashMLA-KV KPool tails on PPU
+            # Allow FlashMLA-KV KPool tails on PPU
             or (_is_ppu and dsa_impl == "flashmla_kv")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] 旧代码：
-            # f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            # "backend."
             f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
             "backend (plus FlashMLA-KV on PPU)."
         )
@@ -113,6 +112,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
+                # CP overrides filled by dsa_backend.py after CP sharding;
+                # empty dict (no-op) when CP is off.
+                **kpool_inputs.cp_overrides,
             )
 
         if forward_mode.is_decode_or_idle():

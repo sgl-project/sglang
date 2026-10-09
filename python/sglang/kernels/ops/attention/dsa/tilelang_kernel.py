@@ -1428,7 +1428,7 @@ def tilelang_sparse_fwd(
         kernel = sparse_attention_fwd_kernel_v1(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
         )
-        # [patch #5(b) 1c8267b9fe - SM89 TileLang v1 kernel execution path]
+        # SM89 TileLang v1 kernel execution path.
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     else:
         kernel_factory = (

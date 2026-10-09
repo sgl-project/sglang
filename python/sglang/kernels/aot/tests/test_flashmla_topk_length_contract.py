@@ -7,8 +7,6 @@ scheduler metadata and kernel page-walk use the same effective topk per query.
 
 A "half-migrated" state (kernel passes topk_length but scheduler does not) is the
 exact bug this contract detects.
-
-Reference: B1 commit 6dd5c0cc6e on v0.5.18_rel.
 """
 
 import ast
