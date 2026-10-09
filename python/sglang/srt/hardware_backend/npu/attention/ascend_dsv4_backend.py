@@ -172,7 +172,9 @@ def _build_explicit_state_block_table(
     within_capacity = columns[None, :] < history_size + capacities[:, None]
     valid = (seqused[:, None] > 0) & within_capacity & (positions >= 0)
 
-    if compress_ratio == 4:
+    if compress_ratio in (4, 128):
+        # Both the c4 attention state and (now) the c128 state are
+        # SWA-page-scoped so they persist across a prefix-cache hit.
         # Masked history/ragged columns are still indexed before torch.where.
         safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
         full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
