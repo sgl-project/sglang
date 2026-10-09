@@ -1507,10 +1507,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         :class:`~sglang.srt.layers.quantization.mxfp4_marlin_moe.Mxfp4MarlinMoEMethod`;
         only the input padding is local (``hidden_size`` is pre-rounded to the
         Marlin-padded width at create_weights)."""
-        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
-            build_marlin_moe_quant_info,
-        )
-
         x = dispatch_output.hidden_states
         if x.shape[-1] == self.hidden_size:
             x_padded = x
@@ -1518,10 +1514,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
-        quant_info = build_marlin_moe_quant_info(layer)
+        quant_info = self.get_marlin_quant_info(layer)
         return self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info
         )
+
+    def get_marlin_quant_info(self, layer):
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            build_marlin_moe_quant_info,
+        )
+
+        return build_marlin_moe_quant_info(layer)
 
     def _apply_sm120_cutlass(self, layer, dispatch_output):
         """SM120 GPT-OSS MXFP8 x MXFP4 MoE via FlashInfer CUTLASS."""
