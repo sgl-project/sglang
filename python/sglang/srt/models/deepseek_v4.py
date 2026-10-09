@@ -3997,11 +3997,14 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _replays_late_layers(self, tail: LateLayerTail, capture_dspark: bool) -> bool:
+    def _replays_late_layers(
+        self, tail: LateLayerTail, capture_dspark: bool, forward_batch: ForwardBatch
+    ) -> bool:
         # Prefill graph steps keep the late layers inside their own graph.
         graphs = self.decoder_replay_graphs
         return (
             graphs is not None
+            and graphs.ready(forward_batch.input_ids.shape[0])
             and not capture_dspark
             and tail.cp_metadata is None
             and not is_in_breakable_cuda_graph()
@@ -4123,7 +4126,7 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-                if self._replays_late_layers(tail, capture_dspark):
+                if self._replays_late_layers(tail, capture_dspark, forward_batch):
                     residual, pre = self.decoder_replay_graphs.run(
                         state=state,
                         positions=positions,
