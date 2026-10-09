@@ -345,6 +345,17 @@ class TreeComponent(ABC):
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+        """Pool tokens the allocator gets back when this node's device value
+        is evicted. The evictable/protected ledgers count these (prefill
+        admission adds the evictable ledger to the allocator's free space, and
+        the eviction walk counts them toward its request), so they must be in
+        the allocator's units: the value length by default, less for a
+        component whose values are not backed one-to-one by pool rows. A
+        component whose per-node figure changes in place reports the delta
+        through ``UnifiedTreeCore.adjust_component_ledger``."""
+        return self.value_len(node)
+
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
         """Whether this component's data is evicted from device but host-backed."""
         cd = node.component_data[self.component_type]

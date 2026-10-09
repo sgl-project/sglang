@@ -217,9 +217,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
+        tree_params = (
+            replace(
+                params,
+                enable_kv_cache_events=False,
+                eviction_policy="lru",
+                eviction_policy_config=None,
+            )
+            if self.disable
+            else params
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
-            params=params,
+            params=tree_params,
             components=self.components,
         )
         # Components execute boundary actions through the tree core.
@@ -599,6 +611,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
+        if self.disable:
+            return
+        result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self._apply_cache_actions(result.cache_actions)
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable

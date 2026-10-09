@@ -140,9 +140,9 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.41.3"
+version = "0.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d72db2750faea2ca5edbf6d0c50277a89dc8f75f5e6ddd695ef30f75e335019b"
+checksum = "63077bf55857e6963effefb5f28134c40cc2ee68bc176cc601bbdeb070017fba"
 dependencies = [
  "bytes",
  "derive_builder",
@@ -901,9 +901,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.4.3"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1cdacfc1398779cf173d5ff54438d9f14682f76875b6879853a84cc7d646228"
+checksum = "45ca7eba9c7e08c01b523fa8dc3d2287a7dabe53b1f9249827d329a91ad8f925"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -918,9 +918,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.2.0"
+version = "7.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4609cdbd65f8bd15c74f4531c1560d04496e8737dfb6b65b45487644b878963"
+checksum = "dbca1e2025c60cbecc4c3e919d689d99e552787a7b63821b7a811d257349e820"
 dependencies = [
  "anyhow",
  "chrono",
@@ -936,9 +936,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.8.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed232a9d254149a4e2e14f0a7d77f59bd64161964c0ba55267beea3955650faa"
+checksum = "b2bee9c4bcbcb9c498d03199d4ec6738cc0a9f861463074369fc3f7352539e44"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3541,7 +3541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
