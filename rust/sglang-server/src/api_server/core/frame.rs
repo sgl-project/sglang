@@ -66,9 +66,7 @@ impl CoreOutput {
         self.token_ids.extend_from_slice(&delta.token_ids);
         self.completion_tokens += delta.completion_tokens;
         self.prompt_tokens = delta.prompt_tokens;
-        if delta.metadata.is_some() {
-            self.metadata.clone_from(&delta.metadata);
-        }
+        self.metadata.clone_from(&delta.metadata);
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
         }
@@ -406,9 +404,9 @@ mod tests {
             dp_rank: Some(1),
         };
         let mut accumulated = CoreOutput::default();
-        for metadata in [Some(populated.clone()), Some(populated.clone()), None] {
+        for _ in 0..2 {
             accumulated.append_delta(&CoreOutput {
-                metadata,
+                metadata: Some(populated.clone()),
                 completion_tokens: 1,
                 ..Default::default()
             });
@@ -423,7 +421,7 @@ mod tests {
         assert_eq!(meta["reasoning_tokens"], 4);
         assert_eq!(meta["num_retractions"], 2);
         assert_eq!(meta["dp_rank"], 1);
-        assert_eq!(accumulated.completion_tokens, 3);
+        assert_eq!(accumulated.completion_tokens, 2);
         accumulated.append_delta(&CoreOutput {
             metadata: Some(SchedulerMetadata::default()),
             ..Default::default()

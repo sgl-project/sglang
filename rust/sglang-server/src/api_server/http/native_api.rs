@@ -464,7 +464,6 @@ fn delta_frame(
     e2e_latency: Option<f64>,
 ) -> api::GenerateResponse {
     delta.completion_tokens = accumulated.completion_tokens;
-    delta.metadata = delta.metadata.or_else(|| accumulated.metadata.clone());
     delta.frame(rid_str, index, e2e_latency)
 }
 
@@ -492,6 +491,10 @@ mod tests {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }
@@ -500,6 +503,10 @@ mod tests {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             // Parsed from the wire map Python emits, not a hand-built enum.
             finish_reason: Some(
                 serde_json::from_value(serde_json::json!({"type": "length", "length": 1}))
@@ -837,15 +844,7 @@ mod tests {
         let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
 
-        let mut first = match frame(10, "Hello") {
-            ResponseItem::Frame(event) => event,
-            _ => unreachable!(),
-        };
-        first.metadata = Some(crate::message::response::SchedulerMetadata {
-            cached_tokens: 128,
-            ..Default::default()
-        });
-        tx.send(ResponseItem::Frame(first)).await.unwrap();
+        tx.send(frame(10, "Hello")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);

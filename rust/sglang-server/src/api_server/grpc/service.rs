@@ -256,7 +256,10 @@ mod tests {
             prompt_tokens: 3,
             text: text.into(),
             completion_tokens: 1,
-            metadata: None,
+            metadata: Some(crate::message::response::SchedulerMetadata {
+                cached_tokens: 128,
+                ..Default::default()
+            }),
             extras: None,
         }
     }
@@ -400,12 +403,10 @@ mod tests {
         assert!(intake.admission.try_accept());
         assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
         assert!(intake.request.text.is_none());
-        let mut first = chunk(&intake.rid, "A", 10, false);
-        first.metadata = Some(crate::message::response::SchedulerMetadata {
-            cached_tokens: 128,
-            ..Default::default()
-        });
-        intake.sink.try_send(ResponseItem::Frame(first)).unwrap();
+        intake
+            .sink
+            .try_send(ResponseItem::Frame(chunk(&intake.rid, "A", 10, false)))
+            .unwrap();
         intake
             .sink
             .try_send(ResponseItem::Done(chunk(&intake.rid, "B", 11, true)))

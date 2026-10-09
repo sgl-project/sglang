@@ -82,7 +82,6 @@ pub(super) fn generate_stream(
                             // Python's incremental stream still reports the
                             // cumulative completion-token count in every frame.
                             delta.completion_tokens = acc.completion_tokens;
-                            delta.metadata = delta.metadata.or_else(|| acc.metadata.clone());
                             yield Ok(frame_item(delta, &public_ids[i], index(i), None));
                         } else {
                             coalesced = true;
@@ -105,7 +104,6 @@ pub(super) fn generate_stream(
                 // use, so it moves out instead of cloning.
                 let output = if options.stream && options.incremental {
                     delta.completion_tokens = acc.completion_tokens;
-                    delta.metadata = delta.metadata.or_else(|| acc.metadata.clone());
                     delta
                 } else {
                     std::mem::take(acc)
