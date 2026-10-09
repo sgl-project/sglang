@@ -244,6 +244,10 @@ where
 
         let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
 
+        if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+            req.headers_mut().insert("x-request-id", header_value);
+        }
+
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
 
