@@ -66,6 +66,7 @@ _REPLICA: GroupCoordinator | None = None
 # Corresponding TP lanes across the replicated encoder copies in one pipeline
 # replica. None means the encoder has only one TP copy, so batch DP cannot run.
 _ENCODER_DP: GroupCoordinator | None = None
+_SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
@@ -141,6 +142,7 @@ def _sync_srt_tp_group() -> None:
     the TP size in the dummy SRT configuration. Other parallel dimensions are
     one. Overrides also work before SRT configuration is published.
     """
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
@@ -148,10 +150,16 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
-    if srt_parallel_state._MOE_TP is None:
+    if srt_parallel_state._TP is _TP and srt_parallel_state._MOE_TP is None:
         srt_parallel_state._MOE_TP = _TP
-    if srt_parallel_state._MOE_EP is None:
-        srt_parallel_state._MOE_EP = _init_srt_moe_ep_group()
+    if (
+        _TP is not None
+        and srt_parallel_state._TP is _TP
+        and srt_parallel_state._MOE_TP is _TP
+        and srt_parallel_state._MOE_EP is None
+    ):
+        _SRT_MOE_EP = _init_srt_moe_ep_group()
+        srt_parallel_state._MOE_EP = _SRT_MOE_EP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
             tp_group=_TP,
@@ -176,6 +184,7 @@ def _sync_srt_tp_group() -> None:
 
 
 def _clear_srt_tp_group() -> None:
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import get_parallel
 
@@ -189,9 +198,11 @@ def _clear_srt_tp_group() -> None:
         srt_parallel_state._TP = None
     if srt_parallel_state._MOE_TP is _TP:
         srt_parallel_state._MOE_TP = None
-    if srt_parallel_state._MOE_EP is not None:
-        srt_parallel_state._MOE_EP.destroy()
-        srt_parallel_state._MOE_EP = None
+    if _SRT_MOE_EP is not None:
+        _SRT_MOE_EP.destroy()
+        if srt_parallel_state._MOE_EP is _SRT_MOE_EP:
+            srt_parallel_state._MOE_EP = None
+        _SRT_MOE_EP = None
 
 
 def init_parallel_group_coordinator(
