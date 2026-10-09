@@ -44,6 +44,8 @@ class GatedResidualState:
         ffn_mix: The FFN stage's read.
         attn_combine: Writes the attention output back into the streams.
         ffn_combine: Writes the FFN output back into the streams.
+        attn_reads_every_row: Whether attn_mix needs every row of the
+            attention's, as a contribution computed for all of them does.
     """
 
     expand: Callable
@@ -51,6 +53,7 @@ class GatedResidualState:
     ffn_mix: Callable
     attn_combine: Callable
     ffn_combine: Callable
+    attn_reads_every_row: bool = False
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
@@ -118,6 +121,10 @@ class _AttnReadout:
 
     def __init__(self, state: GatedResidualState):
         self.state = state
+
+    @property
+    def reads_after_attn_tp_gather(self):
+        return self.state.attn_reads_every_row
 
     def init_residual(self, hidden_states):
         return self.state.expand(hidden_states)

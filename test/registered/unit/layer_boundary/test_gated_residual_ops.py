@@ -183,8 +183,6 @@ class TestGatedResidualOps(CustomTestCase):
                     _, ffn = _build_qwen4_exp_stages(
                         state.residual_ops(),
                         sparse=True,
-                        layer_id=0,
-                        config=SimpleNamespace(num_hidden_layers=1, ple_layer_ids=[]),
                     )
                 with patch(
                     "sglang.srt.layers.layer_boundary.exit.sum_output",

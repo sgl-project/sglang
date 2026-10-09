@@ -39,7 +39,6 @@ from sglang.srt.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from sglang.srt.layers.layer_boundary import (
-    ExitRows,
     GatedResidualState,
     append_stages,
     declare_attn,
@@ -1450,13 +1449,7 @@ def _has_ple(layer_id, config) -> bool:
     return (layer_id + 1) in config.ple_layer_ids
 
 
-def _ffn_exit_rows(layer_id, config):
-    """A PLE layer's read adds an embedding computed for every row, so the FFN
-    before it hands its output on as full attention rows."""
-    return ExitRows.ATTENTION if _has_ple(layer_id + 1, config) else None
-
-
-def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
+def _build_qwen4_exp_stages(residual, *, sparse):
     """The attention and FFN stage boundaries of one gated hyper-connection layer.
 
     Each read normalizes the streams itself, so neither stage binds a norm, and
@@ -1474,7 +1467,6 @@ def _build_qwen4_exp_stages(residual, *, sparse, layer_id, config):
                 next_layer_sparse=sparse,
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
-                exit_rows=_ffn_exit_rows(layer_id, config),
             ),
             None,
         ),
@@ -1543,10 +1535,10 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
+                # The PLE embedding is computed for every row.
+                attn_reads_every_row=self.ple is not None,
             ).residual_ops(),
             sparse=isinstance(self.mlp, Qwen2MoeSparseMoeBlock),
-            layer_id=layer_id,
-            config=config,
         )
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm

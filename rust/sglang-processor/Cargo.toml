@@ -10,13 +10,16 @@ default = ["parser", "render", "tokenizer"]
 parser = ["dep:dynamo-parsers", "dep:dynamo-protocols"]
 render = ["dep:dynamo-protocols", "dep:dynamo-renderer", "dep:minijinja"]
 tokenizer = ["dep:dynamo-tokenizers"]
+# OpenAI endpoints served through `/generate`.
+openai = []
 
 [dependencies]
 async-stream = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
-# Prompt parity: SGLang serializes tool schemas in their request order.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# Prompt parity: SGLang serializes tool schemas in their request order, and
+# parses floats correctly rounded, as Python's `json.loads` does.
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

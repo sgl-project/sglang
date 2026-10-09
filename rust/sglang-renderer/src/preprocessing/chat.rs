@@ -3,11 +3,7 @@
 
 use std::collections::HashMap;
 
-use dynamo_parsers::parsers::get_tool_parser_map;
-use dynamo_parsers::{
-    StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
-    ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig,
-};
+use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ResponseFormat,
@@ -19,7 +15,8 @@ use minijinja::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 use sglang_processor::{
-    OneOrMany as ProcessorOneOrMany, chat_tool_definitions, dynamo_tool_parser_name,
+    OneOrMany as ProcessorOneOrMany, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
+    tool_constraint,
 };
 
 use crate::{
@@ -504,17 +501,6 @@ fn resolve_chat_parser(
     Ok(tools_enabled.then(|| configured_parser.expect("checked").to_owned()))
 }
 
-fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> DynamoToolChoice {
-    match choice {
-        Some(ChatCompletionToolChoiceOption::None) => DynamoToolChoice::None,
-        Some(ChatCompletionToolChoiceOption::Required) => DynamoToolChoice::Required,
-        Some(ChatCompletionToolChoiceOption::Named(choice)) => {
-            DynamoToolChoice::Named(choice.function.name.clone())
-        }
-        Some(ChatCompletionToolChoiceOption::Auto) | None => DynamoToolChoice::Auto,
-    }
-}
-
 fn apply_tool_constraint(
     sampling: &mut SamplingParams,
     parser: Option<&str>,
@@ -522,96 +508,12 @@ fn apply_tool_constraint(
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
 ) -> Result<(), String> {
-    if *tool_choice == DynamoToolChoice::None {
-        return Ok(());
-    }
-    if *tool_choice == DynamoToolChoice::Required && tools.is_empty() {
-        return Err("tool_choice is \"required\" but tools is empty".into());
-    }
-    if let DynamoToolChoice::Named(name) = tool_choice
-        && !tools.iter().any(|tool| &tool.name == name)
-    {
-        return Err(format!(
-            "tool named \"{name}\" in tool_choice is not present in tools"
-        ));
-    }
-
-    let Some(parser) = parser else {
-        return Ok(());
-    };
-    let parser = dynamo_tool_parser_name(parser);
-    let config = get_tool_parser_map()
-        .get(parser)
-        .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
-    let builder = config.structural_tag_builder.clone().or_else(|| {
-        (parser == "llama3_json"
-            && *tool_choice == DynamoToolChoice::Auto
-            && tools.iter().any(|tool| tool.strict.unwrap_or(false)))
-        .then(|| {
-            StructuralTagBuilder::TriggeredTags(TriggeredTagsConfig {
-                begin_template: r#"<|python_tag|>{"name":"{name}", "arguments":"#.to_string(),
-                end_template: "}".to_string(),
-                triggers: vec!["<|python_tag|>".to_string()],
-                content_style: Default::default(),
-                tool_call_ban_tokens: Vec::new(),
-                reasoning_end: None,
-            })
-        })
-    });
-    if let Some(builder) = builder
-        && let Some(tag) = builder
-            .build_tool_call_format(&ToolCallFormatBuildContext {
-                tool_choice,
-                tools,
-                parallel_tool_calls,
-                schema_mode: StructuralTagSchemaMode::Auto,
-                starts_in_reasoning: false,
-            })
-            .map_err(|error| error.to_string())?
-    {
-        sampling.structural_tag = Some(tag.to_string());
-        return Ok(());
-    }
-
-    if matches!(
-        tool_choice,
-        DynamoToolChoice::Required | DynamoToolChoice::Named(_)
-    ) {
-        let selected = match tool_choice {
-            DynamoToolChoice::Named(name) => tools
-                .iter()
-                .filter(|tool| tool.name == *name)
-                .collect::<Vec<_>>(),
-            _ => tools.iter().collect(),
-        };
-        let schemas = selected
-            .into_iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "properties": {
-                        "name": {"type": "string", "enum": [tool.name]},
-                        "parameters": tool.parameters.clone().unwrap_or_else(|| {
-                            serde_json::json!({"type": "object", "properties": {}})
-                        }),
-                    },
-                    "required": ["name", "parameters"],
-                })
-            })
-            .collect::<Vec<_>>();
-        let items = if schemas.len() == 1 {
-            schemas.into_iter().next().expect("one schema")
-        } else {
-            serde_json::json!({"type": "object", "anyOf": schemas})
-        };
-        let mut schema = serde_json::json!({
-            "type": "array",
-            "minItems": 1,
-            "items": items,
-        });
-        if parallel_tool_calls == Some(false) {
-            schema["maxItems"] = serde_json::json!(1);
-        }
-        sampling.json_schema = Some(schema.to_string());
+    let constraint = tool_constraint(parser, tool_choice, tools, parallel_tool_calls)
+        .map_err(|error| error.to_string())?;
+    match constraint {
+        Some(ToolConstraint::StructuralTag(tag)) => sampling.structural_tag = Some(tag),
+        Some(ToolConstraint::JsonSchema(schema)) => sampling.json_schema = Some(schema),
+        None => {}
     }
     Ok(())
 }
@@ -620,21 +522,6 @@ fn apply_tool_constraint(
 mod tests {
     use super::*;
     use crate::{RendererLimits, SamplingDefaults};
-    use dynamo_protocols::types::{
-        ChatCompletionNamedToolChoice, ChatCompletionToolType, FunctionName,
-    };
-
-    fn tool(name: &str, strict: bool) -> ToolDefinition {
-        ToolDefinition {
-            name: name.into(),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"]
-            })),
-            strict: Some(strict),
-        }
-    }
 
     fn chat_request(tool_choice: Option<ChatCompletionToolChoiceOption>) -> ChatRequest {
         ChatRequest {
@@ -702,67 +589,6 @@ mod tests {
             },
         };
         ChatPreprocessor::new(&config, Some(formatter))
-    }
-
-    #[test]
-    fn wire_tool_choices_lower_to_internal_choices() {
-        let named = Some(ChatCompletionToolChoiceOption::Named(
-            ChatCompletionNamedToolChoice {
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionName {
-                    name: "get_weather".into(),
-                },
-            },
-        ));
-
-        assert!(matches!(dynamo_tool_choice(&None), DynamoToolChoice::Auto));
-        assert!(matches!(
-            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Required)),
-            DynamoToolChoice::Required
-        ));
-        assert!(matches!(
-            dynamo_tool_choice(&named),
-            DynamoToolChoice::Named(name) if name == "get_weather"
-        ));
-    }
-
-    #[test]
-    fn required_choice_builds_a_single_call_constraint() {
-        let mut sampling = SamplingParams::default();
-        apply_tool_constraint(
-            &mut sampling,
-            Some("llama3"),
-            &DynamoToolChoice::Required,
-            &[tool("get_weather", false), tool("get_time", false)],
-            Some(false),
-        )
-        .unwrap();
-
-        let schema: JsonValue =
-            serde_json::from_str(sampling.json_schema.as_deref().unwrap()).unwrap();
-        assert_eq!(schema["minItems"], 1);
-        assert_eq!(schema["maxItems"], 1);
-    }
-
-    #[test]
-    fn invalid_tool_choices_are_rejected_before_generation() {
-        let mut sampling = SamplingParams::default();
-        assert!(
-            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None,)
-                .unwrap_err()
-                .contains("required")
-        );
-        assert!(
-            apply_tool_constraint(
-                &mut sampling,
-                None,
-                &DynamoToolChoice::Named("missing".into()),
-                &[tool("get_weather", false)],
-                None,
-            )
-            .unwrap_err()
-            .contains("missing")
-        );
     }
 
     #[test]
