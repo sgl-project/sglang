@@ -8,12 +8,15 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe import mega_gate as mega_gate_runtime
+from sglang.srt.layers.moe import mega_moe
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.topk import TopKConfig
@@ -431,6 +434,263 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             )
         self.assertEqual(out.shape, (0, 4))
         moe.gate.assert_not_called()
+
+    @staticmethod
+    def _mega_gate_reference(x, weight, top_k, **kwargs):
+        """Numerical substitute at the external DeepGEMM boundary only."""
+        if not torch.isfinite(x).all():
+            raise ValueError("The pinned MegaGate rejects nonfinite GEMM inputs")
+        scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
+        if kwargs["unmapped_topk_idx"] is not None:
+            ids = kwargs["unmapped_topk_idx"]
+        else:
+            bias = kwargs["bias"]
+            if kwargs["image_bias"] is not None:
+                bias = torch.where(
+                    kwargs["image_token_mask"][:, None], kwargs["image_bias"], bias
+                )
+            ids = (scores + bias).topk(top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
+        weights = weights * kwargs["routed_scaling_factor"]
+        if kwargs["mask"] is not None:
+            weights = weights.masked_fill(~kwargs["mask"][:, None], 0)
+            ids = ids.masked_fill(~kwargs["mask"][:, None], -1)
+        kwargs["out"][0].copy_(ids)
+        kwargs["out"][1].copy_(weights)
+
+    @classmethod
+    def _mega_gate_moe(cls, fused_shared, scale_in_topk, hash_routing=False):
+        moe = cls._v41_moe(fused_shared, scale_in_topk)
+        moe.config.model_type = "deepseek_v41"
+        moe.config.hidden_size = 256
+        moe.gate.weight = torch.zeros((8, 256), dtype=torch.bfloat16)
+        moe.gate.e_score_correction_bias = torch.tensor(
+            [4.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        moe.gate.e_score_correction_bias_vl = torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]
+        )
+        moe.topk.topk_config.scoring_func = "sqrtsoftplus"
+        if hash_routing:
+            moe.is_hash = True
+            moe.gate.e_score_correction_bias = None
+            moe.topk = SimpleNamespace(
+                topk=2 + fused_shared,
+                num_fused_shared_experts=fused_shared,
+                routed_scaling_factor=2.0,
+                apply_routed_scaling_factor_on_output=scale_in_topk,
+                score_func="sqrtsoftplus",
+                tid2eid=torch.tensor([[6, 7]] * 100, dtype=torch.int32),
+            )
+        return moe
+
+    def test_mega_gate_preserves_vision_hash_shared_scaling_and_padding(self):
+        """A fused gate must preserve expert contributions across EP layouts.
+
+        Nonfinite padding and out-of-vocabulary padded IDs must reach the
+        expert boundary with zero weight; routed scaling must apply once and
+        the home-rank shared expert must contribute exactly one identity.
+        """
+        deep_gemm = self.deep_gemm
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        for is_hash in (False, True):
+            for fused_shared in (0, 1):
+                for scale_in_topk in (False, True):
+                    for valid_rows in (0, 2, 32):
+                        with self.subTest(
+                            is_hash=is_hash,
+                            fused_shared=fused_shared,
+                            scale_in_topk=scale_in_topk,
+                            valid_rows=valid_rows,
+                        ):
+                            moe = self._mega_gate_moe(
+                                fused_shared, scale_in_topk, is_hash
+                            )
+                            hidden = torch.ones((32, 256), dtype=torch.bfloat16)
+                            hidden[valid_rows:] = float("nan")
+                            input_ids = torch.tensor([7, 99] * 16)
+                            input_ids[valid_rows:] = 1000
+                            batch = SimpleNamespace(
+                                moe_num_token_non_padded=lambda: torch.tensor(
+                                    valid_rows
+                                )
+                            )
+
+                            def run_experts(_experts, x, ids, weights, **kwargs):
+                                self.assertTrue((ids[valid_rows:] == -1).all())
+                                self.assertTrue((weights[valid_rows:] == 0).all())
+                                factors = (ids + 1).float()
+                                factors[ids == 9] = 1.0  # rank-1 shared slot
+                                return (factors * weights).sum(
+                                    -1, keepdim=True
+                                ) * kwargs["routed_scaling_factor"]
+
+                            with (
+                                get_context().override_server_args(
+                                    model_path="dummy",
+                                    tp_size=2,
+                                    ep_size=2,
+                                    enable_deterministic_inference=False,
+                                ),
+                                envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+                                patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                                patch.object(mega_moe, "_device_sm", 100),
+                                get_flags().moe.override(
+                                    a2a_backend=MoeA2ABackend.MEGAMOE
+                                ),
+                                get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
+                                patch.object(
+                                    mega_moe.ExpertLocationDispatchInfo,
+                                    "init_new",
+                                    return_value=None,
+                                ),
+                                patch.object(
+                                    mega_moe, "run_mega_routed_experts", run_experts
+                                ),
+                                patch.object(topk_module, "_is_cuda", True),
+                                patch.object(
+                                    topk_module,
+                                    "_can_fuse_padded_region",
+                                    return_value=False,
+                                ),
+                            ):
+                                out = mega_moe._run_mega_routed(
+                                    moe, hidden, batch, input_ids, num_tokens=32
+                                )
+                            image_value = 15.0 + 3 * fused_shared
+                            text_value = image_value if is_hash else 3.0 + fused_shared
+                            expected = torch.tensor([text_value, image_value] * 16)
+                            expected[valid_rows:] = 0.0
+                            torch.testing.assert_close(out[:, 0], expected)
+                            self.assertTrue(torch.isnan(hidden[valid_rows:]).all())
+
+    def test_mega_gate_admission_preserves_unsupported_router_fallbacks(self):
+        """Do not silently change routing when the fused API cannot express it."""
+        moe = self._mega_gate_moe(0, False)
+        hidden = torch.zeros((32, 256), dtype=torch.bfloat16)
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        with (
+            get_context().override_server_args(
+                model_path="dummy", enable_deterministic_inference=False
+            ),
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+        ):
+            self.assertTrue(
+                mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+            )
+            for tokens in (0, 1, 16):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(
+                        moe, hidden[:tokens], 100, None
+                    )
+                )
+            self.assertTrue(
+                mega_gate_runtime.should_use_mega_gate(moe, hidden[:17], 103, None)
+            )
+            for sm in (90, 120):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, sm, None)
+                )
+            for name, value in (
+                ("renormalize", False),
+                ("use_grouped_topk", True),
+                ("scoring_func", "sigmoid"),
+                ("custom_routing_function", object()),
+                ("torch_native", True),
+            ):
+                with patch.object(moe.topk.topk_config, name, value):
+                    self.assertFalse(
+                        mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                    )
+            for algorithm in ("lp", "fake"):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(
+                        moe,
+                        hidden,
+                        100,
+                        SimpleNamespace(ep_dispatch_algorithm=algorithm),
+                    )
+                )
+            with patch.object(moe.topk, "enable_waterfill", True, create=True):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                )
+            with envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(True):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                )
+            with get_exec().deterministic.override(enable_deterministic_inference=True):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                )
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
+                self.assertFalse(
+                    mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+                )
+            del deep_gemm.bf16_mega_gate
+            self.assertFalse(
+                mega_gate_runtime.should_use_mega_gate(moe, hidden, 100, None)
+            )
+
+    def test_mega_gate_maps_eplb_before_shared_slots_and_records_routed_ids(self):
+        """Redundant-expert maps index routed IDs before per-rank slot insertion.
+
+        Shared IDs must not index the EPLB map or enter expert statistics, and
+        padding must not be counted as the map's last physical expert.
+        """
+        moe = self._mega_gate_moe(1, True)
+        hidden = torch.ones((32, 256), dtype=torch.bfloat16)
+        hidden[2:] = float("nan")
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.bf16_mega_gate = self._mega_gate_reference
+        # Reverse routed placement. Physical expert count includes redundancy.
+        dispatch_info = mega_moe.ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=torch.tensor(
+                [9, 8, 7, 6, 5, 4, 3, 2], dtype=torch.int32
+            ),
+            partial_logical_to_all_physical_map=None,
+            partial_logical_to_all_physical_map_num_valid=None,
+            num_physical_experts=10,
+        )
+        recorded = []
+        recorder = SimpleNamespace(
+            on_select_experts=lambda **kw: recorded.append(kw["topk_ids"].clone())
+        )
+        with (
+            get_context().override_server_args(
+                model_path="dummy", tp_size=2, ep_size=2
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "_can_fuse_padded_region", return_value=False),
+            patch.object(
+                mega_gate_runtime,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            weights, ids = mega_gate_runtime.run_mega_gate(
+                moe,
+                hidden,
+                torch.tensor([7, 99] + [1000] * 30),
+                torch.tensor(2),
+                dispatch_info,
+            )
+        # Rank 1's redundant-routed layout has shared ID 11. Logical 0/1
+        # maps to physical 9/8, then shared-slot insertion shifts to 10/9.
+        torch.testing.assert_close(ids[:2], torch.tensor([[10, 9, 11], [2, 3, 11]]))
+        torch.testing.assert_close(weights[:2], torch.ones((2, 3)))
+        self.assertTrue((ids[2:] == -1).all())
+        self.assertTrue((weights[2:] == 0).all())
+        self.assertEqual(len(recorded), 1)
+        torch.testing.assert_close(recorded[0][:2], torch.tensor([[9, 8], [2, 3]]))
+        self.assertTrue((recorded[0][2:] == -1).all())
 
     @staticmethod
     def _v41_moe(fused_shared, scale_in_topk):

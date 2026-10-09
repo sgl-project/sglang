@@ -1314,6 +1314,9 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # Opt-in until routing and end-to-end speed are validated against SGLang's
+    # router; small local batches retain gate GEMM + top-k.
+    SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
