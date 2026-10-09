@@ -360,6 +360,7 @@ class AiterRunnerCore(MoeRunnerCore):
                         runner_input.topk_ids,
                         quant_info.w13_scale,
                         quant_info.w2_scale,
+                        swiglu_limit=quant_info.swiglu_limit,
                     )
                     if out is not None:
                         return AiterRunnerOutput(hidden_states=out)
