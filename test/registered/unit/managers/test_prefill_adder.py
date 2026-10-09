@@ -133,6 +133,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
@@ -1411,6 +1412,72 @@ class TestPrefillAdder(CustomTestCase):
         req.best_match_node = req.last_node
         req.kv = SimpleNamespace(cache_protected_len=prefix_len)
         return req
+
+    def _build_mamba_restore_admission(self, *, holds_state, available_slots):
+        self.mock_token_allocator = self.create_token_allocator(available_size=100_000)
+        self.mock_tree_cache = self.create_tree_cache()
+        self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
+        self.mock_tree_cache.buffer_pipeline = MagicMock()
+        adder = self.create_adder(self.create_running_batch())
+        adder._mamba_slot_cost = 64
+        adder.rem_mamba_slots = available_slots
+        req = self._create_host_hit_req(host_hit=32, tail=8)
+        req.mamba_host_hit_length = 1
+        req.kv.holds_mamba = holds_state
+
+        def load_back(params):
+            req.kv.holds_mamba = True
+            return req.host_hit_length, req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load_back
+        return adder, req
+
+    def test_mamba_restore_admission_counts_request_and_checkpoint(self):
+        for holds_state, slots, capacity, admitted in (
+            (False, 1, 100_000, False),
+            (True, 0, 100_000, False),
+            (False, 2, 100_000, True),
+            (True, 1, 100_000, True),
+            (False, 2, 150, False),  # Enough shared bytes for one state, not two.
+        ):
+            with self.subTest(holds_state=holds_state, slots=slots, capacity=capacity):
+                adder, req = self._build_mamba_restore_admission(
+                    holds_state=holds_state, available_slots=slots
+                )
+                self.mock_token_allocator.available_size.return_value = capacity
+                result = adder.add_one_req(req, False, None)
+                self.assertEqual(adder.can_run_list, [req] if admitted else [])
+                self.assertEqual(adder.rem_mamba_slots, 0 if admitted else slots)
+                if admitted:
+                    self.mock_tree_cache.init_load_back.assert_called_once()
+                    self.assertEqual(
+                        adder.memory_budget.total_offset, 8 + 8 + 1 + slots * 64
+                    )
+                else:
+                    self.assertIs(result, AddReqResult.NO_TOKEN)
+                    self.mock_tree_cache.init_load_back.assert_not_called()
+                    self.assertEqual(adder.memory_budget.total_offset, 0)
+                    if capacity == 100_000:
+                        self.mock_tree_cache.buffer_pipeline.defer_staged_admission.assert_called_once_with(
+                            req, "mamba"
+                        )
+
+    def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):
+        adder, req = self._build_mamba_restore_admission(
+            holds_state=False, available_slots=2
+        )
+        adder.rem_chunk_tokens = 4
+        adder.add_one_req(req, False, None)
+        self.assertIs(adder.new_chunked_req, req)
+        req.prefix_len = req.extend_end
+        # Continuing chunks retain the original host-hit metadata.
+        self.assertEqual(req.mamba_host_hit_length, 1)
+        next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
+        next_adder._mamba_slot_cost = 64
+        next_adder.rem_mamba_slots = 0
+        self.assertIsNone(next_adder.add_chunked_req(req))
+        self.assertEqual(next_adder.rem_mamba_slots, 0)
+        self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (

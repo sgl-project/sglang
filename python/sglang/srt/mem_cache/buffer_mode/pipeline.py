@@ -1438,6 +1438,39 @@ class BufferModePipeline:
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
         return True
 
+    def defer_staged_admission(self, req: Req, pool: str) -> None:
+        """Retain staging for a bounded number of capacity retries."""
+        request = req.cache_request_handle
+        f = self.staged_prefetches.get(request)
+        if f is None:
+            return
+        cache = self._cache
+        defers = self._staged_admission_defers.get(request, 0) + 1
+        self._staged_admission_defers[request] = defers
+        cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
+        if defers < self.max_staged_admission_defers:
+            logger.warning(
+                "HiCache staged prefetch deferred at admission req=%s "
+                "reason=device_capacity pool=%s tokens=%d defers=%d",
+                req.rid,
+                pool,
+                f.num_tokens,
+                defers,
+            )
+            return
+        # Still unmaterializable: drop the hold so the admission loop stops
+        # breaking on this request, which recomputes on its next pass.
+        logger.warning(
+            "HiCache staged prefetch dropped after %d device_capacity "
+            "deferrals req=%s pool=%s tokens=%d",
+            defers,
+            req.rid,
+            pool,
+            f.num_tokens,
+        )
+        self.release_staged_hold(request, reason="device_capacity")
+        req.staged_prefetch_plan = None
+
     def init_load_back(
         self, params: InitLoadBackParams
     ) -> Optional[tuple[int, NodeId]]:
@@ -1476,33 +1509,6 @@ class BufferModePipeline:
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
-        def _defer_for_capacity(pool: str) -> None:
-            defers = self._staged_admission_defers.get(request, 0) + 1
-            self._staged_admission_defers[request] = defers
-            cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
-            if defers < self.max_staged_admission_defers:
-                logger.warning(
-                    "HiCache staged prefetch deferred at admission req=%s "
-                    "reason=device_capacity pool=%s tokens=%d defers=%d",
-                    req.rid,
-                    pool,
-                    f.num_tokens,
-                    defers,
-                )
-                return
-            # Still unmaterializable: drop the hold so the admission loop stops
-            # breaking on this request, which recomputes on its next pass.
-            logger.warning(
-                "HiCache staged prefetch dropped after %d device_capacity "
-                "deferrals req=%s pool=%s tokens=%d",
-                defers,
-                req.rid,
-                pool,
-                f.num_tokens,
-            )
-            self.release_staged_hold(request, reason="device_capacity")
-            req.staged_prefetch_plan = None
-
         splice_base = plan.device_prefix_len
         assert req.prefix_len == splice_base
         prefix_indices = self._cache.prefix_device_indices(req)
@@ -1530,7 +1536,7 @@ class BufferModePipeline:
             else:
                 avail = cache.token_to_kv_pool_allocator.available_size()
             if avail < load_tokens:
-                return _defer_for_capacity("full")
+                return self.defer_staged_admission(req, "full")
 
         load_back_id = -(f.operation_id) - 1
         # The full trailing-window aux transfer is independent of the shorter
@@ -1550,7 +1556,9 @@ class BufferModePipeline:
             if load_context is None:
                 for load_context in component_load_contexts:
                     load_context.finalize_allocation(success=False)
-                return _defer_for_capacity(component.component_type.name.lower())
+                return self.defer_staged_admission(
+                    req, component.component_type.name.lower()
+                )
             component_load_contexts.append(load_context)
             # Not staging, so these stay out of the aux_xfers the ack frees.
             load_transfers.extend(load_context.load_transfers)
@@ -1610,7 +1618,7 @@ class BufferModePipeline:
         if device_indices is None:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
-            return _defer_for_capacity("full_or_aux")
+            return self.defer_staged_admission(req, "full_or_aux")
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
