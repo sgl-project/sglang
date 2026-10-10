@@ -492,11 +492,15 @@ class GroupCoordinator:
             eligible_group,
         )
 
-        if eligible_group(
+        # The same on every rank, unlike pcie_ipc_comm, which a rank-local setup
+        # failure leaves None; the PCIe-IPC all-gathers decide on it whether to
+        # join their collective setup.
+        self.pcie_ipc_eligible = eligible_group(
             group_name=group_name,
             world_size=self.world_size,
             deterministic=self._deterministic_collectives_enabled(),
-        ):
+        )
+        if self.pcie_ipc_eligible:
             try:
                 # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
                 # Autotuning is the other way round: it rendezvouses on the host.
