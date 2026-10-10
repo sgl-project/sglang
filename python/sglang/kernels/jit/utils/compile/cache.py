@@ -216,9 +216,12 @@ def _target_tag() -> str:
     """
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
-    arch = get_jit_cuda_arch()
-    prefix = "mp" if is_musa_runtime() else "sm"
-    return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
+    elif is_musa_runtime():
+        arch = get_jit_cuda_arch()
+        return f"mp{arch.major}{arch.minor}{arch.suffix}"
+    else:
+        arch = get_jit_cuda_arch()
+        return f"sm{arch.major}{arch.minor}{arch.suffix}"
 
 
 @cache_once
@@ -234,17 +237,20 @@ def _environment_fingerprint() -> str:
     """
     if is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
+    elif is_musa_runtime():
+        target = f"musa:{toolchain.gpu_arch_name()}"
     else:
         arch = get_jit_cuda_arch()
-        target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"
+        target = f"cuda:{arch.target_name}"
 
     compilers = []
     for path in (toolchain.device_compiler_path(), toolchain.host_compiler_path()):
         try:
-            compilers.append(subprocess.check_output([path, "--version"], text=True))
+            version = subprocess.check_output([path, "--version"], text=True)
+            compilers.append((path, version))
         except (OSError, subprocess.SubprocessError) as error:
             logger.warning("Cannot fingerprint compiler %s: %s", path, error)
-            compilers.append("unknown")
+            compilers.append((path, _file_digest(pathlib.Path(path)) or "missing"))
 
     versions: List[Tuple[str, str]] = []
     for name in _VERSIONED_PACKAGES:

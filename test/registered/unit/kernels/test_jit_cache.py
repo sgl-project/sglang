@@ -7,6 +7,7 @@ directory, a moved clone still hits — are checked without a GPU or a compiler.
 
 from __future__ import annotations
 
+import builtins
 import os
 import pathlib
 import sys
@@ -14,7 +15,8 @@ import sys
 import msgspec
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils import arch
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -65,6 +67,93 @@ def _entries(paths) -> list:
             cache._DepEntry(root=root, relpath=relpath, digest=cache._file_digest(path))
         )
     return out
+
+
+def test_musa_ninja_uses_the_musa_device_compiler(monkeypatch):
+    monkeypatch.setattr(toolchain, "device_compiler_path", lambda: "/opt/musa/bin/mcc")
+    monkeypatch.setattr(toolchain, "base_cuda_flags", lambda: ["-fPIC", "-x", "musa"])
+    monkeypatch.setattr(toolchain, "target_flags", lambda: ["--offload-arch=mp_31"])
+
+    build_file = ninja.generate(
+        _spec(
+            cuda_files=("/tmp/fused_rope.cu",),
+            cpp_wrappers=(),
+            cuda_wrappers=(("run", "Kernel::run"),),
+        )
+    )
+
+    assert "compiler = /opt/musa/bin/mcc" in build_file
+    assert "command = $compiler " in build_file
+    assert "--offload-arch=mp_31" in build_file
+    assert "-x musa" in build_file
+    assert "nvcc =" not in build_file
+
+
+def test_musa_toolchain_flags(monkeypatch):
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
+    monkeypatch.setattr(toolchain, "gpu_arch_name", lambda: "mp_31")
+    monkeypatch.setattr(
+        toolchain,
+        "tvm_ffi_paths",
+        lambda: (("/opt/tvm/include",), "/opt/tvm/lib", "tvm_ffi"),
+    )
+
+    assert toolchain.device_compiler_path.__wrapped__() == "/opt/musa/bin/mcc"
+    assert toolchain.target_flags() == ["--offload-arch=mp_31"]
+    assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
+    assert toolchain.base_include_paths() == [
+        "/opt/tvm/include",
+        "/opt/musa/include",
+    ]
+    assert toolchain.base_link_flags(with_device=True) == [
+        "-shared",
+        "-L/opt/tvm/lib",
+        "-ltvm_ffi",
+        "-L/opt/musa/lib",
+        "-lmusa",
+        "-lmusart",
+    ]
+
+
+def test_musa_home_prefers_explicit_environment(monkeypatch):
+    monkeypatch.setenv("MUSA_HOME", "/opt/musa-home")
+    monkeypatch.setenv("MUSA_PATH", "/opt/musa-path")
+    monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/usr/bin/mcc")
+
+    assert toolchain.musa_home.__wrapped__() == "/opt/musa-home"
+
+
+def test_musa_home_uses_mcc_path_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("MUSA_HOME", raising=False)
+    monkeypatch.delenv("MUSA_PATH", raising=False)
+    monkeypatch.setattr(toolchain.shutil, "which", lambda _: "/opt/musa/bin/mcc")
+    real_import = builtins.__import__
+
+    def import_without_torch_musa_extension(name, *args, **kwargs):
+        if name == "torch_musa.utils.musa_extension":
+            raise ImportError
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_torch_musa_extension)
+
+    assert toolchain.musa_home.__wrapped__() == "/opt/musa"
+
+
+def test_musa_activation_flags_skip_cuda_fast_math(monkeypatch):
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
+
+    assert arch.get_activation_cuda_cflags() == []
+
+
+def test_musa_target_flags_use_cxx17_without_changing_cuda(monkeypatch):
+    monkeypatch.setattr(arch, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: True)
+    assert "-std=c++17" in arch.get_default_target_flags()
+
+    monkeypatch.setattr(arch, "is_musa_runtime", lambda: False)
+    assert "-std=c++20" in arch.get_default_target_flags(arch.make_jit_cuda_arch(9, 0))
 
 
 def _publish_leaf(scope: pathlib.Path, paths, *, module_name="m") -> pathlib.Path:
@@ -442,7 +531,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(cpu_only).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" not in ldflags and "amdhip" not in ldflags
+    assert all(runtime not in ldflags for runtime in ("cudart", "amdhip", "musart"))
 
     with_device = _spec(cuda_files=("/tmp/a.cu",), cpp_wrappers=(), header_only=False)
     ldflags = next(
@@ -450,7 +539,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(with_device).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" in ldflags or "amdhip" in ldflags
+    assert any(runtime in ldflags for runtime in ("cudart", "amdhip", "musart"))
 
 
 def test_generated_ninja_is_deterministic():

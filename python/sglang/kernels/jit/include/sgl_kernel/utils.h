@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <sgl_kernel/cxx_compat.h>
+
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__
 #include <cuda.h>
@@ -38,11 +40,23 @@
 
 #include <dlpack/dlpack.h>
 
+#include <algorithm>
+#include <array>
+#if SGL_USE_CONCEPTS
 #include <concepts>
+#endif
 #include <cstddef>
+#include <initializer_list>
+#include <iterator>
 #include <ostream>
+#if SGL_USE_RANGES
 #include <ranges>
+#endif
+#if SGL_USE_SPAN
+#include <span>
+#endif
 #include <sstream>
+#include <type_traits>
 #include <utility>
 
 namespace sglang {
@@ -138,12 +152,20 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 inline auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 inline auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }
@@ -151,7 +173,11 @@ inline auto offset(const void* ptr, U... offset) -> const void* {
 }  // namespace pointer
 
 /// \brief Integer ceiling division: ceil(a / b).
+#if SGL_USE_CONCEPTS
 template <std::integral T, std::integral U>
+#else
+template <typename T, typename U, std::enable_if_t<std::is_integral_v<T> && std::is_integral_v<U>, int> = 0>
+#endif
 inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -161,19 +187,122 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
 
+#if SGL_USE_SPAN
+template <typename T>
+using Span = std::span<T>;
+#else
+template <typename T>
+class Span {
+ public:
+  Span() = default;
+  Span(const T* data, std::size_t size) : m_data(data), m_size(size) {}
+  template <typename U, std::enable_if_t<std::is_convertible_v<const U*, T*>, int> = 0>
+  Span(std::initializer_list<U> data) : m_data(data.begin()), m_size(data.size()) {}
+  template <typename U, std::size_t N, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
+  Span(const std::array<U, N>& data) : m_data(data.data()), m_size(N) {}
+
+  const T* data() const {
+    return m_data;
+  }
+  std::size_t size() const {
+    return m_size;
+  }
+  bool empty() const {
+    return m_size == 0;
+  }
+  const T* begin() const {
+    return m_data;
+  }
+  const T* end() const {
+    return m_data + m_size;
+  }
+  const T& operator[](std::size_t index) const {
+    return m_data[index];
+  }
+
+ private:
+  const T* m_data = nullptr;
+  std::size_t m_size = 0;
+};
+#endif
+
+#if !SGL_USE_RANGES
+template <typename T>
+class IntegerRange {
+ public:
+  class Iterator {
+   public:
+    explicit Iterator(T value) : m_value(value) {}
+    T operator*() const {
+      return m_value;
+    }
+    Iterator& operator++() {
+      ++m_value;
+      return *this;
+    }
+    bool operator!=(const Iterator& other) const {
+      return m_value != other.m_value;
+    }
+
+   private:
+    T m_value;
+  };
+
+  IntegerRange(T begin, T end) : m_begin(begin), m_end(end) {}
+  Iterator begin() const {
+    return Iterator(m_begin);
+  }
+  Iterator end() const {
+    return Iterator(m_end);
+  }
+
+ private:
+  T m_begin;
+  T m_end;
+};
+
+namespace stdr {
+using std::copy_n;
+using std::end;
+
+template <typename Range>
+inline bool empty(const Range& range) {
+  return range.empty();
+}
+
+template <typename Range, typename T>
+inline auto find(const Range& range, const T& value) {
+  return std::find(range.begin(), range.end(), value);
+}
+
+template <typename Range, typename Predicate>
+inline bool any_of(const Range& range, Predicate&& predicate) {
+  return std::any_of(range.begin(), range.end(), std::forward<Predicate>(predicate));
+}
+}  // namespace stdr
+#else
 namespace stdr = std::ranges;
 namespace stdv = stdr::views;
+#endif
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
-template <std::integral T>
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 inline auto irange(T end) {
+#if SGL_USE_RANGES
   return stdv::iota(static_cast<T>(0), end);
+#else
+  return IntegerRange<T>(static_cast<T>(0), end);
+#endif
 }
 
 /// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
-template <std::integral T>
+template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 inline auto irange(T start, T end) {
+#if SGL_USE_RANGES
   return stdv::iota(start, end);
+#else
+  return IntegerRange<T>(start, end);
+#endif
 }
 
 /** \brief Error class for stream-style error logging. */
@@ -206,8 +335,9 @@ struct Error {
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
 #define CHECK_HOST(COND) \
-  if (COND) [[likely]] { \
-  } else                 \
+  if (COND) SGL_LIKELY { \
+    }                    \
+  else                   \
     host::Error()
 
 }  // namespace host

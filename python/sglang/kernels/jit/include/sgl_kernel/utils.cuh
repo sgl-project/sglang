@@ -17,12 +17,15 @@
 #pragma once
 
 #include <sgl_kernel/bits.h>
+#include <sgl_kernel/cxx_compat.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#if SGL_USE_CONCEPTS
 #include <concepts>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -30,14 +33,7 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
-#ifndef USE_ROCM
-#include <tvm/ffi/extra/cuda/device_guard.h>
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
-#else
+#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -65,11 +61,83 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #endif
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#elif defined(USE_MUSA)
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <musa_fp8.h>
+#include <musa_runtime.h>
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+using cudaError_t = musaError_t;
+using cudaStream_t = musaStream_t;
+using cudaLaunchConfig_t = musaLaunchConfig_t;
+using cudaLaunchAttribute = musaLaunchAttribute;
+inline constexpr auto cudaSuccess = musaSuccess;
+#define cudaStreamPerThread musaStreamPerThread
+#define cudaGetErrorString musaGetErrorString
+#define cudaGetLastError musaGetLastError
+#define cudaLaunchKernel musaLaunchKernel
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define cudaMemcpy musaMemcpy
+#define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaGetDevice musaGetDevice
+#define cudaRuntimeGetVersion musaRuntimeGetVersion
+#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
+#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#define cudaDevAttrMaxSharedMemoryPerBlock musaDevAttrMaxSharedMemoryPerBlock
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin musaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaOccupancyAvailableDynamicSMemPerBlock musaOccupancyAvailableDynamicSMemPerBlock
+#define cudaFuncSetAttribute musaFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#else
+#include <tvm/ffi/extra/cuda/device_guard.h>
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #endif
 
 namespace sglang {
 
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = uint8_t;
+using fp8_e5m2_t = uint8_t;
+using fp32x2_t = float2;
+using fp16x2_t = half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = uint16_t;
+using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
+using fp32x4_t = float4;
+#elif defined(USE_MUSA)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __mt_bfloat16;
+using fp8_e4m3_t = __mt_fp8_e4m3;
+using fp8_e5m2_t = __mt_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __mt_bfloat162;
+using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
+using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
+using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
+using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
+
+using fp32x4_t = float4;
+#else
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -85,38 +153,29 @@ using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
 using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
-#else
-using fp32_t = float;
-using fp16_t = __half;
-using bf16_t = __hip_bfloat16;
-using fp8_e4m3_t = uint8_t;
-using fp8_e5m2_t = uint8_t;
-using fp32x2_t = float2;
-using fp16x2_t = half2;
-using bf16x2_t = __hip_bfloat162;
-using fp8x2_e4m3_t = uint16_t;
-using fp8x2_e5m2_t = uint16_t;
-using fp8x4_e4m3_t = uint32_t;
-using fp8x4_e5m2_t = uint32_t;
-using fp32x4_t = float4;
 #endif
 
 /*
  * LDG Support
  */
-#ifndef USE_ROCM
-#define SGLANG_LDG(arg) __ldg(arg)
-#else
+#ifdef USE_ROCM
 #define SGLANG_LDG(arg) *(arg)
+#elif defined(USE_MUSA)
+#define SGLANG_LDG(arg) *(arg)
+#else
+#define SGLANG_LDG(arg) __ldg(arg)
 #endif
 
 // DLPack device type for the current platform
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
+#elif defined(USE_MUSA)
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
-inline constexpr auto kDLGPU = kDLROCM;
-inline constexpr auto kDLGPUHost = kDLROCMHost;
+inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #endif
 
 namespace device {
@@ -128,7 +187,13 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM)
+#ifdef USE_ROCM
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#elif defined(USE_MUSA)
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#define SGL_ARCH_BLACKWELL_OR_GREATER 0
+#else
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -138,9 +203,6 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#else  // USE_ROCM
-#define SGL_ARCH_HOPPER_OR_GREATER 0
-#define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
 
 // Maximum vector size in bytes supported by current architecture.
@@ -152,6 +214,18 @@ inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 :
 inline constexpr uint32_t kWarpThreads = 32u;
 /// \brief Most implementations prefer this name; keep the alias for them.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
+
+#if SGL_USE_TYPE_IDENTITY
+using std::type_identity_t;
+#else
+template <typename T>
+struct TypeIdentity {
+  using type = T;
+};
+
+template <typename T>
+using type_identity_t = typename TypeIdentity<T>::type;
+#endif
 
 /**
  * \brief This thread's index within its logical `kNumThreads` group.
@@ -170,19 +244,20 @@ inline constexpr uint32_t kWarpSize = kWarpThreads;
  */
 template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+  static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
+  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask
+  // and the group mask is still needed on top.
+  return threadIdx.x % kNumThreads;
+#elif defined(USE_MUSA)
+  static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
+  return threadIdx.x % kNumThreads;
+#else
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
   uint32_t lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   if constexpr (kNumThreads != 32) lane_id %= kNumThreads;
   return lane_id;
-#else
-  static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
-  // AMD has no lane-id register: `__lane_id()` is computed from the exec mask as
-  // a `v_mbcnt_lo`/`v_mbcnt_hi` pair, and the group mask is still needed on top.
-  // Masking `threadIdx.x` -- already live in v0 -- is 2 instructions cheaper and
-  // yields the same value (measured on gfx950, hipcc 7.0).
-  return threadIdx.x % kNumThreads;
 #endif
 }
 
@@ -244,7 +319,11 @@ SGL_DEVICE void PDLTriggerSecondary() {
 #endif
 }
 
+#if SGL_USE_CONCEPTS
 template <std::integral T, std::integral U>
+#else
+template <typename T, typename U, std::enable_if_t<std::is_integral_v<T> && std::is_integral_v<U>, int> = 0>
+#endif
 SGL_DEVICE constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
@@ -270,7 +349,7 @@ SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
  * the template parameter `T`, which can avoid accidentally using the wrong type.
  */
 template <typename T>
-SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
+SGL_DEVICE void store_as(void* ptr, type_identity_t<T> val, int64_t offset = 0) {
   static_cast<T*>(ptr)[offset] = val;
 }
 
@@ -279,12 +358,20 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
   return static_cast<T*>(ptr) + (... + offset);
 }
 
+#if SGL_USE_CONCEPTS
 template <typename T = char, std::integral... U>
+#else
+template <typename T = char, typename... U, std::enable_if_t<(std::is_integral_v<U> && ...), int> = 0>
+#endif
 SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
   return static_cast<const T*>(ptr) + (... + offset);
 }
@@ -370,6 +457,9 @@ inline auto prefer_l1_carveout(T&& kernel, int device_id, uint32_t block_threads
     return static_cast<uint32_t>(blocks);
   };
 #ifdef USE_ROCM
+  (void)device_id;
+  return {-1, blocks_per_sm()};
+#elif defined(USE_MUSA)
   (void)device_id;
   return {-1, blocks_per_sm()};
 #else
@@ -460,6 +550,9 @@ struct LaunchKernel {
 #ifdef USE_ROCM
     (void)enabled;
     m_config.numAttrs = 0;
+#elif defined(USE_MUSA)
+    (void)enabled;
+    m_config.numAttrs = 0;
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
@@ -473,6 +566,8 @@ struct LaunchKernel {
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
 #ifdef USE_ROCM
+    (void)cluster_dim;
+#elif defined(USE_MUSA)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -515,6 +610,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
+#elif defined(USE_MUSA)
+    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
@@ -559,8 +656,9 @@ struct LaunchKernel {
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
 #define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
-  } else                                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) SGL_LIKELY { \
+    }                                                                 \
+  else                                                                \
     host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
