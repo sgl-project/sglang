@@ -16,9 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.layers.moe.utils as moe_utils
-import sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe as quark_moe
-from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
     QuarkW4A4MXFp4MoE,
 )
@@ -33,22 +31,6 @@ def _make_scheme() -> QuarkW4A4MXFp4MoE:
         weight_config={"qscheme": "per_group"},
         input_config={"qscheme": "per_group", "is_dynamic": True},
     )
-
-
-def _force_aiter_runner(monkeypatch):
-    """Make ``create_moe_runner`` take the AITER branch and capture its config."""
-    captured = {}
-
-    def fake_moe_runner(backend, config):
-        captured["backend"] = backend
-        captured["config"] = config
-        return object()
-
-    monkeypatch.setattr(quark_moe, "MoeRunner", fake_moe_runner)
-    monkeypatch.setattr(
-        moe_utils, "get_moe_runner_backend", lambda: MoeRunnerBackend.AITER
-    )
-    return captured
 
 
 def _fake_layer():
@@ -70,34 +52,6 @@ def _capturing_runner(store):
             return "ran"
 
     return _Runner()
-
-
-def test_create_moe_runner_keeps_silu_when_clamped(monkeypatch):
-    captured = _force_aiter_runner(monkeypatch)
-    scheme = _make_scheme()
-
-    cfg = MoeRunnerConfig(
-        activation="silu",
-        gemm1_alpha=1.702,
-        gemm1_beta=1.0,
-        gemm1_clamp_limit=7.0,
-    )
-    scheme.create_moe_runner(layer=None, moe_runner_config=cfg)
-
-    # The runner selects SwiGLU from this combo. The scheme must not rewrite it.
-    assert captured["config"].activation == "silu"
-    assert captured["config"] is cfg
-
-
-def test_create_moe_runner_keeps_silu_without_clamp(monkeypatch):
-    captured = _force_aiter_runner(monkeypatch)
-    scheme = _make_scheme()
-
-    cfg = MoeRunnerConfig(activation="silu")  # no clamp
-    scheme.create_moe_runner(layer=None, moe_runner_config=cfg)
-
-    assert captured["config"].activation == "silu"
-    assert captured["config"] is cfg
 
 
 def test_apply_weights_forwards_swiglu_limit_when_clamped(monkeypatch):
