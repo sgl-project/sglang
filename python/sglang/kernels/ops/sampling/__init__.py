@@ -102,6 +102,8 @@ def top_p_renorm_probs(
 
 __all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.sampling import cake as _cake  # noqa: E402, F401
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
 register_kernel(
