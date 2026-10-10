@@ -35,6 +35,11 @@ def requested_attention_backends(sgld_options: dict) -> dict[str, str]:
         )
     for component, backend in components.items():
         requested[f"component_attention_backends.{component.strip()}"] = backend
+    override = (sgld_options.get("request_options") or {}).get(
+        "attention_backend_override"
+    )
+    if override:
+        requested["request_options.attention_backend_override"] = override
     return requested
 
 
@@ -104,3 +109,23 @@ def check_parallel_layout(sgld_options: dict) -> None:
 def check_sgld_options(sgld_options: dict) -> None:
     check_attention_backends(sgld_options)
     check_parallel_layout(sgld_options)
+
+
+def check_h3_request_options(request_options: dict, sgld_options: dict) -> None:
+    """Per-request attention options the MiniMax-H3 DiT cannot honor."""
+    if request_options.get("attention_backend_override"):
+        raise ValueError(
+            "MiniMax H3 cannot switch attention per request (its DiT has no "
+            "switchable attention layers); set attention_backend in SGLDOptions"
+        )
+    if request_options.get("skip_softmax_params"):
+        requested = requested_attention_backends(sgld_options)
+        backend = requested.get(
+            "component_attention_backends.transformer",
+            requested.get("attention_backend"),
+        )
+        if (backend or "").strip().lower() != "fa":
+            raise ValueError(
+                "skip_softmax_params runs on FlashAttention; set attention_backend=fa "
+                f"in SGLDOptions (the DiT currently uses {backend or 'the default backend'})"
+            )

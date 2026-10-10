@@ -11,7 +11,7 @@ import sys
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import FastH3Executor, MiniMaxH3Executor, VDNH3Executor
 from ..executors.zimage import ZImageExecutor
-from .preflight import check_sgld_options
+from .preflight import check_h3_request_options, check_sgld_options
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +496,8 @@ class SGLDiffusionGenerator:
             "runtime_model_path": runtime_model_path,
         }
         if self._can_reuse(gather_options):
+            if isinstance(self.executor, MiniMaxH3Executor):
+                check_h3_request_options(plugin_flags["request_options"], sgld_options)
             self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
             self.executor.cache_dit_params = plugin_flags.get("cache_dit_params")
             self.executor.request_options = plugin_flags.get("request_options", {})
@@ -515,6 +517,8 @@ class SGLDiffusionGenerator:
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
+        if model_type in ("minimax_h3", "fast_h3", "vdn_h3"):
+            check_h3_request_options(plugin_flags["request_options"], sgld_options)
         if model_type == "fast_h3":
             from ..executors.minimax_h3 import load_fasth3_release
 

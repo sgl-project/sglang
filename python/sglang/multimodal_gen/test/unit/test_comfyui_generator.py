@@ -402,3 +402,35 @@ def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
         index.write_text(json.dumps({"weight_map": weight_map}))
         with pytest.raises(ValueError, match=message):
             runtime.load_model(model_path="h3.safetensors", sgld_options=options)
+
+
+def test_h3_per_request_attention_options_are_checked_before_worker_load(
+    monkeypatch,
+) -> None:
+    """H3 has no per-request switchable attention, so an override only failed
+    at the first sampling step; skip_softmax_params needs the FA backend."""
+    import pytest
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import preflight
+
+    monkeypatch.setattr(preflight, "_resolved_backend", lambda backend: backend)
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = lambda *a: (_ for _ in ()).throw(
+        AssertionError("worker must not start")
+    )
+    skip = {"skip_softmax_params": {"threshold_scale_factor": 1.0}}
+    for options, message in (
+        ({"request_options": {"attention_backend_override": "fa"}}, "per request"),
+        (
+            {"attention_backend": "torch_sdpa", "request_options": skip},
+            "attention_backend=fa",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            runtime.load_model(model_path="h3.ckpt", sgld_options=options)
+    with pytest.raises(AssertionError, match="worker must not start"):
+        runtime.load_model(
+            model_path="h3.ckpt",
+            sgld_options={"attention_backend": "fa", "request_options": skip},
+        )
