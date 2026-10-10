@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -142,6 +143,7 @@ class TestDPBalanceStats(CustomTestCase):
             )
         )
         with (
+            get_context().override_server_args(),
             clock,
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", True),
@@ -567,9 +569,10 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
         gather.side_effect = lambda output, *a, **kw: output.copy_(values)
         parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
-        for info in infos:
-            info.all_gather(device="cpu", group=None)
-            self.assertFalse(info.can_run_prefill_cuda_graph)
+        with get_context().override_server_args():
+            for info in infos:
+                info.all_gather(device="cpu", group=None)
+                self.assertFalse(info.can_run_prefill_cuda_graph)
 
 
 if __name__ == "__main__":
