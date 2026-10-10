@@ -243,18 +243,6 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def _acknowledge_unused_transport_features(
-    items: List[MultimodalDataItem],
-) -> None:
-    """Release this rank's lazy features when their embeddings are ready.
-
-    Each rank acknowledges only its own slot. A group acknowledgement could
-    recycle a slice before another rank copies it or releases its local proxy.
-    """
-    for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature()
-
-
 def _item_overlap(
     item: MultimodalDataItem, chunk_start: int, chunk_end: int
 ) -> Optional[int]:
@@ -312,7 +300,6 @@ def _get_chunked_embedding_full(
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
         embedding = data_embedding_func(embedding_items_per_req)
-        _acknowledge_unused_transport_features(embedding_items_per_req)
         if isinstance(embedding, list):
             # This path caches the combined per-request embedding, so the
             # per-item form is flattened here.
@@ -323,8 +310,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
-    else:
-        _acknowledge_unused_transport_features(embedding_items_per_req)
+
+    # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -421,7 +408,6 @@ def _batch_encode_per_image_misses(
 
         _move_items_to_device(miss_items, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_items)
-        _acknowledge_unused_transport_features(miss_items)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
@@ -448,11 +434,6 @@ def _batch_encode_per_image_misses(
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[cache_key] = emb
 
-    # duplicate images and batch-wide cache hits also own independent leases
-    for req_info in per_image_requests:
-        _acknowledge_unused_transport_features(
-            [item for _, item, _ in req_info.overlapping]
-        )
     return hash_to_embedding
 
 
@@ -491,7 +472,6 @@ def _get_chunked_embedding_by_item(
             cached_token_count = _embedding_token_count(cached_embedding)
             if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
-                _acknowledge_unused_transport_features([item])
             else:
                 _discard_mismatched_cached_embedding(
                     item.hash, expected_token_count, cached_token_count
@@ -504,7 +484,6 @@ def _get_chunked_embedding_by_item(
         miss_item_list = [item for _, item, _ in miss_items]
         _move_items_to_device(miss_item_list, device, data_embedding_func)
         all_miss_embedding = data_embedding_func(miss_item_list)
-        _acknowledge_unused_transport_features(miss_item_list)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns

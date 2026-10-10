@@ -11,12 +11,12 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.mm_schedule import _acknowledge_unused_transport_features
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -25,6 +25,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -118,13 +119,29 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
 def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool):
     """A rank's cache hit must not retire another rank's proxy before cleanup."""
     items = _publish(vmm_pool)
-    with _rank(0):
-        _acknowledge_unused_transport_features([items[0]])
-    vmm_pool._recycle_chunks()
-    assert vmm_pool.occupied_chunks
-
-    with _rank(1):
-        _acknowledge_unused_transport_features([items[1]])
+    cache = MultiModalStaticCache(1 << 20)
+    cached = torch.ones(1, 2)
+    cache.set(cache.combine_hashes([123]), EmbeddingResult(embedding=cached))
+    for rank, item in enumerate(items):
+        item.hash = 123
+        item.offsets = [(0, 0)]
+        with _rank(rank), patch.object(mm_schedule, "embedding_cache", cache):
+            embedding, _ = mm_schedule._get_chunked_embedding_full(
+                lambda _: pytest.fail("cache hit unexpectedly ran the encoder"),
+                [item],
+                [(0, 0)],
+                0,
+                1,
+                torch.tensor([1]),
+                torch.device("cpu"),
+            )
+        assert torch.equal(embedding, cached)
+        assert not item.feature._consumer_acknowledged, (
+            "cache eviction may need this input again"
+        )
+    for rank, item in enumerate(items):
+        with _rank(rank):
+            item.release_transport_proxies()
     vmm_pool._recycle_chunks()
     assert not vmm_pool.occupied_chunks
 

@@ -723,8 +723,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
             CUDA IPC features are intentionally reconstructed after the image
             assignment.  Each image therefore crosses the tokenizer/scheduler
-            boundary once instead of once per TP rank. Each rank releases its
-            own pool reference once the embeddings are ready.
+            boundary once instead of once per TP rank. Unused ranks keep their
+            lease until request cleanup so cache eviction can re-run the encoder.
             """
             device_index = device.index
             if device.type == "cuda" and device_index is None:
