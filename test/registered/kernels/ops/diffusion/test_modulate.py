@@ -293,6 +293,20 @@ def test_residual_gate_add_guards_and_eager_fallback():
     )
 
 
+def test_residual_gate_add_uses_eager_fallback_on_rocm(monkeypatch):
+    residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn((1, 1, 64), device=DEVICE, dtype=torch.bfloat16)
+    monkeypatch.setattr(torch.version, "hip", torch.version.hip or "test")
+
+    assert not can_use_residual_gate_add_cuda(residual, update, gate)
+    with pytest.raises(RuntimeError, match="unsupported input"):
+        residual_gate_add_cuda(residual, update, gate)
+    assert torch.equal(
+        residual_gate_add(residual, update, gate), residual + update * gate
+    )
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_scaled_residual_add_is_bit_exact(dtype):
