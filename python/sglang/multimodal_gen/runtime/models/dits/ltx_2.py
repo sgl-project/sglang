@@ -520,11 +520,6 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         audio_coords = audio_coords.unsqueeze(1)
         return audio_coords
 
-    def prepare_coords(self, *args, **kwargs):
-        if self.modality == "video":
-            return self.prepare_video_coords(*args, **kwargs)
-        return self.prepare_audio_coords(*args, **kwargs)
-
     def forward(
         self,
         coords: torch.Tensor,
@@ -697,7 +692,6 @@ class LTX2TPRMSNormAcrossHeads(nn.Module):
     ) -> None:
         super().__init__()
         self.full_hidden_size = full_hidden_size
-        self.local_hidden_size = local_hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(local_hidden_size))
 
@@ -1863,8 +1857,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             rope_type=rope_type,
             num_attention_heads=self.audio_num_attention_heads,
         )
-
-        self.cross_pe_max_pos = cross_attn_pos_embed_max_pos
 
         # 5. Transformer Blocks
         self.transformer_blocks = nn.ModuleList(

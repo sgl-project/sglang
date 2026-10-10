@@ -460,6 +460,9 @@ class AttnResidual:
             (num_tokens, block_num, hidden_size)
         )
         self.num_valid_blocks = 0
+        # Whether a write snapshotted only this rank's slice of the rows, which
+        # leaves the bank's other rows stale on this rank.
+        self.written_on_slice = False
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -472,7 +475,11 @@ class AttnResidual:
         """
         bank = self.block_residual if rows is None else self.block_residual[rows]
         bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
+        self._count_write(rows)
+
+    def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
+        self.written_on_slice |= rows is not None
 
     def forward(
         self,
@@ -488,6 +495,11 @@ class AttnResidual:
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
+        if rows is None and self.written_on_slice:
+            raise RuntimeError(
+                "a read of every row after a write of this rank's slice of "
+                "them would aggregate stale snapshots"
+            )
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
@@ -533,7 +545,7 @@ class AttnResidual:
                 write_bank_row=fused_write,
             )
         if fused_write:
-            self.num_valid_blocks += 1  # row nvb written in-kernel
+            self._count_write(rows)  # row nvb written in-kernel
         elif write:
             self.write(prefix, rows)
         return normed, prefix
@@ -572,7 +584,7 @@ class AttnResidual:
         if normed is None:
             return None
         if write:
-            self.num_valid_blocks += 1
+            self._count_write(rows)
         return normed, prefix
 
     def forward_sp_reduce_scatter(

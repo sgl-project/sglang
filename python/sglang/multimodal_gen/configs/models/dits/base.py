@@ -46,6 +46,10 @@ class DiTConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     torch_compile_mode: str = "max-autotune-no-cudagraphs"
 
+    # torch._inductor.config overrides for this model, applied before compiling,
+    # e.g. {"multi_kernel_hints": [64, 4096]}.
+    torch_compile_inductor_config: dict[str, Any] = field(default_factory=dict)
+
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "dit-config") -> Any:
         """Add CLI arguments for DiTConfig fields"""

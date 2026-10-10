@@ -1,12 +1,17 @@
 import itertools
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    accept_draft_tokens,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -325,6 +330,55 @@ def test_context_dependent_output_distribution(block, steps):
         for previous, token in zip(sequence, sequence[1:]):
             expected = expected * target_transition[previous, token]
         assert abs(observed.item() - expected.item()) < 0.008
+
+
+@pytest.mark.parametrize("any_greedy", [False, True])
+def test_dflash_family_accept_uses_block_verification(any_greedy):
+    """The DFLASH-family accept path must reach the block sampler. Here r_1 = 1/2
+    and r_2 = 1, so block verification always accepts both drafts; token-wise
+    verification rejects the first draft half the time."""
+    batch, vocab, masked = 64, 8, -1e4
+    # Draft proposals: q(0) = 1, then q(1) = q(2) = 1/2.
+    draft_logits = torch.full((batch, 2, vocab), masked, device=DEVICE)
+    draft_logits[:, 0, 0] = 0
+    draft_logits[:, 1, 1:3] = 0
+    # Target: p(0) = p(3) = 1/2, then p(1) = 1, then bonus token 4.
+    target_logits = torch.full((batch, 3, vocab), masked, device=DEVICE)
+    target_logits[:, 0, [0, 3]] = 0
+    target_logits[:, 1, 1] = 0
+    target_logits[:, 2, 4] = 0
+    greedy_mask = torch.zeros(batch, dtype=torch.bool, device=DEVICE)
+    greedy_mask[0] = any_greedy
+    sampled = ~greedy_mask
+
+    def accept(block_verification):
+        return accept_draft_tokens(
+            candidates=torch.tensor([[5, 0, 1]], device=DEVICE).repeat(batch, 1),
+            target_logits=target_logits.view(batch * 3, vocab),
+            draft_block=DraftBlockResult(
+                draft_tokens=torch.tensor([[0, 1]], device=DEVICE).repeat(batch, 1),
+                corrected_logits=draft_logits,
+                greedy_mask=greedy_mask,
+                temperatures=torch.ones(batch, device=DEVICE),
+            ),
+            sampling_info=SimpleNamespace(
+                is_all_greedy=False,
+                is_any_greedy=any_greedy,
+                need_top_k_sampling=False,
+                need_top_p_sampling=False,
+                temperatures=torch.ones(batch, 1, device=DEVICE),
+            ),
+            draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
+            gamma=2,
+            verify_num_draft_tokens=3,
+            block_verification=block_verification,
+        )
+
+    correct_len, bonus, _ = accept(True)
+    assert (correct_len[sampled] == 2).all()
+    assert (bonus[sampled] == 4).all()
+    token_correct_len, _, _ = accept(False)
+    assert (token_correct_len[sampled] == 0).any()
 
 
 if __name__ == "__main__":

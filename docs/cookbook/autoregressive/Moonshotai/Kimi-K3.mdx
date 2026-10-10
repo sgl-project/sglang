@@ -316,7 +316,7 @@ PD splits prefill and decode into separate server groups; because K3 is hybrid, 
 
 - **Transfer**: the CUDA cells emit **NiXL** (RDMA); Mooncake stays selectable in the Playground. The Ascend NPU cells emit `--disaggregation-transfer-backend ascend` — the KV/KDA transfer rides the Ascend memory fabric instead (see [below](#npu-pd)).
 - **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host). The positional `8998` after `--prefill` must match `--disaggregation-bootstrap-port`, or only the decode worker registers.
-- **Decode state pool**: chunk cache — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
+- **Decode state pool**: radix cache disabled — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
 
 <a id="npu-pd" />
 

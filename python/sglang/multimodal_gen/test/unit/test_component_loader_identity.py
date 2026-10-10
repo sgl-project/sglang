@@ -181,6 +181,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             component_paths={},
             component_direct_gpu_weight_loading=set(),
             resolve_component_attention_backend=lambda *_names: (None, None),
+            resolve_component_backend_by_role=lambda *_names: {},
             comfyui_mode=False,
         )
 
@@ -203,6 +204,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             component_architecture="LTX2DurationHeadModel",
             component_attn_backend=None,
             component_attn_name="auxiliary_head",
+            component_backend_by_role={},
         )
 
     def test_skipped_alias_keeps_exact_override_and_structural_config(self):

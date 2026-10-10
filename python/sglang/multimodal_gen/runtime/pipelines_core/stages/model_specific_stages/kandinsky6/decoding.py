@@ -25,9 +25,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 class Kandinsky6DecodingStage(DecodingStage):
     """Convert video to channel-first for shared VAE decode; attach the decoded audio."""
 
-    def __init__(self, vae, pipeline=None) -> None:
-        super().__init__(vae=vae, pipeline=pipeline)
-
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         if batch.latents is None:
             raise ValueError("latents must be available before Kandinsky6 decoding.")

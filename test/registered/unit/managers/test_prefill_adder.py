@@ -260,10 +260,7 @@ class TestPrefillAdder(CustomTestCase):
         req.host_hit_length = 768
         req.best_match_node = req.last_node
         req.needs_host_load_back.return_value = True
-        self.mock_tree_cache.init_load_back.return_value = (
-            torch.empty(0, dtype=torch.int64),
-            req.last_node,
-        )
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
             AddReqResult.OTHER,
@@ -1195,7 +1192,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 if remaining_after_load == 0:
                     self.mock_token_allocator.swa_available_size.return_value = 0
-                return torch.arange(delivered, dtype=torch.int64), req.last_node
+                return delivered, req.last_node
 
             self.mock_tree_cache.init_load_back.side_effect = load_back
             verdict = adder.add_one_req(
@@ -1263,7 +1260,7 @@ class TestPrefillAdder(CustomTestCase):
             self.mock_token_allocator.swa_available_size.return_value -= (
                 restored_swa_tokens
             )
-            return torch.arange(restored_tokens), req.last_node
+            return restored_tokens, req.last_node
 
         self.mock_tree_cache.init_load_back.side_effect = load_back
         return adder, req
@@ -1478,7 +1475,7 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertIs(params.req, req)
                     tile_gate.assert_called_once()
                     tile_gate.return_value = AddReqResult.OTHER
-                    return torch.arange(host_hit), restored_node
+                    return host_hit, restored_node
 
                 self.mock_tree_cache.init_load_back.side_effect = load_back
                 with patch.object(

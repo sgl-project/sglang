@@ -97,6 +97,7 @@ class TestAuxStorage(CustomTestCase):
         )
         stub_stage(boundary, StageKind.ATTENTION).entry = lambda _: SimpleNamespace(
             input_move=move,
+            input_retainable=False,
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,

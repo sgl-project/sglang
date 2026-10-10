@@ -427,9 +427,7 @@ class SchedulerDisaggMixin:
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
 
         self._disagg_role = server_args.disagg_role
-        self._disagg_timeout_s = float(getattr(server_args, "disagg_timeout", 600))
         self._disagg_metrics = None
-        self._disagg_mode = getattr(server_args, "disagg_mode", False)
         self._pool_work_pull = None
         self._pool_result_push = None
         self._transfer_manager = None

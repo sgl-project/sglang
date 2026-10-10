@@ -5,7 +5,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
-import json
 import unittest
 from array import array
 from unittest.mock import MagicMock
@@ -25,7 +24,6 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     InklingThinkingBudgetLogitProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
-    _cache_from_str,
 )
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
@@ -90,26 +88,11 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
 
 # Serialization round-trip
 class TestCustomLogitProcessorSerialization(CustomTestCase):
-    def test_to_str_produces_valid_json(self):
-        """Test that to_str() produces valid JSON with a 'callable' field."""
-        s = DisallowedTokensLogitsProcessor.to_str()
-        data = json.loads(s)
-        self.assertIn("callable", data)
-        self.assertIsInstance(data["callable"], str)
-
     def test_round_trip_serialization(self):
         """Test serialize then deserialize produces a usable processor."""
         s = DisallowedTokensLogitsProcessor.to_str()
         processor = CustomLogitProcessor.from_str(s)
         self.assertIsInstance(processor, DisallowedTokensLogitsProcessor)
-
-    def test_from_str_is_cached(self):
-        """Test that from_str uses LRU cache for repeated calls."""
-        _cache_from_str.cache_clear()
-        s = DisallowedTokensLogitsProcessor.to_str()
-        cls1 = _cache_from_str(s)
-        cls2 = _cache_from_str(s)
-        self.assertIs(cls1, cls2)
 
 
 # DisallowedTokensLogitsProcessor

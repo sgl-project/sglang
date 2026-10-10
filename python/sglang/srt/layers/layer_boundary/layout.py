@@ -73,6 +73,7 @@ class SumGroup(Enum):
     from get_parallel() when the sum runs."""
 
     ATTN_TP = auto()
+    ATTN_CP = auto()
     TP = auto()
     # The group one all-reduce of a MoE output runs over.
     MOE_OUTPUT = auto()
@@ -80,6 +81,18 @@ class SumGroup(Enum):
 
 def is_dense_ffn_fully_dp():
     return get_parallel().moe_dense_tp_size == 1
+
+
+def batches_are_unpadded() -> bool:
+    """Whether batches may reach the stages without padding to a multiple of
+    attention TP: --disable-attn-tp-gather skips that padding unless attention
+    DP is on."""
+    parallel = get_parallel()
+    return (
+        parallel.attn_tp_size > 1
+        and not parallel.attn_dp_enabled
+        and parallel.disable_attn_tp_gather
+    )
 
 
 def _prefill_cp_shards_tokens() -> bool:
@@ -145,6 +158,8 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         return parallel.attn_tp_group
+    if group is SumGroup.ATTN_CP:
+        return parallel.attn_cp_group
     if group is SumGroup.TP:
         return parallel.tp_group
     if group is SumGroup.MOE_OUTPUT:

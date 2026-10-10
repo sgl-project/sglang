@@ -256,7 +256,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     """Release the prefix (radix/hicache) cache so a flip works with radix ON.
 
-    With radix disabled (ChunkCache) the flip needs nothing here: ChunkCache
+    With radix disabled the flip needs nothing here: the disabled cache
     keeps no persistent prefixes and, since the instance is idle before the
     switch, the allocator is already empty. This is the historical
     ``--disable-radix-cache`` path, left untouched by the guard below.

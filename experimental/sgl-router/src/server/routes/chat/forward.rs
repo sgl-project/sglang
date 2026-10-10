@@ -219,6 +219,13 @@ pub(super) async fn forward_request(
         (Some(blame), _) => vec![blame.prefill.id.clone()],
         (None, _) => vec![response_worker.id.clone()],
     };
+    // Converted first, so metrics and the access log see the client's status.
+    let result = match result {
+        Ok(response) if request.responder.is_some() => {
+            Ok(super::openai::respond(&mut request.responder, response, metrics.streaming).await)
+        }
+        result => result,
+    };
     let log_context = metrics.record_dispatch_result(&result, engine_rid, blamed_prefill.as_ref());
     // Materialize dispatch errors here so the access log retains the selected worker.
     let mut response = match result {

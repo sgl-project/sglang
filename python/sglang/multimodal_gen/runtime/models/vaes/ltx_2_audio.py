@@ -349,7 +349,6 @@ class LTX2AudioAudioPatchifier:
     ):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
-        self.audio_latent_downsample_factor = audio_latent_downsample_factor
         self.is_causal = is_causal
         self._patch_size = (1, patch_size, patch_size)
 
@@ -413,7 +412,6 @@ class LTX2AudioEncoder(nn.Module):
 
         base_block_channels = base_channels
         base_resolution = resolution
-        self.z_shape = (1, latent_channels, base_resolution, base_resolution)
 
         if self.causality_axis is not None:
             self.conv_in = LTX2AudioCausalConv2d(
@@ -594,7 +592,6 @@ class LTX2AudioDecoder(nn.Module):
 
         base_block_channels = base_channels * self.channel_multipliers[-1]
         base_resolution = resolution // (2 ** (self.num_resolutions - 1))
-        self.z_shape = (1, latent_channels, base_resolution, base_resolution)
 
         if self.causality_axis is not None:
             self.conv_in = LTX2AudioCausalConv2d(

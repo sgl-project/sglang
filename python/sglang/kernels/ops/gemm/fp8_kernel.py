@@ -33,8 +33,11 @@ def deep_gemm_fp8_fp8_bf16_nt(
     B: torch.Tensor,
     Bs: torch.Tensor,
     C: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
 ) -> None:
-    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    recipe = (1, block_n, block_k) if (block_n, block_k) != (128, 128) else None
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C, recipe=recipe)
 
 
 @register_custom_op(mutates_args=["C"])
@@ -746,7 +749,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
+    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C, block_size[0], block_size[1])
 
     return C
 

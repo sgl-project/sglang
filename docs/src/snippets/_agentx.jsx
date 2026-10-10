@@ -191,8 +191,10 @@ export const AgentX = ({ data }) => {
   };
   const noteText = (S) => ({
     "rename-dp-attention": <>Flags are mirrored from the submission image: <code style={S.code}>--enable-dp-attention</code> with <code style={S.code}>--dp-size</code> / <code style={S.code}>--data-parallel-size</code>. Newer SGLang deprecates them in favor of <code style={S.code}>--attn-dp-size</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/41818">#41818</a>).</>,
+    "rename-mamba-strategy": <>Flags are mirrored from the submission image: <code style={S.code}>--mamba-scheduler-strategy</code> is the older spelling of <code style={S.code}>--mamba-radix-cache-strategy</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/28151">#28151</a>). Current SGLang accepts only the new name.</>,
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
+    "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
   });
@@ -202,8 +204,10 @@ export const AgentX = ({ data }) => {
     const text = JSON.stringify(blocks);
     return [
       names.has("--enable-dp-attention") && "rename-dp-attention",
+      names.has("--mamba-scheduler-strategy") && "rename-mamba-strategy",
       names.has("--hicache-size") && "hicache-size",
       env.MOONCAKE_PROTOCOL === "efa" && "efa",
+      env.SGLANG_DISAGGREGATION_NIXL_BACKEND === "LIBFABRIC" && "nixl-libfabric",
       env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
       text.includes("$IB_DEVICES") && "ib-devices",
     ].filter(Boolean);
@@ -582,7 +586,7 @@ export const AgentX = ({ data }) => {
           )}
           {notesFor(blocks).map((n) => noteText(S)[n] && <li key={n}>{noteText(S)[n]}</li>)}
           {routerData.install.map((cmd) => (
-            <li key={cmd}>{cmd.startsWith("#") ? <>Dynamo: {cmd.replace(/^# /, "")}</> : <>Dynamo install used by SA: <code style={S.code}>{cmd}</code></>}</li>
+            <li key={cmd}>{cmd.startsWith("#") ? <>Dynamo: {cmd.replace(/^# /, "")}</> : router === cell.submitted ? <>Dynamo install used by SA: <code style={S.code}>{cmd}</code></> : <>This image does not bundle <code style={S.code}>ai-dynamo</code>. Install the release built for its SGLang version first: <code style={S.code}>{cmd}</code></>}</li>
           ))}
           {router === "dynamo" && !routerData.install.length && <li>Dynamo: the <code style={S.code}>ai-dynamo</code> release bundled in the image.</li>}
           {cell.setup.map((s, i) => (

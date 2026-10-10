@@ -21,7 +21,7 @@ pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RustServerServerArgs, ServerArgs,
 };
-pub use message::multimodal::MmItem;
+pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::MmData;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{

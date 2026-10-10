@@ -31,11 +31,10 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StagePath,
 )
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input, sum_output
+from sglang.srt.layers.layer_boundary.ops import sum_output
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
-    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
@@ -220,20 +219,22 @@ class StageBoundary:
                 model paths that explicitly support it.
 
         Returns:
-            Tensor or owed handle for prepare. A producer-written residual and a
-            declared partial sum are reconstructed from the incoming contract.
+            The received output, complete: the sender completes every sum
+            before transport (see residual_batch.to_pp), so where this stage's
+            entry declares a sum its producer leaves, it takes the path for a
+            sum already completed. A producer-written residual is
+            reconstructed from the producer's declaration.
         """
+        previous = self.declaration.previous
         hidden_states, residual = from_pp(
             tensors,
-            residual_in_hidden=(
-                self.declaration.previous is not None
-                and self.declaration.previous.update.applied_at_exit
-            ),
+            # The producer's declaration says whether the stream arrives written.
+            residual_in_hidden=previous is not None
+            and (previous.update.applied_at_exit or previous.writes_at_handoff),
             allow_missing_residual=allow_missing_residual,
         )
-        declared_sum = self.entry(forward_batch).declared_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
-            hidden_states, residual, PLAIN_ADD, declared_sum=declared_sum
+            hidden_states, residual, PLAIN_ADD
         )
         return hidden_states
 
@@ -262,23 +263,28 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def complete_now(self, hidden_states, forward_batch):
-        """Complete an FFN output outside exit() (the operation-scheduled TBO
-        path, which never defers): the sum it owes, then the move onto the
-        rows the layer hands on."""
+    def complete_now(self, hidden_states, forward_batch, *, already_reduced=False):
+        """Complete an FFN output outside exit(), including its residual update.
+
+        already_reduced is for a producer kernel that fused the output sum.
+        Row movement and residual write-back still belong to this boundary.
+        """
         return self.plan.output.complete_now(
-            hidden_states, stream_of(forward_batch), forward_batch
+            hidden_states,
+            stream_of(forward_batch),
+            forward_batch,
+            already_reduced=already_reduced,
         )
 
     def sum_part(self, hidden_states, forward_batch, group: SumGroup):
         """Complete the sum over ``group`` that one part of this FFN's output
         owes.
 
-        For an FFN that builds the next stream itself (REPLACE_AT_EXIT) from
+        For an FFN that builds the next stream itself (``writes_stream``) from
         several complete parts, normalizing each before combining them; the
         stream it hands to its exit is then complete.
         """
-        if self.declaration.update is not REPLACE_AT_EXIT:
+        if not self.declaration.update.writes_stream:
             raise RuntimeError(
                 "only an FFN that writes the next stream itself sums its parts"
             )
@@ -390,11 +396,10 @@ class StageBoundary:
                     forward_batch=forward_batch,
                 )
             )
-            # Input gathers allocate fresh DP buffers (see attn_tp_gather_input).
             # Without a gather this is the mutable residual, so retention copies.
             capture_gathered.capture(
                 gathered_last_layer_output,
-                owned=move is attn_tp_gather_input
+                owned=entry.input_retainable
                 or (
                     move is None
                     and entry.capture_preserves_residual is not None

@@ -41,10 +41,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
-    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -1059,7 +1059,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
@@ -1117,7 +1117,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 0.0)

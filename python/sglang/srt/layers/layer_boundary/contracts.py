@@ -14,7 +14,7 @@
 """Immutable stage declarations and bound input/output paths."""
 
 from enum import Enum, auto
-from typing import Callable, FrozenSet, Optional, Tuple
+from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -45,6 +45,10 @@ class ExitRows(Enum):
 
     ATTENTION = auto()
     TBO_SPLIT = auto()
+    # The rows the FFN ran on, also at the stack's end: the layer stack's last
+    # FFN, when the model's final read reads this rank's attention-TP slice
+    # and gathers it.
+    SLICE = auto()
 
 
 class BatchVariant(Enum):
@@ -52,6 +56,9 @@ class BatchVariant(Enum):
     CONTEXT_PARALLEL = auto()
     INPUT_SCATTERED = auto()
     SEQUENCE_PARALLEL = auto()
+    # A batch whose rows do not divide over attention TP, which only arrives
+    # unpadded (--disable-attn-tp-gather without attention DP).
+    UNPADDED = auto()
 
 
 class InputContract(msgspec.Struct, frozen=True):
@@ -133,9 +140,11 @@ class EdgeContract(msgspec.Struct, frozen=True):
         residual_to: Residual layout after the boundary.
         residual_joins_sum: Whether one rank may add the residual into a partial
             before reduction; valid only for an eligible plain-add update.
-        arriving_plain_add: Allowed values of ResidualUpdate.is_plain_add for
-            arriving contributions. Empty means use produced.update's capability.
-            The actual update object travels with the residual stream.
+        arriving_plain_add: ResidualUpdate.is_plain_add of the arriving
+            contribution, whose update object travels with the residual stream;
+            None means use produced.update's.
+        arrives_written: Whether the producer applies its update at its exit,
+            so the stream arrives written with no residual add pending.
     """
 
     produced: OutputContract
@@ -145,8 +154,9 @@ class EdgeContract(msgspec.Struct, frozen=True):
     # Whether the residual is added into one rank's share of the produced sum
     # before that sum completes, instead of after it.
     residual_joins_sum: bool = False
-    # Capabilities allowed to arrive from another layer, not its update object.
-    arriving_plain_add: Tuple[bool, ...] = ()
+    # The capability arriving from another layer, not its update object.
+    arriving_plain_add: Optional[bool] = None
+    arrives_written: bool = False
 
 
 class FfnInputFusion(msgspec.Struct, frozen=True):
@@ -163,6 +173,28 @@ class FfnInputFusion(msgspec.Struct, frozen=True):
     # Callable(residual, forward_batch): True guarantees this candidate is
     # selected and does not mutate residual, including backend fallback.
     preserves_residual: Optional[Callable] = None
+
+
+class ReadoutFusion(msgspec.Struct, frozen=True):
+    """A kernel a stage's read supplies (its ``completing_fusions``) that
+    completes the sum its input owes together with the residual add, for a
+    read that is not the residual's plain norm and so takes no FfnInputFusion.
+
+    ``run(hidden_states, residual, forward_batch)`` returns the written stream,
+    the completed sum plus the residual, which the read then reads; or None
+    when it does not take the batch, before touching its inputs or starting a
+    collective."""
+
+    # The group whose sum it completes.
+    completes: SumGroup
+    run: Callable[..., Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]]
+    # Whether it completes the sum onto this rank's attention-TP slice of the
+    # rows (a reduce-scatter, given the whole residual or its slice) rather
+    # than on every row.
+    scatters: bool = False
+    # Whether it also does the read: run(hidden_states, residual,
+    # forward_batch, norm) then returns the read's (input, residual).
+    reads: bool = False
 
 
 class CpMoves(msgspec.Struct, frozen=True):
@@ -188,6 +220,11 @@ class EntryPath(msgspec.Struct, frozen=True):
             applies the producer update and performs the consumer read.
         input_rows: Layout handed to compute after preparation and input_move.
         input_move: Optional movement after prepare, before compute takes the input.
+        input_gather_declared: Whether input_move gathers over attention TP
+            with the stage's own gather.
+        input_retainable: Whether a capture may keep input_move's output
+            without copying: it is storage of its own on every path the move
+            takes.
         attn_input_adapter: Optional callable(input, forward_batch, qkv_latent_func) that
             adapts already-placed input for attention.
         capture_move: Optional movement of the updated residual back onto the
@@ -211,6 +248,8 @@ class EntryPath(msgspec.Struct, frozen=True):
     # Moves the input onto the stage's rows after prepare, when prepare does
     # not: (hidden_states, forward_batch) -> hidden_states.
     input_move: Optional[Callable] = None
+    input_gather_declared: bool = False
+    input_retainable: bool = False
     # Hands the stage its input once it is on its rows:
     # (hidden_states, forward_batch, qkv_latent_func) -> hidden_states.
     attn_input_adapter: Optional[Callable] = None
@@ -232,7 +271,11 @@ class StagePath(msgspec.Struct, frozen=True):
         output_move: Fixed output transport, or None when absent or chosen per
             batch by the attention-DP exit path.
         output_move_completes_sum: Whether that move also reduces the output.
+        output_gathers_attn_tp: Whether that move gathers the rows back over
+            attention TP.
         returns_over_dp: Whether output uses batch-dependent attention-DP transport.
+        writes_at_handoff: Whether the exit completes the output and writes it
+            into the residual, for an FFN that hands off to another pipeline rank.
     """
 
     entry: EntryPath
@@ -240,8 +283,10 @@ class StagePath(msgspec.Struct, frozen=True):
     # None means no fixed move. returns_over_dp selects batch-dependent DP transport.
     output_move: Optional[Callable]
     output_move_completes_sum: bool = False
+    output_gathers_attn_tp: bool = False
 
     returns_over_dp: bool = False
+    writes_at_handoff: bool = False
 
 
 class StageKind(Enum):

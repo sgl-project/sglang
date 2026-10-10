@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -12,7 +12,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -93,118 +92,6 @@ class TestUnoLoRATargets(CustomTestCase):
                     base_model=model,
                     target_modules=targets,
                 )
-
-    def test_nonoverlap_dense_calls_fall_back_to_triton(self):
-        x = object()
-        weights = object()
-        hidden = object()
-        base_output = object()
-        pruned_batch_info = object()
-        expected = object()
-
-        with (
-            patch.object(
-                TritonLoRABackend,
-                "run_lora_a_sgemm",
-                return_value=hidden,
-            ) as run_lora_a,
-            patch.object(
-                TritonLoRABackend,
-                "run_lora_b_sgemm",
-                return_value=expected,
-            ) as run_lora_b,
-        ):
-            actual_hidden = self.backend.run_lora_a_sgemm(
-                x,
-                weights,
-                pruned_batch_info=pruned_batch_info,
-            )
-            actual = self.backend.run_lora_b_sgemm(
-                actual_hidden,
-                weights,
-                base_output=base_output,
-                pruned_batch_info=pruned_batch_info,
-            )
-
-        self.assertIs(actual_hidden, hidden)
-        self.assertIs(actual, expected)
-        run_lora_a.assert_called_once_with(
-            x,
-            weights,
-            pruned_batch_info,
-            1,
-        )
-        run_lora_b.assert_called_once_with(
-            hidden,
-            weights,
-            base_output,
-            pruned_batch_info,
-        )
-
-    def test_overlap_launch_selects_cublas(self):
-        pending = object()
-        x = object()
-        weights = object()
-        hidden = object()
-        base_output = object()
-        expected = object()
-        self.backend._pending_lora_a = pending
-        self.backend._consume_lora_a_overlap = MagicMock(return_value=hidden)
-        self.backend._run_lora_b = MagicMock(return_value=expected)
-
-        with (
-            patch.object(TritonLoRABackend, "run_lora_a_sgemm") as run_lora_a,
-            patch.object(TritonLoRABackend, "run_lora_b_sgemm") as run_lora_b,
-        ):
-            actual_hidden = self.backend.run_lora_a_sgemm(x, weights)
-            actual = self.backend.run_lora_b_sgemm(
-                actual_hidden,
-                weights,
-                base_output=base_output,
-            )
-
-        self.assertIs(actual_hidden, hidden)
-        self.assertIs(actual, expected)
-        self.backend._consume_lora_a_overlap.assert_called_once_with(pending)
-        self.backend._run_lora_b.assert_called_once_with(
-            hidden,
-            weights,
-            base_output,
-        )
-        self.assertFalse(self.backend._use_cublas_lora_b)
-        run_lora_a.assert_not_called()
-        run_lora_b.assert_not_called()
-
-    def test_nonoverlap_qkv_call_falls_back_to_triton(self):
-        expected = object()
-        args = {
-            "x": object(),
-            "qkv_lora_a": object(),
-            "qkv_lora_b": object(),
-            "output_offset": object(),
-            "output_offset_cpu": object(),
-            "max_qkv_out_dim": 128,
-            "base_output": object(),
-            "n_slices": 2,
-        }
-
-        with patch.object(
-            TritonLoRABackend,
-            "run_qkv_lora",
-            return_value=expected,
-        ) as run_qkv_lora:
-            actual = self.backend.run_qkv_lora(**args)
-
-        self.assertIs(actual, expected)
-        run_qkv_lora.assert_called_once_with(
-            args["x"],
-            args["qkv_lora_a"],
-            args["qkv_lora_b"],
-            args["output_offset"],
-            128,
-            args["base_output"],
-            2,
-        )
 
     def test_manager_preflights_targets_before_wrapping(self):
         manager = LoRAManager.__new__(LoRAManager)

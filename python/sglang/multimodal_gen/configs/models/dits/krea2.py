@@ -65,11 +65,6 @@ class Krea2ArchConfig(DiTArchConfig):
     def head_dim(self) -> int:
         return self.features // self.heads
 
-    @property
-    def in_features_packed(self) -> int:
-        """Patch-embed input width: channels * patch**2."""
-        return self.channels * self.patch**2
-
 
 @dataclass
 class Krea2DitConfig(DiTConfig):

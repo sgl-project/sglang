@@ -1775,7 +1775,8 @@ class DeepseekV2MoE(nn.Module):
             if gate_up.weight.shape[0] % 64 != 0 or gate_up.weight.shape[1] % 128 != 0:
                 return False, "gate_up weight shape unsupported by deepgemm"
         else:
-            return False, f"w8a8 linear backend {linear_fn.__name__} unsupported"
+            backend_name = getattr(linear_fn, "__name__", type(linear_fn).__name__)
+            return False, f"w8a8 linear backend {backend_name} unsupported"
         # Routed side: standard dispatcher + triton fused func with dynamic
         # per-token-group-128 fp8 activation quant.
         experts = self.experts
@@ -3038,7 +3039,7 @@ class DeepseekV2Model(nn.Module):
         if not self.pp_group.is_first_rank:
             assert not (
                 not forward_batch.forward_mode.is_idle()
-                and hidden_states.shape[0] != 0
+                and positions.shape[0] != 0
                 and self.use_dsa
                 and dsa_forward_uses_topk
                 and dsa_layer_skips_topk(self.config, self.start_layer)
@@ -3047,7 +3048,7 @@ class DeepseekV2Model(nn.Module):
                 f"PP stage starting at layer {self.start_layer} requires DSA "
                 "topk_indices from the previous stage."
             )
-        device = hidden_states.device
+        device = positions.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,

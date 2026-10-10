@@ -44,7 +44,7 @@ def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
     # than waves through: a startup error beats a canary that reports clean forever.
     return (
         use_torch_reference(device)
-        and current_platform.support_cuda_graph()
+        and current_platform.capabilities.graph_capture
         and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
     )
 

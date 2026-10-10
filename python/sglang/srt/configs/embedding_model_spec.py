@@ -5,9 +5,10 @@ implementations, documentation, and benchmarks can consume the same contract
 without each reimplementing a partial list of embedding architectures.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any
 
 
 class EmbeddingTask(str, Enum):
@@ -168,7 +169,35 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "EmbeddingGemma2Model",
+            **_embedding_gemma2_spec().as_dict(),
+        }
+    )
     return rows
+
+
+def _embedding_gemma2_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_gemma2",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.MULTIMODAL,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=True,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+    )
 
 
 def _embedding_gemma_spec() -> EmbeddingModelSpec:
@@ -275,6 +304,9 @@ def resolve_embedding_model_spec(
     """
 
     architecture_set = set(architectures or ())
+
+    if "EmbeddingGemma2Model" in architecture_set:
+        return _embedding_gemma2_spec()
 
     if is_embedding_gemma:
         return _embedding_gemma_spec()

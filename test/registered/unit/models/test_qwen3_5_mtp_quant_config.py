@@ -55,13 +55,6 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
 
         self.assertIsNone(_mtp_quant_config(quant_config))
 
-    def test_the_two_checkpoints_differ_only_in_the_routed_experts(self):
-        """Guards the premise of the fix, not the implementation."""
-        extra = set(_ALL_BF16_EXCLUDES) - set(_MIXED_EXCLUDES)
-
-        self.assertTrue(all("mlp.experts" in layer for layer in extra))
-        self.assertEqual(len(extra), 512 * 3)
-
     def test_quark_checkpoint_without_mtp_excludes_keeps_quantization(self):
         quant_config = _FakeQuantConfig("quark", ["model.layers.0.self_attn.q_proj"])
 

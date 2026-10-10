@@ -165,7 +165,7 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         last_node = result.best_match_node
 
-        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+        mamba_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit

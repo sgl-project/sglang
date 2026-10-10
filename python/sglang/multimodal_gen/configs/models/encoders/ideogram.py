@@ -31,7 +31,4 @@ class Ideogram4TextEncoderConfig(Qwen3VLConfig):
         self.arch_config.ideogram_fp8_weight_only = not use_bitsandbytes
         self.arch_config.requires_gpu_resident_text_encoder = use_bitsandbytes
 
-    def finalize_model_arch(self):
-        self.post_diffusers_config_update()
-
     arch_config: Qwen3VLArchConfig = field(default_factory=Qwen3VLArchConfig)

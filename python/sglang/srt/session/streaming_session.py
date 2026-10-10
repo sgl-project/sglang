@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import torch
-
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
@@ -138,12 +136,8 @@ class StreamingSession:
 
         self._free_tail(req.kv, prefix_len)
 
-        device_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :prefix_len
-        ].to(dtype=torch.int64)
-
         return MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=prefix_len,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
@@ -286,9 +280,9 @@ class StreamingSession:
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
-        if end <= target:
-            return
         start = target
         if self.cache.page_size > 1:
             start = ceil_align(start, self.cache.page_size)
+        if end <= start:
+            return
         self.cache.free_kv_row(kv, [(start, end)])

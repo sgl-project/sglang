@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     update_sliding_window_buffer,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
@@ -202,12 +203,10 @@ class DllmFlashAttention:
                 swa_out_cache_loc=torch.empty_like(batch.out_cache_loc)
                 if backend.use_sliding_window_kv_pool
                 else None,
-                out_cache_loc_full_physical=torch.empty_like(batch.out_cache_loc)
-                if backend.kv_index_translator.is_translating
-                else None,
             )
         metadata = self._prefill_graph_metadata[key]
         backend._fill_kv_indptr_and_indices(
+            batch.kv_loc_plan,
             bs,
             batch.extend_prefix_lens,
             batch.req_pool_indices,
@@ -220,6 +219,7 @@ class DllmFlashAttention:
             _, _, _, offsets = update_sliding_window_buffer(
                 metadata.window_kv_indptr,
                 backend.kv_index_translator,
+                batch.kv_loc_plan,
                 batch.req_pool_indices,
                 backend.sliding_window_size,
                 batch.extend_prefix_lens,
@@ -231,15 +231,7 @@ class DllmFlashAttention:
             metadata.window_kv_offsets.copy_(offsets)
         if metadata.swa_out_cache_loc is not None:
             metadata.swa_out_cache_loc.copy_(
-                backend.kv_index_translator.sliding_window_write_loc_for(
-                    batch.out_cache_loc
-                )
-            )
-        if metadata.out_cache_loc_full_physical is not None:
-            backend.kv_index_translator.fill_capture_write_loc(
-                out=metadata.out_cache_loc_full_physical,
-                forward_batch=batch,
-                width=metadata.out_cache_loc_full_physical.numel(),
+                backend.kv_index_translator.write_ids(batch, IdSpaceKind.SLIDING_WINDOW)
             )
         backend.forward_metadata = metadata
 

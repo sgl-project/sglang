@@ -474,6 +474,18 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -681,6 +693,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +713,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 

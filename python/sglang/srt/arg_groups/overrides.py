@@ -586,11 +586,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "intel_xpu"
         if view.dsa_decode_backend is None:
             declared["dsa_decode_backend"] = "intel_xpu"
-        # sgl-kernel topk ops (the default) are CUDA-only; fall back to the
-        # torch-native topk implementation on XPU, unless the user already
-        # picked a different backend explicitly (e.g. "flashinfer").
-        if view.dsa_topk_backend == "sgl-kernel":
-            declared["dsa_topk_backend"] = "torch"
         logger.warning(
             "Set DSA backends for XPU: prefill=%s, decode=%s, topk=%s.",
             declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
@@ -1710,6 +1705,12 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
     cfg = resolving_view(server_args)
+    # Logical-page sharding always runs prefill eagerly. This predicate runs
+    # before the sharding hook disables prefill capture, so gate on the feature
+    # itself to retain eager activation headroom in the memory heuristic.
+    if cfg.enable_kv_cache_sharding:
+        return False
+
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False

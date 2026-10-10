@@ -358,8 +358,10 @@ impl Proxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
+        // SGLang's `text/event-stream; charset=utf-8`: clients that decode by the
+        // header would otherwise read the UTF-8 events as Latin-1.
         let content_type = if status.is_success() {
-            "text/event-stream".to_string()
+            "text/event-stream; charset=utf-8".to_string()
         } else {
             upstream_ct
         };

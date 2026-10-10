@@ -134,7 +134,10 @@ class _ResidualMergeRead:
     dtype. The producer's update must be a plain add."""
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, res_scale: Optional[ResidualScaling]):
         self.res_scale = res_scale

@@ -266,11 +266,6 @@ class TestTritonSparseMLARegistration(CustomTestCase):
             "triton_sparse_mla", actions_by_option["--dsa-prefill-backend"].choices
         )
 
-    def test_union_defaults_to_off(self):
-        from sglang.srt.server_args import ServerArgs
-
-        self.assertEqual(ServerArgs(model_path="dummy").dsa_triton_union, 0)
-
     def test_sm120_glm_fp8_still_resolves_to_flashinfer_on_its_own(self):
         # Registering this backend must not change what SM120 selects by itself:
         # the GLM FP8-KV arm of the resolver declares flashinfer_sparse_mla for

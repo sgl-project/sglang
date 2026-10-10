@@ -42,10 +42,11 @@ struct TopKTraitImpl {
   static constexpr uint32_t kCTASize = kNumThreads;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
   // Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
-#ifdef USE_ROCM
   static constexpr uint32_t kMaxNumBlocks = 16384;  // block topk
-#else
-  static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
+#ifndef USE_ROCM
+  // Smallest register bucket for the multi-element radix path; the launchers
+  // instantiate larger ones on demand up to kMaxNumBlocks.
+  static constexpr uint32_t kMinNumBlocksBucket = 4096;
 #endif
   static constexpr uint32_t kSmallThreshold = 8 * kNumWarps;
   static constexpr uint32_t kRadixBits = 8;
@@ -301,6 +302,9 @@ struct TopKTraitImpl {
   }
 #endif  // USE_ROCM
 
+  // kMaxBlocks is the CUDA register bucket; ROCm sizes its slots from
+  // num_blocks at run time instead.
+  template <uint32_t kMaxBlocks = kMaxNumBlocks>
   SGL_DEVICE static void forward(
       const float* __restrict__ scores,
       const uint32_t num_blocks,
@@ -455,15 +459,16 @@ struct TopKTraitImpl {
 
       if (write_pos < topk) topk_out[write_pos] = tx;
     } else {
-      // num_blocks in (kCTASize, kMaxNumBlocks]: each thread caches its (up to
+      // num_blocks in (kCTASize, kMaxBlocks]: each thread caches its (up to
       // kIters) slice of the row in registers -- read from global exactly ONCE --
       // then runs the same 4-pass radix select as the single-element path looped
       // over those slots. Liveness is a uint32_t bitmask (bit i = slot i still in
       // the running set), so there is no per-element flag array; selection is an
       // in-loop scatter, so there is no per-element position array. Nothing is
       // cached in shared memory beyond the histogram.
-      constexpr uint32_t kIters = kMaxNumBlocks / kCTASize;
+      constexpr uint32_t kIters = kMaxBlocks / kCTASize;
       static_assert(kIters <= 32, "active liveness is packed into a uint32_t");
+      static_assert(kMaxBlocks % kCTASize == 0, "bucket must be a multiple of kCTASize");
       uint32_t key[kIters];
       uint32_t active = 0;
 #pragma unroll
@@ -529,6 +534,15 @@ struct TopKTraitImpl {
 using TopKTrait = TopKTraitImpl<512>;
 #ifdef USE_ROCM
 using TopKTraitWide = TopKTraitImpl<1024>;
+#else
+// Smallest instantiated bucket covering max_seqblock, so a short row is not
+// charged the register footprint of the largest one.
+inline uint32_t topk_bucket_for(int max_seqblock) {
+  const auto n = static_cast<uint32_t>(max_seqblock);
+  if (n <= TopKTrait::kMinNumBlocksBucket) return TopKTrait::kMinNumBlocksBucket;          // 4096
+  if (n <= 2 * TopKTrait::kMinNumBlocksBucket) return 2 * TopKTrait::kMinNumBlocksBucket;  // 8192
+  return TopKTrait::kMaxNumBlocks;                                                         // 16384
+}
 #endif
 
 // -------------------------------------------------------------------------
@@ -541,7 +555,7 @@ using TopKTraitWide = TopKTraitImpl<1024>;
 // ascending), [k_eff:topk) = -1. Ascending order is a hard requirement of the
 // MSA fmha_sm100 consumer (kv_block_indexes must be strictly ascending; its
 // sorted-order early-exit otherwise mis-masks the partial last block).
-template <typename SeqLenT, bool kUsePDL, typename TopKTrait>
+template <typename SeqLenT, bool kUsePDL, typename TopKTrait, uint32_t kMaxBlocks = TopKTrait::kMaxNumBlocks>
 __global__ void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
@@ -573,7 +587,8 @@ __global__ void minimax_decode_topk_block_kernel(
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;
   __shared__ typename TopKTrait::Smem smem;
   __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  TopKTrait::template forward<kMaxBlocks>(
+      row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
   __syncthreads();  // s_topk fully written before the sort reads it
 
   // Emit ascending: num_blocks > topk here, so all topk slots hold distinct
@@ -636,7 +651,7 @@ __global__ void minimax_decode_topk_block_kernel(
 // [num_pages, nkv, page_size, D] reshaped to [num_pages*nkv, 1, page_size, D] (a
 // free view when the cache is contiguous HND). num_heads == 1 (h == 0) reproduces
 // the single-kv-head TP>=4 behavior (page index == base_page).
-template <typename SeqLenT, bool kUsePDL, typename TopKTrait>
+template <typename SeqLenT, bool kUsePDL, typename TopKTrait, uint32_t kMaxBlocks = TopKTrait::kMaxNumBlocks>
 __global__ void minimax_decode_topk_page_table_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
@@ -686,7 +701,8 @@ __global__ void minimax_decode_topk_page_table_kernel(
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;  // head-major score
   __shared__ typename TopKTrait::Smem smem;
   __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  TopKTrait::template forward<kMaxBlocks>(
+      row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
   __syncthreads();  // s_topk fully written before the transform reads it
 
   // Sort the selected block ids ascending (k_eff <= kMaxTopK is tiny) so the
@@ -786,17 +802,34 @@ void minimax_decode_topk(
     return;
   }
 #endif
-  LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
-      .enable_pdl(kUsePDL)(
-          minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait>,
-          static_cast<const float*>(score.data_ptr()),
-          static_cast<const SeqLenT*>(seq_lens.data_ptr()),
-          static_cast<int32_t*>(topk_idx.data_ptr()),
-          batch,
-          num_heads,
-          max_seqblock,
-          static_cast<int>(block_size),
-          topk_i);
+  auto launch = [&](auto kernel) {
+    LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            static_cast<const float*>(score.data_ptr()),
+            static_cast<const SeqLenT*>(seq_lens.data_ptr()),
+            static_cast<int32_t*>(topk_idx.data_ptr()),
+            batch,
+            num_heads,
+            max_seqblock,
+            static_cast<int>(block_size),
+            topk_i);
+  };
+#ifdef USE_ROCM
+  launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait>);
+#else
+  switch (topk_bucket_for(max_seqblock)) {
+    case TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMinNumBlocksBucket>);
+      break;
+    case 2 * TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, 2 * TopKTrait::kMinNumBlocksBucket>);
+      break;
+    default:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMaxNumBlocks>);
+      break;
+  }
+#endif
 }
 
 // Page-table variant: emit the per-(batch, kv-head) paged page table consumed by
@@ -891,24 +924,41 @@ void minimax_decode_topk_page_table(
     return;
   }
 #endif
-  LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
-      .enable_pdl(kUsePDL)(
-          minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait>,
-          static_cast<const float*>(score.data_ptr()),
-          static_cast<const SeqLenT*>(seq_lens.data_ptr()),
-          static_cast<const int32_t*>(req_to_token.data_ptr()),
-          static_cast<const int64_t*>(slot_ids.data_ptr()),
-          static_cast<int32_t*>(page_table.data_ptr()),
-          static_cast<int32_t*>(seq_lens_out.data_ptr()),
-          batch,
-          num_heads,
-          max_seqblock,
-          static_cast<int>(block_size),
-          static_cast<int>(topk),
-          static_cast<int>(page_size),
-          r2t_stride,
-          max_kv_len,
-          max_sparse_pages);
+  auto launch = [&](auto kernel) {
+    LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            static_cast<const float*>(score.data_ptr()),
+            static_cast<const SeqLenT*>(seq_lens.data_ptr()),
+            static_cast<const int32_t*>(req_to_token.data_ptr()),
+            static_cast<const int64_t*>(slot_ids.data_ptr()),
+            static_cast<int32_t*>(page_table.data_ptr()),
+            static_cast<int32_t*>(seq_lens_out.data_ptr()),
+            batch,
+            num_heads,
+            max_seqblock,
+            static_cast<int>(block_size),
+            static_cast<int>(topk),
+            static_cast<int>(page_size),
+            r2t_stride,
+            max_kv_len,
+            max_sparse_pages);
+  };
+#ifdef USE_ROCM
+  launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait>);
+#else
+  switch (topk_bucket_for(max_seqblock)) {
+    case TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMinNumBlocksBucket>);
+      break;
+    case 2 * TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, 2 * TopKTrait::kMinNumBlocksBucket>);
+      break;
+    default:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMaxNumBlocks>);
+      break;
+  }
+#endif
 }
 
 }  // namespace sglang

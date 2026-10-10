@@ -19,6 +19,7 @@ def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlin
     state = IpcA2AState()
     with (
         patch(f"{_IPC}.dist.get_rank", return_value=rank),
+        patch(f"{_IPC}.dist.get_process_group_ranks", return_value=[0, 1]),
         patch(f"{_IPC}.torch.cuda.current_device", return_value=rank),
         patch(f"{_IPC}._peer_cuda_device", return_value=1 - rank),
         patch(
@@ -46,12 +47,18 @@ def test_ipc_requires_nvlink_before_mapping_peer_memory(monkeypatch, rank, nvlin
         topology.assert_called_once_with([1, 3])
 
 
-def test_reinitializes_ipc_transport_for_replaced_process_group():
+@pytest.mark.parametrize(
+    "new_ranks", [[0, 2], [0, 1]], ids=["different_pair", "same_pair"]
+)
+def test_ipc_transport_reinitializes_only_for_a_different_rank_pair(new_ranks):
+    """A second group handle over the same pair (the SP device group that
+    AllToAll4D passes vs the Ulysses group USP passes) must reuse the transport."""
     state = IpcA2AState()
     old_group = object()
     new_group = object()
     state.inited = True
     state.group = old_group
+    state.ranks = [0, 1]
     state.calls = 7
 
     def initialize(group):
@@ -61,6 +68,7 @@ def test_reinitializes_ipc_transport_for_replaced_process_group():
     with (
         patch(f"{_IPC}.IPC_A2A", state),
         patch(f"{_IPC}.envs.SGLANG_DIFFUSION_IPC_A2A", True),
+        patch(f"{_IPC}.dist.get_process_group_ranks", return_value=new_ranks),
         patch(
             "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
             return_value=True,
@@ -74,9 +82,10 @@ def test_reinitializes_ipc_transport_for_replaced_process_group():
     ):
         assert ipc_a2a_ready(new_group)
 
-    init.assert_called_once_with(new_group)
-    assert state.group is new_group
-    assert state.calls == 0
+    replaced = new_ranks != [0, 1]
+    assert init.called == replaced
+    assert state.group is (new_group if replaced else old_group)
+    assert state.calls == (0 if replaced else 7)
 
 
 def test_peer_cuda_device_uses_the_ulysses_group_mapping():
