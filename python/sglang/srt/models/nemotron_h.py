@@ -225,6 +225,11 @@ class NemotronHMoE(nn.Module):
             is_gated=False,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             routed_scaling_factor=self.routed_scaling_factor,
+            # The shared experts may still be reading hidden_states on the main
+            # stream while the routed experts run on the alt stream, so the
+            # routed output must not overwrite it. A latent MoE feeds the
+            # experts a private projection instead.
+            inplace=self.use_latent_moe or not config.n_shared_experts,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
