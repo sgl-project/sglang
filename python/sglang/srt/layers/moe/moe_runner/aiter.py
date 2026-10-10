@@ -12,6 +12,7 @@ import torch
 
 _SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
 
 
 class AiterQuantType(str, Enum):
@@ -327,6 +330,7 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
         if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
@@ -344,6 +348,8 @@ class AiterRunnerCore(MoeRunnerCore):
                         self.config.activation == "silu",
                         quant_info.b13 is not None or quant_info.b2 is not None,
                         a1_scale,
+                        quant_info.w13_scale,
+                        quant_info.w2_scale,
                     )
                     and not extra.get("no_combine")
                     and runner_input.num_local_tokens is None

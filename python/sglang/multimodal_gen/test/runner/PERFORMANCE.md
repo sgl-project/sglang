@@ -49,11 +49,17 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 
 `b200-cirrascale1-0123` has separate E2E references of 1574.32 ms for
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
-`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 runners below also
-have separate references. Other Cirrascale runners retain the defaults until
+`qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 and Cirrascale 4
+runners below also have separate references, and `b200-cirrascale1-4567` reuses
+the `1-0123` references. Other Cirrascale runners retain the defaults until
 calibrated.
 
-Historical jobs on this runner, all using driver 580.126.20, already recorded
+The Cirrascale 1, 3 and 4 hosts match on CPU, memory, kernel, driver, VBIOS,
+power limit and GPU settings, and their per-step denoise timings agree, so these
+are samples of one pool. Runners in this pool share pool references instead of
+per-runner minimums.
+
+Historical jobs on `1-0123`, all using driver 580.126.20, already recorded
 the slower timings before this PR's changes, with unchanged B200 case definitions:
 
 | PR / CI job | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
@@ -71,13 +77,30 @@ guard; their recorded timings, not their green status, support these references.
 This does not identify the underlying host/GPU contention mechanism. Loading,
 other metrics, other cases, and other runner references remain unchanged.
 
+### Cirrascale 1-4567 historical CI references
+
+The table above covers `1-0123` only. `b200-cirrascale1-4567` records the
+following, with per-step denoise times in parentheses:
+
+| Scheduled CI job | Guarded | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
+| --- | --- | ---: | ---: |
+| [Scheduled run 147481](https://github.com/sgl-project/sglang/actions/runs/33623166945/job/100224824072) | no | 2724.78 (198.8) | 17680.41 (345.2) |
+| [Scheduled run 150509](https://github.com/sgl-project/sglang/actions/runs/34115218765/job/101720507304) | no | 3131.84 (264.1) | 18510.99 (353.9) |
+| [Scheduled run 151465](https://github.com/sgl-project/sglang/actions/runs/34289320660/job/102278182901) | no | 3263.42 (226.8) | 17541.47 (343.3) |
+| [Scheduled run 159386](https://github.com/sgl-project/sglang/actions/runs/35507027720/job/106068520455) | no | 2965.27 (238.5) | 18190.91 (356.2) |
+| [Scheduled run 166143](https://github.com/sgl-project/sglang/actions/runs/36939300008/job/110626917110) | yes | 1382.58 (96.1) | 17866.72 (346.4) |
+
+The guarded row is the minimum of seven attempts. Qwen2512 matches the `1-0123`
+reference in every job, and Flux1 in the guarded job.
+
 ### Cirrascale 3 historical CI references
 
-Match `b200-cirrascale3-0123` and `b200-cirrascale3-4567` separately, without
-extending the override to unmeasured runners. Their two NVFP4 case definitions,
-sampling configuration and model implementations are unchanged in the historical
-comparisons below. These are warmed request timings, not model download or load
-times. The independent PRs did not include this PR's E2E guard changes.
+Match `b200-cirrascale3-0123` and `b200-cirrascale3-4567` separately; other
+runners reuse them only under the pool rule above. Their two NVFP4 case
+definitions, sampling configuration and model implementations are unchanged in
+the historical comparisons below. These are warmed request timings, not model
+download or load times. The independent PRs did not include this PR's E2E guard
+changes.
 
 | PR / CI job | Runner suffix | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
 | --- | --- | ---: | ---: |
@@ -94,6 +117,30 @@ Keep the 25% tolerance and all other metrics unchanged. In particular, the
 35-second historical Qwen outlier still fails; it is not a new reference.
 These records establish a pre-existing runner-specific mismatch with the Verda
 reference, not the underlying cause of contention or a claim that all runs pass.
+
+### Cirrascale 4 historical CI references
+
+Match `b200-cirrascale4-0123` and `b200-cirrascale4-4567` separately, as for
+Cirrascale 3. Without an override both fell back to the Verda defaults, and all
+nine `multimodal-gen-test-1-b200` jobs they ran in the scheduled PR Test Base
+runs from 2026-09-21 to 2026-10-02 failed on these two cases.
+
+| Scheduled CI job | Runner suffix | Flux1 E2E (ms) | Qwen2512 E2E (ms) |
+| --- | --- | ---: | ---: |
+| [Scheduled run 161447](https://github.com/sgl-project/sglang/actions/runs/35853030052/job/107178181060) | `4-0123` | 1411.71 | 17338.23 |
+| [Scheduled run 163197](https://github.com/sgl-project/sglang/actions/runs/36278567509/job/108505988531) | `4-0123` | 1390.18 | 17367.66 |
+| [Scheduled run 161023, attempt 2](https://github.com/sgl-project/sglang/actions/runs/35796057792/job/107010103099) | `4-4567` | 1446.10 | 17501.32 |
+| [Scheduled run 163409](https://github.com/sgl-project/sglang/actions/runs/36314828013/job/108607491880) | `4-4567` | 1400.67 | 16861.20 |
+| [Scheduled run 164463](https://github.com/sgl-project/sglang/actions/runs/36560152577/job/109378949066) | `4-4567` | 1448.28 | 17671.62 |
+| [Scheduled run 165914](https://github.com/sgl-project/sglang/actions/runs/36853712190/job/110341259661) | `4-4567` | 1453.55 | 17824.04 |
+| [Scheduled run 166397](https://github.com/sgl-project/sglang/actions/runs/36999593636/job/110814117153) | `4-0123` | 1448.82 | 17986.85 |
+| [Scheduled run 166397, attempt 2](https://github.com/sgl-project/sglang/actions/runs/36999593636/job/110861969434) | `4-0123` | 1443.20 | 17770.64 |
+| [Scheduled run 166590](https://github.com/sgl-project/sglang/actions/runs/37076235439/job/111066773459) | `4-4567` | 1477.44 | 19243.87 |
+
+Each row is the minimum of the job's seven retried attempts, at most 6% below
+the Cirrascale 3 references. Under the pool rule above each half reuses its
+Cirrascale 3 counterpart: 1470.24 / 17894.49 ms for `4-0123`, and 1471.19 /
+17346.65 ms for `4-4567`.
 
 ## Initial loading references
 

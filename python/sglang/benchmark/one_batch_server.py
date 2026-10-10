@@ -400,7 +400,7 @@ class BenchArgs:
             action="store_true",
             help=(
                 "Allow --batch-size to exceed the server's "
-                "effective_max_running_requests_per_dp * dp_size. The surplus "
+                "effective_max_running_requests_per_dp * num_dp_ranks. The surplus "
                 "requests are queued by the scheduler and promoted as slots "
                 "free, so the batch is served as multiple sequential batches "
                 "at the running-batch cap. Useful for stabilizing throughput "
@@ -1251,7 +1251,10 @@ def run_benchmark_internal(
 
         internal_states = server_info.get("internal_states", [])
         internal_state = internal_states[0] if internal_states else {}
-        dp_size = internal_state.get("dp_size", None) or 1
+        # Replicas times attention-DP groups, as in `num_dp_ranks_of`.
+        num_dp_ranks = (internal_state.get("dp_size", None) or 1) * (
+            internal_state.get("attn_dp_size", None) or 1
+        )
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state.get(
@@ -1283,10 +1286,12 @@ def run_benchmark_internal(
             assert max_running_requests_per_dp > 0, (
                 f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
             )
-            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+            skip_max_running_requests_threshold = (
+                max_running_requests_per_dp * num_dp_ranks
+            )
 
         print(f"{max_running_requests_per_dp=}")
-        print(f"{dp_size=}")
+        print(f"{num_dp_ranks=}")
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 

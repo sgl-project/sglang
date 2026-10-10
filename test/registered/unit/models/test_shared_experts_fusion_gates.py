@@ -34,6 +34,42 @@ def _quant(name: str):
     return SimpleNamespace(get_name=lambda: name)
 
 
+_QUARK_MXFP4 = {
+    "weight": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": False,
+        "scale_format": "e8m0",
+    },
+    "input_tensors": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+        "scale_format": "e8m0",
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+_QUARK_BLOCK_FP8 = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_block",
+        "block_size": [128, 128],
+        "is_dynamic": False,
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_group",
+        "group_size": 128,
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
 def _import_bailing_modules():
     if importlib.util.find_spec("vllm") is not None:
         from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
@@ -281,6 +317,29 @@ class TestGlmMoeGate(_FusionGateCase):
             "GlmMoeDsaForCausalLM",
         )
 
+    def test_the_dsa_nextn_draft_declares_its_own_architecture(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+        self.assertEqual(
+            GlmMoeDsaForCausalLMNextN.fused_shared_experts_architecture,
+            "GlmMoeDsaForCausalLMNextN",
+        )
+
+    def test_the_dsa_nextn_draft_can_fuse_the_target_layout(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+        self._seed()
+        draft_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLMNextN"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_hidden_layers=78,
+        )
+        self.assertNotIn(
+            "does not support",
+            self._reason(GlmMoeDsaForCausalLMNextN, draft_config) or "",
+        )
+
 
 class TestGlm5NextGate(_FusionGateCase):
     def _config(self, **kw):
@@ -364,6 +423,76 @@ class TestGlm5NextGate(_FusionGateCase):
                 self.assertIn(
                     "same block-FP8 layout",
                     self._reason_on_gfx950(quant=quant),
+                )
+
+    def _quark(
+        self, *, exclude=(), fp8_experts=(45,), fp8_shared=(45,), fp8_shared_down=()
+    ):
+        """A Quark export shaped like amd/GLM-5.3-Flash-Quark-MXFP4: MXFP4 by
+        default, layer 45 (the MTP draft) pinned to block-FP8 expert by expert,
+        and its names mapped the way the loader maps them."""
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        layer_quant_config = {}
+        for layer in fp8_experts:
+            for expert in range(288):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    name = f"model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}"
+                    layer_quant_config[name] = _QUARK_BLOCK_FP8
+        for layer in fp8_shared:
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                name = f"model.language_model.layers.{layer}.mlp.shared_experts.{proj}"
+                layer_quant_config[name] = _QUARK_BLOCK_FP8
+        for layer in fp8_shared_down:
+            name = f"model.language_model.layers.{layer}.mlp.shared_experts.down_proj"
+            layer_quant_config[name] = _QUARK_BLOCK_FP8
+        quant = QuarkConfig.from_config(
+            {
+                "quant_method": "quark",
+                "export": {"kv_cache_group": [], "pack_method": "reorder"},
+                "global_quant_config": _QUARK_MXFP4,
+                "layer_quant_config": layer_quant_config,
+                "layer_type_quant_config": {},
+                "exclude": [f"model.language_model.layers.{name}" for name in exclude],
+                "packed_modules_mapping": {
+                    **Glm5NextForConditionalGeneration.packed_modules_mapping,
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
+            }
+        )
+        quant.apply_weight_name_mapper(
+            Glm5NextForConditionalGeneration.hf_to_sglang_mapper
+        )
+        return quant
+
+    def test_quark_mxfp4_is_admitted(self):
+        config = self._config(num_hidden_layers=45)
+        self.assertIsNone(self._reason_on_gfx950(config=config, quant=self._quark()))
+
+    def test_quark_target_layer_experts_must_share_one_mxfp4_spec(self):
+        config = self._config(num_hidden_layers=45)
+        cases = {
+            "excluded routed expert": self._quark(
+                exclude=["10.mlp.experts.5.gate_proj"]
+            ),
+            "excluded shared expert": self._quark(
+                exclude=[
+                    "10.mlp.shared_experts.gate_proj",
+                    "10.mlp.shared_experts.up_proj",
+                ]
+            ),
+            "block-FP8 routed and shared experts": self._quark(
+                fp8_experts=(10, 45), fp8_shared=(10, 45)
+            ),
+            "block-FP8 shared expert only": self._quark(fp8_shared=(10, 45)),
+            "block-FP8 shared down_proj only": self._quark(fp8_shared_down=(10,)),
+        }
+        for name, quant in cases.items():
+            with self.subTest(name):
+                self.assertIn(
+                    "same Quark MXFP4 layout",
+                    self._reason_on_gfx950(config=config, quant=quant),
                 )
 
     def test_ep_and_a2a_topologies_are_rejected(self):

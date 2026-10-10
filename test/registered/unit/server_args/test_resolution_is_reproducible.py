@@ -501,9 +501,8 @@ class TestALateDeclarationKeepsTheResolution(_RestoresProcessState, CustomTestCa
         server_args = ServerArgs(
             model_path=config_dir,
             device="cuda",
-            dp_size=2,
+            attn_dp_size=2,
             tp_size=2,
-            enable_dp_attention=True,
             random_seed=42,
         )
         server_args.resolve_once()

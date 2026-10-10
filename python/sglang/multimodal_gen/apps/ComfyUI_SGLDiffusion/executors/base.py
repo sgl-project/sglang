@@ -9,10 +9,15 @@ import torch
 try:
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-except ImportError:
+except ImportError as exc:
+    # Keep the nodes importable so ComfyUI shows this; fail clearly on first use.
+    _RUNTIME_IMPORT_ERROR: ImportError | None = exc
     print(
-        "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
+        f"Error: failed to import the SGLang diffusion runtime: {exc!r}. "
+        "Install the diffusion extras with 'pip install sglang[diffusion]'."
     )
+else:
+    _RUNTIME_IMPORT_ERROR = None
 
 
 class SGLDiffusionExecutor(torch.nn.Module):
@@ -115,6 +120,10 @@ class SGLDiffusionExecutor(torch.nn.Module):
         }
 
     def _execute_packed(self, packed, x, timestep):
+        if _RUNTIME_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SGLang diffusion runtime failed to import"
+            ) from _RUNTIME_IMPORT_ERROR
         ensure = getattr(self, "_ensure_runtime", None)
         if ensure is not None:
             ensure(self)

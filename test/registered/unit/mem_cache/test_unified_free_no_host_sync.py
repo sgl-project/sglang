@@ -63,8 +63,10 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
+    (mea.MultiEndedAllocator, "free_physical"),
     (mea.MultiEndedAllocator, "_commit_move_batch"),
     (mea.FloatMultiEndedAllocator, "free"),
+    (mea.FloatMultiEndedAllocator, "free_physical"),
     (mea.FloatMultiEndedAllocator, "make_room"),
     (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
 ]

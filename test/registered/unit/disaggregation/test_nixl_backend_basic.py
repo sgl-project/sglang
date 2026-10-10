@@ -1469,19 +1469,19 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
         src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
         self.assertEqual(num_groups, 2)
 
-        # Every source descriptor [addr, addr+len) must lie inside a registered
-        # base region [ptr, ptr+REGION_LEN). Pre-fix, num_groups=4 pushed the
-        # top group's addresses past the region -> NIXL_ERR_NOT_FOUND.
+        # Every source run must lie inside a registered base region
+        # [ptr, ptr+REGION_LEN), gaps between its blocks included. Pre-fix,
+        # num_groups=4 pushed the top group past the region -> NIXL_ERR_NOT_FOUND.
         src_call = next(c for c in mgr.agent.calls if c[0] == "")
         src_array = src_call[1]
         regions = [(p, p + self.REGION_LEN) for p in self.SRC_PTRS]
-        for addr, length, _dev in src_array:
+        for addr, length, _dev, stride, count in src_array:
             addr = int(addr)
-            length = int(length)
+            end = addr + (int(count) - 1) * int(stride) + int(length)
             self.assertTrue(
-                any(lo <= addr and addr + length <= hi for lo, hi in regions),
-                f"descriptor [{addr:#x}, {addr + length:#x}) escapes all "
-                f"registered source regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
+                any(lo <= addr and end <= hi for lo, hi in regions),
+                f"run [{addr:#x}, {end:#x}) escapes all registered source "
+                f"regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
             )
 
     def test_head_group_idx_maps_replicated_ranks_by_integer_division(self):
@@ -1502,6 +1502,207 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
                 f"decode rank {rank} mapped to group {head_group_idx}, "
                 f"expected {expected[rank]} (modulo bug gives 0,1,0,1)",
             )
+
+
+class ReloadFakeAgent:
+    """NIXL remote metadata as on the NIXL 1.3.0 CI floor: each load starts a
+    new generation, and an old handle's failure unloads the peer by name."""
+
+    def __init__(self):
+        self.sections = {}
+        self.generations = 0
+        self.fail_prep_for = None
+
+    def add_remote_agent(self, metadata):
+        name = metadata.decode("ascii")
+        self.generations += 1
+        self.sections[name] = self.generations
+        return name
+
+    def remove_remote_agent(self, name):
+        del self.sections[name]
+
+    def check_remote_metadata(self, name):
+        return name in self.sections
+
+    def prep_xfer_dlist(self, name, descs, mem_kind):
+        if name and (name not in self.sections or name == self.fail_prep_for):
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
+        return name, self.sections.get(name)
+
+    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif):
+        name, generation = dst
+        if generation != self.sections.get(name):
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
+        return name, generation
+
+    def transfer(self, handle):
+        return "PROC"
+
+    def check_xfer_state(self, handle):
+        name, generation = handle
+        if name not in self.sections:
+            raise RuntimeError("NIXL_ERR_NOT_FOUND")
+        if generation != self.sections[name]:
+            del self.sections[name]
+            raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+        return "DONE"
+
+
+class TestNixlInvalidatedPeerReload(CustomTestCase):
+    def _make_manager(self, peers):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = ReloadFakeAgent()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.attn_tp_size = 1
+        mgr.pp_size = 1
+        mgr.src_mem_kind = "VRAM"
+        mgr._num_slots_src = 4
+        mgr.prep_handles = {}
+        mgr.prep_handles_slice_dst = {}
+        mgr._peer_reload_lock = threading.Lock()
+        mgr._peer_reload_times = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            engine_rank=0,
+            num_draft_entries=0,
+            kv_layer_ids=[],
+            kv_data_ptrs=[0x1000, 0x2000],
+            kv_data_lens=[64, 64],
+            kv_item_lens=[16, 16],
+        )
+        mgr.decode_kv_args_table = {}
+        for name in peers:
+            info = KVArgsRegisterInfo(
+                room="None",
+                endpoint="127.0.0.1",
+                dst_port=5555,
+                agent_name=name,
+                agent_metadata=name.encode("ascii"),
+                dst_kv_ptrs=[0x3000, 0x4000],
+                dst_kv_mem_kinds=["VRAM", "VRAM"],
+                dst_aux_ptrs=[0],
+                dst_state_data_ptrs=[],
+                gpu_id=0,
+                decode_tp_size=1,
+                decode_tp_rank=0,
+                dst_kv_item_len=16,
+                dst_kv_item_lens=[16, 16],
+                dst_num_slots=4,
+            )
+            mgr.decode_kv_args_table[name] = info
+            mgr.agent.add_remote_agent(info.agent_metadata)
+            mgr._prepare_payload_xfer(info)
+        return mgr
+
+    def test_failed_room_reloads_the_invalidated_peer_for_later_rooms(self):
+        """A peer invalidated mid-room must serve later rooms again, even after
+        the failed room's posted handles fail and the room is cleared."""
+        peers = ["healthy", "dropped"]
+        mgr = self._make_manager(peers)
+        healthy_dlist = mgr.prep_handles["healthy"]
+        mgr.request_status = {}
+        mgr.transfer_infos = {}
+        mgr.req_to_decode_prefix_len = {}
+        for room in (31, 32):
+            mgr.request_status[room] = KVPoll.WaitingForInput
+            mgr.req_to_decode_prefix_len[room] = 0
+            mgr.transfer_infos[room] = {
+                name: TransferInfo(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=5555 + i,
+                    agent_name=name,
+                    dst_kv_indices=np.array([2], dtype=np.int32),
+                    dst_aux_index=0,
+                    required_dst_info_num=len(peers),
+                    dst_state_indices=[],
+                )
+                for i, name in enumerate(peers)
+            }
+        mgr.enable_staging = False
+        mgr.enable_deferred_decode_kv_release = False
+        mgr._staging_ctx = None
+        mgr._staging_outstanding = defaultdict(int)
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr.transfer_source_rank = 0
+        mgr.exceptions = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr.send_kv_status_message = MagicMock()
+        # A remote disconnect while posting dropped's aux unloads the peer and
+        # leaves its KV handle posted.
+        disconnect = {"dropped"}
+
+        def send_aux(peer, *args):
+            if peer in disconnect:
+                disconnect.discard(peer)
+                mgr.agent.remove_remote_agent(peer)
+                raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+            return peer, mgr.agent.sections[peer]
+
+        mgr.send_aux = send_aux
+        # The sender clears a room as soon as it sees it failed.
+        update_status = mgr.update_status
+
+        def update_status_and_clear(room, status):
+            update_status(room, status)
+            if status == KVPoll.Failed:
+                mgr.transfer_infos.pop(room, None)
+
+        mgr.update_status = update_status_and_clear
+        chunks = [
+            TransferKVChunk(
+                room=room,
+                prefill_kv_indices=np.array([1], dtype=np.int32),
+                index_slice=slice(0, 1),
+                is_last_chunk=True,
+                chunk_id=0,
+                prefill_aux_index=0,
+                state_indices=None,
+            )
+            for room in (31, 32)
+        ]
+        queue = SimpleNamespace(get=MagicMock(side_effect=[*chunks, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(mgr.request_status[31], KVPoll.Failed)
+        self.assertIn(31, mgr.failure_records)
+        self.assertEqual(mgr.request_status[32], KVPoll.Success)
+        self.assertIs(mgr.prep_handles["healthy"], healthy_dlist)
+
+    def test_failed_rebuild_leaves_the_peer_to_a_later_reload(self):
+        """A reload whose dlists cannot be rebuilt must leave the peer invalid,
+        so a later failure past the interval reloads it."""
+        mgr = self._make_manager(["dropped"])
+        mgr.agent.remove_remote_agent("dropped")
+        for now, prep_fails, reloaded in (
+            (100.0, True, False),
+            (100.5, False, False),
+            (101.5, False, True),
+        ):
+            mgr.agent.fail_prep_for = "dropped" if prep_fails else None
+            with patch(
+                "sglang.srt.disaggregation.nixl.conn.time.monotonic",
+                return_value=now,
+            ):
+                mgr._reload_invalidated_peers(dict.fromkeys(["dropped"]))
+            self.assertEqual(mgr.agent.check_remote_metadata("dropped"), reloaded, now)
+
+        handle = mgr.send_kvcache(
+            "dropped",
+            np.array([1], dtype=np.int32),
+            mgr.decode_kv_args_table["dropped"].dst_kv_ptrs,
+            np.array([2], dtype=np.int32),
+            0,
+            "notif",
+        )
+        self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
 
 if __name__ == "__main__":

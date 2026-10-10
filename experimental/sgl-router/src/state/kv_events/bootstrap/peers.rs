@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Sibling replicas a snapshot may be pulled from. An empty set is conclusive
 /// only after a sync and only if siblings were never seen: before the first
@@ -39,7 +39,11 @@ impl PeerRegistry {
             changed
         };
         if let Some(peers) = changed {
-            info!(count = peers.len(), peers = ?peers, "kv-bootstrap: peer set updated");
+            // Count at info; the full URL list only at debug — on a large
+            // fleet every rolling update re-lists every sibling, and one log
+            // line per change carrying every URL gets loud.
+            info!(count = peers.len(), "kv-bootstrap: peer set updated");
+            debug!(peers = ?peers, "kv-bootstrap: peer set contents");
         }
     }
 

@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -158,6 +158,28 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    if cfg.speculative_use_block_verification:
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+            raise ValueError(
+                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
+                "NEXTN / DFLASH / DSPARK."
+            )
+        if cfg.device != "cuda":
+            raise ValueError(
+                "--speculative-use-block-verification only supports CUDA or ROCm."
+            )
+        # Block verification needs sampled proposals and their full distributions.
+        # The DFLASH family's sampled drafts always carry them.
+        if (
+            cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and not cfg.speculative_use_rejection_sampling
+        ):
+            declare_resolution(
+                server_args,
+                "handle_speculative_decoding",
+                speculative_use_rejection_sampling=True,
+            )
+
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
     # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
     # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
@@ -270,7 +292,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    if cfg.enable_dp_attention and cfg.device != "npu":
+    if attn_dp_enabled_of(cfg) and cfg.device != "npu":
         if not cfg.device.startswith("cuda"):
             raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
         if not cfg.enable_dp_lm_head:
@@ -545,7 +567,7 @@ def _handle_uno(server_args: ServerArgs) -> None:
 
     if (cfg.tp_size, cfg.pp_size) != (1, 1):
         raise ValueError("UNO requires TP=PP=1.")
-    if cfg.enable_dp_attention or cfg.attn_cp_size != 1:
+    if attn_dp_enabled_of(cfg) or cfg.attn_cp_size != 1:
         raise ValueError("UNO does not support DP attention or context parallelism.")
     if cfg.enable_lora or cfg.lora_paths:
         raise ValueError("UNO does not support public Multi-LoRA serving.")
@@ -595,8 +617,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "DSpark speculative decoding only supports CUDA or NPU device."
         )
 
-    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
-    if cfg.enable_dp_attention and cfg.dp_size > 1:
+    if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
         if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
@@ -970,9 +991,8 @@ def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if (
-        cfg.speculative_algorithm == "STANDALONE"
-        and resolved_view(server_args).enable_dp_attention
+    if cfg.speculative_algorithm == "STANDALONE" and attn_dp_enabled_of(
+        resolved_view(server_args)
     ):
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
@@ -1261,7 +1281,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if view.enable_dp_attention:
+    if attn_dp_enabled_of(view):
         # TODO: support dp attention for ngram speculative decoding
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
