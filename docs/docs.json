@@ -1523,6 +1523,7 @@
                   },
                   {
                     "group": "Wan",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2",

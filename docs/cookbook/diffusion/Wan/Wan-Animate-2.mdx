@@ -12,7 +12,23 @@ import { config } from '/src/snippets/configs/Wan/wan-animate-2.jsx';
 
 <DiffusionModelTags tags={["video", "character animation", "image + reference video", "single-expert", "640×800 / 720×1280"]} />
 
-## 1. Model Introduction
+<a id="2-sglang-diffusion-installation" />
+<a id="3-1-basic-configuration" />
+
+## 1. Quick start
+
+Follow the [installation guide](/docs/sglang-diffusion/installation) on Linux with
+NVIDIA CUDA, then select a verified recipe.
+
+<Deployment config={config} />
+
+Provide both a reference image and a server-readable reference video. See
+[HTTP invocation](#4-2-serve-and-request-over-http) for polling and downloading
+the finished video.
+
+<a id="1-model-introduction" />
+
+## 2. Model introduction
 
 [Wan-Animate-2](https://huggingface.co/Wan-AI/Wan2.2-Animate-2-14B-Diffusers) is a
 14B character-animation model in the Wan2.2 family. Instead of the text- or
@@ -39,7 +55,9 @@ reference image and a reference video, so it is invoked differently from the
 other Wan2.2 models. See [section 4](#4-model-invocation).
 </Warning>
 
-### 1.1 Inputs
+<a id="1-1-inputs" />
+
+### 2.1 Inputs
 
 | Input | Field | Passed via |
 | --- | --- | --- |
@@ -53,7 +71,9 @@ online API forwards `video_path` into the pipeline while the reference image rid
 `input_reference`. Local paths must be readable by the server process. HTTP(S)
 video URLs use SGLang's shared media loader before decoding, without a disk cache.
 
-### 1.2 Defaults
+<a id="1-2-defaults" />
+
+### 2.2 Defaults
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
@@ -132,31 +152,15 @@ not general speedup claims; both comparisons used PyTorch 2.13.0+cu130,
 Transformers 5.12.1, and Diffusers 0.37.0. The baseline was the initial native
 implementation, not the official Diffusers implementation.
 
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most
-suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation)
-for installation instructions.
-
 ## 3. Model Deployment
 
-### 3.1 Basic Configuration
+### 3.1 Recommended configurations
 
-Use Linux with NVIDIA CUDA and follow the installation guide above.
-The presets below use the [multi-GPU and memory configurations](#3-3-multi-gpu-and-memory-presets).
 Start with **Auto**, or choose **Memory** for more GPU headroom. Memory usage
 depends on the input video, pixel-area budget, and `clip_len`; see the
 [hardware comparison](#5-1-hardware-comparison) for measured configurations.
 On two B300 GPUs, choose **2 GPUs: CFG** and **CFG parity** for the recommended
 speed/memory balance. The RTX 4090 entry selects its single-GPU memory recipe.
-
-<Deployment config={config} />
-
-The request command submits both reference inputs and returns a video job ID.
-See [HTTP invocation](#4-2-serve-and-request-over-http) for polling and downloading
-the finished video. The reference video path must be readable by the server.
 
 Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
 `model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
@@ -226,7 +230,7 @@ Any value in the YAML can also be passed as a CLI flag (for example
 `POST /v1/videos` creates an asynchronous job. Send the **reference image** as the
 `input_reference` part and the **reference video** as `video_path`, then poll
 the job and download the finished MP4. `size` is the pixel-area budget described in
-[section 1.2](#1-2-defaults); the output dimensions follow the reference image's
+[section 2.2](#2-2-defaults); the output dimensions follow the reference image's
 aspect ratio.
 
 ```bash Command
