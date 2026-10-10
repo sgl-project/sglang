@@ -9,13 +9,14 @@ from unittest.mock import patch
 
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
+    filter_safetensors_files_by_weight_prefix,
     maybe_add_mtp_safetensors,
 )
 from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 INDEX_NAME = "model.safetensors.index.json"
 
@@ -197,6 +198,97 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class TestFilterSafetensorsFilesByWeightPrefix(CustomTestCase):
+    """A draft head packed into its target's checkpoint must not re-stream every
+    shard of that checkpoint (sgl-project/sglang DSPARK draft load)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _shards(self, names):
+        return [_touch(self.folder, name) for name in names]
+
+    def test_keeps_only_prefix_bearing_shards(self):
+        _write_index(
+            self.folder,
+            {
+                "model.layers.0.w": "model-00001-of-00003.safetensors",
+                "model.layers.1.w": "model-00002-of-00003.safetensors",
+                "mtp.0.attn.q_proj.weight": "model-00003-of-00003.safetensors",
+            },
+        )
+        files = self._shards(
+            [
+                "model-00001-of-00003.safetensors",
+                "model-00002-of-00003.safetensors",
+                "model-00003-of-00003.safetensors",
+            ]
+        )
+        self.assertEqual(
+            filter_safetensors_files_by_weight_prefix(
+                files, self.folder, INDEX_NAME, ("mtp.",)
+            ),
+            [files[2]],
+        )
+
+    def test_keeps_every_shard_that_holds_the_prefix(self):
+        _write_index(
+            self.folder,
+            {
+                "model.layers.0.w": "model-00001-of-00002.safetensors",
+                "mtp.0.attn.q_proj.weight": "model-00001-of-00002.safetensors",
+                "mtp.1.attn.q_proj.weight": "model-00002-of-00002.safetensors",
+            },
+        )
+        files = self._shards(
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ]
+        )
+        self.assertEqual(
+            filter_safetensors_files_by_weight_prefix(
+                files, self.folder, INDEX_NAME, ("mtp.",)
+            ),
+            files,
+        )
+
+    def test_no_index_loads_everything(self):
+        files = self._shards(["model.safetensors"])
+        self.assertEqual(
+            filter_safetensors_files_by_weight_prefix(
+                files, self.folder, INDEX_NAME, ("mtp.",)
+            ),
+            files,
+        )
+
+    def test_prefix_absent_from_index_loads_everything(self):
+        # A checkpoint that packs the draft under another name must keep working
+        # rather than load nothing at all.
+        _write_index(self.folder, {"model.layers.0.w": "model.safetensors"})
+        files = self._shards(["model.safetensors"])
+        self.assertEqual(
+            filter_safetensors_files_by_weight_prefix(
+                files, self.folder, INDEX_NAME, ("mtp.",)
+            ),
+            files,
+        )
+
+    def test_no_prefixes_declared_loads_everything(self):
+        _write_index(self.folder, {"mtp.0.w": "model.safetensors"})
+        files = self._shards(["model.safetensors"])
+        self.assertEqual(
+            filter_safetensors_files_by_weight_prefix(
+                files, self.folder, INDEX_NAME, ()
+            ),
+            files,
+        )
 
 
 if __name__ == "__main__":
