@@ -5,6 +5,7 @@ import logging
 import math
 import mmap
 import os
+import time
 import uuid
 import weakref
 
@@ -109,8 +110,127 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+_THP_SIZE = 2 * 1024 * 1024
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
+_MADV_COLLAPSE = getattr(mmap, "MADV_COLLAPSE", 25)
+
+
+def _small_page_bytes(smaps_lines, start: int, end: int) -> int:
+    """Resident bytes of ``[start, end)`` not on transparent huge pages.
+
+    Sums ``Rss - AnonHugePages`` over the /proc/self/smaps mappings that
+    overlap the range. A mapping merged with a neighbouring one is counted
+    whole, which can only overstate the result.
+    """
+    small = 0
+    overlaps = False
+    rss = 0
+    for line in smaps_lines:
+        fields = line.split()
+        if not fields:
+            continue
+        head = fields[0]
+        if "-" in head and not head.endswith(":"):
+            low, high = (int(x, 16) for x in head.split("-"))
+            overlaps = low < end and high > start
+            rss = 0
+        elif overlaps and head == "Rss:":
+            rss = int(fields[1]) * 1024
+        elif overlaps and head == "AnonHugePages:":
+            small += max(rss - int(fields[1]) * 1024, 0)
+    return small
+
+
+def _thp_small_page_bytes(start: int, length: int) -> int:
+    with open("/proc/self/smaps") as smaps:
+        return _small_page_bytes(smaps, start, start + length)
+
+
+def _madvise_collapse(mm: mmap.mmap) -> None:
+    mm.madvise(_MADV_COLLAPSE)
+
+
+def _ensure_thp_backed(mm: mmap.mmap, start: int, length: int) -> None:
+    """Collapse what the pre-fault left on 4 KiB pages; fail if too much stays.
+
+    With THP defrag in madvise mode a fault in an MADV_HUGEPAGE region
+    compacts memory, and falls back to a 4 KiB page when compaction fails, as
+    it does on a node whose memory is fragmented. Even a few GiB of 4 KiB pages
+    are enough to exhaust an RDMA NIC's translation budget (AMD ionic then
+    rejects every further memory region with EINVAL, huge-paged ones too), so
+    MADV_COLLAPSE (Linux 6.1+) retries those ranges synchronously. Whatever is
+    still on 4 KiB pages is logged, and more than
+    SGLANG_HUGEPAGE_THP_MAX_SMALL_MB (negative: no limit) is an error.
+    """
+    small = _thp_small_page_bytes(start, length)
+    small_after_fault = small
+    collapse_note = ""
+    if small:
+        began = time.monotonic()
+        try:
+            _madvise_collapse(mm)
+        except OSError as e:
+            # EAGAIN/ENOMEM: part of the range could not be collapsed;
+            # EINVAL: no MADV_COLLAPSE before Linux 6.1. Measure either way.
+            collapse_note = f" (MADV_COLLAPSE: {e})"
+        small = _thp_small_page_bytes(start, length)
+        collapse_note = (
+            f"; MADV_COLLAPSE in {time.monotonic() - began:.1f} s left "
+            f"{small / 2**20:.1f} MiB{collapse_note}"
+        )
+    logger.info(
+        "THP host pool: %.2f GiB, %.1f MiB on 4 KiB pages after the pre-fault%s.",
+        length / 2**30,
+        small_after_fault / 2**20,
+        collapse_note,
+    )
+    limit_mb = envs.SGLANG_HUGEPAGE_THP_MAX_SMALL_MB.get()
+    if limit_mb >= 0 and small > limit_mb * 2**20:
+        raise OSError(
+            f"SGLANG_HUGEPAGE_SIZE=THP: {small / 2**20:.1f} MiB of the "
+            f"{length / 2**30:.2f} GiB host pool is still on 4 KiB pages after "
+            f"MADV_COLLAPSE (limit SGLANG_HUGEPAGE_THP_MAX_SMALL_MB={limit_mb}). "
+            "Host memory is too fragmented to back the pool with huge pages; an "
+            "RDMA NIC registering it page by page can run out of translation "
+            "entries (AMD ionic then fails every later memory region with "
+            "EINVAL). Start on a node with less fragmented memory, or set the "
+            "limit to -1 to continue anyway."
+        )
+
+
+def _alloc_transparent_hugepages(
+    dims: tuple, dtype: torch.dtype, n_bytes: int
+) -> torch.Tensor:
+    """Pre-faulted anonymous memory backed by transparent 2 MiB pages.
+
+    Needs no reserved hugetlbfs pages, only THP in madvise or always mode.
+    RDMA NICs translate a registered region page by page; at 4 KiB pages a
+    large host KV pool can exhaust a NIC's translation budget (AMD ionic
+    rejects further regions with EINVAL), while 2 MiB pages need 512 times
+    fewer entries. The mapping is private: shmem THP is often disabled, and
+    anonymous THP is not. Pages are written before registration, so they are
+    never copy-on-write shared; the pool must not be touched across fork().
+    What the pre-fault leaves on 4 KiB pages is collapsed before the pool is
+    returned (see _ensure_thp_backed), i.e. before anything registers it.
+    """
+    alloc_bytes = math.ceil(n_bytes / _THP_SIZE) * _THP_SIZE
+    if not _has_madv_populate_write():
+        raise OSError(
+            "SGLANG_HUGEPAGE_SIZE=THP requires MADV_POPULATE_WRITE (Linux 5.14+)"
+        )
+    mm = mmap.mmap(
+        -1, alloc_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=_PROT_RW
+    )
+    mm.madvise(_MADV_HUGEPAGE)
+    mm.madvise(_MADV_POPULATE_WRITE)
+    tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    _ensure_thp_backed(mm, tensor.data_ptr(), alloc_bytes)
+    return tensor
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
+    """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for
+    hugetlbfs pages, or THP for transparent 2 MiB pages.
 
     MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
     pre-faulted physical pages (otherwise pinning can race with COW or page
@@ -123,6 +243,8 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
 
+    if hugepage_size == "THP":
+        return _alloc_transparent_hugepages(dims, dtype, n_bytes)
     if hugepage_size == "":
         page_size, extra_flags = mmap.PAGESIZE, 0
     elif hugepage_size == "2MB":
@@ -131,7 +253,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
     else:
         logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB', '1GB' or 'THP'. "
             "Falling back to plain page-size mmap.",
             envs.SGLANG_HUGEPAGE_SIZE.get(),
         )
