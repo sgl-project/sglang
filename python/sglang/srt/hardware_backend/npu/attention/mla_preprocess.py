@@ -108,6 +108,39 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         self.is_npu_arch35 = is_npu_arch35()
 
+        # Resolve the MLAProlog mode once from the loaded projection methods.
+        # INT8 dtype alone cannot distinguish static from dynamic W8A8.
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUMXFP8LinearMethod,
+            NPUW8A8Int8DynamicLinearMethod,
+        )
+
+        kernels = [
+            getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method)
+            for layer in (self.qkv_a_proj, self.q_b_proj)
+        ]
+        # Each dynamic scheme also specifies its precision and scale layout.
+        dynamic_quant_modes = (
+            (NPUW8A8Int8DynamicLinearMethod, 2),
+            (NPUMXFP8LinearMethod, 3),
+        )
+        self.weight_quant_mode = None
+        for method, mode in dynamic_quant_modes:
+            if all(isinstance(kernel, method) for kernel in kernels):
+                self.weight_quant_mode = mode
+                break
+        if self.weight_quant_mode is None and self.qkv_a_proj.weight.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            if self.q_b_proj.weight.dtype in (torch.float16, torch.bfloat16):
+                self.weight_quant_mode = 0
+            elif (
+                self.q_b_proj.weight.dtype == torch.int8
+                and self.q_b_proj_weight_scale is not None
+            ):
+                self.weight_quant_mode = 1
+
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.zeros(
             (hidden_states.shape[-1]),
@@ -251,31 +284,53 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         #   1: Partial INT8 quantization. Only weight_uq_qr (Q-B projection)
         #      is INT8; weight_dq and weight_dkv_kr (QKV-A projection) remain
         #      FP16/BF16. dequant_scale_w_uq_qr is required.
+        #   2: Dynamic INT8 activations and per-channel INT8 QKV-A/Q-B weights.
         #   3: MXFP8 quantization. token_x, weight_dq, weight_uq_qr, and
         #      weight_dkv_kr use MXFP8 with their corresponding dequant scales.
         #      weight_uk remains unquantized.
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            NPUMXFP8LinearMethod,
-        )
-
         projections = (self.qkv_a_proj, self.q_b_proj)
-        kernels = [
-            getattr(getattr(layer, "scheme", None), "kernel", layer.quant_method)
-            for layer in projections
-        ]
-        is_mxfp8 = [isinstance(kernel, NPUMXFP8LinearMethod) for kernel in kernels]
-        if any(is_mxfp8):
-            if not all(is_mxfp8):
-                raise RuntimeError(
-                    "MLAProlog MXFP8 requires both QKV-A and Q-B to use MXFP8"
-                )
-            expected_shapes = (
-                (
-                    self.qkv_a_proj.input_size,
-                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                ),
-                (self.q_lora_rank, self.num_local_heads * self.qk_head_dim),
+        expected_shapes = (
+            (
+                self.qkv_a_proj.input_size,
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            (self.q_lora_rank, self.num_local_heads * self.qk_head_dim),
+        )
+        if self.weight_quant_mode == 2:
+            if self.rotary_emb.is_neox_style:
+                raise RuntimeError("Dynamic INT8 MLAProlog requires interleaved RoPE")
+            # ModelSlim has already transposed INT8 weights to [K, N].
+            for norm in (self.q_a_layernorm, self.kv_a_layernorm):
+                bias = getattr(norm, "bias", None)
+                if bias is not None and torch.count_nonzero(bias).item():
+                    raise RuntimeError(
+                        "Dynamic INT8 MLAProlog does not support an RMSNorm bias"
+                    )
+            for layer, shape in zip(projections, expected_shapes):
+                if (
+                    layer.weight.dtype != torch.int8
+                    or tuple(layer.weight.shape) != shape
+                ):
+                    raise RuntimeError(
+                        "Unsupported ModelSlim dynamic INT8 MLA weight layout"
+                    )
+                if layer.weight_scale.numel() != shape[1]:
+                    raise RuntimeError(
+                        "Dynamic INT8 MLAProlog requires per-channel scales"
+                    )
+            qkv_weight = self.qkv_a_proj.weight.data
+            qb_weight = self.q_b_proj.weight.data
+            qkv_scale = self.qkv_a_proj.weight_scale.float().reshape(-1)
+            self.qkv_a_proj_scale_q = (
+                qkv_scale[: self.q_lora_rank].view(1, -1).contiguous()
             )
+            self.qkv_a_proj_scale_kv = (
+                qkv_scale[self.q_lora_rank :].view(1, -1).contiguous()
+            )
+            self.q_b_proj_scale = (
+                self.q_b_proj.weight_scale.float().view(1, -1).contiguous()
+            )
+        elif self.weight_quant_mode == 3:
             checkpoint_scales = []
             for layer, (k_dim, n_dim) in zip(projections, expected_shapes):
                 scale = getattr(layer, "weight_scale_inv", None)
@@ -303,35 +358,29 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 qkv_scale[self.q_lora_rank :].contiguous().view(torch.float8_e8m0fnu)
             )
             self.q_b_proj_scale = qb_scale.contiguous().view(torch.float8_e8m0fnu)
-            self.q_b_proj_weight = npu_format_cast(
-                self.q_b_proj.weight.data.contiguous()
-            )
-            self.weight_quant_mode = 3
-        else:
-            if self.qkv_a_proj.weight.dtype not in (torch.float16, torch.bfloat16):
-                raise RuntimeError("Unsupported MLAProlog QKV-A weight format")
+            qb_weight = self.q_b_proj.weight.data.contiguous()
+        elif self.weight_quant_mode in (0, 1):
             qkv_weight = self.qkv_a_proj.weight.data.transpose(0, 1)
-            if self.q_b_proj.weight.dtype in (torch.float16, torch.bfloat16):
-                self.weight_quant_mode = 0
-                self.q_b_proj_weight = npu_format_cast(
-                    self.q_b_proj.weight.data.transpose(0, 1).contiguous()
-                )
-            elif (
-                self.q_b_proj.weight.dtype == torch.int8
-                and self.q_b_proj_weight_scale is not None
-            ):
-                self.weight_quant_mode = 1
-                self.q_b_proj_weight = self.q_b_proj.weight
+            if self.weight_quant_mode == 0:
+                qb_weight = self.q_b_proj.weight.data.transpose(0, 1).contiguous()
             else:
-                raise RuntimeError("Unsupported MLAProlog Q-B weight format")
-        self.q_a_proj_weight = npu_format_cast(
-            qkv_weight[:, : self.q_lora_rank].contiguous()
-        )
-        self.kv_a_proj_weight = npu_format_cast(
-            qkv_weight[:, self.q_lora_rank :].contiguous()
+                qb_weight = self.q_b_proj.weight
+        else:
+            raise RuntimeError(
+                "Unsupported MLAProlog QKV-A/Q-B quantization combination"
+            )
+
+        q_weight = qkv_weight[:, : self.q_lora_rank].contiguous()
+        kv_weight = qkv_weight[:, self.q_lora_rank :].contiguous()
+
+        self.q_a_proj_weight = npu_format_cast(q_weight)
+        self.kv_a_proj_weight = npu_format_cast(kv_weight)
+        self.q_b_proj_weight = (
+            qb_weight if self.weight_quant_mode == 1 else npu_format_cast(qb_weight)
         )
 
-        if get_disagg().disaggregation_mode != "null":
+        # Dynamic INT8 keeps the original projections for extend and indexers.
+        if self.weight_quant_mode != 2 and get_disagg().disaggregation_mode != "null":
             qkv_weight.data.untyped_storage().resize_(0)
 
     def get_sin_cos(self, positions):
@@ -527,7 +576,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 "use BF16 draft KV for BF16 draft weights"
             )
         token_x = hidden_states
-        if self.weight_quant_mode == 3:
+        if self.weight_quant_mode == 2:
+            if any(
+                t.dtype != torch.bfloat16
+                for t in (hidden_states, k_cache, v_cache, self.w_kc)
+            ):
+                raise RuntimeError(
+                    "Dynamic INT8 MLAProlog requires BF16 activations and KV cache"
+                )
+            token_x, token_x_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states.contiguous()
+            )
+        elif self.weight_quant_mode == 3:
             token_x, token_x_scale = torch.ops.npu.npu_dynamic_mx_quant(
                 hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous(),
                 axis=1,
@@ -560,7 +620,16 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 kv_cache_quant_mode=3 if packed else 0,
                 query_quant_mode=0,
             )
-        if self.weight_quant_mode == 3:
+        if self.weight_quant_mode == 2:
+            mla_prolog_input_args.update(
+                dequant_scale_x=token_x_scale.float().view(-1, 1),
+                dequant_scale_w_dq=self.qkv_a_proj_scale_q,
+                dequant_scale_w_dkv_kr=self.qkv_a_proj_scale_kv,
+                dequant_scale_w_uq_qr=self.q_b_proj_scale,
+                kv_cache_quant_mode=0,
+                query_quant_mode=0,
+            )
+        elif self.weight_quant_mode == 3:
             mla_prolog_input_args.update(
                 dequant_scale_w_dq=self.qkv_a_proj_scale_q,
                 dequant_scale_w_dkv_kr=self.qkv_a_proj_scale_kv,
@@ -583,8 +652,13 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         if self.weight_quant_mode == 0:
             dequant_q_norm = None
-        elif self.weight_quant_mode == 1:
+        elif self.weight_quant_mode in (1, 2):
             dequant_q_norm = dequant_q_norm.view(hidden_states.shape[0])
+        if self.weight_quant_mode == 2 and q_nope.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "This torch_npu/CANN MLAProlog implementation does not return BF16 "
+                "query for weight_quant_mode=2, kv_cache_quant_mode=0"
+            )
         return (
             q_pe,
             v_cache,
@@ -597,12 +671,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def uses_mlaprolog(self) -> bool:
-        _is_arch35_dsa = (
-            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
-        )
-        return _is_arch35_dsa or (
+        _is_dsa_mlaprolog = (
+            self.is_npu_arch35 or self.weight_quant_mode == 2
+        ) and get_token_to_kv_pool().index_head_dim is not None
+        return _is_dsa_mlaprolog or (
             hasattr(self.quant_config, "ignore")
             and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
+            # Other ModelSlim projections retain the legacy MLAPO path.
+            and not (
+                hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+                and self.qkv_a_proj.quant_method.quantization_config.get_name()
+                == "modelslim"
+            )
         )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
@@ -613,12 +693,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             and self.qkv_a_proj.quant_method.quantization_config.get_name()
             == "modelslim"
         )
-        _is_arch35_dsa = (
-            self.is_npu_arch35 and get_token_to_kv_pool().index_head_dim is not None
-        )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = self.uses_mlaprolog()
-        if _is_w8a8 and not _is_arch35_dsa:
+        if _is_w8a8 and not _is_mlaprolog:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator
             )
