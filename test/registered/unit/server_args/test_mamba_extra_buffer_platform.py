@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -61,6 +62,33 @@ class TestMambaExtraBufferPlatform(CustomTestCase):
 
             platform.support_mamba_cache_extra_buffer.return_value = True
             _validate()
+
+
+def _supports(arch: str) -> bool:
+    return supports_mamba_cache_extra_buffer(
+        SimpleNamespace(linear_attn_backend="triton"),
+        SimpleNamespace(architectures=[arch]),
+    )
+
+
+class TestMambaExtraBufferXpuArchs(CustomTestCase):
+    def test_inkling_is_admitted_on_xpu(self):
+        """Inkling has no no_buffer path, so rejecting it on XPU fails every launch."""
+        with override_platform(is_xpu=True):
+            for arch in (
+                "InklingForConditionalGeneration",
+                "InklingForConditionalGenerationMTP",
+            ):
+                with self.subTest(arch=arch):
+                    self.assertTrue(_supports(arch))
+
+    def test_other_archs_stay_rejected_on_xpu(self):
+        for arch in ("KimiK3ForConditionalGeneration", "NemotronHForCausalLM"):
+            with self.subTest(arch=arch):
+                with override_platform(is_xpu=False):
+                    self.assertTrue(_supports(arch))
+                with override_platform(is_xpu=True):
+                    self.assertFalse(_supports(arch))
 
 
 if __name__ == "__main__":
