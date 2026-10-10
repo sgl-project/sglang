@@ -1212,6 +1212,13 @@ class ChatMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.tool_calls is None:
+            data.pop("tool_calls", None)
+        return data
+
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
@@ -1285,6 +1292,13 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.delta.tool_calls is None:
+            data["delta"].pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):
