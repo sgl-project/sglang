@@ -127,7 +127,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
-        has_sampled_rows: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """One markov step: the next token per row, and the next state."""
         bias, state = self.step_bias(
@@ -141,7 +140,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             noise_offset=noise_offset,
             step=step,
             logits_out=logits_out,
-            has_sampled_rows=has_sampled_rows,
         )
         return tokens, state
 
@@ -155,11 +153,11 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         noise_offset: torch.Tensor,
         step: int,
         logits_out: Optional[torch.Tensor] = None,
-        has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
-        """One token per row from ``step_logits(base_logits, bias)``: the argmax
-        at temperature 0, a Gumbel-max sample otherwise. ``logits_out`` receives
-        the step logits, ``step_logits_width`` wide."""
+        """One token per row from ``step_logits(base_logits, bias)``. With
+        ``logits_out``, which receives the step logits ``step_logits_width``
+        wide, a row takes the argmax at temperature 0 and a Gumbel-max sample
+        otherwise; without it every row takes the argmax."""
         return MarkovSampleStep.execute(
             base_logits=base_logits,
             bias=bias,
@@ -169,7 +167,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             step=step,
             step_dtype=self.step_logits_dtype(base_logits.dtype),
             logits_out=logits_out,
-            has_sampled_rows=has_sampled_rows,
+            has_sampled_rows=None if logits_out is not None else False,
             **self._vocab_shard_args(),
         )
 
