@@ -555,7 +555,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 )
                 backend.token_to_kv_pool = SimpleNamespace(request_window=None)
                 backend.forward_metadata = DSV4Metadata(
-                    self._make_core_metadata(0), indexer_metadata=None
+                    self._make_core_metadata(0),
+                    indexer_metadata=None,
+                    sparse_prefill_direct=True,
                 )
                 backend._build_sparse_prefill_chunk_cache = mock.Mock(
                     return_value=cache
@@ -704,7 +706,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        forward_batch = SimpleNamespace(
+            name="live", max_seq_len_override=None, extend_prefix_lens_cpu=None
+        )
         static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
