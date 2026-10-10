@@ -1892,6 +1892,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         return self._stream_one_response(obj=obj, state=state, request=request)
 
+
+    @staticmethod
+    async def _is_disconnected(request) -> bool:
+        """Probe whether the HTTP client has disconnected.
+
+        Wraps ``request.is_disconnected()`` to handle ``asyncio.CancelledError``
+        that the ASGI receive channel can raise when the underlying connection
+        is torn down.  Such cancellation is semantically equivalent to a client
+        disconnect.
+        """
+        try:
+            return await request.is_disconnected()
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+
+            # If our enclosing asyncio task is being cancelled,
+            # preserve normal asyncio cancellation semantics.
+            if task is not None and task.cancelling():
+                raise
+
+            # Otherwise the cancellation originated from the
+            # disconnect probe / ASGI receive path.
+            return True
+
     async def _stream_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1913,7 +1937,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._is_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
@@ -2001,7 +2025,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._is_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
