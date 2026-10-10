@@ -841,7 +841,23 @@ class MqaAttentionBase(nn.Module):
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
-        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
+        # PPU: MQALayer.forward's absorb-einsum dispatch is keyed on the global
+        # _FP8_WO_A_GEMM switch (not the per-instance wo_a_fp8) and only has
+        # quantized arms (Fp8 / W8A8Int8 / W8A8Fp8 / compressed-tensors), so a
+        # quantized model must keep its quant_config on wo_a even when
+        # wo_a_fp8_gemm_enabled() is False (e.g. w8a8_int8) -- otherwise wo_a
+        # is built bf16 and the dispatch raises NotImplementedError. Callers
+        # passing wo_a_fp8 explicitly (DSpark draft's bf16 wo_a) are exempt.
+        quantize_wo_a = (
+            fp8
+            or self.use_npu_arch35_mxfp8_wo_a
+            or (
+                wo_a_fp8 is None
+                and _FP8_WO_A_GEMM
+                and _is_ppu
+                and quant_config is not None
+            )
+        )
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -5630,7 +5646,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (
+            self.wo_a_fp8
+            or use_npu_arch35_mxfp8_wo_a(self.quant_config)
+            or (_FP8_WO_A_GEMM and _is_ppu and self.quant_config is not None)
+        ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
