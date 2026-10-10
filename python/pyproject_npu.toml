@@ -32,6 +32,7 @@ dependencies = [
   "huggingface_hub",
   "interegular",
   "IPython",
+  "jsonschema-rs==0.58.6",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
