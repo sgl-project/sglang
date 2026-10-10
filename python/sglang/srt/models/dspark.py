@@ -11,7 +11,10 @@ from torch import nn
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
-from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    MarkovGreedyFusedBiasStep,
+    MarkovSampleStep,
+)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -111,10 +114,39 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     ) -> torch.Tensor:
         return base_logits + bias
 
-    def step_logits_dtype(
-        self, base_dtype: torch.dtype, bias_dtype: torch.dtype
-    ) -> torch.dtype:
-        return torch.promote_types(base_dtype, bias_dtype)
+    @abstractmethod
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        """The dtype of ``base_logits + bias`` for base logits of ``base_dtype``."""
+
+    def draft_step(
+        self,
+        prev_tokens: torch.Tensor,
+        base_logits: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+        temperatures: torch.Tensor,
+        noise_key: int,
+        noise_offset: torch.Tensor,
+        step: int,
+        logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """One markov step: the next token per row, and the next state."""
+        bias, state = self.step_bias(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
+        tokens = self.sample_step(
+            base_logits,
+            bias,
+            temperatures=temperatures,
+            noise_key=noise_key,
+            noise_offset=noise_offset,
+            step=step,
+            logits_out=logits_out,
+            has_sampled_rows=has_sampled_rows,
+        )
+        return tokens, state
 
     def sample_step(
         self,
@@ -138,7 +170,7 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
             key=noise_key,
             offset=noise_offset,
             step=step,
-            step_dtype=self.step_logits_dtype(base_logits.dtype, bias.dtype),
+            step_dtype=self.step_logits_dtype(base_logits.dtype),
             logits_out=logits_out,
             has_sampled_rows=has_sampled_rows,
             **self._vocab_shard_args(),
@@ -191,6 +223,54 @@ class VanillaMarkov(BaseDSparkMarkovHead):
 
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
+
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        # The bias comes out in the embedding's dtype.
+        return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
+
+    def fused_bias_weight(self) -> Optional[torch.Tensor]:
+        """The weight a one-row greedy step may fold into its argmax, or None
+        when the bias is not a plain GEMV of the previous token's embedding."""
+        return self.markov_w2.weight
+
+    def draft_step(
+        self,
+        prev_tokens: torch.Tensor,
+        base_logits: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+        temperatures: torch.Tensor,
+        noise_key: int,
+        noise_offset: torch.Tensor,
+        step: int,
+        logits_out: Optional[torch.Tensor] = None,
+        has_sampled_rows: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        weight = self.fused_bias_weight()
+        # One greedy row: the GEMV and the argmax both stream the weight once,
+        # so one kernel does both.
+        if weight is not None and has_sampled_rows is False and len(prev_tokens) == 1:
+            tokens = MarkovGreedyFusedBiasStep.execute(
+                base_logits=base_logits,
+                latent=self.get_prev_embeddings(prev_tokens),
+                bias_weight=weight,
+                step_dtype=self.step_logits_dtype(base_logits.dtype),
+                logits_out=logits_out,
+            )
+            return tokens, state
+        return super().draft_step(
+            prev_tokens,
+            base_logits,
+            hidden_states=hidden_states,
+            state=state,
+            temperatures=temperatures,
+            noise_key=noise_key,
+            noise_offset=noise_offset,
+            step=step,
+            logits_out=logits_out,
+            has_sampled_rows=has_sampled_rows,
+        )
 
     def step_bias(
         self,
@@ -269,6 +349,10 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
         bias, _ = self.markov_w2(latent_states)
         return bias
 
+    def fused_bias_weight(self) -> Optional[torch.Tensor]:
+        # A quantized weight needs its scale; the fused kernel reads it raw.
+        return None
+
 
 class GatedMarkovHead(VanillaMarkov):
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
@@ -285,6 +369,10 @@ class GatedMarkovHead(VanillaMarkov):
         prev_embeddings = self.get_prev_embeddings(token_ids)
         gate_inputs = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return torch.sigmoid(self.gate_proj(gate_inputs))
+
+    def fused_bias_weight(self) -> Optional[torch.Tensor]:
+        # The bias depends on the hidden state, not only on the previous token.
+        return None
 
     def step_bias(
         self,
@@ -342,6 +430,10 @@ class RNNHead(VanillaMarkov):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+
+    def fused_bias_weight(self) -> Optional[torch.Tensor]:
+        # The bias depends on the hidden state, not only on the previous token.
+        return None
 
     def step_bias(
         self,

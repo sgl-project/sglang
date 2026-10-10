@@ -512,11 +512,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
 
-    def step_logits_dtype(
-        self, base_dtype: torch.dtype, bias_dtype: torch.dtype
-    ) -> torch.dtype:
+    def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         # The bias is FP32 or upcast into an FP32 add, sharded or not.
-        del base_dtype, bias_dtype
+        del base_dtype
         return torch.float32
 
     def _vocab_shard_args(self) -> dict:
