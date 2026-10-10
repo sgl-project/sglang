@@ -1646,6 +1646,10 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return "rotary_emb.inv_freq" in name or "mtp" in name
+
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     packed_modules_mapping = {
@@ -1938,9 +1942,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "mtp" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if "visual" in name:
                 continue
@@ -2135,9 +2137,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "mtp" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if "visual" in name:
                 continue
@@ -2309,6 +2309,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    is_unused_checkpoint_weight = staticmethod(
+        Qwen3_5ForCausalLM.is_unused_checkpoint_weight
+    )
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2402,9 +2405,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         bare_backbone = False
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "mtp" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if name.startswith("language_model."):
                 # A bare Qwen3_5Model save, which has no LM head of its own.
@@ -2523,6 +2524,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
+    is_unused_checkpoint_weight = staticmethod(
+        Qwen3_5ForCausalLM.is_unused_checkpoint_weight
+    )
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2704,9 +2708,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "mtp" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")

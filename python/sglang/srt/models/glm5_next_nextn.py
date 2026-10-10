@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    # This loader also accepts multimodal checkpoint names before remapping.
+    is_unused_checkpoint_weight = None
+
     def prepare_cp_inputs(self, forward_batch, **kwargs):
         # The worker has rotated the target's multimodal embeddings per request.
         # Fill each appended token while indices still address full sequences,

@@ -182,6 +182,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    is_unused_nextn_checkpoint_weight,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _get_llama_4_scaling,
@@ -3353,6 +3354,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, is_nextn=False)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         self.do_load_weights(weights, is_nextn)

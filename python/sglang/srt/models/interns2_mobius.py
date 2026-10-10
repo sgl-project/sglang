@@ -791,6 +791,8 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
 
 
 class InternS2MobiusForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    # This model has its own strict loader, not Qwen3.5 checkpoint semantics.
+    is_unused_checkpoint_weight = None
     packed_modules_mapping = InternS2MobiusForCausalLM.packed_modules_mapping
     supported_lora_modules = InternS2MobiusForCausalLM.supported_lora_modules
 
