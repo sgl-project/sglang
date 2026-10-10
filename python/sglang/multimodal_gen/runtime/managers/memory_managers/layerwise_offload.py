@@ -29,6 +29,7 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
+from sglang.multimodal_gen.runtime.managers.memory_managers import shared_pinned_store
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
@@ -485,6 +486,25 @@ def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
     if stride is None:
         return torch.empty(*size, dtype=dtype, pin_memory=True)
     return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
+
+
+def _store_holds(buf, dtype, offsets, contiguous_weights) -> bool:
+    """Whether a shared store holds the weights this process loaded.
+
+    The key naming a store is structural -- the manager cannot see which
+    checkpoint the weights came from -- so the bytes are compared rather than
+    trusted. A store holding different weights is refused, and the caller falls
+    back to a private allocation.
+    """
+    store = torch.frombuffer(buf, dtype=dtype)
+    for name, _weight, local_weight in contiguous_weights:
+        off = offsets[name]
+        source = local_weight.flatten()
+        if source.device.type != "cpu":
+            source = source.to("cpu")
+        if not torch.equal(store[off : off + source.numel()], source):
+            return False
+    return True
 
 
 class _DirectReader:
@@ -1483,6 +1503,14 @@ class LayerwiseOffloadManager:
             placed_bytes / (1 << 30),
         )
 
+    def _shared_store_key(self, layer_idx: int, dtype, total_numel: int) -> str:
+        """Structural name of one layer store, shared across co-resident runs.
+
+        It names the store's shape, not the checkpoint that filled it: a store
+        holding other weights is refused by the byte comparison instead.
+        """
+        return f"{self._pin_component_name}:{layer_idx}:{dtype}:{total_numel}"
+
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
@@ -1580,13 +1608,29 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                cpu_buffer, populated = self._prepare_host_buffer(
-                    contiguous_weights,
-                    aligned_offsets,
-                    total_numel,
-                    dtype,
-                    pin_this_layer,
-                )
+                shared = None
+                if pin_this_layer and envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+                    shared = shared_pinned_store.begin(
+                        self._shared_store_key(layer_idx, dtype, total_numel),
+                        total_numel * dtype.itemsize,
+                        lambda buf: _store_holds(
+                            buf, dtype, aligned_offsets, contiguous_weights
+                        ),
+                        pool=self._pin_component_name,
+                    )
+                if shared is not None:
+                    cpu_buffer = torch.frombuffer(
+                        shared.buffer, dtype=dtype, count=total_numel
+                    )
+                    populated = not shared.created
+                else:
+                    cpu_buffer, populated = self._prepare_host_buffer(
+                        contiguous_weights,
+                        aligned_offsets,
+                        total_numel,
+                        dtype,
+                        pin_this_layer,
+                    )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
@@ -1612,7 +1656,19 @@ class LayerwiseOffloadManager:
 
                     current_offset += numel
 
+                if shared is not None and shared_pinned_store.commit(shared) is None:
+                    # Registration failed after the bytes were already placed in
+                    # the segment: rebuild them in a private allocation.
+                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
+                    for name, _weight, local_weight in contiguous_weights:
+                        off = aligned_offsets[name]
+                        count = local_weight.numel()
+                        cpu_buffer[off : off + count].copy_(local_weight.flatten())
+
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+        if envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+            shared_pinned_store.summary(self._pin_component_name)
 
     @staticmethod
     def _prepare_host_buffer(
