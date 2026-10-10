@@ -506,3 +506,39 @@ def test_set_lora_node_exposes_strength(monkeypatch):
     assert captured["strength"] == 0.5
 
 
+# --- Bug 6/7: SGLDVideoInput didn't implement VideoInput; dims could be wrong
+
+
+def test_video_input_fallback_fails_loudly_instead_of_returning_wrong_data():
+    video = UTILS.convert_video_to_comfy_video("/tmp/out.mp4", height=720, width=1280)
+    assert isinstance(video, UTILS.SGLDVideoInput)  # no comfy_api.input_impl stubbed
+    with pytest.raises(NotImplementedError):
+        video.get_components()
+
+
+def test_video_input_save_to_refuses_silent_format_drop():
+    video = UTILS.SGLDVideoInput("/tmp/out.mp4", height=720, width=1280)
+    with pytest.raises(NotImplementedError):
+        video.save_to("/tmp/converted.webm", format="webm")
+
+
+def test_generic_video_node_reports_server_resolved_size_not_requested_size():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    node = NODES.SGLDiffusionGenerateVideo()
+
+    with (
+        mock.patch.object(
+            client,
+            "generate_video",
+            return_value={"file_path": "/tmp/x.mp4", "size": "1280x704"},
+        ),
+    ):
+        video, video_path = node.generate_video(
+            sgld_client=client,
+            positive_prompt="a cat",
+            width=1280,
+            height=720,  # requested 720, server actually resolved to 704
+        )
+    assert video.get_dimensions() == (1280, 704)
+
+

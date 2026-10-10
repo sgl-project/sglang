@@ -652,6 +652,11 @@ class SGLDiffusionGenerateVideo:
         try:
             response = sgld_client.generate_video(**request_params)
             video_path = response.get("file_path", "")
+            # The server may have resolved a different size than requested
+            # (e.g. to match an image-to-video input's aspect ratio).
+            resolved_size = response.get("size", "")
+            if resolved_size:
+                width, height = (int(v) for v in resolved_size.split("x"))
             video = convert_video_to_comfy_video(video_path, height, width)
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
