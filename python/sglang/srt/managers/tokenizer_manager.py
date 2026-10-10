@@ -421,6 +421,24 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 
+def resolve_readout_anchor(
+    input_ids: List[int], anchor: Tuple[int, int], chunked_prefill_size: Optional[int]
+) -> List[int]:
+    token_id, offset = anchor
+    positions = [i + offset for i, token in enumerate(input_ids) if token == token_id]
+    if not positions or not all(0 <= p < len(input_ids) for p in positions):
+        raise ValueError(
+            f"the prompt has no readout position at offset {offset} from token {token_id}"
+        )
+    # Positions index one extend segment, so the whole prompt must fit one chunk.
+    if chunked_prefill_size is not None and 0 < chunked_prefill_size < len(input_ids):
+        raise ValueError(
+            f"the prompt has {len(input_ids)} tokens, above the chunked prefill "
+            f"size of {chunked_prefill_size} tokens"
+        )
+    return positions
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -1237,6 +1255,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        if isinstance(obj, GenerateReqInput) and obj.readout_anchor is not None:
+            obj.token_indices_to_pool = resolve_readout_anchor(
+                input_ids=input_ids,
+                anchor=obj.readout_anchor,
+                chunked_prefill_size=get_schedule().chunked_prefill_size,
+            )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
