@@ -51,17 +51,47 @@ class TestResolveMinFreeSlots(unittest.TestCase):
 class TestMinFreeSlotsDelayer(unittest.TestCase):
     def test_delays_below_threshold(self):
         delayer = MinFreeSlotsDelayer(min_free_slots=4)
-        self.assertTrue(delayer.should_delay(running_bs=100, num_allocatable_reqs=2))
+        self.assertTrue(
+            delayer.should_delay(
+                running_bs=100, num_allocatable_reqs=2, num_waiting_reqs=8
+            )
+        )
 
     def test_no_delay_at_or_above_threshold(self):
         delayer = MinFreeSlotsDelayer(min_free_slots=4)
-        self.assertFalse(delayer.should_delay(running_bs=100, num_allocatable_reqs=4))
-        self.assertFalse(delayer.should_delay(running_bs=100, num_allocatable_reqs=8))
+        self.assertFalse(
+            delayer.should_delay(
+                running_bs=100, num_allocatable_reqs=4, num_waiting_reqs=8
+            )
+        )
+        self.assertFalse(
+            delayer.should_delay(
+                running_bs=100, num_allocatable_reqs=8, num_waiting_reqs=8
+            )
+        )
 
     def test_no_delay_when_idle(self):
         # Nothing running: no decode batch to protect, prefill at once.
         delayer = MinFreeSlotsDelayer(min_free_slots=4)
-        self.assertFalse(delayer.should_delay(running_bs=0, num_allocatable_reqs=0))
+        self.assertFalse(
+            delayer.should_delay(
+                running_bs=0, num_allocatable_reqs=0, num_waiting_reqs=8
+            )
+        )
+
+    def test_no_delay_when_every_waiting_request_fits(self):
+        """Waiting requests that all fit must not wait for running ones to finish."""
+        delayer = MinFreeSlotsDelayer(min_free_slots=4)
+        self.assertFalse(
+            delayer.should_delay(
+                running_bs=254, num_allocatable_reqs=2, num_waiting_reqs=2
+            )
+        )
+        self.assertTrue(
+            delayer.should_delay(
+                running_bs=254, num_allocatable_reqs=2, num_waiting_reqs=3
+            )
+        )
 
 
 if __name__ == "__main__":
