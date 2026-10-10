@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
     SNAPSHOT_OFFLOAD,
+    component_residency_selector_matches,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -116,6 +117,50 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     return mode.lower()
+
+
+def _normalize_warmup_preload_components(value: object) -> str:
+    """Return ``auto``, ``none``, or a comma-joined selector list."""
+    if value is None:
+        return "auto"
+    if not isinstance(value, str):
+        raise ValueError(f"--warmup-preload-components must be a string, got {value!r}")
+    tokens = [
+        token
+        for raw in value.split(",")
+        if (token := raw.strip().replace("-", "_").lower())
+    ]
+    if not tokens:
+        raise ValueError(
+            "--warmup-preload-components must be 'auto', 'none', or a "
+            "comma-separated list of component names"
+        )
+    if "auto" in tokens or "none" in tokens:
+        if len(tokens) != 1:
+            raise ValueError(
+                "--warmup-preload-components cannot mix 'auto' or 'none' "
+                "with component names"
+            )
+        return tokens[0]
+    return ",".join(dict.fromkeys(tokens))
+
+
+def _normalize_warmup_preload_margin_gib(value: object) -> float:
+    if value is None:
+        return 1.0
+    try:
+        margin = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "--warmup-preload-margin-gib must be a non-negative finite number, "
+            f"got {value!r}"
+        ) from exc
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError(
+            "--warmup-preload-margin-gib must be a non-negative finite number, "
+            f"got {value!r}"
+        )
+    return margin
 
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
@@ -537,6 +582,13 @@ class ServerArgs(DisaggServerArgsMixin):
     # warmup and automatic residency planning. Execution remains bounded by
     # warmup_steps and the server warmup frame/area caps.
     warmup_sampling_params: dict[str, Any] | str | None = None
+    # Which preferred components to copy onto the device at the end of warmup.
+    # "auto" keeps the pipeline hints, "none" skips those preloads, and a
+    # comma-separated list preloads only the named components.
+    warmup_preload_components: str = "auto"
+    # Device headroom left free when deciding whether a warmup preload fits.
+    # 1.0 matches the historical fixed margin.
+    warmup_preload_margin_gib: float = 1.0
 
     disable_autocast: bool | None = None
 
@@ -1509,6 +1561,42 @@ class ServerArgs(DisaggServerArgsMixin):
 
         if self.warmup_mode is None:
             self.warmup_mode = "off"
+
+        self.warmup_preload_components = _normalize_warmup_preload_components(
+            getattr(self, "warmup_preload_components", "auto")
+        )
+        self.warmup_preload_margin_gib = _normalize_warmup_preload_margin_gib(
+            getattr(self, "warmup_preload_margin_gib", 1.0)
+        )
+
+    def allows_warmup_preload(self, component_name: str) -> bool:
+        """Whether warmup may preload this preferred component.
+
+        A missing spec means ``auto``. ``ServerArgs.__new__`` test fakes never
+        run ``__init__``, so the field may be absent.
+        """
+        spec = getattr(self, "warmup_preload_components", "auto")
+        if not isinstance(spec, str) or spec in ("", "auto"):
+            return True
+        if spec == "none":
+            return False
+        return any(
+            component_residency_selector_matches(component_name, selector)
+            for selector in spec.split(",")
+            if selector
+        )
+
+    @property
+    def warmup_preload_margin_bytes(self) -> int:
+        """Byte headroom reserved when a warmup preload is sized.
+
+        A missing margin means the historical 1 GiB. ``round(1.0 * 1024**3)``
+        equals that constant.
+        """
+        margin_gib = getattr(self, "warmup_preload_margin_gib", 1.0)
+        if margin_gib is None:
+            margin_gib = 1.0
+        return round(float(margin_gib) * 1024**3)
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -2641,6 +2729,37 @@ class ServerArgs(DisaggServerArgsMixin):
                 '\'{"width":832,"height":480,"num_frames":9,'
                 '"num_inference_steps":4}\'. Warmup still applies its '
                 "bounded execution caps."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-preload-components",
+            type=str,
+            default=ServerArgs.warmup_preload_components,
+            help=(
+                "Which preferred components to preload at the end of a warmup "
+                "request. 'auto' keeps today's pipeline hints. 'none' skips "
+                "those preloads and does not clear the GPU: components kept by "
+                "keep_ready_after_warmup stay up. Otherwise a comma-separated "
+                "list of exact module keys or the groups dit, text_encoder, "
+                "image_encoder, vae, and all. A group includes numbered suffixes "
+                "(text_encoder matches text_encoder_2; dit matches transformer, "
+                "transformer_2, video_dit, audio_dit, and the rest of the DiT "
+                "set). An exact key such as transformer matches only that "
+                "module. all matches every component, same as auto for this "
+                "filter. Names the pipeline did not mark preferred are not "
+                "preloaded."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-preload-margin-gib",
+            type=float,
+            default=ServerArgs.warmup_preload_margin_gib,
+            help=(
+                "GiB of free device memory to leave unused when deciding "
+                "whether a warmup preload fits. The default 1.0 is the "
+                "historical fixed headroom. 0 leaves no extra headroom. "
+                "Layerwise offload does not consult this headroom. "
+                "This does not estimate activations or attention workspace."
             ),
         )
         # component residency and legacy offload controls
