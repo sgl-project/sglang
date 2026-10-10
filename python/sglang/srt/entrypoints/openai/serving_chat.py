@@ -1045,6 +1045,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if request.return_indexer_topk and not request.return_meta_info:
+            return "return_indexer_topk requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1306,6 +1309,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_indexer_topk=request.return_indexer_topk,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,
