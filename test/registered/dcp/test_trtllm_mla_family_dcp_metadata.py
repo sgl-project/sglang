@@ -233,6 +233,26 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
                 return_lse=return_lse,
             )
 
+    def test_sm12x_decode_omits_trtllm_gen_counter(self):
+        for sm12x in (False, True):
+            with (
+                self.subTest(sm12x=sm12x),
+                patch.object(backend_module, "is_sm120_supported", return_value=sm12x),
+            ):
+                backend = self._make_backend()
+                counter = backend._multi_ctas_kv_counter_buffer = object()
+                calls = []
+                self._call(
+                    backend,
+                    q_len=1,
+                    dcp_enabled=False,
+                    kernel=lambda **kw: calls.append(kw),
+                )
+                if sm12x:
+                    self.assertNotIn("multi_ctas_kv_counter_buffer", calls[0])
+                else:
+                    self.assertIs(calls[0]["multi_ctas_kv_counter_buffer"], counter)
+
     def test_multi_token_query_under_dcp_raises(self):
         with self.assertRaises(NotImplementedError):
             self._call(self._make_backend(), q_len=NUM_DRAFT_TOKENS, dcp_enabled=True)
