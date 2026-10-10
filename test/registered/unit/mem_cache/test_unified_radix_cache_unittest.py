@@ -21,6 +21,7 @@ from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
@@ -49,7 +50,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    match_kv_cache,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -4772,6 +4777,59 @@ class UnifiedRadixCacheSuite:
         cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
         cons.sanity_check()
+
+    def test_decode_promises_only_the_prefetched_l3_span(self):
+        self._skip_unsupported_hicache_test()
+        if self.cfg.components != (ComponentType.FULL,) or self.cfg.page_size != 4:
+            self.skipTest("one FULL page_size=4 fixture covers the decode L3 promise")
+
+        threshold = 16
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        short_hit = self._make_seq(1, 2)  # below prefetch_threshold
+        long_hit = self._make_seq(1001, 6)
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        for seq in (short_hit, long_hit):
+            self._insert(prod, prod_alloc, prod_rtp, seq)
+            leaf = prod.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+            self._backup_node(prod, leaf)
+            self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        decode = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_decode_hicache=True), tree_cache=cons
+        )
+        for stored, promised in ((short_hit, 0), (long_hit, len(long_hit))):
+            req = self._make_req(cons_rtp)
+            req.origin_input_ids = array("q", stored + list(range(5000, 5016)))
+            result = match_kv_cache(req, cons, req.origin_input_ids)
+            match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                decode, req, result
+            )
+            self.assertEqual(match.l3_storage_hit_length, len(stored))
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(decode, req, match)
+            self.assertEqual(match.decode_prefix_len, promised)
+            if promised:
+                self._run_prefetch_to_completion(cons, req.cache_request_handle)
+                hit = cons.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", stored)))
+                )
+                self.assertEqual(hit.host_hit_length, promised)
 
     def test_buffer_only_cache_salt_uses_the_request_namespace(self):
         self._skip_unsupported_hicache_test()

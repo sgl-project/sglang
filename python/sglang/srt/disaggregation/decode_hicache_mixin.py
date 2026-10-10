@@ -112,7 +112,8 @@ class DecodeHiCachePreallocMixin:
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds.
 
-        On failure, degrades to L2-only restore by clearing l3 fields.
+        Clears the L3 span unless the prefetch was taken, so prefill is never
+        promised tokens nothing will load.
         """
         if (
             prefix_match is None
@@ -122,27 +123,31 @@ class DecodeHiCachePreallocMixin:
             return
         try:
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
                 self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            self.tree_cache.prefetch_from_storage(
+            # Same span as the prefill scheduler: the queried hit end, plus the
+            # bigram boundary token, with no second storage query.
+            ticketed = self.tree_cache.prefetch_from_storage(
                 req.cache_request_handle,
                 prefix_match.last_host_node,
-                suffix,
+                req.origin_input_ids[matched_len:],
                 last_hash,
                 prefix_keys,
+                matched_prefix_tokens=req.origin_input_ids[:matched_len],
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            if not (prefix_match.prefetch_registered or ticketed):
+                # Declined (below prefetch_threshold or rate limited): nothing loads.
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
