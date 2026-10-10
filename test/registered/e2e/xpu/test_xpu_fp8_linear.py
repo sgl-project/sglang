@@ -8,12 +8,16 @@ Usage:
 
 import unittest
 from typing import List
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
     per_token_group_quant_fp8,
+    scaled_fp8_quant,
     torch_w8a8_block_fp8_linear,
 )
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -330,6 +334,72 @@ class TestXPUFP8Linear(CustomTestCase):
             q_input, input_scale, weight, block_size, weight_scale, bias
         ).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
+
+    def test_channelwise_xpu_rowwise_scaled_mm_gate(self):
+        """Use fused rowwise scaled_mm for M>=8 without changing accuracy."""
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=False, weight_block_size=None)
+        )
+        K, N = 256, 384
+        weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / 3
+        weight_scale = (
+            weight_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+            / torch.finfo(torch.float8_e4m3fn).max
+        )
+        block_method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        self.assertFalse(block_method.use_per_token_if_dynamic)
+
+        layer = torch.nn.Module()
+        layer.logical_widths = [N]
+        layer.weight = torch.nn.Parameter(weight_bf16, requires_grad=False)
+        layer.orig_dtype = torch.bfloat16
+        layer.input_scale = None
+        method.cutlass_fp8_supported = True
+        self.assertFalse(method.use_per_token_if_dynamic)
+        method.process_weights_after_loading(layer)
+        self.assertTrue(method.use_per_token_if_dynamic)
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+        self.assertEqual(tuple(weight_scale.shape), (N, 1))
+        self.assertTrue(weight_scale.t().is_contiguous())
+        original_scaled_mm = torch._scaled_mm
+
+        for m in (1, 8):
+            with self.subTest(m=m):
+                x = torch.randn(m, K, dtype=torch.bfloat16, device=self.device) / 3
+                q_input, input_scale = scaled_fp8_quant(
+                    x, use_per_token_if_dynamic=True
+                )
+                reference = (q_input.float() * input_scale.float()) @ (
+                    weight.float() * weight_scale.t()
+                )
+                calls = []
+
+                def traced_scaled_mm(*args, **kwargs):
+                    calls.append(
+                        (
+                            tuple(kwargs["scale_a"].shape),
+                            tuple(kwargs["scale_b"].shape),
+                        )
+                    )
+                    return original_scaled_mm(*args, **kwargs)
+
+                with patch.object(torch, "_scaled_mm", side_effect=traced_scaled_mm):
+                    output = apply_fp8_linear(
+                        input=x,
+                        weight=weight,
+                        weight_scale=weight_scale,
+                        use_per_token_if_dynamic=method.use_per_token_if_dynamic,
+                        compressed_tensor_quant=True,
+                    )
+
+                torch.testing.assert_close(
+                    output, reference.to(torch.bfloat16), rtol=0.01, atol=0.1
+                )
+                expected_scale_shapes = ((m, 1), (1, N)) if m >= 8 else ((1,), (1,))
+                self.assertEqual(calls, [expected_scale_shapes])
 
 
 if __name__ == "__main__":
