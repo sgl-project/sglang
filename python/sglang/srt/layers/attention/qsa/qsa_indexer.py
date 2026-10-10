@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+import os
 
 import torch
-
+from sglang.srt.layers.attention.qsa.cache_sharding import (
+    QSACacheShardingRuntime,
+    assert_qsa_cache_sharding_runtime_match,
+    get_qsa_cache_sharding_runtime,
+)
+from sglang.srt.layers.attention.qsa.distributed_topk import (
+    gather_and_merge_qsa_topk_candidates,
+)
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -29,15 +36,30 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.mem_cache.qsa_kv_pool import assert_qsa_indices_in_bounds
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
-def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
+def _qsa_prefill_row_chunk_size(
+    rows: int,
+    keys: int,
+    heads: int,
+    *,
+    collective_keys: int | None = None,
+    collective_world_size: int = 1,
+) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
+    if collective_keys is not None:
+        if collective_world_size <= 0:
+            raise ValueError("collective_world_size must be positive")
+        # Every rank must issue the same sequence of candidate collectives.
+        # Rank-local sharded cache lengths can differ, so derive the workspace
+        # schedule from the shared global key count instead.
+        keys = -(collective_keys // -collective_world_size)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
@@ -55,9 +77,31 @@ class QSAIndexer(MultiPlatformOp):
         quant_config=None,
         prefix: str = "",
         rotary_emb=None,
+        distributed_topk_group=None,
+        cache_sharding_runtime: QSACacheShardingRuntime | None = None,
     ) -> None:
         self._validate_config(config)
         super().__init__()
+        resolved_runtime = get_qsa_cache_sharding_runtime()
+        if cache_sharding_runtime is None:
+            cache_sharding_runtime = resolved_runtime
+        assert_qsa_cache_sharding_runtime_match(
+            resolved_runtime,
+            cache_sharding_runtime,
+            component="QSA indexer",
+        )
+        expected_group = (
+            cache_sharding_runtime.group if cache_sharding_runtime.enabled else None
+        )
+        if (
+            distributed_topk_group is not None
+            and distributed_topk_group is not expected_group
+        ):
+            raise ValueError(
+                "indexer QSA cache-sharding collective group does not match "
+                "the runtime contract"
+            )
+        self.cache_sharding_runtime = cache_sharding_runtime
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
         self.index_kv_heads = int(config.indexer_kv_heads)
@@ -87,6 +131,7 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self.distributed_topk_group = expected_group
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -164,7 +209,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
@@ -186,13 +231,20 @@ class QSAIndexer(MultiPlatformOp):
                     int(positions.max().item())
                 )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
+            fused_state_slots = cache_loc[: qk.shape[0]].long()
+            assert_qsa_indices_in_bounds(
+                fused_state_slots,
+                key_state_buffer.shape[0],
+                valid_mask=torch.ones_like(fused_state_slots, dtype=torch.bool),
+                label="QSA pending-state write locations",
+            )
             q = qsa_index_q_norm_rope_store(
                 qk,
                 positions.long(),
                 self.rotary_emb.cos_sin_cache,
                 self._rope_axis_map(qk.device),
                 self.q_layernorm.weight.data,
-                cache_loc[: qk.shape[0]].long(),
+                fused_state_slots,
                 key_state_buffer.view(key_state_buffer.shape[0], -1),
                 pool.qsa_rope_position_buffer,
                 self.index_n_heads,
@@ -231,7 +283,8 @@ class QSAIndexer(MultiPlatformOp):
         self,
         pool,
         group_locs: torch.Tensor,
-        write_locs: torch.Tensor,
+        owner_mask: torch.Tensor,
+        local_write_locs: torch.Tensor | None = None,
         source_keys: torch.Tensor | None = None,
         source_rope: torch.Tensor | None = None,
     ) -> None:
@@ -245,7 +298,23 @@ class QSAIndexer(MultiPlatformOp):
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
         if source_rope is None:
             source_rope = pool.qsa_rope_position_buffer
+        if local_write_locs is None:
+            local_write_locs = owner_mask
+            owner_mask = torch.ones_like(local_write_locs, dtype=torch.bool)
         compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        owner_rows = owner_mask.to(torch.bool)
+        assert_qsa_indices_in_bounds(
+            group_locs,
+            source_keys.shape[0],
+            valid_mask=owner_rows.unsqueeze(1).expand_as(group_locs),
+            label="QSA compressed source read locations",
+        )
+        assert_qsa_indices_in_bounds(
+            local_write_locs,
+            compressed_buffer.shape[0],
+            valid_mask=owner_rows,
+            label="QSA compressed destination write locations",
+        )
         qsa_index_k_compress_store(
             source_keys.reshape(source_keys.shape[0], -1)
             .contiguous()
@@ -255,7 +324,8 @@ class QSAIndexer(MultiPlatformOp):
             self.rotary_emb.cos_sin_cache,
             self._rope_axis_map(source_keys.device),
             self.k_layernorm.weight.data,
-            write_locs.to(torch.int32),
+            owner_mask.to(torch.int32),
+            local_write_locs.to(torch.int32),
             compressed_buffer.view(compressed_buffer.shape[0], -1),
             self.compress_ratio,
             self.rotary_emb.rotary_dim,
@@ -322,7 +392,14 @@ class QSAIndexer(MultiPlatformOp):
         if metadata.write_locs.numel() == 0:
             return
         group_end_positions = metadata.compress_group_positions.long()
-        compressed_locs = metadata.write_locs
+        owner_mask = metadata.write_owner_mask
+        compressed_locs = metadata.local_write_locs
+        if owner_mask is None or compressed_locs is None:
+            raise RuntimeError(
+                "QSA eager compression metadata requires owner mask and local "
+                "write locations"
+            )
+        owner_mask = owner_mask.bool()
         if is_extend:
             # Extend chunks are group-aligned; each planned group lies in this forward,
             # so read its members from the packed chunk tensors.
@@ -353,18 +430,26 @@ class QSAIndexer(MultiPlatformOp):
             self._fused_compress_store(
                 pool,
                 group_locs,
+                owner_mask,
                 compressed_locs,
                 source_keys=source_keys,
                 source_rope=source_rope,
             )
             return
-        key_groups = source_keys[group_locs]
+        owned_rows = torch.nonzero(owner_mask, as_tuple=False).flatten()
+        if owned_rows.numel() == 0:
+            return
+        owned_group_locs = group_locs.index_select(0, owned_rows)
+        key_groups = source_keys[owned_group_locs]
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
-            source_rope[group_locs[:, 0]]
+            source_rope[owned_group_locs[:, 0]]
         )
         normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
-        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+        buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        buffer[compressed_locs.index_select(0, owned_rows).long()] = normalized.to(
+            buffer.dtype
+        )
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
         """Fixed-shape graph-replay compression; non-boundary rows write slot 0."""
@@ -377,6 +462,11 @@ class QSAIndexer(MultiPlatformOp):
             self._fused_compress_store(
                 pool,
                 group_locs,
+                (
+                    metadata.write_owner_mask
+                    if metadata.write_owner_mask is not None
+                    else metadata.graph_write_locs != 0
+                ),
                 metadata.graph_write_locs,
             )
             return
@@ -432,6 +522,104 @@ class QSAIndexer(MultiPlatformOp):
         )
         return torch.cat([rotated, tensor[..., rotary_dim:]], dim=-1)
 
+    def _maybe_merge_distributed_topk(
+        self,
+        logits: torch.Tensor | None,
+        local_indices: torch.Tensor,
+        row_starts: torch.Tensor,
+        logical_block_positions: torch.Tensor | None = None,
+        static_buffers=None,
+    ) -> torch.Tensor:
+        """Convert local candidates to exact global top-k when explicitly enabled."""
+
+        group = getattr(self, "distributed_topk_group", None)
+        if group is None:
+            return local_indices
+        if (
+            static_buffers is not None
+            and getattr(static_buffers, "candidate_symm_state", None) is not None
+            and logits is not None
+            and logits.shape[1] > 0
+            and os.environ.get("SGLANG_QSA_FUSED_CANDIDATE_PUBLISH", "1") != "0"
+        ):
+            from sglang.srt.layers.attention.qsa import distributed_topk
+
+            _, merged_indices = (
+                distributed_topk.fused_publish_and_merge_qsa_topk_candidates(
+                    logits,
+                    local_indices,
+                    row_starts,
+                    logical_block_positions,
+                    group=group,
+                    topk=self.block_topk,
+                    static_buffers=static_buffers,
+                    # Interleaved compressed-page ownership makes ids disjoint.
+                    deduplicate=False,
+                )
+            )
+            return merged_indices
+        valid = local_indices >= 0
+        mapped_logical_positions = None
+        if logical_block_positions is not None:
+            if logical_block_positions.shape[1] == 0:
+                valid = torch.zeros_like(valid)
+            else:
+                within_local_row = local_indices < logical_block_positions.shape[1]
+                safe_local_indices = torch.where(
+                    valid & within_local_row,
+                    local_indices,
+                    torch.zeros_like(local_indices),
+                ).long()
+                mapped_logical_positions = logical_block_positions.gather(
+                    1, safe_local_indices
+                )
+                valid &= within_local_row & (mapped_logical_positions >= 0)
+        if logits is None or logits.shape[1] == 0:
+            local_scores = torch.full(
+                local_indices.shape,
+                float("-inf"),
+                dtype=torch.float32,
+                device=local_indices.device,
+            )
+        else:
+            absolute_indices = (
+                local_indices.clamp_min(0).long()
+                + row_starts.long().unsqueeze(1)
+            )
+            within_logits = absolute_indices < logits.shape[1]
+            valid &= within_logits
+            safe_absolute_indices = torch.where(
+                valid, absolute_indices, torch.zeros_like(absolute_indices)
+            )
+            local_scores = logits.gather(1, safe_absolute_indices).masked_fill(
+                ~valid, float("-inf")
+            )
+        if logical_block_positions is None:
+            global_indices = local_indices.to(torch.int64) * int(
+                group.world_size
+            ) + int(group.rank_in_group)
+        elif logical_block_positions.shape[1] == 0:
+            global_indices = torch.full_like(local_indices, -1, dtype=torch.int64)
+        else:
+            global_indices = mapped_logical_positions
+        global_indices = torch.where(
+            valid, global_indices, torch.full_like(global_indices, -1)
+        ).to(torch.int32)
+        graph_kwargs = (
+            {"static_buffers": static_buffers} if static_buffers is not None else {}
+        )
+        _, merged_indices = gather_and_merge_qsa_topk_candidates(
+            local_scores,
+            global_indices,
+            group=group,
+            topk=self.block_topk,
+            # Interleaved compressed-page ownership partitions logical block
+            # positions across QSA cache shards, so gathered ids are disjoint.
+            deduplicate=False,
+            **graph_kwargs,
+        )
+        return merged_indices
+
     def select_prefill_tokens(
         self,
         q: torch.Tensor,
@@ -440,6 +628,11 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        logical_block_positions: torch.Tensor | None = None,
+        logical_block_sequence_ids: torch.Tensor | None = None,
+        static_buffers=None,
+        collective_keys: int | None = None,
+        collective_world_size: int = 1,
     ) -> torch.Tensor:
         rows = q.shape[0]
         output = torch.empty(
@@ -451,7 +644,11 @@ class QSAIndexer(MultiPlatformOp):
             return output
 
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
+            rows,
+            compressed_keys.shape[0],
+            q.shape[1],
+            collective_keys=collective_keys,
+            collective_world_size=collective_world_size,
         )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
@@ -477,6 +674,23 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+            chunk_logical_block_positions = None
+            if logical_block_positions is not None:
+                chunk_logical_block_positions = (
+                    logical_block_positions[chunk_slice]
+                    if logical_block_sequence_ids is None
+                    else logical_block_positions.index_select(
+                        0, logical_block_sequence_ids[chunk_slice].long()
+                    )
+                )
+            block_indices = QSAIndexer._maybe_merge_distributed_topk(
+                self,
+                logits,
+                block_indices,
+                row_starts[chunk_slice],
+                chunk_logical_block_positions,
+                static_buffers,
+            )
             selected = expand_qsa_block_indices(
                 block_indices,
                 query_positions[chunk_slice],
@@ -498,14 +712,18 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        logical_block_positions: torch.Tensor | None = None,
+        static_buffers=None,
     ) -> torch.Tensor:
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-        )
+        row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
+        with torch.profiler.record_function("qsa.local_scan"):
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+            )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
@@ -518,19 +736,27 @@ class QSAIndexer(MultiPlatformOp):
                 row_starts=None,
             )
         else:
-            row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        block_indices = QSAIndexer._maybe_merge_distributed_topk(
+            self,
+            logits,
+            block_indices,
+            row_starts,
+            logical_block_positions,
+            static_buffers,
+        )
         if defer_expansion:
             return block_indices
-        return expand_qsa_block_indices(
+        selected = expand_qsa_block_indices(
             block_indices,
             query_positions,
             sequence_lengths,
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
         )
+        return selected
 
     def forward_cuda_cp(
         self,
@@ -708,6 +934,17 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
         )
+        static_buffers = (
+            getattr(
+                indexer_metadata.token_to_kv_pool,
+                "qsa_cache_sharding_buffers",
+                None,
+            )
+            if indexer_metadata.is_cuda_graph
+            else None
+        )
+        if static_buffers is not None:
+            static_buffers = static_buffers.for_layer(self.layer_id)
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
@@ -721,12 +958,33 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                logical_block_positions=getattr(
+                    indexer_metadata, "decode_block_positions", None
+                ),
+                static_buffers=static_buffers,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
+        prefill_kwargs = {}
+        block_positions = getattr(indexer_metadata, "prefill_block_positions", None)
+        if block_positions is not None:
+            prefill_kwargs["logical_block_positions"] = block_positions
+            prefill_kwargs["logical_block_sequence_ids"] = query_sequence_ids
+        group = getattr(self, "distributed_topk_group", None)
+        if group is not None:
+            prefill_kwargs["collective_keys"] = int(
+                torch.div(
+                    indexer_metadata.sequence_lengths,
+                    self.compress_ratio,
+                    rounding_mode="floor",
+                )
+                .sum()
+                .item()
+            )
+            prefill_kwargs["collective_world_size"] = int(group.world_size)
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
@@ -737,6 +995,8 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            **prefill_kwargs,
+            static_buffers=static_buffers,
         )
 
     def forward_cuda(

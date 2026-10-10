@@ -56,6 +56,15 @@ class Parallel(msgspec.Struct):
             aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
+    qsa_cache_sharding_size: A[
+        int,
+        Arg(
+            help="The number of tensor-parallel ranks over which QSA cache, "
+            "distributed Top-K, and owner attention are sharded. GDN, PLE, and "
+            "the QSA pending ring remain replicated.",
+            aliases=["--state-cp-size"],
+        ),
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -354,6 +363,9 @@ class Parallel(msgspec.Struct):
             "zero where decode context parallelism is off."
         )
     )
+    qsa_cache_sharding_rank = Derived(
+        doc="This process's rank in its QSA cache-sharding group."
+    )
     attn_dp_rank = Derived(
         doc=(
             "This process's index in the attention-DP group, computed from "
@@ -394,3 +406,4 @@ class Parallel(msgspec.Struct):
     attn_cp_group = Derived(doc="The attention context-parallel group.")
     shared_experts_tp_group = Derived(doc=("The shared-expert tensor-parallel group."))
     dcp_group = Derived(doc="The decode context-parallel group.")
+    qsa_cache_sharding_group = Derived(doc="The QSA cache-sharding group.")

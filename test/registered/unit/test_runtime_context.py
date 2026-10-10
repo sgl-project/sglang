@@ -97,6 +97,7 @@ _DP = "sglang.srt.layers.dp_attention"
 GROUP_STAMPS = {
     "tp_group": "_TP",
     "dcp_group": "_DCP",
+    "qsa_cache_sharding_group": "_QSA_CACHE_SHARDING",
     "pp_group": "_PP",
     "moe_ep_group": "_MOE_EP",
     "moe_dp_group": "_MOE_DP",

@@ -49,6 +49,9 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    PageInterleavePoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -110,6 +113,16 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _qsa_cache_sharding_graph_reservation_gb(
+    *, sharding_size: int, is_qsa: bool, cuda_graph_enabled: bool
+) -> float:
+    if sharding_size <= 1 or not is_qsa or not cuda_graph_enabled:
+        return 0.0
+    # NCCL graph-private pools are created per QSA cache shard during decode
+    # capture and are not visible when the KV pool is initially sized.
+    return sharding_size * 0.5
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
@@ -340,8 +353,15 @@ class KVCacheConfigurator:
             )
         return full_capacity or swa_capacity
 
-    def logical_token_capacity(self, *, max_total_num_tokens: int) -> int:
+    def logical_token_capacity(
+        self,
+        *,
+        max_total_num_tokens: int,
+        allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+    ) -> int:
         """Request tokens a pool of `max_total_num_tokens` per-rank rows holds."""
+        if isinstance(allocator, PageInterleavePoolAllocator):
+            return allocator.size
         # SWA allocators never widen under DCP.
         if self.is_hybrid_swa:
             return max_total_num_tokens
@@ -419,7 +439,10 @@ class KVCacheConfigurator:
         )
 
         return KVCacheConfigResult(
-            max_total_num_tokens=sizes.max_total_num_tokens,
+            max_total_num_tokens=self.logical_token_capacity(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+                allocator=alloc,
+            ),
             max_running_requests=sizes.max_running_requests,
             full_max_total_num_tokens=sizes.full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
@@ -2269,6 +2292,9 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        from sglang.srt.layers.attention.qsa.cache_sharding import (
+            get_qsa_cache_sharding_runtime,
+        )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -2296,6 +2322,7 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
+                cache_sharding_runtime=get_qsa_cache_sharding_runtime(),
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
@@ -2395,7 +2422,36 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            if _is_npu and (
+            from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+            qsa_sharding_runtime = getattr(
+                token_to_kv_pool, "cache_sharding_runtime", None
+            )
+            if (
+                isinstance(token_to_kv_pool, QSATokenToKVPool)
+                and qsa_sharding_runtime is not None
+                and qsa_sharding_runtime.enabled
+            ):
+                token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+                    size=sizes.max_total_num_tokens,
+                    physical_page_size=get_schedule().page_size,
+                    shard_size=qsa_sharding_runtime.size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif current_platform.is_out_of_tree():
+                AllocatorCls = current_platform.get_paged_allocator_cls()
+                token_to_kv_pool_allocator = AllocatorCls(
+                    sizes.max_total_num_tokens,
+                    page_size=get_schedule().page_size,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    kvcache=token_to_kv_pool,
+                    need_sort=need_sort,
+                )
+            elif _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
@@ -2580,6 +2636,26 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        qsa_sharding_graph_reservation_gb = (
+            _qsa_cache_sharding_graph_reservation_gb(
+                sharding_size=int(get_parallel().qsa_cache_sharding_size),
+                is_qsa=parse_qsa_profile(self.model_config.hf_config) is not None,
+                cuda_graph_enabled=(
+                    get_exec().graph.cuda_graph_config.decode.backend
+                    != Backend.DISABLED
+                ),
+            )
+        )
+        if qsa_sharding_graph_reservation_gb:
+            slack_gb += qsa_sharding_graph_reservation_gb
+            logger.info(
+                "Reserving %.2f GB for QSA cache-sharding CUDA-graph "
+                "collective private pools.",
+                qsa_sharding_graph_reservation_gb,
+            )
+
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.

@@ -42,8 +42,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
-
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import (
@@ -79,6 +77,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
+from torch.distributed import Backend, ProcessGroup
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -2193,6 +2192,7 @@ _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
+_QSA_CACHE_SHARDING: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -2234,6 +2234,10 @@ def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
 
 def get_dcp_group() -> GroupCoordinator:
     return get_parallel().dcp_group
+
+
+def get_qsa_cache_sharding_group() -> GroupCoordinator:
+    return get_parallel().qsa_cache_sharding_group
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -2306,7 +2310,14 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP):
+            for group in (
+                _DCP,
+                _QSA_CACHE_SHARDING,
+                _ATTN_TP,
+                _SHARED_EXPERTS_TP,
+                _MOE_EP,
+                _MOE_TP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2550,6 +2561,16 @@ def init_distributed_environment(
     get_parallel().override_permanently(world_group=_WORLD)
 
 
+def _build_tp_subgroups(
+    tp_group_ranks: list[list[int]], subgroup_size: int
+) -> list[list[int]]:
+    return [
+        tp_group[start : start + subgroup_size]
+        for tp_group in tp_group_ranks
+        for start in range(0, len(tp_group), subgroup_size)
+    ]
+
+
 def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -2621,6 +2642,7 @@ def initialize_model_parallel(
     attention_context_model_parallel_size = parallel.attn_cp_size
     moe_data_model_parallel_size = parallel.moe_dp_size
     decode_context_parallel_size = parallel.attn_dcp_size
+    qsa_cache_sharding_size = parallel.qsa_cache_sharding_size
     shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
 
     # Joiners construct their local TP/PP layout in global rank space.
@@ -2651,6 +2673,15 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
             f"decode_context_parallel_size ({decode_context_parallel_size})"
+        )
+    if qsa_cache_sharding_size < 1:
+        raise RuntimeError(
+            f"qsa_cache_sharding_size ({qsa_cache_sharding_size}) must be >= 1"
+        )
+    if tensor_model_parallel_size % qsa_cache_sharding_size != 0:
+        raise RuntimeError(
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
+            f"qsa_cache_sharding_size ({qsa_cache_sharding_size})"
         )
 
     # Build the tensor model-parallel groups.
@@ -2702,14 +2733,8 @@ def initialize_model_parallel(
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     if decode_context_parallel_size > 1:
-        dcp_group_ranks = []
-        for tp_group in group_ranks:
-            for start in range(0, len(tp_group), decode_context_parallel_size):
-                dcp_group_ranks.append(
-                    tp_group[start : start + decode_context_parallel_size]
-                )
         _DCP = init_model_parallel_group(
-            dcp_group_ranks,
+            _build_tp_subgroups(group_ranks, decode_context_parallel_size),
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
@@ -2721,6 +2746,29 @@ def initialize_model_parallel(
         if _TP.rank_in_group == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+
+    # QSA cache sharding is independent of decode context parallelism.
+    global _QSA_CACHE_SHARDING
+    assert _QSA_CACHE_SHARDING is None, (
+        "QSA cache-sharding group is already initialized"
+    )
+    if qsa_cache_sharding_size > 1:
+        _QSA_CACHE_SHARDING = init_model_parallel_group(
+            _build_tp_subgroups(group_ranks, qsa_cache_sharding_size),
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="qsa_cache_sharding",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+        if _TP.rank_in_group == 0:
+            logger.info(
+                "QSA cache sharding enabled, size=%d, tp_size=%d",
+                qsa_cache_sharding_size,
+                tensor_model_parallel_size,
             )
 
     attn_dp_size = attention_data_parallel_size
@@ -2982,6 +3030,7 @@ def initialize_model_parallel(
         "attn_cp_group": _ATTN_CP,
         "shared_experts_tp_group": _SHARED_EXPERTS_TP,
         "dcp_group": _DCP,
+        "qsa_cache_sharding_group": _QSA_CACHE_SHARDING,
     }
     get_parallel().override_permanently(
         **{name: group for name, group in built.items() if group is not None}
@@ -3284,6 +3333,11 @@ def destroy_model_parallel():
         _DCP.destroy()
     _DCP = None
 
+    global _QSA_CACHE_SHARDING
+    if _QSA_CACHE_SHARDING:
+        _QSA_CACHE_SHARDING.destroy()
+    _QSA_CACHE_SHARDING = None
+
     global _MOE_EP
     if _MOE_EP:
         _MOE_EP.destroy()
@@ -3483,6 +3537,7 @@ _CONTEXT_NAME_OF = {
     "get_attn_tp_group": "attn_tp_group",
     "get_attn_cp_group": "attn_cp_group",
     "get_shared_experts_tp_group": "shared_experts_tp_group",
+    "get_qsa_cache_sharding_group": "qsa_cache_sharding_group",
     "get_dcp_group": "dcp_group",
     "get_world_size": "launch_world_size",
     "get_world_rank": "launch_world_rank",

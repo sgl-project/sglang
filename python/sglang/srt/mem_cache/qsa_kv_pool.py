@@ -10,12 +10,23 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Optional
+from dataclasses import dataclass
 
 import torch
-
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.qsa.cache_sharding import (
+    QSACacheShardingRuntime,
+    assert_qsa_cache_sharding_runtime_match,
+    get_qsa_cache_sharding_runtime,
+)
+from sglang.srt.mem_cache.allocator.page_interleave import (
+    page_interleave_shard_size,
+)
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.page_interleave import (
+    PageInterleavePlacement,
+    PageShardSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +54,248 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
         f"Unsupported --qsa-indexer-dtype {name!r}; expected one of "
         f"{QSA_INDEXER_DTYPE_CHOICES}"
     )
+
+
+_INTEGER_DTYPES = (
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+
+
+def assert_qsa_indices_in_bounds(
+    indices: torch.Tensor,
+    upper_bound: int,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    label: str,
+) -> None:
+    """Validate QSA kernel indices without synchronizing CUDA tensors to host."""
+
+    if not isinstance(indices, torch.Tensor):
+        raise TypeError(f"{label} must be a tensor")
+    if indices.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"{label} must have integer dtype")
+    if upper_bound < 0:
+        raise ValueError(f"{label} upper bound must be non-negative")
+    if valid_mask is None:
+        valid_mask = indices >= 0
+    elif valid_mask.shape != indices.shape:
+        raise ValueError(f"{label} valid mask must match index shape")
+    else:
+        valid_mask = valid_mask.to(device=indices.device, dtype=torch.bool)
+    condition = torch.all(
+        (~valid_mask) | ((indices >= 0) & (indices < upper_bound))
+    )
+    message = f"{label} must be in [0, {upper_bound})"
+    if indices.is_cuda:
+        torch._assert_async(condition, message)
+    elif not bool(condition.item()):
+        raise IndexError(message)
+
+
+def _qsa_placement(*, rank: int, world_size: int, page_size: int):
+    if world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    return PageInterleavePlacement(
+        PageShardSpec(
+            shard_rank=rank,
+            shard_size=world_size,
+            page_size=page_size,
+            max_prefix_tokens=0,
+            chunk_tokens=0,
+        )
+    )
+
+
+def qsa_global_compressed_capacity(
+    local_token_capacity: int,
+    *,
+    compress_ratio: int,
+    world_size: int | None = None,
+    allocator=None,
+) -> int:
+    if allocator is not None:
+        allocator_world_size = page_interleave_shard_size(allocator)
+        if world_size is not None and world_size != allocator_world_size:
+            raise ValueError("allocator and explicit QSA shard widths disagree")
+        world_size = allocator_world_size
+    world_size = 1 if world_size is None else world_size
+    if min(local_token_capacity, compress_ratio, world_size) <= 0:
+        raise ValueError("QSA compressed-capacity inputs must be positive")
+    return -((local_token_capacity * world_size) // -compress_ratio)
+
+
+@dataclass(frozen=True)
+class QSARawKVSharding:
+    """Interleaved owner mapping for the rank-local raw QSA K/V cache."""
+
+    local_capacity: int
+    page_size: int
+    world_size: int
+    rank: int
+
+    def __post_init__(self) -> None:
+        if self.local_capacity < 0:
+            raise ValueError("local_capacity must be non-negative")
+        if self.page_size <= 0:
+            raise ValueError("page_size must be positive")
+        object.__setattr__(
+            self,
+            "placement",
+            _qsa_placement(rank=self.rank, world_size=self.world_size, page_size=1),
+        )
+
+    @property
+    def global_capacity(self) -> int:
+        return self.local_capacity * self.world_size
+
+    def global_to_local_tokens(self, global_slots: torch.Tensor) -> torch.Tensor:
+        global_slots = global_slots.long()
+        valid = (global_slots >= 0) & (global_slots < self.global_capacity)
+        owned = self.placement.local_mask(global_slots, self.rank)
+        local = self.placement.local_index(global_slots.clamp_min(0))
+        return torch.where(valid & owned, local, -1)
+
+    def local_write_targets(
+        self, global_slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert_qsa_indices_in_bounds(
+            global_slots,
+            self.global_capacity,
+            valid_mask=global_slots >= 0,
+            label="raw KV write locations",
+        )
+        local = self.global_to_local_tokens(global_slots)
+        owner = local >= 0
+        safe_local = torch.where(owner, local, 0)
+        assert_qsa_indices_in_bounds(
+            safe_local,
+            self.local_capacity,
+            valid_mask=owner,
+            label="raw KV local write locations",
+        )
+        return owner, safe_local
+
+    def local_copy_targets(
+        self, global_src: torch.Tensor, global_dst: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if global_src.shape != global_dst.shape:
+            raise ValueError("source and destination slots must have matching shapes")
+        src = self.global_to_local_tokens(global_src)
+        dst = self.global_to_local_tokens(global_dst)
+        src_owned = src >= 0
+        dst_owned = dst >= 0
+        if bool(torch.any(src_owned != dst_owned).item()):
+            raise ValueError("cross-owner raw K/V copy requires communication")
+        return src[src_owned], dst[dst_owned]
+
+@dataclass(frozen=True)
+class QSACompressedBlockSharding:
+    """Interleaved full-page ownership for QSA compressed blocks.
+
+    Every compressed block in a physical page has the same owner. The small
+    per-request pending ring remains replicated because an incomplete
+    compression group can be completed by the next token before a
+    compressed-page owner is selected.
+    """
+
+    global_blocks: int
+    compressed_page_size: int
+    world_size: int
+    rank: int
+
+    def __post_init__(self) -> None:
+        if self.global_blocks < 0:
+            raise ValueError("global_blocks must be non-negative")
+        if self.compressed_page_size <= 0:
+            raise ValueError(
+                "compressed_page_size must be positive, got "
+                f"{self.compressed_page_size}"
+            )
+        object.__setattr__(
+            self,
+            "placement",
+            _qsa_placement(
+                rank=self.rank,
+                world_size=self.world_size,
+                page_size=self.compressed_page_size,
+            ),
+        )
+
+    @property
+    def global_pages(self) -> int:
+        return -(self.global_blocks // -self.compressed_page_size)
+
+    @property
+    def local_pages(self) -> int:
+        if self.rank >= self.global_pages:
+            return 0
+        return (self.global_pages - 1 - self.rank) // self.world_size + 1
+
+    @property
+    def local_blocks(self) -> int:
+        return self.local_pages * self.compressed_page_size
+
+    def global_to_local_pages(self, global_pages: torch.Tensor) -> torch.Tensor:
+        global_pages = global_pages.long()
+        valid = (global_pages >= 0) & (global_pages < self.global_pages)
+        owned = global_pages.remainder(self.world_size) == self.rank
+        return torch.where(
+            valid & owned,
+            torch.div(global_pages, self.world_size, rounding_mode="floor"),
+            -1,
+        )
+
+    def global_to_local_blocks(self, global_blocks: torch.Tensor) -> torch.Tensor:
+        global_blocks = global_blocks.long()
+        valid = (global_blocks >= 0) & (global_blocks < self.global_blocks)
+        safe_blocks = global_blocks.clamp_min(0)
+        owned = self.placement.local_mask(safe_blocks, self.rank)
+        local_blocks = self.placement.local_index(safe_blocks)
+        return torch.where(valid & owned, local_blocks, -1)
+
+    def local_write_targets(
+        self,
+        global_blocks: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return dense owner mask and safe rank-local destinations.
+
+        Eager fused compression keeps its static, shape-derived group count.
+        Non-owner and padded rows therefore stay in the launch but are masked
+        before the kernel reads group members or writes compressed state.
+        """
+        if global_blocks.ndim != 1:
+            raise ValueError("global_blocks must be one-dimensional")
+        checked_mask = (
+            global_blocks >= 0
+            if valid_mask is None
+            else valid_mask.to(device=global_blocks.device, dtype=torch.bool)
+        )
+        assert_qsa_indices_in_bounds(
+            global_blocks,
+            self.global_blocks,
+            valid_mask=checked_mask,
+            label="compressed KV write locations",
+        )
+        local_blocks = self.global_to_local_blocks(global_blocks)
+        owner_mask = local_blocks >= 0
+        if valid_mask is not None:
+            if valid_mask.shape != global_blocks.shape:
+                raise ValueError("valid_mask must match global_blocks")
+            owner_mask &= valid_mask.to(device=global_blocks.device, dtype=torch.bool)
+        safe_local_blocks = torch.where(owner_mask, local_blocks, 0)
+        assert_qsa_indices_in_bounds(
+            safe_local_blocks,
+            self.local_blocks,
+            valid_mask=owner_mask,
+            label="compressed KV local write locations",
+        )
+        return owner_mask, safe_local_blocks
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
@@ -80,7 +333,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         page_size: int,
         head_num: int,
         head_dim: int,
-        full_attention_layer_ids: List[int],
+        full_attention_layer_ids: list[int],
         device: str,
         mamba_pool: MambaPool,
         qsa_index_kv_heads: int,
@@ -88,10 +341,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        cache_sharding_runtime: QSACacheShardingRuntime | None = None,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
-        start_layer: Optional[int] = None,
-        full_kv_pool_class: Optional[type] = None,
+        start_layer: int | None = None,
+        full_kv_pool_class: type | None = None,
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
@@ -110,6 +364,15 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
+        topology_runtime = get_qsa_cache_sharding_runtime()
+        if cache_sharding_runtime is None:
+            cache_sharding_runtime = topology_runtime
+        assert_qsa_cache_sharding_runtime_match(
+            cache_sharding_runtime,
+            topology_runtime,
+            component="pool",
+        )
+        self.cache_sharding_runtime = cache_sharding_runtime
         super().__init__(
             size=size,
             dtype=dtype,
@@ -160,7 +423,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
-        self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
+        self.qsa_global_compressed_capacity = qsa_global_compressed_capacity(
+            state_size,
+            compress_ratio=self.qsa_compress_ratio,
+            world_size=1,
+        )
+        self.qsa_compressed_capacity = self.qsa_global_compressed_capacity
+        self.qsa_raw_kv_sharding = None
+        self.qsa_owner_group = None
         # Pre-compression index-K state is a per-request ring, not a per-token cache:
         # only the pending group's ``ratio`` members must survive a forward,
         # addressed as ``req_pool_idx * ratio + position % ratio``.
@@ -171,6 +441,27 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
         self.qsa_num_request_slots = int(num_request_slots)
         ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        self.qsa_compressed_sharding = None
+        if cache_sharding_runtime.enabled:
+            self.qsa_global_compressed_capacity = qsa_global_compressed_capacity(
+                state_size,
+                compress_ratio=self.qsa_compress_ratio,
+                world_size=cache_sharding_runtime.size,
+            )
+            self.qsa_owner_group = cache_sharding_runtime.group
+            self.qsa_raw_kv_sharding = QSARawKVSharding(
+                local_capacity=size + page_size,
+                page_size=page_size,
+                world_size=cache_sharding_runtime.size,
+                rank=cache_sharding_runtime.rank,
+            )
+            self.qsa_compressed_sharding = QSACompressedBlockSharding(
+                global_blocks=self.qsa_global_compressed_capacity,
+                compressed_page_size=self.qsa_compressed_page_size,
+                world_size=cache_sharding_runtime.size,
+                rank=cache_sharding_runtime.rank,
+            )
+            self.qsa_compressed_capacity = self.qsa_compressed_sharding.local_blocks
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -230,6 +521,70 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self._transfer_full_attention_id(layer_id)
         ]
 
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        dcp_kv_mask: torch.Tensor | None = None,
+    ) -> None:
+        sharding = self.qsa_raw_kv_sharding
+        if sharding is not None:
+            local_layer_id = self._transfer_full_attention_id(layer.layer_id)
+            key_buffer = self.full_kv_pool.get_key_buffer(local_layer_id)
+            value_buffer = self.full_kv_pool.get_value_buffer(local_layer_id)
+            buffer_heads = key_buffer.shape[1]
+            buffer_dim = key_buffer.shape[-1]
+            if (
+                cache_k.ndim != 3
+                or cache_v.shape != cache_k.shape
+                or value_buffer.shape != key_buffer.shape
+                or cache_k.shape[1] != buffer_heads
+                or cache_k.shape[2] != buffer_dim
+            ):
+                raise ValueError(
+                    "raw K/V write layout must match the owner-local cache: "
+                    f"cache={tuple(cache_k.shape)}, buffer={tuple(key_buffer.shape)}"
+                )
+            owner_mask, loc = sharding.local_write_targets(loc)
+            if dcp_kv_mask is not None:
+                owner_mask &= dcp_kv_mask.to(device=owner_mask.device, dtype=torch.bool)
+            dcp_kv_mask = owner_mask
+        super().set_kv_buffer(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            dcp_kv_mask=dcp_kv_mask,
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        sharding = self.qsa_raw_kv_sharding
+        if sharding is not None:
+            src_loc, tgt_loc = sharding.local_copy_targets(src_loc, tgt_loc)
+        self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def clear_raw_kv_slots(self, global_slots: torch.Tensor) -> None:
+        sharding = self.qsa_raw_kv_sharding
+        if sharding is None:
+            local_slots = global_slots
+        else:
+            local_slots = sharding.global_to_local_tokens(global_slots)
+            local_slots = local_slots[local_slots >= 0]
+        if local_slots.numel() == 0:
+            return
+        layer_ids = self.full_attention_layer_id_mapping.values()
+        for layer_id in layer_ids:
+            key = self.full_kv_pool.get_key_buffer(layer_id)
+            value = self.full_kv_pool.get_value_buffer(layer_id)
+            key[local_slots] = 0
+            value[local_slots] = 0
+
     def set_qsa_key_state_buffer(
         self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
     ) -> None:
@@ -262,6 +617,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
+        if self.qsa_compressed_sharding is not None:
+            local_blocks = self.qsa_compressed_sharding.global_to_local_blocks(loc)
+            source_rows = torch.nonzero(
+                local_blocks >= 0, as_tuple=False
+            ).flatten()
+            loc = local_blocks.index_select(0, source_rows)
+            compressed_k = compressed_k.index_select(0, source_rows)
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
     @staticmethod

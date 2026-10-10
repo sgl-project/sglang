@@ -311,11 +311,53 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        rotation_bases: Optional[List[int]] = None,
     ):
-        raise NotImplementedError(
-            "PageInterleavePoolAllocator does not support decode allocation "
-            "(logical-page KV sharding runs on prefill nodes only)"
+        ps, shard_size = self.page_size, self.shard_size
+        bs = len(seq_lens_cpu)
+        assert rotation_bases is not None and len(rotation_bases) == bs, (
+            "sharded alloc_decode needs the rotation base of every request"
         )
+        if self.debug_mode:
+            assert torch.all(
+                (last_loc + 2) % ps == seq_lens % ps
+            ), "decode length and last location disagree"
+
+        # A decode token needs a fresh page exactly at the first position of a
+        # position-page. Its owner is host-computable from the chain rotation,
+        # so the hot path does not synchronize on last_loc.
+        new_page_reqs: List[List[int]] = [[] for _ in range(shard_size)]
+        for i in range(bs):
+            seq_len = int(seq_lens_cpu[i])
+            if seq_len % ps != 1:
+                continue
+            owner = (int(rotation_bases[i]) + (seq_len - 1) // ps) % shard_size
+            new_page_reqs[owner].append(i)
+
+        needs = [len(reqs) for reqs in new_page_reqs]
+        available = self.class_free_page_counts()
+        if any(need > available[c] for c, need in enumerate(needs)):
+            return None
+        if self.need_sort and any(
+            needs[c] > len(self.class_free_pages[c]) for c in range(shard_size)
+        ):
+            self.merge_and_sort_free()
+
+        out_indices = last_loc + 1
+        for owner, reqs in enumerate(new_page_reqs):
+            count = len(reqs)
+            if count == 0:
+                continue
+            pages = self.class_free_pages[owner][:count]
+            self.class_free_pages[owner] = self.class_free_pages[owner][count:]
+            request_indices = torch.tensor(
+                reqs, dtype=torch.int64, device=self.device
+            )
+            out_indices[request_indices] = pages.to(dtype=out_indices.dtype) * ps
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
+        return out_indices
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
