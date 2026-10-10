@@ -218,23 +218,12 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
-# Arbitrary upper bounds; exp expands frames 2**exp, upscaling_scale squares the pixels.
-_MAX_FRAME_INTERPOLATION_EXP = 4
+# Arbitrary upper bounds; upscaling_scale squares the pixel count.
 _FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
 _MAX_UPSCALING_SCALE = 8
 
 
 def _check_postprocess_controls(params: "SamplingParams") -> None:
-    exp = params.frame_interpolation_exp
-    if (
-        isinstance(exp, bool)
-        or not isinstance(exp, int)
-        or not 1 <= exp <= _MAX_FRAME_INTERPOLATION_EXP
-    ):
-        raise ValueError(
-            "frame_interpolation_exp must be an int in "
-            f"[1, {_MAX_FRAME_INTERPOLATION_EXP}], got {exp!r}"
-        )
     scale = params.frame_interpolation_scale
     low, high = _FRAME_INTERPOLATION_SCALE_RANGE
     if (
@@ -716,7 +705,7 @@ class SamplingParams:
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
-        # exp expands frames as 2**exp; scale bounds follow RIFE's supported range.
+        # scale bounds follow RIFE's supported range.
         _check_postprocess_controls(self)
 
         # num_frames is already asserted in __post_init__, but keep a friendly error here too

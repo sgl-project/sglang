@@ -9,10 +9,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("frame_interpolation_exp", 0),
-        ("frame_interpolation_exp", -1),
-        ("frame_interpolation_exp", 40),
-        ("frame_interpolation_exp", True),
         ("frame_interpolation_scale", 0.0),
         ("frame_interpolation_scale", -1.0),
         ("frame_interpolation_scale", float("nan")),
@@ -25,8 +21,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     ],
 )
 def test_out_of_range_postprocess_controls_are_rejected(field, value):
-    """exp expands frames as 2**exp and upscaling_scale sizes the output; values
-    outside the supported range must be rejected, not reach the kernels."""
+    """upscaling_scale sizes the output and scale feeds RIFE; values outside the
+    supported range must be rejected, not reach the kernels."""
     with pytest.raises(ValueError, match=field):
         SamplingParams(**{field: value})._validate()
 
@@ -34,8 +30,8 @@ def test_out_of_range_postprocess_controls_are_rejected(field, value):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"frame_interpolation_exp": 1, "frame_interpolation_scale": 0.5},
-        {"frame_interpolation_exp": 4, "frame_interpolation_scale": 4.0},
+        {"frame_interpolation_scale": 0.5},
+        {"frame_interpolation_scale": 4.0},
         {"upscaling_scale": 1},
         {"upscaling_scale": 8},
     ],
