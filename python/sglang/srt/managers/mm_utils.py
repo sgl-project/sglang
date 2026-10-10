@@ -553,9 +553,7 @@ def embed_mm_inputs(
         _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
         if use_deepstack.get(modality, None):
             _scatter_mm_embedding(
-                dest=input_deepstack_embeds,
-                mask=mask,
-                src=deepstack_embeddings[i],
+                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
             )
 
     return input_embeds, other_info

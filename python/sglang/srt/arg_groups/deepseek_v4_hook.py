@@ -341,8 +341,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
 
 def _validate_deepseek_v41_vision_prefill_cp(server_args: ServerArgs) -> None:
-    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-
     cfg = resolving_view(server_args)
     if cfg.cp_strategy != "interleave":
         raise ValueError(

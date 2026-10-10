@@ -385,24 +385,41 @@ def _batch_encode_per_image_misses(
     unique_misses: Dict[Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
 
-    # Phase 1a: collect cache misses over the unique overlapping spans
-    for span in _collect_image_span_requests(per_image_requests):
-        cache_key = (span.hash, span.span_len)
-        cached = embedding_cache.get_single(span.hash)
-        if cached is not None:
-            cached_embedding = cached.embedding
-            cached_token_count = _embedding_token_count(cached_embedding)
-            if cached_token_count == span.span_len:
-                hash_to_embedding[cache_key] = cached_embedding
+    # Phase 1a: find overlapping items per request and collect cache misses
+    for req_info in per_image_requests:
+        chunk_start = req_info.extend_prefix_len
+        chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
+        overlapping = []
+        if req_info.extend_seq_len > 0:
+            for idx, item in enumerate(req_info.items):
+                token_count = _item_overlap(item, chunk_start, chunk_end)
+                if token_count is not None:
+                    overlapping.append((idx, item, token_count))
+        req_info.overlapping = overlapping
+
+        for _idx, item, expected_token_count in overlapping:
+            cache_key = (item.hash, expected_token_count)
+            if cache_key in hash_to_embedding:
                 continue
-            _discard_mismatched_cached_embedding(
-                span.hash, span.span_len, cached_token_count
-            )
-        elif (
-            span.inside_chunk and span.item.can_defer_cuda_ipc_feature_reconstruction()
-        ):
-            span.item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
-        unique_misses[cache_key] = (span.item, span.span_len)
+            cached = embedding_cache.get_single(item.hash)
+            if cached is not None:
+                cached_embedding = cached.embedding
+                cached_token_count = _embedding_token_count(cached_embedding)
+                if cached_token_count == expected_token_count:
+                    hash_to_embedding[cache_key] = cached_embedding
+                else:
+                    _discard_mismatched_cached_embedding(
+                        item.hash, expected_token_count, cached_token_count
+                    )
+                    unique_misses[cache_key] = (item, expected_token_count)
+            elif cache_key not in unique_misses:
+                if (
+                    item.offsets[0][0] >= chunk_start
+                    and item.offsets[-1][1] < chunk_end
+                    and item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
+                unique_misses[cache_key] = (item, expected_token_count)
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
@@ -444,40 +461,23 @@ def _batch_encode_per_image_misses(
 def _collect_image_span_requests(
     per_image_requests: List[PerImageRequestInfo],
 ) -> List[ImageSpanRequest]:
-    spans: Dict[
-        Tuple[Optional[int], int],
-        Tuple[MultimodalDataItem, bool, List[MultimodalDataItem]],
-    ] = {}
+    spans: Dict[Tuple[Optional[int], int], ImageSpanRequest] = {}
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
         chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
-        overlapping = []
-        if req_info.extend_seq_len > 0:
-            for idx, item in enumerate(req_info.items):
-                token_count = _item_overlap(item, chunk_start, chunk_end)
-                if token_count is not None:
-                    overlapping.append((idx, item, token_count))
-        req_info.overlapping = overlapping
-
-        for _idx, item, token_count in overlapping:
-            cache_key = (item.hash, token_count)
-            if cache_key in spans:
-                spans[cache_key][2].append(item)
-                continue
-            inside_chunk = (
-                item.offsets[0][0] >= chunk_start and item.offsets[-1][1] < chunk_end
+        req_info.overlapping = [
+            (idx, item, token_count)
+            for idx, item in enumerate(req_info.items)
+            if (token_count := _item_overlap(item, chunk_start, chunk_end)) is not None
+        ]
+        for _idx, item, token_count in req_info.overlapping:
+            span = spans.setdefault(
+                (item.hash, token_count),
+                ImageSpanRequest(hash=item.hash, span_len=token_count, item=item),
             )
-            spans[cache_key] = (item, inside_chunk, [])
-    return [
-        ImageSpanRequest(
-            hash=item_hash,
-            span_len=span_len,
-            item=item,
-            inside_chunk=inside_chunk,
-            duplicates=duplicates,
-        )
-        for (item_hash, span_len), (item, inside_chunk, duplicates) in spans.items()
-    ]
+            if span.item is not item:
+                span.duplicates.append(item)
+    return list(spans.values())
 
 
 def _owner_span_encoder(data_embedding_func: DataEmbeddingFunc, device: torch.device):
@@ -665,18 +665,11 @@ def _get_chunked_prefill_embedding(
     if per_image_requests and mm_owner is not None:
         # The owner protocol must see every overlapping span before any local
         # cache filtering: a rank-local hit can never skip a group collective.
-        span_requests = _collect_image_span_requests(per_image_requests)
-        if mm_owner.engaged:
-            hash_to_embedding = mm_owner.resolve(
-                span_requests,
-                cache=embedding_cache,
-                encode=_owner_span_encoder(data_embedding_func, device),
-            )
-        elif span_requests:
-            raise RuntimeError(
-                "owner eligibility saw no image span in this chunk, but "
-                f"scheduling found {len(span_requests)}"
-            )
+        hash_to_embedding = mm_owner.resolve(
+            _collect_image_span_requests(per_image_requests),
+            cache=embedding_cache,
+            encode=_owner_span_encoder(data_embedding_func, device),
+        )
     elif per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
             data_embedding_func, per_image_requests, device

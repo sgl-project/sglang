@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 SpanKey = Tuple[Optional[int], int]
 SpanEncoder = Callable[[List[Any]], torch.Tensor | List[torch.Tensor]]
-SpanSignature = Callable[[Any, int], Tuple[Any, ...]]
 
 LOCAL_HIT = 0
 OWNER_CACHE_BROADCAST = 1
@@ -39,7 +38,6 @@ class ImageSpanRequest(msgspec.Struct, frozen=True):
     hash: Optional[int]
     span_len: int
     item: Any
-    inside_chunk: bool
     duplicates: List[Any] = []
 
 
@@ -60,13 +58,12 @@ class RankManifest(msgspec.Struct, frozen=True):
 
 
 class OwnerPlan(msgspec.Struct, frozen=True):
-    actions: List[int]
-    owners: List[int]
+    actions: List[int] = []
+    owners: List[int] = []
     error: Optional[str] = None
 
 
 class RankStatus(msgspec.Struct, frozen=True):
-    rank: int
     error: Optional[str] = None
 
 
@@ -98,7 +95,7 @@ def has_owner_span_work(
         if mm_input is None or extend_len <= 0:
             continue
         items = [item for item in mm_input.mm_items if item is not None]
-        if not items or any(
+        if any(
             item.precomputed_embeddings is not None or len(item.offsets) != 1
             for item in items
         ):
@@ -117,7 +114,6 @@ class MmOwnerSession(msgspec.Struct):
     width: int
     rids: List[str]
     signature: Any
-    engaged: bool
     phase: str = PHASE_PREPARE
     in_collective: bool = False
 
@@ -127,10 +123,6 @@ class MmOwnerSession(msgspec.Struct):
         cache: MultiModalStaticCache,
         encode: SpanEncoder,
     ) -> Dict[SpanKey, torch.Tensor]:
-        if not self.engaged:
-            raise RuntimeError(
-                "owner protocol reached for a chunk whose host metadata has no image span"
-            )
         # Owners allocate different amounts than receivers, so none of these
         # buffers may come out of a symmetric pool.
         saved_context = disable_symmetric_memory_context()
@@ -161,11 +153,7 @@ class MmOwnerSession(msgspec.Struct):
         self._complete()
 
     def _fail(self, exc: BaseException) -> None:
-        if (
-            not self.engaged
-            or self.in_collective
-            or isinstance(exc, MmOwnerProtocolError)
-        ):
+        if self.in_collective or isinstance(exc, MmOwnerProtocolError):
             raise exc
         text = _describe(self, self.phase, exc)
         if self.phase == PHASE_PREPARE:
@@ -176,20 +164,11 @@ class MmOwnerSession(msgspec.Struct):
         _exchange_status(self, text, exc)
 
     def _complete(self) -> None:
-        if not self.engaged:
-            return
         if self.phase == PHASE_PREPARE:
             raise RuntimeError(
                 f"owner protocol {self.phase} completed without a manifest exchange"
             )
-        error = None
-        cause = None
-        try:
-            _synchronize(self.device)
-        except Exception as exc:
-            cause = exc
-            error = _describe(self, self.phase, exc)
-        _exchange_status(self, error, cause)
+        _drain_and_agree(self, self.phase)
 
 
 def _manifest(
@@ -225,17 +204,30 @@ def _plan_or_error(session: MmOwnerSession, manifests: List[RankManifest]) -> Ow
     try:
         return _make_plan(manifests)
     except Exception as exc:
-        return OwnerPlan(actions=[], owners=[], error=_describe(session, "plan", exc))
+        return OwnerPlan(error=_describe(session, "plan", exc))
 
 
 def _exchange_status(
     session: MmOwnerSession, error: Optional[str], cause: Optional[BaseException]
 ) -> None:
     with session.uncaptured():
-        statuses = session.group.all_gather_object(
-            RankStatus(rank=session.group.rank_in_group, error=error)
-        )
-    _raise_first_error(statuses, cause)
+        statuses = session.group.all_gather_object(RankStatus(error=error))
+    for status in statuses:
+        if status.error is not None:
+            raise MmOwnerProtocolError(status.error) from cause
+
+
+def _drain_and_agree(
+    session: MmOwnerSession, stage: str, step: Optional[Callable[[], Any]] = None
+) -> Any:
+    result, error, cause = None, None, None
+    try:
+        result = step() if step is not None else None
+        _synchronize(session.device)
+    except Exception as exc:
+        error, cause = _describe(session, stage, exc), exc
+    _exchange_status(session, error, cause)
+    return result
 
 
 def _resolve_owner_features(
@@ -258,14 +250,11 @@ def _resolve_owner_features(
     if all(action == LOCAL_HIT for action in plan.actions):
         return features
 
-    buffers: Dict[int, torch.Tensor] = {}
-    error = None
-    try:
-        buffers = _prepare_transfers(session, requests, keys, plan, features, encode)
-        _synchronize(session.device)
-    except Exception as exc:
-        error = _describe(session, "encode", exc)
-    _exchange_status(session, error, None)
+    buffers = _drain_and_agree(
+        session,
+        "encode",
+        lambda: _prepare_transfers(session, requests, keys, plan, features, encode),
+    )
 
     with session.uncaptured():
         for index, (action, owner) in enumerate(zip(plan.actions, plan.owners)):
@@ -348,7 +337,7 @@ def _valid_cached_span(
 def _make_plan(manifests: List[RankManifest]) -> OwnerPlan:
     for manifest in manifests:
         if manifest.error is not None:
-            return OwnerPlan(actions=[], owners=[], error=manifest.error)
+            return OwnerPlan(error=manifest.error)
     lead = manifests[0]
     for manifest in manifests[1:]:
         if (manifest.keys, manifest.dtype, manifest.width, manifest.rids) != (
@@ -358,8 +347,6 @@ def _make_plan(manifests: List[RankManifest]) -> OwnerPlan:
             lead.rids,
         ):
             return OwnerPlan(
-                actions=[],
-                owners=[],
                 error=(
                     "image manifest mismatch between group ranks 0 and "
                     f"{manifest.rank}: rids={lead.rids} vs {manifest.rids}, "
@@ -413,12 +400,11 @@ def _prepare_transfers(
         else:
             owned.append(index)
     if owned:
-        owned_hashes = [keys[index].hash for index in owned]
         try:
             encoded = encode([requests[index].item for index in owned])
         except Exception as exc:
             raise RuntimeError(
-                f"owner encode of image hashes {owned_hashes} failed: "
+                f"owner encode of image hashes {[keys[i].hash for i in owned]} failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         spans = _split_spans(encoded, [keys[index].span_len for index in owned])
@@ -476,11 +462,3 @@ def _describe(session: MmOwnerSession, stage: str, exc: BaseException) -> str:
         f"{session.group.ranks[session.group.rank_in_group]}, rids={list(session.rids)}): "
         f"{type(exc).__name__}: {exc}"
     )
-
-
-def _raise_first_error(
-    statuses: List[RankStatus], cause: Optional[BaseException]
-) -> None:
-    for status in statuses:
-        if status.error is not None:
-            raise MmOwnerProtocolError(status.error) from cause

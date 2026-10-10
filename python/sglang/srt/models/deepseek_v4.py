@@ -4635,7 +4635,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def _mm_owner_session(self, forward_batch) -> Optional[MmOwnerSession]:
-        if self.mm_owner_group is None:
+        if self.mm_owner_group is None or not has_owner_span_work(
+            forward_batch.mm_inputs,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+        ):
             return None
         return MmOwnerSession(
             group=self.mm_owner_group,
@@ -4644,11 +4648,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             width=self.config.hidden_size,
             rids=list(forward_batch.rids or ()),
             signature=self._image_span_signature,
-            engaged=has_owner_span_work(
-                forward_batch.mm_inputs,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-            ),
         )
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch, mm_owner):
