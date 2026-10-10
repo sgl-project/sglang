@@ -3,6 +3,9 @@
 import torch
 
 from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
+from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
+    MeshRender,
+)
 
 
 def test_plucker_rays_for_bf16_poses_match_float32():
@@ -17,3 +20,13 @@ def test_plucker_rays_for_bf16_poses_match_float32():
     actual = get_plucker_embeddings(c2ws.bfloat16(), Ks.bfloat16(), height, width)
 
     assert torch.equal(actual.float(), expected)
+
+
+def test_default_texture_follows_width_height_texture_size():
+    """texture_size is (width, height); the blank default texture was built as
+    (width, height, 3) instead of the (height, width, 3) of a loaded texture."""
+    render = MeshRender.__new__(MeshRender)
+    render.tex = None
+    render.texture_size = (64, 32)
+
+    assert render.get_texture().shape == (32, 64, 3)
