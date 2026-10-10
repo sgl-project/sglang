@@ -193,6 +193,29 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
 
+    def test_rejection_sampling_replay_stages_target_cutoffs(self):
+        # Draft overrides resolve inside the graph, so replay must stage every
+        # raw target cutoff it reads, including top_p.
+        publish(
+            ServerArgs(model_path="dummy", speculative_use_rejection_sampling=True),
+            role="tokenizer",
+        )
+        runner = self._build_runner(_RecordingDraftBackend())
+        runner.temperatures = torch.ones(CAPTURE_BS, 1)
+        runner.top_ks = torch.ones(CAPTURE_BS, dtype=torch.int32)
+        runner.top_ps = torch.ones(CAPTURE_BS)
+        batch = self._build_forward_batch([10, 11], 21)
+        batch.sampling_info = SimpleNamespace(
+            temperatures=torch.tensor([[0.8], [1.2]]),
+            top_ks=torch.tensor([1, 3], dtype=torch.int32),
+            top_ps=torch.tensor([0.9, 0.7]),
+            is_all_greedy=False,
+        )
+        runner.execute(batch)
+        torch.testing.assert_close(runner.temperatures[:2, 0], torch.tensor([0.8, 1.2]))
+        self.assertEqual(runner.top_ks[:2].tolist(), [1, 3])
+        torch.testing.assert_close(runner.top_ps[:2], torch.tensor([0.9, 0.7]))
+
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None
         # rather than coerce it into an int.

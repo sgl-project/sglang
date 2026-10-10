@@ -13,7 +13,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptSampling,
     FinalizeAcceptLens,
     SelectMixedAccept,
-    SoftmaxTemp,
     accept_greedy_triton,
     finalize_accept_lens_triton,
 )
@@ -886,12 +885,7 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-    draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-        temperatures=draft_block.temperatures,
-        rows_per_request=gamma_rows,
-    ).view(bs, gamma_rows, vocab)
+    draft_probs = draft_block.draft_probs
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(

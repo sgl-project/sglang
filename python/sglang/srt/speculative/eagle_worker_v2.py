@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -107,7 +108,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -724,6 +724,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if needs_draft_probs:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_sampling_params = DraftSamplingParams.from_sampling_info(
+                forward_batch.sampling_info
+            )
 
         topk1_chain_fits = (
             self.topk == 1
@@ -803,8 +806,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if needs_draft_probs:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
-                        forward_batch.sampling_info.temperatures,
-                        forward_batch.sampling_info.top_ks,
+                        draft_sampling_params,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -823,11 +825,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
                 else:
-                    probs = renorm_draft_probs(
-                        logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        needs_draft_probs,
-                    )
+                    probs = renorm_draft_probs(logits_output.next_token_logits)
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope:
@@ -1012,14 +1010,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                DraftSamplingParams.from_sampling_info(batch.sampling_info),
+            )
         else:
+            probs = renorm_draft_probs(logits_output.next_token_logits)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1184,8 +1181,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
-                batch.sampling_info.top_ks,
+                DraftSamplingParams.from_sampling_info(batch.sampling_info),
             )
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
@@ -1201,11 +1197,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
-            )
+            probs = renorm_draft_probs(draft_logits_output.next_token_logits)
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states

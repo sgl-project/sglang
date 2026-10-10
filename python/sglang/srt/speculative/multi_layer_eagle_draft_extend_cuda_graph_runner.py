@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -74,12 +75,11 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
-    wide_row_softmax_triton,
 )
 from sglang.srt.speculative.spec_utils import (
-    fast_sample,
     fast_topk,
     resolve_num_tokens_per_req,
+    sample_draft_proposal,
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -134,7 +134,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     # Rejection sampling with the single-CG runner only, else None (the presence
     # of draft_probs selects the in-graph proposal branch in _run_step_body).
-    temperatures: Optional[torch.Tensor]
+    sampling_params: Optional[DraftSamplingParams]
     draft_probs: Optional[torch.Tensor]
 
 
@@ -382,18 +382,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
     def _sample_draft_proposal(self, ret, bs: int):
-        """In-graph Leviathan proposal (single-CG runner + rejection sampling):
-        q = softmax(logits / T) written straight into this step's draft_probs
-        slot, then X ~ q. The accept test coin*q(X) < p(X) is unbiased only if
-        q is exactly the distribution X was drawn from -- q here IS the
-        stashed tensor."""
+        """Draw from the final q and retain it for acceptance and correction."""
         buffers = self.buffers
-        probs = wide_row_softmax_triton(
-            self._select_step_logits(ret, bs),
-            buffers.temperatures[:bs],
-            buffers.draft_probs[:bs, self.step],
+        probs, ret.topk_p, ret.topk_index = sample_draft_proposal(
+            self._select_step_logits(ret, bs), buffers.sampling_params.slice(bs)
         )
-        ret.topk_p, ret.topk_index = fast_sample(probs, num_samples=1)
+        buffers.draft_probs[:bs, self.step].copy_(probs)
 
     def _run_step_body(self, forward_batch: ForwardBatch, num_tokens: int, bs: int):
         """One draft step's body: model forward + chain-hidden write + top-k.
@@ -684,13 +678,13 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 and self.eagle_worker.use_rejection_sampling
                 and self.eagle_worker.topk == 1
             ):
-                temperatures = torch.ones((max_bs, 1), dtype=torch.float)
+                sampling_params = DraftSamplingParams.greedy(max_bs, self.device)
                 draft_probs = torch.empty(
                     (max_bs, self.speculative_num_steps, vocab_size),
                     dtype=torch.float,
                 )
             else:
-                temperatures = None
+                sampling_params = None
                 draft_probs = None
 
             if self.require_gathered_buffer:
@@ -733,7 +727,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
-            temperatures=temperatures,
+            sampling_params=sampling_params,
             draft_probs=draft_probs,
         )
 
@@ -833,16 +827,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts,
             buffers.num_accept_tokens,
             buffers.select_index,
-            buffers.temperatures,
+            None,
             forward_batch.seq_lens,
             forward_batch.req_pool_indices,
             forward_batch.spec_info.num_correct_drafts,
             forward_batch.spec_info.num_accept_tokens,
-            (
-                forward_batch.sampling_info.temperatures
-                if buffers.temperatures is not None
-                else None
-            ),
+            None,
             buffers.hidden_states,
             (
                 forward_batch.spec_info.hidden_states
@@ -862,6 +852,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.num_front_tokens,
             self.seq_len_fill_value,
         )
+
+        if buffers.sampling_params is not None:
+            buffers.sampling_params.copy_from(forward_batch.sampling_info, raw_bs)
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.
@@ -963,9 +956,9 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
 
     Rejection sampling is supported by sampling X ~ q inside the graph
     (_sample_draft_proposal, selected by the draft_probs buffer's presence):
-    the captured rotation then carries the sampled token, prepare() stages the
-    temperatures sampling_info cannot deliver in-graph, and the worker clones
-    the per-step q off buffers.draft_probs after replay. torch.multinomial
+    the captured rotation then carries the sampled token, prepare() stages
+    temperature and cutoffs, and the worker clones each step's q from
+    buffers.draft_probs after replay. torch.multinomial
     draws through the graph-registered Philox generator, so each replay gets
     fresh coins.
     """

@@ -27,7 +27,6 @@ _TRITON_KERNELS = [
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
     ("lilicorr", "lilicorr_topk_lse"),
-    ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
     ("row_argmax", "row_argmax"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),

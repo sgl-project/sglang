@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.draft_sampling import DraftSamplingParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -76,7 +77,6 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
@@ -258,8 +258,7 @@ class _SelectorDraftSampler:
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
-        self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
-        self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+        self.sampling_params = DraftSamplingParams.greedy(max_bs, device)
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
@@ -271,20 +270,8 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        if sampling_info is None or not self.sampling_enabled:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
-            )
-        )
+        if self.sampling_enabled:
+            self.sampling_params.copy_from(sampling_info, bs)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -296,8 +283,7 @@ class _SelectorDraftSampler:
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=self.uniforms[:bs].uniform_(),
-            temperatures=self.temperatures[:bs],
-            greedy_mask=self.greedy_mask[:bs],
+            params=self.sampling_params.slice(bs) if self.sampling_enabled else None,
         )
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
@@ -1444,23 +1430,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_model, pred_hidden, anchor_token_ids
         )
         device = pred_hidden.device
-        # Clamped like DSpark so greedy rows don't divide by zero.
-        temperatures = (
-            torch.ones(bs, dtype=torch.float32, device=device)
-            if sampling_info is None or not self._selector_sampling_enabled
-            else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
-        )
-        greedy_mask = (
-            torch.ones(bs, dtype=torch.bool, device=device)
-            if not self._selector_sampling_enabled
-            else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
-        )
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
             uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
-            temperatures=temperatures,
-            greedy_mask=greedy_mask,
+            params=(
+                DraftSamplingParams.from_sampling_info(
+                    sampling_info, batch_size=bs, device=device
+                )
+                if self._selector_sampling_enabled
+                else None
+            ),
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
