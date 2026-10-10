@@ -1401,6 +1401,9 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # FlashInfer EAGLE target-verify and multi-step draft plans built from host-known
+    # lengths, so replays issue no blocking device-to-host reads.
+    SGLANG_ENABLE_SYNC_FREE_SPEC_PLAN = EnvBool(False)
     # Experimental: allow pipeline parallelism x speculative decoding
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).

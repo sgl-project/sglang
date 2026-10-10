@@ -30,6 +30,13 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_sync_free_plan import (
+    draft_kv_indptr_host,
+    eagle_verify_plan_host_inputs,
+    fast_verify_plan,
+    record_plan,
+    wait_for_previous_plan,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -309,6 +316,7 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
+        self.sync_free_spec_plan = envs.SGLANG_ENABLE_SYNC_FREE_SPEC_PLAN.get()
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -860,6 +868,20 @@ class FlashInferAttnBackend(AttentionBackend):
             # spec_info of these per-bs wrappers.
             for w in self.prefill_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
+
+        if (
+            in_capture
+            and self.sync_free_spec_plan
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            and self.prefill_backend == "fa2"
+            and self.dispatch_reason is None
+        ):
+            # EAGLE verify keeps its custom mask, which fast_prefill_plan does not
+            # take; installed after the real plan() above set up _cached_module.
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_verify_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
@@ -1565,6 +1587,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.sync_free_spec_plan = attn_backend.sync_free_spec_plan
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1796,6 +1819,8 @@ class FlashInferIndicesUpdaterDecode:
         )
 
         if wrapper_uses_fast_decode_plan:
+            if self.sync_free_spec_plan:
+                wait_for_previous_plan(wrapper)
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
             wrapper.begin_forward(
                 kv_indptr,
@@ -1814,6 +1839,8 @@ class FlashInferIndicesUpdaterDecode:
                 ),
                 global_override_indptr_cpu=global_override_indptr_cpu,
             )
+            if self.sync_free_spec_plan:
+                record_plan(wrapper)
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
             wrapper.begin_forward(
@@ -1855,6 +1882,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.sync_free_spec_plan = attn_backend.sync_free_spec_plan
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -2300,7 +2328,20 @@ class FlashInferIndicesUpdaterPrefill:
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
-        if uses_fast_prefill:
+        uses_fast_verify = (
+            hasattr(wrapper_paged.begin_forward, "func")
+            and wrapper_paged.begin_forward.func is fast_verify_plan
+        )
+        if uses_fast_verify:
+            assert seq_lens_cpu is not None, (
+                "fast_verify_plan replay requires host-known seq_lens_cpu (got None)"
+            )
+            paged_plan_kwargs = eagle_verify_plan_host_inputs(
+                seq_lens_cpu=seq_lens_cpu,
+                draft_token_num=spec_info.draft_token_num,
+                bs=bs,
+            )
+        elif uses_fast_prefill:
             assert seq_lens_cpu is not None, (
                 "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
             )
@@ -2332,6 +2373,11 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
+        order_plan = self.sync_free_spec_plan and (
+            uses_fast_prefill or uses_fast_verify
+        )
+        if order_plan:
+            wait_for_previous_plan(wrapper_paged)
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -2352,6 +2398,8 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+        if order_plan:
+            record_plan(wrapper_paged)
 
 
 class FlashInferMultiStepDraftBackend:
@@ -2368,6 +2416,7 @@ class FlashInferMultiStepDraftBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.sync_free_spec_plan = envs.SGLANG_ENABLE_SYNC_FREE_SPEC_PLAN.get()
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
@@ -2411,6 +2460,7 @@ class FlashInferMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
+        indptr_cpu_whole: Optional[torch.Tensor] = None,
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
@@ -2458,8 +2508,9 @@ class FlashInferMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        if indptr_cpu_whole is None:
+            # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
+            indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
         for i in range(self.speculative_num_steps - 1):
@@ -2526,7 +2577,32 @@ class FlashInferMultiStepDraftBackend:
                 inner_fb, in_capture=in_capture
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        indptr_cpu_whole = None
+        if (
+            self.sync_free_spec_plan
+            and not in_capture
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            # The rows generate_draft_decode_kv_indices writes, from host-known lengths;
+            # replays come from the draft cuda-graph runner, which sets num_padding.
+            indptr_cpu_whole = draft_kv_indptr_host(
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                num_seqs=bs,
+                num_padding=forward_batch.num_padding,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                window_cap=(
+                    self.draft_window_size + self.draft_sink_size
+                    if self.draft_window_size > 0
+                    else 0
+                ),
+            )
+        self.common_template(
+            forward_batch,
+            self.cuda_graph_kv_indices,
+            call_fn,
+            indptr_cpu_whole=indptr_cpu_whole,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
