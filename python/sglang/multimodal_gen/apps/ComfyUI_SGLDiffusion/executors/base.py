@@ -36,6 +36,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self._lora_input = None
         self._sgld_reload = None
         self._ensure_runtime = None
+        self.enable_cache_dit = None
         if self.adapter_cls is None:
             raise TypeError(f"{type(self).__name__} must set adapter_cls")
         self.adapter = self.adapter_cls()
@@ -108,7 +109,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 self._sent_conds.add(key)
 
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
-        return {
+        kwargs = {
             "prompt": " ",
             "guidance_scale": packed.guidance_scale,
             "height": packed.height,
@@ -118,6 +119,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "save_output": False,
             "suppress_logs": self.should_suppress_logs(timestep),
         }
+        # enable_cache_dit is a generic SamplingParams field (not H3-specific);
+        # apply it here so every executor honors the SGLDOptions toggle.
+        enable_cache_dit = getattr(self, "enable_cache_dit", None)
+        if enable_cache_dit is not None:
+            kwargs["enable_cache_dit"] = bool(enable_cache_dit)
+        return kwargs
 
     def _execute_packed(self, packed, x, timestep):
         if _RUNTIME_IMPORT_ERROR is not None:

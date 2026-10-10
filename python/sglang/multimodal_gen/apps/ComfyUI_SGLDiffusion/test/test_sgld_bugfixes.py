@@ -297,3 +297,33 @@ def test_gguf_support_does_not_leak_into_global_folder_registry():
             FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
 
 
+# --- Bug 4: enable_cache_dit was silently ignored for non-H3 models --------
+
+
+def test_enable_cache_dit_applies_to_every_executor_not_just_h3():
+    from sgld_bugfix_under_test.executors.base import SGLDiffusionExecutor
+
+    class _DummyConfig:
+        unet_config = {"dtype": torch.float32}
+
+    class _DummyAdapter:
+        pass
+
+    class _DummyExecutor(SGLDiffusionExecutor):
+        adapter_cls = _DummyAdapter
+
+        def should_suppress_logs(self, timestep):
+            return False
+
+    class _Packed:
+        guidance_scale = 1.0
+        height = 8
+        width = 8
+
+    executor = _DummyExecutor(generator=None, model_path="x", model=None, config=_DummyConfig())
+    executor.enable_cache_dit = True
+
+    kwargs = executor._sampling_params_kwargs(_Packed(), timestep=0)
+    assert kwargs["enable_cache_dit"] is True
+
+

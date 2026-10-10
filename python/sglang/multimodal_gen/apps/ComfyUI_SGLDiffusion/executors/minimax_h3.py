@@ -245,7 +245,4 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
         kwargs = super()._sampling_params_kwargs(packed, timestep)
         drop_h3_pinned_sampling_fields(kwargs)
-        enable_cache_dit = getattr(self, "enable_cache_dit", None)
-        if enable_cache_dit is not None:
-            kwargs["enable_cache_dit"] = bool(enable_cache_dit)
         return kwargs
