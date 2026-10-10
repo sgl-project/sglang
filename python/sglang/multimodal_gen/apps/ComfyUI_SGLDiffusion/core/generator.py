@@ -431,7 +431,11 @@ class SGLDiffusionGenerator:
         model_config.custom_operations = model_options.get("custom_operations", None)
         model_config.unet_config["disable_unet_model_creation"] = True
         comfyui_model = model_config.get_model({})
-        return comfyui_model, model_config, model_type
+        # Real byte size from the checkpoint header, not a per-architecture
+        # guess: lets ComfyUI's VRAM accounting work the same for every
+        # model type instead of only the ones with a hardcoded entry.
+        model_size_bytes = parameters * unet_dtype.itemsize
+        return comfyui_model, model_config, model_type, model_size_bytes
 
     def load_model(
         self, model_path: str, model_options: dict = None, sgld_options: dict = None
@@ -478,9 +482,20 @@ class SGLDiffusionGenerator:
         self.last_options = gather_options
         self.model_path = detect_path
 
-        comfyui_model, model_config, model_type = self.get_comfyui_model(
-            detect_path, model_options
+        comfyui_model, model_config, model_type, model_size_bytes = (
+            self.get_comfyui_model(detect_path, model_options)
         )
+        if _looks_like_gguf(model_path):
+            # detect_path is the BF16 companion used only so ComfyUI's
+            # architecture detect has keys to read; the weights that
+            # actually land in VRAM are the (much smaller, quantized) GGUF
+            # file, so size them from that file instead of the companion.
+            try:
+                model_size_bytes = os.path.getsize(
+                    sgld_options["transformer_weights_path"]
+                )
+            except OSError:
+                pass
         if model_type is None or model_type not in self.pipeline_class_dict:
             raise ValueError(f"Unsupported model type: {model_type}")
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
@@ -509,7 +524,11 @@ class SGLDiffusionGenerator:
         offload_device = model_management.unet_offload_device()
 
         self._patcher = SGLDModelPatcher(
-            comfyui_model, load_device, offload_device, model_type=model_type
+            comfyui_model,
+            load_device,
+            offload_device,
+            size=model_size_bytes,
+            model_type=model_type,
         )
         self._patcher.add_wrapper_with_key(
             WrappersMP.SAMPLER_SAMPLE,
