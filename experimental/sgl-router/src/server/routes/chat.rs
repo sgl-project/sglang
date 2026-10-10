@@ -2887,7 +2887,7 @@ mod tests {
             load_monitor: crate::config::LoadMonitorConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
             admission: crate::config::AdmissionConfig::default(),
-            retry: crate::config::RetryConfig::default(),
+            retry: RetryConfig::default(),
         }
     }
 

@@ -501,7 +501,6 @@ impl CacheAwareBlocks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAwareDecision {
     CacheHit,
-    LoadImbalance,
     NoWorkers,
     RequestBodyUnavailable,
     RequestJsonInvalid,
@@ -556,7 +555,6 @@ impl CacheAwareDecision {
     fn as_str(self) -> &'static str {
         match self {
             Self::CacheHit => "cache_hit",
-            Self::LoadImbalance => "load_imbalance",
             Self::NoWorkers => "no_workers",
             Self::RequestBodyUnavailable => "request_body_unavailable",
             Self::RequestJsonInvalid => "request_json_invalid",

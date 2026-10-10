@@ -32,19 +32,16 @@
 //! workers that are idle on the engine side but still draining a finished
 //! stream to a slow client.
 //!
-//! 1. **Load gate**, per [`crate::config::LoadGate`]. Two mutually exclusive
-//!    strategies; see that type for why each measures what it does.
+//! 1. **Load gate**, per [`crate::config::LoadGate`]: an optional per-worker
+//!    queue limit (`--worker-queue-limit`); see that type for why it measures
+//!    the queue rather than total depth.
 //!
-//!    `PerWorkerQueue` defers to step 3, because a per-worker question cannot
+//!    The gate always defers to step 3, because a per-worker question cannot
 //!    be answered until the cache has named a worker. The cache lookup is
 //!    unchanged, but every min-load fallback in this file additionally prefers
 //!    a non-queueing worker — including the below-threshold tree-miss path,
-//!    which is the highest-volume one.
-//!
-//!    `FleetSpread` — the default — decides here: when the spread is wide it
-//!    skips the cache lookup entirely and picks the lowest-load of a
-//!    `min_load_choices` sample,
-//!    abandoning locality for every request on the strength of one busy one.
+//!    which is the highest-volume one. With no limit set there is no load
+//!    override at all.
 //! 2. **Routing tokens.** Prefer the ingress-precomputed ids
 //!    (`ctx.request_tokens()`); fall back to tokenizing the body here
 //!    (chat-encoder-aware for chat traffic, raw `prompt`/`text` otherwise)
@@ -54,7 +51,7 @@
 //!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
 //!    pick the lowest-load worker whose `url` appears in the match result and
-//!    whose engine queue is under `PerWorkerQueue`'s limit, if one is
+//!    whose engine queue is under the `--worker-queue-limit`, if one is
 //!    configured. An owner holding the prefix on device is preferred over
 //!    one holding it only on host (the tree tracks tiers); load breaks ties
 //!    within a tier. Otherwise, fall through.
@@ -179,16 +176,6 @@ impl std::fmt::Debug for CacheAwareZmqPolicy {
     }
 }
 
-/// Snapshot of the load-imbalance check, carried out of
-/// [`CacheAwareZmqPolicy::balance_check`] so the caller can log the
-/// numbers behind a rebalance decision.
-struct BalanceCheck {
-    min_load: usize,
-    max_load: usize,
-    abs_diff: usize,
-    imbalanced: bool,
-}
-
 use crate::policies::engine_load::WorkerLoads;
 
 /// Outcome of [`CacheAwareZmqPolicy::match_request`] — the matched cache
@@ -300,7 +287,7 @@ impl CacheAwareZmqPolicy {
     /// `choices == 0` (impossible from the CLI, which is `NonZeroUsize`)
     /// is treated as 1.
     ///
-    /// Under [`LoadGate::PerWorkerQueue`] this stays a two-tier pick, and
+    /// With a `--worker-queue-limit` set this stays a two-tier pick, and
     /// the sampling happens WITHIN each tier: the sample is drawn from the
     /// workers that are not already queueing, and only when none exists
     /// from the queueing ones — a sample never lands on a queueing worker
@@ -376,41 +363,6 @@ impl CacheAwareZmqPolicy {
         workers
             .iter()
             .any(|w| loads.waiting_of(w).is_some_and(|q| q < floor.get()))
-    }
-
-    /// Detect load imbalance. Returns the min/max load snapshot together
-    /// with the `imbalanced` verdict — `true` when the spread between max
-    /// and min load is large enough that cache-aware routing would dump
-    /// even more on the hot worker. The caller logs these numbers so every
-    /// rebalance decision is visible in the logs.
-    ///
-    /// `min_load`/`max_load` are [`WorkerLoads::load_of`] values, i.e. for a
-    /// worker with a fresh engine snapshot this is the engine-reported depth
-    /// PLUS this router's own not-yet-reported dispatches — not the raw
-    /// engine number alone. An on-call reader comparing this log's
-    /// `max_load` against the engine's own `/metrics` queue depth during an
-    /// incident should expect them to differ by that correction.
-    fn balance_check(
-        &self,
-        workers: &[Arc<Worker>],
-        loads: &WorkerLoads,
-        abs_threshold: usize,
-        rel_factor: f32,
-    ) -> BalanceCheck {
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
-            let l = loads.load_of(w);
-            (mn.min(l), mx.max(l))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-        let abs_diff = max_load.saturating_sub(min_load);
-        let rel_threshold = (min_load as f32 * rel_factor) as usize;
-        let imbalanced = abs_diff > abs_threshold && max_load > rel_threshold;
-        BalanceCheck {
-            min_load,
-            max_load,
-            abs_diff,
-            imbalanced,
-        }
     }
 
     /// Match the request against the tree across one or both hashing modes.
@@ -543,7 +495,7 @@ impl CacheAwareZmqPolicy {
                 .and_then(|tiers| tiers.best_slot())
                 .unwrap_or(usize::MAX)
         };
-        let best_rank = candidates.clone().map(|w| rank(w)).min()?;
+        let best_rank = candidates.clone().map(&rank).min()?;
         // Least-loaded owner below the best tier: what the slack rule falls
         // back to, and the queue the best-tier owners are measured against.
         let lower = candidates
@@ -681,92 +633,37 @@ impl Policy for CacheAwareZmqPolicy {
         // stopped using would send the NEXT turn somewhere cold.
         let mm_key = self.mm_affinity_key(ctx);
 
-        // 1. Load gate. With a queue limit configured the gate is per-worker and
-        //    cannot be decided yet — it needs to know which worker the cache
-        //    would pick — so it moves to step 3 and only the audit log runs here.
-        //    Without one, the fleet-spread check can short-circuit the whole
-        //    selection before any tokenization happens.
+        // 1. Load gate. The gate is per-worker, so it cannot be decided yet — it
+        //    needs to know which worker the cache would pick — and moves to step
+        //    3; only the audit log runs here. With no `--worker-queue-limit` set
+        //    there is no load override at all.
         //
-        //    Both paths log `engine_load_workers` against `engine_load_expected`
-        //    on every selection: that pair is the only signal that `load_of` has
+        //    The log pairs `engine_load_workers` with `engine_load_expected` on
+        //    every selection: that pair is the only signal that `load_of` has
         //    fallen back to the per-process in-flight counter, which silently
         //    rescales every load comparison below it.
-        match self.config.load_gate {
-            LoadGate::PerWorkerQueue(limit) => {
-                // `waiting_of` is `None` for every worker here, so the gate
-                // admits everything and the fleet-spread strategy it replaced
-                // is not running either — the router has no load override at
-                // all. Silent otherwise: `cache_worker_queued` sitting at 0 is
-                // indistinguishable from a healthy fleet, and the
-                // workers/expected pair reads 0/0 when no worker ever
-                // advertised a load port, which looks correctly configured.
-                if loads.engine_worker_count() == 0 && should_log(&QUEUE_GATE_BLIND_LOG_COUNTER) {
-                    tracing::warn!(
-                        model = %ctx.model(),
-                        worker_queue_limit = limit.get(),
-                        engine_load_expected = self.engine_load.expected_count(),
-                        "cache-aware-zmq: --worker-queue-limit is set but no worker has a fresh engine load snapshot, so the queue gate is inert and the fleet-spread gate it replaced is not running. Check that engines advertise a load port and publish LoadStat",
-                    );
-                }
-                tracing::debug!(
+        if let Some(limit) = self.config.load_gate.queue_limit() {
+            // `waiting_of` is `None` for every worker here, so the gate admits
+            // everything and the router has no load override at all. Silent
+            // otherwise: `cache_worker_queued` sitting at 0 is indistinguishable
+            // from a healthy fleet, and the workers/expected pair reads 0/0 when
+            // no worker ever advertised a load port, which looks correctly
+            // configured.
+            if loads.engine_worker_count() == 0 && should_log(&QUEUE_GATE_BLIND_LOG_COUNTER) {
+                tracing::warn!(
                     model = %ctx.model(),
-                    worker_queue_limit = limit.get(),
-                    engine_load_workers = loads.engine_worker_count(),
+                    worker_queue_limit = limit,
                     engine_load_expected = self.engine_load.expected_count(),
-                    "cache-aware-zmq: per-worker queue gate active; deferring the load gate to the matched set",
+                    "cache-aware-zmq: --worker-queue-limit is set but no worker has a fresh engine load snapshot, so the queue gate is inert. Check that engines advertise a load port and publish LoadStat",
                 );
             }
-            LoadGate::FleetSpread {
-                abs_threshold,
-                rel_threshold,
-            } => {
-                let balance = self.balance_check(workers, &loads, abs_threshold, rel_threshold);
-                tracing::debug!(
-                    model = %ctx.model(),
-                    min_load = balance.min_load,
-                    max_load = balance.max_load,
-                    abs_diff = balance.abs_diff,
-                    balance_abs_threshold = abs_threshold,
-                    balance_rel_threshold = rel_threshold,
-                    imbalanced = balance.imbalanced,
-                    engine_load_workers = loads.engine_worker_count(),
-                    engine_load_expected = self.engine_load.expected_count(),
-                    "cache-aware-zmq: load-balance check considered",
-                );
-                if balance.imbalanced {
-                    self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
-                    let chosen = Self::pick_min_load(
-                        workers,
-                        &loads,
-                        &self.config.load_gate,
-                        self.config.min_load_choices,
-                    );
-                    if let Some(w) = &chosen {
-                        tracing::info!(
-                            model = %ctx.model(),
-                            worker = %w.url,
-                            worker_load = loads.load_of(w),
-                            min_load = balance.min_load,
-                            max_load = balance.max_load,
-                            abs_diff = balance.abs_diff,
-                            balance_abs_threshold = abs_threshold,
-                            balance_rel_threshold = rel_threshold,
-                            engine_load_workers = loads.engine_worker_count(),
-                            engine_load_expected = self.engine_load.expected_count(),
-                            "cache-aware-zmq: load imbalance detected — bypassing cache, routing to sampled min-load worker",
-                        );
-                        // Re-pin even though load overrode affinity. The worker
-                        // we are actually sending this turn to ends up with the
-                        // FULLER prefix (it computes turns 1..N; the old pin
-                        // holds only 1..N-1), so leaving the pin behind would
-                        // send the next turn to the more stale of the two.
-                        if let Some(key) = mm_key.as_deref() {
-                            self.mm_affinity.record(key, &w.url);
-                        }
-                    }
-                    return chosen;
-                }
-            }
+            tracing::debug!(
+                model = %ctx.model(),
+                worker_queue_limit = limit,
+                engine_load_workers = loads.engine_worker_count(),
+                engine_load_expected = self.engine_load.expected_count(),
+                "cache-aware-zmq: per-worker queue gate active; deferring the load gate to the matched set",
+            );
         }
 
         // 1b. Affinity for image conversations, ahead of the overlap path
@@ -1944,7 +1841,7 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(2).unwrap()),
+                load_gate: LoadGate::new(NonZeroUsize::new(2)),
                 min_load_choices: usize::MAX,
                 saturation_queue_floor: None,
                 ..Default::default()
@@ -2016,7 +1913,7 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(2).unwrap()),
+                load_gate: LoadGate::new(NonZeroUsize::new(2)),
                 min_load_choices: usize::MAX,
                 saturation_queue_floor: None,
                 ..Default::default()
@@ -2342,10 +2239,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 32,
-                    rel_threshold: 1.1,
-                },
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             Arc::new(HashTree::new()),
@@ -2387,60 +2281,6 @@ mod tests {
         );
     }
 
-    /// When load imbalance overrides affinity, the pin must MOVE to the worker
-    /// the turn actually went to — that worker ends up with the fuller prefix,
-    /// so leaving the pin behind would send the next turn to the staler one.
-    #[test]
-    fn imbalance_bypass_repins_to_the_worker_actually_used() {
-        let registry = tokenizer_registry_with_tiny();
-        let policy = new_policy(
-            CacheAwareConfig {
-                cache_threshold: 0.0,
-                // Trip the imbalance check on a small, easily-created spread.
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 1,
-                    rel_threshold: 1.0,
-                },
-                ..Default::default()
-            },
-            Arc::new(HashTree::new()),
-            registry,
-            oracle_for_tests(4),
-        );
-        let w0 = worker("http://w0:30000", "tiny");
-        let w1 = worker("http://w1:30000", "tiny");
-        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
-        let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"messages":[{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":"http://img/x.png"}}]}]}))
-        .unwrap();
-
-        // Turn 1, balanced: establishes a pin.
-        let first = policy
-            .select(&workers, &SelectionContext::new(&model, Some(&body)))
-            .unwrap();
-        let other = if first.url == w0.url { &w1 } else { &w0 };
-
-        // Turn 2 under imbalance: load the pinned worker so min-load bypasses
-        // affinity and routes to `other`.
-        let guards: Vec<_> = (0..4).map(|_| first.load_guard()).collect();
-        let second = policy
-            .select(&workers, &SelectionContext::new(&model, Some(&body)))
-            .unwrap();
-        assert_eq!(second.url, other.url, "imbalance must override affinity");
-        drop(guards);
-
-        // Turn 3, balanced again: the pin must now point at `other`, not the
-        // original worker.
-        let third = policy
-            .select(&workers, &SelectionContext::new(&model, Some(&body)))
-            .unwrap();
-        assert_eq!(
-            third.url, other.url,
-            "the pin must have moved to the worker the imbalanced turn used"
-        );
-    }
-
     /// A DIFFERENT image must not inherit the pin — otherwise affinity would
     /// funnel unrelated conversations onto one worker.
     #[test]
@@ -2449,10 +2289,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 32,
-                    rel_threshold: 1.1,
-                },
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             Arc::new(HashTree::new()),
@@ -2495,10 +2332,7 @@ mod tests {
         let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 32,
-                    rel_threshold: 1.1,
-                },
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             Arc::new(HashTree::new()),
@@ -2925,52 +2759,11 @@ mod tests {
         );
     }
 
-    /// w0 holds the prefix but is heavily overloaded → imbalance branch
-    /// skips cache-aware and picks w1.
-    #[test]
-    fn imbalanced_pool_skips_cache_check() {
-        let tree = Arc::new(HashTree::new());
-        let registry = tokenizer_registry_with_tiny();
-        let text = "hello world hello world hello world";
-        let tok = registry.get("tiny").unwrap();
-        let ids = adapter::encode(&tok, text).unwrap();
-        let block_size = 4u32;
-        let hashes = compute_block_hashes(&ids, block_size as usize);
-        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
-
-        let policy = new_policy(
-            CacheAwareConfig {
-                cache_threshold: 0.0, // would normally always match
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 5,
-                    rel_threshold: 2.0,
-                },
-                ..Default::default()
-            },
-            tree,
-            registry,
-            oracle_for_tests(4),
-        );
-        let w0 = worker("http://w0:30000", "tiny");
-        let w1 = worker("http://w1:30000", "tiny");
-        // Bump w0 well above the imbalance threshold.
-        let mut guards = Vec::new();
-        for _ in 0..20 {
-            guards.push(w0.load_guard());
-        }
-        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
-        let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
-        let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, "http://w1:30000", "imbalance must dominate");
-    }
-
-    /// Fresh engine-reported load drives the imbalance + min-load decision
-    /// instead of the router-side in-flight counter. Both workers hold the
-    /// prefix and have zero router-side load, so without engine load the
-    /// tiebreak would pick w0 (stable order). Engine load says w0 is hot
-    /// (50) and w1 is light (1) → the imbalance branch routes to w1.
+    /// Fresh engine-reported load drives the matched-set tiebreak instead of
+    /// the router-side in-flight counter. Both workers hold the prefix and have
+    /// zero router-side load, so without engine load the tiebreak would pick w0
+    /// (stable order). Engine load says w0 is hot (50) and w1 is light (1) → the
+    /// matched-set tiebreak routes to w1.
     #[test]
     fn engine_load_overrides_active_load() {
         let tree = Arc::new(HashTree::new());
@@ -2990,10 +2783,7 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 5,
-                    rel_threshold: 2.0,
-                },
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             tree,
@@ -3038,12 +2828,8 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 0.0,
-                // High thresholds so the imbalance fast-path never fires (10 vs
-                // 2) and selection reaches the matched-set tiebreak.
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 100,
-                    rel_threshold: 100.0,
-                },
+                // No load gate, so selection reaches the matched-set tiebreak.
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             tree,
@@ -3093,10 +2879,7 @@ mod tests {
                 // High thresholds so the imbalance fast-path never fires on
                 // the raw engine numbers (1 vs 3) and selection reaches the
                 // matched-set tiebreak, which also uses `load_of`.
-                load_gate: LoadGate::FleetSpread {
-                    abs_threshold: 100,
-                    rel_threshold: 100.0,
-                },
+                load_gate: LoadGate::default(),
                 ..Default::default()
             },
             tree,
@@ -4010,7 +3793,7 @@ mod tests {
     fn queue_cfg(limit: usize) -> CacheAwareConfig {
         CacheAwareConfig {
             cache_threshold: 0.0, // any match counts; the gate is what's under test
-            load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(limit).expect("limit > 0")),
+            load_gate: LoadGate::new(NonZeroUsize::new(limit)),
             min_load_choices: usize::MAX,
             ..Default::default()
         }
@@ -4022,16 +3805,6 @@ mod tests {
         CacheAwareConfig {
             saturation_queue_floor: Some(NonZeroUsize::new(floor).expect("floor > 0")),
             ..queue_cfg(limit)
-        }
-    }
-
-    /// Fleet-spread config with the shipped defaults, for the side-by-side arms
-    /// that characterise the strategy the queue gate replaces.
-    fn spread_cfg() -> CacheAwareConfig {
-        CacheAwareConfig {
-            cache_threshold: 0.0,
-            min_load_choices: usize::MAX,
-            ..Default::default()
         }
     }
 
@@ -4094,7 +3867,7 @@ mod tests {
     /// well under their concurrency cap. Here the cache home is SHALLOWER than
     /// the alternative — depth 13 vs 20 — yet it is the one that would make the
     /// request wait. Any depth-based gate keeps feeding it; the queue gate does
-    /// not, and the fleet-spread arm does not either.
+    /// not.
     #[test]
     fn queue_gate_diverts_a_shallow_but_queueing_cache_home() {
         let registry = tokenizer_registry_with_tiny();
@@ -4114,10 +3887,10 @@ mod tests {
         let metrics = MetricsRegistry::new();
         let policy = new_policy_with_load(
             queue_cfg(4),
-            Arc::clone(&tree),
-            Arc::clone(&registry),
+            tree,
+            registry,
             oracle_for_tests(4),
-            Arc::clone(&engine_load),
+            engine_load,
         )
         .with_metrics(Arc::clone(&metrics));
         assert_eq!(
@@ -4131,19 +3904,6 @@ mod tests {
                 "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 1"
             ),
             "the diversion must be attributable to the queue gate; got:\n{rendered}"
-        );
-
-        let spread = new_policy_with_load(
-            spread_cfg(),
-            tree,
-            registry,
-            oracle_for_tests(4),
-            engine_load,
-        );
-        assert_eq!(
-            spread.select(&workers, &ctx).expect("must pick").url,
-            "http://w0:30000",
-            "the fleet-spread strategy keeps feeding the queueing worker: spread is only 7",
         );
     }
 
@@ -4764,10 +4524,9 @@ mod tests {
         );
     }
 
-    /// Over-firing, the other half of what this replaces: a wide fleet spread
-    /// makes `FleetSpread` bypass the cache for every request. The queue gate
-    /// never consults the spread, so a cache home with no backlog keeps its
-    /// traffic no matter how uneven the fleet is.
+    /// The queue gate never consults the fleet-wide load spread, so a cache
+    /// home with no backlog keeps its traffic no matter how uneven the rest of
+    /// the fleet is — even with another worker sitting at a far higher depth.
     #[test]
     fn queue_gate_ignores_fleet_spread_when_the_cache_home_is_not_queueing() {
         let registry = tokenizer_registry_with_tiny();
@@ -4788,28 +4547,15 @@ mod tests {
 
         let policy = new_policy_with_load(
             queue_cfg(4),
-            Arc::clone(&tree),
-            Arc::clone(&registry),
-            oracle_for_tests(4),
-            Arc::clone(&engine_load),
-        );
-        assert_eq!(
-            policy.select(&workers, &ctx).expect("must pick").url,
-            "http://w0:30000",
-            "a wide spread must not divert a request whose cache home has no queue",
-        );
-
-        let spread = new_policy_with_load(
-            spread_cfg(),
             tree,
             registry,
             oracle_for_tests(4),
             engine_load,
         );
         assert_eq!(
-            spread.select(&workers, &ctx).expect("must pick").url,
-            "http://w1:30000",
-            "documents the behaviour the queue gate replaces",
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "a wide spread must not divert a request whose cache home has no queue",
         );
     }
 
@@ -4862,7 +4608,7 @@ mod tests {
         let policy = new_policy_with_load(
             CacheAwareConfig {
                 cache_threshold: 1.0,
-                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(4).unwrap()),
+                load_gate: LoadGate::new(NonZeroUsize::new(4)),
                 ..Default::default()
             },
             tree,
