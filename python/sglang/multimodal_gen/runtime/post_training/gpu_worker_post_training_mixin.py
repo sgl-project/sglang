@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
@@ -19,14 +23,21 @@ from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils import MultiprocessingSerializer, init_custom_process_group
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+        DestroyWeightsUpdateGroupReqInput,
+        InitWeightsUpdateGroupReqInput,
         UpdateWeightFromTensorCheckerReqInput,
         UpdateWeightFromTensorReqInput,
+        UpdateWeightsFromDistributedReqInput,
     )
+
+
+_SENDER_RANK = 0
 
 
 def _normalize_gpu_uuid(uuid: str) -> str:
@@ -34,7 +45,70 @@ def _normalize_gpu_uuid(uuid: str) -> str:
     return uuid.removeprefix("MIG-").removeprefix("GPU-").lower()
 
 
+def _receive_broadcast_weights(
+    req: UpdateWeightsFromDistributedReqInput, group: dist.ProcessGroup
+) -> list[tuple[str, torch.Tensor]]:
+    named_tensors = [
+        (
+            name,
+            torch.empty(
+                shape, dtype=getattr(torch, dtype), device=torch.cuda.current_device()
+            ),
+        )
+        for name, dtype, shape in zip(req.names, req.dtypes, req.shapes, strict=True)
+    ]
+    handles = [
+        dist.broadcast(tensor, src=_SENDER_RANK, group=group, async_op=True)
+        for _, tensor in named_tensors
+    ]
+    for handle in handles:
+        handle.wait()
+    return named_tensors
+
+
 class GPUWorkerPostTrainingMixin:
+    def init_weights_update_group(
+        self, req: InitWeightsUpdateGroupReqInput
+    ) -> tuple[bool, str]:
+        if req.group_name in self._weights_update_groups:
+            return False, f"Group {req.group_name} already exists"
+        engine_world = get_world_group()
+        if req.rank_offset + engine_world.world_size > req.world_size:
+            return False, "Engine ranks exceed the update group size"
+        dist_timeout = self.server_args.dist_timeout
+        self._weights_update_groups[req.group_name] = init_custom_process_group(
+            backend=req.backend,
+            init_method=NetworkAddress(req.master_address, req.master_port).to_tcp(),
+            world_size=req.world_size,
+            rank=req.rank_offset + engine_world.rank_in_group,
+            group_name=req.group_name,
+            timeout=None if dist_timeout is None else timedelta(seconds=dist_timeout),
+        )
+        return True, "Initialized weight update group"
+
+    def update_weights_from_distributed(
+        self, req: UpdateWeightsFromDistributedReqInput
+    ) -> tuple[bool, str]:
+        group = self._weights_update_groups.get(req.group_name)
+        if group is None:
+            return False, f"Unknown weight update group {req.group_name}"
+        named_tensors = _receive_broadcast_weights(req, group)
+        return WeightsUpdater(self.pipeline).update_weights_from_tensor(
+            named_tensors=named_tensors,
+            target_modules=req.target_modules,
+            weight_update_mode=req.weight_update_mode,
+            lora_alpha=req.lora_alpha,
+            lora_rank=req.lora_rank,
+        )
+
+    def destroy_weights_update_group(
+        self, req: DestroyWeightsUpdateGroupReqInput
+    ) -> tuple[bool, str]:
+        group = self._weights_update_groups.pop(req.group_name, None)
+        if group is not None:
+            dist.destroy_process_group(group)
+        return True, "Destroyed weight update group"
+
     def update_weights_from_disk(
         self,
         model_path: str,
