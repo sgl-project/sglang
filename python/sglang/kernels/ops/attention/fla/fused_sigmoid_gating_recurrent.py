@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -5,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
@@ -64,6 +66,22 @@ def _select_recurrent_launch_config(
         # GLM TP8 DFlash verification: 256 CTAs instead of 32.
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
+
+
+@functools.lru_cache(maxsize=8)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_bv(v_size: int, programs_per_split: int, device: torch.device) -> int:
+    # V tiles are independent; splitting them fills otherwise idle SMs at small N.
+    v_pow2 = triton.next_power_of_2(v_size)
+    bv_max = min(v_pow2, 32)
+    bv_min = min(16, bv_max)
+    wanted = max(1, _sm_count(device.index) // max(1, programs_per_split))
+    splits = 1 << (wanted.bit_length() - 1)
+    splits = max(1, min(splits, v_pow2 // bv_min))
+    return max(bv_min, min(bv_max, v_pow2 // splits))
 
 
 _EX2_APPROX_FTZ_F32 = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
@@ -610,6 +628,8 @@ def fused_sigmoid_gating_delta_rule_update(
         target_verify=target_verify,
         cache_steps=cache_steps,
     )
+    if is_kda and _is_sm90 and envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get():
+        BV = _select_bv(V, N * HV, v.device)
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"

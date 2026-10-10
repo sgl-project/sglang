@@ -31,6 +31,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",

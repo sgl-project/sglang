@@ -1236,6 +1236,8 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    SGLANG_ENABLE_FP8_BLOCK_GEMV = EnvBool(False)
+    SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================
