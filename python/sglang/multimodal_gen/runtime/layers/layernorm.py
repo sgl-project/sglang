@@ -38,6 +38,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.srt.utils.custom_op import register_custom_op
+
+# An opaque op to torch.compile, as srt.models.utils registers it: a bare JIT
+# launch graph-breaks every layer that normalizes q/k.
+fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
 
 _is_cuda = current_platform.is_cuda()
 _is_rocm = current_platform.is_rocm()
@@ -1161,7 +1166,6 @@ def apply_qk_norm_rope(
     if (
         fused_enabled
         and (_is_cuda or _is_rocm)
-        and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
