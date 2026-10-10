@@ -1570,9 +1570,9 @@ class USPAttention(nn.Module):
         """
         groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
         if (
-            groups in (0, 1)
+            not q.is_cuda
+            or groups in (0, 1)
             or self.backend not in PIPELINED_ATTENTION_BACKENDS
-            or not q.is_cuda
             or torch.compiler.is_compiling()
             or torch.cuda.is_current_stream_capturing()
         ):
