@@ -5,6 +5,9 @@ metatags:
 ---
 
 import { Qwen3NextDeployment } from '/src/snippets/autoregressive/qwen3-next-deployment.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config as ascendConfig } from '/src/snippets/configs/Qwen/qwen3-next-80b-a3b-instruct.jsx';
+import { benchmarks as ascendBenchmarks } from '/src/snippets/configs/Qwen/qwen3-next-80b-a3b-instruct-benchmarks.jsx';
 
 ## 1. Model Introduction
 
@@ -46,7 +49,21 @@ The Qwen3-Next series comes in only one size but offers different thinking modes
 
 <Qwen3NextDeployment />
 
-### 3.2 Configuration Tips
+<a id="ascend-npu-deployment" />
+
+### 3.2 Ascend NPU deployment
+
+The Cookbook also includes a deployment path based on the validated **Atlas 800I A3** best-practice configuration.
+The selector below currently exposes the supported **1-card PD co-located** scenario: prefill and decode run in the same process, and one A3 card contributes two dies, so the command uses `--tp-size 2`.
+
+Before you run the command, complete the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) or the [full installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation).
+Use the W8A8 main checkpoint and the BF16 checkpoint as the NEXTN draft model. The selector's **Env** control lets you set both local paths and the HCCL/Gloo interface. This is the only A3 launch recipe on this page. The pre-existing GPU examples below retain their stated platform scope and are not NPU launch recipes; do not use them as a substitute for the 1-card A3 command.
+
+<Deployment config={ascendConfig} benchmarks={ascendBenchmarks} />
+
+For model conversion, environment versions, and the reasoning behind each performance setting, see the [Qwen3-Next Ascend NPU tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct) and [best-practice configuration](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_next_80b_a3b_instruct).
+
+### 3.3 Configuration Tips
 
 - `--max-mamba-cache-size`: Adjust `--max-mamba-cache-size` to increase mamba cache space and max running requests capability. It will decrease KV cache space as a trade-off. You can adjust it according to workload.
 
