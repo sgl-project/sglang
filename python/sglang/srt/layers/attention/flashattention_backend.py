@@ -30,7 +30,11 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadataBuilder,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+    is_interleave,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
@@ -1416,6 +1420,44 @@ class FlashAttentionBackend(AttentionBackend):
             raise NotImplementedError("MLA extend does not return an LSE.")
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
+        if cp_active and is_interleave():
+            if (
+                self.use_mla
+                and self.fa_impl_ver == 4
+                and (
+                    (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size >= 0
+                    )
+                    or layer.logit_cap != 0
+                    or self.num_splits > 1
+                )
+            ):
+                raise NotImplementedError(
+                    "FA4 dense interleave MLA does not support sliding windows, "
+                    "softcaps, or forced split-KV."
+                )
+            if (
+                layer.is_cross_attention
+                or layer.attn_type
+                in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+                or (
+                    self.local_attn_builder is not None
+                    and self.local_attn_builder.applies(layer, self.forward_metadata)
+                )
+                or self.fa_skip_kv_cache
+                or score_mod is not None
+                or rel_bias is not None
+                or self.kv_cache_is_mxfp8
+                or return_lse
+                or forward_batch.attn_attend_prefix_cache is not None
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                raise NotImplementedError(
+                    "Dense interleave CP requires causal paged attention without "
+                    "local chunking, custom score/bias, MXFP8, LSE output, or "
+                    "speculative verification."
+                )
 
         if k is not None:
             assert v is not None
@@ -1425,9 +1467,19 @@ class FlashAttentionBackend(AttentionBackend):
                     if cp_active:
                         cp_strategy = get_cp_strategy()
                         assert cp_strategy is not None
-                        cp_strategy.materialize_full_mla_kv(
+                        gathered = cp_strategy.materialize_full_mla_kv(
                             forward_batch, layer, k, k_rope
                         )
+                        # DSA consumes interleave's gathered tuple directly;
+                        # dense MLA additionally owns the paged cache write.
+                        if gathered is not None:
+                            full_k, full_k_rope = gathered
+                            self.token_to_kv_pool.set_mla_kv_buffer(
+                                layer,
+                                KVWriteLoc.for_layer(forward_batch, layer),
+                                full_k,
+                                full_k_rope,
+                            )
                     else:
                         self.token_to_kv_pool.set_mla_kv_buffer(
                             layer,
@@ -1615,16 +1667,33 @@ class FlashAttentionBackend(AttentionBackend):
             if cp_active:
 
                 def _fa_cp_attn(
-                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
+                    q_chunk,
+                    cu_seqlens_q_cp,
+                    cache_seqlens_cp,
+                    max_seqlen_q_cp,
+                    *,
+                    request_indices=None,
                 ):
+                    cp_page_table = page_table
+                    cp_kwargs = kwargs
+                    cp_cu_k = cu_seqlens_k if not use_local_attn else None
+                    if request_indices is not None:
+                        cp_page_table = page_table.index_select(0, request_indices)
+                        cp_cu_k = None
+                        cp_kwargs = dict(kwargs)
+                        for name in ("k_descale", "v_descale"):
+                            if name in cp_kwargs:
+                                cp_kwargs[name] = cp_kwargs[name].index_select(
+                                    0, request_indices
+                                )
                     return flash_attn_with_kvcache(
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
-                        page_table=page_table,
+                        page_table=cp_page_table,
                         cache_seqlens=cache_seqlens_cp,
                         cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        cu_seqlens_k_new=cp_cu_k,
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
                         causal=False if use_cascade_attn else causal,
@@ -1633,7 +1702,7 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
-                        **kwargs,
+                        **cp_kwargs,
                     )
 
                 q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1875,12 +1944,9 @@ class FlashAttentionBackend(AttentionBackend):
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
                 if cp_active:
-                    # MLA CP: q is rank-local zigzag-split; run the
-                    # absorbed-MLA kernel twice (prev/next halves) against
-                    # the full latent KV pool through the selected strategy.
-                    # Concat q_nope + q_rope along dim=-1 so the wrapper's
-                    # chunk(2, dim=0) keeps their alignment; split back
-                    # inside the closure.
+                    # The strategy selects local query groups against the full
+                    # latent cache. Keep nope/rope aligned through that dispatch
+                    # and split them again at the absorbed-MLA kernel boundary.
                     assert not use_cascade_attn, (
                         "Cascade attention under MLA CP is not supported."
                     )
@@ -1891,26 +1957,42 @@ class FlashAttentionBackend(AttentionBackend):
                         cu_seqlens_q_cp,
                         cache_seqlens_cp,
                         max_seqlen_q_cp,
+                        *,
+                        request_indices=None,
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
+                        cp_page_table = page_table
+                        cp_k_descale, cp_v_descale = fa_k_descale, fa_v_descale
+                        cp_cu_k = cu_seqlens_k if not use_local_attn else None
+                        if request_indices is not None:
+                            cp_page_table = page_table.index_select(0, request_indices)
+                            cp_cu_k = None
+                            if cp_k_descale is not None:
+                                cp_k_descale = cp_k_descale.index_select(
+                                    0, request_indices
+                                )
+                                cp_v_descale = cp_v_descale.index_select(
+                                    0, request_indices
+                                )
                         return flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
-                            page_table=page_table,
+                            page_table=cp_page_table,
                             cache_seqlens=cache_seqlens_cp,
                             cu_seqlens_q=cu_seqlens_q_cp,
-                            cu_seqlens_k_new=(
-                                cu_seqlens_k if not use_local_attn else None
-                            ),
+                            cu_seqlens_k_new=cp_cu_k,
                             max_seqlen_q=max_seqlen_q_cp,
                             softmax_scale=layer.scaling,
                             causal=causal,
+                            window_size=(
+                                window_size if request_indices is not None else (-1, -1)
+                            ),
                             softcap=layer.logit_cap,
-                            k_descale=fa_k_descale,
-                            v_descale=fa_v_descale,
+                            k_descale=cp_k_descale,
+                            v_descale=cp_v_descale,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
                         )
