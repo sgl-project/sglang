@@ -390,12 +390,17 @@ class DiffusionServerBase:
 
     def _validate_and_record(
         self,
+        ctx: ServerContext,
         case: DiffusionTestCase,
         perf_record: RequestPerfRecord,
         request_index: int = 1,
-        load_time_ms: float | None = None,
     ) -> None:
-        """Validate metrics and record results."""
+        """Validate metrics and record results.
+
+        The load duration is read off ``ctx`` rather than passed separately:
+        recording a result requires it, and a caller that has the server always
+        has the measurement.
+        """
         if perf_record is None:
             raise PerformanceValidationError(
                 f"[performance] {case.id}: request performance record is missing"
@@ -426,7 +431,7 @@ class DiffusionServerBase:
         )
 
         summary = validator.collect_metrics(perf_record)
-        summary.load_time_ms = load_time_ms
+        summary.load_time_ms = ctx.load_time_ms
         self._record_performance_result(case, summary, request_index)
         self._print_performance_log(case, summary, scenario)
 
@@ -1727,7 +1732,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             run_case_check(
                 "performance",
                 lambda: self._validate_and_record(
-                    case, perf_record, request_index, diffusion_server.load_time_ms
+                    diffusion_server, case, perf_record, request_index
                 ),
             )
 
