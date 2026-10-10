@@ -1562,6 +1562,84 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    # Token-level pieces of two consecutive tool calls; streaming coalesces
+    # consecutive pieces into one increment under backlog or --stream-interval.
+    _TWO_CALL_PIECES = [
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>",
+        "function",
+        "<｜tool▁sep｜>",
+        "get_weather",
+        "\n```json\n",
+        '{"city": ',
+        '"Paris"}',
+        "\n```",
+        "<｜tool▁call▁end｜>",
+        "\n",
+        "<｜tool▁call▁begin｜>",
+        "function",
+        "<｜tool▁sep｜>",
+        "get_tourist_attractions",
+        "\n```json\n",
+        '{"city": ',
+        '"Tokyo"}',
+        "\n```",
+        "<｜tool▁call▁end｜>",
+        "<｜tool▁calls▁end｜>",
+    ]
+
+    def _stream_tool_calls(self, chunks):
+        detector = DeepSeekV3Detector()
+        names, arguments, normal_text = {}, {}, ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.name:
+                    self.assertNotIn(call.tool_index, names)
+                    names[call.tool_index] = call.name
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters
+                )
+        self.assertEqual(sorted(arguments), sorted(names))
+        calls = [
+            (names[index], json.loads(arguments[index])) for index in sorted(names)
+        ]
+        return calls, normal_text
+
+    def test_parse_streaming_multiple_complete_tool_calls_in_one_increment(self):
+        """Every complete call in one increment is emitted, in order."""
+        text = "".join(self._TWO_CALL_PIECES)
+        expected = [
+            ("get_weather", {"city": "Paris"}),
+            ("get_tourist_attractions", {"city": "Tokyo"}),
+        ]
+
+        calls, normal_text = self._stream_tool_calls([text])
+
+        self.assertEqual(calls, expected)
+        self.assertEqual(normal_text, "")
+        one_shot = DeepSeekV3Detector().detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in one_shot.calls], expected
+        )
+
+    def test_parse_streaming_tool_calls_independent_of_increment_size(self):
+        """Coalescing any number of pieces per increment yields the same calls."""
+        pieces = self._TWO_CALL_PIECES
+        expected = [
+            ("get_weather", {"city": "Paris"}),
+            ("get_tourist_attractions", {"city": "Tokyo"}),
+        ]
+        for size in range(1, len(pieces) + 1):
+            with self.subTest(pieces_per_increment=size):
+                chunks = [
+                    "".join(pieces[i : i + size]) for i in range(0, len(pieces), size)
+                ]
+                calls, normal_text = self._stream_tool_calls(chunks)
+                self.assertEqual(calls, expected)
+                self.assertEqual(normal_text.strip(), "")
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
