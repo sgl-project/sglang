@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "bfloat16": {"flashmla_sparse"},
-    "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
+    "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla", "tilelang"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
