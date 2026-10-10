@@ -1,3 +1,4 @@
+import inspect
 import logging
 
 from sglang.srt.environ import envs
@@ -15,7 +16,25 @@ def patch_tokenizer(tokenizer):
         )
         return _SpecialTokensCachePatcher.patch(tokenizer)
 
+    if _needs_pad_padding_side_shim(tokenizer):
+        logger.info(f"Applying _pad(padding_side=...) compat shim for {type(tokenizer)}")
+        return _PadPaddingSideShim.patch(tokenizer)
+
     return tokenizer
+
+
+def _needs_pad_padding_side_shim(tokenizer) -> bool:
+    pad_fn = getattr(type(tokenizer), "_pad", None)
+    if pad_fn is None:
+        return False
+    try:
+        sig = inspect.signature(pad_fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "padding_side" in params:
+        return False
+    return not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def unpatch_tokenizer(tokenizer):
@@ -38,6 +57,29 @@ def decode_without_hf_kwargs(tokenizer, token_ids, skip_special_tokens):
             special_ids_set = set(special_ids)
             token_ids = [tid for tid in token_ids if tid not in special_ids_set]
     return tokenizer.decode(token_ids)
+
+
+class _PadPaddingSideShim:
+    _PATCHED_FLAG = "_sglang_pad_padding_side_patched"
+
+    @classmethod
+    def patch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
+
+        if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        original_pad = tokenizer_cls._pad
+
+        def patched_pad(self, *args, **kwargs):
+            kwargs.pop("padding_side", None)
+            return original_pad(self, *args, **kwargs)
+
+        tokenizer_cls._original_pad = original_pad
+        tokenizer_cls._pad = patched_pad
+        setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
+
+        return tokenizer
 
 
 class _SpecialTokensCachePatcher:
