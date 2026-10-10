@@ -1320,11 +1320,20 @@ def _fwd_kernel_unified(
         first_query = cur_block_m * BLOCK_M
         last_query = tl.minimum(first_query + BLOCK_M, cur_seq_q_len)
         start_k = tl.maximum(0, cur_seq_prefix_len + first_query - SLIDING_WINDOW_SIZE)
-        start_k = start_k // BLOCK_N * BLOCK_N
+        # Align the tile grid to absolute key positions rather than to the start of the
+        # (possibly trimmed) window prefix. Otherwise a token's keys are grouped into
+        # different online-softmax tiles depending on how much of its prefix came from
+        # the radix cache, which breaks deterministic inference. The first tile may now
+        # begin before index 0; those slots are masked below.
+        start_k = (cur_window_start + start_k) // BLOCK_N * BLOCK_N - cur_window_start
         end_k = tl.minimum(cur_seq_kv_len, cur_seq_prefix_len + last_query)
     for start_n in range(start_k, end_k, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_kv_len
+        if IS_CAUSAL and SLIDING_WINDOW_SIZE > 0 and not USE_CUSTOM_MASK:
+            # start_n is aligned to absolute positions, so it can be negative here.
+            mask_n = ((start_n + offs_n) >= 0) & ((start_n + offs_n) < cur_seq_kv_len)
+        else:
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            mask_n = (start_n + offs_n) < cur_seq_kv_len
 
         # Compute mask
         final_mask = mask_m[:, None] & mask_n[None, :]
