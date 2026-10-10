@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import torch
 
@@ -227,6 +227,21 @@ class AttentionBackend(ABC):
         metadata object.
         """
         raise NotImplementedError()
+
+    def breakable_cuda_graph_request_slots(self, max_bs: int) -> tuple[int, ...]:
+        """Request counts to capture per token bucket under captured metadata.
+
+        Empty when the captured metadata does not depend on the request
+        count. Otherwise the runner captures one graph per listed count and
+        replays the smallest one that holds the batch.
+        """
+        return ()
+
+    def can_replay_breakable_cuda_graph(
+        self, *, batch_size: int, prefix_lens: Optional[Sequence[int]]
+    ) -> bool:
+        """Whether captured metadata can describe this batch at replay."""
+        return True
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""

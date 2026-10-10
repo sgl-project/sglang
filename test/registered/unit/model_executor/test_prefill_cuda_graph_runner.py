@@ -604,6 +604,74 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
 
+    def test_capture_spreads_a_bucket_over_the_requested_slots(self):
+        spread = runner_module._spread_capture_seq_lens
+        self.assertEqual(spread([8], 1), [8])
+        self.assertEqual(spread([8], 3), [6, 1, 1])
+        self.assertEqual(spread([4, 4], 3), [3, 4, 1])
+        with self.assertRaises(AssertionError):
+            spread([2], 3)
+
+    def test_request_slot_variants_select_the_smallest_fitting_graph(self):
+        class CapturedMetadataBackend:
+            def can_replay_breakable_cuda_graph(self, *, batch_size, prefix_lens):
+                return not any(prefix_lens or ())
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=64),
+            attn_backend=CapturedMetadataBackend(),
+        )
+        runner._capture_req_slots = 1
+        runner._is_full_backend = False
+        runner._capture_chunked_prefix = False
+        runner.enable_lora = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.max_num_tokens = 128
+        runner.capture_num_tokens = [4, 8, 128]
+        runner.max_context_size = None
+        runner.backend = SimpleNamespace()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner.use_captured_attn_metadata = True
+        runner._captured_req_slots = (1, 2, 4, 8)
+
+        # Each captured request needs a token, and a bucket over the context
+        # length needs at least two requests.
+        self.assertEqual(runner._req_slots_for_bucket(4), [1, 2, 4])
+        self.assertEqual(runner._req_slots_for_bucket(128), [2, 4, 8])
+        self.assertEqual(runner._select_req_slots(8, 3), 4)
+        self.assertIsNone(runner._select_req_slots(4, 5))
+
+        forward_batch = SimpleNamespace(
+            batch_size=3,
+            input_ids=torch.zeros(7, dtype=torch.int64),
+            input_embeds=None,
+            replace_embeds=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens_cpu=None,
+            dp_prefill_cuda_graph_max_prefix_len=0,
+            return_logprob=False,
+            extend_prefix_lens_cpu=[0, 0, 0],
+        )
+        self.assertTrue(runner.can_run_graph(forward_batch))
+        self.assertEqual(
+            runner._shape_key(8, forward_batch),
+            ShapeKey(size=8, variant_label="req_slots:4"),
+        )
+        # The backend vetoes batches its captured metadata cannot describe.
+        forward_batch.extend_prefix_lens_cpu = [0, 2, 0]
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        # More requests than the largest captured variant stays eager.
+        forward_batch.extend_prefix_lens_cpu = [0] * 9
+        forward_batch.batch_size = 9
+        forward_batch.input_ids = torch.zeros(100, dtype=torch.int64)
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        forward_batch.extend_prefix_lens_cpu = [0] * 8
+        forward_batch.batch_size = 8
+        self.assertTrue(runner.can_run_graph(forward_batch))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -552,6 +552,10 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         skip_reduce: bool,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph():
+            # Captured Mamba metadata covers the whole padded bucket, so the
+            # mixer can stay inside the graph.
+            if get_attn_backend().use_captured_forward_metadata_for_breakable_cuda_graph:
+                return self._forward_mamba(hidden_states, forward_batch)
             output = torch.empty_like(hidden_states)
             breakable_nemotron_mamba2_with_output(
                 hidden_states, output, self.layer_id, skip_reduce

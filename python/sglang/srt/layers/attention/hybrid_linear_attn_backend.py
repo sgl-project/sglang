@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 
@@ -1052,6 +1052,121 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             assert get_exec().mamba.mamba_track_interval >= self.mamba_chunk_size, (
                 f"mamba_track_interval ({get_exec().mamba.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
             )
+        # Radix-cache state tracking plans its copies on the host per batch,
+        # so only untracked prefill can run from captured metadata.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            not get_exec().mamba.enable_mamba_extra_buffer
+        )
+        self._pad_mamba_index: Optional[torch.Tensor] = None
+
+    def breakable_cuda_graph_request_slots(self, max_bs: int) -> tuple[int, ...]:
+        # Every sequence of the captured layout computes and writes a full
+        # SSM state, so pad sequences cost as much as live ones: capture a
+        # geometric ladder of request counts instead of one max-size layout.
+        slots = [1]
+        while slots[-1] * 2 < max_bs:
+            slots.append(slots[-1] * 2)
+        if slots[-1] != max_bs:
+            slots.append(max_bs)
+        return tuple(slots)
+
+    def can_replay_breakable_cuda_graph(
+        self, *, batch_size: int, prefix_lens: Optional[Sequence[int]]
+    ) -> bool:
+        # Initial states need host-planned chunk indices, which a graph
+        # cannot refresh.
+        return prefix_lens is None or not any(prefix_lens)
+
+    def _mamba_pad_index(self) -> torch.Tensor:
+        # Req-pool row 0 maps to the reserved mamba padding slot.
+        if self._pad_mamba_index is None:
+            row = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            self._pad_mamba_index = self._translate_mamba_indices(
+                self.req_to_token_pool.get_mamba_indices(row)
+            )
+        return self._pad_mamba_index
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ) -> Mamba2Metadata:
+        """Capture the batch's requests plus one pad sequence.
+
+        At replay the pad sequence absorbs the bucket's padding tokens and
+        any unused request slots become zero-length sequences; all of them
+        write the reserved padding slot.
+        """
+        num_tokens = len(forward_batch.input_ids)
+        num_seqs = forward_batch.batch_size + 1
+        live_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        )
+        mamba_cache_indices = torch.cat([live_indices, self._mamba_pad_index()])
+        lens = [*forward_batch.extend_seq_lens_cpu, 0]
+        query_start_loc = torch.zeros(
+            (num_seqs + 1,), dtype=torch.int32, device=self.device
+        )
+        query_start_loc[1:] = torch.tensor(lens, device=self.device).cumsum(0)
+        seq_idx = torch.repeat_interleave(
+            torch.arange(num_seqs, dtype=torch.int32, device=self.device),
+            torch.tensor(lens, device=self.device),
+            output_size=num_tokens,
+        ).unsqueeze(0)
+        metadata = Mamba2Metadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
+            logical_num_tokens=num_tokens,
+            num_prefills=num_seqs,
+            num_prefill_tokens=num_tokens,
+            num_decodes=0,
+            mixed_metadata=Mamba2Metadata.MixedMetadata(
+                has_initial_states=torch.zeros(
+                    (num_seqs,), dtype=torch.bool, device=self.device
+                ),
+                prep_initial_states=False,
+                chunk_size=self.mamba_chunk_size,
+                seq_idx=seq_idx,
+                chunk_indices=None,
+                chunk_offsets=None,
+                # Sizes the causal-conv launch grid only, so it must cover
+                # the longest sequence any replay can bring.
+                extend_seq_lens_cpu=[num_tokens] + [0] * (num_seqs - 1),
+            ),
+        )
+        self.forward_metadata = metadata
+        return metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata: Mamba2Metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        del static_forward_batch
+        bs = forward_batch.batch_size
+        num_seqs = capture_metadata.num_prefills
+        num_tokens = capture_metadata.num_prefill_tokens
+        assert bs < num_seqs, f"{bs=} needs a capture with more than {num_seqs=}"
+        live_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        query_start_loc = capture_metadata.query_start_loc
+        query_start_loc[:bs].copy_(forward_batch.extend_start_loc)
+        query_start_loc[bs] = live_tokens
+        query_start_loc[bs + 1 :] = num_tokens
+        seq_idx = capture_metadata.mixed_metadata.seq_idx[0]
+        seq_idx[:live_tokens] = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int32, device=self.device),
+            forward_batch.extend_seq_lens,
+            output_size=live_tokens,
+        )
+        seq_idx[live_tokens:] = bs
+        mamba_cache_indices = capture_metadata.mamba_cache_indices
+        mamba_cache_indices[:bs].copy_(
+            self._translate_mamba_indices(
+                self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
+            )
+        )
+        mamba_cache_indices[bs:] = self._mamba_pad_index()
+        self.forward_metadata = capture_metadata
 
     def init_forward_metadata_out_graph(
         self,
@@ -1227,6 +1342,48 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    # Full attention runs eagerly between breakable graph segments, so only
+    # the linear backend's metadata is captured.
+    @property
+    def use_captured_forward_metadata_for_breakable_cuda_graph(self) -> bool:
+        return self.linear_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+
+    def breakable_cuda_graph_request_slots(self, max_bs: int) -> tuple[int, ...]:
+        return self.linear_attn_backend.breakable_cuda_graph_request_slots(max_bs)
+
+    def can_replay_breakable_cuda_graph(
+        self, *, batch_size: int, prefix_lens: Optional[Sequence[int]]
+    ) -> bool:
+        return self.linear_attn_backend.can_replay_breakable_cuda_graph(
+            batch_size=batch_size, prefix_lens=prefix_lens
+        )
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        self.full_attn_backend.init_forward_metadata(forward_batch)
+        return self.linear_attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            forward_batch
+        )
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        self.full_attn_backend.init_forward_metadata(forward_batch)
+        if static_forward_batch is not None:
+            self.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=len(static_forward_batch.input_ids)
+            )
+        self.linear_attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            capture_metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:

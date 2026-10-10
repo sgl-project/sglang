@@ -164,6 +164,20 @@ def _chunked_prefix_variant(num_chunks: int) -> str:
     return f"chunked_prefix:{num_chunks}"
 
 
+def _req_slots_variant(req_slots: int) -> str:
+    return f"req_slots:{req_slots}"
+
+
+def _spread_capture_seq_lens(seq_lens: list[int], req_slots: int) -> list[int]:
+    """Spread a capture bucket over exactly ``req_slots`` requests by moving
+    single tokens off the first request."""
+    extra = req_slots - len(seq_lens)
+    assert 0 <= extra < seq_lens[0], (
+        f"cannot spread {seq_lens=} over {req_slots} requests"
+    )
+    return [seq_lens[0] - extra, *seq_lens[1:], *([1] * extra)]
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -286,6 +300,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     _backend_can_run_prefill_cuda_graph = None
+    use_captured_attn_metadata = False
+    # Request counts captured per token bucket; empty when the captured
+    # graphs do not depend on the request count.
+    _captured_req_slots: tuple[int, ...] = ()
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -587,6 +605,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.use_captured_attn_metadata = False
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
+        )
+        self._captured_req_slots = (
+            tuple(
+                model_runner.attn_backend.breakable_cuda_graph_request_slots(
+                    self.max_bs
+                )
+            )
+            if self.use_captured_attn_metadata
+            else ()
         )
 
         # BCG and Full CG capture only the transformer body (layer_model.forward),
@@ -1001,6 +1028,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
+        if self._captured_req_slots:
+            req_slots = self._select_req_slots(num_tokens, forward_batch.batch_size)
+            assert req_slots is not None, (
+                "prefill batch has no captured request-slot variant"
+            )
+            variant = _req_slots_variant(req_slots)
         return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
@@ -1250,6 +1283,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if replace_embeds is not None:
             return False
+        if (
+            self.use_captured_attn_metadata
+            and not self.model_runner.attn_backend.can_replay_breakable_cuda_graph(
+                batch_size=batch_size, prefix_lens=prefix_lens
+            )
+        ):
+            return False
         # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
@@ -1287,6 +1327,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        if (
+            self._captured_req_slots
+            and self._select_req_slots(padded_num_tokens, batch_size) is None
+        ):
             return False
         return True
 
@@ -1369,16 +1414,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=self.static_draft_hidden_states[:num_tokens],
         )
 
-    def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
-        """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
-
-        Default tensor inputs are fresh literals; under a Breakable
-        backend, we swap in slices of our static buffers so captured
-        segments read from stable addresses.
-
-        Returns ``(forward_batch, attn_backend)`` to mirror decode's
-        capture_prepare signature.
-        """
+    def _fewest_capture_seq_lens(self, num_tokens: int) -> list[int]:
         model_context_length = self.model_runner.model_config.context_len
         context_length = min(
             self.max_context_size or model_context_length, model_context_length
@@ -1386,10 +1422,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # A prefill bucket is an aggregate token count. Capture it as the
         # fewest synthetic requests, with every request containing no more
         # than context_length tokens.
-        capture_seq_lens = [
+        return [
             min(context_length, num_tokens - start)
             for start in range(0, num_tokens, context_length)
         ]
+
+    def _req_slots_for_bucket(self, num_tokens: int) -> list[int]:
+        """Captured request-count variants of one token bucket; each needs at
+        least one token per request."""
+        min_reqs = len(self._fewest_capture_seq_lens(num_tokens))
+        return [r for r in self._captured_req_slots if min_reqs <= r <= num_tokens]
+
+    def _select_req_slots(self, num_tokens: int, batch_size: int) -> Optional[int]:
+        return next(
+            (r for r in self._req_slots_for_bucket(num_tokens) if r >= batch_size),
+            None,
+        )
+
+    def capture_prepare(
+        self, num_tokens: int, req_slots: Optional[int] = None
+    ) -> tuple[ForwardBatch, AttentionBackend]:
+        """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
+
+        Default tensor inputs are fresh literals; under a Breakable
+        backend, we swap in slices of our static buffers so captured
+        segments read from stable addresses. ``req_slots`` fixes the
+        request count for backends whose captured metadata depends on it.
+
+        Returns ``(forward_batch, attn_backend)`` to mirror decode's
+        capture_prepare signature.
+        """
+        capture_seq_lens = self._fewest_capture_seq_lens(num_tokens)
+        if req_slots is not None:
+            capture_seq_lens = _spread_capture_seq_lens(capture_seq_lens, req_slots)
         if self.prefill_backend_name == Backend.FULL:
             # Full captures a fixed request-axis shape; unused slots are
             # zero-length sentinels after the context-bounded real requests.
@@ -1581,7 +1646,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            if self._captured_req_slots:
+                for req_slots in self._req_slots_for_bucket(num_tokens):
+                    self.capture_one_shape(num_tokens, req_slots=req_slots)
+            else:
+                self.capture_one_shape(num_tokens)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(
@@ -1589,12 +1658,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        req_slots: Optional[int] = None,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
-        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        forward_batch, attn_backend = self.capture_prepare(num_tokens, req_slots)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1613,14 +1688,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "limits; the graph would read stale LoRA metadata at replay."
             )
             lora_manager.prepare_lora_batch(forward_batch)
-        shape_key = ShapeKey(
-            size=num_tokens,
-            variant_label=(
-                _chunked_prefix_variant(prefix_num_chunks)
-                if prefix_num_chunks
-                else None
-            ),
-        )
+        if prefix_num_chunks:
+            variant_label = _chunked_prefix_variant(prefix_num_chunks)
+        elif req_slots is not None:
+            variant_label = _req_slots_variant(req_slots)
+        else:
+            variant_label = None
+        shape_key = ShapeKey(size=num_tokens, variant_label=variant_label)
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
                 forward_batch, shape_key, prefix_num_chunks
@@ -2105,8 +2179,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            if self._capture_chunked_prefix and shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.
