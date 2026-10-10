@@ -37,6 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import is_sm120_supported
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -1629,7 +1630,8 @@ def run_dsv4_compress_attention_case(
     """SWA + compressed-cache path (compress ratios 1, 2, 4, 128) through
     `DeepseekV4AttnBackend.forward` against a pure-PyTorch reference that reads the
     same cache bytes and metadata indices. `sparse_prefill` pins
-    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`; the C4 seeding dispatches on the same flag.
+    `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL`. On SM120 the production backend
+    selects dense prefill; seeding and path checks follow that fallback.
     """
     assert case.compress_ratio in (1, 2, 4, 128), (
         f"DSV4 compact runner requires compress_ratio in (1, 2, 4, 128); "
@@ -1652,7 +1654,14 @@ def run_dsv4_compress_attention_case(
         device=device,
         compression_ratios=[case.compress_ratio],
     )
-    fixture.seed_c4_for_sparse_prefill = sparse_prefill
+    # `sparse_prefill_fwd` is unsupported on SM120, so the backend keeps the
+    # dense extend path there even when the env var requests sparse. The env
+    # override below still applies the caller's request unchanged: if the SM120
+    # guard is ever removed or relaxed, the sparse path becomes eligible and the
+    # post-forward assertion below fails instead of silently passing. Everything
+    # downstream keys off the path actually taken.
+    expect_sparse_prefill = sparse_prefill and not is_sm120_supported()
+    fixture.seed_c4_for_sparse_prefill = expect_sparse_prefill
     fixture.extra_entries = extra_entries  # type: ignore[attr-defined]
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
@@ -1681,9 +1690,16 @@ def run_dsv4_compress_attention_case(
         # Only `_forward_prefill_sparse` populates `sparse_prefill_cache`;
         # verify the intended path ran before the reference rebuilds metadata.
         sparse_cache = fixture.backend.forward_metadata.sparse_prefill_cache
-        if sparse_prefill:
+        if expect_sparse_prefill:
             testcase.assertIsNotNone(
                 sparse_cache, f"{case.name} did not take _forward_prefill_sparse"
+            )
+        elif sparse_prefill:
+            testcase.assertIsNone(
+                sparse_cache,
+                f"{case.name} took _forward_prefill_sparse on SM120, where "
+                "sparse_prefill_fwd is unsupported and the dense "
+                "flash_mla_with_kvcache_sm120 path must be used instead",
             )
         else:
             testcase.assertIsNone(
