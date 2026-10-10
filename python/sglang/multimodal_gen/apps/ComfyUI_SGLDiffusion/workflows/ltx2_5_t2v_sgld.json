@@ -1,0 +1,341 @@
+{
+  "384": {
+    "class_type": "SGLDUNETLoader",
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default",
+      "sgld_options": [
+        "900",
+        0
+      ]
+    }
+  },
+  "900": {
+    "class_type": "SGLDOptions",
+    "inputs": {
+      "model_type": "auto-detect"
+    }
+  },
+  "385": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ltx-2.5-video-vae-bf16.safetensors"
+    }
+  },
+  "386": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ltx-2.5-audio-vae-bf16.safetensors"
+    }
+  },
+  "387": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    }
+  },
+  "364": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "387",
+        0
+      ],
+      "text": "Dynamic cinematic close-up of high-tech modular machinery self-assembling in midair, precision robotic parts, magnetic connectors, and glowing circuits clicking together, subtle smoke and light flares, extremely detailed titanium textures. The final product displays a clean, clear surface with large glowing engraved text “LTX-2.5” centered and unobstructed, dramatic lighting, photorealism, 8K, sharp focus.\n"
+    }
+  },
+  "373": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "387",
+        0
+      ],
+      "text": "pc game, console game, video game, cartoon, childish, ugly"
+    }
+  },
+  "365": {
+    "class_type": "LTXVConditioning",
+    "inputs": {
+      "positive": [
+        "364",
+        0
+      ],
+      "negative": [
+        "373",
+        0
+      ],
+      "frame_rate": 24.0
+    }
+  },
+  "356": {
+    "class_type": "EmptyLTXVLatentVideo",
+    "inputs": {
+      "width": 640,
+      "height": 360,
+      "length": 121,
+      "batch_size": 1
+    }
+  },
+  "366": {
+    "class_type": "LTXVEmptyLatentAudio",
+    "inputs": {
+      "audio_vae": [
+        "386",
+        0
+      ],
+      "frames_number": 121,
+      "frame_rate": 24,
+      "batch_size": 1
+    }
+  },
+  "377": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": [
+        "356",
+        0
+      ],
+      "audio_latent": [
+        "366",
+        0
+      ]
+    }
+  },
+  "339": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 558811532553686
+    }
+  },
+  "352": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler_ancestral"
+    }
+  },
+  "404": {
+    "class_type": "ManualSigmas",
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    }
+  },
+  "388": {
+    "class_type": "LTXVDualCFGGuider",
+    "inputs": {
+      "model": [
+        "384",
+        0
+      ],
+      "positive": [
+        "365",
+        0
+      ],
+      "negative": [
+        "365",
+        1
+      ],
+      "video_cfg": 1.0,
+      "audio_cfg": 1.0
+    }
+  },
+  "344": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "339",
+        0
+      ],
+      "guider": [
+        "388",
+        0
+      ],
+      "sampler": [
+        "352",
+        0
+      ],
+      "sigmas": [
+        "404",
+        0
+      ],
+      "latent_image": [
+        "377",
+        0
+      ]
+    }
+  },
+  "367": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": [
+        "344",
+        0
+      ]
+    }
+  },
+  "371": {
+    "class_type": "LatentUpscaleModelLoader",
+    "inputs": {
+      "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    }
+  },
+  "348": {
+    "class_type": "LTXVLatentUpsampler",
+    "inputs": {
+      "samples": [
+        "367",
+        0
+      ],
+      "upscale_model": [
+        "371",
+        0
+      ],
+      "vae": [
+        "385",
+        0
+      ]
+    }
+  },
+  "340": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": [
+        "348",
+        0
+      ],
+      "audio_latent": [
+        "367",
+        1
+      ]
+    }
+  },
+  "338": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 42
+    }
+  },
+  "341": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler_ancestral"
+    }
+  },
+  "395": {
+    "class_type": "ManualSigmas",
+    "inputs": {
+      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+    }
+  },
+  "391": {
+    "class_type": "LTXVDualCFGGuider",
+    "inputs": {
+      "model": [
+        "384",
+        0
+      ],
+      "positive": [
+        "365",
+        0
+      ],
+      "negative": [
+        "365",
+        1
+      ],
+      "video_cfg": 1.0,
+      "audio_cfg": 1.0
+    }
+  },
+  "368": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "338",
+        0
+      ],
+      "guider": [
+        "391",
+        0
+      ],
+      "sampler": [
+        "341",
+        0
+      ],
+      "sigmas": [
+        "395",
+        0
+      ],
+      "latent_image": [
+        "340",
+        0
+      ]
+    }
+  },
+  "369": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": [
+        "368",
+        0
+      ]
+    }
+  },
+  "374": {
+    "class_type": "VAEDecodeTiled",
+    "inputs": {
+      "samples": [
+        "369",
+        0
+      ],
+      "vae": [
+        "385",
+        0
+      ],
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 16
+    }
+  },
+  "358": {
+    "class_type": "LTXVAudioVAEDecode",
+    "inputs": {
+      "samples": [
+        "369",
+        1
+      ],
+      "audio_vae": [
+        "386",
+        0
+      ]
+    }
+  },
+  "370": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "374",
+        0
+      ],
+      "audio": [
+        "358",
+        0
+      ],
+      "fps": 24.0
+    }
+  },
+  "75": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "370",
+        0
+      ],
+      "filename_prefix": "video/LTX_2.5_t2v_sgld",
+      "format": "mp4",
+      "codec": "h264"
+    }
+  }
+}
