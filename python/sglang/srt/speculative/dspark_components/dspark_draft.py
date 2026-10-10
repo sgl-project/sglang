@@ -125,6 +125,15 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
+def cap_step_logits(
+    step_logits: torch.Tensor, sample_vocab_size: Optional[int]
+) -> torch.Tensor:
+    """Restrict draft sampling to IDs the target can score."""
+    if sample_vocab_size is not None and step_logits.shape[-1] > sample_vocab_size:
+        return step_logits[..., :sample_vocab_size]
+    return step_logits
+
+
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,
@@ -134,6 +143,7 @@ def sample_draft_block(
     markov_head,
     device: torch.device,
     tp_sync: SpecTpSync,
+    sample_vocab_size: Optional[int] = None,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -151,6 +161,7 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
+            step_logits = cap_step_logits(step_logits, sample_vocab_size)
             return tp_sync.sync(
                 SpecTpSyncSite.DSPARK_DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
             )
@@ -159,6 +170,7 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
+            step_logits = cap_step_logits(step_logits, sample_vocab_size)
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
@@ -190,6 +202,8 @@ def sample_draft_block(
         hidden_states=draft_hidden,
         sampler=sampler,
     )
+    # Verify softmaxes these as the proposal q; crop to the sampled vocabulary.
+    corrected_logits = cap_step_logits(corrected_logits, sample_vocab_size)
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=corrected_logits,
@@ -209,10 +223,12 @@ class DraftBlockProposer:
         draft_block_spec_info,
         tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
+        sample_vocab_size: Optional[int] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
         self.gamma = gamma
+        self.sample_vocab_size = sample_vocab_size
         self.sample_from_anchor = bool(draft_model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self._mask_token_id = mask_token_id
@@ -324,6 +340,7 @@ class DraftBlockProposer:
                 markov_head=self.draft_model.markov_head,
                 device=device,
                 tp_sync=self._tp_sync,
+                sample_vocab_size=self.sample_vocab_size,
             )
         proposal_block_ids = (
             draft_block_ids

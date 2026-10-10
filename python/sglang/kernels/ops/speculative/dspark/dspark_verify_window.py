@@ -851,15 +851,19 @@ def build_out_tokens(
     verify_num_draft_tokens: int,
     gamma: int,
 ) -> torch.Tensor:
+    """Return accepted drafts, the bonus token, and zero-filled tail slots."""
     bs = draft_tokens.shape[0]
-    out_tokens = torch.empty(
+    out_tokens = torch.zeros(
         (bs, verify_num_draft_tokens),
         dtype=torch.int64,
         device=draft_tokens.device,
     )
-    out_tokens[:, :gamma].copy_(draft_tokens)
-    out_tokens[:, gamma].fill_(0)
-    out_tokens.scatter_(1, correct_len.to(torch.int64)[:, None], bonus[:, None])
+    correct_len = correct_len.to(torch.int64)
+    keep = (
+        torch.arange(gamma, device=draft_tokens.device)[None, :] < correct_len[:, None]
+    )
+    out_tokens[:, :gamma] = torch.where(keep, draft_tokens.to(torch.int64), 0)
+    out_tokens.scatter_(1, correct_len[:, None], bonus[:, None])
     return out_tokens
 
 
@@ -883,7 +887,8 @@ def _build_out_tokens_kernel(
     bonus = tl.load(bonus_ptr + b, mask=mask, other=0)
     draft_mask = mask & (k < gamma)
     draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0)
-    val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
+    # Rejected drafts must not reach downstream token gathers.
+    val = tl.where(k == cl, bonus, tl.where(k < cl, draft, 0))
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 
