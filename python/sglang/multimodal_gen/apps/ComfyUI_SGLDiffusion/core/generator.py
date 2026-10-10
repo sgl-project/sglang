@@ -289,6 +289,9 @@ class SGLDiffusionGenerator:
         lora = getattr(executor, "_lora_input", None)
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
+        # The new worker's session cache starts empty, so conditioning the
+        # old worker already had cannot be restored; resend it.
+        executor.begin_sampler_run()
 
     def kill_generator(self):
         """Force-stop workers this owner started. Do not scan the process table."""
