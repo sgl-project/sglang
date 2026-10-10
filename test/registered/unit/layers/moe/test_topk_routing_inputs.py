@@ -1043,7 +1043,11 @@ class TestTopKRoutingInputs(CustomTestCase):
                     dispatched = dispatcher._dispatch_prefill_allgather(hidden, output)
                 self.assertEqual(solved, [expected_owner])
                 self.assertEqual(set(captured), {expected_owner})
-                self.assertEqual(captured[expected_owner].tolist(), [[0, 1]] * 4)
+                # R3 capture masks the rows past num_token_non_padded=2.
+                self.assertEqual(
+                    captured[expected_owner].tolist(),
+                    [[0, 1], [0, 1], [-1, -1], [-1, -1]],
+                )
                 self.assertEqual(
                     dispatched.topk_output.topk_ids.tolist(),
                     [[2, 0], [2, 0], [-1, -1], [-1, -1]],
