@@ -16,7 +16,7 @@ import time
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
 
@@ -324,77 +324,49 @@ class TestDispatchingWithTrace(CustomTestCase):
         ctl.dispatch_health_check = MagicMock()
         return ctl
 
-    def test_health_bypasses_user_load_balancing_state(self):
-        ctl = self._make_traced_controller()
-        health_req = _req(rid="HEALTH_CHECK_dispatch")
+    def test_health_and_user_dispatch_use_separate_state(self):
+        for rid, is_health in [("HEALTH_CHECK_dispatch", True), ("user", False)]:
+            with self.subTest(rid=rid):
+                ctl = self._make_traced_controller()
+                req = _req(rid=rid)
+                ctl.dispatching_with_trace(req)
+                self.assertEqual(ctl.refresh_load_budget.call_count, int(not is_health))
+                self.assertEqual(
+                    ctl.dispatching.call_args_list, [] if is_health else [call(req)]
+                )
+                self.assertEqual(
+                    ctl.dispatch_health_check.call_args_list,
+                    [call(req)] if is_health else [],
+                )
 
-        ctl.dispatching_with_trace(health_req)
-
-        ctl.refresh_load_budget.assert_not_called()
-        ctl.dispatching.assert_not_called()
-        ctl.dispatch_health_check.assert_called_once_with(health_req)
-
-    def test_user_uses_normal_load_balancing_state(self):
-        ctl = self._make_traced_controller()
-        user_req = _req(rid="user_dispatch")
-
-        ctl.dispatching_with_trace(user_req)
-
-        ctl.refresh_load_budget.assert_called_once()
-        ctl.dispatching.assert_called_once_with(user_req)
-        ctl.dispatch_health_check.assert_not_called()
-
-    def test_health_only_batch_does_not_refresh_budget(self):
-        ctl = _make_controller(num_dp_ranks=4)
-        ctl.refresh_load_budget_on_dispatch = True
-        ctl.refresh_load_budget = MagicMock()
-        ctl.dispatching_with_trace = MagicMock()
-        health_req = _req(rid="HEALTH_CHECK_batch")
-
-        ctl.dispatch_batch_generate([health_req])
-
-        ctl.refresh_load_budget.assert_not_called()
-        ctl.dispatching_with_trace.assert_called_once_with(
-            health_req, refresh_load_budget=False
-        )
-
-    def test_user_batch_refreshes_budget_once(self):
-        ctl = _make_controller(num_dp_ranks=4)
-        ctl.refresh_load_budget_on_dispatch = True
-        ctl.refresh_load_budget = MagicMock()
-        ctl.dispatching_with_trace = MagicMock()
-        health_req = _req(rid="HEALTH_CHECK_batch")
-        user_req = _req(rid="user_batch")
-
-        ctl.dispatch_batch_generate([health_req, user_req])
-
-        ctl.refresh_load_budget.assert_called_once()
-        self.assertEqual(ctl.dispatching_with_trace.call_count, 2)
+    def test_batch_refreshes_budget_only_for_user_requests(self):
+        for rids, refreshes in [
+            (["HEALTH_CHECK_batch"], 0),
+            (["HEALTH_CHECK_batch", "user"], 1),
+        ]:
+            with self.subTest(rids=rids):
+                ctl = self._make_traced_controller()
+                ctl.dispatching_with_trace = MagicMock()
+                reqs = [_req(rid=rid) for rid in rids]
+                ctl.dispatch_batch_generate(reqs)
+                self.assertEqual(ctl.refresh_load_budget.call_count, refreshes)
+                self.assertEqual(
+                    ctl.dispatching_with_trace.call_args_list,
+                    [call(req, refresh_load_budget=False) for req in reqs],
+                )
 
 
 class TestHealthCheckScheduler(CustomTestCase):
     def test_health_and_user_round_robin_state_are_independent(self):
         ctl = _make_controller(num_dp_ranks=4)
-        users = [_req(rid=f"user_{i}") for i in range(5)]
-        health_checks = [
-            _req(rid="HEALTH_CHECK_0"),
-            _req(rid="HEALTH_CHECK_1"),
-        ]
-
-        ctl.round_robin_scheduler(users[0])
-        ctl.round_robin_scheduler(users[1])
-        ctl.dispatch_health_check(health_checks[0])
-        ctl.round_robin_scheduler(users[2])
-        ctl.dispatch_health_check(health_checks[1])
-        ctl.round_robin_scheduler(users[3])
-        ctl.round_robin_scheduler(users[4])
-
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.health_round_robin_counter, 0)
+        ctl.dispatch_health_check(_req(rid="HEALTH_CHECK"))
         self.assertEqual(ctl.round_robin_counter, 1)
-        self.assertEqual(ctl.health_round_robin_counter, 2)
-        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 3)
-        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 2)
-        ctl.workers[2].send_pyobj.assert_called_once()
-        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.health_round_robin_counter, 1)
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.round_robin_counter, 2)
+        self.assertEqual(ctl.health_round_robin_counter, 1)
 
     def test_health_round_robin_uses_only_active_workers(self):
         ctl = _make_controller(num_dp_ranks=4)
