@@ -1176,6 +1176,14 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.max_req_input_len = self.get_max_admissible_input_len(
+            self.max_req_input_len,
+            self.max_total_num_tokens,
+            self.page_size,
+            page_interleave_shard_size(
+                self.tp_worker.model_runner.token_to_kv_pool_allocator
+            ),
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2600,6 +2608,27 @@ class Scheduler(
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
+    @staticmethod
+    def get_max_admissible_input_len(
+        max_req_input_len: int,
+        max_total_num_tokens: int,
+        page_size: int,
+        kv_shard_widening: int = 1,
+    ) -> int:
+        """Return the threshold for the base PrefillAdder capacity gate.
+
+        ``validate_input_length`` rejects inputs with ``len >= threshold``.
+        Keep one allocator page per shard beyond the raw input, matching the
+        ``PrefillAdder.add_one_req`` total-token gate after output clipping.
+        This prevents a request that passes the public input-length check but
+        can never pass scheduler admission.
+        """
+        # Worker capacity is already in logical DCP tokens. Only page-interleave
+        # sharding widens it, and reserves an extra page on each shard.
+        return min(
+            max_req_input_len, (max_total_num_tokens - page_size) * kv_shard_widening
+        )
+
     def _process_and_broadcast_mm_inputs(
         self,
         raw_mm_inputs,
@@ -3060,9 +3089,6 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -3071,8 +3097,14 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        # Initialize after validation so auto-truncation is reflected in the
+        # output budget rather than leaving a formerly too-long prompt with a
+        # clipped zero-token generation budget.
+        self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -3547,6 +3579,7 @@ class Scheduler(
             get_serving().allow_auto_truncate,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -3883,6 +3916,13 @@ class Scheduler(
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
+            running_batch.batch_is_full = False
+
+        if running_batch.is_empty():
+            # `batch_is_full` is an admission hint for the current running
+            # batch. It must not survive after that batch drains (for example,
+            # when a queued request that returned NO_TOKEN is cancelled), or
+            # the fast path below skips the waiting queue indefinitely.
             running_batch.batch_is_full = False
 
         if (
