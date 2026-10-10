@@ -119,8 +119,16 @@ class SpecTpSync:
         return values
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
-        """Free GPU memory, reduced to the group minimum when ``site`` is on."""
-        distributed = self.enabled(site) and group.world_size > 1
+        """Free GPU memory, reduced to the group minimum when required.
+
+        A caller passing a group other than the one this sync was built from
+        (e.g. DSpark's DP-attention draft passing the full TP group while the
+        sync is bound to the single-rank attention group) needs the reduction
+        for collective alignment, so the site gate does not apply to it.
+        """
+        distributed = group.world_size > 1 and (
+            self.enabled(site) or group is not self._tp_group
+        )
         return get_available_gpu_memory(
             device,
             gpu_id,
