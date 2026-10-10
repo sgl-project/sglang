@@ -1,31 +1,15 @@
 import torch
+import torch_npu
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFABackend,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
-
-# Import to use torch.ops.attentions, install package with sgl_kernel_npu
-try:
-    import attentions  # noqa: F401
-except ImportError as e:
-    logger.warning_once(
-        "The 'attentions' library is not installed. Laser Attention is unavailable. "
-        "Installing this library may improve performance on NPU. "
-        "See: sgl-project/sgl-kernel-npu"
-    )
-    raise ImportError(
-        (
-            "The required 'attentions' package is not installed. "
-            "Install it from sgl-project/sgl-kernel-npu."
-        )
-    ) from e
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
 _BF16_LASER_SCALE = 256.0
@@ -58,6 +42,13 @@ class LaserAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
+        if torch_npu.npu.get_soc_version() == 260:
+            raise ValueError(
+                "Laser Attention is unavailable on Ascend 950 (A5). "
+                "Use --attention-backend fa or rain_fusion_attn."
+            )
+        import sgl_kernel_npu  # noqa: F401
+
         self.softmax_scale = softmax_scale
 
         # After preprocess input layout should be BNSD.
@@ -66,11 +57,10 @@ class LaserAttentionImpl(AttentionImpl):
         self.dim_index = 3
         self.dim_base = 128
         self.max_token = 2**31 - 1
-        self.seq_len_pad_base = 256
 
         # the laser attention operator has issues with small seq_len
         self.min_seqlen = 2048
-        self.sdpa_impl = SDPABackend.get_impl_cls()(
+        self.sdpa_impl = AscendFABackend.get_impl_cls()(
             num_heads,
             head_size,
             causal,
@@ -167,7 +157,7 @@ class LaserAttentionImpl(AttentionImpl):
         pre_tokens: int,
         scale_value: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.la(
+        return torch.ops.npu.laser_attn(
             query=query,
             key=key,
             value=value,
@@ -213,10 +203,10 @@ class LaserAttentionImpl(AttentionImpl):
             )
         else:
             pre_tokens = self.max_token
-            if kv_seqlen % self.seq_len_pad_base != 0:
+            if kv_seqlen % self.seqlen_base != 0:
                 pre_tokens = (
-                    kv_seqlen // self.seq_len_pad_base + 1
-                ) * self.seq_len_pad_base - kv_seqlen
+                    kv_seqlen // self.seqlen_base + 1
+                ) * self.seqlen_base - kv_seqlen
 
             q, k, v, qk_scale, value_scale = self._la_preprocess_input(
                 query,
