@@ -124,6 +124,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             noise=eager_noise,
             device=DEVICE,
             tp_sync=tp_sync,
+            greedy_draft=False,
         )
         self.assertTrue(
             torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
