@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from functools import lru_cache
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.cake_kernels._routes import cake_route_enabled
 from sglang.kernels.ops.moe.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_masked_post_quant,
@@ -88,6 +92,764 @@ else:
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Cake (FlashInfer) contiguous grouped FP8 GEMM route, opt-in via
+# ``SGLANG_CAKE_ROUTES=moe_fp8_grouped``.
+#
+# Both expert GEMMs run on FlashInfer prepared runners (block-scaled contract
+# of FlashInfer PR #6048, SM100a / SM103a; see
+# ``sglang.kernels.cake_kernels.gemm_grouped_fp8``).  A runner binds the
+# expert weights and their packed UE8M0 int32 scales; every call rebinds the
+# per-token operands -- the dispatcher's E4M3 rows, its packed UE8M0 int32
+# activation scales (MN-major ``(1, M)`` strides included) and ``m_indices``
+# with the compact layout's ``-1`` padding rows, which the kernel skips
+# natively -- through ``launch(a=..., a_scale=..., m_indices=..., out=...)``.
+# No staging copies, no scale conversion, no padding fill, no stream
+# synchronisation; the down GEMM writes the caller-owned output directly.
+# Runners are cached per (per-token operand geometry, weights, alignment),
+# prepared eagerly outside CUDA-graph capture and released from the per-token
+# tensors they were prepared on (``release_prepared_operands``), so a cached
+# plan pins no batch buffers.
+# Admission is all-or-nothing: both expert GEMMs run on Cake or the call falls
+# through to the unchanged DeepGEMM code below, always with a logged reason.
+#
+# The fused gate_up GEMM + SwiGLU + FP8-quant FlashInfer entry stays unused:
+# on FlashInfer main (PR #6049 unmerged) its ``launch()`` takes no operands,
+# it only accepts FP32 scales and rejects ``-1`` rows, so using it would bring
+# back the staging copies and scale conversion this route removed.
+# Re-enable it once that entry speaks the per-call block-scaled contract.
+#
+# The masked (batch DeepGEMM) MoE path has no Cake backend here: FlashInfer's
+# ``prepare_batch_deepgemm_fp8_nt_groupwise`` (PR #6044) binds every operand
+# at prepare, owns a fixed ``(N, K)`` band that excludes this route's models
+# and accepts packed UE8M0 scales only for two DeepSeek geometries.
+# ---------------------------------------------------------------------------
+
+_CAKE_ROUTE = "moe_fp8_grouped"
+_CAKE_SCALE_BLOCK = 128
+# Row alignment of expert runs in the compact layout when the route takes the
+# call: FlashInfer's fast single-run schedule needs a multiple of 128; other
+# multiples of 32 run its slower multi-run fallback.  128 measured faster than
+# DeepGEMM at DeepGEMM's own 32/64/96/224 alignments on every shape (CAKE-931).
+_CAKE_LAYOUT_ALIGNMENT = 128
+_CAKE_ALIGNMENT_MULTIPLE = 32
+# FlashInfer requires 16-byte aligned storage for every launch operand.
+_CAKE_STORAGE_ALIGNMENT = 16
+_cake_logged: Dict[str, bool] = {}
+
+
+@lru_cache(maxsize=1)
+def _cake_grouped_fp8_api() -> SimpleNamespace:
+    """Lazy handles to the Cake adapter admission checks and prepared-runner wrapper."""
+    from sglang.kernels.cake_kernels import gemm_grouped_fp8 as adapter
+    from sglang.kernels.ops.gemm.cake import (
+        cake_prepare_group_gemm_fp8_nt_groupwise_contiguous,
+    )
+
+    return SimpleNamespace(
+        device_available=adapter.block_scaled_contiguous_available,
+        supports_plain=adapter.supports_group_gemm_fp8_nt_groupwise_contiguous,
+        prepare_plain=cake_prepare_group_gemm_fp8_nt_groupwise_contiguous,
+    )
+
+
+def _cake_stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _cake_log_once(key: str, message: str) -> None:
+    if not _cake_logged.get(key):
+        _cake_logged[key] = True
+        logger.info(message)
+
+
+def _cake_runner_use_swizzle() -> bool:
+    """Mirror of ``DeepGemmRunnerCore.use_swizzle`` for callers without a runner."""
+    return get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
+
+
+def _cake_weights_reject_reason(
+    *,
+    activation: str,
+    use_mxfp8: bool,
+    is_fp4_experts: bool,
+    use_swizzle: bool,
+    w13_weight: torch.Tensor,
+    w13_scale: Optional[torch.Tensor],
+    w2_weight: torch.Tensor,
+    w2_scale: Optional[torch.Tensor],
+    hidden_size: int,
+    scale_ue8m0: bool,
+) -> Optional[str]:
+    """Static (per layer, per config) admission shared by the route and the
+    compact-layout alignment policy; ``None`` when the expert weights fit."""
+    if activation != "silu":
+        return f"activation {activation!r} (only silu)"
+    if use_mxfp8 or is_fp4_experts:
+        return "mxfp8 / fp4 expert weights"
+    if use_swizzle:
+        return "swizzled contiguous layout"
+    if (
+        w13_weight.dtype != torch.float8_e4m3fn
+        or w2_weight.dtype != torch.float8_e4m3fn
+    ):
+        return "non-E4M3 expert weights"
+    if w13_scale is None or w2_scale is None:
+        return "missing weight scales"
+    if w13_weight.ndim != 3 or w2_weight.ndim != 3:
+        return "unexpected expert weight ranks"
+    groups, n, k13 = (int(v) for v in w13_weight.shape)
+    groups2, k2, h2 = (int(v) for v in w2_weight.shape)
+    k = hidden_size
+    if k13 != k or groups2 != groups or k2 != k or 2 * h2 != n:
+        return (
+            "inconsistent expert shapes "
+            f"w13={tuple(w13_weight.shape)} w2={tuple(w2_weight.shape)} K={k}"
+        )
+    if k % _CAKE_SCALE_BLOCK or n % (2 * _CAKE_SCALE_BLOCK):
+        return f"K={k} must be a multiple of 128 and N={n} of 256"
+    scale_dtype = torch.int32 if scale_ue8m0 else torch.float32
+    if w13_scale.dtype != scale_dtype or w2_scale.dtype != scale_dtype:
+        return (
+            f"weight scales {w13_scale.dtype} / {w2_scale.dtype} do not match the "
+            f"{scale_dtype} activation scales (one scale family per GEMM)"
+        )
+    return None
+
+
+_CAKE_LAYOUT_ALIGNMENT_ENV = "SGLANG_CAKE_MOE_FP8_LAYOUT_ALIGNMENT"
+
+
+def _cake_layout_alignment_override() -> Optional[Any]:
+    """Tuning knob for the compact-layout alignment the Cake route asks for:
+    unset -> the policy below; ``deepgemm`` -> keep DeepGEMM's own choice;
+    a multiple of 32 -> that alignment.  Anything else is a configuration
+    error and raises."""
+    raw = os.environ.get(_CAKE_LAYOUT_ALIGNMENT_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw == "deepgemm":
+        return raw
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0 or value % _CAKE_ALIGNMENT_MULTIPLE:
+        raise ValueError(
+            f"{_CAKE_LAYOUT_ALIGNMENT_ENV}={raw!r}: expected 'deepgemm' or a "
+            f"positive multiple of {_CAKE_ALIGNMENT_MULTIPLE}"
+        )
+    return value
+
+
+# Widening the compact layout to 128-row expert runs multiplies the ``-1`` rows
+# every per-row kernel of the MoE layer sweeps (scatter, SiLU, quant,
+# post-permute) by 128 / DeepGEMM's alignment.  Measured on GB200 TP1
+# Qwen3.5-35B-A3B-FP8 (bench_one_batch, 256 experts, top-8): bs 1 (8
+# assignments, 1024 rows at 128) and bs 32 (256 assignments) are faster at 128
+# than on DeepGEMM's layout, bs 8 (64 assignments, 8192 rows at 128 vs 2048)
+# is 7 % slower at 128 and 2.5 % slower on DeepGEMM's own alignment.  The
+# policy therefore keeps 128 when the padded layout stays small in absolute
+# terms or when the assignments populate every expert on average, and leaves
+# the sparse middle band on DeepGEMM's alignment.
+_CAKE_FAST_ALIGNMENT_MAX_ROWS = 2048
+
+
+def _cake_fast_alignment_pays(num_assignments: int, num_experts: int) -> bool:
+    """Whether the 128-row layout is expected to beat DeepGEMM's alignment for
+    ``num_assignments`` token-expert assignments over ``num_experts`` local
+    experts (see :data:`_CAKE_FAST_ALIGNMENT_MAX_ROWS`)."""
+    if num_assignments <= 0:
+        return True
+    rows = _get_compact_all_tokens(num_assignments, num_experts, _CAKE_LAYOUT_ALIGNMENT)
+    return rows <= _CAKE_FAST_ALIGNMENT_MAX_ROWS or num_assignments >= num_experts
+
+
+def _cake_contiguous_layout_alignment(
+    default: int,
+    *,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    hidden_size: int,
+    device: torch.device,
+    num_assignments: int,
+    num_experts: int,
+) -> int:
+    """Row alignment for the compact contiguous layout.
+
+    ``default`` is DeepGEMM's own choice (``get_contiguous_layout_alignment``).
+    When the ``moe_fp8_grouped`` Cake route is enabled and will admit this
+    layer on this device, the layout is built with :data:`_CAKE_LAYOUT_ALIGNMENT`
+    instead so the Cake GEMMs run their fast schedule, unless the batch falls in
+    the band where the extra padding rows cost more than the schedule gains
+    (:func:`_cake_fast_alignment_pays`).  The decision uses the same static
+    admission as the route (``_cake_weights_reject_reason`` plus the adapter's
+    device-level probe); the dynamic per-call admission can still fall back to
+    DeepGEMM, which then runs on the chosen layout.
+    :data:`_CAKE_LAYOUT_ALIGNMENT_ENV` overrides the choice for admitted layers
+    (``deepgemm`` or a multiple of 32).
+    """
+    override = _cake_layout_alignment_override()
+    if override is None:
+        target = (
+            _CAKE_LAYOUT_ALIGNMENT
+            if _cake_fast_alignment_pays(num_assignments, num_experts)
+            else default
+        )
+    else:
+        target = override
+    if target == "deepgemm":
+        target = default
+    if default == target or not cake_route_enabled(_CAKE_ROUTE):
+        return default
+    if device.type != "cuda":
+        return default
+    reason = _cake_weights_reject_reason(
+        activation=runner_config.activation,
+        use_mxfp8=bool(quant_info.use_mxfp8),
+        is_fp4_experts=bool(quant_info.is_fp4_experts),
+        use_swizzle=_cake_runner_use_swizzle(),
+        w13_weight=quant_info.w13_weight,
+        w13_scale=quant_info.w13_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        hidden_size=hidden_size,
+        scale_ue8m0=bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0),
+    )
+    if reason is not None:
+        _cake_log_once(
+            "alignment_default",
+            f"Cake {_CAKE_ROUTE}: compact layout keeps DeepGEMM alignment, {reason}",
+        )
+        return default
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if not _cake_grouped_fp8_api().device_available(index):
+        _cake_log_once(
+            "alignment_default",
+            f"Cake {_CAKE_ROUTE}: compact layout keeps DeepGEMM alignment, the "
+            "installed FlashInfer / device does not provide the block-scaled "
+            "contiguous grouped FP8 GEMM",
+        )
+        return default
+    _cake_log_once(
+        f"alignment_{target}",
+        f"Cake {_CAKE_ROUTE}: compact layout alignment {target} "
+        f"(DeepGEMM would pick {default}, {num_assignments} assignments over "
+        f"{num_experts} experts"
+        f"{'' if override is None else f', {_CAKE_LAYOUT_ALIGNMENT_ENV}={override}'})",
+    )
+    return target
+
+
+def _cake_debug_sync(stage: str) -> None:
+    """``SGLANG_CAKE_DEBUG``: synchronize after ``stage`` (outside graph capture) and log the outcome."""
+    if torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must name the failing stage
+        logger.error("Cake %s debug: stage %s FAILED: %r", _CAKE_ROUTE, stage, exc)
+        raise
+    logger.info("Cake %s debug: stage %s ok", _CAKE_ROUTE, stage)
+
+
+def _cake_debug_tensor(name: str, t: Optional[torch.Tensor]) -> str:
+    if t is None:
+        return f"{name}=None"
+    return (
+        f"{name}=shape{tuple(t.shape)}/{str(t.dtype).replace('torch.', '')}"
+        f"/stride{tuple(t.stride())}/ptr%16={t.data_ptr() % 16}"
+    )
+
+
+def _cake_debug_describe(
+    req: _CakeContigRequest, plan: _CakeContigPlan, ops: _CakeContigOperands
+) -> None:
+    """``SGLANG_CAKE_DEBUG``: one-time summary of the dispatcher inputs, the
+    per-call operands and the prepared runners."""
+    raw = req.m_indices
+    valid = raw[raw >= 0]
+    parts = [
+        _cake_debug_tensor("hidden_states", req.hidden_states),
+        _cake_debug_tensor("hidden_states_scale", req.hidden_states_scale),
+        _cake_debug_tensor("m_indices", raw),
+        _cake_debug_tensor("w13_weight", req.w13_weight),
+        _cake_debug_tensor("w13_scale", req.w13_scale),
+        _cake_debug_tensor("w2_weight", req.w2_weight),
+        _cake_debug_tensor("w2_scale", req.w2_scale),
+    ]
+    for name in ("act", "down_input", "down_input_scale"):
+        tensor = getattr(ops, name)
+        if tensor is not None:
+            parts.append(_cake_debug_tensor(name, tensor))
+    parts += [
+        _cake_debug_tensor("gateup", ops.gateup),
+        _cake_debug_tensor("out", ops.out),
+        f"alignment={plan.alignment} layout_alignment={req.layout_alignment} "
+        f"scale_ue8m0={plan.scale_ue8m0} swiglu_limit={req.swiglu_limit} "
+        f"fused_activation={plan.fused_activation}",
+        f"m_indices[min={int(raw.min())} max={int(raw.max())} neg={int((raw < 0).sum())} "
+        f"valid_nondecreasing={bool((valid[1:] >= valid[:-1]).all())} "
+        f"groups={int(req.w13_weight.shape[0])}]",
+    ]
+    for name, runner in (("gateup", plan.gateup_runner), ("down", plan.down_runner)):
+        parts.append(
+            f"{name}_runner[route={getattr(runner, 'route', None)} grid={getattr(runner, 'grid', None)} "
+            f"module={getattr(runner, 'module_name', None)}]"
+        )
+    logger.info("Cake %s debug: %s", _CAKE_ROUTE, " ".join(parts))
+
+
+@dataclass
+class _CakeContigRequest:
+    """Everything the Cake route needs; building it runs no kernels."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: torch.Tensor
+    m_indices: torch.Tensor
+    w13_weight: torch.Tensor
+    w13_scale: Optional[torch.Tensor]
+    w2_weight: torch.Tensor
+    w2_scale: Optional[torch.Tensor]
+    activation: str
+    swiglu_limit: Optional[float]
+    silu_mul_keep_fp32: bool
+    use_swizzle: bool
+    use_mxfp8: bool
+    is_fp4_experts: bool
+    activation_scale_block_size: Optional[int]
+    # Row alignment of expert runs in the contiguous layout.  ``None`` = 128:
+    # the DeepEP normal / v2 contiguous layouts are built by ``ep_scatter`` with
+    # its default ``expert_alignment=128``; the standard dispatcher records its
+    # per-call choice in ``running_state["contiguous_layout_alignment"]``.
+    layout_alignment: Optional[int]
+
+
+@dataclass
+class _CakeContigPlan:
+    """Prepared runner pair for one (per-token geometry, weights, alignment)."""
+
+    gateup_runner: Any
+    down_runner: Any
+    alignment: int
+    # True: block-scaled family (packed UE8M0 int32 scales, native ``-1`` rows).
+    # False: FP32 family (``fill_padding=True``), mirrors DEEPGEMM_SCALE_UE8M0=0.
+    scale_ue8m0: bool
+    swiglu_limit: Optional[float]
+    # True: the DeepGEMM path's fused FP32 SiLU*up + quant kernel
+    # (``silu_mul_keep_fp32``).  False: its default pair, BF16 ``silu_and_mul``
+    # then ``sglang_per_token_group_quant_fp8``; see ``_cake_fused_activation``.
+    fused_activation: bool
+    debug_described: bool = False
+
+
+@dataclass
+class _CakeContigOperands:
+    """Per-call tensors: the same allocations the DeepGEMM path makes.
+
+    Fused activation: ``down_input`` / ``down_input_scale`` are the fused
+    kernel's outputs and ``act`` is ``None``.  Unfused (default): ``act`` is
+    the BF16 ``silu_and_mul`` output and the quantizer allocates the down GEMM
+    operands itself, exactly like the DeepGEMM path, so they are ``None`` here.
+    """
+
+    gateup: torch.Tensor
+    down_input: Optional[torch.Tensor]
+    down_input_scale: Optional[torch.Tensor]
+    out: torch.Tensor
+    act: Optional[torch.Tensor] = None
+
+
+def _cake_fused_activation(req: _CakeContigRequest) -> bool:
+    """Mirror of ``DeepGemmRunnerCore._run_contiguous_gemm``'s activation-stage
+    choice for the layouts the route admits (never swizzled): the fused FP32
+    ``silu_and_mul_contig_post_quant`` only with ``silu_mul_keep_fp32``,
+    otherwise BF16 ``silu_and_mul`` (``silu_and_mul_clamp`` with a SwiGLU
+    limit) followed by ``sglang_per_token_group_quant_fp8``.  The two stages
+    are not bitwise equal (FP32 vs BF16-rounded SiLU*up before the per-group
+    absmax), so the route must take the baseline's pick to keep the model's
+    numerics identical up to GEMM accumulation order."""
+    return bool(req.use_swizzle or req.silu_mul_keep_fp32)
+
+
+class _CakeContigFp8Route:
+    """Prepared Cake runners for the contiguous FP8 expert GEMMs.
+
+    A plan (one prepared runner per GEMM) is keyed by the per-token operand
+    geometry (``M``, ``K``, scale dtype and strides), the expert weight storage
+    and the layout alignment; it is prepared once, eagerly, outside CUDA-graph
+    capture, released from the tensors it was prepared on and rebound to the
+    caller's tensors on every call.  Runners own no descriptor storage and no
+    per-token device memory, so the cache costs nothing per batch size; the
+    per-call intermediates (gate_up BF16, down input E4M3 + scales) are
+    ordinary allocations like the DeepGEMM path's.
+    """
+
+    def __init__(self) -> None:
+        self._plans: Dict[Tuple[Any, ...], Optional[_CakeContigPlan]] = {}
+
+    # -- admission ---------------------------------------------------------
+
+    @staticmethod
+    def _alignment(req: _CakeContigRequest) -> int:
+        return (
+            req.layout_alignment
+            if req.layout_alignment is not None
+            else _CAKE_LAYOUT_ALIGNMENT
+        )
+
+    @staticmethod
+    def _per_call_reject_reason(req: _CakeContigRequest) -> Optional[str]:
+        """Storage alignment of this call's dispatcher tensors.
+
+        ``launch`` rebinds them and FlashInfer requires 16-byte aligned storage
+        for every operand (shapes, dtypes and strides are pinned by the plan
+        key).  Checked before any allocation so a rejected call costs nothing.
+        """
+        for name, tensor in (
+            ("hidden_states", req.hidden_states),
+            ("hidden_states_scale", req.hidden_states_scale),
+            ("m_indices", req.m_indices),
+        ):
+            if tensor.data_ptr() % _CAKE_STORAGE_ALIGNMENT:
+                return f"{name} storage is not {_CAKE_STORAGE_ALIGNMENT}-byte aligned"
+        return None
+
+    @classmethod
+    def _static_reject_reason(cls, req: _CakeContigRequest) -> Optional[str]:
+        if req.activation_scale_block_size not in (None, _CAKE_SCALE_BLOCK):
+            return f"activation scale block {req.activation_scale_block_size}"
+        hs, hss = req.hidden_states, req.hidden_states_scale
+        if hs.dtype != torch.float8_e4m3fn or hs.ndim != 2:
+            return "non-E4M3 or non-2D hidden_states"
+        m, k = (int(v) for v in hs.shape)
+        if m <= 0:
+            return "empty batch"
+        if hss.dtype == torch.int32:
+            scale_cols = ceil_div(k // _CAKE_SCALE_BLOCK, 4)
+        elif hss.dtype == torch.float32:
+            scale_cols = k // _CAKE_SCALE_BLOCK
+        else:
+            return f"activation scales {hss.dtype} (int32 packed UE8M0 or FP32)"
+        if hss.ndim != 2 or tuple(int(v) for v in hss.shape) != (m, scale_cols):
+            return (
+                f"activation scale shape {tuple(hss.shape)} {hss.dtype}, "
+                f"expected ({m}, {scale_cols})"
+            )
+        reason = _cake_weights_reject_reason(
+            activation=req.activation,
+            use_mxfp8=req.use_mxfp8,
+            is_fp4_experts=req.is_fp4_experts,
+            use_swizzle=req.use_swizzle,
+            w13_weight=req.w13_weight,
+            w13_scale=req.w13_scale,
+            w2_weight=req.w2_weight,
+            w2_scale=req.w2_scale,
+            hidden_size=k,
+            scale_ue8m0=hss.dtype == torch.int32,
+        )
+        if reason is not None:
+            return reason
+        if req.m_indices.dtype != torch.int32 or tuple(req.m_indices.shape) != (m,):
+            return "m_indices must be int32 (M,)"
+        alignment = cls._alignment(req)
+        if alignment <= 0 or alignment % _CAKE_ALIGNMENT_MULTIPLE:
+            return f"layout alignment {alignment} is not a multiple of 32"
+        return None
+
+    # -- plans -------------------------------------------------------------
+
+    @staticmethod
+    def _plan_key(req: _CakeContigRequest, alignment: int) -> Tuple[Any, ...]:
+        hs, hss = req.hidden_states, req.hidden_states_scale
+        return (
+            hs.device.type,
+            hs.device.index,
+            tuple(int(v) for v in hs.shape),
+            tuple(int(v) for v in hs.stride()),
+            hss.dtype,
+            tuple(int(v) for v in hss.stride()),
+            tuple(int(v) for v in req.m_indices.stride()),
+            tuple(int(v) for v in req.w13_weight.shape),
+            req.w13_weight.data_ptr(),
+            req.w13_scale.data_ptr(),
+            req.w2_weight.data_ptr(),
+            req.w2_scale.data_ptr(),
+            req.swiglu_limit,
+            req.silu_mul_keep_fp32,
+            req.use_swizzle,
+            alignment,
+        )
+
+    @staticmethod
+    def _down_operands(req: _CakeContigRequest) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The down GEMM's E4M3 input and its scales, laid out as the DeepGEMM
+        contiguous path's quantizer produces them (``scale_ue8m0`` selects the
+        packed UE8M0 MN-major ``(M, ceil(H/512))`` int32 scales or FP32
+        ``(M, H/128)``)."""
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+
+        m = int(req.hidden_states.shape[0])
+        h = int(req.w13_weight.shape[1]) // 2
+        device = req.hidden_states.device
+        scale_ue8m0 = req.hidden_states_scale.dtype == torch.int32
+        down_input = torch.empty((m, h), device=device, dtype=torch.float8_e4m3fn)
+        down_input_scale = create_per_token_group_quant_fp8_output_scale(
+            x_shape=(m, h),
+            device=device,
+            group_size=_CAKE_SCALE_BLOCK,
+            column_major_scales=scale_ue8m0,
+            scale_tma_aligned=scale_ue8m0,
+            scale_ue8m0=scale_ue8m0,
+        )
+        return down_input, down_input_scale
+
+    @classmethod
+    def _operands(
+        cls, req: _CakeContigRequest, allocate_output: Callable[[], torch.Tensor]
+    ) -> _CakeContigOperands:
+        """Allocate this call's intermediates exactly as the DeepGEMM contiguous
+        path does: gate_up BF16 plus, fused, the down GEMM operands, or,
+        unfused, the BF16 activation the quantizer reads."""
+        m = int(req.hidden_states.shape[0])
+        n = int(req.w13_weight.shape[1])
+        h = n // 2
+        device = req.hidden_states.device
+        gateup = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+        if _cake_fused_activation(req):
+            down_input, down_input_scale = cls._down_operands(req)
+            act = None
+        else:
+            down_input = down_input_scale = None
+            act = torch.empty((m, h), device=device, dtype=torch.bfloat16)
+        return _CakeContigOperands(
+            gateup=gateup,
+            down_input=down_input,
+            down_input_scale=down_input_scale,
+            out=allocate_output(),
+            act=act,
+        )
+
+    def _build_plan(
+        self, req: _CakeContigRequest, alignment: int, ops: _CakeContigOperands
+    ) -> Tuple[Optional[_CakeContigPlan], str]:
+        api = _cake_grouped_fp8_api()
+        m, k = (int(v) for v in req.hidden_states.shape)
+        groups, n, _ = (int(v) for v in req.w13_weight.shape)
+        h = n // 2
+        scale_ue8m0 = req.hidden_states_scale.dtype == torch.int32
+        # Block-scaled family skips ``-1`` rows natively; the FP32 family needs
+        # FlashInfer to fill them.
+        kwargs = dict(fill_padding=not scale_ue8m0, alignment=alignment)
+        family = "ue8m0" if scale_ue8m0 else "fp32"
+        fused_activation = _cake_fused_activation(req)
+        if ops.down_input is not None and ops.down_input_scale is not None:
+            down_input, down_input_scale = ops.down_input, ops.down_input_scale
+        else:
+            # Unfused: the quantizer allocates these per call; prepare on
+            # same-layout templates (released below, every launch rebinds).
+            down_input, down_input_scale = self._down_operands(req)
+        if not api.supports_plain(
+            req.hidden_states,
+            req.w13_weight,
+            req.hidden_states_scale,
+            req.w13_scale,
+            req.m_indices,
+            ops.gateup,
+            **kwargs,
+        ):
+            return None, (
+                f"gate_up GEMM not admitted (M={m} N={n} K={k} G={groups} "
+                f"scales={family} alignment={alignment})"
+            )
+        if not api.supports_plain(
+            down_input,
+            req.w2_weight,
+            down_input_scale,
+            req.w2_scale,
+            req.m_indices,
+            ops.out,
+            **kwargs,
+        ):
+            return None, (
+                f"down GEMM not admitted (M={m} N={k} K={h} G={groups} "
+                f"scales={family} alignment={alignment})"
+            )
+        # FlashInfer re-validates at prepare and may still refuse what the
+        # adapter's mirror admitted (route without a registered program on
+        # this device, grid below one cluster, ...): fall back with its reason.
+        try:
+            gateup_runner = api.prepare_plain(
+                req.hidden_states,
+                req.w13_weight,
+                req.hidden_states_scale,
+                req.w13_scale,
+                req.m_indices,
+                ops.gateup,
+                **kwargs,
+            )
+            down_runner = api.prepare_plain(
+                down_input,
+                req.w2_weight,
+                down_input_scale,
+                req.w2_scale,
+                req.m_indices,
+                ops.out,
+                **kwargs,
+            )
+        except (ValueError, TypeError, NotImplementedError, RuntimeError) as exc:
+            return None, (
+                f"FlashInfer refused to prepare the runners (M={m} N={n} K={k} "
+                f"G={groups} scales={family} alignment={alignment}): {exc}"
+            )
+        # The plan outlives this call's tensors: drop the runners' references to
+        # the operands they were prepared on (every launch rebinds all of them),
+        # otherwise one full-size activation set per layer stays pinned.
+        gateup_runner.release_prepared_operands()
+        down_runner.release_prepared_operands()
+        plan = _CakeContigPlan(
+            gateup_runner=gateup_runner,
+            down_runner=down_runner,
+            alignment=alignment,
+            scale_ue8m0=scale_ue8m0,
+            swiglu_limit=req.swiglu_limit,
+            fused_activation=fused_activation,
+        )
+        return plan, (
+            f"M={m} N={n} K={k} G={groups} scales={family} alignment={alignment} "
+            f"activation={'fused_fp32' if fused_activation else 'silu_and_mul+quant'}"
+        )
+
+    # -- execution ---------------------------------------------------------
+
+    def try_run(
+        self,
+        req: _CakeContigRequest,
+        allocate_output: Callable[[], torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Run both expert GEMMs on Cake, or return ``None`` to use DeepGEMM.
+
+        Returning ``None`` leaves every request tensor untouched.
+        ``allocate_output`` provides the ``(M, K)`` BF16 result tensor
+        (caller-owned allocation); the down GEMM writes it directly.
+        """
+        reason = self._static_reject_reason(req)
+        if reason is not None:
+            _cake_log_once(
+                "fallback", f"Cake {_CAKE_ROUTE}: DeepGEMM fallback, {reason}"
+            )
+            return None
+        reason = self._per_call_reject_reason(req)
+        if reason is not None:
+            _cake_log_once(
+                "per_call_fallback",
+                f"Cake {_CAKE_ROUTE}: DeepGEMM fallback for this call, {reason}",
+            )
+            return None
+        alignment = self._alignment(req)
+        key = self._plan_key(req, alignment)
+        if key in self._plans:
+            plan = self._plans[key]
+            if plan is None:
+                return None
+            return self._run(plan, req, self._operands(req, allocate_output))
+        if _cake_stream_capturing():
+            _cake_log_once(
+                "capture_fallback",
+                f"Cake {_CAKE_ROUTE}: shape {tuple(req.hidden_states.shape)} first "
+                "seen inside CUDA-graph capture; using DeepGEMM for this graph "
+                "(warm the shape up eagerly before capture)",
+            )
+            return None
+        ops = self._operands(req, allocate_output)
+        plan, detail = self._build_plan(req, alignment, ops)
+        self._plans[key] = plan
+        if plan is None:
+            _cake_log_once(
+                "fallback", f"Cake {_CAKE_ROUTE}: DeepGEMM fallback, {detail}"
+            )
+            return None
+        _cake_log_once("route", f"Cake {_CAKE_ROUTE}: route taken, {detail}")
+        if alignment % _CAKE_LAYOUT_ALIGNMENT:
+            _cake_log_once(
+                "slow_alignment",
+                f"Cake {_CAKE_ROUTE}: layout alignment {alignment} runs the "
+                f"multi-run schedule; {_CAKE_LAYOUT_ALIGNMENT} is the fast path",
+            )
+        return self._run(plan, req, ops)
+
+    @staticmethod
+    def _run(
+        plan: _CakeContigPlan, req: _CakeContigRequest, ops: _CakeContigOperands
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
+
+        debug = envs.SGLANG_CAKE_DEBUG.get()
+        if debug and not plan.debug_described:
+            plan.debug_described = True
+            _cake_debug_describe(req, plan, ops)
+        plan.gateup_runner.launch(
+            a=req.hidden_states,
+            a_scale=req.hidden_states_scale,
+            m_indices=req.m_indices,
+            out=ops.gateup,
+        )
+        if debug:
+            _cake_debug_sync("gateup")
+        # The DeepGEMM contiguous path's own activation stage and scale
+        # layout (``_cake_fused_activation``); padding rows hold garbage the
+        # down GEMM never reads.
+        if plan.fused_activation:
+            down_input, down_input_scale = ops.down_input, ops.down_input_scale
+            silu_and_mul_contig_post_quant(
+                input=ops.gateup,
+                output=down_input,
+                output_scale=down_input_scale,
+                quant_group_size=_CAKE_SCALE_BLOCK,
+                scale_ue8m0=plan.scale_ue8m0,
+                transposed=plan.scale_ue8m0,
+                swiglu_limit=plan.swiglu_limit,
+                swizzle=False,
+            )
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            n = int(ops.gateup.shape[1])
+            if plan.swiglu_limit is not None:
+                silu_and_mul_clamp(ops.gateup.view(-1, n), ops.act, plan.swiglu_limit)
+            else:
+                _legacy_silu_and_mul(ops.gateup.view(-1, n), ops.act)
+            down_input, down_input_scale = sglang_per_token_group_quant_fp8(
+                ops.act,
+                _CAKE_SCALE_BLOCK,
+                column_major_scales=plan.scale_ue8m0,
+                scale_tma_aligned=plan.scale_ue8m0,
+                scale_ue8m0=plan.scale_ue8m0,
+            )
+        if debug:
+            _cake_debug_sync("silu_quant")
+        plan.down_runner.launch(
+            a=down_input,
+            a_scale=down_input_scale,
+            m_indices=req.m_indices,
+            out=ops.out,
+        )
+        if debug:
+            _cake_debug_sync("down")
+        return ops.out
+
+    def reset_for_tests(self) -> None:
+        self._plans.clear()
+        _cake_logged.clear()
+
+
+_CAKE_CONTIG_FP8 = _CakeContigFp8Route()
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -391,6 +1153,21 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
+    @staticmethod
+    def _allocate_down_output(
+        all_tokens: int, hidden_size: int, device: torch.device
+    ) -> torch.Tensor:
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this final output enters the pool; intermediate
+        # buffers stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            return torch.empty(
+                (all_tokens, hidden_size), device=device, dtype=torch.bfloat16
+            )
+
     def _run_contiguous_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -427,6 +1204,34 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             return torch.empty(
                 (0, K), device=hidden_states_device, dtype=torch.bfloat16
             )
+
+        if cake_route_enabled(_CAKE_ROUTE):
+            cake_output = _CAKE_CONTIG_FP8.try_run(
+                _CakeContigRequest(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
+                    m_indices=m_indices,
+                    w13_weight=quant_info.w13_weight,
+                    w13_scale=quant_info.w13_scale,
+                    w2_weight=quant_info.w2_weight,
+                    w2_scale=quant_info.w2_scale,
+                    activation=self.config.activation,
+                    swiglu_limit=self.swiglu_limit,
+                    silu_mul_keep_fp32=bool(self.config.silu_mul_keep_fp32),
+                    use_swizzle=bool(self.use_swizzle),
+                    use_mxfp8=bool(quant_info.use_mxfp8),
+                    is_fp4_experts=bool(quant_info.is_fp4_experts),
+                    activation_scale_block_size=runner_input.activation_scale_block_size,
+                    layout_alignment=running_state.get("contiguous_layout_alignment"),
+                ),
+                allocate_output=lambda: self._allocate_down_output(
+                    all_tokens, K, hidden_states_device
+                ),
+            )
+            if cake_output is not None:
+                dispose_tensor(hidden_states)
+                dispose_tensor(hidden_states_scale)
+                return cake_output
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
@@ -602,18 +1407,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             scale_expanded_rows_(down_input_scale, running_state["topk_weights"])
             running_state["deepep_v2_weight_prefused"] = True
 
-        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
-        # allocation is required, so the downstream all-reduce takes the low-latency
-        # symmetric path. Only this final output enters the pool; intermediate
-        # buffers stay on the default allocator to bound pool occupancy.
-        with use_symmetric_memory(
-            get_parallel().tp_group, disabled=not is_allocation_symmetric()
-        ):
-            down_output = torch.empty(
-                (all_tokens, K),
-                device=hidden_states_device,
-                dtype=torch.bfloat16,
-            )
+        down_output = self._allocate_down_output(all_tokens, K, hidden_states_device)
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
@@ -1076,6 +1870,17 @@ def pre_permute_standard_to_deep_gemm(
     num_assignments = topk_ids.numel()
     block_e = deep_gemm_wrapper.get_contiguous_layout_alignment(
         num_assignments, num_experts
+    )
+    # The Cake route needs 128-row expert runs for its fast schedule; DeepGEMM
+    # accepts any alignment, so widening it is safe for the fallback too.
+    block_e = _cake_contiguous_layout_alignment(
+        block_e,
+        quant_info=quant_info,
+        runner_config=runner_config,
+        hidden_size=hidden_states.size(1),
+        device=hidden_states_device,
+        num_assignments=num_assignments,
+        num_experts=num_experts,
     )
     all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
