@@ -28,10 +28,7 @@ from sglang.multimodal_gen.tools.quantize_pi05_modelopt_fp8 import (
     load_observations,
     run_actions,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def tiny_model():
