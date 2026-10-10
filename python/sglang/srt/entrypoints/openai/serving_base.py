@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -21,6 +24,15 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _get_prompt_prep_executor() -> ThreadPoolExecutor:
+    # Prompt preparation (chat template render + tokenizer encode) is pure
+    # synchronous CPU work. For long prompts it can take hundreds of ms to
+    # seconds, which would block the tokenizer_manager event loop and stall
+    # every active stream, so it runs on this small bounded worker pool.
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="prompt-prep")
 
 
 # Base class for specific endpoint handlers
@@ -88,9 +100,15 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            # Convert to internal format. This covers the whole prompt-prep
+            # chain (message processing, chat template render, tokenizer
+            # encode); offload it so the event loop keeps pumping outputs.
+            loop = asyncio.get_running_loop()
+            adapted_request, processed_request = await loop.run_in_executor(
+                _get_prompt_prep_executor(),
+                self._convert_to_internal_request,
+                request,
+                raw_request,
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
