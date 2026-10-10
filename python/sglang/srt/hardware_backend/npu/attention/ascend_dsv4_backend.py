@@ -681,6 +681,72 @@ class CompressorAscendBackendMixin:
             except Exception as _exc:
                 print(f"[C4STP] pre skipped: {_exc}", flush=True)
 
+        # C4OWN: per-forward OWNERSHIP dump of the c4-indexer compress STATE
+        # slots for the c4 block-band positions [17408, 17536), so a prefix-cache
+        # HIT and MISS can be compared ownership-vs-content. For each covered
+        # absolute position this prints the exact table column (col), the
+        # resolved state_loc the kernel reads, the req_pool_idx that state_loc
+        # belongs to (forward_batch.req_pool_indices -- the SAME per-batch req
+        # pool _build_explicit_state_block_table was called with above), and the
+        # PRE-op state row content. Runs BEFORE compressor_op, next to the
+        # _c4stp_probe("pre") call, so pre_* is truly pre-op. Env
+        # DSV4_DUMP_C4OWN = layer id or "all"; INDEXER compressor (idx=1) only.
+        _want_own = os.environ.get("DSV4_DUMP_C4OWN")
+        _c4own_on = (
+            bool(_want_own)
+            and (_want_own in ("all", "") or _want_own == str(compressor.layer_id))
+            and bool(compressor.is_in_indexer)
+        )
+        if _c4own_on:
+            try:
+                # .cpu() BEFORE any slicing/indexing (NPU aclnn device-mismatch,
+                # lesson from 4d9cf4a).
+                _hist = coff * ratio
+                _width = int(state_block_table.shape[1])
+                _sp = fm.start_pos.reshape(-1).to(torch.int64).cpu()
+                _tbl_cpu = state_block_table.detach().to("cpu").to(torch.int64)
+                _flat = (
+                    state_cache.reshape(-1, state_cache.shape[-1])
+                    .detach()
+                    .to("cpu")
+                )
+                _rows_n = _flat.shape[0]
+                _req_cpu = (
+                    forward_batch.req_pool_indices.reshape(-1).to(torch.int64).cpu()
+                )
+                # positions [17408,17536); emit 17528..17535 first, then the rest
+                # of the band, and cap at ~20 lines.
+                _cand = list(range(17528, 17536)) + list(range(17408, 17528))
+                _n = 0
+                for _p in _cand:
+                    if _n >= 20:
+                        break
+                    for _b in range(_tbl_cpu.shape[0]):
+                        _idx = _hist + (_p - int(_sp[_b]))
+                        if _idx < 0 or _idx >= _width:
+                            continue
+                        _sl = int(_tbl_cpu[_b, _idx])
+                        if _sl < 0 or _sl >= _rows_n:
+                            continue
+                        _row = _flat[_sl].to(torch.float32)
+                        _sum = float(_row.sum())
+                        _absmax = (
+                            float(_row.abs().max()) if _row.numel() > 0 else 0.0
+                        )
+                        _req = int(_req_cpu[_b]) if _b < _req_cpu.numel() else -1
+                        print(
+                            f"[C4OWN] layer={compressor.layer_id} idx=1 "
+                            f"req={_req} pos={_p} col={_idx} loc={_sl} "
+                            f"page={_sl // 8} row={_sl % 8} "
+                            f"pre_sum={_sum:.6e} pre_absmax={_absmax:.6e}",
+                            flush=True,
+                        )
+                        _n += 1
+                        if _n >= 20:
+                            break
+            except Exception as _exc:
+                print(f"[C4OWN] skipped: {_exc}", flush=True)
+
         import os
 
         # A full DSV4_DUMP is tens of thousands of lines. DSV4_DUMP_LAYERS keeps
