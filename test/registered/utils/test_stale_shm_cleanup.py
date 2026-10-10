@@ -69,14 +69,33 @@ class TestCleanupStaleShm(unittest.TestCase):
         self.assertTrue(os.path.exists(f"/dev/shm/{live}"))
         self.assertTrue(os.path.exists(f"/dev/shm/{foreign}"))
 
-    def test_noop_outside_ci(self):
+    def test_pid_stamped_sweep_runs_outside_ci(self):
+        """The pid-stamped rule must run in production too: segments leaked
+        by a crashed run otherwise wedge every later startup on a full
+        tmpfs (load snapshot SIGBUS / NCCL ENOSPC crashloop)."""
         dead_pid = _spawn_dead_pid()
         stale = self._make_segment(f"sgl_shm_mq_{dead_pid}_cccc0000")
+        live = self._make_segment(f"sgl_shm_mq_{os.getpid()}_fff0000")
+        orphan = self._make_raw_file("sglang_loads_test_outside_ci.shm")
 
         with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "false"}):
             cleanup_stale_shm()
 
-        self.assertTrue(os.path.exists(f"/dev/shm/{stale}"))
+        self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
+        self.assertTrue(os.path.exists(f"/dev/shm/{live}"))
+        # Orphan families stay CI-only: unconditionally unlinking them can
+        # hit a concurrent live server on the same machine.
+        self.assertTrue(os.path.exists(orphan))
+
+    def test_scheduler_entry_binds_sweep(self):
+        """Bind the production call site: the scheduler entry must sweep
+        before constructing Scheduler, or the startup wedge returns."""
+        import inspect
+
+        from sglang.srt.managers.scheduler import run_scheduler_process
+
+        src = inspect.getsource(run_scheduler_process)
+        self.assertIn("cleanup_stale_shm", src)
 
     def test_shm_ring_buffer_uses_reclaimable_name(self):
         """Bind the production call site: ShmRingBuffer must emit a
