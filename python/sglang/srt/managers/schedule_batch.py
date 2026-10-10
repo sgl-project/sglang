@@ -2297,6 +2297,27 @@ def compute_extend_logprob_start_len(
     return min(resolved_start - prefix_len, extend_len)
 
 
+def check_encoder_swa_replay_request(req: Req) -> None:
+    """Reject inputs that encoder SWA replay cannot rebuild or return."""
+    mm_inputs = req.multimodal_inputs
+    if (
+        req.input_embeds is not None
+        or req.positional_embed_overrides is not None
+        or (
+            mm_inputs is not None
+            and not all(item.is_image() for item in mm_inputs.mm_items)
+        )
+    ):
+        raise ValueError(
+            "encoder SWA replay currently supports text and image requests only"
+        )
+    if req.return_logprob and req.logprob_start_len not in (
+        -1,
+        len(req.origin_input_ids),
+    ):
+        raise ValueError("encoder SWA replay cannot return cached prompt logprobs")
+
+
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
     vocab_size: int,
@@ -2753,21 +2774,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
             for req in reqs:
-                if (
-                    req.multimodal_inputs is not None
-                    or req.input_embeds is not None
-                    or req.positional_embed_overrides is not None
-                ):
-                    raise ValueError(
-                        "encoder SWA replay currently supports token-only text requests"
-                    )
-                if req.return_logprob and req.logprob_start_len not in (
-                    -1,
-                    len(req.origin_input_ids),
-                ):
-                    raise ValueError(
-                        "encoder SWA replay cannot return cached prompt logprobs"
-                    )
+                check_encoder_swa_replay_request(req)
             self.encoder_swa_reset = [
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
