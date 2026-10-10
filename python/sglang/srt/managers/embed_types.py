@@ -44,15 +44,41 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
         # Dispatch by element rank to avoid a per-element unsqueeze.
         if isinstance(self.embeds, list):
             if not self.embeds:
-                self.embeds = torch.cat(self.embeds, dim=0)  # raises — empty is invalid
+                raise ValueError(
+                    "positional_embed_overrides embeds must be a non-empty list of "
+                    "tensors or a pre-stacked [N, hidden_dim] tensor."
+                )
             elif self.embeds[0].dim() == 1:
                 # [hidden_dim] elements → stack adds the leading dim.
                 self.embeds = torch.stack(self.embeds, dim=0)
             else:
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
+        # Enforce rank here rather than in validate_hidden_dim: that method only
+        # inspects the last dim, so a [N, 1, hidden_dim] input would satisfy both
+        # the length check below and the hidden-dim check, then fail deep inside
+        # the scheduler's scatter and abort every co-batched request.
+        if self.embeds.dim() != 2:
+            raise ValueError(
+                f"positional_embed_overrides embeds must be 2-D [N, hidden_dim], got "
+                f"shape {tuple(self.embeds.shape)}."
+            )
         if self.embeds.shape[0] != len(self.positions):
             raise ValueError(
                 f"embeds length ({self.embeds.shape[0]}) != "
                 f"positions length ({len(self.positions)})"
+            )
+
+    def validate_hidden_dim(self, expected_hidden_dim: int) -> None:
+        """Raise ValueError if the stacked embeds tensor's last dim != model hidden_dim.
+
+        Called from the request-ingestion path so callers get an actionable error
+        instead of an opaque scatter failure inside the scheduler process.
+        """
+        actual = self.embeds.shape[-1]
+        if actual != expected_hidden_dim:
+            raise ValueError(
+                f"positional_embed_overrides hidden_dim ({actual}) does not match "
+                f"model hidden_size ({expected_hidden_dim}). Each embed tensor must "
+                f"have shape [hidden_size] or [1, hidden_size]."
             )
