@@ -1848,7 +1848,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 prefix_tokens = self.forward_metadata.mixed_prefill_tokens
                 if (
                     prefix_reqs
-                    and q.dtype == self.data_type == torch.bfloat16
+                    and self.data_type in (torch.float16, torch.bfloat16)
+                    and q.dtype == self.data_type
                     and layer.attn_type == AttentionType.DECODER
                 ):
                     out = torch.empty_like(q) if out is None else out
