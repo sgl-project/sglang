@@ -69,7 +69,6 @@
     "registered/unit/model_executor/test_hisparse_pool_configurator.py"
   ],
   "rust-server": [
-    "registered/rust/test_run_rust_tests.py",
     "registered/core/test_srt_endpoint.py",
     "registered/vlm/test_rust_native_mm_e2e.py",
     "registered/vlm/test_rust_native_mm_mmmu.py",
