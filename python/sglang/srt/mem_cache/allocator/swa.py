@@ -398,9 +398,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device = self.device
         swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
         swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
+        swa_seq_lens = torch.full((1,), swa_tail_len, dtype=torch.int64, device=device)
         swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        swa_last_loc = torch.full((1,), -1, dtype=torch.int64, device=device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,
