@@ -9,6 +9,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.quark.utils import (
+    deep_compare,
     e8m0_to_f32,
     should_ignore_layer,
 )
@@ -154,6 +155,45 @@ class TestShouldIgnoreLayerFusedNames(CustomTestCase):
                 fused_mapping=QKV_MAPPING,
             )
         )
+
+
+class TestDeepCompare(CustomTestCase):
+    """`deep_compare` decides whether two quark layer configs are the same.
+
+    The list branch used to compare ``set(a) == set(b)``, which raises on a
+    list of dicts and silently ignores order and length.
+    """
+
+    def test_equal_nested_configs(self):
+        config = {
+            "weight": {"dtype": "mx_fp4", "group_size": 32, "block_size": [1, 128]},
+            "input_tensors": None,
+        }
+        self.assertTrue(deep_compare(config, dict(config)))
+
+    def test_list_of_dicts_is_comparable(self):
+        # dicts are unhashable, so a set-based comparison raises here
+        left = {"weight": {"hints": [{"dtype": "mx_fp4"}]}}
+        right = {"weight": {"hints": [{"dtype": "fp8_e4m3"}]}}
+        self.assertFalse(deep_compare(left, right))
+        self.assertTrue(
+            deep_compare(left, {"weight": {"hints": [{"dtype": "mx_fp4"}]}})
+        )
+
+    def test_list_order_is_significant(self):
+        # [1, 128] and [128, 1] are different block shapes
+        self.assertFalse(
+            deep_compare({"block_size": [1, 128]}, {"block_size": [128, 1]})
+        )
+
+    def test_list_length_is_significant(self):
+        self.assertFalse(deep_compare({"shape": [128, 128]}, {"shape": [128]}))
+
+    def test_differing_scalars(self):
+        self.assertFalse(deep_compare({"group_size": 32}, {"group_size": 64}))
+
+    def test_differing_types(self):
+        self.assertFalse(deep_compare({"a": 1}, {"a": "1"}))
 
 
 if __name__ == "__main__":
