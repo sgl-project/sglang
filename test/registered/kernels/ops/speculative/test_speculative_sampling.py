@@ -145,6 +145,11 @@ def test_tree_speculative_sampling_target_only(
         ([1, 2, 3], [0.0, 0.25, 0.0, 0.75], 0.25, 1.0, 3, 1),
         ([1], [0.0, 0.25, 0.75], 0.0, 1.0, 1, 1),
         ([1], [0.0, 1.0], 1.0 - 2**-24, 1.0, 1, 1),
+        # A renormalized one-token nucleus carries 1 - 2^-24, not 1.0; with the
+        # largest float32 coin the draft is (correctly) rejected, but the
+        # residual relu(q - p) is then empty and the fallback must still sample
+        # from the target (token 1), not emit vocab_size - 1 (#42528).
+        ([1], [0.0, 1.0 - 2**-24, 0.0], 1.0 - 2**-24, 1.0, 1, 0),
     ],
     ids=[
         "zero-mass-zero-threshold",
@@ -152,6 +157,7 @@ def test_tree_speculative_sampling_target_only(
         "interior-boundary",
         "lower-endpoint",
         "upper-endpoint",
+        "upper-endpoint-empty-residual",
     ],
 )
 def test_target_only_sampling_cdf_boundaries(

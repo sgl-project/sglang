@@ -131,7 +131,45 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   temp_storage.last_valid_id = -1;
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.block_aggregate.value;
-  DType u = coin * sum_relu_q_minus_p;
+  __syncthreads();
+
+  // The residual relu(q - p) can be empty: every token the target gives mass to was a
+  // rejected draft (so p == q there). That happens when the coin equals the target's
+  // renormalized mass (e.g. a one-token nucleus of 1 - 2^-24 and coin == 1 - 2^-24,
+  // the largest float32 torch.rand can return): the draft is rejected by the half-open
+  // CDF test and nothing is left to sample from, so the fallback below would emit
+  // token id d - 1 - a token with zero target probability. Sample from the target
+  // distribution itself in that case.
+  const bool residual_empty = !(sum_relu_q_minus_p > DType(0));
+  DType sampling_mass = sum_relu_q_minus_p;
+  if (residual_empty) {
+    // sum_relu_q_minus_p was broadcast from block_aggregate, so this branch is uniform
+    // across the block and the block-wide reductions inside it are safe. The target
+    // mass is only needed on this (rare) path; keeping it here leaves the common
+    // nonempty-residual and bonus paths with a single reduction per tile.
+    DType sum_q(0);
+    DType q_arr[VEC_SIZE];
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      q_vec.fill(DType(0));
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        q_arr[j] = q_vec[j];
+      }
+      sum_q += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum<VEC_SIZE>(q_arr);
+      __syncthreads();
+    }
+    if (tx == 0) {
+      temp_storage.block_aggregate.value = sum_q;
+    }
+    __syncthreads();
+    sampling_mass = temp_storage.block_aggregate.value;
+    // Complete the broadcast before the sampling scan below reuses shared storage.
+    __syncthreads();
+  }
+  DType u = coin * sampling_mass;
 
   DType aggregate_relu_q_minus_p(0);
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -148,7 +186,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     vec_t<DType, VEC_SIZE> relu_q_minus_p_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
+      relu_q_minus_p_vec[j] = residual_empty ? q_vec[j] : max(q_vec[j] - p_vec[j], DType(0));
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
