@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 
+# srt group globals the diffusion runtime mirrors from its own TP group. srt's
+# initialize_model_parallel refuses to run while any of them is set.
+_MIRRORED_SRT_GROUPS = ("_TP", "_ATTN_TP", "_MOE_TP", "_MOE_EP")
+
 
 def _resolve_llada_image_component_path(
     model_root: str,
@@ -110,14 +114,16 @@ class LLaDAImageTextEncoderRunner:
             ranks=SpawnRanks(world_rank=0, gpu_id=gpu_id),
         )
         with use_context(self.runtime_context):
-            # The diffusion runtime mirrors its TP group into the srt globals.
-            # Detach the groups without clearing the encoder context's ranks,
-            # then restore the mirror and keep the encoder group for forwards.
-            saved_srt_tp = srt_parallel_state._TP
-            saved_srt_attn_tp = srt_parallel_state._ATTN_TP
+            # The diffusion runtime mirrors its TP group into the srt globals,
+            # the MoE groups included. Detach the groups without clearing the
+            # encoder context's ranks, then restore the mirror and keep the
+            # encoder groups for forwards.
+            saved_groups = {
+                name: getattr(srt_parallel_state, name) for name in _MIRRORED_SRT_GROUPS
+            }
             try:
-                srt_parallel_state._TP = None
-                srt_parallel_state._ATTN_TP = None
+                for name in _MIRRORED_SRT_GROUPS:
+                    setattr(srt_parallel_state, name, None)
                 init_parallel_runtime(
                     server_args=srt_args,
                     device=device.type,
@@ -133,11 +139,13 @@ class LLaDAImageTextEncoderRunner:
                 self.worker.alloc_memory_pool()
                 self.worker.init_attention_backends()
                 self.worker.init_cuda_graphs()
-                self.encoder_tp_group = srt_parallel_state._TP
-                self.encoder_attn_tp_group = srt_parallel_state._ATTN_TP
+                self.encoder_groups = {
+                    name: getattr(srt_parallel_state, name)
+                    for name in _MIRRORED_SRT_GROUPS
+                }
             finally:
-                srt_parallel_state._TP = saved_srt_tp
-                srt_parallel_state._ATTN_TP = saved_srt_attn_tp
+                for name, group in saved_groups.items():
+                    setattr(srt_parallel_state, name, group)
             self.server_args = srt_args
             self.model_runner = self.worker.model_runner
             self.page_size = self.model_runner.page_size
@@ -199,17 +207,22 @@ class LLaDAImageTextEncoderRunner:
 
         # Restore the encoder context inside the diffusion TP scope.
         with (
-            mm_parallel_state.use_tensor_parallel_group(self.encoder_tp_group),
+            mm_parallel_state.use_tensor_parallel_group(self.encoder_groups["_TP"]),
             use_context(self.runtime_context),
         ):
-            saved_attn_tp = srt_parallel_state._ATTN_TP
+            # The TP scope points _TP and _ATTN_TP at one group. Use every
+            # encoder group the srt layers read during the forward.
+            swapped = [name for name in _MIRRORED_SRT_GROUPS if name != "_TP"]
+            saved_groups = {name: getattr(srt_parallel_state, name) for name in swapped}
             try:
-                srt_parallel_state._ATTN_TP = self.encoder_attn_tp_group
+                for name in swapped:
+                    setattr(srt_parallel_state, name, self.encoder_groups[name])
                 return self._encode_impl(
                     prompts, max_sequence_length, component_context=component_context
                 )
             finally:
-                srt_parallel_state._ATTN_TP = saved_attn_tp
+                for name, group in saved_groups.items():
+                    setattr(srt_parallel_state, name, group)
 
     def _encode_impl(
         self, prompts: list[str], max_sequence_length: int, component_context
