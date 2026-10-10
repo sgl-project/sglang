@@ -523,8 +523,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             return None
         shard = self._tp_shard
         prev = first_prev_tokens.long()
-        greedy = torch.zeros(prev.shape[0], dtype=torch.float32, device=prev.device)
-        offset = torch.zeros(1, dtype=torch.int64, device=prev.device)
+        # The greedy-only variant reads neither, so nothing fills them.
+        greedy = torch.empty(prev.shape[0], dtype=torch.float32, device=prev.device)
+        offset = torch.empty(1, dtype=torch.int64, device=prev.device)
         tokens = []
         for step in range(base_logits.shape[1]):
             bias, _ = self.step_bias(prev, hidden_states=None, state=None)
