@@ -176,6 +176,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_xpu,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
@@ -3681,8 +3682,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=state.positions,
             hidden_states=hidden_states,
             # DSV4 non-fused layers carry no residual across layers; the key is
-            # required by the next layer's op_mhc_prepare_attn (ignored) and by
-            # _model_forward_tbo_merge_outputs (None -> None).
+            # required by the next layer's op_mhc_prepare_attn (ignored).
             residual=None,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
@@ -4162,7 +4162,7 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
             _model_forward_filter_inputs,
-            _model_forward_tbo_merge_outputs,
+            _model_forward_tbo_merge_key,
         )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
@@ -4236,10 +4236,9 @@ class DeepseekV4Model(nn.Module):
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-        hidden_states, _ = _model_forward_tbo_merge_outputs(
-            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+        return _model_forward_tbo_merge_key(
+            outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
         )
-        return hidden_states
 
     @torch.no_grad()
     def forward(
@@ -4415,8 +4414,28 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+# Quark keys its per-layer specs by checkpoint module names (layers.N.attn.wq_a,
+# mtp.0.ffn.experts.N.w1, ...); this maps them onto the module prefixes built here.
+_QUARK_CKPT_TO_SGLANG_MAPPER = WeightsMapper(
+    orig_to_new_prefix={"layers.": "model.layers.", "mtp.": "model.mtp."},
+    orig_to_new_substr={".attn.": ".self_attn.", ".ffn.": ".mlp."},
+    orig_to_new_suffix={".w1": ".gate_proj", ".w2": ".down_proj", ".w3": ".up_proj"},
+)
+
+
+def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
+    quantization_config = getattr(config, "quantization_config", None) or {}
+    return quantization_config.get("quant_method") == "quark"
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
+        # The loader hands this mapper to every quant config; other formats were
+        # written against different names, so only Quark checkpoints get it.
+        return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
 
     def __init__(
         self,
@@ -5486,7 +5505,20 @@ def _prepare_deepseek_v4_weights(
     if quant_config is not None and quant_config.get_name() == "expert_pack":
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
         return weights
+    if quant_config is not None and quant_config.get_name() == "quark":
+        weights = _rename_quark_fp8_block_scales(weights)
     return _dequant_fp8_wo_a_streaming(weights)
+
+
+def _rename_quark_fp8_block_scales(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    # Quark spells the FP8-block scale ".weight_scale" where native V4 spells it
+    # ".scale" (both e8m0); MXFP4 scales are uint8 and keep their name.
+    for name, tensor in weights:
+        if name.endswith(".weight_scale") and tensor.dtype == torch.float8_e8m0fnu:
+            name = name.removesuffix(".weight_scale") + ".scale"
+        yield name, tensor
 
 
 def _fuse_deepseek_v4_wqkv_a_pair(

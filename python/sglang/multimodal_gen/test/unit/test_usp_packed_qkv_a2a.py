@@ -174,5 +174,65 @@ class TestPackedQKVInputA2A(CustomTestCase):
                     self.assertTrue(packed[r][i].is_contiguous())
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestPackedQKVRowViewPredicate(CustomTestCase):
+    """`_packed_qkv_row_view_is_free` decides which path the a2a takes.
+
+    It is the whole safety argument for accepting strided input: the pack
+    kernel reads q/k/v through explicit row/head strides, so only head_size
+    needs unit stride, but `view(b * s_local, h, d)` still has to be free. If
+    the predicate admits a layout where that view would copy, the kernel reads
+    the wrong rows and attention is silently wrong -- no exception.
+    """
+
+    H, D, WORLD = 8, 64, 4
+
+    def _merged_qkv_chunk(self, b, s):
+        """q/k/v as chunks of one packed projection, the FLUX.2 layout.
+
+        Non-contiguous, unit stride on head_size, batch/seq mergeable -- the
+        case this PR exists to accept.
+        """
+        inner = self.H * self.D
+        hidden = torch.randn(b, s, 3 * inner, device="cuda", dtype=torch.bfloat16)
+        q, k, v = hidden.chunk(3, dim=-1)
+        return tuple(t.unflatten(-1, (self.H, self.D)) for t in (q, k, v))
+
+    def test_strided_merged_projection_is_accepted(self):
+        q, k, v = self._merged_qkv_chunk(1, 32)
+        self.assertFalse(q.is_contiguous(), "setup: q must be strided")
+        self.assertTrue(usp_mod._packed_qkv_row_view_is_free(q))
+        self.assertTrue(usp_mod._can_use_packed_qkv_a2a_4d(q, k, v, self.WORLD))
+        # the row view the pack kernel takes must genuinely not copy
+        rows = q.shape[0] * q.shape[1]
+        self.assertEqual(q.view(rows, self.H, self.D).data_ptr(), q.data_ptr())
+
+    def test_batched_sequence_slice_is_rejected(self):
+        """b > 1 sliced along seq: stride(0) still spans the unsliced rows, so
+        merging batch and seq would copy. Must stay on the unpacked path."""
+        full = torch.randn(2, 64, self.H, self.D, device="cuda", dtype=torch.bfloat16)
+        sl = full[:, 32:]
+        self.assertEqual(sl.stride(-1), 1, "setup: head_size is unit stride")
+        self.assertNotEqual(sl.stride(0), sl.shape[1] * sl.stride(1))
+        self.assertFalse(usp_mod._packed_qkv_row_view_is_free(sl))
+        self.assertFalse(usp_mod._can_use_packed_qkv_a2a_4d(sl, sl, sl, self.WORLD))
+
+    def test_contiguous_still_accepted(self):
+        """No regression for the layouts that already qualified."""
+        t = torch.randn(1, 32, self.H, self.D, device="cuda", dtype=torch.bfloat16)
+        self.assertTrue(t.is_contiguous())
+        self.assertTrue(usp_mod._packed_qkv_row_view_is_free(t))
+        self.assertTrue(usp_mod._can_use_packed_qkv_a2a_4d(t, t, t, self.WORLD))
+
+    def test_non_unit_head_stride_is_rejected(self):
+        """head_size must be unit-stride; the kernel cannot express a gap."""
+        wide = torch.randn(
+            1, 32, self.H, 2 * self.D, device="cuda", dtype=torch.bfloat16
+        )
+        t = wide[..., ::2]
+        self.assertNotEqual(t.stride(-1), 1)
+        self.assertFalse(usp_mod._packed_qkv_row_view_is_free(t))
+
+
 if __name__ == "__main__":
     unittest.main()

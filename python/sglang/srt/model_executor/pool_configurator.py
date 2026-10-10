@@ -926,7 +926,7 @@ def compute_swa_request_cap(
         )
 
 
-class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
+class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA with the SWA pool sized from the explicit max_running_requests
     worst case instead of swa_full_tokens_ratio; the rest goes to the full pool."""
 
@@ -943,12 +943,18 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
-        """True when SWAChunkCache can be sized from explicit max requests."""
+        """True when a radix-disabled hybrid SWA cache can be sized from
+        explicit max requests."""
         if get_schedule().max_running_requests is None:
             return False
         if not get_memory().disable_radix_cache:
             return False
-        if get_schedule().chunked_prefill_size is None:
+        # The cap holds at most one prefill chunk per batch in flight; an
+        # unchunked prefill writes the whole prompt into the SWA pool.
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if get_disagg().disaggregation_mode != "decode" and (
+            chunked_prefill_size is None or chunked_prefill_size <= 0
+        ):
             return False
         if kvc.sliding_window_size is None:
             return False
@@ -1608,8 +1614,8 @@ def create_memory_pool_configurator(
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
-        if SWAChunkCapPoolConfigurator.is_applicable(kvc):
-            return SWAChunkCapPoolConfigurator(kvc)
+        if SWARequestCapPoolConfigurator.is_applicable(kvc):
+            return SWARequestCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)
