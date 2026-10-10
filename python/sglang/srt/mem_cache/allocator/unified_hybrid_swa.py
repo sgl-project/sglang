@@ -335,33 +335,6 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
-    def bind_swa_for_loaded_rows(
-        self, full_token_ids: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Bind SWA pages to resident or newly loaded full-attention virtual IDs.
-
-        Bind before translating: unbound pages translate to the padding sink.
-        Return physical IDs, or None if capacity cannot be reclaimed.
-        """
-        ids = full_token_ids.to(torch.int64)
-        if ids.numel() == 0:
-            return ids
-        ps = self.page_size
-        pages = torch.unique(ids // ps)
-        # Tombstones (-1) and the padding sink (0) both need a physical binding.
-        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
-        need = int(unbound.numel()) * ps
-        if need:
-            if need > self.swa_available_size():
-                return None
-            if (
-                need > self.swa_attn_allocator.available_size()
-                and not _relieve_for_alloc(self.swa_attn_allocator, need)
-            ):
-                return None
-            self.swa_attn_allocator.alloc_with_virtual(unbound)
-        return self.translate_loc_from_full_to_swa(ids)
-
     def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
         """Block page relocation while host transfers use resolved device indices."""
         install_move_gate(

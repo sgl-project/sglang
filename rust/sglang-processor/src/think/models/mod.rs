@@ -9,6 +9,7 @@ use super::ThinkConfig;
 pub(crate) fn think_config(reasoning_parser: &str) -> Option<ThinkConfig> {
     match reasoning_parser {
         "deepseek-v4" => Some(deepseek_v4::THINK),
+        "deepseek-v41" => Some(deepseek_v4::THINK_V41),
         _ => None,
     }
 }
