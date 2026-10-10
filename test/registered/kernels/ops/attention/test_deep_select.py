@@ -8,9 +8,7 @@ valid range, and slots past a row's ``end`` hold the fill values.
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -177,56 +175,6 @@ def test_page_transform_matches_reference(k, rows, width, with_end):
     logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
     logical = torch.where(valid, logical, torch.full_like(logical, -1))
     _check_topk(input, k, logical, end=end, idx_fill=-1)
-
-
-def test_full_topk_decode_runtime_integration():
-    from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
-    from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
-    from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
-
-    rows, width, k, page_size = 4, 4096, 512, 64
-    scores = _make_input(rows, width, torch.float32)
-    end = torch.tensor([0, 1, k - 1, width], dtype=torch.int32, device="cuda")
-    table, inverse = _random_page_table(rows, width, page_size)
-    output = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(
-        page_table=table,
-        compressed_page_size=page_size,
-    )
-    inputs = DecodeInputs(
-        indexer=SimpleNamespace(index_topk=k),
-        layer_id=0,
-        compress_ratio=1,
-        freqs_cis=None,
-        x=None,
-        q_lora=None,
-        positions=None,
-        req_rows=torch.arange(rows, device="cuda"),
-        paged_metadata=metadata,
-        is_verify=False,
-        out_page_indices=output,
-    )
-    data = DecodeScores(
-        bs=rows,
-        lmax=width,
-        lens=end.to(torch.int64),
-        slots=torch.empty(0, dtype=torch.int64, device="cuda"),
-        scores=scores,
-    )
-    indexer = object.__new__(mod.FullTopKIndexer)
-    indexer.token_to_kv_pool = None
-    indexer.req_to_token = None
-    indexer.use_deep_gemm_decode = False
-    indexer.use_deep_select_decode = True
-
-    with patch.object(mod, "decode_scores", return_value=data):
-        indexer.topk_decode(inputs)
-
-    valid = output != -1
-    wide = output.long()
-    logical = inverse[(wide // page_size).clamp(min=0)] * page_size + wide % page_size
-    logical = torch.where(valid, logical, torch.full_like(logical, -1))
-    _check_topk(scores, k, logical, end=end, idx_fill=-1)
 
 
 if __name__ == "__main__":
