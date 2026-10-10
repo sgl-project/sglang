@@ -102,19 +102,16 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: 10
-        # Same persistent venv ci_install_dependency.sh creates on this runner; dropping
-        # its completion marker makes the next CI job there rebuild rather than trust it.
+        # Keep this unpinned resolve out of /opt/sglang-ci-py*, which gated jobs reuse;
+        # `python3 -m uv` runs the uv just upgraded, not an older one on PATH.
         run: |
-          venv=/opt/sglang-ci-py3.12
-          rm -f "$venv/.install-complete"
-          if [ ! -x "$venv/bin/python3" ]; then
-            command -v uv >/dev/null 2>&1 || python3 -m pip install uv
-            uv python install 3.12 --python-preference only-managed
-            uv venv "$venv" --python 3.12 --python-preference only-managed --seed
-          fi
+          venv="$RUNNER_TEMP/sglang-coverage-venv"
+          python3 -m pip install --upgrade uv
+          python3 -m uv python install --upgrade 3.12 --python-preference only-managed
+          python3 -m uv venv "$venv" --python 3.12 --python-preference only-managed --seed
           echo "$venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$venv" >> "$GITHUB_ENV"
-          "$venv/bin/python3" -m pip install -e "python/[test]"
+          python3 -m uv pip install --python "$venv/bin/python3" -e "python/[test]"
 
       - name: Run unit tests with coverage
         # Non-gating on purpose: running the whole tree in one process
