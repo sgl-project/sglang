@@ -3692,9 +3692,10 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
     from sglang.srt.utils.network import NetworkAddress
 
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/ping")
     async def ping():

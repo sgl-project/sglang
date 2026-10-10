@@ -55,36 +55,61 @@ configure_environment() {
     USE_VENV="${USE_VENV:-0}"
     echo "USE_VENV=${USE_VENV}"
 
-    python3 -m pip install --upgrade pip
-    if ! command -v uv >/dev/null 2>&1; then
-        pip install uv
+    # A stale uv only knows the managed Python builds released before it.
+    python3 -m pip install --upgrade pip uv
+    # Put that uv ahead of any older copy on PATH (runner image, standalone installer).
+    UV_BIN_DIR="$(dirname "$(python3 -c 'import uv; print(uv.find_uv_bin())')")"
+    export PATH="${UV_BIN_DIR}:${PATH}"
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_BIN_DIR" >> "$GITHUB_PATH" || true
     fi
+    uv --version
 
-    SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    # Every job installs into a uv-managed venv, whatever Python the runner image ships.
+    CI_PYTHON_VER="${SGLANG_TEST_CI_PYTHON:-3.12}"
+    echo "SGLANG_TEST_CI_PYTHON=${CI_PYTHON_VER}"
 
+    # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
+    # --upgrade repoints uv's minor-version link at the latest patch; a kept venv follows it.
+    uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+
+    UV_VENV_COMPLETE_MARKER=""
     if [ "$USE_VENV" = "1" ]; then
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
-        uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
-        # shellcheck disable=SC1091
-        source "$UV_VENV/bin/activate"
-        [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
-        [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
-
-        if [ -n "${GITHUB_ENV:-}" ]; then
-            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
-            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
-            touch "$UV_VENV/env.sh"
-        fi
-        if [ -n "${GITHUB_PATH:-}" ]; then
-            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
-        fi
+        uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
     else
-        echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
-        UV_VENV=""
+        # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
+        UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
+        # A cancelled install leaves dist-info that later installs treat as satisfied;
+        # rebuild unless the last install ran to completion.
+        UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
+        if [ ! -f "$UV_VENV_COMPLETE_MARKER" ]; then
+            rm -rf "$UV_VENV"
+            uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
+        fi
+        rm -f "$UV_VENV_COMPLETE_MARKER"
+    fi
+
+    # shellcheck disable=SC1091
+    source "$UV_VENV/bin/activate"
+    [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
+    [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
+
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+        mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+        echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+        # ci_cleanup_venv.sh deletes this path, so only the per-job venv exports it.
+        if [ "$USE_VENV" = "1" ]; then
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+        fi
+        echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
+        : > "$UV_VENV/env.sh"
+    fi
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -382,14 +407,8 @@ release_cargo_cache_lock() {
 }
 
 setup_pip_toolchain() {
-    if [ "$USE_VENV" = "1" ]; then
-        # The bootstrap upgrade hit system pip; this upgrades the venv's own.
-        python3 -m pip install --upgrade pip
-    fi
-
-    if [ "$USE_VENV" != "1" ]; then
-        export UV_SYSTEM_PYTHON=1
-    fi
+    # The bootstrap upgrade hit system pip; this upgrades the venv's own.
+    python3 -m pip install --upgrade pip
 
     export UV_LINK_MODE=copy
     PIP_CMD="uv pip"
@@ -548,9 +567,8 @@ require_prebuilt_rust_exts() {
     # Exact EXT_SUFFIX rather than an _*.so glob: no crate sets abi3, so a module
     # built for another minor version satisfies the glob while the import system
     # ignores it, leaving is_rust_server_built() false and the Rust-server tests
-    # silently skipped. Stages have no setup-python, so the interpreter is whatever
-    # the image ships, and the pools are not on one version (h20 is 3.12 while
-    # h100 is 3.10) - a mismatch is drift to route around, not a failure.
+    # silently skipped. A SGLANG_TEST_CI_PYTHON outside the build matrix has no module;
+    # build it from source rather than fail.
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
@@ -809,7 +827,9 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
+        # drop the cap once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
@@ -835,9 +855,7 @@ setup_ld_library_path() {
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
-        echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
-    fi
+    echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
     fi
@@ -943,6 +961,9 @@ main() {
     prepare_runner
     setup_ld_library_path
     verify_imports
+    if [ -n "$UV_VENV_COMPLETE_MARKER" ]; then
+        touch "$UV_VENV_COMPLETE_MARKER"
+    fi
 }
 
 main "$@"

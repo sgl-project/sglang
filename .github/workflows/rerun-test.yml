@@ -386,14 +386,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
       # Worth the most of the three jobs: this runner is hosted, so it has no
       # persistent cargo target dir and every dispatch compiled cold. Its
-      # setup-python pins the same 3.10 the modules were built against.
+      # setup-python pins the same 3.12 the modules were built against.
       - uses: ./.github/actions/download-rust-ext
         id: rust_ext
 
@@ -471,7 +471,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Write back result to reply comment
         env:
