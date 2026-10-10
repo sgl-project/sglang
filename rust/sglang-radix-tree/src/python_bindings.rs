@@ -3934,12 +3934,9 @@ fn get_hash_str(
                 "prior_hash must be a 64-character hexadecimal digest",
             ));
         }
-        if let Some(token_id) = raw
-            .iter()
-            .find(|token_id| u32::try_from(**token_id).is_err())
-        {
+        if let Some(token_id) = raw.iter().find(|token_id| **token_id < 0) {
             return Err(PyValueError::new_err(format!(
-                "token id {token_id} does not fit in uint32"
+                "token id {token_id} must be a non-negative int64"
             )));
         }
         Ok(py.detach(move || {
