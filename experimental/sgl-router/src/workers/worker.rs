@@ -41,7 +41,7 @@ pub enum WireProtocol {
 }
 
 /// Engine launch facts from `/server_info`; a bare [`WireProtocol`] means one DP rank.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EngineProfile {
     pub protocol: WireProtocol,
     /// `dp_size * attn_dp_size`; 0 is treated as 1.

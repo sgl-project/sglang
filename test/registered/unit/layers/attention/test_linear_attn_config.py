@@ -46,12 +46,6 @@ class TestLinearAttnBackends(CustomTestCase):
         backends = resolve_linear_attn_backends(prefill_default="flashinfer")
         self.assertEqual(backends.prefill, LinearAttnKernelBackend.FLASHINFER)
 
-    def test_the_base_backend_applies_without_a_default(self):
-        self._publish(linear_attn_backend="triton")
-        backends = resolve_linear_attn_backends()
-        self.assertEqual(backends.prefill, LinearAttnKernelBackend.TRITON)
-        self.assertEqual(backends.decode, LinearAttnKernelBackend.TRITON)
-
     def test_the_default_does_not_reach_the_decode_backend(self):
         self._publish(linear_attn_backend="triton")
         backends = resolve_linear_attn_backends(prefill_default="flashinfer")

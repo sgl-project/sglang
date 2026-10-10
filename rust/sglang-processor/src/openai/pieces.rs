@@ -39,16 +39,19 @@ impl TokenPieces {
         Self { pieces, byte_level }
     }
 
-    /// The token's piece when the tokenizer is byte-level BPE.
-    pub fn byte_level_piece(&self, id: u32) -> Option<&str> {
-        self.byte_level
-            .then(|| self.pieces.get(&id).map(String::as_str))
-            .flatten()
+    /// The token's bytes when the tokenizer is byte-level BPE.
+    pub fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        let piece = self.pieces.get(&id).filter(|_| self.byte_level)?;
+        let bytes = piece
+            .chars()
+            .map(byte_level_byte)
+            .collect::<Option<Vec<u8>>>()?;
+        (!bytes.is_empty()).then_some(bytes)
     }
 }
 
 /// GPT-2's `bytes_to_unicode`, inverted for one character.
-pub(super) fn byte_level_byte(c: char) -> Option<u8> {
+fn byte_level_byte(c: char) -> Option<u8> {
     let printable = |b: u32| matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
     let c = c as u32;
     if printable(c) {
@@ -70,12 +73,12 @@ mod tests {
     fn byte_level_probe_matches_python() {
         let gpt2 = json!({"model": {"vocab": {"!": 0, "\"": 1, "#": 2, "Ġa": 3, "é": 4}}, "added_tokens": []});
         let pieces = TokenPieces::from_tokenizer_json(&gpt2);
-        assert_eq!(pieces.byte_level_piece(3), Some("Ġa"));
+        assert_eq!(pieces.byte_level_bytes(3), Some(b" a".to_vec()));
         // DeepSeek's first ids are full-width special tokens, so Python says no.
         let deepseek = json!({"model": {"vocab": {"!": 3, "a": 4}},
             "added_tokens": [{"id": 0, "content": "<｜begin▁of▁sentence｜>"}]});
         assert_eq!(
-            TokenPieces::from_tokenizer_json(&deepseek).byte_level_piece(3),
+            TokenPieces::from_tokenizer_json(&deepseek).byte_level_bytes(3),
             None
         );
         assert_eq!(byte_level_byte('Ġ'), Some(b' '));

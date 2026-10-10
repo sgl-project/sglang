@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
@@ -19,9 +20,11 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
     _resolve_transformer_layer_model,
+    get_prefill_num_tokens_to_capture,
 )
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.model_loader.utils import resolve_language_model
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +59,67 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_capture_buckets_keep_tp_shards_equal(self):
+        override = get_context().override_server_args(
+            enable_two_batch_overlap=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        for attn_tp_size, dense_tp_size, expected in (
+            (8, 1, [8, 16, 24, 32]),
+            (4, 1, [4, 8, 12, 16, 20, 24, 28, 32]),
+            (1, 1, [4, 8, 12, 16, 20, 24, 28, 32]),
+            (8, None, [4, 8, 12, 16, 20, 24, 28, 32]),
+        ):
+            with (
+                self.subTest(attn_tp_size=attn_tp_size, dense_tp_size=dense_tp_size),
+                get_parallel().override(
+                    tp_size=8,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    moe_tp_size=8,
+                    attn_tp_size=attn_tp_size,
+                    attn_dp_size=8 // attn_tp_size,
+                    attn_cp_size=1,
+                    num_dp_ranks=8 // attn_tp_size,
+                    attn_dp_enabled=attn_tp_size < 8,
+                    moe_dense_tp_size=dense_tp_size,
+                    disable_attn_tp_gather=False,
+                    enable_dp_lm_head=True,
+                ),
+                get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+            ):
+                buckets = get_prefill_num_tokens_to_capture(list(range(4, 33, 4)))
+                self.assertEqual(buckets, expected)
+                if dense_tp_size == 1:
+                    replay_tokens = PrefillCudaGraphRunner._pad_to_bucket(28, buckets)
+                    shards = torch.arange(replay_tokens).tensor_split(attn_tp_size)
+                    self.assertEqual(len({shard.numel() for shard in shards}), 1)
+
+    def test_capture_ceiling_rounds_up_for_sequence_sharding(self):
+        override = get_context().override_server_args(enable_two_batch_overlap=False)
+        override.install()
+        self.addCleanup(override.restore)
+        with (
+            get_parallel().override(
+                tp_size=8,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                moe_tp_size=8,
+                attn_tp_size=8,
+                attn_dp_size=1,
+                attn_cp_size=1,
+                num_dp_ranks=1,
+                attn_dp_enabled=False,
+                moe_dense_tp_size=1,
+                disable_attn_tp_gather=False,
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+        ):
+            buckets = get_prefill_num_tokens_to_capture([4, 12, 28])
+            self.assertEqual(buckets, [8, 16, 32])
+            self.assertEqual(PrefillCudaGraphRunner._pad_to_bucket(28, buckets), 32)
+
     def test_qwen_hc_restore_round_trip(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._qwen_bcg_hc_sidechannel = True

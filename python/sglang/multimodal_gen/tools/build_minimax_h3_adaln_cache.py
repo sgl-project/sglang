@@ -149,8 +149,8 @@ def _load_tensor(
 
 def main() -> None:
     args = _parse_args()
-    if args.num_inference_steps < 2 and args.timesteps is None:
-        raise ValueError("--num-inference-steps must be at least 2")
+    if args.num_inference_steps < 1 and args.timesteps is None:
+        raise ValueError("--num-inference-steps must be at least 1")
     mode_variant = _MODE_VARIANTS[args.mode]
     if args.model_variant != mode_variant:
         raise ValueError(f"--mode {args.mode} requires {mode_variant}")

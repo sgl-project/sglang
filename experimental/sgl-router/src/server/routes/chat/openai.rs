@@ -41,33 +41,38 @@ pub(super) async fn respond(
     let mut frames = Box::pin(sse_data(body).fuse());
     let mut first = Vec::new();
     let mut failed = None;
+    let mut last = Bytes::new();
     while first.is_empty() && failed.is_none() {
         match frames.next().await {
             None => break,
             Some(Err(error)) => failed = Some(error),
             Some(Ok(data)) => match responder.stream_data(&data) {
-                Ok(events) => first = events,
+                Ok(events) => (first, last) = (events, data),
                 Err(reply) => return json_response(reply),
             },
         }
     }
     // The pump's terminal error still ends the converted stream as an error.
-    // Once the OpenAI stream ends, dropping `frames` closes the upstream, which
-    // aborts the engine's other choices as Python does.
-    let pending = (!responder.done()).then_some((frames, responder));
+    let pending = after(frames, responder, &last);
     let rest = stream::unfold(pending, |pending| async move {
-        let (mut frames, mut responder) = pending?;
-        let events = match frames.next().await? {
-            Ok(data) => responder
-                .stream_data(&data)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| Ok(Bytes::from(e)))
-                .collect(),
-            Err(error) => vec![Err(error)],
+        let (mut frames, responder) = pending?;
+        let Some(mut responder) = responder else {
+            while frames.next().await.is_some() {}
+            return None;
         };
-        let pending = (!responder.done()).then_some((frames, responder));
-        Some((stream::iter(events), pending))
+        let (events, data) = match frames.next().await? {
+            Ok(data) => (
+                responder
+                    .stream_data(&data)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| Ok(Bytes::from(e)))
+                    .collect(),
+                data,
+            ),
+            Err(error) => (vec![Err(error)], Bytes::new()),
+        };
+        Some((stream::iter(events), after(frames, responder, &data)))
     })
     .flatten();
     let events = stream::iter(first.into_iter().map(|e| Ok(Bytes::from(e))))
@@ -75,6 +80,19 @@ pub(super) async fn respond(
         .chain(rest);
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, Body::from_stream(events))
+}
+
+/// What is left to read after `data`: more frames, the rest of a finished
+/// stream (no responder), or nothing. Dropping the upstream aborts the engine
+/// request, which Python does at an abort or error but not after `[DONE]`.
+fn after<F>(frames: F, responder: Responder, data: &[u8]) -> Option<(F, Option<Responder>)> {
+    if !responder.done() {
+        Some((frames, Some(responder)))
+    } else if data == b"[DONE]" {
+        Some((frames, None))
+    } else {
+        None
+    }
 }
 
 fn json_response(reply: Reply) -> Response<Body> {

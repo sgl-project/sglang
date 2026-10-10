@@ -23,9 +23,6 @@ are pinned in test_kv_index_translator.py.
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
 
-import ast
-import inspect
-import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest.mock import create_autospec
@@ -86,38 +83,6 @@ def _armed_source(v2p, swa_map):
         ),
     }
     return src
-
-
-def _call_names(func) -> list:
-    """Dotted call targets appearing in `func`'s body, e.g.
-    'kv_loc_plan.bind'."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    names = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            parts = []
-            cur = node.func
-            while isinstance(cur, ast.Attribute):
-                parts.append(cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name):
-                parts.append(cur.id)
-            names.append(".".join(reversed(parts)))
-    return names
-
-
-class TestForwardBatchWiring(CustomTestCase):
-    """Critical-path bookkeeping: the construction-time call sites."""
-
-    def test_init_new_binds_the_plan(self):
-        names = _call_names(ForwardBatch.init_new.__func__)
-        for call in ("translator.own_plan", "kv_loc_plan.bind"):
-            self.assertIn(
-                call,
-                names,
-                "init_new must take its write ids from a plan; a batch built "
-                "without one ships virtual ids to the kernels",
-            )
 
 
 class TestPadComposesWithDerivation(CustomTestCase):

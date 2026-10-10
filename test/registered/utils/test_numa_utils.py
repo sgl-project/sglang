@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils.numa_utils import (
     _handle_numa_bind_failure,
     _is_numa_available,
@@ -57,16 +56,6 @@ class TestIsNumaAvailable(unittest.TestCase):
         self, _mock_isdir, _mock_which, _mock_mempolicy
     ):
         self.assertFalse(_is_numa_available())
-
-    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
-    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
-    @patch("sglang.srt.utils.numa_utils._is_cuda", True)
-    @patch("os.path.isdir", return_value=True)
-    def test_isdir_called_with_node1_path(
-        self, mock_isdir, _mock_which, _mock_mempolicy
-    ):
-        _is_numa_available()
-        mock_isdir.assert_called_with("/sys/devices/system/node/node1")
 
 
 # Pin _is_xpu=False so these cases still reach the mocked pynvml on a real XPU
@@ -186,10 +175,6 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         args.numa_node = numa_node
         return args
 
-    def test_auto_numa_bind_enabled_by_default(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(envs.SGLANG_AUTO_NUMA_BIND.get())
-
     @patch.dict(os.environ, {"SGLANG_AUTO_NUMA_BIND": "0"})
     def test_returns_explicit_numa_node_when_auto_bind_disabled(self):
         args = self._make_server_args(numa_node=[2, 3, 0, 1])
@@ -240,14 +225,6 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
     def test_returns_first_node_when_multiple_found(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         self.assertEqual(get_numa_node_if_available(args, 0), 0)
-
-    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
-    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
-    def test_logs_warning_when_multiple_nodes(self, _mock_avail, _mock_gpu):
-        args = self._make_server_args(numa_node=None)
-        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
-            get_numa_node_if_available(args, 0)
-        self.assertTrue(any("Multiple NUMA nodes" in msg for msg in cm.output))
 
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
     @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])

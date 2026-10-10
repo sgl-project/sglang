@@ -50,10 +50,6 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-    set_tc_piecewise_forward_context,
-)
 from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
@@ -343,34 +339,7 @@ class EagerRunner(BaseRunner):
             else "extend"
         )
         with device_timer_ctx(model_runner.device_timer, category):
-            pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
-                _is_hip
-                and pcg_runner is not None
-                and not isinstance(pcg_runner, EagerRunner)
-                and not cp_active
-            ):
-                # HIP PCG eager fallback: enter the PCG context so Dynamo guards
-                # and PCG-specific MoE/attention paths stay consistent.
-                with (
-                    enable_tc_piecewise_cuda_graph(),
-                    set_tc_piecewise_forward_context(
-                        forward_batch,
-                        model_runner.attention_layers,
-                        getattr(model_runner.model, "quant_config", None),
-                        model_runner.moe_layers,
-                        model_runner.moe_fusions,
-                        dsa_indexers=model_runner.dsa_indexers,
-                        mha_companion_layers=model_runner.mha_companion_layers,
-                    ),
-                ):
-                    ret = model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
-            elif cp_active and (
+            if cp_active and (
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):

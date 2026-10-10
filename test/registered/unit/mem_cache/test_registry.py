@@ -44,6 +44,7 @@ def _make_ctx(
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
     full_tokens_per_layer=None,
+    enable_kv_cache_sharding=False,
 ):
     # The factory reads the published bags for the cache-backend leaves, so the
     # fixture publishes them; the instance stays for the whole-object contract
@@ -55,6 +56,7 @@ def _make_ctx(
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
         enable_unified_cache_external_linker=False,
+        enable_kv_cache_sharding=enable_kv_cache_sharding,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -154,6 +156,31 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             result = default_radix_cache_factory(ctx)
         create_unified.assert_called_once_with(ctx)
         self.assertIs(result, create_unified.return_value)
+
+    def test_kv_sharding_with_disable_radix_routes_to_unified(self):
+        ctx = _make_ctx(self, disable_radix_cache=True, enable_kv_cache_sharding=True)
+        with patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
+        ) as create_unified:
+            result = default_radix_cache_factory(ctx)
+        create_unified.assert_called_once_with(ctx)
+        self.assertIs(result, create_unified.return_value)
+
+    def test_kv_sharding_uses_unified_radix_cache(self):
+        ctx = _make_ctx(self, enable_kv_cache_sharding=True)
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_hybrid_swa_with_disable_radix_routes_to_unified(self):
         ctx = _make_ctx(

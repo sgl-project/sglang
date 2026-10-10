@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

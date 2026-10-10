@@ -696,8 +696,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
-        node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
+        or unanchored one would silently release (or steal) another holder's segment."""
+        assert params.node_id == node.id, (
             f"lock receipt anchored on node {params.node_id} released on node {node.id}"
         )
 
@@ -2494,21 +2494,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
-        # SWA can be evicted independently of FULL, including holes between
-        # resident SWA nodes. Describe precisely which full rows back it.
-        full_load_slices = {}
-        offset = 0
-        for nid in kv_xfer.nodes_to_load or ():
-            count = len(self.node_by_id(nid).key)
-            full_load_slices[nid] = slice(offset, offset + count)
-            offset += count
-        for xfer in comp_xfers.get(ComponentType.SWA, ()):
-            xfer.anchor_index_parts = [
-                full_load_slices[nid]
-                if nid in full_load_slices
-                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
-                for nid in xfer.nodes_to_load or ()
-            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(

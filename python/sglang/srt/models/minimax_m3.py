@@ -23,6 +23,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_silu_mul_mxfp8,
+    swiglu_oai_mxfp8,
+    swiglu_oai_mxfp8_deepgemm,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -64,6 +69,11 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_deepgemm_input,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -90,7 +100,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -286,6 +296,7 @@ class MiniMaxM3MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         hidden_act = config.hidden_act
+        self.fuse_swiglu_oai_mxfp8 = hidden_act == "swigluoai"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -307,9 +318,11 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
+            self.swiglu_alpha = float(config.swiglu_alpha)
+            self.swiglu_limit = float(config.swiglu_limit)
             if _is_npu:
                 self.act_fn = lambda x: self._swigluoai_fused(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
             else:
                 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -317,12 +330,30 @@ class MiniMaxM3MLP(nn.Module):
                 )
 
                 self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+
+    def _swiglu_oai_mxfp8(self, gate_up: torch.Tensor):
+        if not (
+            self.fuse_swiglu_oai_mxfp8
+            and gate_up.shape[0] > 0
+            and not get_forward().sp_active
+            and can_use_silu_mul_mxfp8(gate_up)
+        ):
+            return None
+        if accepts_mxfp8_swizzled_input(self.down_proj):
+            return Mxfp8SwizzledInput(
+                *swiglu_oai_mxfp8(gate_up, self.swiglu_alpha, self.swiglu_limit)
+            )
+        if accepts_mxfp8_deepgemm_input(self.down_proj):
+            return swiglu_oai_mxfp8_deepgemm(
+                gate_up, self.swiglu_alpha, self.swiglu_limit
+            )
+        return None
 
     def forward(
         self,
@@ -330,7 +361,9 @@ class MiniMaxM3MLP(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self._swiglu_oai_mxfp8(gate_up)
+        if x is None:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

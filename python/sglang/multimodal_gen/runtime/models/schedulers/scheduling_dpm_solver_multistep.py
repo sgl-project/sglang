@@ -9,6 +9,7 @@
 # This wrapper delegates all numerical work to diffusers' implementation
 # and only adapts the interface for sglang's denoising stage.
 
+import numpy as np
 import torch
 from diffusers import (
     DPMSolverMultistepScheduler as DiffusersDPMSolverMultistepScheduler,
@@ -101,9 +102,42 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
     def begin_index(self) -> int | None:
         return self._begin_index
 
-    def set_timesteps(self, num_inference_steps: int, device=None, **kwargs):
-        self._inner.set_timesteps(num_inference_steps, device=device, **kwargs)
+    def set_timesteps(
+        self,
+        num_inference_steps: int | None = None,
+        device=None,
+        sigmas: np.ndarray | list[float] | None = None,
+        **kwargs,
+    ):
+        if sigmas is None:
+            self._inner.set_timesteps(num_inference_steps, device=device, **kwargs)
+        else:
+            self._set_sigmas(np.asarray(sigmas, dtype=np.float64), device)
         self.timesteps = self._inner.timesteps
+
+    def _set_sigmas(self, sigmas: np.ndarray, device=None) -> None:
+        inner = self._inner
+        if inner.config.final_sigmas_type == "sigma_min":
+            sigma_last = (
+                (1 - inner.alphas_cumprod[0]) / inner.alphas_cumprod[0]
+            ) ** 0.5
+        else:
+            sigma_last = 0
+        timesteps = sigmas * inner.config.num_train_timesteps
+        sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
+        inner.sigmas = torch.from_numpy(sigmas)
+        inner.timesteps = torch.from_numpy(timesteps).to(
+            device=device, dtype=torch.int64
+        )
+        inner.num_inference_steps = len(timesteps)
+        self._reset_solver_state()
+
+    def _reset_solver_state(self) -> None:
+        inner = self._inner
+        inner.model_outputs = [None] * inner.config.solver_order
+        inner.lower_order_nums = 0
+        inner._step_index = None
+        inner._begin_index = None
 
     def scale_model_input(
         self, sample: torch.Tensor, timestep: int | None = None

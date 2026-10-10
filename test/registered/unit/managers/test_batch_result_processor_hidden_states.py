@@ -318,6 +318,66 @@ class TestPrefillSkippedOutput(CustomTestCase):
         )
 
 
+class TestMixedBatchKvRelease(CustomTestCase):
+    def test_decode_req_finishing_in_mixed_batch_gets_release_hook(self):
+        """A decode req that finishes inside a mixed batch goes through the
+        worker's pre-release hook, as it would in a decode batch; a prefill
+        req finishing on its first token does not."""
+        prefill_req = _PrefillReq(
+            rid="prefill", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        decode_req = _PrefillReq(
+            rid="decode", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        for req in (prefill_req, decode_req):
+            req.finished = lambda req=req: bool(req.output_ids)
+            req.kv = SimpleNamespace(kv_committed_len=0)
+        batch = SimpleNamespace(
+            reqs=[prefill_req, decode_req],
+            decoding_reqs=[decode_req],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            next_token_ids=torch.tensor([5, 6]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = _make_processor(self)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ) as release,
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(release.call_count, 2)
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
+            decode_req
+        )
+
+
 class TestDecodeWithoutLogits(CustomTestCase):
     def test_pipeline_result_commits_token_without_sampling_metadata(self):
         processor = _make_processor(self)

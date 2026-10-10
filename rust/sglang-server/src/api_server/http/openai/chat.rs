@@ -14,7 +14,7 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
+use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -26,10 +26,12 @@ use dynamo_protocols::types::{
 use futures::StreamExt;
 use serde::Deserialize;
 use sglang_processor::{
-    ReasoningStreamSplitter, dynamo_tool_choice, dynamo_tool_parser_name, split_reasoning,
+    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
+    tool_call_stream,
 };
 
 use super::completions::completion_usage;
+use super::pd_routing::PDRoutingFields;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
@@ -52,6 +54,8 @@ struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    routing: PDRoutingFields,
 }
 
 async fn chat_completions(
@@ -61,6 +65,7 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        routing,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -166,7 +171,16 @@ async fn chat_completions(
     };
 
     let stream = request.stream.unwrap_or(false);
-    let n = request.n.unwrap_or(1) as usize;
+    let prompt_count = 1;
+    let choices_per_prompt = request.n.unwrap_or(1) as usize;
+    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+        Ok(routing) => routing,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    // Chat normalizes one prompt, so each bootstrap column has one entry.
+    let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
+    let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
+    let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -179,7 +193,7 @@ async fn chat_completions(
         .stream_options
         .is_some_and(|options| options.include_usage)
         || state.server_args.stream_response_default_include_usage;
-    let mut submitted = Vec::with_capacity(n);
+    let mut submitted = Vec::with_capacity(choices_per_prompt);
 
     // V4 prefills <think>, so the generated stream has no opening marker.
     let starts_in_reasoning = matches!(
@@ -187,9 +201,9 @@ async fn chat_completions(
         Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
     ) && prompt.ends_with("<think>");
     let mut prompt = Some(prompt);
-    for index in 0..n {
+    for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
-        let choice_prompt = if index + 1 == n {
+        let choice_prompt = if index + 1 == choices_per_prompt {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
             prompt
@@ -209,6 +223,11 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: bootstrap_host.clone(),
+            bootstrap_port,
+            bootstrap_room,
+            routed_dp_rank: routing.routed_dp_rank,
+            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -246,6 +265,7 @@ async fn chat_completions(
             want_logprobs,
             parser,
             reasoning_parser,
+            starts_in_reasoning,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -438,10 +458,15 @@ pub(super) async fn unary_chat(
     want_logprobs: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
+    let reasoning_options = ReasoningOptions {
+        force_reasoning: starts_in_reasoning.then_some(true),
+        ..Default::default()
+    };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
@@ -463,8 +488,12 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) =
-            split_reasoning(reasoning_parser.as_deref(), &output.text, &output.token_ids);
+        let (reasoning_text, text) = split_reasoning(
+            reasoning_parser.as_deref(),
+            &reasoning_options,
+            &output.text,
+            &output.token_ids,
+        );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -540,7 +569,10 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), starts_in_reasoning.then_some(true)))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), ReasoningOptions {
+                        force_reasoning: starts_in_reasoning.then_some(true),
+                        ..Default::default()
+                    }))
                     .collect()
             } else {
                 vec![]
@@ -712,13 +744,13 @@ pub(super) fn chat_event_stream(
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
-        Box::pin(apply_tool_calling_jail(
-            Some(dynamo_tool_parser_name(&parser).to_owned()),
+        tool_call_stream(
+            &parser,
             tool_choice,
             tools,
             uses_tool_call_structural_tag,
             raw,
-        ))
+        )
     } else {
         Box::pin(raw)
     };
@@ -1016,6 +1048,7 @@ mod tests {
             false,
             None,
             None,
+            false,
             None,
             true,
             None,
@@ -1052,6 +1085,7 @@ mod tests {
             false,
             None,
             Some("deepseek-r1".into()),
+            false,
             None,
             true,
             None,

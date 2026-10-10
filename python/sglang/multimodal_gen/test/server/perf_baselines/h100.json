@@ -3524,6 +3524,60 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 73.7
+        },
+        "wan2_2_animate_2_14b_ref2v": {
+            "stages_ms": {
+                "WanAnimate2BeforeDenoisingStage": 3783.78,
+                "WanAnimate2DenoisingStage": 94604.96,
+                "WanAnimate2OutputStage": 0.06
+            },
+            "denoise_step_ms": {
+                "0": 25832.83,
+                "1": 7210.15,
+                "2": 11187.28,
+                "3": 8460.7,
+                "4": 8407.93,
+                "5": 8409.07,
+                "6": 8408.07,
+                "7": 8415.78
+            },
+            "expected_e2e_ms": 98402.77,
+            "expected_load_ms": 62901.15,
+            "expected_avg_denoise_ms": 10791.48,
+            "expected_median_denoise_ms": 8412.42,
+            "load_peak_vram_mb": 1776.0,
+            "runtime_peak_vram_mb": 36322.0,
+            "load_peak_allocated_mb": 1737.0,
+            "runtime_peak_allocated_mb": 25748.0,
+            "estimated_full_test_time_s": 489.9,
+            "warmup_peak_vram_mb": 14598.0
+        },
+        "wan2_2_animate_2_14b_ref2v_cfg_parallel_2gpu": {
+            "stages_ms": {
+                "WanAnimate2BeforeDenoisingStage": 5778.62,
+                "WanAnimate2DenoisingStage": 58196.97,
+                "WanAnimate2OutputStage": 0.06
+            },
+            "denoise_step_ms": {
+                "0": 21723.06,
+                "1": 3125.83,
+                "2": 4335.41,
+                "3": 4337.63,
+                "4": 4347.53,
+                "5": 4339.76,
+                "6": 4350.68,
+                "7": 4280.35
+            },
+            "expected_e2e_ms": 63988.59,
+            "expected_load_ms": 64309.0,
+            "expected_avg_denoise_ms": 6355.03,
+            "expected_median_denoise_ms": 4338.7,
+            "load_peak_vram_mb": 1776.0,
+            "runtime_peak_vram_mb": 36322.0,
+            "load_peak_allocated_mb": 1737.0,
+            "runtime_peak_allocated_mb": 25745.0,
+            "estimated_full_test_time_s": 404.0,
+            "warmup_peak_vram_mb": 14598.0
         }
     }
 }

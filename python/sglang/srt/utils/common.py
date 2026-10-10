@@ -4226,11 +4226,15 @@ def require_mlp_sync():
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(
+    *, gathered_buffer_required: Optional[bool] = None
+) -> int:
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer():
+    if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
     if not is_hip() and alignment % get_parallel().attn_cp_size != 0:

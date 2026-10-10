@@ -132,6 +132,9 @@ class ForwardMetadata:
     swa_attn_logits: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # Deterministic extend: window KV lists padded to absolute tile boundaries
+    aligned_window_kv_indptr: Optional[torch.Tensor] = None
+    aligned_window_kv_indices: Optional[torch.Tensor] = None
     # Lean decode (persistent-grid partial-result buffers)
     lean_Mp: Optional[torch.Tensor] = None
     lean_Lp: Optional[torch.Tensor] = None
@@ -165,6 +168,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_decode_seqlen_gate,
         )
         from sglang.kernels.ops.attention.extend_attention import (
+            align_window_kv_to_tiles,
             build_unified_kv_indices,
             can_use_dense_prefill_fp8,
             dense_prefill_attention_fwd,
@@ -187,6 +191,7 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
+        self.align_window_kv_to_tiles = torch.compiler.disable(align_window_kv_to_tiles)
         # Dense (non-absorbed) MLA prefill over a materialized prefix; see
         # handle_attention_triton for when the dispatcher selects it.
         self.dense_prefill_attention_fwd = torch.compiler.disable(
@@ -829,6 +834,8 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
+        aligned_window_kv_indptr = None
+        aligned_window_kv_indices = None
         swa_attn_logits = None
         spec_info = forward_batch.spec_info
         # Lean decode buffers are only allocated on the decode path below; default
@@ -1036,6 +1043,15 @@ class TritonAttnBackend(AttentionBackend):
                     self.device,
                     self.token_to_kv_pool,
                 )
+                if self.enable_deterministic:
+                    aligned_window_kv_indptr, aligned_window_kv_indices = (
+                        self.align_window_kv_to_tiles(
+                            window_kv_indptr,
+                            window_kv_indices,
+                            forward_batch.extend_prefix_lens[:bs] - window_kv_lens,
+                            bs,
+                        )
+                    )
 
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1073,6 +1089,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
+            aligned_window_kv_indptr=aligned_window_kv_indptr,
+            aligned_window_kv_indices=aligned_window_kv_indices,
             lean_Mp=lean_Mp,
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
@@ -2084,6 +2102,17 @@ class TritonAttnBackend(AttentionBackend):
                 window_start_pos = forward_batch.seq_lens[:bs] - window_kv_lens
             else:
                 window_start_pos = None
+            # The padding is masked only by the sliding-window mask, so a layer
+            # that attends bidirectionally keeps the unpadded list.
+            if (
+                sliding_window_size > 0
+                and self.forward_metadata.aligned_window_kv_indptr is not None
+            ):
+                prefix_kv_indptr = self.forward_metadata.aligned_window_kv_indptr
+                prefix_kv_indices = self.forward_metadata.aligned_window_kv_indices
+                window_start_pos = forward_batch.extend_prefix_lens[:bs] - (
+                    prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
+                )
         else:
             sliding_window_size = -1
             prefix_kv_indptr = self.forward_metadata.kv_indptr

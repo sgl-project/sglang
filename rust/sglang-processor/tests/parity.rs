@@ -19,6 +19,7 @@ fn fixtures_match_sglang() {
     unsafe {
         std::env::remove_var("SGLANG_DEFAULT_THINKING");
         std::env::remove_var("SGLANG_DSV4_REASONING_EFFORT");
+        std::env::remove_var("SGLANG_DSV41_REASONING_EFFORT");
     }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity");
     for entry in std::fs::read_dir(dir).unwrap() {

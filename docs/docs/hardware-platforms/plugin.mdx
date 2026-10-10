@@ -572,11 +572,6 @@ field defaults to the conservative answer.
       <td>Runs the decode graph runner (<code>get_graph_runner_cls()</code>).</td>
     </tr>
     <tr>
-      <td><code>piecewise_graph</code></td>
-      <td><code>False</code></td>
-      <td>Runs the prefill piecewise compilation backend.</td>
-    </tr>
-    <tr>
       <td><code>hicache_device_kernels</code></td>
       <td><code>False</code></td>
       <td>The sgl_kernel HiCache transfer / write-back kernels are available; otherwise host pools skip their staging buffers.</td>
@@ -624,11 +619,6 @@ field defaults to the conservative answer.
       <td><code>get_quantization_config(quantization)</code></td>
       <td><code>return None</code></td>
       <td>Return hardware-specific quantization config for the specific quantization scheme, raise an error if not supported or return None to use the default config.</td>
-    </tr>
-    <tr>
-      <td><code>get_piecewise_backend_cls()</code></td>
-      <td><code>return None</code></td>
-      <td>Piecewise compilation backend class</td>
     </tr>
     <tr>
       <td><code>get_compile_backend(mode)</code></td>

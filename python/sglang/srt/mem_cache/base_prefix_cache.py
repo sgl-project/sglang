@@ -218,8 +218,7 @@ class DecLockRefParams:
 
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
-    ``None`` only for receipts that never came from a unified-tree acquire
-    (legacy caches, session sentinels).
+    ``None`` only for legacy caches; the unified tree rejects such a receipt.
     """
 
     node_id: Optional[int] = None

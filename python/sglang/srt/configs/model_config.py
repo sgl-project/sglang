@@ -2396,6 +2396,8 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

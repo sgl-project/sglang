@@ -66,6 +66,7 @@ _REPLICA: GroupCoordinator | None = None
 # Corresponding TP lanes across the replicated encoder copies in one pipeline
 # replica. None means the encoder has only one TP copy, so batch DP cannot run.
 _ENCODER_DP: GroupCoordinator | None = None
+_SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
@@ -112,6 +113,28 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _init_srt_moe_ep_group():
+    """SRT's MOE EP group for FusedMoE layers.
+
+    multimodal_gen has no expert parallelism: every rank keeps all experts
+    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    group must therefore be single-rank (``moe_ep_size=1``); aliasing
+    ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
+    FusedMoE dispatch.
+    """
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    world_size = torch.distributed.get_world_size()
+    return srt_parallel_state.init_model_parallel_group(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=get_world_group().local_rank,
+        backend=torch.distributed.get_backend(get_world_group().device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+
 def _sync_srt_tp_group() -> None:
     """Expose this package's TP group, widths, and ranks to shared SRT layers.
 
@@ -119,6 +142,7 @@ def _sync_srt_tp_group() -> None:
     the TP size in the dummy SRT configuration. Other parallel dimensions are
     one. Overrides also work before SRT configuration is published.
     """
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
@@ -126,6 +150,16 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._TP is _TP and srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    if (
+        _TP is not None
+        and srt_parallel_state._TP is _TP
+        and srt_parallel_state._MOE_TP is _TP
+        and srt_parallel_state._MOE_EP is None
+    ):
+        _SRT_MOE_EP = _init_srt_moe_ep_group()
+        srt_parallel_state._MOE_EP = _SRT_MOE_EP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
             tp_group=_TP,
@@ -150,6 +184,7 @@ def _sync_srt_tp_group() -> None:
 
 
 def _clear_srt_tp_group() -> None:
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import get_parallel
 
@@ -161,6 +196,13 @@ def _clear_srt_tp_group() -> None:
             get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._MOE_TP is _TP:
+        srt_parallel_state._MOE_TP = None
+    if _SRT_MOE_EP is not None:
+        _SRT_MOE_EP.destroy()
+        if srt_parallel_state._MOE_EP is _SRT_MOE_EP:
+            srt_parallel_state._MOE_EP = None
+        _SRT_MOE_EP = None
 
 
 def init_parallel_group_coordinator(
@@ -868,9 +910,11 @@ def destroy_model_parallel() -> None:
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
+    from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
+    IPC_A2A_MULTI.reset()
 
     destroyed_groups = []
     for group in (

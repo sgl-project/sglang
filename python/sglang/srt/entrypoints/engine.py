@@ -66,6 +66,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
+    run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
@@ -895,8 +896,15 @@ class Engine(EngineScoreMixin, EngineBase):
         use_dp_controller = (
             get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
         )
+        prelaunch_dp_schedulers = (
+            use_dp_controller
+            and get_parallel().attn_dp_enabled
+            and get_exec().moe.elastic_ep_backend is None
+            and not get_exec().moe.is_ep_joiner
+        )
+        prelaunched_schedulers = {}
 
-        if not use_dp_controller:
+        if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=get_exec().features.enable_memory_saver
@@ -909,7 +917,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
+                    reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
                     gpu_id = (
                         get_device().base_gpu_id
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
@@ -917,9 +925,12 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                        if prelaunch_dp_schedulers:
+                            target = run_scheduler_process_with_init_pipe
+                            args = (run_scheduler_process_func, writer)
+                        else:
+                            target = run_scheduler_process_func
+                            args = (
                                 server_args,
                                 port_args,
                                 gpu_id,
@@ -927,8 +938,8 @@ class Engine(EngineScoreMixin, EngineBase):
                                 pp_rank,
                                 None,
                                 writer,
-                            ),
-                        )
+                            )
+                        proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
@@ -936,8 +947,13 @@ class Engine(EngineScoreMixin, EngineBase):
                             proc.start()
 
                     scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
-        else:
+                    if prelaunch_dp_schedulers:
+                        prelaunched_schedulers[pp_rank, tp_rank] = (proc.pid, reader)
+                        writer.close()
+                    else:
+                        scheduler_pipe_readers.append(reader)
+
+        if use_dp_controller:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
@@ -948,10 +964,15 @@ class Engine(EngineScoreMixin, EngineBase):
                     port_args=port_args,
                     pipe_writer=writer,
                     run_scheduler_process_func=run_scheduler_process_func,
+                    prelaunched_schedulers=prelaunched_schedulers or None,
                 ),
             )
-            proc.start()
-            scheduler_procs.append(proc)
+            try:
+                proc.start()
+            finally:
+                for _, init_pipe in prelaunched_schedulers.values():
+                    init_pipe.close()
+            scheduler_procs.insert(0, proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
@@ -970,18 +991,26 @@ class Engine(EngineScoreMixin, EngineBase):
                     key=lambda source: source["dp_rank"],
                 )
             scheduler_infos.extend(infos)
-            if use_dp_controller:
+            if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def block_until_scheduler_exits():
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} "
-                    f"terminated with {proc.exitcode}"
-                )
+            watchdog = None
+            if prelaunch_dp_schedulers and get_parallel().node_rank > 0:
+                watchdog = SubprocessWatchdog(scheduler_procs)
+                watchdog.start()
+            try:
+                for proc in scheduler_procs:
+                    proc.join()
+                    logger.error(
+                        f"Scheduler or DataParallelController {proc.pid} "
+                        f"terminated with {proc.exitcode}"
+                    )
+            finally:
+                if watchdog is not None:
+                    watchdog.stop()
 
         return (
             SchedulerInitResult(

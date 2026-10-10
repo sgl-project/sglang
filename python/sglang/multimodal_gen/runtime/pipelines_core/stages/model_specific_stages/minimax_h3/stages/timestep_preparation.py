@@ -47,7 +47,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             )
             with safe_open(pdd_heads, "pt") as f:
                 steps = f.get_slice("video_out.weight").get_shape()[0]
-            if self._pdd_config["num_inference_steps"] != steps + 1:
+            if self._pdd_config["num_inference_steps"] != steps:
                 raise ValueError("MiniMax-H3 PDD config does not match the fused heads")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -104,7 +104,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             if batch.is_warmup:
                 # Warmup may run fewer steps, but must use the same intervals
                 # as serving rather than rescaling a shorter grid to [1, 0].
-                sigmas[modality] = expected[: max(2, batch.num_inference_steps)]
+                sigmas[modality] = expected[: batch.num_inference_steps + 1]
                 continue
             actual = sigmas[modality]
             if len(actual) != len(expected) or any(
@@ -206,7 +206,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         num_steps = requested_num_steps
         if dmd_steps is not None and batch.is_warmup:
             # warmup truncates the trained rungs instead of rescaling a shorter grid
-            num_steps = len(dmd_steps) + 1
+            num_steps = len(dmd_steps)
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
@@ -215,7 +215,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 dmd_steps=dmd_steps,
             )
             if num_steps != requested_num_steps:
-                sigmas[modality] = sigmas[modality][: max(2, requested_num_steps)]
+                sigmas[modality] = sigmas[modality][: requested_num_steps + 1]
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

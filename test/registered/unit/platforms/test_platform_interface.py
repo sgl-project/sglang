@@ -232,12 +232,6 @@ class TestCudaDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_cuda_seed.assert_called_once_with(123)
 
-    def test_cuda_srt_platform_capabilities(self):
-        base = CudaSRTPlatform()
-        self.assertTrue(base.capabilities.graph_capture)
-        self.assertTrue(base.capabilities.piecewise_graph)
-        self.assertTrue(base.capabilities.supports_triton)
-
 
 class TestXpuDeviceMixin(CustomTestCase):
     """Tests for XPU device operation defaults."""
@@ -265,11 +259,6 @@ class TestXpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_called_once_with(123)
         mock_torch_seed.assert_called_once_with(123)
         mock_xpu_seed.assert_called_once_with(123)
-
-    def test_xpu_srt_platform_capabilities(self):
-        base = XpuSRTPlatform()
-        self.assertTrue(base.capabilities.graph_capture)
-        self.assertTrue(base.capabilities.piecewise_graph)
 
 
 class TestNpuDeviceMixin(CustomTestCase):
@@ -338,12 +327,6 @@ class TestNpuDeviceMixin(CustomTestCase):
         mock_np_seed.assert_not_called()
         mock_torch_seed.assert_not_called()
         mock_npu.manual_seed_all.assert_not_called()
-
-    def test_npu_srt_platform_capabilities(self):
-        base = NPUSRTPlatform()
-        self.assertTrue(base.capabilities.graph_capture)
-        self.assertFalse(base.capabilities.piecewise_graph)
-        self.assertTrue(base.capabilities.supports_triton)
 
 
 class TestCpuDeviceMixin(CustomTestCase):
