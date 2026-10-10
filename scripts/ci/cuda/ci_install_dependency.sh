@@ -55,10 +55,16 @@ configure_environment() {
     USE_VENV="${USE_VENV:-0}"
     echo "USE_VENV=${USE_VENV}"
 
-    python3 -m pip install --upgrade pip
-    if ! command -v uv >/dev/null 2>&1; then
-        pip install uv
+    # A stale uv only knows the managed Python builds released before it.
+    python3 -m pip install --upgrade pip uv
+    # Put that uv ahead of any older copy on PATH (runner image, standalone installer).
+    UV_BIN_DIR="$(dirname "$(python3 -c 'import uv; print(uv.find_uv_bin())')")"
+    export PATH="${UV_BIN_DIR}:${PATH}"
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+        echo "$UV_BIN_DIR" >> "$GITHUB_PATH" || true
     fi
+    uv --version
 
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     # Set to empty to install into the system Python whatever its version.
@@ -71,16 +77,16 @@ configure_environment() {
         UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
     elif [ -n "$CI_PYTHON_VER" ] && [ "$SYS_PYTHON_VER" != "$CI_PYTHON_VER" ]; then
-        # Kept across jobs like the system site-packages it replaces, so installs
-        # stay incremental and JIT caches keyed on package paths keep hitting.
+        # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
         UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
-        # A job cancelled mid-install leaves dist-info without its files, which later
-        # installs treat as satisfied; rebuild unless the last install ran to completion.
+        # A cancelled install leaves dist-info that later installs treat as satisfied;
+        # rebuild unless the last install ran to completion.
         UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
-        if [ ! -f "$UV_VENV_COMPLETE_MARKER" ] || ! "$UV_VENV/bin/python3" -c "import sys; assert sys.version_info[:2] == tuple(map(int, '${CI_PYTHON_VER}'.split('.')))" 2>/dev/null; then
+        # --upgrade repoints uv's minor-version link at the latest patch; the kept venv follows it.
+        # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
+        uv python install --upgrade "$CI_PYTHON_VER" --python-preference only-managed
+        if [ ! -f "$UV_VENV_COMPLETE_MARKER" ]; then
             rm -rf "$UV_VENV"
-            # Managed builds ship Python.h, which Triton's runtime launcher compiles against.
-            uv python install "$CI_PYTHON_VER" --python-preference only-managed
             uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
         fi
         rm -f "$UV_VENV_COMPLETE_MARKER"
