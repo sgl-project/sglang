@@ -469,6 +469,146 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
   PDLTriggerSecondary<kUsePDL>();
 }
 
+/// \brief `fused_qknorm_rope_warp` for head_dim 128 with the norm rounded before
+/// NeoX RoPE, two rows per warp: 16 lanes per row, 16 B per lane. Each lane keeps
+/// the partial sums of the two warp-kernel lanes it covers and replays their xor
+/// butterfly, so the output is bit-identical to the one-row-per-warp kernel.
+template <int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheDType, typename IdType, bool kOutOfPlace>
+__global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutOfPlace> __grid_constant__ params) {
+  using namespace device;
+
+  constexpr int64_t kHeadDim = 128;
+  constexpr uint32_t kRowLanes = 16;
+  constexpr uint32_t kElems = kHeadDim / kRowLanes;
+  constexpr uint32_t kRotaryLanes = kRopeDim / kElems;
+  constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheDType);
+  static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim && kRopeDim % (2 * kElems) == 0);
+
+  using Packed = packed_t<DType>;
+  using Storage = AlignedVector<Packed, kElems / 2>;
+
+  const auto& [q_ptr, k_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions, q_stride_bytes, k_stride_bytes, head_stride_bytes, num_qo_heads, num_kv_heads, num_tokens, eps] =
+      static_cast<const QKNormRopeParams&>(params);
+
+  const uint32_t lane_id = threadIdx.x % kWarpThreads;
+  const uint32_t row_lane = lane_id % kRowLanes;
+  const uint32_t row_base = lane_id - row_lane;
+  const uint32_t start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+  const uint32_t num_workers = gridDim.x * kWarpsPerBlock;
+  const uint32_t num_qk_heads = num_qo_heads + num_kv_heads;
+  const uint32_t num_rows = num_qk_heads * num_tokens;
+  const uint32_t num_pairs = div_ceil(num_rows, 2u);
+  const uint32_t partner_lane = row_base + (row_lane < kHalfRotaryLanes ? row_lane + kHalfRotaryLanes
+                                            : row_lane < kRotaryLanes   ? row_lane - kHalfRotaryLanes
+                                                                        : row_lane);
+
+  PDLWaitPrimary<kUsePDL>();
+
+  for (uint32_t pair = start_worker_id; pair < num_pairs; pair += num_workers) {
+    // a missing second row recomputes the last one and skips the store
+    const uint32_t wanted_row = 2 * pair + lane_id / kRowLanes;
+    const uint32_t row = wanted_row < num_rows ? wanted_row : num_rows - 1;
+    const uint32_t token_id = row / num_qk_heads;
+    const uint32_t head_id = row % num_qk_heads;
+    const bool load_q = head_id < num_qo_heads;
+    const void* input = load_q ? pointer::offset(q_ptr, token_id * q_stride_bytes, head_id * head_stride_bytes)
+                               : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
+    void* output = const_cast<void*>(input);
+    if constexpr (kOutOfPlace) {
+      output =
+          load_q ? pointer::offset(
+                       params.q_out_ptr, token_id * params.q_out_stride_bytes, head_id * params.out_head_stride_bytes)
+                 : pointer::offset(
+                       params.k_out_ptr, token_id * params.k_out_stride_bytes, head_id * params.out_head_stride_bytes);
+    }
+
+    auto vec = load_as<Storage>(input, row_lane);
+    const auto weight_vec = load_as<Storage>(load_q ? q_weight_ptr : k_weight_ptr, row_lane);
+
+    // part[h] is the sum of warp-kernel lane 2 * row_lane + h, and the shuffles
+    // below are that kernel's 16..2 xor steps; its final step adds the pair.
+    float part[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (uint32_t j = 0; j < kElems / 2; ++j) {
+      const auto x = cast<fp32x2_t>(vec[j]);
+      part[j / 2] += x.x * x.x;
+      part[j / 2] += x.y * x.y;
+    }
+#pragma unroll
+    for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
+      part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
+      part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
+    }
+    const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
+
+#pragma unroll
+    for (uint32_t j = 0; j < kElems / 2; ++j) {
+      const auto x = cast<fp32x2_t>(vec[j]);
+      const auto w = cast<fp32x2_t>(weight_vec[j]);
+      vec[j] = cast<Packed, fp32x2_t>({x.x * norm_factor * w.x, x.y * norm_factor * w.y});
+    }
+
+    Storage partner_vec;
+#pragma unroll
+    for (uint32_t j = 0; j < kElems / 2; ++j) {
+      auto bits = reinterpret_cast<const uint32_t&>(vec[j]);
+      bits = __shfl_sync(0xffffffffu, bits, partner_lane);
+      reinterpret_cast<uint32_t&>(partner_vec[j]) = bits;
+    }
+    if (row_lane < kRotaryLanes) {
+      const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
+      const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
+      const auto sin_ptr = cos_ptr + kRopeDim / 2;
+      const uint32_t cache_base = (row_lane % kHalfRotaryLanes) * kElems;
+      // one 16 B load per lane for a 16-bit cache; FP32 rows take two
+      CacheDType cos_vals[kElems];
+      CacheDType sin_vals[kElems];
+      constexpr uint32_t kCacheVecElems = 16 / sizeof(CacheDType);
+      using CacheVec = AlignedVector<CacheDType, kCacheVecElems>;
+#pragma unroll
+      for (uint32_t c = 0; c < kElems / kCacheVecElems; ++c) {
+        const auto cos_vec = load_as<CacheVec>(cos_ptr + cache_base, c);
+        const auto sin_vec = load_as<CacheVec>(sin_ptr + cache_base, c);
+#pragma unroll
+        for (uint32_t e = 0; e < kCacheVecElems; ++e) {
+          cos_vals[c * kCacheVecElems + e] = cos_vec[e];
+          sin_vals[c * kCacheVecElems + e] = sin_vec[e];
+        }
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kElems / 2; ++j) {
+        auto& values = unpack(vec[j]);
+        const auto& partner_values = unpack(partner_vec[j]);
+#pragma unroll
+        for (uint32_t i = 0; i < 2; ++i) {
+          const auto cos = cos_vals[2 * j + i];
+          const auto sin = sin_vals[2 * j + i];
+          if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+            values[i] = row_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
+                                                    : rotary_add_fp32(values[i], cos, partner_values[i], sin);
+          } else {
+            values[i] = row_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                    : rotary_add(values[i], cos, partner_values[i], sin);
+          }
+        }
+      }
+    }
+    if (wanted_row < num_rows) store_as<Storage>(output, vec, row_lane);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+/// \brief Whether `fused_qknorm_rope_half_warp` covers this instantiation.
+template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBeforeRope, bool kCacheHasFullWidth>
+inline constexpr bool kUseHalfWarp =
+#ifdef USE_ROCM
+    false;
+#else
+    kHeadDim == 128 && kIsNeox && kRoundNormBeforeRope && !kCacheHasFullWidth && kRopeDim > 0 && kRopeDim % 16 == 0;
+#endif
+
 /// \brief Shared launch tail of the three host runners: pick the index-type
 /// instantiation, size the persistent grid from the occupancy table, launch.
 template <auto kKernelI32, auto kKernelI64, typename Params>
@@ -494,21 +634,31 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAllowHalfWarp = true>
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
+  // kAllowHalfWarp = false keeps the one-row-per-warp kernel, which tests compare against
+  static constexpr bool kHalfWarp =
+      kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kCacheHasFullWidth>;
   template <typename IdType>
-  static constexpr auto kernel = fused_qknorm_rope_warp<
-      kHeadDim,
-      kRopeDim,
-      kIsNeox,
-      kUsePDL,
-      DType,
-      CacheDType,
-      kRoundNormBeforeRope,
-      false,
-      kCacheHasFullWidth,
-      IdType>;
+  static constexpr auto kernel = [] {
+    if constexpr (kHalfWarp) {
+      return fused_qknorm_rope_half_warp<kRopeDim, kUsePDL, DType, CacheDType, IdType, false>;
+    } else {
+      return fused_qknorm_rope_warp<
+          kHeadDim,
+          kRopeDim,
+          kIsNeox,
+          kUsePDL,
+          DType,
+          CacheDType,
+          kRoundNormBeforeRope,
+          false,
+          kCacheHasFullWidth,
+          IdType>;
+    }
+  }();
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -568,7 +718,8 @@ struct QKNormRopeKernel {
         .eps = eps,
     };
 
-    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto num_rows = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto num_works = kHalfWarp ? div_ceil(num_rows, 2u) : num_rows;
     launch_qknorm_rope<kernel<int32_t>, kernel<int64_t>>(
         params, id_type.is_type<int32_t>(), num_works, device.unwrap(), kUsePDL);
   }
@@ -582,22 +733,32 @@ template <
     typename DType,
     typename CacheDType,
     bool kRoundNormBeforeRope,
-    bool kCacheHasFullWidth>
+    bool kCacheHasFullWidth,
+    bool kAllowHalfWarp = true>
 struct QKNormRopeOutOfPlaceKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
+  // kAllowHalfWarp = false keeps the one-row-per-warp kernel, which tests compare against
+  static constexpr bool kHalfWarp =
+      kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kCacheHasFullWidth>;
   template <typename IdType>
-  static constexpr auto kernel = fused_qknorm_rope_warp<
-      kHeadDim,
-      kRopeDim,
-      kIsNeox,
-      kUsePDL,
-      DType,
-      CacheDType,
-      kRoundNormBeforeRope,
-      false,
-      kCacheHasFullWidth,
-      IdType,
-      true>;
+  static constexpr auto kernel = [] {
+    if constexpr (kHalfWarp) {
+      return fused_qknorm_rope_half_warp<kRopeDim, kUsePDL, DType, CacheDType, IdType, true>;
+    } else {
+      return fused_qknorm_rope_warp<
+          kHeadDim,
+          kRopeDim,
+          kIsNeox,
+          kUsePDL,
+          DType,
+          CacheDType,
+          kRoundNormBeforeRope,
+          false,
+          kCacheHasFullWidth,
+          IdType,
+          true>;
+    }
+  }();
 
   /// \brief QK-norm + RoPE from q/k into q_out/k_out; q and k are left untouched.
   static void
@@ -665,7 +826,8 @@ struct QKNormRopeOutOfPlaceKernel {
     params.k_out_stride_bytes = static_cast<int64_t>(Dko.unwrap() * sizeof(DType));
     params.out_head_stride_bytes = out_head_stride_bytes;
 
-    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto num_rows = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto num_works = kHalfWarp ? div_ceil(num_rows, 2u) : num_rows;
     launch_qknorm_rope<kernel<int32_t>, kernel<int64_t>>(
         params, id_type.is_type<int32_t>(), num_works, device.unwrap(), kUsePDL);
   }

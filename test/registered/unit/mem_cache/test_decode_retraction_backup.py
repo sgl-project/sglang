@@ -122,7 +122,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             hicache_write_policy="write_back",
             disaggregation_mode="decode" if shared_receive else "null",
             disaggregation_decode_host_receive_threshold=(
-                host_receive_threshold if shared_receive else 0.0
+                host_receive_threshold if shared_receive else 1.0
             ),
             disaggregation_decode_enable_radix_cache=radix_cache,
         )
@@ -360,9 +360,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_threshold_controls_device_allocation(self, _world_size):
-        """Transfers at the threshold leave device KV free; zero disables staging."""
+        """Zero always stages, one disables, and intermediate values gate on usage."""
         for threshold, used_tokens, host_staged in (
-            (0.0, 16, False),
+            (0.0, 0, True),
+            (1.0, 16, False),
             (0.5, 15, False),
             (0.5, 16, True),
         ):

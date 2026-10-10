@@ -9,7 +9,7 @@
 use std::pin::Pin;
 
 use dynamo_parsers::ToolDefinition;
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
+use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
@@ -28,7 +28,7 @@ mod tools;
 pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
 pub use self::tools::{
     ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
-    tool_constraint,
+    parse_tool_calls, tool_call_stream, tool_constraint,
 };
 use self::tools::{post_tool_terminal_markers, tool_call_delta};
 
@@ -265,13 +265,13 @@ impl ChatResponseProcessor {
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
-            Box::pin(apply_tool_calling_jail(
-                Some(dynamo_tool_parser_name(&parser).to_owned()),
+            tool_call_stream(
+                &parser,
                 self.tool_choice,
                 self.tools,
                 self.uses_tool_call_structural_tag,
                 raw,
-            ))
+            )
         } else {
             Box::pin(raw)
         };
@@ -470,6 +470,48 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 1,
         })
+    }
+
+    #[test]
+    fn deepseek_v4_parses_as_sglang_does() {
+        let output = "plan</think>Sure.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n\
+            <｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n\
+            </｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let events = futures::executor::block_on(
+            processor(Some("deepseekv4"), Some("deepseek-v4"), 1)
+                .with_reasoning_state(Some(true))
+                .process_stream(stream::iter(vec![chunk(0, output, true)]))
+                .collect::<Vec<_>>(),
+        );
+        let (mut reasoning, mut content, mut calls, mut finish) =
+            (String::new(), String::new(), vec![], None);
+        for event in events {
+            if let Ok(ChatEvent::Delta {
+                reasoning_content,
+                content: text,
+                tool_calls,
+                finish_reason,
+                ..
+            }) = event
+            {
+                reasoning += reasoning_content.as_deref().unwrap_or_default();
+                content += text.as_deref().unwrap_or_default();
+                calls.extend(
+                    tool_calls
+                        .into_iter()
+                        .flatten()
+                        .map(|c| (c.name, c.arguments)),
+                );
+                finish = finish_reason.or(finish);
+            }
+        }
+        assert_eq!((reasoning.as_str(), content.as_str()), ("plan", "Sure."));
+        let call = (
+            Some("get_weather".into()),
+            Some(r#"{"city": "Paris"}"#.into()),
+        );
+        assert_eq!(calls, vec![call]);
+        assert_eq!(finish, Some(ChatFinishReason::ToolCalls));
     }
 
     #[test]
