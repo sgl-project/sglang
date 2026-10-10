@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     DEFAULT_SIGMA_SHIFT_VIDEO,
     serialize_comfyui_layout,
     time_shift_sigma,
-    time_shift_slope,
 )
 
 from .adapter import ComfyUIModelAdapter, PackedForward
@@ -139,6 +138,8 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
             width=int(video.shape[-1]),
             extra_req=extra_req,
             unpack_ctx={
+                "video_denoise_mask": kwargs.get("denoise_mask"),
+                "audio_denoise_mask": kwargs.get("audio_denoise_mask"),
                 "audio_scale": scale,
                 "audio_src": audio_src,
                 "carry": carry,
@@ -158,12 +159,19 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
                 "MiniMax H3 unpack expects [video, audio] noise_pred, "
                 f"got {type(noise_pred)!r}"
             )
-        # Match ComfyUI MiniMaxH3._forward: negated velocities, and audio
-        # scaled by d(sigma_a)/d(sigma_v) so the sampler's sigma_v ODE is
-        # the audio stream's true ODE on its shifted schedule.
+        # ComfyUI's carried-audio transformation below already incorporates
+        # the sigma-a / sigma-v derivative. Applying time_shift_slope again
+        # double-scales audio and changes the coupled denoising trajectory.
         v_video = (-v_video).to(device=video_x.device, dtype=video_x.dtype)
         v_audio = (-v_audio).to(device=audio_x.device, dtype=audio_x.dtype)
         ctx = packed.unpack_ctx
+        for name, velocity in (
+            ("video_denoise_mask", v_video),
+            ("audio_denoise_mask", v_audio),
+        ):
+            mask = ctx.get(name)
+            if mask is not None:
+                velocity.mul_(mask.to(device=velocity.device, dtype=velocity.dtype))
         scale = float(ctx.get("audio_scale", 1.0))
         if scale != 1.0:
             audio_src = ctx["audio_src"]
@@ -172,12 +180,6 @@ class MiniMaxH3Adapter(ComfyUIModelAdapter):
             v_audio = (1.0 - scale) * (audio_src * carry) + (
                 1.0 + (scale - 1.0) * sigma_a
             ).to(v_audio.dtype) * v_audio
-        slope_a = time_shift_slope(
-            ctx["sigma_v"],
-            ctx.get("shift_v", DEFAULT_SIGMA_SHIFT_VIDEO),
-            ctx.get("shift_a", DEFAULT_SIGMA_SHIFT_AUDIO),
-        ).to(device=v_audio.device, dtype=v_audio.dtype)
-        v_audio = slope_a * v_audio
         return [v_video, v_audio]
 
     def fill_req(self, req, packed: PackedForward) -> None:
@@ -227,8 +229,75 @@ class MiniMaxH3Executor(SGLDiffusionExecutor):
 
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
         kwargs = super()._sampling_params_kwargs(packed, timestep)
+        kwargs.update(getattr(self, "request_options", {}))
         drop_h3_pinned_sampling_fields(kwargs)
         enable_cache_dit = getattr(self, "enable_cache_dit", None)
         if enable_cache_dit is not None:
             kwargs["enable_cache_dit"] = bool(enable_cache_dit)
+        cache_params = getattr(self, "cache_dit_params", None)
+        if cache_params is not None:
+            kwargs["cache_dit_params"] = cache_params
+        return kwargs
+
+
+class FastH3Adapter(MiniMaxH3Adapter):
+    model_types = ("fast_h3",)
+    pipeline_class_name = "FastH3Pipeline"
+
+
+class VDNH3Adapter(MiniMaxH3Adapter):
+    model_types = ("vdn_h3",)
+    pipeline_class_name = "VDNH3Pipeline"
+
+
+def validate_distilled_h3_step(packed, model_type):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+        minimax_h3_time_shift_sigmas,
+    )
+
+    sigmas = packed.extra_req.get("h3_sample_sigmas")
+    n = 5 if model_type == "fast_h3" else 9
+    # num_steps counts DiT forwards; the grid has one more point.
+    expected = torch.tensor(
+        minimax_h3_time_shift_sigmas(num_steps=n - 1, shift_scale=12.0)
+    )
+    actual = (
+        torch.as_tensor(sigmas).detach().float().cpu() if sigmas is not None else None
+    )
+    if (
+        actual is None
+        or actual.numel() != n
+        or not torch.allclose(actual.reshape(-1), expected, atol=1e-6, rtol=0)
+    ):
+        raise ValueError(
+            f"{model_type} requires its trained {n-1}-NFE video shift 12 grid; use SGLDH3DistilledSigmas"
+        )
+    payload = packed.extra_req.get("h3_payload") or {}
+    if payload.get("refs") or (model_type == "fast_h3" and payload.get("keyframes")):
+        raise ValueError(f"{model_type} does not support this reference/keyframe task")
+
+
+class FastH3Executor(MiniMaxH3Executor):
+    adapter_cls = FastH3Adapter
+
+    def _execute_packed(self, packed, x, timestep):
+        validate_distilled_h3_step(packed, "fast_h3")
+        return super()._execute_packed(packed, x, timestep)
+
+    def _sampling_params_kwargs(self, packed, timestep):
+        kwargs = super()._sampling_params_kwargs(packed, timestep)
+        kwargs["num_inference_steps"] = 4
+        return kwargs
+
+
+class VDNH3Executor(MiniMaxH3Executor):
+    adapter_cls = VDNH3Adapter
+
+    def _execute_packed(self, packed, x, timestep):
+        validate_distilled_h3_step(packed, "vdn_h3")
+        return super()._execute_packed(packed, x, timestep)
+
+    def _sampling_params_kwargs(self, packed, timestep):
+        kwargs = super()._sampling_params_kwargs(packed, timestep)
+        kwargs["num_inference_steps"] = 8
         return kwargs
