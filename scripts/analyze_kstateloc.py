@@ -172,6 +172,37 @@ def phases(path, lo, hi):
                 print(f"   [XDIFF] layer={layer}: {'IDENTICAL' if len(uniq) == 1 else 'DIFFERS(' + str(len(uniq)) + ')'}")
 
 
+def tagged(path, lo, hi):
+    """No-rebuild disambiguation: attribute each [KSTATELOC] row to the most
+    recent [XDIFF] (layer, xmd5). xmd5 differs by request (MISS vs HIT), so
+    grouping by (layer, xmd5) separates the two requests without a layer id in
+    the kernel print. Assumes [XDIFF] precedes the op's [KSTATELOC] in the log."""
+    cur_layer, cur_md5 = None, None
+    buckets = collections.defaultdict(lambda: collections.defaultdict(set))
+    with open(path, "r", errors="ignore") as fh:
+        for ln in fh:
+            xd = _xdiff_from(ln)
+            if xd is not None:
+                cur_layer, cur_md5 = xd[0], xd[7]
+                continue
+            rw = _rw_from(ln)
+            if rw is not None:
+                op, b, p, col, sl, blk, row = rw
+                if lo <= p < hi:
+                    buckets[cur_layer][cur_md5].add(sl)
+    print(f"{path}: [XDIFF]-tagged  window[{lo},{hi})")
+    for layer in sorted(k for k in buckets if k is not None):
+        mds = buckets[layer]
+        variants = sorted(mds.items())
+        distinct = len({tuple(sorted(v)) for _, v in mds.items()})
+        tag = "" if distinct == 1 else "   <== stateLoc differs by request"
+        print(f"\n-- layer {layer}: {len(mds)} request-variant(s){tag}")
+        for md5, slots in variants:
+            print(f"   xmd5={md5[:8]} stateLoc={sorted(slots)}")
+    if any(k is None for k in buckets):
+        print("\n(note: some KSTATELOC rows preceded any XDIFF -> layer unknown)")
+
+
 def _show_xdiff(xdiff, tag=""):
     if not xdiff:
         return
@@ -219,13 +250,16 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--phases", action="store_true")
+    ap.add_argument("--tagged", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         return
     if not a.log:
         ap.error("log path required (or --selftest)")
-    if a.phases:
+    if a.tagged:
+        tagged(a.log, a.lo, a.hi)
+    elif a.phases:
         phases(a.log, a.lo, a.hi)
     elif a.log2:
         diff2(a.log, a.log2, a.lo, a.hi)
