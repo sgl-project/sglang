@@ -483,6 +483,9 @@ class LoRAPipeline(ComposedPipelineBase):
         base._offload_root = module
         base._offload_param_prefix = name
         base._packed_weight_cpu = data
+        scale = materialized.get(f"{name}.weight_scale")
+        if scale is not None:
+            base._packed_weight_scale_cpu = scale.detach()
 
     def _reject_lora_on_packed_weights(self) -> None:
         """Fail before any layer is replaced if a target has no plain weight.
@@ -732,7 +735,10 @@ class LoRAPipeline(ComposedPipelineBase):
                 )
                 return False
             return True
-        if has_unmergeable_weights:
+        if any(
+            not (layer.can_merge_base_weight or layer.can_requant_merge)
+            for layer in lora_layers.values()
+        ):
             raise ValueError(
                 f"LoRA merge mode is unavailable for {module_name} because its "
                 "quantized weights cannot be updated in place; use merge mode 'dynamic'"
@@ -1256,6 +1262,12 @@ class LoRAPipeline(ComposedPipelineBase):
                                 {"module": module_name, "paths": tgt_paths}
                             )
                     adapted_count += count
+                    if effective_merge_weights and is_layerwise_offloaded_module(
+                        self.modules.get(module_name)
+                    ):
+                        self._park_merged_adapters_on_host(
+                            lora_layers_dict, tgt_nicknames
+                        )
                     self.cur_adapter_name[module_name] = merged_name
                     self.cur_adapter_path[module_name] = ",".join(
                         str(p or self.loaded_adapter_paths.get(n, ""))
@@ -1330,6 +1342,23 @@ class LoRAPipeline(ComposedPipelineBase):
                 100 * loss,
             )
         return True
+
+    def _park_merged_adapters_on_host(
+        self, lora_layers: dict[str, BaseLayerWithLoRA], nicknames: list[str]
+    ) -> None:
+        """Merged weights no longer read the LoRA factors; free their device copies.
+
+        Only for layerwise-offloaded modules, where device memory is the
+        constraint; a later re-merge reads the host copies.
+        """
+        for layer in lora_layers.values():
+            for lora_A, lora_B, *_ in layer.lora_weights_list if layer.merged else ():
+                lora_A.data, lora_B.data = lora_A.data.cpu(), lora_B.data.cpu()
+        for nickname in nicknames:
+            adapters = self.lora_adapters.get(nickname, {})
+            for name, tensor in adapters.items():
+                if torch.is_tensor(tensor):
+                    adapters[name] = tensor.cpu()
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
