@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtx
 
 logger = init_logger(__name__)
 
+# Leave headroom for the allocator when deciding whether a warmup preload fits.
+DEFAULT_WARMUP_PRELOAD_MARGIN_BYTES = 1 * 1024**3
+
 
 @dataclass(slots=True)
 class ComponentUse:
@@ -68,6 +71,7 @@ class ResidencyState:
     current_use: ComponentUse | None = None
     future_uses: tuple[ComponentUse, ...] = ()
     batch_is_warmup: bool = False
+    warmup_preload_margin_bytes: int = DEFAULT_WARMUP_PRELOAD_MARGIN_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +210,9 @@ class ComponentResidencyManager:
         self.state = ResidencyState(
             stages=stages,
             batch_is_warmup=self._is_warmup_batch(batch),
+            warmup_preload_margin_bytes=int(
+                getattr(server_args, "warmup_preload_margin_gib", 1.0) * 1024**3
+            ),
         )
         self._active_use = None
         self._active_use_module = None
@@ -659,6 +666,8 @@ class ComponentResidencyManager:
     def finish_request(self) -> None:
         self.finish_active_use(prefetch_next=False)
         preferred_uses = self._preferred_request_end_uses()
+        if self.state.batch_is_warmup:
+            preferred_uses = self._warmup_preload_uses(preferred_uses)
         for component_name, use in list(self._uses_seen.items()):
             module = self._modules_seen.get(component_name)
             if module is None:
@@ -981,6 +990,24 @@ class ComponentResidencyManager:
         if preferred_use is None:
             return {}
         return {preferred_use.component_name: preferred_use}
+
+    def _warmup_preload_uses(
+        self, preferred_uses: dict[str, ComponentUse]
+    ) -> dict[str, ComponentUse]:
+        policy = getattr(self.server_args, "warmup_preload_components", "auto")
+        if policy == "auto":
+            return preferred_uses
+        if policy == "none":
+            return {}
+        names = set(policy.split(","))
+        unknown = names.difference(self._uses_seen)
+        if unknown:
+            logger.warning(
+                "--warmup-preload-components names %s, which warmup did not use; "
+                "ignoring them.",
+                ", ".join(sorted(unknown)),
+            )
+        return {name: use for name, use in self._uses_seen.items() if name in names}
 
     @staticmethod
     def _same_use(lhs: ComponentUse, rhs: ComponentUse) -> bool:

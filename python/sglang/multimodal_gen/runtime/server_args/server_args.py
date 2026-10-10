@@ -537,6 +537,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # warmup and automatic residency planning. Execution remains bounded by
     # warmup_steps and the server warmup frame/area caps.
     warmup_sampling_params: dict[str, Any] | str | None = None
+    # Components kept on device after warmup: "auto" follows the pipeline's
+    # preferred_ready_after_request hints, "none" keeps none, and a
+    # comma-separated list keeps only the named components.
+    warmup_preload_components: str = "auto"
+    # Free device memory a warmup preload must leave for the allocator.
+    warmup_preload_margin_gib: float = 1.0
 
     disable_autocast: bool | None = None
 
@@ -706,7 +712,28 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_warmup_preload()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_warmup_preload(self) -> None:
+        policy = (self.warmup_preload_components or "").strip()
+        if policy.lower() in ("auto", "none"):
+            policy = policy.lower()
+        else:
+            names = [name.strip() for name in policy.split(",")]
+            if not all(names):
+                raise ValueError(
+                    "--warmup-preload-components must be 'auto', 'none', or a "
+                    "comma-separated list of component names, got "
+                    f"{self.warmup_preload_components!r}"
+                )
+            policy = ",".join(names)
+        self.warmup_preload_components = policy
+        if self.warmup_preload_margin_gib < 0:
+            raise ValueError(
+                "--warmup-preload-margin-gib must be non-negative, got "
+                f"{self.warmup_preload_margin_gib}"
+            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -2641,6 +2668,26 @@ class ServerArgs(DisaggServerArgsMixin):
                 '\'{"width":832,"height":480,"num_frames":9,'
                 '"num_inference_steps":4}\'. Warmup still applies its '
                 "bounded execution caps."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-preload-components",
+            type=str,
+            default=ServerArgs.warmup_preload_components,
+            help=(
+                "Components to keep on device after warmup. 'auto' follows the "
+                "pipeline's defaults, 'none' keeps none, and a comma-separated "
+                "list such as 'text_encoder,transformer' keeps only those."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-preload-margin-gib",
+            type=float,
+            default=ServerArgs.warmup_preload_margin_gib,
+            help=(
+                "Free device memory, in GiB, that a warmup preload must leave. "
+                "Raise it when the first real request runs out of memory after "
+                "warmup kept a component on device."
             ),
         )
         # component residency and legacy offload controls
