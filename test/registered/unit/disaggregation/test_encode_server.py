@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.encoder.server import (
     rid_to_receive_count,
     rid_to_receive_endpoint,
 )
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
@@ -2357,6 +2358,40 @@ class TestMooncakeRegistration(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
             self.engine.deregister(1234)
+
+        self.assertIs(ctx.exception.__cause__, backend_error)
+
+    def test_batch_registration_failure_reaches_kv_and_staging_callers(self):
+        """Failed registrations must stop initialization of KV and staging buffers."""
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.engine = self.engine
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1234],
+            kv_data_lens=[4096],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            state_data_ptrs=[],
+            state_data_lens=[],
+        )
+        for buffer, register in (
+            ("kv", manager.register_buffer_to_engine),
+            ("staging", lambda: manager._register_staging_memory(1234, 4096)),
+        ):
+            with self.subTest(buffer=buffer):
+                self.engine.engine.batch_register_memory.return_value = 0
+                register()
+                self.engine.engine.batch_register_memory.return_value = -7
+                with self.assertRaisesRegex(
+                    RuntimeError, "registration failed.*ret=-7"
+                ):
+                    register()
+
+    def test_batch_register_preserves_backend_failure(self):
+        backend_error = OSError("backend failed")
+        self.engine.engine.batch_register_memory.side_effect = backend_error
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed") as ctx:
+            self.engine.batch_register([1234], [4096])
 
         self.assertIs(ctx.exception.__cause__, backend_error)
 
