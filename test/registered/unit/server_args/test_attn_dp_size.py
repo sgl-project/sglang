@@ -67,6 +67,8 @@ class TestAttnDpSize(CustomTestCase):
                 )
                 new = self.resolve(tp_size=tp_size, attn_dp_size=width)
                 self.assertEqual(self.layout(legacy), (1, width, False))
+                self.assertEqual(legacy.num_dp_ranks, width)
+                self.assertEqual(new.num_dp_ranks, width)
                 self.assertEqual(legacy.resolved_dict(), new.resolved_dict())
 
     def test_without_attention_dp_the_width_is_one(self):
@@ -81,6 +83,7 @@ class TestAttnDpSize(CustomTestCase):
                 self.assertEqual(
                     self.layout(server_args), (fields.get("dp_size", 1), 1, False)
                 )
+                self.assertEqual(server_args.num_dp_ranks, fields.get("dp_size", 1))
 
     def test_rejected_layouts(self):
         for fields, message in (
@@ -170,6 +173,7 @@ class TestAttnDpSize(CustomTestCase):
             raw = parser.parse_args(argv)
         self.assertEqual(len(logs.output), 1)
         self.assertIn("--attn-dp-size", logs.output[0])
+        self.assertIn("server_args.num_dp_ranks", logs.output[0])
         self.assertTrue(ServerArgs.from_cli_args(raw).enable_dp_attention)
 
 
